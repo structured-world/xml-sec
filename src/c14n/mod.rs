@@ -129,6 +129,9 @@ pub enum C14nError {
     /// Invalid node reference.
     #[error("invalid node reference")]
     InvalidNode,
+    /// Algorithm not yet implemented.
+    #[error("unsupported algorithm: {0}")]
+    UnsupportedAlgorithm(String),
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -148,10 +151,16 @@ pub fn canonicalize(
     output: &mut Vec<u8>,
 ) -> Result<(), C14nError> {
     match algo.mode {
-        C14nMode::Inclusive1_0 | C14nMode::Inclusive1_1 => {
+        C14nMode::Inclusive1_0 => {
             let renderer = InclusiveNsRenderer;
             serialize_canonical(doc, node_set, algo.with_comments, &renderer, output)
         }
+        // C14N 1.1 has observable differences (xml:id propagation, xml:base fixup)
+        // that are not yet implemented. Fail explicitly rather than silently
+        // producing 1.0 output. See ROADMAP P1-007.
+        C14nMode::Inclusive1_1 => Err(C14nError::UnsupportedAlgorithm(
+            "C14N 1.1 is not yet implemented (tracked in P1-007)".to_string(),
+        )),
         C14nMode::Exclusive1_0 => {
             let renderer = ExclusiveNsRenderer::new(&algo.inclusive_prefixes);
             serialize_canonical(doc, node_set, algo.with_comments, &renderer, output)
@@ -169,6 +178,7 @@ pub fn canonicalize_xml(xml: &[u8], algo: &C14nAlgorithm) -> Result<Vec<u8>, C14
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -212,6 +222,19 @@ mod tests {
         assert_eq!(
             String::from_utf8(result).expect("utf8"),
             r#"<root a="1" b="2"><empty></empty></root>"#
+        );
+    }
+
+    #[test]
+    fn c14n_1_1_returns_error() {
+        let xml = b"<root/>";
+        let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
+        let result = canonicalize_xml(xml, &algo);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, C14nError::UnsupportedAlgorithm(_)),
+            "expected UnsupportedAlgorithm, got: {err:?}"
         );
     }
 }

@@ -64,6 +64,7 @@ impl NsRenderer for InclusiveNsRenderer {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::super::serialize::serialize_canonical;
     use super::*;
@@ -130,7 +131,8 @@ mod tests {
         let mut out = Vec::new();
         serialize_canonical(&doc, None, false, &renderer, &mut out).expect("c14n");
         let result = String::from_utf8(out).expect("utf8");
-        // Order should be: xmlns="" (default), xmlns:a, xmlns:z.
+        // Order should be: xmlns="..." (default), xmlns:a, xmlns:z.
+        // find(r#"xmlns=""#) matches the start of xmlns="http://default.com"
         let idx_default = result.find(r#"xmlns=""#).expect("default ns");
         let idx_a = result.find(r#"xmlns:a="#).expect("a ns");
         let idx_z = result.find(r#"xmlns:z="#).expect("z ns");

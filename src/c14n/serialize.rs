@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use roxmltree::{Document, Node, NodeType};
 
-use super::escape::{escape_attr, escape_text};
+use super::escape::{escape_attr, escape_cr, escape_text};
 use super::C14nError;
 
 /// Trait for namespace rendering strategies (inclusive vs exclusive).
@@ -111,7 +111,8 @@ fn serialize_children(
                     }
                     output.extend_from_slice(b"<!--");
                     if let Some(text) = child.text() {
-                        output.extend_from_slice(text.as_bytes());
+                        // C14N spec: \r in comments must be escaped to &#xD;
+                        escape_cr(text, output);
                     }
                     output.extend_from_slice(b"-->");
                 }
@@ -126,7 +127,8 @@ fn serialize_children(
                         output.extend_from_slice(pi.target.as_bytes());
                         if let Some(value) = pi.value {
                             output.push(b' ');
-                            output.extend_from_slice(value.as_bytes());
+                            // C14N spec: \r in PI content must be escaped to &#xD;
+                            escape_cr(value, output);
                         }
                         output.extend_from_slice(b"?>");
                     }
@@ -246,6 +248,10 @@ fn has_preceding_element_sibling(node: &Node) -> bool {
 }
 
 /// Write the qualified name (prefix:localname or just localname) of an element.
+///
+/// Uses `lookup_prefix()` to reverse-map namespace URI → prefix.
+/// This is ambiguous when multiple prefixes bind the same URI; see
+/// ns_exclusive.rs comment on `visibly_utilized_prefixes()`.
 fn write_qualified_name(node: Node, output: &mut Vec<u8>) {
     if let Some(ns_uri) = node.tag_name().namespace() {
         if let Some(prefix) = node.lookup_prefix(ns_uri) {
@@ -272,6 +278,7 @@ fn write_attribute_name(element: Node, attr: &roxmltree::Attribute, output: &mut
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::super::ns_inclusive::InclusiveNsRenderer;
     use super::*;

@@ -78,10 +78,15 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
 /// A prefix is visibly utilized if:
 /// 1. The element's tag name uses that prefix, OR
 /// 2. Any attribute on the element uses that prefix.
+// NOTE: roxmltree does not expose the lexical prefix from parsed QNames.
+// We reverse-map via lookup_prefix(namespace_uri). This is ambiguous when
+// multiple prefixes bind the same URI (e.g., xmlns:a="u" xmlns:b="u").
+// In practice this is extremely rare in SAML/XMLDSig documents.
+// A proper fix requires a parser that preserves lexical prefixes.
 fn visibly_utilized_prefixes<'a>(node: Node<'a, '_>) -> HashSet<&'a str> {
     let mut utilized = HashSet::new();
 
-    // Element's own prefix.
+    // Element's own prefix (reverse-mapped from namespace URI).
     if let Some(ns_uri) = node.tag_name().namespace() {
         match node.lookup_prefix(ns_uri) {
             Some(prefix) if !prefix.is_empty() => {
@@ -110,6 +115,7 @@ fn visibly_utilized_prefixes<'a>(node: Node<'a, '_>) -> HashSet<&'a str> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::super::serialize::serialize_canonical;
     use super::*;

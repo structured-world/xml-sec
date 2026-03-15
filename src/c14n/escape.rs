@@ -33,7 +33,20 @@ pub(crate) fn escape_attr(s: &str, output: &mut Vec<u8>) {
     }
 }
 
+/// Escape only carriage returns in comment/PI content for canonical XML.
+///
+/// C14N spec section 2.3: `\r` in comments and PIs → `&#xD;`
+pub(crate) fn escape_cr(s: &str, output: &mut Vec<u8>) {
+    for b in s.bytes() {
+        match b {
+            b'\r' => output.extend_from_slice(b"&#xD;"),
+            _ => output.push(b),
+        }
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
