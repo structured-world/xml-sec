@@ -170,18 +170,10 @@ fn serialize_element(
     }
 
     // Regular attributes, sorted by (namespace-uri, local-name).
+    // Note: roxmltree doesn't expose attribute nodes with separate Node identity,
+    // so node_set filtering cannot distinguish individual attributes. When an
+    // element is in the set, all its attributes are included (matches xmlsec1).
     let mut attrs: Vec<_> = node.attributes().collect();
-
-    // Filter attributes by node-set if applicable.
-    if let Some(pred) = node_set {
-        // For document subsets, only include attributes that are "in the set".
-        // roxmltree doesn't give attribute nodes separate Node identity,
-        // so when we have a node_set, all attributes of an included element
-        // are included (matching xmlsec1 behavior for typical use cases).
-        let _ = pred;
-        // All attributes included if the element is in the set.
-    }
-
     attrs.sort_by(|a, b| {
         let a_key = (a.namespace().unwrap_or(""), a.name());
         let b_key = (b.namespace().unwrap_or(""), b.name());

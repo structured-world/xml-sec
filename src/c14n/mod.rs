@@ -2,7 +2,8 @@
 //!
 //! Implements:
 //! - [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) (inclusive)
-//! - [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) (inclusive)
+//! - [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) — URI parsing only;
+//!   canonicalization returns `UnsupportedAlgorithm` (1.1-specific rules not yet implemented)
 //! - [Exclusive XML Canonicalization 1.0](https://www.w3.org/TR/xml-exc-c14n/) (exclusive)
 //!
 //! # Example
@@ -49,17 +50,29 @@ pub enum C14nMode {
 /// `<Transform>` elements.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C14nAlgorithm {
-    /// The canonicalization mode.
-    pub mode: C14nMode,
-    /// Whether to preserve comment nodes.
-    pub with_comments: bool,
-    /// For Exclusive C14N: prefixes to treat as inclusive.
-    /// Parsed from `<ec:InclusiveNamespaces PrefixList="..."/>`.
-    /// `"#default"` in the PrefixList is normalized to `""` (empty string).
-    pub inclusive_prefixes: HashSet<String>,
+    mode: C14nMode,
+    with_comments: bool,
+    /// For Exclusive C14N: prefixes forced via InclusiveNamespaces PrefixList.
+    /// `"#default"` is normalized to `""` (empty string) by `with_prefix_list()`.
+    inclusive_prefixes: HashSet<String>,
 }
 
 impl C14nAlgorithm {
+    /// The canonicalization mode.
+    pub fn mode(&self) -> C14nMode {
+        self.mode
+    }
+
+    /// Whether comment nodes are preserved.
+    pub fn with_comments(&self) -> bool {
+        self.with_comments
+    }
+
+    /// Prefixes forced via InclusiveNamespaces PrefixList (exclusive C14N).
+    pub fn inclusive_prefixes(&self) -> &HashSet<String> {
+        &self.inclusive_prefixes
+    }
+
     /// Create a new algorithm with the given mode and comments flag.
     pub fn new(mode: C14nMode, with_comments: bool) -> Self {
         Self {
@@ -157,9 +170,9 @@ pub fn canonicalize(
         }
         // C14N 1.1 has observable differences (xml:id propagation, xml:base fixup)
         // that are not yet implemented. Fail explicitly rather than silently
-        // producing 1.0 output. See ROADMAP P1-007.
+        // producing 1.0 output.
         C14nMode::Inclusive1_1 => Err(C14nError::UnsupportedAlgorithm(
-            "C14N 1.1 is not yet implemented (tracked in P1-007)".to_string(),
+            "C14N 1.1 is not yet implemented".to_string(),
         )),
         C14nMode::Exclusive1_0 => {
             let renderer = ExclusiveNsRenderer::new(&algo.inclusive_prefixes);
