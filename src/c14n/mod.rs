@@ -183,7 +183,8 @@ pub fn canonicalize(
 
 /// Convenience: parse XML bytes and canonicalize the whole document.
 pub fn canonicalize_xml(xml: &[u8], algo: &C14nAlgorithm) -> Result<Vec<u8>, C14nError> {
-    let xml_str = std::str::from_utf8(xml).map_err(|e| C14nError::Parse(e.to_string()))?;
+    let xml_str =
+        std::str::from_utf8(xml).map_err(|e| C14nError::Parse(format!("invalid UTF-8: {e}")))?;
     let doc = Document::parse(xml_str).map_err(|e| C14nError::Parse(e.to_string()))?;
     let mut output = Vec::new();
     canonicalize(&doc, None, algo, &mut output)?;

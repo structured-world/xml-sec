@@ -69,7 +69,12 @@ fn serialize_children(
         match child.node_type() {
             NodeType::Element => {
                 if in_set {
-                    // Before root element: emit \n if there was output before.
+                    // Before root element: emit \n separator if there was output before
+                    // (e.g., a preceding comment/PI). Note: when node_set excludes the
+                    // root element but includes preceding comments, those comments won't
+                    // get a trailing \n — this is acceptable because document subsets
+                    // that exclude the root element are only used with XPath transforms,
+                    // which are not yet implemented.
                     if is_doc_root && !output.is_empty() {
                         output.push(b'\n');
                     }

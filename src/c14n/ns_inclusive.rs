@@ -1,8 +1,10 @@
-//! Inclusive namespace rendering for C14N 1.0 and 1.1.
+//! Inclusive namespace rendering for C14N 1.0.
 //!
-//! In inclusive mode, ALL in-scope namespace declarations are emitted on each
-//! element, even if the namespace prefix is not visibly used by that element's
-//! tag or attributes.
+//! In inclusive mode, all in-scope namespace declarations are rendered on each
+//! element unless the same binding was already emitted by the nearest output
+//! ancestor (suppressing redundant redeclarations). Unlike exclusive C14N,
+//! namespaces are rendered even if not visibly used by the element's tag or
+//! attributes.
 
 use std::collections::HashMap;
 
