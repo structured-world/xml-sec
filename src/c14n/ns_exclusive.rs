@@ -96,8 +96,11 @@ fn visibly_utilized_prefixes<'a>(node: Node<'a, '_>) -> HashSet<&'a str> {
     let el_prefix = element_prefix(node);
     if !el_prefix.is_empty() {
         utilized.insert(el_prefix);
-    } else if node.tag_name().namespace().is_some() {
-        // Unprefixed element with namespace = default namespace utilized.
+    } else {
+        // Unprefixed element relies on the current default-namespace binding
+        // (including xmlns="" undeclaration), so the default namespace is
+        // visibly utilized. This ensures xmlns="" is emitted when needed
+        // to undeclare an inherited default namespace in exclusive C14N.
         utilized.insert("");
     }
 
@@ -168,6 +171,18 @@ mod tests {
         assert_eq!(
             result,
             r#"<root xmlns="http://example.com"><child></child></root>"#
+        );
+    }
+
+    #[test]
+    fn unprefixed_element_undeclares_default_ns() {
+        // child undeclares default ns with xmlns="". In exclusive C14N,
+        // the default namespace must be visibly utilized so xmlns="" is emitted.
+        let xml = r#"<root xmlns="http://example.com"><child xmlns=""/></root>"#;
+        let result = exc_c14n(xml, &HashSet::new());
+        assert!(
+            result.contains(r#"<child xmlns="">"#),
+            "xmlns=\"\" must be emitted for undeclaration. Got: {result}"
         );
     }
 }
