@@ -221,6 +221,10 @@ fn serialize_element(
 ///
 /// This function emits `\n` either before or after the node, depending on
 /// whether the root element has already been emitted.
+///
+/// Limitation: when `node_set` excludes the root element, the `\n` logic may
+/// be incorrect for preceding comments/PIs. This only affects XPath-selected
+/// subsets that exclude the root — not relevant for SAML enveloped signatures.
 fn write_doc_level_separator(node: &Node, output: &mut Vec<u8>) {
     let root_elem_seen = has_preceding_element_sibling(node);
     if root_elem_seen {

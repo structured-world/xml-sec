@@ -28,8 +28,7 @@ fn assert_exc_c14n(xml: &[u8], prefix_list: &str, expected: &str) {
 }
 
 // ─── Simple namespace document (inclusive) ──────────────────────────────────
-// Source: tests/vectors/simple-ns.xml
-// Reference: xmllint --c14n
+// Reference output verified against: xmllint --c14n
 
 const SIMPLE_NS_XML: &[u8] =
     br#"<root xmlns:z="http://z.com" xmlns:a="http://a.com" xmlns="http://default.com" b="2" a="1">

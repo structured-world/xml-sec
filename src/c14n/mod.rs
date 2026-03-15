@@ -185,6 +185,10 @@ pub fn canonicalize(
 }
 
 /// Convenience: parse XML bytes and canonicalize the whole document.
+///
+/// Input must be valid UTF-8 (XML 1.0 documents are UTF-8 or declare their
+/// encoding; roxmltree only accepts UTF-8). Returns `C14nError::Parse` for
+/// invalid UTF-8 or malformed XML.
 pub fn canonicalize_xml(xml: &[u8], algo: &C14nAlgorithm) -> Result<Vec<u8>, C14nError> {
     let xml_str =
         std::str::from_utf8(xml).map_err(|e| C14nError::Parse(format!("invalid UTF-8: {e}")))?;
