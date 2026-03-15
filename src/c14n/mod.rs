@@ -104,6 +104,9 @@ impl C14nAlgorithm {
 
     /// Set the InclusiveNamespaces PrefixList (exclusive C14N only).
     /// `"#default"` is normalized to empty string `""`.
+    ///
+    /// Only meaningful for [`C14nMode::Exclusive1_0`]. For inclusive modes,
+    /// the prefix list is ignored during canonicalization.
     pub fn with_prefix_list(mut self, prefix_list: &str) -> Self {
         self.inclusive_prefixes = prefix_list
             .split_whitespace()
