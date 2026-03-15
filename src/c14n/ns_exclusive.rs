@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use roxmltree::Node;
 
-use super::prefix::{attribute_prefix, element_prefix};
+use super::prefix::{attribute_prefix, element_prefix, has_in_scope_default_namespace};
 use super::serialize::NsRenderer;
 
 /// Exclusive C14N namespace renderer.
@@ -57,9 +57,14 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
                 continue;
             }
 
-            // Don't emit xmlns="" if no default ns was in scope.
-            if prefix.is_empty() && uri.is_empty() && !parent_rendered.contains_key("") {
-                continue;
+            // Suppress xmlns="" when no non-empty default namespace is in scope.
+            // Check source tree for subsets where output ancestors may be absent.
+            if prefix.is_empty() && uri.is_empty() {
+                let has_rendered_default = parent_rendered.contains_key("");
+                let has_in_scope_default = has_in_scope_default_namespace(node);
+                if !has_rendered_default && !has_in_scope_default {
+                    continue;
+                }
             }
 
             decls.push((prefix.to_string(), uri.to_string()));

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use roxmltree::Node;
 
+use super::prefix::has_in_scope_default_namespace;
 use super::serialize::NsRenderer;
 
 /// Inclusive C14N namespace renderer.
@@ -46,10 +47,19 @@ impl NsRenderer for InclusiveNsRenderer {
                 continue;
             }
 
-            // Suppress xmlns="" when no default namespace was previously in scope.
-            // Only emit xmlns="" to undeclare a previously declared default ns.
-            if prefix.is_empty() && uri.is_empty() && !parent_rendered.contains_key("") {
-                continue;
+            // Suppress xmlns="" when no non-empty default namespace is in scope.
+            // Check the source tree (not just parent_rendered) to handle document
+            // subsets where output ancestors may be absent.
+            if prefix.is_empty() && uri.is_empty() {
+                // Only emit xmlns="" if there's actually a default ns to undeclare.
+                // parent_rendered tracks what output ancestors emitted; but for subsets,
+                // a non-output ancestor may have declared xmlns="uri" which needs
+                // undeclaring. Fall back to source tree inspection.
+                let has_rendered_default = parent_rendered.contains_key("");
+                let has_in_scope_default = has_in_scope_default_namespace(node);
+                if !has_rendered_default && !has_in_scope_default {
+                    continue;
+                }
             }
 
             decls.push((prefix.to_string(), uri.to_string()));
