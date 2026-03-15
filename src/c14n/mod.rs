@@ -1,23 +1,217 @@
 //! XML Canonicalization (C14N).
 //!
 //! Implements:
-//! - [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/)
-//! - [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/)
-//! - [Exclusive XML Canonicalization](https://www.w3.org/TR/xml-exc-c14n/)
+//! - [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) (inclusive)
+//! - [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) (inclusive)
+//! - [Exclusive XML Canonicalization 1.0](https://www.w3.org/TR/xml-exc-c14n/) (exclusive)
+//!
+//! # Example
+//!
+//! ```
+//! use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_xml};
+//!
+//! let xml = b"<root b=\"2\" a=\"1\"><empty/></root>";
+//! let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
+//! let canonical = canonicalize_xml(xml, &algo).unwrap();
+//! assert_eq!(
+//!     String::from_utf8(canonical).unwrap(),
+//!     "<root a=\"1\" b=\"2\"><empty></empty></root>"
+//! );
+//! ```
 
-/// Canonicalization algorithm selection.
+mod escape;
+pub(crate) mod ns_exclusive;
+pub(crate) mod ns_inclusive;
+pub(crate) mod serialize;
+
+use std::collections::HashSet;
+
+use roxmltree::{Document, Node};
+
+use ns_exclusive::ExclusiveNsRenderer;
+use ns_inclusive::InclusiveNsRenderer;
+use serialize::serialize_canonical;
+
+/// C14N algorithm mode (without the comments flag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum C14nAlgorithm {
-    /// Canonical XML 1.0 (with comments).
-    Inclusive10WithComments,
-    /// Canonical XML 1.0 (without comments).
-    Inclusive10,
-    /// Canonical XML 1.1 (with comments).
-    Inclusive11WithComments,
-    /// Canonical XML 1.1 (without comments).
-    Inclusive11,
-    /// Exclusive Canonical XML (with comments).
-    Exclusive10WithComments,
-    /// Exclusive Canonical XML (without comments).
-    Exclusive10,
+pub enum C14nMode {
+    /// Inclusive C14N 1.0 — all in-scope namespaces rendered.
+    Inclusive1_0,
+    /// Inclusive C14N 1.1 — like 1.0 with xml:id propagation and xml:base fixup.
+    Inclusive1_1,
+    /// Exclusive C14N 1.0 — only visibly-utilized namespaces rendered.
+    Exclusive1_0,
+}
+
+/// Full C14N algorithm identifier.
+///
+/// Constructed from algorithm URIs found in `<CanonicalizationMethod>` or
+/// `<Transform>` elements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct C14nAlgorithm {
+    /// The canonicalization mode.
+    pub mode: C14nMode,
+    /// Whether to preserve comment nodes.
+    pub with_comments: bool,
+    /// For Exclusive C14N: prefixes to treat as inclusive.
+    /// Parsed from `<ec:InclusiveNamespaces PrefixList="..."/>`.
+    /// `"#default"` in the PrefixList is normalized to `""` (empty string).
+    pub inclusive_prefixes: HashSet<String>,
+}
+
+impl C14nAlgorithm {
+    /// Create a new algorithm with the given mode and comments flag.
+    pub fn new(mode: C14nMode, with_comments: bool) -> Self {
+        Self {
+            mode,
+            with_comments,
+            inclusive_prefixes: HashSet::new(),
+        }
+    }
+
+    /// Parse from an algorithm URI. Returns `None` for unrecognized URIs.
+    pub fn from_uri(uri: &str) -> Option<Self> {
+        let (mode, with_comments) = match uri {
+            "http://www.w3.org/TR/2001/REC-xml-c14n-20010315" => (C14nMode::Inclusive1_0, false),
+            "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments" => {
+                (C14nMode::Inclusive1_0, true)
+            }
+            "http://www.w3.org/2006/12/xml-c14n11" => (C14nMode::Inclusive1_1, false),
+            "http://www.w3.org/2006/12/xml-c14n11#WithComments" => (C14nMode::Inclusive1_1, true),
+            "http://www.w3.org/2001/10/xml-exc-c14n#" => (C14nMode::Exclusive1_0, false),
+            "http://www.w3.org/2001/10/xml-exc-c14n#WithComments" => (C14nMode::Exclusive1_0, true),
+            _ => return None,
+        };
+        Some(Self {
+            mode,
+            with_comments,
+            inclusive_prefixes: HashSet::new(),
+        })
+    }
+
+    /// Set the InclusiveNamespaces PrefixList (exclusive C14N only).
+    /// `"#default"` is normalized to empty string `""`.
+    pub fn with_prefix_list(mut self, prefix_list: &str) -> Self {
+        self.inclusive_prefixes = prefix_list
+            .split_whitespace()
+            .map(|p| {
+                if p == "#default" {
+                    String::new()
+                } else {
+                    p.to_string()
+                }
+            })
+            .collect();
+        self
+    }
+
+    /// Get the algorithm URI for this configuration.
+    pub fn uri(&self) -> &'static str {
+        match (self.mode, self.with_comments) {
+            (C14nMode::Inclusive1_0, false) => "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+            (C14nMode::Inclusive1_0, true) => {
+                "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"
+            }
+            (C14nMode::Inclusive1_1, false) => "http://www.w3.org/2006/12/xml-c14n11",
+            (C14nMode::Inclusive1_1, true) => "http://www.w3.org/2006/12/xml-c14n11#WithComments",
+            (C14nMode::Exclusive1_0, false) => "http://www.w3.org/2001/10/xml-exc-c14n#",
+            (C14nMode::Exclusive1_0, true) => "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+        }
+    }
+}
+
+/// Error type for C14N operations.
+#[derive(Debug, thiserror::Error)]
+pub enum C14nError {
+    /// XML parsing error.
+    #[error("XML parse error: {0}")]
+    Parse(String),
+    /// Invalid node reference.
+    #[error("invalid node reference")]
+    InvalidNode,
+    /// I/O error.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Canonicalize an XML document or document subset.
+///
+/// - `doc`: parsed roxmltree document (read-only DOM).
+/// - `node_set`: optional predicate controlling which nodes appear in output.
+///   `None` means the entire document.
+/// - `algo`: algorithm parameters (mode, comments, prefix list).
+/// - `output`: byte buffer receiving canonical XML.
+pub fn canonicalize(
+    doc: &Document,
+    node_set: Option<&dyn Fn(Node) -> bool>,
+    algo: &C14nAlgorithm,
+    output: &mut Vec<u8>,
+) -> Result<(), C14nError> {
+    match algo.mode {
+        C14nMode::Inclusive1_0 | C14nMode::Inclusive1_1 => {
+            let renderer = InclusiveNsRenderer;
+            serialize_canonical(doc, node_set, algo.with_comments, &renderer, output)
+        }
+        C14nMode::Exclusive1_0 => {
+            let renderer = ExclusiveNsRenderer::new(&algo.inclusive_prefixes);
+            serialize_canonical(doc, node_set, algo.with_comments, &renderer, output)
+        }
+    }
+}
+
+/// Convenience: parse XML bytes and canonicalize the whole document.
+pub fn canonicalize_xml(xml: &[u8], algo: &C14nAlgorithm) -> Result<Vec<u8>, C14nError> {
+    let xml_str = std::str::from_utf8(xml).map_err(|e| C14nError::Parse(e.to_string()))?;
+    let doc = Document::parse(xml_str).map_err(|e| C14nError::Parse(e.to_string()))?;
+    let mut output = Vec::new();
+    canonicalize(&doc, None, algo, &mut output)?;
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_uri_roundtrip() {
+        let uris = [
+            "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+            "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+            "http://www.w3.org/2006/12/xml-c14n11",
+            "http://www.w3.org/2006/12/xml-c14n11#WithComments",
+            "http://www.w3.org/2001/10/xml-exc-c14n#",
+            "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+        ];
+        for uri in uris {
+            let algo = C14nAlgorithm::from_uri(uri).expect(uri);
+            assert_eq!(algo.uri(), uri);
+        }
+    }
+
+    #[test]
+    fn unknown_uri_returns_none() {
+        assert!(C14nAlgorithm::from_uri("http://example.com/unknown").is_none());
+    }
+
+    #[test]
+    fn prefix_list_parsing() {
+        let algo = C14nAlgorithm::new(C14nMode::Exclusive1_0, false)
+            .with_prefix_list("foo bar #default baz");
+        assert!(algo.inclusive_prefixes.contains("foo"));
+        assert!(algo.inclusive_prefixes.contains("bar"));
+        assert!(algo.inclusive_prefixes.contains("baz"));
+        assert!(algo.inclusive_prefixes.contains("")); // #default → ""
+        assert_eq!(algo.inclusive_prefixes.len(), 4);
+    }
+
+    #[test]
+    fn canonicalize_xml_basic() {
+        let xml = b"<root b=\"2\" a=\"1\"><empty/></root>";
+        let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
+        let result = canonicalize_xml(xml, &algo).expect("c14n");
+        assert_eq!(
+            String::from_utf8(result).expect("utf8"),
+            r#"<root a="1" b="2"><empty></empty></root>"#
+        );
+    }
 }
