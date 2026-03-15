@@ -14,7 +14,7 @@ readme = "README.md"
 
 [dependencies]
 # XML parsing
-roxmltree = "0.21"
+roxmltree = { version = "0.21", features = ["positions"] }
 
 # Crypto
 ring = "0.17"

@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use roxmltree::Node;
 
+use super::prefix::{attribute_prefix, element_prefix};
 use super::serialize::NsRenderer;
 
 /// Exclusive C14N namespace renderer.
@@ -80,36 +81,26 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
 /// A prefix is visibly utilized if:
 /// 1. The element's tag name uses that prefix, OR
 /// 2. Any attribute on the element uses that prefix.
-// NOTE: roxmltree does not expose the lexical prefix from parsed QNames.
-// We reverse-map via lookup_prefix(namespace_uri). This is ambiguous when
-// multiple prefixes bind the same URI (e.g., xmlns:a="u" xmlns:b="u").
-// In practice this is extremely rare in SAML/XMLDSig documents.
-// A proper fix requires a parser that preserves lexical prefixes.
+///
+/// Uses lexical prefixes extracted from source XML byte positions,
+/// avoiding ambiguity when multiple prefixes bind the same namespace URI.
 fn visibly_utilized_prefixes<'a>(node: Node<'a, '_>) -> HashSet<&'a str> {
     let mut utilized = HashSet::new();
 
-    // Element's own prefix (reverse-mapped from namespace URI).
-    if let Some(ns_uri) = node.tag_name().namespace() {
-        match node.lookup_prefix(ns_uri) {
-            Some(prefix) if !prefix.is_empty() => {
-                utilized.insert(prefix);
-            }
-            _ if !ns_uri.is_empty() => {
-                // Element uses default namespace.
-                utilized.insert("");
-            }
-            _ => {}
-        }
+    // Element's own lexical prefix from source XML.
+    let el_prefix = element_prefix(node);
+    if !el_prefix.is_empty() {
+        utilized.insert(el_prefix);
+    } else if node.tag_name().namespace().is_some() {
+        // Unprefixed element with namespace = default namespace utilized.
+        utilized.insert("");
     }
 
-    // Attribute prefixes.
+    // Attribute lexical prefixes from source XML.
     for attr in node.attributes() {
-        if let Some(ns_uri) = attr.namespace() {
-            if let Some(prefix) = node.lookup_prefix(ns_uri) {
-                if !prefix.is_empty() {
-                    utilized.insert(prefix);
-                }
-            }
+        let attr_prefix = attribute_prefix(node, &attr);
+        if !attr_prefix.is_empty() {
+            utilized.insert(attr_prefix);
         }
     }
 

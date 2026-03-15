@@ -23,6 +23,7 @@
 mod escape;
 pub(crate) mod ns_exclusive;
 pub(crate) mod ns_inclusive;
+mod prefix;
 pub(crate) mod serialize;
 
 use std::collections::HashSet;

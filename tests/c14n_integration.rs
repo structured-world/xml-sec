@@ -304,6 +304,40 @@ fn cdata_flattened() {
     );
 }
 
+// ─── Prefix aliasing (multiple prefixes for same URI) ───────────────────────
+
+#[test]
+fn aliased_prefixes_exclusive() {
+    // Two prefixes bound to the same URI. Each element/attribute must preserve
+    // the lexical prefix actually used in the source, not an arbitrary one
+    // returned by lookup_prefix().
+    let xml = br#"<root xmlns:a="http://same" xmlns:b="http://same"><b:child a:x="1"/></root>"#;
+    assert_exc_c14n(
+        xml,
+        "",
+        concat!(
+            "<root>",
+            r#"<b:child xmlns:a="http://same" xmlns:b="http://same" a:x="1"></b:child>"#,
+            "</root>",
+        ),
+    );
+}
+
+#[test]
+fn aliased_prefixes_inclusive() {
+    let xml = br#"<root xmlns:a="http://same" xmlns:b="http://same"><b:child a:x="1"/></root>"#;
+    assert_c14n(
+        xml,
+        C14nMode::Inclusive1_0,
+        false,
+        concat!(
+            r#"<root xmlns:a="http://same" xmlns:b="http://same">"#,
+            r#"<b:child a:x="1"></b:child>"#,
+            "</root>",
+        ),
+    );
+}
+
 // ─── Default namespace undeclaration ────────────────────────────────────────
 
 #[test]

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use roxmltree::{Document, Node, NodeType};
 
 use super::escape::{escape_attr, escape_cr, escape_text};
+use super::prefix::{attribute_prefix, element_prefix};
 use super::C14nError;
 
 /// Trait for namespace rendering strategies (inclusive vs exclusive).
@@ -250,32 +251,25 @@ fn has_preceding_element_sibling(node: &Node) -> bool {
 
 /// Write the qualified name (prefix:localname or just localname) of an element.
 ///
-/// Uses `lookup_prefix()` to reverse-map namespace URI → prefix.
-/// This is ambiguous when multiple prefixes bind the same URI; see
-/// ns_exclusive.rs comment on `visibly_utilized_prefixes()`.
+/// Extracts the lexical prefix from the source XML via byte-range positions,
+/// avoiding ambiguity when multiple prefixes bind the same namespace URI.
 fn write_qualified_name(node: Node, output: &mut Vec<u8>) {
-    if let Some(ns_uri) = node.tag_name().namespace() {
-        if let Some(prefix) = node.lookup_prefix(ns_uri) {
-            if !prefix.is_empty() {
-                output.extend_from_slice(prefix.as_bytes());
-                output.push(b':');
-            }
-        }
+    let prefix = element_prefix(node);
+    if !prefix.is_empty() {
+        output.extend_from_slice(prefix.as_bytes());
+        output.push(b':');
     }
     output.extend_from_slice(node.tag_name().name().as_bytes());
 }
 
 /// Write an attribute's qualified name (prefix:localname or just localname).
 ///
-/// Uses `lookup_prefix()` reverse-mapping (see `write_qualified_name` doc).
+/// Extracts the lexical prefix from the source XML via byte-range positions.
 fn write_attribute_name(element: Node, attr: &roxmltree::Attribute, output: &mut Vec<u8>) {
-    if let Some(ns_uri) = attr.namespace() {
-        if let Some(prefix) = element.lookup_prefix(ns_uri) {
-            if !prefix.is_empty() {
-                output.extend_from_slice(prefix.as_bytes());
-                output.push(b':');
-            }
-        }
+    let prefix = attribute_prefix(element, attr);
+    if !prefix.is_empty() {
+        output.extend_from_slice(prefix.as_bytes());
+        output.push(b':');
     }
     output.extend_from_slice(attr.name().as_bytes());
 }
