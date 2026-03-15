@@ -1,0 +1,37 @@
+[package]
+name = "xml-sec"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+description = "Pure Rust XML Security: XMLDSig, XMLEnc, C14N. Drop-in replacement for libxmlsec1."
+repository = "https://github.com/structured-world/xml-sec"
+homepage = "https://github.com/structured-world/xml-sec"
+documentation = "https://docs.rs/xml-sec"
+keywords = ["xml", "xmldsig", "xmlenc", "c14n", "saml"]
+categories = ["cryptography", "web-programming", "authentication"]
+readme = "README.md"
+
+[dependencies]
+# XML parsing
+roxmltree = "0.20"
+
+# Crypto
+ring = "0.17"
+
+# X.509 certificates
+x509-parser = "0.16"
+der = "0.7"
+
+# Error handling
+thiserror = "2"
+
+[dev-dependencies]
+# W3C test vectors
+base64 = "0.22"
+
+[features]
+default = ["xmldsig", "c14n"]
+xmldsig = []           # XML Digital Signatures (sign + verify)
+xmlenc = []            # XML Encryption (encrypt + decrypt)
+c14n = []              # XML Canonicalization (inclusive + exclusive)

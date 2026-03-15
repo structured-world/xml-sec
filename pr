@@ -1,0 +1,75 @@
+
+---
+Промпт 1 — Source Tree Inventory
+
+Мне нужно проанализировать кодовые базы-доноры для проекта xml-sec (Pure Rust XML Security).
+
+### Агент 1: xmlsec1 (~/projects/sw/xml-sec/donors/xmlsec/)
+
+Ты анализируешь исходный код xmlsec1 (C, XML Security Library) для справочного каталога.
+
+ЗАДАЧА: Создать структурированный каталог исходников.
+
+ПРАВИЛА ФИЛЬТРАЦИИ:
+- ВКЛЮЧАТЬ: .c/.h файлы из: src/ (core), src/openssl/ (crypto backend), include/xmlsec/
+- ВКЛЮЧАТЬ: tests/aleksey/ (reference test vectors — W3C compliance)
+- ИСКЛЮЧАТЬ: src/nss/, src/gnutls/, src/mscrypto/, src/mscng/ (alternative crypto backends)
+- ИСКЛЮЧАТЬ: win32/, docs/, scripts/, m4/
+- ИСКЛЮЧАТЬ: файлы < 20 строк
+
+ФОРМАТ ВЫВОДА — файл ~/projects/sw/xml-sec/.refs/xmlsec-tree.md
+
+ПРОЦЕДУРА:
+1. cd ~/projects/sw/xml-sec/donors/xmlsec/ && git rev-parse HEAD
+2. Focus: src/c14n.c (canonicalization), src/xmldsig.c (signatures), src/xmlenc.c (encryption),
+   src/transforms.c (transform chain), src/keys.c (key management), src/x509.c (certificates)
+3. Для каждого файла: read first 100 lines → describe struct/function signatures
+
+### Агент 2: samael (~/projects/sw/xml-sec/donors/samael/)
+
+Ты анализируешь исходный код samael (Rust, SAML2 library) — reference для XML signature handling.
+
+ПРАВИЛА ФИЛЬТРАЦИИ:
+- ВКЛЮЧАТЬ: src/ (all .rs files)
+- ИСКЛЮЧАТЬ: tests/, examples/
+
+Focus: как samael делает XML signature verification, где вызывает C xmlsec1, какие Rust structures определены.
+
+ФОРМАТ ВЫВОДА — файл ~/projects/sw/xml-sec/.refs/samael-tree.md
+
+---
+
+Промпт 2 — Feature-Targeted Deep Analysis
+
+FEATURE-БЛОКИ (8 штук):
+
+1. C14N Inclusive — xmlsec1 src/c14n.c, алгоритм каноникализации, namespace processing, attribute sorting
+2. C14N Exclusive — xmlsec1 src/c14n.c (exclusive mode), namespace rendering rules
+3. XMLDSig Verify — xmlsec1 src/xmldsig.c, verification pipeline: Reference → DigestValue → SignatureValue
+4. XMLDSig Sign — xmlsec1 src/xmldsig.c, signing pipeline: transforms → digest → sign
+5. Transform Chain — xmlsec1 src/transforms.c, enveloped-signature transform, XPath filter
+6. XMLEnc — xmlsec1 src/xmlenc.c, symmetric/asymmetric encryption, key wrapping
+7. Key Management — xmlsec1 src/keys.c, src/x509.c, KeyInfo element processing
+8. samael Integration — samael src/xmlsec.rs, how Rust SAML calls xmlsec1 FFI, what we replace
+
+---
+
+Промпт 3 — Architecture Documents
+
+Создать ~/projects/sw/xml-sec/arch/ с документами:
+- arch/c14n.md — Canonicalization design
+- arch/xmldsig.md — Digital Signatures design
+- arch/xmlenc.md — Encryption design
+- arch/transforms.md — Transform pipeline design
+- arch/keys.md — Key management design
+- arch/ROADMAP.md — Phased implementation plan
+- arch/DECISIONS.md — ADR log
+
+---
+
+Промпт 4 — Roadmap
+
+Phase 1 (3 мес): C14N + XMLDSig verify-only → samael can use xml-sec for SAML assertion validation
+Phase 2 (3 мес): XMLDSig sign + KeyInfo → full SAML IdP support
+Phase 3 (3 мес): XMLEnc + full transform pipeline
+Phase 4 (3 мес): W3C conformance test suite, production hardening, 1.0 release
