@@ -53,17 +53,19 @@ pub(crate) fn attribute_prefix<'a>(node: Node<'a, '_>, attr: &Attribute<'a, '_>)
 }
 
 /// Check whether `xmlns=""` on `node` would be meaningful — i.e., whether
-/// any ancestor in the source tree has a non-empty default namespace that
-/// this `xmlns=""` would undeclare.
+/// the in-scope default namespace (as determined by the nearest ancestor
+/// `xmlns` declaration) is non-empty and would be undeclared.
 ///
 /// This is needed for correct `xmlns=""` suppression in C14N document subsets:
 /// when output ancestors are absent, `parent_rendered` alone cannot determine
-/// whether `xmlns=""` is meaningful. We check the source tree ancestors.
+/// whether `xmlns=""` is meaningful. We walk the source tree ancestors to
+/// find the effective in-scope default namespace.
 ///
-/// Returns `true` if any ancestor element has `xmlns="<non-empty-uri>"`,
-/// meaning `xmlns=""` on `node` is an active undeclaration.
+/// Returns `true` if the nearest ancestor element with a default-namespace
+/// declaration has `xmlns="<non-empty-uri>"`, meaning `xmlns=""` on `node`
+/// would actively undeclare the in-scope default namespace.
 pub(crate) fn has_in_scope_default_namespace(node: Node) -> bool {
-    // Walk ancestors to find any default namespace declaration.
+    // Walk ancestors to find the nearest default namespace declaration.
     let mut current = node.parent();
     while let Some(n) = current {
         if n.is_element() {

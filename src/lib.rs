@@ -12,15 +12,18 @@
 //! ## Quick Start
 //!
 //! ```rust
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_xml};
 //!
 //! let xml = b"<root b=\"2\" a=\"1\"><empty/></root>";
 //! let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
-//! let canonical = canonicalize_xml(xml, &algo).unwrap();
+//! let canonical = canonicalize_xml(xml, &algo)?;
 //! assert_eq!(
-//!     String::from_utf8(canonical).unwrap(),
+//!     String::from_utf8(canonical)?,
 //!     "<root a=\"1\" b=\"2\"><empty></empty></root>"
 //! );
+//! # Ok(())
+//! # }
 //! ```
 
 #![deny(unsafe_code)]
