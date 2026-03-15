@@ -266,6 +266,8 @@ fn write_qualified_name(node: Node, output: &mut Vec<u8>) {
 }
 
 /// Write an attribute's qualified name (prefix:localname or just localname).
+///
+/// Uses `lookup_prefix()` reverse-mapping (see `write_qualified_name` doc).
 fn write_attribute_name(element: Node, attr: &roxmltree::Attribute, output: &mut Vec<u8>) {
     if let Some(ns_uri) = attr.namespace() {
         if let Some(prefix) = element.lookup_prefix(ns_uri) {

@@ -24,6 +24,8 @@ impl NsRenderer for InclusiveNsRenderer {
         node: Node<'a, '_>,
         parent_rendered: &HashMap<String, String>,
     ) -> (Vec<(String, String)>, HashMap<String, String>) {
+        // Clone is O(n) per element. Acceptable for typical XML depths (<20 levels).
+        // Optimization: pass &mut and restore on backtrack — deferred to perf phase.
         let mut rendered = parent_rendered.clone();
         let mut decls: Vec<(String, String)> = Vec::new();
 
