@@ -14,7 +14,7 @@ readme = "README.md"
 
 [dependencies]
 # XML parsing
-roxmltree = "0.20"
+roxmltree = "0.21"
 
 # Crypto
 ring = "0.17"
