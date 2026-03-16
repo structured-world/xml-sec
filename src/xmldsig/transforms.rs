@@ -17,7 +17,7 @@
 //! | Exclusive C14N 1.0 | NodeSet → Binary | P0 |
 //! | Base64 decode | Binary → Binary | P1 (future) |
 
-use roxmltree::{Document, Node, NodeId};
+use roxmltree::{Document, Node};
 
 use super::types::{TransformData, TransformError};
 use crate::c14n::{self, C14nAlgorithm};
@@ -45,12 +45,17 @@ pub enum Transform {
 
 /// Apply a single transform to the pipeline data.
 ///
-/// `signature_node_id` is the `NodeId` of the `<Signature>` element that
-/// contains the `<Reference>` being processed. It is used by the enveloped
-/// transform to know which signature subtree to exclude.
+/// `signature_node` is the `<Signature>` element that contains the
+/// `<Reference>` being processed. It is used by the enveloped transform
+/// to know which signature subtree to exclude.
+///
+/// Accepting `Node` instead of `NodeId` binds the signature target to a
+/// specific document at the type level, preventing cross-document misuse
+/// (a bare `NodeId` is an untyped `u32` index that could silently resolve
+/// to the wrong node if passed with a different document).
 pub fn apply_transform<'a>(
     doc: &'a Document<'a>,
-    signature_node_id: NodeId,
+    signature_node: Node<'a, 'a>,
     transform: &Transform,
     input: TransformData<'a>,
 ) -> Result<TransformData<'a>, TransformError> {
@@ -65,9 +70,9 @@ pub fn apply_transform<'a>(
             // xmlsec1 equivalent:
             //   xmlSecNodeSetGetChildren(doc, signatureNode, 1, 1)  // inverted tree
             //   xmlSecNodeSetAdd(inNodes, children, Intersection)   // intersect = subtract
-            let signature_node = doc
-                .get_node(signature_node_id)
-                .ok_or(TransformError::EnvelopedSignatureNotFound)?;
+            if !std::ptr::eq(signature_node.document() as *const _, doc as *const _) {
+                return Err(TransformError::EnvelopedSignatureNotFound);
+            }
             nodes.exclude_subtree(signature_node);
             Ok(TransformData::NodeSet(nodes))
         }
@@ -95,14 +100,14 @@ pub fn apply_transform<'a>(
 /// Returns the final byte sequence ready for digest computation.
 pub fn execute_transforms<'a>(
     doc: &'a Document<'a>,
-    signature_node_id: NodeId,
+    signature_node: Node<'a, 'a>,
     initial_data: TransformData<'a>,
     transforms: &[Transform],
 ) -> Result<Vec<u8>, TransformError> {
     let mut data = initial_data;
 
     for transform in transforms {
-        data = apply_transform(doc, signature_node_id, transform, data)?;
+        data = apply_transform(doc, signature_node, transform, data)?;
     }
 
     // Final coercion: if the result is still a NodeSet, canonicalize with
@@ -224,7 +229,7 @@ mod tests {
         let data = TransformData::NodeSet(node_set);
 
         // Apply enveloped transform
-        let result = apply_transform(&doc, sig_node.id(), &Transform::Enveloped, data).unwrap();
+        let result = apply_transform(&doc, sig_node, &Transform::Enveloped, data).unwrap();
         let node_set = result.into_node_set().unwrap();
 
         // Root and data should be in the set
@@ -254,11 +259,9 @@ mod tests {
     fn enveloped_requires_node_set_input() {
         let xml = "<root/>";
         let doc = Document::parse(xml).unwrap();
-        let sig_id = doc.root_element().id();
-
         // Binary input should fail with TypeMismatch
         let data = TransformData::Binary(vec![1, 2, 3]);
-        let result = apply_transform(&doc, sig_id, &Transform::Enveloped, data);
+        let result = apply_transform(&doc, doc.root_element(), &Transform::Enveloped, data);
         assert!(result.is_err());
         match result.unwrap_err() {
             TransformError::TypeMismatch { expected, got } => {
@@ -282,7 +285,7 @@ mod tests {
         let algo =
             C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315").unwrap();
         let result =
-            apply_transform(&doc, doc.root_element().id(), &Transform::C14n(algo), data).unwrap();
+            apply_transform(&doc, doc.root_element(), &Transform::C14n(algo), data).unwrap();
 
         let bytes = result.into_binary().unwrap();
         let output = String::from_utf8(bytes).unwrap();
@@ -298,7 +301,7 @@ mod tests {
         let algo =
             C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315").unwrap();
         let data = TransformData::Binary(vec![1, 2, 3]);
-        let result = apply_transform(&doc, doc.root_element().id(), &Transform::C14n(algo), data);
+        let result = apply_transform(&doc, doc.root_element(), &Transform::C14n(algo), data);
 
         assert!(result.is_err());
         assert!(matches!(
@@ -334,7 +337,7 @@ mod tests {
             ),
         ];
 
-        let result = execute_transforms(&doc, sig_node.id(), initial, &transforms).unwrap();
+        let result = execute_transforms(&doc, sig_node, initial, &transforms).unwrap();
 
         let output = String::from_utf8(result).unwrap();
         // Signature subtree should be gone; attributes sorted
@@ -351,7 +354,7 @@ mod tests {
         let doc = Document::parse(xml).unwrap();
 
         let initial = TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc));
-        let result = execute_transforms(&doc, doc.root_element().id(), initial, &[]).unwrap();
+        let result = execute_transforms(&doc, doc.root_element(), initial, &[]).unwrap();
 
         let output = String::from_utf8(result).unwrap();
         assert_eq!(output, r#"<root a="1" b="2"><child></child></root>"#);
@@ -365,7 +368,7 @@ mod tests {
         let doc = Document::parse(xml).unwrap();
 
         let initial = TransformData::Binary(b"raw bytes".to_vec());
-        let result = execute_transforms(&doc, doc.root_element().id(), initial, &[]).unwrap();
+        let result = execute_transforms(&doc, doc.root_element(), initial, &[]).unwrap();
 
         assert_eq!(result, b"raw bytes");
     }
@@ -396,7 +399,7 @@ mod tests {
         let node_set = NodeSet::entire_document_without_comments(&doc);
         let data = TransformData::NodeSet(node_set);
 
-        let result = apply_transform(&doc, sig_node.id(), &Transform::Enveloped, data).unwrap();
+        let result = apply_transform(&doc, sig_node, &Transform::Enveloped, data).unwrap();
         let node_set = result.into_node_set().unwrap();
 
         // Sig1 should still be in the set
@@ -583,7 +586,7 @@ mod tests {
 
         // Execute the pipeline with empty URI (entire document)
         let initial = TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc));
-        let result = execute_transforms(&doc, sig_node.id(), initial, &transforms).unwrap();
+        let result = execute_transforms(&doc, sig_node, initial, &transforms).unwrap();
 
         let output = String::from_utf8(result).unwrap();
 

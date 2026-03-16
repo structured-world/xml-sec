@@ -71,7 +71,7 @@ fn enveloped_exc_c14n_saml_response() {
     let initial = resolver.dereference("").unwrap();
 
     // Execute pipeline
-    let result = execute_transforms(&doc, sig_node.id(), initial, &transforms).unwrap();
+    let result = execute_transforms(&doc, sig_node, initial, &transforms).unwrap();
     let output = String::from_utf8(result).unwrap();
 
     // Signature must be completely absent
@@ -123,7 +123,7 @@ fn enveloped_inclusive_c14n() {
         Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
     ];
 
-    let result = execute_transforms(&doc, sig_node.id(), initial, &transforms).unwrap();
+    let result = execute_transforms(&doc, sig_node, initial, &transforms).unwrap();
     let output = String::from_utf8(result).unwrap();
 
     // Signature gone
@@ -162,7 +162,7 @@ fn enveloped_inclusive_c14n_1_1() {
         Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_1, false)),
     ];
 
-    let result = execute_transforms(&doc, sig_node.id(), initial, &transforms).unwrap();
+    let result = execute_transforms(&doc, sig_node, initial, &transforms).unwrap();
     let output = String::from_utf8(result).unwrap();
 
     assert!(!output.contains("Signature"), "output: {output}");
@@ -201,7 +201,7 @@ fn id_uri_enveloped_assertion_level_signature() {
         ),
     ];
 
-    let result = execute_transforms(&doc, sig_node.id(), initial, &transforms).unwrap();
+    let result = execute_transforms(&doc, sig_node, initial, &transforms).unwrap();
     let output = String::from_utf8(result).unwrap();
 
     // Should contain the Assertion element and Subject
@@ -250,7 +250,7 @@ fn nested_signatures_only_own_excluded() {
         Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
     ];
 
-    let result = execute_transforms(&doc, outer_sig.id(), initial, &transforms).unwrap();
+    let result = execute_transforms(&doc, outer_sig, initial, &transforms).unwrap();
     let output = String::from_utf8(result).unwrap();
 
     // Outer signature should be excluded
@@ -291,7 +291,7 @@ fn enveloped_only_falls_back_to_default_c14n() {
         xml_sec::xmldsig::TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc));
     let transforms = vec![Transform::Enveloped];
 
-    let result = execute_transforms(&doc, sig_node.id(), initial, &transforms).unwrap();
+    let result = execute_transforms(&doc, sig_node, initial, &transforms).unwrap();
     let output = String::from_utf8(result).unwrap();
 
     // Signature gone
@@ -354,7 +354,7 @@ fn exc_c14n_with_prefix_list_from_xml() {
 
     // Execute pipeline
     let initial = resolver.dereference("").unwrap();
-    let result = execute_transforms(&doc, sig_node.id(), initial, &transforms).unwrap();
+    let result = execute_transforms(&doc, sig_node, initial, &transforms).unwrap();
     let output = String::from_utf8(result).unwrap();
 
     // Signature removed
@@ -412,7 +412,7 @@ fn parse_and_execute_transforms_roundtrip() {
     let initial = resolver.dereference(uri).unwrap();
 
     // Step 3: Execute transforms
-    let result = execute_transforms(&doc, sig_node.id(), initial, &transforms).unwrap();
+    let result = execute_transforms(&doc, sig_node, initial, &transforms).unwrap();
     let output = String::from_utf8(result).unwrap();
 
     // Step 4: Verify
@@ -443,7 +443,7 @@ fn enveloped_signature_only_child() {
         Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
     ];
 
-    let result = execute_transforms(&doc, sig_node.id(), initial, &transforms).unwrap();
+    let result = execute_transforms(&doc, sig_node, initial, &transforms).unwrap();
     let output = String::from_utf8(result).unwrap();
 
     // Only whitespace and root element should remain
@@ -469,7 +469,7 @@ fn enveloped_preserves_surrounding_whitespace() {
         Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
     ];
 
-    let result = execute_transforms(&doc, sig_node.id(), initial, &transforms).unwrap();
+    let result = execute_transforms(&doc, sig_node, initial, &transforms).unwrap();
     let output = String::from_utf8(result).unwrap();
 
     // The text nodes ("\n  ") around Signature are preserved — they're not
