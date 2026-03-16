@@ -103,8 +103,14 @@ impl<'a> NodeSet<'a> {
         }
     }
 
-    /// Create a node set representing an element and all its descendants
-    /// (including attributes, namespaces, and text nodes), with comments.
+    /// Create a node set rooted at `element`, containing that element and all
+    /// of its descendant nodes (elements, text, and, for this constructor,
+    /// comment nodes).
+    ///
+    /// Note: in `roxmltree`, attributes and namespaces are not separate nodes
+    /// and therefore are not tracked individually in this `NodeSet`. During
+    /// canonicalization, any attributes and namespace declarations belonging to
+    /// the included elements are serialized as part of those elements.
     pub fn subtree(doc: &'a Document<'a>, element: Node<'a, 'a>) -> Self {
         let mut ids = HashSet::new();
         collect_subtree_ids(element, &mut ids);
