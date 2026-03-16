@@ -35,7 +35,7 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
         let utilized = visibly_utilized_prefixes(node);
         // Exclusive mode: only visibly-utilized prefixes and forced prefixes
         // from InclusiveNamespaces PrefixList are candidates.
-        collect_ns_declarations(node, parent_rendered, &|prefix, _| {
+        collect_ns_declarations(node, parent_rendered, |prefix, _| {
             utilized.contains(prefix) || self.inclusive_prefixes.contains(prefix)
         })
     }

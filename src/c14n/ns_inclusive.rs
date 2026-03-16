@@ -26,7 +26,7 @@ impl NsRenderer for InclusiveNsRenderer {
         parent_rendered: &HashMap<String, String>,
     ) -> (Vec<(String, String)>, HashMap<String, String>) {
         // Inclusive mode: all in-scope namespace bindings are candidates.
-        collect_ns_declarations(node, parent_rendered, &|_, _| true)
+        collect_ns_declarations(node, parent_rendered, |_, _| true)
     }
 }
 

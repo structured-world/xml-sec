@@ -35,7 +35,7 @@ use super::prefix::has_in_scope_default_namespace;
 pub(crate) fn collect_ns_declarations(
     node: Node<'_, '_>,
     parent_rendered: &HashMap<String, String>,
-    include_prefix: &dyn Fn(&str, &str) -> bool,
+    include_prefix: impl Fn(&str, &str) -> bool,
 ) -> (Vec<(String, String)>, HashMap<String, String>) {
     let mut rendered = parent_rendered.clone();
     let mut decls: Vec<(String, String)> = Vec::new();
@@ -96,7 +96,7 @@ mod tests {
     fn collect_all(xml: &str) -> Vec<(String, String)> {
         let doc = Document::parse(xml).expect("parse");
         let root = doc.root_element();
-        let (decls, _) = collect_ns_declarations(root, &HashMap::new(), &|_, _| true);
+        let (decls, _) = collect_ns_declarations(root, &HashMap::new(), |_, _| true);
         decls
     }
 
@@ -122,10 +122,10 @@ mod tests {
     fn redundant_suppressed() {
         let doc = Document::parse(r#"<root xmlns:a="http://a"><child/></root>"#).expect("parse");
         let root = doc.root_element();
-        let (_, rendered) = collect_ns_declarations(root, &HashMap::new(), &|_, _| true);
+        let (_, rendered) = collect_ns_declarations(root, &HashMap::new(), |_, _| true);
 
         let child = root.first_element_child().expect("child");
-        let (decls, _) = collect_ns_declarations(child, &rendered, &|_, _| true);
+        let (decls, _) = collect_ns_declarations(child, &rendered, |_, _| true);
         assert!(decls.is_empty(), "child must not redeclare a:");
     }
 
@@ -144,10 +144,10 @@ mod tests {
         let doc = Document::parse(r#"<root xmlns="http://example.com"><child xmlns=""/></root>"#)
             .expect("parse");
         let root = doc.root_element();
-        let (_, rendered) = collect_ns_declarations(root, &HashMap::new(), &|_, _| true);
+        let (_, rendered) = collect_ns_declarations(root, &HashMap::new(), |_, _| true);
 
         let child = root.first_element_child().expect("child");
-        let (decls, _) = collect_ns_declarations(child, &rendered, &|_, _| true);
+        let (decls, _) = collect_ns_declarations(child, &rendered, |_, _| true);
         assert!(
             decls.iter().any(|(p, u)| p.is_empty() && u.is_empty()),
             "xmlns=\"\" must be emitted to undeclare default ns"
@@ -161,7 +161,7 @@ mod tests {
                 .expect("parse");
         let root = doc.root_element();
         // Only accept prefix "b".
-        let (decls, _) = collect_ns_declarations(root, &HashMap::new(), &|p, _| p == "b");
+        let (decls, _) = collect_ns_declarations(root, &HashMap::new(), |p, _| p == "b");
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].0, "b");
     }
