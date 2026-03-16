@@ -323,6 +323,15 @@ mod tests {
     }
 
     #[test]
+    fn resolve_schemeless_base_returns_reference() {
+        // When base has no scheme, parse_base returns None and resolve_uri
+        // falls back to returning the reference as-is. This is correct:
+        // without an absolute base, relative resolution is undefined.
+        assert_eq!(resolve_uri("sub/dir/", "file.xml"), "file.xml");
+        assert_eq!(resolve_uri("relative", "../other"), "../other");
+    }
+
+    #[test]
     fn resolve_urn_reference() {
         // URN has a scheme, should be returned as-is
         assert_eq!(
