@@ -21,7 +21,7 @@ ring = "0.17"
 
 # X.509 certificates
 x509-parser = "0.18"
-der = "0.7"
+der = "0.8"
 
 # Error handling
 thiserror = "2"
