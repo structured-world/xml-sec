@@ -43,7 +43,7 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, &mut out).expect("c14n");
+        serialize_canonical(&doc, None, false, &renderer, false, &mut out).expect("c14n");
         let result = String::from_utf8(out).expect("utf8");
         // Default ns and a: ns should appear on root.
         assert!(result.contains(r#"xmlns="http://example.com""#));
@@ -56,7 +56,7 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, &mut out).expect("c14n");
+        serialize_canonical(&doc, None, false, &renderer, false, &mut out).expect("c14n");
         let result = String::from_utf8(out).expect("utf8");
         // xmlns:a should appear only once (on root), not redeclared on child.
         assert_eq!(
@@ -71,7 +71,7 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, &mut out).expect("c14n");
+        serialize_canonical(&doc, None, false, &renderer, false, &mut out).expect("c14n");
         let result = String::from_utf8(out).expect("utf8");
         // child should redeclare a: with different URI.
         assert!(result.contains(r#"<child xmlns:a="http://other.com">"#));
@@ -83,7 +83,7 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, &mut out).expect("c14n");
+        serialize_canonical(&doc, None, false, &renderer, false, &mut out).expect("c14n");
         let result = String::from_utf8(out).expect("utf8");
         // child should have xmlns="" to undeclare the default namespace.
         assert!(result.contains(r#"<child xmlns="">"#));
@@ -96,7 +96,7 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, &mut out).expect("c14n");
+        serialize_canonical(&doc, None, false, &renderer, false, &mut out).expect("c14n");
         let result = String::from_utf8(out).expect("utf8");
         // Order should be: xmlns="..." (default), xmlns:a, xmlns:z.
         // find(r#"xmlns=""#) matches the start of xmlns="http://default.com"

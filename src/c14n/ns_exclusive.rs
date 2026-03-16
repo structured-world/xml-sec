@@ -87,7 +87,7 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = ExclusiveNsRenderer::new(prefix_list);
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, &mut out).expect("c14n");
+        serialize_canonical(&doc, None, false, &renderer, false, &mut out).expect("c14n");
         String::from_utf8(out).expect("utf8")
     }
 

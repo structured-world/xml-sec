@@ -29,6 +29,7 @@ pub(crate) mod ns_exclusive;
 pub(crate) mod ns_inclusive;
 mod prefix;
 pub(crate) mod serialize;
+mod xml_base;
 
 use std::collections::HashSet;
 
@@ -174,17 +175,20 @@ pub fn canonicalize(
     match algo.mode {
         C14nMode::Inclusive1_0 => {
             let renderer = InclusiveNsRenderer;
-            serialize_canonical(doc, node_set, algo.with_comments, &renderer, output)
+            serialize_canonical(doc, node_set, algo.with_comments, &renderer, false, output)
         }
-        // C14N 1.1 has observable differences (xml:id propagation, xml:base fixup)
-        // that are not yet implemented. Fail explicitly rather than silently
-        // producing 1.0 output.
-        C14nMode::Inclusive1_1 => Err(C14nError::UnsupportedAlgorithm(
-            "C14N 1.1 is not yet implemented".to_string(),
-        )),
+        // C14N 1.1 serialization is identical to 1.0 with two additions:
+        //   - xml:id propagation: covered by xml:* attribute inheritance
+        //     in serialize.rs (collect_inherited_xml_attrs).
+        //   - xml:base fixup: resolve relative xml:base URIs in document
+        //     subsets via RFC 3986 (fixup_xml_base=true).
+        C14nMode::Inclusive1_1 => {
+            let renderer = InclusiveNsRenderer;
+            serialize_canonical(doc, node_set, algo.with_comments, &renderer, true, output)
+        }
         C14nMode::Exclusive1_0 => {
             let renderer = ExclusiveNsRenderer::new(&algo.inclusive_prefixes);
-            serialize_canonical(doc, node_set, algo.with_comments, &renderer, output)
+            serialize_canonical(doc, node_set, algo.with_comments, &renderer, false, output)
         }
     }
 }
@@ -252,15 +256,81 @@ mod tests {
     }
 
     #[test]
-    fn c14n_1_1_returns_error() {
-        let xml = b"<root/>";
+    fn c14n_1_1_basic() {
+        // C14N 1.1 serialization is identical to 1.0 for full documents.
+        let xml = b"<root b=\"2\" a=\"1\"><empty/></root>";
         let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
-        let result = canonicalize_xml(xml, &algo);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let result = canonicalize_xml(xml, &algo).expect("c14n 1.1");
+        assert_eq!(
+            String::from_utf8(result).expect("utf8"),
+            r#"<root a="1" b="2"><empty></empty></root>"#
+        );
+    }
+
+    #[test]
+    fn c14n_1_1_with_comments() {
+        let xml = b"<root><!-- comment -->text</root>";
+        let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, true);
+        let result = canonicalize_xml(xml, &algo).expect("c14n 1.1 with comments");
+        assert_eq!(
+            String::from_utf8(result).expect("utf8"),
+            "<root><!-- comment -->text</root>"
+        );
+    }
+
+    #[test]
+    fn c14n_1_1_without_comments() {
+        let xml = b"<root><!-- comment -->text</root>";
+        let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
+        let result = canonicalize_xml(xml, &algo).expect("c14n 1.1 without comments");
+        assert_eq!(
+            String::from_utf8(result).expect("utf8"),
+            "<root>text</root>"
+        );
+    }
+
+    #[test]
+    fn c14n_1_1_namespaces() {
+        // C14N 1.1 renders all in-scope namespaces like 1.0.
+        let xml = b"<root xmlns:a=\"http://a\" xmlns:b=\"http://b\"><child/></root>";
+        let algo_10 = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
+        let algo_11 = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
+        let result_10 = canonicalize_xml(xml, &algo_10).expect("1.0");
+        let result_11 = canonicalize_xml(xml, &algo_11).expect("1.1");
+        // For full documents, 1.0 and 1.1 produce identical output.
+        assert_eq!(result_10, result_11);
+    }
+
+    #[test]
+    fn c14n_1_1_xml_id_inherited_in_subset() {
+        // C14N 1.1 propagates xml:id to document subsets, just like xml:lang.
+        use roxmltree::Document;
+        use std::collections::HashSet;
+
+        let xml = r#"<root xml:id="r1"><child>text</child></root>"#;
+        let doc = Document::parse(xml).expect("parse");
+        let child = doc.root_element().first_element_child().expect("child");
+
+        // Build subset: child + its descendants, excluding root
+        let mut ids = HashSet::new();
+        let mut stack = vec![child];
+        while let Some(n) = stack.pop() {
+            ids.insert(n.id());
+            for c in n.children() {
+                stack.push(c);
+            }
+        }
+        let pred = move |n: roxmltree::Node| ids.contains(&n.id());
+
+        let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
+        let mut out = Vec::new();
+        canonicalize(&doc, Some(&pred), &algo, &mut out).expect("c14n 1.1 subset");
+        let result = String::from_utf8(out).expect("utf8");
+
+        // xml:id="r1" should be inherited from root onto child
         assert!(
-            matches!(err, C14nError::UnsupportedAlgorithm(_)),
-            "expected UnsupportedAlgorithm, got: {err:?}"
+            result.contains(r#"xml:id="r1""#),
+            "xml:id should be inherited in C14N 1.1 subset; got: {result}"
         );
     }
 }
