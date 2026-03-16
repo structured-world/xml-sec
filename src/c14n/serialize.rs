@@ -259,7 +259,7 @@ fn serialize_element(
     // Using Cow to avoid allocations when no fixup is needed.
     let mut all_attrs: Vec<(&str, &str, &str, Cow<'_, str>)> = Vec::new();
     for attr in node.attributes() {
-        let value = if let Some(ref base) = effective_parent_base {
+        let value = if let Some(base) = effective_parent_base.as_deref() {
             if attr.namespace() == Some(XML_NS) && attr.name() == "base" {
                 // C14N 1.1: resolve the element's xml:base against the
                 // parent's effective base when non-empty. For xml:base="",
@@ -286,8 +286,8 @@ fn serialize_element(
     for &(name, value) in &inherited_xml {
         let resolved_value = if config.fixup_xml_base && name == "base" {
             // C14N 1.1: inherited xml:base uses the resolved effective value
-            match effective_parent_base {
-                Some(ref base) => Cow::Owned(base.clone()),
+            match effective_parent_base.as_ref() {
+                Some(base) => Cow::Owned(base.clone()),
                 None => Cow::Borrowed(value),
             }
         } else {

@@ -530,8 +530,9 @@ fn c14n_1_0_xml_base_not_resolved() {
     canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
     let result = String::from_utf8(output).expect("utf8");
 
-    // C14N 1.0: xml:base stays as raw "sub/", parent's "http://example.com/"
-    // is inherited separately
+    // C14N 1.0: xml:base stays as raw "sub/". The parent's
+    // xml:base="http://example.com/" is not copied onto the child because
+    // the child already has its own xml:base attribute.
     assert!(
         result.contains(r#"xml:base="sub/""#),
         "C14N 1.0 should NOT resolve xml:base; got: {result}"
