@@ -24,6 +24,7 @@
 //! ```
 
 mod escape;
+mod ns_common;
 pub(crate) mod ns_exclusive;
 pub(crate) mod ns_inclusive;
 mod prefix;

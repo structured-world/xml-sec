@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use roxmltree::Node;
 
-use super::prefix::has_in_scope_default_namespace;
+use super::ns_common::collect_ns_declarations;
 use super::serialize::NsRenderer;
 
 /// Inclusive C14N namespace renderer.
@@ -25,55 +25,8 @@ impl NsRenderer for InclusiveNsRenderer {
         node: Node<'a, '_>,
         parent_rendered: &HashMap<String, String>,
     ) -> (Vec<(String, String)>, HashMap<String, String>) {
-        // Clone is O(n) per element. Acceptable for typical XML depths (<20 levels).
-        // Optimization: pass &mut and restore on backtrack — deferred to perf phase.
-        let mut rendered = parent_rendered.clone();
-        let mut decls: Vec<(String, String)> = Vec::new();
-
-        // Collect all in-scope namespace declarations from roxmltree.
-        // node.namespaces() yields every ns declared on this element or
-        // inherited from ancestors.
-        for ns in node.namespaces() {
-            let prefix = ns.name().unwrap_or(""); // None = default namespace
-            let uri = ns.uri();
-
-            // The `xml` prefix namespace is never declared in canonical XML.
-            if prefix == "xml" {
-                continue;
-            }
-
-            // Emit only if different from what the nearest output ancestor rendered.
-            if parent_rendered.get(prefix).map(|u| u.as_str()) == Some(uri) {
-                continue;
-            }
-
-            // Suppress xmlns="" when no non-empty default namespace is in scope.
-            // Check the source tree (not just parent_rendered) to handle document
-            // subsets where output ancestors may be absent.
-            if prefix.is_empty() && uri.is_empty() {
-                // Only emit xmlns="" if there's actually a default ns to undeclare.
-                // parent_rendered tracks what output ancestors emitted; but for subsets,
-                // a non-output ancestor may have declared xmlns="uri" which needs
-                // undeclaring. Fall back to source tree inspection.
-                let has_rendered_default = parent_rendered.contains_key("");
-                let has_in_scope_default = has_in_scope_default_namespace(node);
-                if !has_rendered_default && !has_in_scope_default {
-                    continue;
-                }
-            }
-
-            decls.push((prefix.to_string(), uri.to_string()));
-        }
-
-        // Sort namespace declarations by prefix (lexicographic, "" sorts first).
-        decls.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Update the rendered map.
-        for (prefix, uri) in &decls {
-            rendered.insert(prefix.clone(), uri.clone());
-        }
-
-        (decls, rendered)
+        // Inclusive mode: all in-scope namespace bindings are candidates.
+        collect_ns_declarations(node, parent_rendered, &|_, _| true)
     }
 }
 
