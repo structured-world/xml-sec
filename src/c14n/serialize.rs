@@ -228,7 +228,10 @@ fn serialize_element(
     // For C14N 1.1 (fixup_xml_base=true): xml:base values are additionally
     // resolved to effective URIs per RFC 3986.
     let inherited_xml = if config.inherit_xml_attrs {
-        // xml:id inheritance gated on C14N 1.1 (same flag as xml:base fixup)
+        // xml:id is only inheritable in C14N 1.1. Both xml:id propagation
+        // and xml:base fixup are C14N 1.1 features, so fixup_xml_base
+        // serves as the "is C14N 1.1" indicator. If these ever need to be
+        // independent, add a separate field to C14nConfig.
         let include_xml_id = config.fixup_xml_base;
         collect_inherited_xml_attrs(node, node_set, include_xml_id)
     } else {
@@ -258,9 +261,9 @@ fn serialize_element(
     for attr in node.attributes() {
         let value = if let Some(ref base) = effective_parent_base {
             if attr.namespace() == Some(XML_NS) && attr.name() == "base" {
-                // C14N 1.1: resolve element's own xml:base against parent's
-                // effective base. Skip empty xml:base="" — it means "remove
-                // the base", so we emit it unchanged (not resolved).
+                // C14N 1.1: resolve the element's xml:base against the
+                // parent's effective base when non-empty. For xml:base="",
+                // emit the attribute value unchanged (do not resolve it).
                 let raw = attr.value();
                 if raw.is_empty() {
                     Cow::Borrowed(raw)

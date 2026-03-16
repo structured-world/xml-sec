@@ -17,16 +17,20 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 /// Compute the effective `xml:base` for an element by resolving the ancestor
 /// chain per [RFC 3986 §5](https://www.rfc-editor.org/rfc/rfc3986#section-5).
 ///
-/// Walks from `start` up the ancestor chain, collecting `xml:base` values.
-/// Stops at the nearest ancestor that is included in the node set (if
-/// provided), since that ancestor will render its own `xml:base` in the
-/// canonical output. Resolves from the topmost collected base to the closest.
+/// Walks from `start` up the ancestor chain, collecting `xml:base` values
+/// from each element. If a `node_set` is provided, the walk stops at the
+/// nearest ancestor that is included in the node set, since that ancestor
+/// will render its own `xml:base` in the canonical output. The function still
+/// uses that included ancestor's `xml:base` (if any) as the resolution seed,
+/// so that the omitted portion of the chain resolves against the correct
+/// effective base. Resolves from the topmost collected base to the closest.
 ///
 /// The resulting reference is absolute only if some ancestor `xml:base`
 /// (or the effective base at that point) is absolute; otherwise it may be
 /// a relative reference.
 ///
-/// Returns `None` if no ancestor in the omitted chain has a non-empty
+/// Returns `None` if neither the omitted ancestor chain nor the nearest
+/// included ancestor (when `node_set` is provided) has a non-empty
 /// `xml:base` attribute.
 pub(crate) fn compute_effective_xml_base(
     start: Node<'_, '_>,
@@ -249,7 +253,11 @@ fn merge_paths(base_path: &str, reference: &str) -> String {
 }
 
 /// Remove `.` and `..` segments from a path per RFC 3986 §5.2.4.
+///
+/// For absolute paths (starting with `/`), `..` at the root is a no-op.
+/// For relative paths, unresolved leading `..` segments are preserved.
 fn remove_dot_segments(path: &str) -> String {
+    let is_absolute = path.starts_with('/');
     let mut segments: Vec<&str> = Vec::new();
 
     for segment in path.split('/') {
@@ -258,9 +266,20 @@ fn remove_dot_segments(path: &str) -> String {
                 // Current directory — skip
             }
             ".." => {
-                // Parent directory — remove last segment (but not past root)
-                if segments.len() > 1 {
+                // Parent directory — RFC 3986 §5.2.4:
+                // - For absolute paths, do not traverse above root (the
+                //   leading "" segment from the initial '/' is preserved).
+                // - For relative paths, preserve unmatched ".." segments.
+                let can_pop = match segments.last() {
+                    Some(&"") => false,   // root segment of absolute path
+                    Some(&"..") => false, // already an unmatched ".."
+                    Some(_) => true,
+                    None => false,
+                };
+                if can_pop {
                     segments.pop();
+                } else if !is_absolute {
+                    segments.push("..");
                 }
             }
             s => segments.push(s),
@@ -444,6 +463,13 @@ mod tests {
     #[test]
     fn remove_dots_at_root() {
         assert_eq!(remove_dot_segments("/../a"), "/a");
+    }
+
+    #[test]
+    fn remove_dots_relative_leading_dotdot() {
+        // Relative paths: unmatched ".." segments must be preserved
+        assert_eq!(remove_dot_segments("../../a"), "../../a");
+        assert_eq!(remove_dot_segments("foo/../../bar"), "../bar");
     }
 
     // ── has_scheme tests ─────────────────────────────────────────────

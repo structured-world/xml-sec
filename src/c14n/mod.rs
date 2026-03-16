@@ -2,8 +2,7 @@
 //!
 //! Implements:
 //! - [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) (inclusive)
-//! - [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) — URI parsing only;
-//!   canonicalization returns `UnsupportedAlgorithm` (1.1-specific rules not yet implemented)
+//! - [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) (inclusive; xml:id propagation and xml:base fixup)
 //! - [Exclusive XML Canonicalization 1.0](https://www.w3.org/TR/xml-exc-c14n/) (exclusive)
 //!
 //! # Example
