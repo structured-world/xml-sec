@@ -93,6 +93,10 @@ fn xml_base_value<'a>(node: Node<'a, '_>) -> Option<&'a str> {
 ///
 /// Handles: absolute references (with scheme), authority overrides (`//`),
 /// absolute paths (`/`), relative paths, and empty references.
+///
+/// **When base has no scheme** (schemeless/relative base), resolution is not
+/// possible per RFC 3986 §5.2.2. In this case the reference is returned
+/// unchanged. Callers must provide a scheme-bearing base for absolute output.
 pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
     // Empty reference → base URI
     if reference.is_empty() {
