@@ -244,11 +244,25 @@ fn merge_paths(base_path: &str, reference: &str) -> String {
     if base_path.is_empty() {
         format!("/{reference}")
     } else {
-        // Remove everything after (and including) the last segment of base path
+        // Remove everything after the last segment of base path.
+        // If there is no '/' in the base path (non-hierarchical path,
+        // e.g. opaque URIs like `urn:foo:bar`), return the reference
+        // unchanged per RFC 3986 §5.2.3.
         match base_path.rfind('/') {
             Some(pos) => format!("{}{reference}", &base_path[..=pos]),
-            None => format!("/{reference}"),
+            None => reference.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    /// Non-hierarchical base path (no '/') should return reference as-is.
+    #[test]
+    fn non_hierarchical_base_does_not_add_slash() {
+        assert_eq!(merge_paths("foo:bar", "baz"), "baz");
     }
 }
 
