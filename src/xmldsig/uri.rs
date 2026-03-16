@@ -5,12 +5,14 @@
 //!
 //! - **Empty URI** (`""` or absent): the entire document, excluding comments.
 //! - **Bare-name `#id`**: the element whose ID attribute matches `id`, as a subtree.
+//! - **`#xpointer(/)`**: the entire document, including comments.
+//! - **`#xpointer(id('id'))` / `#xpointer(id("id"))`**: element by ID (equivalent to bare-name).
 //!
 //! External URIs (http://, file://, etc.) are not supported — only same-document
 //! references are needed for SAML signature verification.
 
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use roxmltree::{Document, Node};
 
@@ -63,6 +65,9 @@ impl<'a> UriReferenceResolver<'a> {
     /// adds to them (does not replace). Pass an empty slice to use only defaults.
     pub fn with_id_attrs(doc: &'a Document<'a>, extra_attrs: &[&str]) -> Self {
         let mut id_map = HashMap::new();
+        // Track IDs seen more than once so they are never reinserted
+        // after being removed (handles 3+ occurrences correctly).
+        let mut duplicate_ids: HashSet<&'a str> = HashSet::new();
 
         // Merge default + extra attribute names, dedup
         let mut attr_names: Vec<&str> = DEFAULT_ID_ATTRS.to_vec();
@@ -77,6 +82,11 @@ impl<'a> UriReferenceResolver<'a> {
             if node.is_element() {
                 for attr_name in &attr_names {
                     if let Some(value) = node.attribute(*attr_name) {
+                        // Skip IDs already marked as duplicate
+                        if duplicate_ids.contains(value) {
+                            continue;
+                        }
+
                         // Duplicate IDs are invalid per XML spec and can enable
                         // signature-wrapping attacks. Remove the entry so that
                         // lookups for ambiguous IDs fail with ElementNotFound
@@ -87,6 +97,7 @@ impl<'a> UriReferenceResolver<'a> {
                             }
                             Entry::Occupied(o) => {
                                 o.remove();
+                                duplicate_ids.insert(value);
                             }
                         }
                     }
@@ -443,6 +454,18 @@ mod tests {
             result.unwrap_err(),
             TransformError::ElementNotFound(_)
         ));
+    }
+
+    #[test]
+    fn triple_duplicate_ids_stay_rejected() {
+        // Verify that 3+ occurrences don't re-insert (the HashSet tracks
+        // permanently removed IDs so Entry::Vacant after remove doesn't re-add)
+        let xml = r#"<root><a ID="dup">1</a><b ID="dup">2</b><c ID="dup">3</c></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let resolver = UriReferenceResolver::new(&doc);
+
+        assert!(!resolver.has_id("dup"));
+        assert!(resolver.dereference("#dup").is_err());
     }
 
     #[test]
