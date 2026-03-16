@@ -96,8 +96,14 @@ impl<'a> UriReferenceResolver<'a> {
                                 v.insert(node);
                             }
                             Entry::Occupied(o) => {
-                                o.remove();
-                                duplicate_ids.insert(value);
+                                // Only treat as duplicate if a *different* element
+                                // maps the same ID value. The same element can
+                                // expose the same value via multiple scanned attrs
+                                // (e.g., both `ID="x"` and `Id="x"`).
+                                if o.get().id() != node.id() {
+                                    o.remove();
+                                    duplicate_ids.insert(value);
+                                }
                             }
                         }
                     }
@@ -193,11 +199,12 @@ impl<'a> UriReferenceResolver<'a> {
 fn parse_xpointer_id(fragment: &str) -> Option<&str> {
     let inner = fragment.strip_prefix("xpointer(id(")?.strip_suffix("))")?;
 
-    // Strip single or double quotes
-    if (inner.starts_with('\'') && inner.ends_with('\''))
-        || (inner.starts_with('"') && inner.ends_with('"'))
-    {
-        Some(&inner[1..inner.len() - 1])
+    // Strip single or double quotes using safe helpers to avoid panics
+    // on malformed input (e.g., `xpointer(id('))` where inner is `'`)
+    if let Some(stripped) = inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        Some(stripped)
+    } else if let Some(stripped) = inner.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        Some(stripped)
     } else {
         None
     }
@@ -601,6 +608,23 @@ mod tests {
         assert_eq!(super::parse_xpointer_id("xpointer(id(foo))"), None); // no quotes
         assert_eq!(super::parse_xpointer_id("not-xpointer"), None);
         assert_eq!(super::parse_xpointer_id(""), None);
+
+        // Malformed: single quote char — must not panic (was slicing bug)
+        assert_eq!(super::parse_xpointer_id("xpointer(id('))"), None);
+        assert_eq!(super::parse_xpointer_id(r#"xpointer(id("))"#), None);
+    }
+
+    #[test]
+    fn same_element_multiple_id_attrs_not_duplicate() {
+        // An element with both ID="x" and Id="x" should NOT be treated as
+        // duplicate — it's the same element exposing the same value via
+        // different scanned attribute names.
+        let xml = r#"<root><item ID="x" Id="x">data</item></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let resolver = UriReferenceResolver::new(&doc);
+
+        assert!(resolver.has_id("x"));
+        assert!(resolver.dereference("#x").is_ok());
     }
 
     #[test]
