@@ -98,9 +98,10 @@ fn xml_base_value<'a>(node: Node<'a, '_>) -> Option<&'a str> {
 /// Handles: absolute references (with scheme), authority overrides (`//`),
 /// absolute paths (`/`), relative paths, and empty references.
 ///
-/// **When base has no scheme** (schemeless/relative base), resolution is not
-/// possible per RFC 3986 §5.2.2. In this case the reference is returned
-/// unchanged. Callers must provide a scheme-bearing base for absolute output.
+/// **When base has no scheme** (schemeless/relative base), full RFC 3986
+/// resolution is not possible, but path-merge and dot-segment removal are
+/// still performed so that chained relative `xml:base` values collapse
+/// correctly (e.g. `a/b/` + `c/` → `a/b/c/`). The result remains relative.
 pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
     // Empty reference → base URI
     if reference.is_empty() {
@@ -115,7 +116,19 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
     // Parse base URI components
     let base_parts = match parse_base(base) {
         Some(parts) => parts,
-        None => return reference.to_string(), // base has no scheme, can't resolve
+        None => {
+            // Schemeless/relative base. Still perform path-merge and
+            // dot-segment removal so that a chain of relative xml:base
+            // values is correctly collapsed (e.g. "a/b/" + "c/" → "a/b/c/").
+            if reference.starts_with("//") || reference.starts_with('/') {
+                return reference.to_string();
+            }
+            let (ref_path, ref_suffix) = split_path_suffix(reference);
+            let base_path_only = strip_query_fragment(base);
+            let merged = merge_paths(base_path_only, ref_path);
+            let cleaned = remove_dot_segments(&merged);
+            return format!("{cleaned}{ref_suffix}");
+        }
     };
     let scheme = base_parts.scheme;
     let authority = base_parts.authority;
@@ -201,8 +214,17 @@ struct BaseParts<'a> {
 }
 
 /// Parse a base URI into scheme, optional authority, and path per RFC 3986.
+///
+/// Returns `None` if `base` has no valid RFC 3986 scheme (e.g. relative
+/// paths like `a/b:c` where `:` is not a scheme delimiter).
 fn parse_base(base: &str) -> Option<BaseParts<'_>> {
-    let scheme_end = base.find(':')?;
+    // Only treat ':' as a scheme delimiter if base has a valid scheme.
+    // This prevents mis-parsing relative paths containing ':' in later
+    // segments (e.g. "a/b:c" would wrongly yield scheme="a/b").
+    if !has_scheme(base) {
+        return None;
+    }
+    let scheme_end = base.find(':').expect("has_scheme guarantees ':'");
     let scheme = &base[..scheme_end];
 
     let mut rest = &base[scheme_end + 1..];
@@ -423,12 +445,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_schemeless_base_returns_reference() {
-        // When base has no scheme, parse_base returns None and resolve_uri
-        // falls back to returning the reference as-is. This is correct:
-        // without an absolute base, relative resolution is undefined.
-        assert_eq!(resolve_uri("sub/dir/", "file.xml"), "file.xml");
-        assert_eq!(resolve_uri("relative", "../other"), "../other");
+    fn resolve_schemeless_base_merges_paths() {
+        // Schemeless base: path-merge + dot removal still applies so that
+        // chained relative xml:base values collapse correctly.
+        assert_eq!(resolve_uri("sub/dir/", "file.xml"), "sub/dir/file.xml");
+        assert_eq!(resolve_uri("a/b/", "../c"), "a/c");
+        assert_eq!(resolve_uri("a/b", "c"), "a/c");
     }
 
     #[test]
