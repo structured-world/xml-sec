@@ -224,7 +224,7 @@ fn parse_base(base: &str) -> Option<BaseParts<'_>> {
     if !has_scheme(base) {
         return None;
     }
-    let scheme_end = base.find(':').expect("has_scheme guarantees ':'");
+    let scheme_end = base.find(':')?;
     let scheme = &base[..scheme_end];
 
     let mut rest = &base[scheme_end + 1..];
