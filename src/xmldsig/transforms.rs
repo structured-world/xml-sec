@@ -25,6 +25,9 @@ use crate::c14n::{self, C14nAlgorithm};
 /// The algorithm URI for the enveloped signature transform.
 pub const ENVELOPED_SIGNATURE_URI: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
 
+/// XMLDSig namespace URI for `<Transform>` elements.
+const XMLDSIG_NS_URI: &str = "http://www.w3.org/2000/09/xmldsig#";
+
 /// Namespace URI for Exclusive C14N `<InclusiveNamespaces>` elements.
 const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 
@@ -143,8 +146,11 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
         if !child.is_element() {
             continue;
         }
-        // Match on local name, ignoring namespace prefix (could be ds:Transform or Transform)
-        if child.tag_name().name() != "Transform" {
+        // Match on local name AND namespace — reject non-XMLDSig elements
+        // that happen to be named "Transform" (fail-closed parsing).
+        if child.tag_name().name() != "Transform"
+            || child.tag_name().namespace() != Some(XMLDSIG_NS_URI)
+        {
             continue;
         }
         let uri = child.attribute("Algorithm").ok_or_else(|| {
@@ -158,7 +164,7 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
         } else if let Some(mut algo) = C14nAlgorithm::from_uri(uri) {
             // For exclusive C14N, check for InclusiveNamespaces child
             if algo.mode() == c14n::C14nMode::Exclusive1_0 {
-                if let Some(prefix_list) = parse_inclusive_prefixes(child) {
+                if let Some(prefix_list) = parse_inclusive_prefixes(child)? {
                     algo = algo.with_prefix_list(&prefix_list);
                 }
             }
@@ -179,23 +185,32 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
 /// the element MUST be in the `http://www.w3.org/2001/10/xml-exc-c14n#` namespace.
 /// Elements with the same local name but a different namespace are ignored.
 ///
+/// Returns `Ok(None)` if no `<InclusiveNamespaces>` child is present.
+/// Returns `Err` if the element exists but lacks the required `PrefixList` attribute
+/// (fail-closed: malformed control elements are rejected, not silently ignored).
+///
 /// The element is typically:
 /// ```xml
 /// <ec:InclusiveNamespaces
 ///     xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#"
 ///     PrefixList="ds saml #default"/>
 /// ```
-fn parse_inclusive_prefixes(transform_node: Node) -> Option<String> {
+fn parse_inclusive_prefixes(transform_node: Node) -> Result<Option<String>, TransformError> {
     for child in transform_node.children() {
         if child.is_element() {
             let tag = child.tag_name();
             if tag.name() == "InclusiveNamespaces" && tag.namespace() == Some(EXCLUSIVE_C14N_NS_URI)
             {
-                return child.attribute("PrefixList").map(String::from);
+                let prefix_list = child.attribute("PrefixList").ok_or_else(|| {
+                    TransformError::UnsupportedTransform(
+                        "missing PrefixList attribute on <InclusiveNamespaces>".into(),
+                    )
+                })?;
+                return Ok(Some(prefix_list.to_string()));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -483,6 +498,26 @@ mod tests {
             }
             other => panic!("expected C14n, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_transforms_missing_prefix_list_is_error() {
+        // InclusiveNamespaces in correct namespace but without PrefixList
+        // attribute should be rejected (fail-closed), not silently ignored.
+        let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#"
+                                xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#">
+            <Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#">
+                <ec:InclusiveNamespaces/>
+            </Transform>
+        </Transforms>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let result = parse_transforms(doc.root_element());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TransformError::UnsupportedTransform(_)
+        ));
     }
 
     #[test]
