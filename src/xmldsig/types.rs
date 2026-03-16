@@ -225,7 +225,8 @@ pub enum TransformError {
     #[error("C14N error: {0}")]
     C14n(String),
 
-    /// The Signature node referenced by the enveloped transform was not found.
-    #[error("enveloped-signature transform: Signature node not found in document")]
-    EnvelopedSignatureNotFound,
+    /// The Signature node passed to the enveloped transform belongs to a
+    /// different `Document` than the input `NodeSet`.
+    #[error("enveloped-signature transform: invalid Signature node for this document")]
+    CrossDocumentSignatureNode,
 }
