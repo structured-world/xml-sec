@@ -4,7 +4,7 @@
 //!
 //! ## Current Status
 //!
-//! - URI dereference: same-document references (`""`, `#id`, `#xpointer(/)`)
+//! - URI dereference: same-document references (`""`, `#id`, `#xpointer(/)`, `#xpointer(id('...'))`)
 //! - ID attribute resolution with configurable attribute names
 //! - Node set types for the transform pipeline
 

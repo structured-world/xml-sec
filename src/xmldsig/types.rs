@@ -122,7 +122,17 @@ impl<'a> NodeSet<'a> {
     }
 
     /// Check whether a node is in this set.
+    ///
+    /// Returns `false` for nodes from a different document than this set's
+    /// owning document (prevents cross-document NodeId collisions).
     pub fn contains(&self, node: Node<'_, '_>) -> bool {
+        // Guard: reject nodes from a different document. NodeIds are
+        // per-document indices — the same index from another document
+        // would reference a completely different node.
+        if !std::ptr::eq(node.document() as *const _, self.doc as *const _) {
+            return false;
+        }
+
         let id = node.id();
 
         // Check exclusion first
@@ -143,7 +153,13 @@ impl<'a> NodeSet<'a> {
     }
 
     /// Exclude a node and all its descendants from this set.
+    ///
+    /// No-op for nodes from a different document.
     pub fn exclude_subtree(&mut self, node: Node<'_, '_>) {
+        // Guard: only exclude nodes from our document
+        if !std::ptr::eq(node.document() as *const _, self.doc as *const _) {
+            return;
+        }
         collect_subtree_ids(node, &mut self.excluded);
     }
 

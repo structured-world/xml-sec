@@ -9,6 +9,7 @@
 //! External URIs (http://, file://, etc.) are not supported — only same-document
 //! references are needed for SAML signature verification.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use roxmltree::{Document, Node};
@@ -56,10 +57,10 @@ impl<'a> UriReferenceResolver<'a> {
         Self::with_id_attrs(doc, DEFAULT_ID_ATTRS)
     }
 
-    /// Build a resolver with custom ID attribute names.
+    /// Build a resolver scanning additional ID attribute names beyond the defaults.
     ///
-    /// The defaults (`ID`, `Id`, `id`) are always included. Additional names
-    /// are appended. Pass an empty slice to use only the defaults.
+    /// The defaults (`ID`, `Id`, `id`) are always included; `extra_attrs`
+    /// adds to them (does not replace). Pass an empty slice to use only defaults.
     pub fn with_id_attrs(doc: &'a Document<'a>, extra_attrs: &[&str]) -> Self {
         let mut id_map = HashMap::new();
 
@@ -76,8 +77,18 @@ impl<'a> UriReferenceResolver<'a> {
             if node.is_element() {
                 for attr_name in &attr_names {
                     if let Some(value) = node.attribute(*attr_name) {
-                        // First occurrence wins (per XML spec, IDs should be unique)
-                        id_map.entry(value).or_insert(node);
+                        // Duplicate IDs are invalid per XML spec and can enable
+                        // signature-wrapping attacks. Remove the entry so that
+                        // lookups for ambiguous IDs fail with ElementNotFound
+                        // rather than silently picking an arbitrary node.
+                        match id_map.entry(value) {
+                            Entry::Vacant(v) => {
+                                v.insert(node);
+                            }
+                            Entry::Occupied(o) => {
+                                o.remove();
+                            }
+                        }
                     }
                 }
             }
@@ -106,6 +117,10 @@ impl<'a> UriReferenceResolver<'a> {
                 NodeSet::entire_document_without_comments(self.doc),
             ))
         } else if let Some(fragment) = uri.strip_prefix('#') {
+            // Note: we intentionally do NOT percent-decode the fragment.
+            // XMLDSig ID values are XML Name tokens (no spaces/special chars),
+            // and real-world SAML never uses percent-encoded fragments.
+            // xmlsec1 also passes fragments through without decoding.
             self.dereference_fragment(fragment)
         } else {
             Err(TransformError::UnsupportedUri(uri.to_string()))
@@ -119,6 +134,11 @@ impl<'a> UriReferenceResolver<'a> {
     /// - `xpointer(id('foo'))` → element by ID (equivalent to bare-name `#foo`)
     /// - bare name `foo` → element by ID attribute
     fn dereference_fragment(&self, fragment: &str) -> Result<TransformData<'a>, TransformError> {
+        if fragment.is_empty() {
+            // Bare "#" is not a valid same-document reference
+            return Err(TransformError::UnsupportedUri("#".to_string()));
+        }
+
         if fragment == "xpointer(/)" {
             // XPointer root: entire document WITH comments (unlike empty URI).
             // Per XMLDSig §4.3.3.3: "the XPointer expression [...] includes
@@ -175,6 +195,7 @@ fn parse_xpointer_id(fragment: &str) -> Option<&str> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::types::NodeSet;
     use super::*;
 
     #[test]
@@ -330,6 +351,43 @@ mod tests {
     }
 
     #[test]
+    fn empty_fragment_rejected() {
+        // Bare "#" (empty fragment) is not a valid same-document reference
+        let xml = "<root/>";
+        let doc = Document::parse(xml).unwrap();
+        let resolver = UriReferenceResolver::new(&doc);
+
+        let result = resolver.dereference("#");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TransformError::UnsupportedUri(uri) => assert_eq!(uri, "#"),
+            other => panic!("expected UnsupportedUri, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn foreign_document_node_rejected() {
+        // NodeSet.contains() must reject nodes from a different document
+        let xml1 = "<root><child/></root>";
+        let xml2 = "<other><item/></other>";
+        let doc1 = Document::parse(xml1).unwrap();
+        let doc2 = Document::parse(xml2).unwrap();
+
+        let node_set = NodeSet::entire_document_without_comments(&doc1);
+
+        // Node from doc2 should NOT be in doc1's node set
+        let foreign_node = doc2.root_element();
+        assert!(
+            !node_set.contains(foreign_node),
+            "foreign document node should be rejected"
+        );
+
+        // Node from doc1 should be in the set
+        let own_node = doc1.root_element();
+        assert!(node_set.contains(own_node));
+    }
+
+    #[test]
     fn custom_id_attr_name() {
         // roxmltree stores `wsu:Id` with local name "Id" — already in DEFAULT_ID_ATTRS.
         // Test with a truly custom attribute name instead.
@@ -370,21 +428,21 @@ mod tests {
     }
 
     #[test]
-    fn first_id_wins_for_duplicates() {
-        // If two elements have the same ID value, first occurrence wins
+    fn duplicate_ids_are_rejected() {
+        // Duplicate IDs are removed from the index to prevent signature-wrapping
+        // attacks — lookups for ambiguous IDs fail instead of picking arbitrarily.
         let xml = r#"<root><a ID="dup">first</a><b ID="dup">second</b></root>"#;
         let doc = Document::parse(xml).unwrap();
         let resolver = UriReferenceResolver::new(&doc);
 
-        let data = resolver.dereference("#dup").unwrap();
-        let node_set = data.into_node_set().unwrap();
-
-        // Should resolve to the first <a> element
-        let first = doc
-            .descendants()
-            .find(|n| n.is_element() && n.has_tag_name("a"))
-            .unwrap();
-        assert!(node_set.contains(first));
+        // "dup" appears twice → removed from index
+        assert!(!resolver.has_id("dup"));
+        let result = resolver.dereference("#dup");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TransformError::ElementNotFound(_)
+        ));
     }
 
     #[test]
