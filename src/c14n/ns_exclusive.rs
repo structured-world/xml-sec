@@ -7,7 +7,8 @@ use std::collections::{HashMap, HashSet};
 
 use roxmltree::Node;
 
-use super::prefix::{attribute_prefix, element_prefix, has_in_scope_default_namespace};
+use super::ns_common::collect_ns_declarations;
+use super::prefix::{attribute_prefix, element_prefix};
 use super::serialize::NsRenderer;
 
 /// Exclusive C14N namespace renderer.
@@ -32,52 +33,11 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
         parent_rendered: &HashMap<String, String>,
     ) -> (Vec<(String, String)>, HashMap<String, String>) {
         let utilized = visibly_utilized_prefixes(node);
-        // Clone is O(n) per element. Acceptable for typical XML depths (<20 levels).
-        // Optimization: pass &mut and restore on backtrack — deferred to perf phase.
-        let mut rendered = parent_rendered.clone();
-        let mut decls: Vec<(String, String)> = Vec::new();
-
-        for ns in node.namespaces() {
-            let prefix = ns.name().unwrap_or("");
-            let uri = ns.uri();
-
-            // The `xml` prefix is never declared.
-            if prefix == "xml" {
-                continue;
-            }
-
-            // Include if visibly utilized OR in the forced prefix list.
-            let dominated = utilized.contains(prefix) || self.inclusive_prefixes.contains(prefix);
-            if !dominated {
-                continue;
-            }
-
-            // Only render if different from nearest output ancestor.
-            if parent_rendered.get(prefix).map(|s| s.as_str()) == Some(uri) {
-                continue;
-            }
-
-            // Suppress xmlns="" when no non-empty default namespace is in scope.
-            // Check source tree for subsets where output ancestors may be absent.
-            if prefix.is_empty() && uri.is_empty() {
-                let has_rendered_default = parent_rendered.contains_key("");
-                let has_in_scope_default = has_in_scope_default_namespace(node);
-                if !has_rendered_default && !has_in_scope_default {
-                    continue;
-                }
-            }
-
-            decls.push((prefix.to_string(), uri.to_string()));
-        }
-
-        // Sort by prefix.
-        decls.sort_by(|a, b| a.0.cmp(&b.0));
-
-        for (prefix, uri) in &decls {
-            rendered.insert(prefix.clone(), uri.clone());
-        }
-
-        (decls, rendered)
+        // Exclusive mode: only visibly-utilized prefixes and forced prefixes
+        // from InclusiveNamespaces PrefixList are candidates.
+        collect_ns_declarations(node, parent_rendered, |prefix, _| {
+            utilized.contains(prefix) || self.inclusive_prefixes.contains(prefix)
+        })
     }
 }
 
