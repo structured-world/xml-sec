@@ -13,17 +13,30 @@ use roxmltree::Node;
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
 /// Compute the effective `xml:base` for an element by resolving the ancestor
-/// chain per RFC 3986.
+/// chain per [RFC 3986 §5](https://www.rfc-editor.org/rfc/rfc3986#section-5).
 ///
-/// Walks from `start` up to the document root, collects all `xml:base`
-/// values, then resolves from the root-most (base) to the closest (relative).
+/// Walks from `start` up the ancestor chain, collecting `xml:base` values.
+/// Stops at the nearest ancestor that is included in the node set (if
+/// provided), since that ancestor will render its own `xml:base` in the
+/// canonical output. Resolves from the topmost collected base to the closest.
 ///
-/// Returns `None` if no ancestor has `xml:base`.
-pub(crate) fn compute_effective_xml_base(start: Node<'_, '_>) -> Option<String> {
+/// Returns `None` if no ancestor in the omitted chain has `xml:base`.
+pub(crate) fn compute_effective_xml_base(
+    start: Node<'_, '_>,
+    node_set: Option<&dyn Fn(Node) -> bool>,
+) -> Option<String> {
     let mut bases: Vec<&str> = Vec::new();
     let mut current = Some(start);
     while let Some(n) = current {
         if n.is_element() {
+            // Stop at the nearest included ancestor — it renders its own
+            // xml:base in the canonical output, so we only need to resolve
+            // the contiguous omitted chain below it.
+            if let Some(pred) = node_set {
+                if pred(n) {
+                    break;
+                }
+            }
             if let Some(base) = xml_base_value(n) {
                 bases.push(base);
             }
@@ -55,6 +68,10 @@ fn xml_base_value<'a>(node: Node<'a, '_>) -> Option<&'a str> {
 }
 
 /// Resolve a URI reference against a base URI per RFC 3986 §5.2.2.
+///
+/// C14N 1.1 §2.4 explicitly specifies RFC 3986 §5 for `xml:base` resolution:
+/// "IRI resolution of relative references is performed as described in
+/// Section 5 of [RFC 3986]." No C14N-specific deviations from RFC 3986.
 ///
 /// Handles: absolute references (with scheme), authority overrides (`//`),
 /// absolute paths (`/`), relative paths, and empty references.
@@ -311,7 +328,7 @@ mod tests {
         let doc = Document::parse(xml).unwrap();
         let child = doc.root_element().first_element_child().unwrap();
         // Compute from child's parent (root)
-        let base = compute_effective_xml_base(child.parent().unwrap());
+        let base = compute_effective_xml_base(child.parent().unwrap(), None);
         assert_eq!(base.as_deref(), Some("http://example.com/"));
     }
 
@@ -325,7 +342,7 @@ mod tests {
 
         // From c's parent (b): chain is [b: "sub/", a: "http://example.com/"]
         // Resolved: "http://example.com/" + "sub/" = "http://example.com/sub/"
-        let base = compute_effective_xml_base(c.parent().unwrap());
+        let base = compute_effective_xml_base(c.parent().unwrap(), None);
         assert_eq!(base.as_deref(), Some("http://example.com/sub/"));
     }
 
@@ -339,7 +356,7 @@ mod tests {
         let c = b.first_element_child().unwrap();
         let d = c.first_element_child().unwrap();
 
-        let base = compute_effective_xml_base(d.parent().unwrap());
+        let base = compute_effective_xml_base(d.parent().unwrap(), None);
         assert_eq!(base.as_deref(), Some("http://ex.com/x/y/"));
     }
 
@@ -348,7 +365,10 @@ mod tests {
         let xml = r#"<root><child/></root>"#;
         let doc = Document::parse(xml).unwrap();
         let child = doc.root_element().first_element_child().unwrap();
-        assert_eq!(compute_effective_xml_base(child.parent().unwrap()), None);
+        assert_eq!(
+            compute_effective_xml_base(child.parent().unwrap(), None),
+            None
+        );
     }
 
     #[test]
@@ -360,7 +380,7 @@ mod tests {
         let d = b.first_element_child().unwrap();
 
         // "http://example.com/a/b/" + "../c/" = "http://example.com/a/c/"
-        let base = compute_effective_xml_base(d.parent().unwrap());
+        let base = compute_effective_xml_base(d.parent().unwrap(), None);
         assert_eq!(base.as_deref(), Some("http://example.com/a/c/"));
     }
 }

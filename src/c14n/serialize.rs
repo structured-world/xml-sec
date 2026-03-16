@@ -13,9 +13,21 @@ use super::prefix::{attribute_prefix, element_prefix};
 use super::xml_base::{compute_effective_xml_base, resolve_uri};
 use super::C14nError;
 
-/// The XML namespace URI. Attributes in this namespace (`xml:lang`,
-/// `xml:space`, `xml:base`) are inherited in C14N document subsets.
+/// The XML namespace URI.
+///
+/// In C14N document subsets (W3C C14N §2.4), inheritable attributes in
+/// this namespace are propagated from ancestors outside the node set:
+/// - C14N 1.0 / Exclusive 1.0: `xml:lang`, `xml:space`, `xml:base`
+/// - C14N 1.1: adds `xml:id` to the above set
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+
+/// Check whether an xml:* attribute name is inheritable in the current mode.
+///
+/// Per C14N 1.0 §2.4: `xml:lang`, `xml:space`, `xml:base` are inherited.
+/// Per C14N 1.1: `xml:id` is also inherited (xml:id propagation).
+fn is_inheritable_xml_attr(local_name: &str, include_xml_id: bool) -> bool {
+    matches!(local_name, "lang" | "space" | "base") || (include_xml_id && local_name == "id")
+}
 
 /// Trait for namespace rendering strategies (inclusive vs exclusive).
 pub(crate) trait NsRenderer {
@@ -203,19 +215,21 @@ fn serialize_element(
     // Note: roxmltree doesn't expose attribute nodes with separate Node identity,
     // so node_set filtering cannot distinguish individual attributes. When an
     // element is in the set, all its attributes are included (matches xmlsec1).
-    let inherited_xml = collect_inherited_xml_attrs(node, node_set);
+    let inherited_xml = collect_inherited_xml_attrs(node, node_set, fixup_xml_base);
 
     // Compute effective parent xml:base for C14N 1.1 fixup. Needed when:
     // - fixup is enabled (C14N 1.1), AND
     // - parent is not in the node set (otherwise parent renders its own base)
     // The effective base is used for both inherited xml:base values and
     // resolving the element's own xml:base against the ancestor chain.
-    let parent_not_in_set = node_set.is_some()
-        && !node
-            .parent()
-            .is_some_and(|p| p.is_element() && node_set.expect("checked")(p));
+    let parent_not_in_set = if let Some(pred) = node_set {
+        !node.parent().is_some_and(|p| p.is_element() && pred(p))
+    } else {
+        false
+    };
     let effective_parent_base = if fixup_xml_base && parent_not_in_set {
-        node.parent().and_then(compute_effective_xml_base)
+        node.parent()
+            .and_then(|p| compute_effective_xml_base(p, node_set))
     } else {
         None
     };
@@ -224,16 +238,13 @@ fn serialize_element(
     // Using Cow to avoid allocations when no fixup is needed.
     let mut all_attrs: Vec<(&str, &str, &str, Cow<'_, str>)> = Vec::new();
     for attr in node.attributes() {
-        let value = if fixup_xml_base
-            && effective_parent_base.is_some()
-            && attr.namespace() == Some(XML_NS)
-            && attr.name() == "base"
-        {
-            // C14N 1.1: resolve element's own xml:base against parent's effective base
-            Cow::Owned(resolve_uri(
-                effective_parent_base.as_deref().expect("checked above"),
-                attr.value(),
-            ))
+        let value = if let Some(ref base) = effective_parent_base {
+            if attr.namespace() == Some(XML_NS) && attr.name() == "base" {
+                // C14N 1.1: resolve element's own xml:base against parent's effective base
+                Cow::Owned(resolve_uri(base, attr.value()))
+            } else {
+                Cow::Borrowed(attr.value())
+            }
         } else {
             Cow::Borrowed(attr.value())
         };
@@ -326,18 +337,22 @@ fn has_preceding_element_sibling(node: &Node) -> bool {
     false
 }
 
-/// Collect `xml:*` attributes inherited from ancestors for document subsets.
+/// Collect inheritable `xml:*` attributes from ancestors for document subsets.
 ///
 /// Per [W3C C14N 1.0 §2.4](https://www.w3.org/TR/xml-c14n/#ProcessingModel):
 /// when an element is in the node set but its parent is NOT, `xml:lang`,
-/// `xml:space`, and `xml:base` attributes from ancestor elements must be
-/// emitted on the element to preserve inherited semantics.
+/// `xml:space`, and `xml:base` from ancestor elements must be emitted on
+/// the element to preserve inherited semantics.
+///
+/// The `include_xml_id` flag (true for C14N 1.1) additionally inherits
+/// `xml:id`. Other `xml:*` attributes are never inherited.
 ///
 /// Returns `(local_name, value)` pairs. Closer ancestors take precedence.
 /// Attributes already present on the element itself are excluded.
 fn collect_inherited_xml_attrs<'a>(
     node: Node<'a, '_>,
     node_set: Option<&dyn Fn(Node) -> bool>,
+    include_xml_id: bool,
 ) -> Vec<(&'a str, &'a str)> {
     let pred = match node_set {
         Some(p) => p,
@@ -352,11 +367,15 @@ fn collect_inherited_xml_attrs<'a>(
         }
     }
 
-    // Collect xml:* attr names already on this element (own attrs take precedence).
+    // Collect inheritable xml:* attr names already on this element (own attrs
+    // take precedence). Non-inheritable xml:* attrs are ignored.
     let mut seen: HashSet<&str> = HashSet::new();
     for attr in node.attributes() {
         if attr.namespace() == Some(XML_NS) {
-            seen.insert(attr.name());
+            let local = attr.name();
+            if is_inheritable_xml_attr(local, include_xml_id) {
+                seen.insert(local);
+            }
         }
     }
 
@@ -367,8 +386,11 @@ fn collect_inherited_xml_attrs<'a>(
     while let Some(anc) = ancestor {
         if anc.is_element() {
             for attr in anc.attributes() {
-                if attr.namespace() == Some(XML_NS) && seen.insert(attr.name()) {
-                    inherited.push((attr.name(), attr.value()));
+                if attr.namespace() == Some(XML_NS) {
+                    let local = attr.name();
+                    if is_inheritable_xml_attr(local, include_xml_id) && seen.insert(local) {
+                        inherited.push((attr.name(), attr.value()));
+                    }
                 }
             }
         }
