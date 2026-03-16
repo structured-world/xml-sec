@@ -154,10 +154,16 @@ impl<'a> NodeSet<'a> {
 }
 
 /// Collect a node and all its descendants into a set of `NodeId`s.
+///
+/// Uses an explicit stack instead of recursion to avoid stack overflow
+/// on deeply nested XML (attacker-controlled input in SAML contexts).
 fn collect_subtree_ids(node: Node<'_, '_>, ids: &mut HashSet<NodeId>) {
-    ids.insert(node.id());
-    for child in node.children() {
-        collect_subtree_ids(child, ids);
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        ids.insert(current.id());
+        for child in current.children() {
+            stack.push(child);
+        }
     }
     // roxmltree models attributes as children only for elements,
     // but they're accessible via node.attributes(). For node-set

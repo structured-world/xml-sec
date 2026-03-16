@@ -94,6 +94,8 @@ impl<'a> UriReferenceResolver<'a> {
     /// |-----|--------|
     /// | `""` (empty) | Entire document, comments excluded |
     /// | `"#foo"` | Subtree rooted at element with ID `foo` |
+    /// | `"#xpointer(/)"` | Entire document, comments included |
+    /// | `"#xpointer(id('foo'))"` | Subtree rooted at element with ID `foo` |
     /// | other | `Err(UnsupportedUri)` |
     pub fn dereference(&self, uri: &str) -> Result<TransformData<'a>, TransformError> {
         if uri.is_empty() {
@@ -127,6 +129,9 @@ impl<'a> UriReferenceResolver<'a> {
         } else if let Some(id) = parse_xpointer_id(fragment) {
             // xpointer(id('foo')) → same as bare-name #foo
             self.resolve_id(id)
+        } else if fragment.starts_with("xpointer(") {
+            // Any other XPointer expression is unsupported
+            Err(TransformError::UnsupportedUri(format!("#{fragment}")))
         } else {
             // Bare-name fragment: #foo → element by ID
             self.resolve_id(fragment)
@@ -296,6 +301,32 @@ mod tests {
             }
             other => panic!("expected UnsupportedUri, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn unsupported_xpointer_expression() {
+        // XPointer expressions other than xpointer(/) and xpointer(id(...))
+        // should return UnsupportedUri, not fall through to ID lookup
+        let xml = "<root/>";
+        let doc = Document::parse(xml).unwrap();
+        let resolver = UriReferenceResolver::new(&doc);
+
+        let result = resolver.dereference("#xpointer(foo())");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TransformError::UnsupportedUri(uri) => {
+                assert_eq!(uri, "#xpointer(foo())")
+            }
+            other => panic!("expected UnsupportedUri, got: {other:?}"),
+        }
+
+        // Generic XPointer with XPath should also be unsupported
+        let result = resolver.dereference("#xpointer(//element)");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TransformError::UnsupportedUri(_)
+        ));
     }
 
     #[test]
