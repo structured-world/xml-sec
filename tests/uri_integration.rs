@@ -11,28 +11,24 @@ use xml_sec::xmldsig::uri::UriReferenceResolver;
 /// Dereference `uri`, build a C14N predicate from the resulting NodeSet,
 /// canonicalize with inclusive C14N 1.0, and return the canonical string.
 fn deref_and_canonicalize(xml: &str, uri: &str) -> String {
-    let doc = roxmltree::Document::parse(xml).expect("parse");
-    let resolver = UriReferenceResolver::new(&doc);
-
-    let data = resolver.dereference(uri).expect("dereference");
-    let node_set = data.into_node_set().expect("into_node_set");
-
-    let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
-    let predicate = |n: roxmltree::Node| node_set.contains(n);
-    let mut output = Vec::new();
-    canonicalize(&doc, Some(&predicate), &algo, &mut output).expect("canonicalize");
-    String::from_utf8(output).expect("utf8")
+    deref_and_canonicalize_impl(xml, uri, false)
 }
 
 /// Same but with comments enabled (for xpointer(/) which includes comments).
 fn deref_and_canonicalize_with_comments(xml: &str, uri: &str) -> String {
+    deref_and_canonicalize_impl(xml, uri, true)
+}
+
+/// Shared implementation for dereferencing and canonicalizing, parameterized
+/// by whether comments should be included.
+fn deref_and_canonicalize_impl(xml: &str, uri: &str, with_comments: bool) -> String {
     let doc = roxmltree::Document::parse(xml).expect("parse");
     let resolver = UriReferenceResolver::new(&doc);
 
     let data = resolver.dereference(uri).expect("dereference");
     let node_set = data.into_node_set().expect("into_node_set");
 
-    let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, true);
+    let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, with_comments);
     let predicate = |n: roxmltree::Node| node_set.contains(n);
     let mut output = Vec::new();
     canonicalize(&doc, Some(&predicate), &algo, &mut output).expect("canonicalize");

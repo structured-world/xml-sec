@@ -188,7 +188,7 @@ impl<'a> UriReferenceResolver<'a> {
     /// Look up an element by its ID attribute value and return a subtree node set.
     fn resolve_id(&self, id: &str) -> Result<TransformData<'a>, TransformError> {
         match self.id_map.get(id) {
-            Some(&element) => Ok(TransformData::NodeSet(NodeSet::subtree(self.doc, element))),
+            Some(&element) => Ok(TransformData::NodeSet(NodeSet::subtree(element))),
             None => Err(TransformError::ElementNotFound(id.to_string())),
         }
     }

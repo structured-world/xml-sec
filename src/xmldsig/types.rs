@@ -111,11 +111,11 @@ impl<'a> NodeSet<'a> {
     /// and therefore are not tracked individually in this `NodeSet`. During
     /// canonicalization, any attributes and namespace declarations belonging to
     /// the included elements are serialized as part of those elements.
-    pub fn subtree(doc: &'a Document<'a>, element: Node<'a, 'a>) -> Self {
+    pub fn subtree(element: Node<'a, 'a>) -> Self {
         let mut ids = HashSet::new();
         collect_subtree_ids(element, &mut ids);
         Self {
-            doc,
+            doc: element.document(),
             included: Some(ids),
             excluded: HashSet::new(),
             with_comments: true,
@@ -189,11 +189,12 @@ fn collect_subtree_ids(node: Node<'_, '_>, ids: &mut HashSet<NodeId>) {
     }
     // In roxmltree, attributes and namespaces are not nodes and do not
     // appear in `children()` traversal; they're accessed via
-    // node.attributes(). For node-set membership we therefore track only
-    // element NodeIds. During C14N, the serializer checks whether an
-    // element is in the node set and then serializes all of that element's
-    // attributes/namespaces as part of the element, so separate attribute
-    // identifiers are unnecessary.
+    // node.attributes(). We therefore track the NodeIds of all descendant
+    // nodes reachable via `children()` (elements, text, comments,
+    // processing instructions, etc.). During C14N, the serializer checks
+    // whether an element is in the node set and then serializes all of
+    // that element's attributes/namespaces as part of the element, so
+    // separate attribute/namespace identifiers are unnecessary.
 }
 
 /// Errors during transform processing.
