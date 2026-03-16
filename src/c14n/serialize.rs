@@ -381,10 +381,18 @@ fn collect_inherited_xml_attrs<'a>(
 
     // Walk ancestor chain. Closer ancestors take precedence: once a name is
     // seen, later (more distant) ancestors with the same name are skipped.
+    // Stop at the nearest included ancestor — it renders its own xml:*
+    // attributes in the canonical output, so inheriting past it would
+    // incorrectly propagate attributes that are already visible.
     let mut inherited = Vec::new();
     let mut ancestor = node.parent();
     while let Some(anc) = ancestor {
         if anc.is_element() {
+            // Stop at the nearest included ancestor (same logic as
+            // compute_effective_xml_base).
+            if pred(anc) {
+                break;
+            }
             for attr in anc.attributes() {
                 if attr.namespace() == Some(XML_NS) {
                     let local = attr.name();
@@ -708,6 +716,42 @@ mod tests {
         assert!(
             result.contains("<child>text</child>"),
             "child should not have xml:lang; got: {result}"
+        );
+    }
+
+    #[test]
+    fn no_inheritance_past_included_ancestor() {
+        // A (in set, xml:lang="en") → B (not in set) → C (in set)
+        // C should NOT inherit xml:lang from A because A is in the set
+        // and renders its own attributes. The walk must stop at A.
+        let xml = r#"<a xml:lang="en"><b><c>text</c></b></a>"#;
+        let doc = Document::parse(xml).unwrap();
+        let a = doc.root_element();
+        let b = a.first_element_child().unwrap();
+        let c = b.first_element_child().unwrap();
+
+        // Include a and c (not b)
+        let mut ids = HashSet::new();
+        ids.insert(a.id());
+        ids.insert(c.id());
+        for child in c.children() {
+            ids.insert(child.id());
+        }
+        let pred = subset_predicate(ids);
+
+        let renderer = InclusiveNsRenderer;
+        let mut out = Vec::new();
+        serialize_canonical(&doc, Some(&pred), false, &renderer, false, &mut out).unwrap();
+        let result = String::from_utf8(out).unwrap();
+
+        // xml:lang should appear on <a> only, NOT inherited onto <c>
+        assert!(
+            result.contains(r#"<a xml:lang="en">"#),
+            "a should have xml:lang; got: {result}"
+        );
+        assert!(
+            !result.contains(r#"<c xml:lang"#),
+            "c should NOT inherit xml:lang from a; got: {result}"
         );
     }
 
