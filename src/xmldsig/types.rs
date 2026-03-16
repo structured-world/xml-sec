@@ -208,10 +208,6 @@ pub enum TransformError {
         got: &'static str,
     },
 
-    /// URI dereference failed.
-    #[error("URI dereference failed: {0}")]
-    UriDeref(String),
-
     /// Element not found by ID.
     #[error("element not found by ID: {0}")]
     ElementNotFound(String),
