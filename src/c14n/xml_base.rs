@@ -58,10 +58,17 @@ pub(crate) fn compute_effective_xml_base(
 }
 
 /// Get the `xml:base` attribute value from an element, if present.
+///
+/// Per RFC 3986, an empty reference resolves to the current base. We
+/// therefore treat `xml:base=""` as if no `xml:base` were present.
 fn xml_base_value<'a>(node: Node<'a, '_>) -> Option<&'a str> {
     for attr in node.attributes() {
         if attr.namespace() == Some(XML_NS) && attr.name() == "base" {
-            return Some(attr.value());
+            let value = attr.value();
+            if value.is_empty() {
+                return None;
+            }
+            return Some(value);
         }
     }
     None
@@ -126,13 +133,44 @@ fn has_scheme(uri: &str) -> bool {
 }
 
 /// Parse a base URI into (scheme, authority, path).
+///
+/// This follows the basic RFC 3986 structure:
+///   URI = scheme ":" hier-part [ "?" query ] [ "#" fragment ]
+///   where hier-part may start with "//" authority.
+///
+/// We return:
+/// - `scheme` as everything before the first `:`;
+/// - `authority` if there is a `//authority` component, otherwise the
+///   empty string;
+/// - `path` as the remainder after the authority, including any query
+///   or fragment.
 fn parse_base(base: &str) -> Option<(&str, &str, &str)> {
-    let scheme_end = base.find("://")?;
+    // Find the scheme separator.
+    let scheme_end = base.find(':')?;
     let scheme = &base[..scheme_end];
-    let after_scheme = &base[scheme_end + 3..];
-    let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
-    let authority = &after_scheme[..authority_end];
-    let path = &after_scheme[authority_end..];
+
+    let mut rest = &base[scheme_end + 1..];
+
+    // Default: no authority.
+    let mut authority = "";
+
+    // If the hier-part starts with "//", then an authority is present.
+    if rest.starts_with("//") {
+        rest = &rest[2..];
+        // Authority goes up to the first '/', '?', or '#' (or end of string).
+        let mut auth_end = rest.len();
+        for ch in ['/', '?', '#'] {
+            if let Some(pos) = rest.find(ch) {
+                if pos < auth_end {
+                    auth_end = pos;
+                }
+            }
+        }
+        authority = &rest[..auth_end];
+        rest = &rest[auth_end..];
+    }
+
+    let path = rest;
     Some((scheme, authority, path))
 }
 
@@ -277,6 +315,38 @@ mod tests {
             resolve_uri("http://example.com/a", "../../b"),
             "http://example.com/b"
         );
+    }
+
+    #[test]
+    fn resolve_file_scheme_no_authority() {
+        // file: URIs may lack authority (file:/path or file:///path)
+        assert_eq!(
+            resolve_uri("file:///home/user/doc.xml", "sub/file.xml"),
+            "file:///home/user/sub/file.xml"
+        );
+    }
+
+    #[test]
+    fn resolve_base_with_query_fragment() {
+        // Query and fragment in base should be ignored for path merge
+        assert_eq!(
+            resolve_uri("http://example.com/a/b?q=1#f", "c"),
+            "http://example.com/a/c"
+        );
+    }
+
+    // ── xml_base_value tests ─────────────────────────────────────────
+
+    #[test]
+    fn empty_xml_base_treated_as_absent() {
+        let xml = r#"<root xml:base=""><child xml:base="http://ex.com/"/></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let root = doc.root_element();
+        // xml:base="" on root should be treated as absent
+        assert_eq!(xml_base_value(root), None);
+        // Non-empty xml:base should be returned
+        let child = root.first_element_child().unwrap();
+        assert_eq!(xml_base_value(child), Some("http://ex.com/"));
     }
 
     // ── remove_dot_segments tests ────────────────────────────────────

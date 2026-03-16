@@ -215,7 +215,11 @@ fn serialize_element(
     // Note: roxmltree doesn't expose attribute nodes with separate Node identity,
     // so node_set filtering cannot distinguish individual attributes. When an
     // element is in the set, all its attributes are included (matches xmlsec1).
-    let inherited_xml = collect_inherited_xml_attrs(node, node_set, fixup_xml_base);
+    //
+    // xml:id inheritance is a separate concern from xml:base fixup, but is
+    // currently enabled under the same C14N 1.1 mode as xml:base fixup.
+    let include_xml_id = fixup_xml_base;
+    let inherited_xml = collect_inherited_xml_attrs(node, node_set, include_xml_id);
 
     // Compute effective parent xml:base for C14N 1.1 fixup. Needed when:
     // - fixup is enabled (C14N 1.1), AND
