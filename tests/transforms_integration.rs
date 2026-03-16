@@ -424,8 +424,10 @@ fn parse_and_execute_transforms_roundtrip() {
 
 #[test]
 fn enveloped_signature_only_child() {
-    // Edge case: the Signature is the only child of root.
-    // After enveloped transform, only the root element (empty) remains.
+    // Edge case: the Signature is the only element child of root.
+    // After the enveloped transform, the Signature subtree is removed and
+    // only the root element (plus any surrounding whitespace text nodes)
+    // remains in the NodeSet / canonical output.
     let xml = r#"<root>
     <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
         <ds:SignedInfo/>
@@ -446,7 +448,8 @@ fn enveloped_signature_only_child() {
     let result = execute_transforms(&doc, sig_node, initial, &transforms).unwrap();
     let output = String::from_utf8(result).unwrap();
 
-    // Only whitespace and root element should remain
+    // The Signature subtree should be removed; only the root element and any
+    // surrounding whitespace text nodes should remain.
     assert!(!output.contains("Signature"), "output: {output}");
     assert!(output.contains("<root>"), "output: {output}");
 }

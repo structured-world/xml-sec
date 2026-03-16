@@ -95,7 +95,7 @@ pub fn apply_transform<'a>(
 /// 1. Start with `initial_data` (from URI dereference).
 /// 2. Apply each transform sequentially.
 /// 3. If the result is still a `NodeSet`, apply default inclusive C14N 1.0
-///    to produce bytes (per [XMLDSig §4.3.3.2]).
+///    to produce bytes (per [XMLDSig §4.3.3.2](https://www.w3.org/TR/xmldsig-core1/#sec-ReferenceProcessingModel)).
 ///
 /// Returns the final byte sequence ready for digest computation.
 pub fn execute_transforms<'a>(
