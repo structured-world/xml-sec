@@ -2,7 +2,9 @@
 //!
 //! When C14N 1.1 processes a document subset and an element's parent is
 //! outside the node set, `xml:base` values must be resolved to effective
-//! (absolute) URIs per [RFC 3986 §5](https://www.rfc-editor.org/rfc/rfc3986#section-5).
+//! URIs per [RFC 3986 §5](https://www.rfc-editor.org/rfc/rfc3986#section-5).
+//! The effective URI is absolute only if the ancestor chain includes an
+//! absolute (scheme-bearing) base; otherwise it may remain relative.
 //!
 //! This module provides a minimal RFC 3986 relative URI resolver — just
 //! enough for `xml:base` fixup. It is NOT a general-purpose URI library.
@@ -20,7 +22,12 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 /// provided), since that ancestor will render its own `xml:base` in the
 /// canonical output. Resolves from the topmost collected base to the closest.
 ///
-/// Returns `None` if no ancestor in the omitted chain has `xml:base`.
+/// The resulting reference is absolute only if some ancestor `xml:base`
+/// (or the effective base at that point) is absolute; otherwise it may be
+/// a relative reference.
+///
+/// Returns `None` if no ancestor in the omitted chain has a non-empty
+/// `xml:base` attribute.
 pub(crate) fn compute_effective_xml_base(
     start: Node<'_, '_>,
     node_set: Option<&dyn Fn(Node) -> bool>,
@@ -30,10 +37,14 @@ pub(crate) fn compute_effective_xml_base(
     while let Some(n) = current {
         if n.is_element() {
             // Stop at the nearest included ancestor — it renders its own
-            // xml:base in the canonical output, so we only need to resolve
-            // the contiguous omitted chain below it.
+            // xml:base in the canonical output. However, we still collect
+            // its xml:base value as the resolution seed, so that the
+            // omitted chain below resolves against an absolute base.
             if let Some(pred) = node_set {
                 if pred(n) {
+                    if let Some(base) = xml_base_value(n) {
+                        bases.push(base);
+                    }
                     break;
                 }
             }
@@ -99,9 +110,21 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
         None => return reference.to_string(), // base has no scheme, can't resolve
     };
 
-    // Reference starts with // → authority override
-    if reference.starts_with("//") {
-        return format!("{scheme}:{reference}");
+    // Reference starts with // → authority override (RFC 3986 §5.2.2:
+    // the path component must still be normalized).
+    if let Some(rest) = reference.strip_prefix("//") {
+        // Split authority from path at first '/', '?', or '#'
+        let mut auth_end = rest.len();
+        for ch in ['/', '?', '#'] {
+            if let Some(pos) = rest.find(ch) {
+                if pos < auth_end {
+                    auth_end = pos;
+                }
+            }
+        }
+        let new_authority = &rest[..auth_end];
+        let new_path = remove_dot_segments(&rest[auth_end..]);
+        return format!("{scheme}://{new_authority}{new_path}");
     }
 
     // Reference starts with / → absolute path

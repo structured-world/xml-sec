@@ -218,6 +218,11 @@ fn serialize_element(
     //
     // xml:id inheritance is a separate concern from xml:base fixup, but is
     // currently enabled under the same C14N 1.1 mode as xml:base fixup.
+    //
+    // NOTE: xml:* inheritance applies to ALL C14N modes (inclusive, exclusive,
+    // 1.0, 1.1) per W3C specs. Exclusive C14N §4.4 modifies only namespace
+    // node handling; attribute rules (including xml:* inheritance from §2.4)
+    // are inherited unchanged from the inclusive spec.
     let include_xml_id = fixup_xml_base;
     let inherited_xml = collect_inherited_xml_attrs(node, node_set, include_xml_id);
 
@@ -400,6 +405,11 @@ fn collect_inherited_xml_attrs<'a>(
             for attr in anc.attributes() {
                 if attr.namespace() == Some(XML_NS) {
                     let local = attr.name();
+                    // Skip empty xml:base="" — per RFC 3986 an empty reference
+                    // resolves to the current base, so it's a no-op.
+                    if local == "base" && attr.value().is_empty() {
+                        continue;
+                    }
                     if is_inheritable_xml_attr(local, include_xml_id) && seen.insert(local) {
                         inherited.push((attr.name(), attr.value()));
                     }
