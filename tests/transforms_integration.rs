@@ -478,5 +478,10 @@ fn enveloped_preserves_surrounding_whitespace() {
     // The text nodes ("\n  ") around Signature are preserved — they're not
     // part of the Signature subtree (they're siblings). C14N will emit them.
     assert!(output.contains("<data>text</data>"), "output: {output}");
+    // Verify whitespace around removed Signature is actually in the output
+    assert!(
+        output.contains("\n  <data>text</data>\n"),
+        "whitespace around Signature should be preserved: {output}"
+    );
     assert!(!output.contains("SignedInfo"), "output: {output}");
 }

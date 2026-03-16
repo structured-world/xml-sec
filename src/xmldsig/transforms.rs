@@ -288,6 +288,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn enveloped_rejects_cross_document_signature_node() {
+        // Signature node from a different Document must be rejected,
+        // not silently used to exclude wrong subtree.
+        let xml = r#"<Root><Signature Id="sig"/></Root>"#;
+        let doc1 = Document::parse(xml).unwrap();
+        let doc2 = Document::parse(xml).unwrap();
+
+        // NodeSet from doc1, Signature node from doc2
+        let node_set = NodeSet::entire_document_without_comments(&doc1);
+        let input = TransformData::NodeSet(node_set);
+        let sig_from_doc2 = doc2
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "Signature")
+            .unwrap();
+
+        let result = apply_transform(sig_from_doc2, &Transform::Enveloped, input);
+        assert!(matches!(
+            result,
+            Err(TransformError::CrossDocumentSignatureNode)
+        ));
+    }
+
     // ── C14N transform ───────────────────────────────────────────────
 
     #[test]
