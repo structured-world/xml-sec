@@ -224,4 +224,8 @@ pub enum TransformError {
     /// Canonicalization error during transform.
     #[error("C14N error: {0}")]
     C14n(String),
+
+    /// The Signature node referenced by the enveloped transform was not found.
+    #[error("enveloped-signature transform: Signature node not found in document")]
+    EnvelopedSignatureNotFound,
 }
