@@ -29,6 +29,16 @@ fn is_inheritable_xml_attr(local_name: &str, include_xml_id: bool) -> bool {
     matches!(local_name, "lang" | "space" | "base") || (include_xml_id && local_name == "id")
 }
 
+/// Configuration flags for C14N serialization that vary by mode.
+#[derive(Clone, Copy)]
+pub(crate) struct C14nConfig {
+    /// Inherit xml:* attributes from ancestors outside the node set (§2.4).
+    /// `true` for Inclusive C14N (1.0/1.1), `false` for Exclusive C14N (§3).
+    pub inherit_xml_attrs: bool,
+    /// Resolve relative xml:base URIs via RFC 3986 (C14N 1.1 only).
+    pub fixup_xml_base: bool,
+}
+
 /// Trait for namespace rendering strategies (inclusive vs exclusive).
 pub(crate) trait NsRenderer {
     /// Compute namespace declarations to emit for this element.
@@ -50,16 +60,20 @@ pub(crate) trait NsRenderer {
 ///   returns `true` are included in the output
 /// - `with_comments`: whether to preserve comment nodes
 /// - `ns_renderer`: namespace rendering strategy
+/// - `inherit_xml_attrs`: if `true` (Inclusive C14N), inherit `xml:lang`,
+///   `xml:space`, `xml:base` (and `xml:id` for 1.1) from ancestors outside
+///   the node set per C14N §2.4. If `false` (Exclusive C14N), skip this
+///   search — per Exc-C14N §3, ancestor xml:* import is explicitly omitted.
 /// - `fixup_xml_base`: if `true` (C14N 1.1), resolve `xml:base` relative
-///   URIs in document subsets. If `false` (C14N 1.0 / Exclusive), inherit
-///   `xml:base` values as-is.
+///   URIs in document subsets via RFC 3986. Only meaningful when
+///   `inherit_xml_attrs` is `true`.
 /// - `output`: destination buffer
 pub(crate) fn serialize_canonical(
     doc: &Document,
     node_set: Option<&dyn Fn(Node) -> bool>,
     with_comments: bool,
     ns_renderer: &dyn NsRenderer,
-    fixup_xml_base: bool,
+    config: C14nConfig,
     output: &mut Vec<u8>,
 ) -> Result<(), C14nError> {
     let root = doc.root();
@@ -68,7 +82,7 @@ pub(crate) fn serialize_canonical(
         node_set,
         with_comments,
         ns_renderer,
-        fixup_xml_base,
+        config,
         &HashMap::new(),
         output,
     );
@@ -81,7 +95,7 @@ fn serialize_children(
     node_set: Option<&dyn Fn(Node) -> bool>,
     with_comments: bool,
     ns_renderer: &dyn NsRenderer,
-    fixup_xml_base: bool,
+    config: C14nConfig,
     parent_rendered: &HashMap<String, String>,
     output: &mut Vec<u8>,
 ) {
@@ -108,7 +122,7 @@ fn serialize_children(
                         node_set,
                         with_comments,
                         ns_renderer,
-                        fixup_xml_base,
+                        config,
                         parent_rendered,
                         output,
                     );
@@ -119,7 +133,7 @@ fn serialize_children(
                         node_set,
                         with_comments,
                         ns_renderer,
-                        fixup_xml_base,
+                        config,
                         parent_rendered,
                         output,
                     );
@@ -179,7 +193,7 @@ fn serialize_element(
     node_set: Option<&dyn Fn(Node) -> bool>,
     with_comments: bool,
     ns_renderer: &dyn NsRenderer,
-    fixup_xml_base: bool,
+    config: C14nConfig,
     parent_rendered: &HashMap<String, String>,
     output: &mut Vec<u8>,
 ) {
@@ -204,27 +218,22 @@ fn serialize_element(
 
     // Regular attributes, sorted by (namespace-uri, local-name).
     //
-    // For document subsets: when the parent element is not in the node set,
-    // xml:* attributes (xml:lang, xml:space, xml:base) are inherited from
-    // ancestors per W3C C14N §2.4. These are merged with own attributes.
+    // For Inclusive C14N document subsets: when the parent element is not in
+    // the node set, xml:* attributes are inherited from ancestors per §2.4.
     //
-    // For C14N 1.1 (fixup_xml_base=true): xml:base values are resolved to
-    // effective (absolute) URIs per RFC 3986. Both inherited and own xml:base
-    // attributes are resolved against the ancestor chain.
+    // For Exclusive C14N: this inheritance is explicitly OMITTED per Exc-C14N
+    // §3: "This search and copying are omitted from the Exclusive XML
+    // Canonicalization method."
     //
-    // Note: roxmltree doesn't expose attribute nodes with separate Node identity,
-    // so node_set filtering cannot distinguish individual attributes. When an
-    // element is in the set, all its attributes are included (matches xmlsec1).
-    //
-    // xml:id inheritance is a separate concern from xml:base fixup, but is
-    // currently enabled under the same C14N 1.1 mode as xml:base fixup.
-    //
-    // NOTE: xml:* inheritance applies to ALL C14N modes (inclusive, exclusive,
-    // 1.0, 1.1) per W3C specs. Exclusive C14N §4.4 modifies only namespace
-    // node handling; attribute rules (including xml:* inheritance from §2.4)
-    // are inherited unchanged from the inclusive spec.
-    let include_xml_id = fixup_xml_base;
-    let inherited_xml = collect_inherited_xml_attrs(node, node_set, include_xml_id);
+    // For C14N 1.1 (fixup_xml_base=true): xml:base values are additionally
+    // resolved to effective URIs per RFC 3986.
+    let inherited_xml = if config.inherit_xml_attrs {
+        // xml:id inheritance gated on C14N 1.1 (same flag as xml:base fixup)
+        let include_xml_id = config.fixup_xml_base;
+        collect_inherited_xml_attrs(node, node_set, include_xml_id)
+    } else {
+        Vec::new()
+    };
 
     // Compute effective parent xml:base for C14N 1.1 fixup. Needed when:
     // - fixup is enabled (C14N 1.1), AND
@@ -236,7 +245,7 @@ fn serialize_element(
     } else {
         false
     };
-    let effective_parent_base = if fixup_xml_base && parent_not_in_set {
+    let effective_parent_base = if config.fixup_xml_base && parent_not_in_set {
         node.parent()
             .and_then(|p| compute_effective_xml_base(p, node_set))
     } else {
@@ -265,7 +274,7 @@ fn serialize_element(
         ));
     }
     for &(name, value) in &inherited_xml {
-        let resolved_value = if fixup_xml_base && name == "base" {
+        let resolved_value = if config.fixup_xml_base && name == "base" {
             // C14N 1.1: inherited xml:base uses the resolved effective value
             match effective_parent_base {
                 Some(ref base) => Cow::Owned(base.clone()),
@@ -299,7 +308,7 @@ fn serialize_element(
         node_set,
         with_comments,
         ns_renderer,
-        fixup_xml_base,
+        config,
         &rendered,
         output,
     );
@@ -448,7 +457,18 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, false, &mut out).expect("c14n");
+        serialize_canonical(
+            &doc,
+            None,
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .expect("c14n");
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
             "<root><empty></empty></root>"
@@ -461,7 +481,18 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, false, &mut out).expect("c14n");
+        serialize_canonical(
+            &doc,
+            None,
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .expect("c14n");
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
             "<root> hello &amp; world </root>"
@@ -474,7 +505,18 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, false, &mut out).expect("c14n");
+        serialize_canonical(
+            &doc,
+            None,
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .expect("c14n");
         assert_eq!(String::from_utf8(out).expect("utf8"), "<root>text</root>");
     }
 
@@ -484,7 +526,18 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, true, &renderer, false, &mut out).expect("c14n");
+        serialize_canonical(
+            &doc,
+            None,
+            true,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .expect("c14n");
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
             "<root><!-- comment -->text</root>"
@@ -497,7 +550,18 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, false, &mut out).expect("c14n");
+        serialize_canonical(
+            &doc,
+            None,
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .expect("c14n");
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
             r#"<root a="1" b="2" c="3"></root>"#
@@ -510,7 +574,18 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, false, &mut out).expect("c14n");
+        serialize_canonical(
+            &doc,
+            None,
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .expect("c14n");
         // XML declaration is omitted by roxmltree parsing.
         // PI inside root is preserved.
         assert_eq!(
@@ -525,7 +600,18 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, false, &mut out).expect("c14n");
+        serialize_canonical(
+            &doc,
+            None,
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .expect("c14n");
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
             "<a><b><c></c></b><d></d></a>"
@@ -538,7 +624,18 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, true, &renderer, false, &mut out).expect("c14n");
+        serialize_canonical(
+            &doc,
+            None,
+            true,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .expect("c14n");
         // C14N spec: \n between document-level nodes.
         // Before root: comment + \n + root
         // After root: root + \n + comment
@@ -554,7 +651,18 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, false, &mut out).expect("c14n");
+        serialize_canonical(
+            &doc,
+            None,
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .expect("c14n");
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
             "<?pi data?>\n<root></root>"
@@ -593,7 +701,18 @@ mod tests {
 
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, Some(&pred), false, &renderer, false, &mut out).unwrap();
+        serialize_canonical(
+            &doc,
+            Some(&pred),
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .unwrap();
         let result = String::from_utf8(out).unwrap();
 
         assert!(
@@ -616,7 +735,18 @@ mod tests {
 
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, Some(&pred), false, &renderer, false, &mut out).unwrap();
+        serialize_canonical(
+            &doc,
+            Some(&pred),
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .unwrap();
         let result = String::from_utf8(out).unwrap();
 
         assert!(
@@ -636,7 +766,18 @@ mod tests {
 
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, Some(&pred), false, &renderer, false, &mut out).unwrap();
+        serialize_canonical(
+            &doc,
+            Some(&pred),
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .unwrap();
         let result = String::from_utf8(out).unwrap();
 
         assert!(result.contains(r#"xml:lang="fr""#), "got: {result}");
@@ -661,7 +802,18 @@ mod tests {
 
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, Some(&pred), false, &renderer, false, &mut out).unwrap();
+        serialize_canonical(
+            &doc,
+            Some(&pred),
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .unwrap();
         let result = String::from_utf8(out).unwrap();
 
         assert!(
@@ -688,7 +840,18 @@ mod tests {
 
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, Some(&pred), false, &renderer, false, &mut out).unwrap();
+        serialize_canonical(
+            &doc,
+            Some(&pred),
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .unwrap();
         let result = String::from_utf8(out).unwrap();
 
         assert!(
@@ -719,7 +882,18 @@ mod tests {
 
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, Some(&pred), false, &renderer, false, &mut out).unwrap();
+        serialize_canonical(
+            &doc,
+            Some(&pred),
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .unwrap();
         let result = String::from_utf8(out).unwrap();
 
         // xml:lang appears on root, NOT on child
@@ -755,7 +929,18 @@ mod tests {
 
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, Some(&pred), false, &renderer, false, &mut out).unwrap();
+        serialize_canonical(
+            &doc,
+            Some(&pred),
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .unwrap();
         let result = String::from_utf8(out).unwrap();
 
         // xml:lang should appear on <a> only, NOT inherited onto <c>
@@ -777,7 +962,18 @@ mod tests {
 
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, false, &mut out).unwrap();
+        serialize_canonical(
+            &doc,
+            None,
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .unwrap();
         let result = String::from_utf8(out).unwrap();
 
         assert_eq!(result, r#"<root xml:lang="en"><child>text</child></root>"#);
@@ -795,7 +991,18 @@ mod tests {
 
         let renderer = InclusiveNsRenderer;
         let mut out = Vec::new();
-        serialize_canonical(&doc, Some(&pred), false, &renderer, false, &mut out).unwrap();
+        serialize_canonical(
+            &doc,
+            Some(&pred),
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .unwrap();
         let result = String::from_utf8(out).unwrap();
 
         // Should have xmlns:foo (ns decl) then xml:lang (regular attr)

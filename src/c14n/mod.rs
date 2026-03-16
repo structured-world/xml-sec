@@ -37,7 +37,7 @@ use roxmltree::{Document, Node};
 
 use ns_exclusive::ExclusiveNsRenderer;
 use ns_inclusive::InclusiveNsRenderer;
-use serialize::serialize_canonical;
+use serialize::{serialize_canonical, C14nConfig};
 
 /// C14N algorithm mode (without the comments flag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,23 +172,33 @@ pub fn canonicalize(
     algo: &C14nAlgorithm,
     output: &mut Vec<u8>,
 ) -> Result<(), C14nError> {
+    // inherit_xml_attrs: Inclusive C14N inherits xml:* attrs from ancestors
+    // per §2.4. Exclusive C14N explicitly omits this per Exc-C14N §3.
+    // fixup_xml_base: C14N 1.1 resolves relative xml:base URIs via RFC 3986.
     match algo.mode {
         C14nMode::Inclusive1_0 => {
             let renderer = InclusiveNsRenderer;
-            serialize_canonical(doc, node_set, algo.with_comments, &renderer, false, output)
+            let config = C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            };
+            serialize_canonical(doc, node_set, algo.with_comments, &renderer, config, output)
         }
-        // C14N 1.1 serialization is identical to 1.0 with two additions:
-        //   - xml:id propagation: covered by xml:* attribute inheritance
-        //     in serialize.rs (collect_inherited_xml_attrs).
-        //   - xml:base fixup: resolve relative xml:base URIs in document
-        //     subsets via RFC 3986 (fixup_xml_base=true).
         C14nMode::Inclusive1_1 => {
             let renderer = InclusiveNsRenderer;
-            serialize_canonical(doc, node_set, algo.with_comments, &renderer, true, output)
+            let config = C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: true,
+            };
+            serialize_canonical(doc, node_set, algo.with_comments, &renderer, config, output)
         }
         C14nMode::Exclusive1_0 => {
             let renderer = ExclusiveNsRenderer::new(&algo.inclusive_prefixes);
-            serialize_canonical(doc, node_set, algo.with_comments, &renderer, false, output)
+            let config = C14nConfig {
+                inherit_xml_attrs: false,
+                fixup_xml_base: false,
+            };
+            serialize_canonical(doc, node_set, algo.with_comments, &renderer, config, output)
         }
     }
 }
