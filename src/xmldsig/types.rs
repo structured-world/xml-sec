@@ -187,13 +187,13 @@ fn collect_subtree_ids(node: Node<'_, '_>, ids: &mut HashSet<NodeId>) {
             stack.push(child);
         }
     }
-    // roxmltree models attributes as children only for elements,
-    // but they're accessible via node.attributes(). For node-set
-    // membership, we need to track the element ID — the C14N
-    // serializer checks element membership and then serializes
-    // all its attributes. Individual attribute NodeIds are not
-    // needed because roxmltree doesn't expose them as separate nodes
-    // in the tree traversal.
+    // In roxmltree, attributes and namespaces are not nodes and do not
+    // appear in `children()` traversal; they're accessed via
+    // node.attributes(). For node-set membership we therefore track only
+    // element NodeIds. During C14N, the serializer checks whether an
+    // element is in the node set and then serializes all of that element's
+    // attributes/namespaces as part of the element, so separate attribute
+    // identifiers are unnecessary.
 }
 
 /// Errors during transform processing.

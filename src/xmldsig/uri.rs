@@ -63,6 +63,12 @@ impl<'a> UriReferenceResolver<'a> {
     ///
     /// The defaults (`ID`, `Id`, `id`) are always included; `extra_attrs`
     /// adds to them (does not replace). Pass an empty slice to use only defaults.
+    ///
+    /// Attribute names are matched using `roxmltree`'s *local-name* view of
+    /// attributes: any namespace prefix is stripped before comparison. For
+    /// example, an attribute written as `wsu:Id="..."` in the XML is seen as
+    /// simply `Id` by `roxmltree`, so callers **must** pass `"Id"`, not
+    /// `"wsu:Id"` or `"{namespace}Id"`.
     pub fn with_id_attrs(doc: &'a Document<'a>, extra_attrs: &[&str]) -> Self {
         let mut id_map = HashMap::new();
         // Track IDs seen more than once so they are never reinserted
@@ -165,6 +171,10 @@ impl<'a> UriReferenceResolver<'a> {
             ))
         } else if let Some(id) = parse_xpointer_id(fragment) {
             // xpointer(id('foo')) → same as bare-name #foo
+            // Reject empty parsed ID (e.g., xpointer(id(''))) — not a valid XML Name
+            if id.is_empty() {
+                return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
+            }
             self.resolve_id(id)
         } else if fragment.starts_with("xpointer(") {
             // Any other XPointer expression is unsupported
@@ -592,6 +602,21 @@ mod tests {
             TransformError::ElementNotFound(id) => assert_eq!(id, "missing"),
             other => panic!("expected ElementNotFound, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn xpointer_id_empty_value_rejected() {
+        // xpointer(id('')) parses to empty string — reject as UnsupportedUri
+        let xml = "<root/>";
+        let doc = Document::parse(xml).unwrap();
+        let resolver = UriReferenceResolver::new(&doc);
+
+        let result = resolver.dereference("#xpointer(id(''))");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TransformError::UnsupportedUri(_)
+        ));
     }
 
     #[test]
