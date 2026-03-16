@@ -351,6 +351,194 @@ fn default_ns_undeclaration() {
     );
 }
 
+// ─── C14N 1.1 ───────────────────────────────────────────────────────────────
+
+#[test]
+fn c14n_1_1_full_document_matches_1_0() {
+    // For full documents without xml:base fixup scenarios, C14N 1.1 output
+    // is identical to C14N 1.0.
+    let algo_10 = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
+    let algo_11 = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
+    let result_10 = canonicalize_xml(MERLIN_DATA_XML, &algo_10).expect("1.0");
+    let result_11 = canonicalize_xml(MERLIN_DATA_XML, &algo_11).expect("1.1");
+    assert_eq!(
+        result_10, result_11,
+        "C14N 1.1 full-document output should match 1.0"
+    );
+}
+
+#[test]
+fn c14n_1_1_with_comments() {
+    assert_c14n(
+        COMMENTS_PI_XML,
+        C14nMode::Inclusive1_1,
+        true,
+        concat!(
+            "<!-- doc-level comment -->\n<?target data?>\n",
+            "<root>\n",
+            "  <!-- inner comment -->\n",
+            "  <child></child>\n",
+            "</root>\n<!-- trailing comment -->",
+        ),
+    );
+}
+
+#[test]
+fn c14n_1_1_idempotency() {
+    let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
+    let pass1 = canonicalize_xml(MERLIN_DATA_XML, &algo).expect("pass1");
+    let pass2 = canonicalize_xml(&pass1, &algo).expect("pass2");
+    assert_eq!(pass1, pass2, "C14N 1.1 must be idempotent");
+}
+
+#[test]
+fn c14n_1_1_xml_id_inherited_in_subset() {
+    // C14N 1.1 specific: xml:id is propagated to document subsets.
+    // Root has xml:id="doc1", subset includes only child — xml:id must appear.
+    let xml = r#"<root xml:id="doc1" xmlns:a="http://a"><a:child>text</a:child></root>"#;
+    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
+
+    let child = doc.root_element().first_element_child().expect("child");
+    let child_id = child.id();
+    // Include child and its text node
+    let pred =
+        |n: roxmltree::Node| n.id() == child_id || n.parent().is_some_and(|p| p.id() == child_id);
+
+    let mut output = Vec::new();
+    canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
+    let result = String::from_utf8(output).expect("utf8");
+
+    assert!(
+        result.contains(r#"xml:id="doc1""#),
+        "xml:id should be inherited in C14N 1.1 subset; got: {result}"
+    );
+    // Also verify namespace is rendered
+    assert!(
+        result.contains(r#"xmlns:a="http://a""#),
+        "namespace should be rendered; got: {result}"
+    );
+}
+
+#[test]
+fn c14n_1_1_xml_lang_and_id_both_inherited() {
+    // Both xml:lang and xml:id should be inherited together.
+    let xml = r#"<root xml:lang="en" xml:id="r1"><child/></root>"#;
+    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
+
+    let child = doc.root_element().first_element_child().expect("child");
+    let child_id = child.id();
+    let pred = |n: roxmltree::Node| n.id() == child_id;
+
+    let mut output = Vec::new();
+    canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
+    let result = String::from_utf8(output).expect("utf8");
+
+    assert!(result.contains(r#"xml:id="r1""#), "got: {result}");
+    assert!(result.contains(r#"xml:lang="en""#), "got: {result}");
+}
+
+// ─── C14N 1.1 xml:base fixup ─────────────────────────────────────────────────
+
+#[test]
+fn c14n_1_1_xml_base_resolved_in_subset() {
+    // Root has xml:base="http://example.com/", child has xml:base="sub/".
+    // In a subset excluding root, child's xml:base should be resolved
+    // to "http://example.com/sub/" (not raw "sub/").
+    let xml = r#"<root xml:base="http://example.com/"><child xml:base="sub/">text</child></root>"#;
+    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
+
+    let child = doc.root_element().first_element_child().expect("child");
+    let child_id = child.id();
+    let pred =
+        |n: roxmltree::Node| n.id() == child_id || n.parent().is_some_and(|p| p.id() == child_id);
+
+    let mut output = Vec::new();
+    canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
+    let result = String::from_utf8(output).expect("utf8");
+
+    assert!(
+        result.contains(r#"xml:base="http://example.com/sub/""#),
+        "xml:base should be resolved to absolute URI; got: {result}"
+    );
+}
+
+#[test]
+fn c14n_1_1_xml_base_inherited_resolved() {
+    // Root has xml:base, middle has xml:base. Subset includes only leaf.
+    // Inherited xml:base should be the fully resolved effective URI.
+    let xml = r#"<a xml:base="http://ex.com/x/"><b xml:base="y/"><c/></b></a>"#;
+    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
+
+    let a = doc.root_element();
+    let b = a.first_element_child().expect("b");
+    let c = b.first_element_child().expect("c");
+    let c_id = c.id();
+    let pred = |n: roxmltree::Node| n.id() == c_id;
+
+    let mut output = Vec::new();
+    canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
+    let result = String::from_utf8(output).expect("utf8");
+
+    // Effective base: http://ex.com/x/ + y/ = http://ex.com/x/y/
+    assert!(
+        result.contains(r#"xml:base="http://ex.com/x/y/""#),
+        "inherited xml:base should be resolved; got: {result}"
+    );
+}
+
+#[test]
+fn c14n_1_1_xml_base_dotdot_resolved() {
+    // Relative xml:base with .. segment should be resolved.
+    let xml = r#"<a xml:base="http://ex.com/a/b/"><b xml:base="../c/"><d/></b></a>"#;
+    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
+
+    let a = doc.root_element();
+    let b = a.first_element_child().expect("b");
+    let d = b.first_element_child().expect("d");
+    let d_id = d.id();
+    let pred = |n: roxmltree::Node| n.id() == d_id;
+
+    let mut output = Vec::new();
+    canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
+    let result = String::from_utf8(output).expect("utf8");
+
+    // http://ex.com/a/b/ + ../c/ = http://ex.com/a/c/
+    assert!(
+        result.contains(r#"xml:base="http://ex.com/a/c/""#),
+        "xml:base with .. should be resolved; got: {result}"
+    );
+}
+
+#[test]
+fn c14n_1_0_xml_base_not_resolved() {
+    // C14N 1.0 does NOT resolve xml:base — inherited value is raw.
+    let xml = r#"<root xml:base="http://example.com/"><child xml:base="sub/">text</child></root>"#;
+    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
+
+    let child = doc.root_element().first_element_child().expect("child");
+    let child_id = child.id();
+    let pred =
+        |n: roxmltree::Node| n.id() == child_id || n.parent().is_some_and(|p| p.id() == child_id);
+
+    let mut output = Vec::new();
+    canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
+    let result = String::from_utf8(output).expect("utf8");
+
+    // C14N 1.0: xml:base stays as raw "sub/". The parent's
+    // xml:base="http://example.com/" is not copied onto the child because
+    // the child already has its own xml:base attribute.
+    assert!(
+        result.contains(r#"xml:base="sub/""#),
+        "C14N 1.0 should NOT resolve xml:base; got: {result}"
+    );
+}
+
 // ─── Document subset: xmlns="" with excluded ancestor ───────────────────────
 
 #[test]

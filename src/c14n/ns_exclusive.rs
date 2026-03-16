@@ -78,7 +78,7 @@ fn visibly_utilized_prefixes<'a>(node: Node<'a, '_>) -> HashSet<&'a str> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::super::serialize::serialize_canonical;
+    use super::super::serialize::{serialize_canonical, C14nConfig};
     use super::*;
     use roxmltree::Document;
     use std::collections::HashSet;
@@ -87,7 +87,18 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let renderer = ExclusiveNsRenderer::new(prefix_list);
         let mut out = Vec::new();
-        serialize_canonical(&doc, None, false, &renderer, &mut out).expect("c14n");
+        serialize_canonical(
+            &doc,
+            None,
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: false,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .expect("c14n");
         String::from_utf8(out).expect("utf8")
     }
 
