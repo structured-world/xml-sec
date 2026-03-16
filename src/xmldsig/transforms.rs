@@ -25,6 +25,9 @@ use crate::c14n::{self, C14nAlgorithm};
 /// The algorithm URI for the enveloped signature transform.
 pub const ENVELOPED_SIGNATURE_URI: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
 
+/// Namespace URI for Exclusive C14N `<InclusiveNamespaces>` elements.
+const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+
 /// A single transform in the pipeline.
 #[derive(Debug, Clone)]
 pub enum Transform {
@@ -108,7 +111,9 @@ pub fn execute_transforms<'a>(
         TransformData::Binary(bytes) => Ok(bytes),
         TransformData::NodeSet(nodes) => {
             let algo = C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315")
-                .expect("known URI");
+                .ok_or_else(|| {
+                TransformError::C14n("unsupported default C14N algorithm URI".to_string())
+            })?;
             let mut output = Vec::new();
             let predicate = |node: Node| nodes.contains(node);
             c14n::canonicalize(nodes.document(), Some(&predicate), &algo, &mut output)
@@ -165,6 +170,10 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
 /// Parse the `PrefixList` attribute from an `<ec:InclusiveNamespaces>` child
 /// element, if present.
 ///
+/// Per the [Exclusive C14N spec](https://www.w3.org/TR/xml-exc-c14n/#def-InclusiveNamespaces-PrefixList),
+/// the element MUST be in the `http://www.w3.org/2001/10/xml-exc-c14n#` namespace.
+/// Elements with the same local name but a different namespace are ignored.
+///
 /// The element is typically:
 /// ```xml
 /// <ec:InclusiveNamespaces
@@ -173,8 +182,12 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
 /// ```
 fn parse_inclusive_prefixes(transform_node: Node) -> Option<String> {
     for child in transform_node.children() {
-        if child.is_element() && child.tag_name().name() == "InclusiveNamespaces" {
-            return child.attribute("PrefixList").map(String::from);
+        if child.is_element() {
+            let tag = child.tag_name();
+            if tag.name() == "InclusiveNamespaces" && tag.namespace() == Some(EXCLUSIVE_C14N_NS_URI)
+            {
+                return child.attribute("PrefixList").map(String::from);
+            }
         }
     }
     None
@@ -438,6 +451,32 @@ mod tests {
                 assert!(algo.inclusive_prefixes().contains("ds"));
                 assert!(algo.inclusive_prefixes().contains("saml"));
                 assert!(algo.inclusive_prefixes().contains("")); // #default
+            }
+            other => panic!("expected C14n, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_transforms_ignores_wrong_ns_inclusive_namespaces() {
+        // InclusiveNamespaces in a foreign namespace should be ignored —
+        // only elements in http://www.w3.org/2001/10/xml-exc-c14n# are valid.
+        let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#">
+                <InclusiveNamespaces xmlns="http://example.com/fake"
+                                     PrefixList="attacker-controlled"/>
+            </Transform>
+        </Transforms>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let chain = parse_transforms(doc.root_element()).unwrap();
+        assert_eq!(chain.len(), 1);
+        match &chain[0] {
+            Transform::C14n(algo) => {
+                // PrefixList from wrong namespace should NOT be honoured
+                assert!(
+                    algo.inclusive_prefixes().is_empty(),
+                    "should ignore InclusiveNamespaces in wrong namespace"
+                );
             }
             other => panic!("expected C14n, got: {other:?}"),
         }
