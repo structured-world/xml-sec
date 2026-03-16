@@ -5,3 +5,5 @@ Cargo.lock
 .DS_Store
 donors/
 .refs/
+arch/
+ROADMAP.md

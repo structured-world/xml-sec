@@ -11,13 +11,19 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,no_run
-//! use xml_sec::{XmlSigner, XmlVerifier};
+//! ```rust
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_xml};
 //!
-//! // Verify a signed XML document
-//! let doc = std::fs::read_to_string("signed.xml").unwrap();
-//! let cert = std::fs::read("cert.pem").unwrap();
-//! let valid = XmlVerifier::new(&cert).verify(&doc).unwrap();
+//! let xml = b"<root b=\"2\" a=\"1\"><empty/></root>";
+//! let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
+//! let canonical = canonicalize_xml(xml, &algo)?;
+//! assert_eq!(
+//!     String::from_utf8(canonical)?,
+//!     "<root a=\"1\" b=\"2\"><empty></empty></root>"
+//! );
+//! # Ok(())
+//! # }
 //! ```
 
 #![deny(unsafe_code)]
