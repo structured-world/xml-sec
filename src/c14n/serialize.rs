@@ -258,8 +258,15 @@ fn serialize_element(
     for attr in node.attributes() {
         let value = if let Some(ref base) = effective_parent_base {
             if attr.namespace() == Some(XML_NS) && attr.name() == "base" {
-                // C14N 1.1: resolve element's own xml:base against parent's effective base
-                Cow::Owned(resolve_uri(base, attr.value()))
+                // C14N 1.1: resolve element's own xml:base against parent's
+                // effective base. Skip empty xml:base="" — it means "remove
+                // the base", so we emit it unchanged (not resolved).
+                let raw = attr.value();
+                if raw.is_empty() {
+                    Cow::Borrowed(raw)
+                } else {
+                    Cow::Owned(resolve_uri(base, raw))
+                }
             } else {
                 Cow::Borrowed(attr.value())
             }

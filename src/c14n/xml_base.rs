@@ -109,15 +109,30 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
     }
 
     // Parse base URI components
-    let (scheme, authority, base_path) = match parse_base(base) {
+    let base_parts = match parse_base(base) {
         Some(parts) => parts,
         None => return reference.to_string(), // base has no scheme, can't resolve
     };
+    let scheme = base_parts.scheme;
+    let authority = base_parts.authority;
+    let base_path = base_parts.path;
+
+    // Reference starts with ? → query-only: keep base scheme+authority+path.
+    // Reference starts with # → fragment-only: keep base scheme+authority+path+query.
+    // Per RFC 3986 §5.2.2, these replace only the query/fragment components.
+    if reference.starts_with('?') || reference.starts_with('#') {
+        let base_no_qf = strip_query_fragment(base);
+        if reference.starts_with('?') {
+            return format!("{base_no_qf}{reference}");
+        }
+        // Fragment-only: keep query too
+        let base_no_frag = base.split('#').next().unwrap_or(base);
+        return format!("{base_no_frag}{reference}");
+    }
 
     // Reference starts with // → authority override (RFC 3986 §5.2.2:
     // the path component must still be normalized).
     if let Some(rest) = reference.strip_prefix("//") {
-        // Split authority from path at first '/', '?', or '#'
         let mut auth_end = rest.len();
         for ch in ['/', '?', '#'] {
             if let Some(pos) = rest.find(ch) {
@@ -128,19 +143,21 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
         }
         let new_authority = &rest[..auth_end];
         let new_path = remove_dot_segments(&rest[auth_end..]);
-        return format!("{scheme}://{new_authority}{new_path}");
+        return recompose(scheme, Some(new_authority), &new_path);
     }
 
     // Reference starts with / → absolute path
     if reference.starts_with('/') {
         let cleaned = remove_dot_segments(reference);
-        return format!("{scheme}://{authority}{cleaned}");
+        return recompose(scheme, authority, &cleaned);
     }
 
-    // Relative path — merge with base path
-    let merged = merge_paths(base_path, reference);
+    // Relative path — merge with base path (strip query/fragment from
+    // base_path first, since merge operates on the path component only).
+    let clean_base_path = strip_query_fragment(base_path);
+    let merged = merge_paths(clean_base_path, reference);
     let cleaned = remove_dot_segments(&merged);
-    format!("{scheme}://{authority}{cleaned}")
+    recompose(scheme, authority, &cleaned)
 }
 
 /// Check if a URI string has a scheme (e.g., `http:`, `urn:`).
@@ -159,32 +176,26 @@ fn has_scheme(uri: &str) -> bool {
     }
 }
 
-/// Parse a base URI into (scheme, authority, path).
-///
-/// This follows the basic RFC 3986 structure:
-///   URI = scheme ":" hier-part [ "?" query ] [ "#" fragment ]
-///   where hier-part may start with "//" authority.
-///
-/// We return:
-/// - `scheme` as everything before the first `:`;
-/// - `authority` if there is a `//authority` component, otherwise the
-///   empty string;
-/// - `path` as the remainder after the authority, including any query
-///   or fragment.
-fn parse_base(base: &str) -> Option<(&str, &str, &str)> {
-    // Find the scheme separator.
+/// Parsed base URI components.
+struct BaseParts<'a> {
+    scheme: &'a str,
+    /// `Some("")` = authority present but empty (e.g., `file:///path`).
+    /// `None` = no authority (e.g., `urn:foo:bar`).
+    authority: Option<&'a str>,
+    path: &'a str,
+}
+
+/// Parse a base URI into scheme, optional authority, and path per RFC 3986.
+fn parse_base(base: &str) -> Option<BaseParts<'_>> {
     let scheme_end = base.find(':')?;
     let scheme = &base[..scheme_end];
 
     let mut rest = &base[scheme_end + 1..];
+    let mut authority = None;
 
-    // Default: no authority.
-    let mut authority = "";
-
-    // If the hier-part starts with "//", then an authority is present.
+    // If the hier-part starts with "//", an authority is present (may be empty).
     if rest.starts_with("//") {
         rest = &rest[2..];
-        // Authority goes up to the first '/', '?', or '#' (or end of string).
         let mut auth_end = rest.len();
         for ch in ['/', '?', '#'] {
             if let Some(pos) = rest.find(ch) {
@@ -193,12 +204,35 @@ fn parse_base(base: &str) -> Option<(&str, &str, &str)> {
                 }
             }
         }
-        authority = &rest[..auth_end];
+        authority = Some(&rest[..auth_end]);
         rest = &rest[auth_end..];
     }
 
-    let path = rest;
-    Some((scheme, authority, path))
+    Some(BaseParts {
+        scheme,
+        authority,
+        path: rest,
+    })
+}
+
+/// Recompose a URI from scheme, optional authority, and path per RFC 3986 §5.3.
+///
+/// `authority = Some("")` → `scheme:///path` (empty authority, e.g. `file:///`).
+/// `authority = None` → `scheme:path` (no authority, e.g. `urn:foo:bar`).
+fn recompose(scheme: &str, authority: Option<&str>, path: &str) -> String {
+    match authority {
+        Some(auth) => format!("{scheme}://{auth}{path}"),
+        None => format!("{scheme}:{path}"),
+    }
+}
+
+/// Strip query (`?...`) and fragment (`#...`) from a URI or path component.
+fn strip_query_fragment(s: &str) -> &str {
+    let end = s
+        .find('?')
+        .unwrap_or(s.len())
+        .min(s.find('#').unwrap_or(s.len()));
+    &s[..end]
 }
 
 /// Merge a relative reference with a base path per RFC 3986 §5.2.3.
