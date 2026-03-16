@@ -134,9 +134,14 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
         return format!("{base_no_frag}{reference}");
     }
 
+    // Split reference into path and query/fragment suffix. We apply
+    // remove_dot_segments only to the path portion, then reattach the
+    // query/fragment to the result.
+    let (ref_path, ref_suffix) = split_path_suffix(reference);
+
     // Reference starts with // → authority override (RFC 3986 §5.2.2:
     // the path component must still be normalized).
-    if let Some(rest) = reference.strip_prefix("//") {
+    if let Some(rest) = ref_path.strip_prefix("//") {
         let mut auth_end = rest.len();
         for ch in ['/', '?', '#'] {
             if let Some(pos) = rest.find(ch) {
@@ -147,21 +152,27 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
         }
         let new_authority = &rest[..auth_end];
         let new_path = remove_dot_segments(&rest[auth_end..]);
-        return recompose(scheme, Some(new_authority), &new_path);
+        let mut result = recompose(scheme, Some(new_authority), &new_path);
+        result.push_str(ref_suffix);
+        return result;
     }
 
     // Reference starts with / → absolute path
-    if reference.starts_with('/') {
-        let cleaned = remove_dot_segments(reference);
-        return recompose(scheme, authority, &cleaned);
+    if ref_path.starts_with('/') {
+        let cleaned = remove_dot_segments(ref_path);
+        let mut result = recompose(scheme, authority, &cleaned);
+        result.push_str(ref_suffix);
+        return result;
     }
 
     // Relative path — merge with base path (strip query/fragment from
     // base_path first, since merge operates on the path component only).
     let clean_base_path = strip_query_fragment(base_path);
-    let merged = merge_paths(clean_base_path, reference);
+    let merged = merge_paths(clean_base_path, ref_path);
     let cleaned = remove_dot_segments(&merged);
-    recompose(scheme, authority, &cleaned)
+    let mut result = recompose(scheme, authority, &cleaned);
+    result.push_str(ref_suffix);
+    result
 }
 
 /// Check if a URI string has a scheme (e.g., `http:`, `urn:`).
@@ -228,6 +239,24 @@ fn recompose(scheme: &str, authority: Option<&str>, path: &str) -> String {
         Some(auth) => format!("{scheme}://{auth}{path}"),
         None => format!("{scheme}:{path}"),
     }
+}
+
+/// Split a reference into (path, suffix) where suffix is `?query#fragment`
+/// (or just `#fragment`, or empty). Only considers `?` and `#` after the
+/// first character to preserve leading `?`/`#` semantics (those are handled
+/// separately as query-only / fragment-only references).
+fn split_path_suffix(reference: &str) -> (&str, &str) {
+    // Find the earliest '?' or '#' after position 0
+    let mut split_at = reference.len();
+    for ch in ['?', '#'] {
+        if let Some(pos) = reference[1..].find(ch) {
+            let abs_pos = pos + 1;
+            if abs_pos < split_at {
+                split_at = abs_pos;
+            }
+        }
+    }
+    (&reference[..split_at], &reference[split_at..])
 }
 
 /// Strip query (`?...`) and fragment (`#...`) from a URI or path component.
@@ -435,6 +464,40 @@ mod tests {
         assert_eq!(
             resolve_uri("http://example.com/a/b?q=1#f", "c"),
             "http://example.com/a/c"
+        );
+    }
+
+    #[test]
+    fn resolve_reference_with_query() {
+        // Reference contains query — must be preserved in output
+        assert_eq!(
+            resolve_uri("http://example.com/a/b", "c?x=1"),
+            "http://example.com/a/c?x=1"
+        );
+    }
+
+    #[test]
+    fn resolve_reference_with_fragment() {
+        // Reference contains fragment — must be preserved in output
+        assert_eq!(
+            resolve_uri("http://example.com/a/b", "c#frag"),
+            "http://example.com/a/c#frag"
+        );
+    }
+
+    #[test]
+    fn resolve_reference_with_query_and_fragment() {
+        assert_eq!(
+            resolve_uri("http://example.com/a/b", "c?q=1#f"),
+            "http://example.com/a/c?q=1#f"
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_path_with_query() {
+        assert_eq!(
+            resolve_uri("http://example.com/a", "/b/c?q"),
+            "http://example.com/b/c?q"
         );
     }
 
