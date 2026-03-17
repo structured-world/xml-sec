@@ -110,12 +110,9 @@ pub fn execute_transforms<'a>(
     match data {
         TransformData::Binary(bytes) => Ok(bytes),
         TransformData::NodeSet(nodes) => {
+            #[expect(clippy::expect_used, reason = "hardcoded URI is a known constant")]
             let algo = C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315")
-                .ok_or_else(|| {
-                TransformError::UnsupportedTransform(
-                    "unsupported default C14N algorithm URI".into(),
-                )
-            })?;
+                .expect("default C14N algorithm URI must be supported by C14nAlgorithm::from_uri");
             let mut output = Vec::new();
             let predicate = |node: Node| nodes.contains(node);
             c14n::canonicalize(nodes.document(), Some(&predicate), &algo, &mut output)
