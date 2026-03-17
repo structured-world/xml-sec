@@ -134,22 +134,32 @@ pub fn execute_transforms<'a>(
 /// For Exclusive C14N, also parses the optional `<InclusiveNamespaces
 /// PrefixList="...">` child element.
 pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, TransformError> {
+    // Validate that we received a <ds:Transforms> element.
+    if !transforms_node.is_element() {
+        return Err(TransformError::UnsupportedTransform(
+            "expected <Transforms> element but got non-element node".into(),
+        ));
+    }
+    let transforms_tag = transforms_node.tag_name();
+    if transforms_tag.name() != "Transforms" || transforms_tag.namespace() != Some(XMLDSIG_NS_URI) {
+        return Err(TransformError::UnsupportedTransform(
+            "expected <ds:Transforms> element in XMLDSig namespace".into(),
+        ));
+    }
+
     let mut chain = Vec::new();
 
     for child in transforms_node.children() {
         if !child.is_element() {
             continue;
         }
-        // Match on local name AND namespace.
-        // Ignore non-Transform elements, but fail closed if we see a
-        // <Transform> element that is not in the XMLDSig namespace.
+
+        // Only <ds:Transform> children are allowed; fail closed on any other element.
         let tag = child.tag_name();
-        if tag.name() != "Transform" {
-            continue;
-        }
-        if tag.namespace() != Some(XMLDSIG_NS_URI) {
+        if tag.name() != "Transform" || tag.namespace() != Some(XMLDSIG_NS_URI) {
             return Err(TransformError::UnsupportedTransform(
-                "unexpected <Transform> element with incorrect or missing XMLDSig namespace".into(),
+                "unexpected child element of <ds:Transforms>; only <ds:Transform> is allowed"
+                    .into(),
             ));
         }
         let uri = child.attribute("Algorithm").ok_or_else(|| {
