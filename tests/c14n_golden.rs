@@ -61,11 +61,13 @@ fn assert_c14n_matches_golden_comments(
         .unwrap_or_else(|e| panic!("{label}: canonicalize failed: {e}"));
     let result_str = String::from_utf8(result).expect("invalid utf8");
     let golden_content = fixture(golden);
+    // Truncate to ~500 chars for readable error messages (golden files can be 23KB+).
+    // Use char boundary to avoid panic on multi-byte UTF-8.
+    let got_preview: String = result_str.chars().take(500).collect();
+    let exp_preview: String = golden_content.chars().take(500).collect();
     assert_eq!(
         result_str, golden_content,
-        "\n{label}: C14N output differs from xmllint golden\n--- GOT (first 500) ---\n{}\n--- EXPECTED (first 500) ---\n{}",
-        &result_str[..result_str.len().min(500)],
-        &golden_content[..golden_content.len().min(500)]
+        "\n{label}: C14N output differs from xmllint golden\n--- GOT (first 500) ---\n{got_preview}\n--- EXPECTED (first 500) ---\n{exp_preview}",
     );
 }
 
