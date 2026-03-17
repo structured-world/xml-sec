@@ -199,8 +199,7 @@ fn collect_subtree_ids(node: Node<'_, '_>, ids: &mut HashSet<NodeId>) {
 
 /// Errors during transform processing.
 ///
-/// Marked `#[non_exhaustive]` — new variants will be added as more transforms
-/// are implemented (Base64, XPath). Crate is pre-1.0 so this is not a semver concern.
+/// New variants may be added as more transforms are implemented (Base64, XPath).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransformError {

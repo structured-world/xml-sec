@@ -223,7 +223,7 @@ fn parse_inclusive_prefixes(transform_node: Node) -> Result<Option<String>, Tran
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
     use super::*;
     use crate::xmldsig::NodeSet;
