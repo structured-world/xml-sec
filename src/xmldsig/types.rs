@@ -198,7 +198,10 @@ fn collect_subtree_ids(node: Node<'_, '_>, ids: &mut HashSet<NodeId>) {
 }
 
 /// Errors during transform processing.
+///
+/// New variants may be added as more transforms are implemented (Base64, XPath).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TransformError {
     /// Data type mismatch between transforms.
     #[error("type mismatch: expected {expected}, got {got}")]
@@ -224,4 +227,9 @@ pub enum TransformError {
     /// Canonicalization error during transform.
     #[error("C14N error: {0}")]
     C14n(String),
+
+    /// The Signature node passed to the enveloped transform belongs to a
+    /// different `Document` than the input `NodeSet`.
+    #[error("enveloped-signature transform: invalid Signature node for this document")]
+    CrossDocumentSignatureNode,
 }

@@ -8,7 +8,9 @@
 //! - ID attribute resolution with configurable attribute names
 //! - Node set types for the transform pipeline
 
+pub mod transforms;
 pub mod types;
 pub mod uri;
 
+pub use transforms::{execute_transforms, parse_transforms, Transform};
 pub use types::{NodeSet, TransformData, TransformError};
