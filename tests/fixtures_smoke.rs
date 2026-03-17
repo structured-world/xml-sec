@@ -204,16 +204,18 @@ fn assert_pem_file(path: &Path, expected_marker: &str) {
     );
 }
 
-/// Recursively count files in a directory.
+/// Recursively count files in a directory. Panics on I/O errors
+/// so missing/unreadable fixtures produce a clear diagnostic.
 fn count_files_recursive(dir: &Path, count: &mut usize) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                count_files_recursive(&path, count);
-            } else {
-                *count += 1;
-            }
+    let entries = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("cannot read directory {}: {e}", dir.display()));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|e| panic!("cannot read entry in {}: {e}", dir.display()));
+        let path = entry.path();
+        if path.is_dir() {
+            count_files_recursive(&path, count);
+        } else {
+            *count += 1;
         }
     }
 }
