@@ -417,23 +417,23 @@ mod tests {
 
     #[test]
     fn enveloped_only_excludes_own_signature() {
-        // Nested signatures: enveloped transform should only exclude
-        // the specific <Signature> being verified, not all signatures
-        let xml = r#"<root>
+        // Two real <Signature> elements: enveloped transform should only
+        // exclude the specific one being verified, not the other.
+        let xml = r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
             <data>hello</data>
-            <Sig1 xmlns="http://www.w3.org/2000/09/xmldsig#">
-                <SignedInfo><Reference URI=""/></SignedInfo>
-            </Sig1>
-            <Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
-                <SignedInfo><Reference URI=""/></SignedInfo>
-            </Signature>
+            <ds:Signature Id="sig-other">
+                <ds:SignedInfo><ds:Reference URI=""/></ds:SignedInfo>
+            </ds:Signature>
+            <ds:Signature Id="sig-target">
+                <ds:SignedInfo><ds:Reference URI=""/></ds:SignedInfo>
+            </ds:Signature>
         </root>"#;
         let doc = Document::parse(xml).unwrap();
 
-        // We are verifying the <Signature> element, not <Sig1>
+        // We are verifying sig-target, not sig-other
         let sig_node = doc
             .descendants()
-            .find(|n| n.is_element() && n.tag_name().name() == "Signature")
+            .find(|n| n.is_element() && n.attribute("Id") == Some("sig-target"))
             .unwrap();
 
         let node_set = NodeSet::entire_document_without_comments(&doc);
@@ -442,14 +442,14 @@ mod tests {
         let result = apply_transform(sig_node, &Transform::Enveloped, data).unwrap();
         let node_set = result.into_node_set().unwrap();
 
-        // Sig1 should still be in the set
-        let sig1 = doc
+        // sig-other should still be in the set
+        let sig_other = doc
             .descendants()
-            .find(|n| n.is_element() && n.tag_name().name() == "Sig1")
+            .find(|n| n.is_element() && n.attribute("Id") == Some("sig-other"))
             .unwrap();
         assert!(
-            node_set.contains(sig1),
-            "other signature elements should NOT be excluded"
+            node_set.contains(sig_other),
+            "other Signature elements should NOT be excluded"
         );
 
         // Signature should be excluded
