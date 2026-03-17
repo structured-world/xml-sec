@@ -69,10 +69,7 @@ pub(crate) fn apply_transform<'a>(
             // xmlsec1 equivalent:
             //   xmlSecNodeSetGetChildren(doc, signatureNode, 1, 1)  // inverted tree
             //   xmlSecNodeSetAdd(inNodes, children, Intersection)   // intersect = subtract
-            if !std::ptr::eq(
-                signature_node.document() as *const _,
-                nodes.document() as *const _,
-            ) {
+            if !std::ptr::eq(signature_node.document(), nodes.document()) {
                 return Err(TransformError::CrossDocumentSignatureNode);
             }
             nodes.exclude_subtree(signature_node);

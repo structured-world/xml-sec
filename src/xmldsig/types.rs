@@ -199,6 +199,7 @@ fn collect_subtree_ids(node: Node<'_, '_>, ids: &mut HashSet<NodeId>) {
 
 /// Errors during transform processing.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TransformError {
     /// Data type mismatch between transforms.
     #[error("type mismatch: expected {expected}, got {got}")]
