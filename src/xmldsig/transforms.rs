@@ -53,7 +53,7 @@ pub enum Transform {
 /// to know which signature subtree to exclude. The node must belong to the
 /// same document as the `NodeSet` in `input`; a cross-document mismatch
 /// returns [`TransformError::CrossDocumentSignatureNode`].
-pub fn apply_transform<'a>(
+pub(crate) fn apply_transform<'a>(
     signature_node: Node<'a, 'a>,
     transform: &Transform,
     input: TransformData<'a>,
@@ -115,7 +115,9 @@ pub fn execute_transforms<'a>(
         TransformData::NodeSet(nodes) => {
             let algo = C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315")
                 .ok_or_else(|| {
-                TransformError::C14n("unsupported default C14N algorithm URI".to_string())
+                TransformError::UnsupportedTransform(
+                    "unsupported default C14N algorithm URI".into(),
+                )
             })?;
             let mut output = Vec::new();
             let predicate = |node: Node| nodes.contains(node);
