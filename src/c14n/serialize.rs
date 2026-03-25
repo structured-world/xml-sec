@@ -103,7 +103,7 @@ fn serialize_children(
 
     for child in parent.children() {
         // Node-set filtering: skip nodes not in the set.
-        let in_set = node_set.map_or(true, |pred| pred(child));
+        let in_set = node_set.is_none_or(|pred| pred(child));
 
         match child.node_type() {
             NodeType::Element => {
