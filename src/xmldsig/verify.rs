@@ -148,7 +148,7 @@ pub enum ReferenceProcessingError {
 
     /// URI dereference failed.
     #[error("URI dereference failed: {0}")]
-    UriDereference(#[from] super::types::TransformError),
+    UriDereference(super::types::TransformError),
 
     /// Transform execution failed.
     #[error("transform failed: {0}")]

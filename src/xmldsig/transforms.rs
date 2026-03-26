@@ -250,7 +250,15 @@ fn parse_xpath_compat_transform(transform_node: Node) -> Result<Transform, Trans
         .unwrap_or_default();
 
     if expr == ENVELOPED_SIGNATURE_XPATH_EXPR {
-        Ok(Transform::XpathExcludeAllSignatures)
+        let dsig_ns = xpath_node.lookup_namespace_uri(Some("dsig"));
+        if dsig_ns == Some(XMLDSIG_NS_URI) {
+            Ok(Transform::XpathExcludeAllSignatures)
+        } else {
+            Err(TransformError::UnsupportedTransform(
+                "XPath compatibility form requires the `dsig` prefix to be bound to the XMLDSig namespace"
+                    .into(),
+            ))
+        }
     } else {
         Err(TransformError::UnsupportedTransform(format!(
             "unsupported XPath expression: {expr}"
@@ -702,6 +710,25 @@ mod tests {
                 <foo:XPath xmlns:foo="http://example.com/ns">
                     not(ancestor-or-self::dsig:Signature)
                 </foo:XPath>
+            </Transform>
+        </Transforms>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let result = parse_transforms(doc.root_element());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TransformError::UnsupportedTransform(_)
+        ));
+    }
+
+    #[test]
+    fn parse_transforms_rejects_xpath_with_wrong_dsig_prefix_binding() {
+        let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+                <XPath xmlns:dsig="http://example.com/not-xmldsig">
+                    not(ancestor-or-self::dsig:Signature)
+                </XPath>
             </Transform>
         </Transforms>"#;
         let doc = Document::parse(xml).unwrap();
