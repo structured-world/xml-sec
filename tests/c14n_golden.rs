@@ -196,7 +196,7 @@ fn find_element_by_id<'a>(
 }
 
 /// Build a node-set predicate that includes a node and all its descendants.
-fn subtree_predicate(root: roxmltree::Node) -> impl Fn(roxmltree::Node) -> bool {
+fn subtree_predicate(root: roxmltree::Node) -> impl Fn(roxmltree::Node) -> bool + use<> {
     let mut ids = HashSet::new();
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
