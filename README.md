@@ -47,6 +47,7 @@ Current MSRV: Rust 1.92.
 | Spec | Status |
 |------|--------|
 | [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) | Partially implemented |
+| [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) | Partially implemented |
 | [Exclusive C14N](https://www.w3.org/TR/xml-exc-c14n/) | Partially implemented |
 | [XMLDSig](https://www.w3.org/TR/xmldsig-core1/) | Partially implemented |
 | [XMLEnc](https://www.w3.org/TR/xmlenc-core1/) | Planned |
