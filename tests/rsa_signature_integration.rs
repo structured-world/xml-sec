@@ -226,6 +226,19 @@ fn malformed_spki_der_returns_typed_error() {
 }
 
 #[test]
+fn undersized_rsa_public_key_returns_typed_error() {
+    let err = verify_rsa_signature_pem(
+        SignatureAlgorithm::RsaSha256,
+        "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDfWcQXSKc3SPo1GnqN+GKZ3gH5\nJk0nOlH6sWB2ebIOyZBL/+DsgZIHxa4kz3Ic9DFGQChtdmC13UmJU5tFzs32GCVY\nVJsTbO9uQbhE/5oiP82lGbSQdSqN5vLGK23w8jhI554bk+G8ejquNDezOuQUfa9B\ndyE0GTD54npN9GrtSQIDAQAB\n-----END PUBLIC KEY-----\n",
+        b"payload",
+        b"signature",
+    )
+    .expect_err("1024-bit RSA key should be rejected before verification");
+
+    assert!(matches!(err, SignatureVerificationError::InvalidKeyDer));
+}
+
+#[test]
 fn spki_der_with_trailing_garbage_returns_typed_error() {
     let mut public_key_der = x509_parser::pem::parse_x509_pem(
         read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem")).as_bytes(),

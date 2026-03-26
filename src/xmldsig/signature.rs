@@ -85,7 +85,8 @@ pub fn verify_rsa_signature_spki(
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
 
     match public_key {
-        PublicKey::RSA(_) => {
+        PublicKey::RSA(rsa) => {
+            validate_rsa_public_key(&rsa, algorithm)?;
             let key = signature::UnparsedPublicKey::new(
                 verification_algorithm,
                 spki.subject_public_key.data,
@@ -93,6 +94,52 @@ pub fn verify_rsa_signature_spki(
             Ok(key.verify(signed_data, signature_value).is_ok())
         }
         _ => Err(SignatureVerificationError::InvalidKeyDer),
+    }
+}
+
+fn validate_rsa_public_key(
+    rsa: &x509_parser::public_key::RSAPublicKey<'_>,
+    algorithm: SignatureAlgorithm,
+) -> Result<(), SignatureVerificationError> {
+    let min_modulus_bits = minimum_rsa_modulus_bits(algorithm)?;
+    let modulus_start = rsa
+        .modulus
+        .iter()
+        .position(|byte| *byte != 0)
+        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+    let modulus = &rsa.modulus[modulus_start..];
+    if modulus.is_empty() {
+        return Err(SignatureVerificationError::InvalidKeyDer);
+    }
+    let modulus_bits = modulus
+        .len()
+        .checked_mul(8)
+        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+    if !(min_modulus_bits..=8192).contains(&modulus_bits) {
+        return Err(SignatureVerificationError::InvalidKeyDer);
+    }
+
+    let exponent = rsa
+        .try_exponent()
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    if !(3..=((1_u64 << 33) - 1)).contains(&exponent) || exponent % 2 == 0 {
+        return Err(SignatureVerificationError::InvalidKeyDer);
+    }
+
+    Ok(())
+}
+
+fn minimum_rsa_modulus_bits(
+    algorithm: SignatureAlgorithm,
+) -> Result<usize, SignatureVerificationError> {
+    match algorithm {
+        SignatureAlgorithm::RsaSha1
+        | SignatureAlgorithm::RsaSha256
+        | SignatureAlgorithm::RsaSha384
+        | SignatureAlgorithm::RsaSha512 => Ok(2048),
+        _ => Err(SignatureVerificationError::UnsupportedAlgorithm {
+            uri: algorithm.uri().to_string(),
+        }),
     }
 }
 
