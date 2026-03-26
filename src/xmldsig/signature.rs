@@ -18,6 +18,10 @@ use super::parse::SignatureAlgorithm;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SignatureVerificationError {
+    /// The provided PEM block could not be parsed as PEM input.
+    #[error("invalid PEM public key")]
+    InvalidKeyPem,
+
     /// The signature method is not an RSA PKCS#1 v1.5 algorithm.
     #[error("unsupported signature algorithm: {uri}")]
     UnsupportedAlgorithm {
@@ -47,8 +51,11 @@ pub fn verify_rsa_signature_pem(
     signed_data: &[u8],
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
-    let (_, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
+        .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
+    if !rest.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err(SignatureVerificationError::InvalidKeyPem);
+    }
     if pem.label != "PUBLIC KEY" {
         return Err(SignatureVerificationError::InvalidKeyFormat { label: pem.label });
     }
@@ -68,8 +75,11 @@ pub fn verify_rsa_signature_spki(
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
     let verification_algorithm = verification_algorithm(algorithm)?;
-    let (_, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
+    let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    if !rest.is_empty() {
+        return Err(SignatureVerificationError::InvalidKeyDer);
+    }
     let public_key = spki
         .parsed()
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;

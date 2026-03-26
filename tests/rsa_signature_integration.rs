@@ -164,7 +164,7 @@ fn wrong_spki_key_fails_verification() {
 }
 
 #[test]
-fn malformed_pem_returns_typed_error() {
+fn non_public_key_pem_returns_invalid_key_format() {
     let err = verify_rsa_signature_pem(
         SignatureAlgorithm::RsaSha256,
         "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
@@ -180,6 +180,37 @@ fn malformed_pem_returns_typed_error() {
 }
 
 #[test]
+fn malformed_pem_returns_typed_error() {
+    let err = verify_rsa_signature_pem(
+        SignatureAlgorithm::RsaSha256,
+        "-----BEGIN PUBLIC KEY-----\n%%%%\n-----END PUBLIC KEY-----\n",
+        b"payload",
+        b"signature",
+    )
+    .expect_err("corrupt PEM should be rejected");
+
+    assert!(matches!(err, SignatureVerificationError::InvalidKeyPem));
+}
+
+#[test]
+fn pem_with_trailing_garbage_returns_typed_error() {
+    let public_key_pem = format!(
+        "{}TRAILING",
+        read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+    );
+
+    let err = verify_rsa_signature_pem(
+        SignatureAlgorithm::RsaSha256,
+        &public_key_pem,
+        b"payload",
+        b"signature",
+    )
+    .expect_err("PEM with trailing garbage should be rejected");
+
+    assert!(matches!(err, SignatureVerificationError::InvalidKeyPem));
+}
+
+#[test]
 fn malformed_spki_der_returns_typed_error() {
     let err = verify_rsa_signature_spki(
         SignatureAlgorithm::RsaSha256,
@@ -188,6 +219,27 @@ fn malformed_spki_der_returns_typed_error() {
         b"signature",
     )
     .expect_err("malformed SPKI DER should be rejected");
+
+    assert!(matches!(err, SignatureVerificationError::InvalidKeyDer));
+}
+
+#[test]
+fn spki_der_with_trailing_garbage_returns_typed_error() {
+    let mut public_key_der = x509_parser::pem::parse_x509_pem(
+        read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem")).as_bytes(),
+    )
+    .expect("fixture PEM should parse")
+    .1
+    .contents;
+    public_key_der.extend_from_slice(b"TRAILING");
+
+    let err = verify_rsa_signature_spki(
+        SignatureAlgorithm::RsaSha256,
+        &public_key_der,
+        b"payload",
+        b"signature",
+    )
+    .expect_err("SPKI DER with trailing garbage should be rejected");
 
     assert!(matches!(err, SignatureVerificationError::InvalidKeyDer));
 }
