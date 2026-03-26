@@ -58,6 +58,7 @@ impl SignatureAlgorithm {
     }
 
     /// Return the XML namespace URI.
+    #[must_use]
     pub fn uri(self) -> &'static str {
         match self {
             Self::RsaSha1 => "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
