@@ -24,6 +24,11 @@ use crate::c14n::{self, C14nAlgorithm};
 
 /// The algorithm URI for the enveloped signature transform.
 pub const ENVELOPED_SIGNATURE_URI: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
+/// The algorithm URI for the XPath 1.0 transform.
+const XPATH_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+/// xmlsec1 donor vectors use this XPath expression as a compatibility form of
+/// enveloped-signature exclusion.
+const ENVELOPED_SIGNATURE_XPATH_EXPR: &str = "not(ancestor-or-self::dsig:Signature)";
 
 /// XMLDSig namespace URI for `<Transform>` elements.
 const XMLDSIG_NS_URI: &str = "http://www.w3.org/2000/09/xmldsig#";
@@ -167,6 +172,8 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
 
         let transform = if uri == ENVELOPED_SIGNATURE_URI {
             Transform::Enveloped
+        } else if uri == XPATH_URI {
+            parse_xpath_compat_transform(child)?
         } else if let Some(mut algo) = C14nAlgorithm::from_uri(uri) {
             // For exclusive C14N, check for InclusiveNamespaces child
             if algo.mode() == c14n::C14nMode::Exclusive1_0 {
@@ -182,6 +189,35 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
     }
 
     Ok(chain)
+}
+
+/// Parse the narrow XPath compatibility case we currently support.
+///
+/// We do not implement general XPath evaluation here. The only accepted form is
+/// the xmlsec1 donor-vector expression that is semantically equivalent to the
+/// enveloped-signature transform.
+fn parse_xpath_compat_transform(transform_node: Node) -> Result<Transform, TransformError> {
+    let xpath_node = transform_node
+        .children()
+        .find(|child| child.is_element() && child.tag_name().name() == "XPath")
+        .ok_or_else(|| {
+            TransformError::UnsupportedTransform(
+                "XPath transform requires a <XPath> child element".into(),
+            )
+        })?;
+
+    let expr = xpath_node
+        .text()
+        .map(|text| text.split_whitespace().collect::<String>())
+        .unwrap_or_default();
+
+    if expr == ENVELOPED_SIGNATURE_XPATH_EXPR {
+        Ok(Transform::Enveloped)
+    } else {
+        Err(TransformError::UnsupportedTransform(format!(
+            "unsupported XPath expression: {expr}"
+        )))
+    }
 }
 
 /// Parse the `PrefixList` attribute from an `<ec:InclusiveNamespaces>` child
@@ -586,6 +622,39 @@ mod tests {
 
         let chain = parse_transforms(doc.root_element()).unwrap();
         assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn parse_transforms_accepts_enveloped_compat_xpath() {
+        let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+                <XPath xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">
+                    not(ancestor-or-self::dsig:Signature)
+                </XPath>
+            </Transform>
+        </Transforms>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let chain = parse_transforms(doc.root_element()).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert!(matches!(chain[0], Transform::Enveloped));
+    }
+
+    #[test]
+    fn parse_transforms_rejects_other_xpath_expressions() {
+        let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+                <XPath>self::node()</XPath>
+            </Transform>
+        </Transforms>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let result = parse_transforms(doc.root_element());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TransformError::UnsupportedTransform(_)
+        ));
     }
 
     #[test]

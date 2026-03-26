@@ -23,12 +23,13 @@ ring = "0.17"
 x509-parser = "0.18"
 der = "0.8"
 
+# Base64 encoding/decoding
+base64 = "0.22"
+
 # Error handling
 thiserror = "2"
 
 [dev-dependencies]
-# W3C test vectors
-base64 = "0.22"
 
 [features]
 default = ["xmldsig", "c14n"]
