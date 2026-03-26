@@ -10,6 +10,7 @@
 
 pub mod digest;
 pub mod parse;
+pub mod signature;
 pub mod transforms;
 pub mod types;
 pub mod uri;
@@ -18,6 +19,9 @@ pub mod verify;
 pub use digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 pub use parse::{
     ParseError, Reference, SignatureAlgorithm, SignedInfo, find_signature_node, parse_signed_info,
+};
+pub use signature::{
+    SignatureVerificationError, verify_rsa_signature_pem, verify_rsa_signature_spki,
 };
 pub use transforms::{Transform, execute_transforms, parse_transforms};
 pub use types::{NodeSet, TransformData, TransformError};
