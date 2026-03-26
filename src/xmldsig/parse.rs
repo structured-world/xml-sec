@@ -290,8 +290,8 @@ fn required_algorithm_attr<'a>(
 ///
 /// XMLDSig allows whitespace within base64 content (line-wrapped encodings).
 fn base64_decode_digest(b64: &str) -> Result<Vec<u8>, ParseError> {
-    use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
 
     // Strip all whitespace (newlines, spaces, tabs) before decoding
     let cleaned: String = b64.chars().filter(|c| !c.is_ascii_whitespace()).collect();

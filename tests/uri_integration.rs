@@ -3,7 +3,7 @@
 //! Verifies that dereferencing a URI produces a NodeSet that, when used as
 //! a predicate for C14N, produces the correct canonical output.
 
-use xml_sec::c14n::{canonicalize, C14nAlgorithm, C14nMode};
+use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::xmldsig::uri::UriReferenceResolver;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::fs;
 
 use ring::digest;
-use xml_sec::c14n::{canonicalize, canonicalize_xml, C14nAlgorithm, C14nMode};
+use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize, canonicalize_xml};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 

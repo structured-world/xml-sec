@@ -78,7 +78,7 @@ fn visibly_utilized_prefixes<'a>(node: Node<'a, '_>) -> HashSet<&'a str> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::super::serialize::{serialize_canonical, C14nConfig};
+    use super::super::serialize::{C14nConfig, serialize_canonical};
     use super::*;
     use roxmltree::Document;
     use std::collections::HashSet;

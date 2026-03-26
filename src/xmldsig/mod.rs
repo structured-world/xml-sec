@@ -15,13 +15,13 @@ pub mod types;
 pub mod uri;
 pub mod verify;
 
-pub use digest::{compute_digest, constant_time_eq, DigestAlgorithm};
+pub use digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 pub use parse::{
-    find_signature_node, parse_signed_info, ParseError, Reference, SignatureAlgorithm, SignedInfo,
+    ParseError, Reference, SignatureAlgorithm, SignedInfo, find_signature_node, parse_signed_info,
 };
-pub use transforms::{execute_transforms, parse_transforms, Transform};
+pub use transforms::{Transform, execute_transforms, parse_transforms};
 pub use types::{NodeSet, TransformData, TransformError};
 pub use verify::{
-    process_all_references, process_reference, ReferenceProcessingError, ReferenceResult,
-    ReferencesResult,
+    ReferenceProcessingError, ReferenceResult, ReferencesResult, process_all_references,
+    process_reference,
 };

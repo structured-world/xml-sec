@@ -33,7 +33,7 @@ impl NsRenderer for InclusiveNsRenderer {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::super::serialize::{serialize_canonical, C14nConfig};
+    use super::super::serialize::{C14nConfig, serialize_canonical};
     use super::*;
     use roxmltree::Document;
 

@@ -11,7 +11,7 @@
 
 use roxmltree::Node;
 
-use super::digest::{compute_digest, constant_time_eq, DigestAlgorithm};
+use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 use super::parse::Reference;
 use super::transforms::execute_transforms;
 use super::uri::UriReferenceResolver;
@@ -160,7 +160,7 @@ pub enum ReferenceProcessingError {
 mod tests {
     use super::*;
     use crate::xmldsig::digest::DigestAlgorithm;
-    use crate::xmldsig::parse::{parse_signed_info, Reference};
+    use crate::xmldsig::parse::{Reference, parse_signed_info};
     use crate::xmldsig::transforms::Transform;
     use crate::xmldsig::uri::UriReferenceResolver;
     use roxmltree::Document;

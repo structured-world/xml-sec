@@ -11,7 +11,7 @@
 //! - `process_reference` / `process_all_references` (full wiring)
 
 use base64::Engine;
-use xml_sec::xmldsig::digest::{compute_digest, DigestAlgorithm};
+use xml_sec::xmldsig::digest::{DigestAlgorithm, compute_digest};
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::transforms::execute_transforms;
 use xml_sec::xmldsig::uri::UriReferenceResolver;

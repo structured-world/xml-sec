@@ -36,7 +36,7 @@ use roxmltree::{Document, Node};
 
 use ns_exclusive::ExclusiveNsRenderer;
 use ns_inclusive::InclusiveNsRenderer;
-use serialize::{serialize_canonical, C14nConfig};
+use serialize::{C14nConfig, serialize_canonical};
 
 /// C14N algorithm mode (without the comments flag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

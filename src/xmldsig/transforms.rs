@@ -197,10 +197,10 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
             parse_xpath_compat_transform(child)?
         } else if let Some(mut algo) = C14nAlgorithm::from_uri(uri) {
             // For exclusive C14N, check for InclusiveNamespaces child
-            if algo.mode() == c14n::C14nMode::Exclusive1_0 {
-                if let Some(prefix_list) = parse_inclusive_prefixes(child)? {
-                    algo = algo.with_prefix_list(&prefix_list);
-                }
+            if algo.mode() == c14n::C14nMode::Exclusive1_0
+                && let Some(prefix_list) = parse_inclusive_prefixes(child)?
+            {
+                algo = algo.with_prefix_list(&prefix_list);
             }
             Transform::C14n(algo)
         } else {
@@ -812,7 +812,10 @@ mod tests {
             TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc)),
             &[
                 Transform::Enveloped,
-                Transform::C14n(C14nAlgorithm::new(crate::c14n::C14nMode::Inclusive1_0, false)),
+                Transform::C14n(C14nAlgorithm::new(
+                    crate::c14n::C14nMode::Inclusive1_0,
+                    false,
+                )),
             ],
         )
         .unwrap();
@@ -821,7 +824,10 @@ mod tests {
             TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc)),
             &[
                 Transform::XpathExcludeAllSignatures,
-                Transform::C14n(C14nAlgorithm::new(crate::c14n::C14nMode::Inclusive1_0, false)),
+                Transform::C14n(C14nAlgorithm::new(
+                    crate::c14n::C14nMode::Inclusive1_0,
+                    false,
+                )),
             ],
         )
         .unwrap();
