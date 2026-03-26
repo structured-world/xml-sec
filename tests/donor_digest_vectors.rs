@@ -13,7 +13,7 @@ use xml_sec::xmldsig::uri::UriReferenceResolver;
 use xml_sec::xmldsig::verify::process_all_references;
 
 fn donor_xml(name: &str) -> String {
-    let path = Path::new("donors/xmlsec/tests/aleksey-xmldsig-01").join(name);
+    let path = Path::new("tests/fixtures/xmldsig/aleksey-xmldsig-01").join(name);
     fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()))
 }

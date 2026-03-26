@@ -102,7 +102,10 @@ pub fn compute_digest(algorithm: DigestAlgorithm, data: &[u8]) -> Vec<u8> {
 ///
 /// Uses `ring::constant_time::verify_slices_are_equal` internally.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    #[allow(deprecated)]
+    #[expect(
+        deprecated,
+        reason = "legacy ring constant-time helper is still used here"
+    )]
     ring::constant_time::verify_slices_are_equal(a, b).is_ok()
 }
 

@@ -140,7 +140,7 @@ fn saml_response_enveloped_reference_valid() {
 // ── SAML Assertion: enveloped signature inside assertion ─────────────────────
 
 #[test]
-fn saml_assertion_level_enveloped_reference() {
+fn saml_assertion_level_enveloped_reference_valid() {
     // Signature inside the Assertion, signing only the Assertion subtree (URI="#_assert1")
     let xml_template = r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
                                      xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
@@ -382,7 +382,7 @@ fn multiple_references_fail_fast_on_second() {
 // ── Inclusive C14N variant ────────────────────────────────────────────────────
 
 #[test]
-fn reference_with_inclusive_c14n() {
+fn reference_with_inclusive_c14n_valid() {
     // Tests that inclusive C14N (not just exclusive) works in the reference pipeline
     let xml_template = r##"<root xmlns:ns="http://example.com" ns:attr="val">
         <data>content</data>
@@ -439,7 +439,7 @@ fn reference_with_inclusive_c14n() {
 // ── SHA-384 digest algorithm ─────────────────────────────────────────────────
 
 #[test]
-fn reference_with_sha384_digest() {
+fn reference_with_sha384_digest_valid() {
     let xml_template = r##"<root>
         <data>content</data>
         <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
@@ -556,7 +556,7 @@ fn reference_without_transforms_uses_default_c14n() {
 // ── Single process_reference call with pre_digest ────────────────────────────
 
 #[test]
-fn process_single_reference_with_pre_digest() {
+fn process_single_reference_with_pre_digest_valid() {
     let xml_template = r##"<root>
         <data>important</data>
         <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">

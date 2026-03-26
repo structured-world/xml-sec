@@ -66,8 +66,12 @@ pub fn process_reference(
     signature_node: Node<'_, '_>,
     store_pre_digest: bool,
 ) -> Result<ReferenceResult, ReferenceProcessingError> {
-    // 1. Dereference URI (default to empty string if absent)
-    let uri = reference.uri.as_deref().unwrap_or("");
+    // 1. Dereference URI. Omitted URI is distinct from URI="" in XMLDSig and
+    // must be rejected until caller-provided external object resolution exists.
+    let uri = reference
+        .uri
+        .as_deref()
+        .ok_or(ReferenceProcessingError::MissingUri)?;
     let initial_data = resolver
         .dereference(uri)
         .map_err(ReferenceProcessingError::UriDereference)?;
@@ -138,6 +142,10 @@ pub fn process_all_references(
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReferenceProcessingError {
+    /// `<Reference>` omitted the `URI` attribute, which we do not resolve implicitly.
+    #[error("reference URI is required; omitted URI references are not supported")]
+    MissingUri,
+
     /// URI dereference failed.
     #[error("URI dereference failed: {0}")]
     UriDereference(#[from] super::types::TransformError),
@@ -310,17 +318,10 @@ mod tests {
     }
 
     #[test]
-    fn reference_with_absent_uri_defaults_to_empty() {
-        // URI = None should behave like URI = "" (whole document)
+    fn reference_with_absent_uri_fails_closed() {
         let xml = "<root><child>text</child></root>";
         let doc = Document::parse(xml).unwrap();
         let resolver = UriReferenceResolver::new(&doc);
-
-        // Compute digest for empty URI
-        let initial_data = resolver.dereference("").unwrap();
-        let pre_digest =
-            crate::xmldsig::execute_transforms(doc.root_element(), initial_data, &[]).unwrap();
-        let expected_digest = compute_digest(DigestAlgorithm::Sha256, &pre_digest);
 
         let reference = Reference {
             uri: None, // absent URI
@@ -328,11 +329,11 @@ mod tests {
             ref_type: None,
             transforms: vec![],
             digest_method: DigestAlgorithm::Sha256,
-            digest_value: expected_digest,
+            digest_value: vec![0; 32],
         };
 
-        let result = process_reference(&reference, &resolver, doc.root_element(), false).unwrap();
-        assert!(result.valid);
+        let result = process_reference(&reference, &resolver, doc.root_element(), false);
+        assert!(matches!(result, Err(ReferenceProcessingError::MissingUri)));
     }
 
     // ── process_all_references: fail-fast ────────────────────────────

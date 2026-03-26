@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Envelope xmlns="urn:envelope">
+  <Data>
+	Hello, World!
+  </Data>
+  <Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
+    <SignedInfo>
+      <CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/>
+      <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384"/>
+      <Reference URI="">
+        <Transforms>
+          <Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+	        <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+	          <XPath xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">not(ancestor-or-self::dsig:Signature)</XPath>
+	        </Transform>
+        </Transforms>
+        <DigestMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/>
+        <DigestValue>KWY6fYC7HAkpMGN1mD/luDV8Mt3J3r4F0u0h6tKpVu+Z5/y7dM3gh9PHJ4BzTfv2</DigestValue>
+      </Reference>
+    </SignedInfo>
+    <SignatureValue>AEv1rn0nz5YW1dor1hQP6dBR5xHYZqtBgoPqpx8sblrlkfGz6kXKDXigh9lJhJfD
+fM7AJIYGSu3uJcSA0y5VegjHAM0rG3yR0EqU2FhUMBPE2bQLwBsi4ynPp2zf987C
+zlT9XeJH5xOyjocigtSrQrCRze75p8mvinf8MZUhKP0avnQd</SignatureValue>
+    <KeyInfo>
+      <KeyName>TestKeyName-ec-prime521v1</KeyName>
+    </KeyInfo>
+  </Signature>
+</Envelope>

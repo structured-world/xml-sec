@@ -45,6 +45,13 @@ pub enum Transform {
     /// Input: `NodeSet` → Output: `NodeSet`
     Enveloped,
 
+    /// Narrow XPath compatibility form used by some donor vectors:
+    /// `not(ancestor-or-self::dsig:Signature)`.
+    ///
+    /// Unlike `Enveloped`, this excludes every `ds:Signature` subtree in the
+    /// current document, not only the containing signature.
+    XpathExcludeAllSignatures,
+
     /// XML Canonicalization (any supported variant).
     ///
     /// Input: `NodeSet` → Output: `Binary`
@@ -78,6 +85,20 @@ pub(crate) fn apply_transform<'a>(
                 return Err(TransformError::CrossDocumentSignatureNode);
             }
             nodes.exclude_subtree(signature_node);
+            Ok(TransformData::NodeSet(nodes))
+        }
+        Transform::XpathExcludeAllSignatures => {
+            let mut nodes = input.into_node_set()?;
+            let doc = nodes.document();
+
+            for node in doc.descendants().filter(|node| {
+                node.is_element()
+                    && node.tag_name().name() == "Signature"
+                    && node.tag_name().namespace() == Some(XMLDSIG_NS_URI)
+            }) {
+                nodes.exclude_subtree(node);
+            }
+
             Ok(TransformData::NodeSet(nodes))
         }
         Transform::C14n(algo) => {
@@ -194,8 +215,8 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
 /// Parse the narrow XPath compatibility case we currently support.
 ///
 /// We do not implement general XPath evaluation here. The only accepted form is
-/// the xmlsec1 donor-vector expression that is semantically equivalent to the
-/// enveloped-signature transform.
+/// the xmlsec1 donor-vector expression that excludes all `ds:Signature`
+/// subtrees from the current node-set.
 fn parse_xpath_compat_transform(transform_node: Node) -> Result<Transform, TransformError> {
     let mut xpath_node = None;
 
@@ -229,7 +250,7 @@ fn parse_xpath_compat_transform(transform_node: Node) -> Result<Transform, Trans
         .unwrap_or_default();
 
     if expr == ENVELOPED_SIGNATURE_XPATH_EXPR {
-        Ok(Transform::Enveloped)
+        Ok(Transform::XpathExcludeAllSignatures)
     } else {
         Err(TransformError::UnsupportedTransform(format!(
             "unsupported XPath expression: {expr}"
@@ -654,7 +675,7 @@ mod tests {
 
         let chain = parse_transforms(doc.root_element()).unwrap();
         assert_eq!(chain.len(), 1);
-        assert!(matches!(chain[0], Transform::Enveloped));
+        assert!(matches!(chain[0], Transform::XpathExcludeAllSignatures));
     }
 
     #[test]
@@ -733,6 +754,58 @@ mod tests {
             result.unwrap_err(),
             TransformError::UnsupportedTransform(_)
         ));
+    }
+
+    #[test]
+    fn xpath_compat_excludes_other_signature_subtrees_too() {
+        let xml = r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <payload>keep-me</payload>
+            <ds:Signature Id="sig-1">
+                <ds:SignedInfo/>
+                <ds:SignatureValue>one</ds:SignatureValue>
+            </ds:Signature>
+            <ds:Signature Id="sig-2">
+                <ds:SignedInfo/>
+                <ds:SignatureValue>two</ds:SignatureValue>
+            </ds:Signature>
+        </root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let signature_nodes: Vec<_> = doc
+            .descendants()
+            .filter(|node| {
+                node.is_element()
+                    && node.tag_name().name() == "Signature"
+                    && node.tag_name().namespace() == Some(XMLDSIG_NS_URI)
+            })
+            .collect();
+        let sig_node = signature_nodes[0];
+
+        let enveloped = execute_transforms(
+            sig_node,
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc)),
+            &[
+                Transform::Enveloped,
+                Transform::C14n(C14nAlgorithm::new(crate::c14n::C14nMode::Inclusive1_0, false)),
+            ],
+        )
+        .unwrap();
+        let xpath_compat = execute_transforms(
+            sig_node,
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc)),
+            &[
+                Transform::XpathExcludeAllSignatures,
+                Transform::C14n(C14nAlgorithm::new(crate::c14n::C14nMode::Inclusive1_0, false)),
+            ],
+        )
+        .unwrap();
+
+        let enveloped = String::from_utf8(enveloped).unwrap();
+        let xpath_compat = String::from_utf8(xpath_compat).unwrap();
+
+        assert!(enveloped.contains("sig-2"));
+        assert!(!xpath_compat.contains("sig-1"));
+        assert!(!xpath_compat.contains("sig-2"));
+        assert!(xpath_compat.contains("keep-me"));
     }
 
     #[test]
