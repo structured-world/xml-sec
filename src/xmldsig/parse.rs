@@ -135,6 +135,7 @@ pub enum ParseError {
 }
 
 /// Find the first `<ds:Signature>` element in the document.
+#[must_use]
 pub fn find_signature_node<'a>(doc: &'a Document<'a>) -> Option<Node<'a, 'a>> {
     doc.descendants().find(|n| {
         n.is_element()
