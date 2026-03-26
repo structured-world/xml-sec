@@ -69,6 +69,7 @@ impl SignatureAlgorithm {
     }
 
     /// Whether this algorithm is allowed for signing (not just verification).
+    #[must_use]
     pub fn signing_allowed(self) -> bool {
         !matches!(self, Self::RsaSha1)
     }
