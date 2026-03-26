@@ -20,11 +20,25 @@ jobs:
               github.rest.repos.listBranches,
               { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
             );
+            const openPullRequests = await github.paginate(
+              github.rest.pulls.list,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: "open",
+                per_page: 100
+              }
+            );
+            const activeBranches = new Set(
+              openPullRequests
+                .map(pr => pr.head?.ref)
+                .filter(ref => ref?.startsWith("release-plz-"))
+            );
             const stale = branches
               .filter(b => b.name.startsWith("release-plz-"))
+              .filter(b => !activeBranches.has(b.name))
               .map(b => b.name);
-            stale.sort().reverse();
-            const toDelete = stale.slice(1);
+            const toDelete = stale;
             for (const branch of toDelete) {
               try {
                 await github.rest.git.deleteRef({
