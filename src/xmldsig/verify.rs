@@ -41,6 +41,7 @@ pub struct ReferencesResult {
 
 impl ReferencesResult {
     /// Whether all references passed digest verification.
+    #[must_use]
     pub fn all_valid(&self) -> bool {
         self.first_failure.is_none()
     }
