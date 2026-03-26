@@ -1,15 +1,17 @@
-//! RSA signature verification helpers for XMLDSig.
+//! Signature verification helpers for XMLDSig.
 //!
-//! This module covers roadmap task P1-019: RSA PKCS#1 v1.5 verification for
-//! `rsa-sha1`, `rsa-sha256`, `rsa-sha384`, and `rsa-sha512`.
+//! This module currently covers roadmap task P1-019 (RSA PKCS#1 v1.5) and
+//! P1-020 (ECDSA P-256/P-384) verification.
 //!
 //! Input public keys are accepted in SubjectPublicKeyInfo (SPKI) form because
 //! that is how the vendored PEM fixtures are stored. `ring` expects the inner
-//! ASN.1 `RSAPublicKey` bytes, so we validate and unwrap SPKI first.
+//! SPKI payload for both algorithm families:
+//! - RSA: ASN.1 `RSAPublicKey`
+//! - ECDSA: uncompressed SEC1 EC point bytes from the SPKI bit string
 
 use ring::signature;
 use x509_parser::prelude::FromDer;
-use x509_parser::public_key::PublicKey;
+use x509_parser::public_key::{ECPoint, PublicKey};
 use x509_parser::x509::SubjectPublicKeyInfo;
 
 use super::parse::SignatureAlgorithm;
@@ -39,6 +41,11 @@ pub enum SignatureVerificationError {
     /// The provided DER bytes were not a valid SPKI-encoded RSA public key.
     #[error("invalid RSA SubjectPublicKeyInfo DER")]
     InvalidKeyDer,
+
+    /// The provided ECDSA signature bytes were neither XMLDSig fixed-width
+    /// nor ASN.1 DER encoded.
+    #[error("invalid ECDSA signature encoding")]
+    InvalidSignatureFormat,
 }
 
 /// Verify an RSA XMLDSig signature using a PEM-encoded SPKI public key.
@@ -62,6 +69,31 @@ pub fn verify_rsa_signature_pem(
     }
 
     verify_rsa_signature_spki(algorithm, &pem.contents, signed_data, signature_value)
+}
+
+/// Verify an ECDSA XMLDSig signature using a PEM-encoded SPKI public key.
+///
+/// The PEM must contain a `PUBLIC KEY` block. The signature value must use the
+/// XMLDSig fixed-width `r || s` format required by RFC 6931 / XMLDSig 1.1.
+/// Returns `Ok(false)` for signature mismatch and `Err` for
+/// algorithm/key/signature-format preparation errors.
+#[must_use = "discarding the verification result skips signature validation"]
+pub fn verify_ecdsa_signature_pem(
+    algorithm: SignatureAlgorithm,
+    public_key_pem: &str,
+    signed_data: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationError> {
+    let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
+        .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
+    if !rest.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err(SignatureVerificationError::InvalidKeyPem);
+    }
+    if pem.label != "PUBLIC KEY" {
+        return Err(SignatureVerificationError::InvalidKeyFormat { label: pem.label });
+    }
+
+    verify_ecdsa_signature_spki(algorithm, &pem.contents, signed_data, signature_value)
 }
 
 /// Verify an RSA XMLDSig signature using DER-encoded SPKI public key bytes.
@@ -89,6 +121,41 @@ pub fn verify_rsa_signature_spki(
     match public_key {
         PublicKey::RSA(rsa) => {
             validate_rsa_public_key(&rsa, algorithm)?;
+            let key = signature::UnparsedPublicKey::new(
+                verification_algorithm,
+                spki.subject_public_key.data,
+            );
+            Ok(key.verify(signed_data, signature_value).is_ok())
+        }
+        _ => Err(SignatureVerificationError::InvalidKeyDer),
+    }
+}
+
+/// Verify an ECDSA XMLDSig signature using DER-encoded SPKI public key bytes.
+///
+/// The input must be an X.509 `SubjectPublicKeyInfo` wrapping an EC key.
+/// Returns `Ok(false)` for signature mismatch and `Err` for algorithm/key
+/// preparation errors.
+#[must_use = "discarding the verification result skips signature validation"]
+pub fn verify_ecdsa_signature_spki(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationError> {
+    let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    if !rest.is_empty() {
+        return Err(SignatureVerificationError::InvalidKeyDer);
+    }
+    let public_key = spki
+        .parsed()
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+
+    match public_key {
+        PublicKey::EC(ec) => {
+            let verification_algorithm =
+                ecdsa_verification_algorithm(&spki, &ec, algorithm, signature_value)?;
             let key = signature::UnparsedPublicKey::new(
                 verification_algorithm,
                 spki.subject_public_key.data,
@@ -160,6 +227,104 @@ fn verification_algorithm(
             uri: algorithm.uri().to_string(),
         }),
     }
+}
+
+fn ecdsa_verification_algorithm(
+    spki: &SubjectPublicKeyInfo<'_>,
+    ec: &ECPoint<'_>,
+    algorithm: SignatureAlgorithm,
+    signature_value: &[u8],
+) -> Result<&'static dyn signature::VerificationAlgorithm, SignatureVerificationError> {
+    let curve_oid = spki
+        .algorithm
+        .parameters
+        .as_ref()
+        .and_then(|params| params.as_oid().ok())
+        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+    let point_len = ec.key_size();
+
+    let (fixed_algorithm, asn1_algorithm) =
+        match (curve_oid.to_id_string().as_str(), point_len, algorithm) {
+            ("1.2.840.10045.3.1.7", 256, SignatureAlgorithm::EcdsaP256Sha256) => Ok((
+                &signature::ECDSA_P256_SHA256_FIXED,
+                &signature::ECDSA_P256_SHA256_ASN1,
+            )),
+            ("1.3.132.0.34", 384, SignatureAlgorithm::EcdsaP384Sha384) => Ok((
+                &signature::ECDSA_P384_SHA384_FIXED,
+                &signature::ECDSA_P384_SHA384_ASN1,
+            )),
+            ("1.2.840.10045.3.1.7", _, _) | ("1.3.132.0.34", _, _) | (_, 256, _) | (_, 384, _) => {
+                Err(SignatureVerificationError::UnsupportedAlgorithm {
+                    uri: algorithm.uri().to_string(),
+                })
+            }
+            _ => Err(SignatureVerificationError::InvalidKeyDer),
+        }?;
+
+    if uses_xmlsig_fixed_signature(signature_value, ec)? {
+        Ok(fixed_algorithm)
+    } else {
+        Ok(asn1_algorithm)
+    }
+}
+
+fn uses_xmlsig_fixed_signature(
+    signature_value: &[u8],
+    ec: &ECPoint<'_>,
+) -> Result<bool, SignatureVerificationError> {
+    let key_size_bytes = ec
+        .key_size()
+        .checked_div(8)
+        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+    let expected_len = key_size_bytes
+        .checked_mul(2)
+        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+
+    if signature_value.len() != expected_len {
+        if looks_like_der_sequence(signature_value) {
+            return Ok(false);
+        }
+        return Err(SignatureVerificationError::InvalidSignatureFormat);
+    }
+
+    Ok(true)
+}
+
+fn looks_like_der_sequence(signature_value: &[u8]) -> bool {
+    let Some((&tag, rest)) = signature_value.split_first() else {
+        return false;
+    };
+    if tag != 0x30 {
+        return false;
+    }
+
+    let Some((&len_byte, remainder)) = rest.split_first() else {
+        return false;
+    };
+
+    if len_byte & 0x80 == 0 {
+        return usize::from(len_byte) == remainder.len();
+    }
+
+    let len_len = usize::from(len_byte & 0x7f);
+    if len_len == 0 || len_len > std::mem::size_of::<usize>() || remainder.len() < len_len {
+        return false;
+    }
+
+    let (len_bytes, content) = remainder.split_at(len_len);
+    let mut declared_len = 0_usize;
+    for &byte in len_bytes {
+        declared_len = match declared_len.checked_mul(256) {
+            Some(len) => len,
+            None => return false,
+        };
+        declared_len = match declared_len.checked_add(usize::from(byte)) {
+            Some(len) => len,
+            None => return false,
+        };
+    }
+
+    declared_len == content.len()
 }
 
 #[cfg(test)]
