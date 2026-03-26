@@ -58,6 +58,12 @@ Apache-2.0
 
 ## Support the Project
 
+<div align="center">
+
 If `xml-sec` is useful in your stack, you can help fund continued implementation and maintenance.
 
-**TRX / TRC-20:** `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
+![USDT TRC-20 Donation QR Code](assets/usdt-qr.svg)
+
+USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
+
+</div>
