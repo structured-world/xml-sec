@@ -322,10 +322,12 @@ fn classify_ecdsa_signature_encoding(
         .checked_mul(2)
         .ok_or(SignatureVerificationError::InvalidKeyDer)?;
 
-    match inspect_der_encoded_ecdsa_signature(signature_value, component_len)? {
-        Some(()) => Ok(EcdsaSignatureEncoding::Asn1Der),
-        None if signature_value.len() == expected_len => Ok(EcdsaSignatureEncoding::XmlDsigFixed),
-        None => Err(SignatureVerificationError::InvalidSignatureFormat),
+    match inspect_der_encoded_ecdsa_signature(signature_value, component_len) {
+        Ok(Some(())) => Ok(EcdsaSignatureEncoding::Asn1Der),
+        Ok(None) | Err(_) if signature_value.len() == expected_len => {
+            Ok(EcdsaSignatureEncoding::XmlDsigFixed)
+        }
+        Ok(None) | Err(_) => Err(SignatureVerificationError::InvalidSignatureFormat),
     }
 }
 
@@ -340,9 +342,6 @@ fn inspect_der_encoded_ecdsa_signature(
         return Ok(None);
     }
 
-    // Do not silently fall back to raw `r || s` once input starts with DER
-    // SEQUENCE tag (0x30): malformed DER must stay a typed format error rather
-    // than being treated as an ordinary signature mismatch.
     let sequence = parse_der_length(rest)
         .ok_or(SignatureVerificationError::InvalidSignatureFormat)?
         .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;

@@ -13,7 +13,7 @@ use ring::signature::{
 };
 use xml_sec::c14n::canonicalize;
 use xml_sec::xmldsig::parse::{SignatureAlgorithm, find_signature_node, parse_signed_info};
-use xml_sec::xmldsig::signature::{
+use xml_sec::xmldsig::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_ecdsa_signature_spki,
 };
 
@@ -126,6 +126,58 @@ fn local_p384_signature_matches() {
     .expect("P-384 verification should not error on valid fixtures");
 
     assert!(valid, "locally signed P-384 signature should verify");
+}
+
+#[test]
+fn local_p384_raw_signature_with_der_like_prefix_matches() {
+    const MAX_ATTEMPTS: usize = 8192;
+
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha384-ecdsa-sha384.xml",
+    ));
+    let private_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime384v1-key.pem"));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem"));
+    let (signature_algorithm, canonical_signed_info, _) =
+        canonicalized_signed_info_and_signature(&xml);
+    assert_eq!(
+        SignatureAlgorithm::EcdsaP384Sha384,
+        signature_algorithm,
+        "fixture SignatureMethod should be EcdsaP384Sha384",
+    );
+
+    let pkcs8_der = x509_parser::pem::parse_x509_pem(private_key_pem.as_bytes())
+        .expect("fixture PEM should parse")
+        .1
+        .contents;
+    let rng = SystemRandom::new();
+    let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &pkcs8_der, &rng)
+        .expect("fixture PKCS#8 should parse");
+
+    for _ in 0..MAX_ATTEMPTS {
+        let signature = key_pair
+            .sign(&rng, &canonical_signed_info)
+            .expect("fixture P-384 key should sign");
+        if signature.as_ref().first().copied() != Some(0x30) {
+            continue;
+        }
+
+        let valid = verify_ecdsa_signature_pem(
+            SignatureAlgorithm::EcdsaP384Sha384,
+            &public_key_pem,
+            &canonical_signed_info,
+            signature.as_ref(),
+        );
+
+        assert!(
+            matches!(valid, Ok(true)),
+            "fixed-width signature with leading 0x30 must verify as raw r||s, got {valid:?}"
+        );
+        return;
+    }
+
+    panic!(
+        "failed to generate a fixed-width P-384 signature starting with 0x30 after {MAX_ATTEMPTS} attempts"
+    );
 }
 
 #[test]
@@ -295,12 +347,12 @@ fn signature_with_wrong_length_returns_typed_error() {
 }
 
 #[test]
-fn malformed_der_signature_returns_typed_error() {
+fn malformed_der_signature_with_non_raw_length_returns_typed_error() {
     let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem"));
     let malformed_der_signature = {
-        let mut signature = vec![0_u8; 96];
+        let mut signature = vec![0_u8; 95];
         signature[0] = 0x30;
-        signature[1] = 94;
+        signature[1] = 93;
         signature
     };
 
