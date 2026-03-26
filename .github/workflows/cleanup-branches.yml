@@ -38,8 +38,8 @@ jobs:
               .filter(b => b.name.startsWith("release-plz-"))
               .filter(b => !activeBranches.has(b.name))
               .map(b => b.name);
-            const toDelete = stale;
-            for (const branch of toDelete) {
+            let deletedCount = 0;
+            for (const branch of stale) {
               try {
                 await github.rest.git.deleteRef({
                   owner: context.repo.owner,
@@ -47,6 +47,7 @@ jobs:
                   ref: `heads/${branch}`
                 });
                 core.info(`Deleted: ${branch}`);
+                deletedCount += 1;
               } catch (e) {
                 if (e.status === 422) {
                   core.info(`Skip ${branch} (already deleted or protected)`);
@@ -55,4 +56,4 @@ jobs:
                 }
               }
             }
-            core.info(`Cleaned ${toDelete.length} of ${stale.length} release-plz branches`);
+            core.info(`Cleaned ${deletedCount} of ${stale.length} release-plz branches`);

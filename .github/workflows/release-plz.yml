@@ -12,6 +12,8 @@ concurrency:
 jobs:
   release-plz:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Generate token (SW Release Bot)
         id: app-token
