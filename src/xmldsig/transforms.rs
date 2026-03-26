@@ -225,22 +225,20 @@ fn parse_xpath_compat_transform(transform_node: Node) -> Result<Transform, Trans
         if tag.name() == "XPath" && tag.namespace() == Some(XMLDSIG_NS_URI) {
             if xpath_node.is_some() {
                 return Err(TransformError::UnsupportedTransform(
-                    "XPath transform must contain exactly one <ds:XPath> child element".into(),
+                    "XPath transform must contain exactly one XMLDSig <XPath> child element".into(),
                 ));
             }
             xpath_node = Some(child);
         } else {
             return Err(TransformError::UnsupportedTransform(
-                "XPath transform allows only a single <ds:XPath> child element in the XMLDSig namespace"
-                    .into(),
+                "XPath transform allows only a single XMLDSig <XPath> child element".into(),
             ));
         }
     }
 
     let xpath_node = xpath_node.ok_or_else(|| {
         TransformError::UnsupportedTransform(
-            "XPath transform requires a single <ds:XPath> child element in the XMLDSig namespace"
-                .into(),
+            "XPath transform requires a single XMLDSig <XPath> child element".into(),
         )
     })?;
 
