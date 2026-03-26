@@ -129,6 +129,19 @@ pub enum ParseError {
     #[error("base64 decode error: {0}")]
     Base64(String),
 
+    /// DigestValue length did not match the declared DigestMethod.
+    #[error(
+        "digest length mismatch for {algorithm}: expected {expected} bytes, got {actual} bytes"
+    )]
+    DigestLengthMismatch {
+        /// Digest algorithm URI/name used for diagnostics.
+        algorithm: &'static str,
+        /// Expected decoded digest length in bytes.
+        expected: usize,
+        /// Actual decoded digest length in bytes.
+        actual: usize,
+    },
+
     /// Transform parsing error.
     #[error("transform error: {0}")]
     Transform(#[from] super::types::TransformError),
@@ -159,10 +172,19 @@ pub fn parse_signed_info(signed_info_node: Node) -> Result<SignedInfo, ParseErro
     })?;
     verify_ds_element(c14n_node, "CanonicalizationMethod")?;
     let c14n_uri = required_algorithm_attr(c14n_node, "CanonicalizationMethod")?;
-    let c14n_method =
+    let mut c14n_method =
         C14nAlgorithm::from_uri(c14n_uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
             uri: c14n_uri.to_string(),
         })?;
+    if let Some(prefix_list) = parse_inclusive_prefixes(c14n_node)? {
+        if c14n_method.mode() == crate::c14n::C14nMode::Exclusive1_0 {
+            c14n_method = c14n_method.with_prefix_list(&prefix_list);
+        } else {
+            return Err(ParseError::UnsupportedAlgorithm {
+                uri: c14n_uri.to_string(),
+            });
+        }
+    }
 
     // 2. SignatureMethod (required, second)
     let sig_method_node = children.next().ok_or(ParseError::MissingElement {
@@ -231,7 +253,7 @@ fn parse_reference(reference_node: Node) -> Result<Reference, ParseError> {
     })?;
     verify_ds_element(digest_value_node, "DigestValue")?;
     let digest_b64 = digest_value_node.text().unwrap_or("");
-    let digest_value = base64_decode_digest(digest_b64)?;
+    let digest_value = base64_decode_digest(digest_b64, digest_method)?;
 
     // No more children expected
     if let Some(unexpected) = children.next() {
@@ -288,18 +310,57 @@ fn required_algorithm_attr<'a>(
     })
 }
 
+/// Parse the `PrefixList` attribute from an `<ec:InclusiveNamespaces>` child of
+/// `<CanonicalizationMethod>`, if present.
+///
+/// This mirrors transform parsing for Exclusive C14N and keeps SignedInfo
+/// canonicalization parameters lossless.
+fn parse_inclusive_prefixes(node: Node) -> Result<Option<String>, ParseError> {
+    const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+
+    for child in node.children() {
+        if child.is_element() {
+            let tag = child.tag_name();
+            if tag.name() == "InclusiveNamespaces" && tag.namespace() == Some(EXCLUSIVE_C14N_NS_URI)
+            {
+                return child
+                    .attribute("PrefixList")
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        ParseError::InvalidStructure(
+                            "missing PrefixList attribute on <InclusiveNamespaces>".into(),
+                        )
+                    })
+                    .map(Some);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 /// Base64-decode a digest value string, stripping whitespace.
 ///
 /// XMLDSig allows whitespace within base64 content (line-wrapped encodings).
-fn base64_decode_digest(b64: &str) -> Result<Vec<u8>, ParseError> {
+fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec<u8>, ParseError> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 
     // Strip all whitespace (newlines, spaces, tabs) before decoding
     let cleaned: String = b64.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    STANDARD
+    let digest = STANDARD
         .decode(&cleaned)
-        .map_err(|e| ParseError::Base64(e.to_string()))
+        .map_err(|e| ParseError::Base64(e.to_string()))?;
+    let expected = digest_method.output_len();
+    let actual = digest.len();
+    if actual != expected {
+        return Err(ParseError::DigestLengthMismatch {
+            algorithm: digest_method.uri(),
+            expected,
+            actual,
+        });
+    }
+    Ok(digest)
 }
 
 #[cfg(test)]
@@ -504,6 +565,27 @@ mod tests {
         assert!(si.references[0].uri.is_none());
     }
 
+    #[test]
+    fn parse_signed_info_preserves_inclusive_prefixes() {
+        let xml = r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                                 xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#">
+            <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#">
+                <ec:InclusiveNamespaces PrefixList="ds saml #default"/>
+            </CanonicalizationMethod>
+            <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+            <Reference URI="">
+                <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>
+            </Reference>
+        </SignedInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let si = parse_signed_info(doc.root_element()).unwrap();
+        assert!(si.c14n_method.inclusive_prefixes().contains("ds"));
+        assert!(si.c14n_method.inclusive_prefixes().contains("saml"));
+        assert!(si.c14n_method.inclusive_prefixes().contains(""));
+    }
+
     // ── parse_signed_info: error cases ───────────────────────────────
 
     #[test]
@@ -661,6 +743,51 @@ mod tests {
         let doc = Document::parse(xml).unwrap();
         let result = parse_signed_info(doc.root_element());
         assert!(matches!(result.unwrap_err(), ParseError::Base64(_)));
+    }
+
+    #[test]
+    fn digest_value_length_must_match_digest_method() {
+        let xml = r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+            <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+            <Reference URI="">
+                <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                <DigestValue>dGVzdA==</DigestValue>
+            </Reference>
+        </SignedInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let result = parse_signed_info(doc.root_element());
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::DigestLengthMismatch {
+                algorithm: "http://www.w3.org/2001/04/xmlenc#sha256",
+                expected: 32,
+                actual: 4,
+            }
+        ));
+    }
+
+    #[test]
+    fn inclusive_prefixes_on_inclusive_c14n_is_rejected() {
+        let xml = r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                                 xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#">
+            <CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315">
+                <ec:InclusiveNamespaces PrefixList="ds"/>
+            </CanonicalizationMethod>
+            <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+            <Reference URI="">
+                <DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+                <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>
+            </Reference>
+        </SignedInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let result = parse_signed_info(doc.root_element());
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::UnsupportedAlgorithm { .. }
+        ));
     }
 
     #[test]

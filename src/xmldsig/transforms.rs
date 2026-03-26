@@ -246,7 +246,7 @@ fn parse_xpath_compat_transform(transform_node: Node) -> Result<Transform, Trans
 
     let expr = xpath_node
         .text()
-        .map(|text| text.split_whitespace().collect::<String>())
+        .map(|text| text.trim().to_string())
         .unwrap_or_default();
 
     if expr == ENVELOPED_SIGNATURE_XPATH_EXPR {
@@ -735,6 +735,24 @@ mod tests {
 
         let result = parse_transforms(doc.root_element());
         assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TransformError::UnsupportedTransform(_)
+        ));
+    }
+
+    #[test]
+    fn parse_transforms_rejects_xpath_with_internal_whitespace_mutation() {
+        let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+                <XPath xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">
+                    not(ancestor-or-self::dsig:Signa ture)
+                </XPath>
+            </Transform>
+        </Transforms>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let result = parse_transforms(doc.root_element());
         assert!(matches!(
             result.unwrap_err(),
             TransformError::UnsupportedTransform(_)
