@@ -60,6 +60,6 @@ Apache-2.0
 
 If `xml-sec` is useful in your stack, you can help fund continued implementation and maintenance.
 
-![USDT TRC-20 Donation QR Code](https://raw.githubusercontent.com/structured-world/xml-sec/main/assets/usdt-qr.svg)
+![USDT TRC-20 Donation QR Code](assets/usdt-qr.svg)
 
 USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
