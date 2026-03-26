@@ -4,7 +4,6 @@
 //! canonicalized `<SignedInfo>` bytes plus a real RSA public key must verify
 //! against donor `SignatureValue` bytes for the declared `SignatureMethod`.
 
-use std::fs;
 use std::path::Path;
 
 use base64::Engine;
@@ -14,12 +13,8 @@ use xml_sec::xmldsig::signature::{
     SignatureVerificationError, verify_rsa_signature_pem, verify_rsa_signature_spki,
 };
 
-fn read_file(path: &str) -> String {
-    fs::read_to_string(path).unwrap_or_else(|err| panic!("failed to read {path}: {err}"))
-}
-
 fn read_fixture(path: &Path) -> String {
-    fs::read_to_string(path)
+    std::fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed to read fixture {}: {err}", path.display()))
 }
 
@@ -95,7 +90,7 @@ fn donor_rsa_sha1_signature_matches() {
 #[test]
 fn donor_rsa_sha256_signature_matches() {
     assert_donor_signature_valid(
-        Path::new("donors/xmlsec/tests/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml"),
+        Path::new("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml"),
         Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
         SignatureAlgorithm::RsaSha256,
     );
@@ -104,7 +99,7 @@ fn donor_rsa_sha256_signature_matches() {
 #[test]
 fn donor_rsa_sha384_signature_matches() {
     assert_donor_signature_valid(
-        Path::new("donors/xmlsec/tests/aleksey-xmldsig-01/enveloping-sha384-rsa-sha384.xml"),
+        Path::new("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha384-rsa-sha384.xml"),
         Path::new("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem"),
         SignatureAlgorithm::RsaSha384,
     );
@@ -113,7 +108,7 @@ fn donor_rsa_sha384_signature_matches() {
 #[test]
 fn donor_rsa_sha512_signature_matches() {
     assert_donor_signature_valid(
-        Path::new("donors/xmlsec/tests/aleksey-xmldsig-01/enveloping-sha512-rsa-sha512.xml"),
+        Path::new("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha512-rsa-sha512.xml"),
         Path::new("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem"),
         SignatureAlgorithm::RsaSha512,
     );
@@ -121,11 +116,10 @@ fn donor_rsa_sha512_signature_matches() {
 
 #[test]
 fn tampered_signed_info_fails_verification() {
-    let xml = read_file(
-        "/Users/polaz/projects/sw/xml-sec/donors/xmlsec/tests/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
-    );
-    let public_key_pem =
-        read_file("/Users/polaz/projects/sw/xml-sec/tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
     let (algorithm, mut canonical_signed_info, signature_value) =
         canonicalized_signed_info_and_signature(&xml);
 
@@ -148,11 +142,10 @@ fn tampered_signed_info_fails_verification() {
 
 #[test]
 fn wrong_spki_key_fails_verification() {
-    let xml = read_file(
-        "/Users/polaz/projects/sw/xml-sec/donors/xmlsec/tests/aleksey-xmldsig-01/enveloping-sha512-rsa-sha512.xml",
-    );
-    let public_key_pem =
-        read_file("/Users/polaz/projects/sw/xml-sec/tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha512-rsa-sha512.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
     let (algorithm, canonical_signed_info, signature_value) =
         canonicalized_signed_info_and_signature(&xml);
 
