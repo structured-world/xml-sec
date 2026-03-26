@@ -34,7 +34,11 @@ jobs:
                 });
                 core.info(`Deleted: ${branch}`);
               } catch (e) {
-                core.info(`Skip ${branch}: ${e.message}`);
+                if (e.status === 422) {
+                  core.info(`Skip ${branch} (already deleted or protected)`);
+                } else {
+                  core.warning(`Failed to delete ${branch}: ${e.message}`);
+                }
               }
             }
             core.info(`Cleaned ${toDelete.length} of ${stale.length} release-plz branches`);
