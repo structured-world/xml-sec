@@ -260,9 +260,10 @@ fn parse_xpath_compat_transform(transform_node: Node) -> Result<Transform, Trans
             ))
         }
     } else {
-        Err(TransformError::UnsupportedTransform(format!(
-            "unsupported XPath expression: {expr}"
-        )))
+        Err(TransformError::UnsupportedTransform(
+            "unsupported XPath expression in compatibility transform; only `not(ancestor-or-self::dsig:Signature)` is supported"
+                .into(),
+        ))
     }
 }
 

@@ -19,8 +19,8 @@ use xml_sec::xmldsig::verify::{process_all_references, process_reference};
 
 // ── Helper ───────────────────────────────────────────────────────────────────
 
-/// Compute the correct SHA-256 digest for a Reference's URI+transforms and
-/// return it as base64 for embedding in test XML.
+/// Compute the correct digest for a Reference's URI+transforms with the
+/// requested algorithm and return it as base64 for embedding in test XML.
 fn compute_reference_digest_b64(
     doc: &roxmltree::Document<'_>,
     sig_node: roxmltree::Node<'_, '_>,
