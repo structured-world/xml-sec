@@ -44,6 +44,7 @@ pub enum SignatureAlgorithm {
 
 impl SignatureAlgorithm {
     /// Parse from an XML algorithm URI.
+    #[must_use]
     pub fn from_uri(uri: &str) -> Option<Self> {
         match uri {
             "http://www.w3.org/2000/09/xmldsig#rsa-sha1" => Some(Self::RsaSha1),

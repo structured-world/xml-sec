@@ -29,8 +29,6 @@ base64 = "0.22"
 # Error handling
 thiserror = "2"
 
-[dev-dependencies]
-
 [features]
 default = ["xmldsig", "c14n"]
 xmldsig = []           # XML Digital Signatures (sign + verify)
