@@ -469,7 +469,7 @@ mod tests {
                     <Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
                 </Transforms>
                 <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                <DigestValue>dGVzdA==</DigestValue>
+                <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>
             </Reference>
         </SignedInfo>"#;
         let doc = Document::parse(xml).unwrap();
@@ -481,7 +481,7 @@ mod tests {
         let r = &si.references[0];
         assert_eq!(r.uri.as_deref(), Some(""));
         assert_eq!(r.digest_method, DigestAlgorithm::Sha256);
-        assert_eq!(r.digest_value, b"test"); // "dGVzdA==" decodes to "test"
+        assert_eq!(r.digest_value, vec![0u8; 32]);
         assert_eq!(r.transforms.len(), 2);
     }
 
@@ -492,11 +492,11 @@ mod tests {
             <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"/>
             <Reference URI="#a">
                 <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                <DigestValue>AAAA</DigestValue>
+                <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>
             </Reference>
             <Reference URI="#b">
                 <DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
-                <DigestValue>AQID</DigestValue>
+                <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>
             </Reference>
         </SignedInfo>"##;
         let doc = Document::parse(xml).unwrap();
@@ -518,7 +518,7 @@ mod tests {
             <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
             <Reference URI="#obj">
                 <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                <DigestValue>dGVzdA==</DigestValue>
+                <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>
             </Reference>
         </SignedInfo>"##;
         let doc = Document::parse(xml).unwrap();
@@ -534,7 +534,7 @@ mod tests {
             <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
             <Reference URI="#data" Id="ref1" Type="http://www.w3.org/2000/09/xmldsig#Object">
                 <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                <DigestValue>dGVzdA==</DigestValue>
+                <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>
             </Reference>
         </SignedInfo>"##;
         let doc = Document::parse(xml).unwrap();
@@ -557,7 +557,7 @@ mod tests {
             <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
             <Reference>
                 <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                <DigestValue>dGVzdA==</DigestValue>
+                <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>
             </Reference>
         </SignedInfo>"#;
         let doc = Document::parse(xml).unwrap();
@@ -797,7 +797,7 @@ mod tests {
             <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
             <Reference URI="">
                 <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                <DigestValue>dGVzdA==</DigestValue>
+                <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>
                 <Unexpected/>
             </Reference>
         </SignedInfo>"#;
@@ -828,18 +828,18 @@ mod tests {
     fn base64_with_whitespace() {
         let xml = r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-            <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+            <SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/>
             <Reference URI="">
-                <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                <DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
                 <DigestValue>
-                    dGVz
-                    dA==
+                    AAAAAAAA
+                    AAAAAAAAAAAAAAAAAAA=
                 </DigestValue>
             </Reference>
         </SignedInfo>"#;
         let doc = Document::parse(xml).unwrap();
         let si = parse_signed_info(doc.root_element()).unwrap();
-        assert_eq!(si.references[0].digest_value, b"test");
+        assert_eq!(si.references[0].digest_value, vec![0u8; 20]);
     }
 
     // ── Real-world SAML structure ────────────────────────────────────
@@ -852,11 +852,11 @@ mod tests {
                 <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
                 <ds:Reference URI="#_resp1">
                     <ds:Transforms>
-                        <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
-                        <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+                    <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+                    <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
                     </ds:Transforms>
                     <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                    <ds:DigestValue>aGVsbG8=</ds:DigestValue>
+                    <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
                 </ds:Reference>
             </ds:SignedInfo>
             <ds:SignatureValue>ZmFrZQ==</ds:SignatureValue>
@@ -875,6 +875,6 @@ mod tests {
         assert_eq!(si.references.len(), 1);
         assert_eq!(si.references[0].uri.as_deref(), Some("#_resp1"));
         assert_eq!(si.references[0].transforms.len(), 2);
-        assert_eq!(si.references[0].digest_value, b"hello");
+        assert_eq!(si.references[0].digest_value, vec![0u8; 32]);
     }
 }
