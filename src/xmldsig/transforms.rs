@@ -197,14 +197,31 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
 /// the xmlsec1 donor-vector expression that is semantically equivalent to the
 /// enveloped-signature transform.
 fn parse_xpath_compat_transform(transform_node: Node) -> Result<Transform, TransformError> {
-    let xpath_node = transform_node
-        .children()
-        .find(|child| child.is_element() && child.tag_name().name() == "XPath")
-        .ok_or_else(|| {
-            TransformError::UnsupportedTransform(
-                "XPath transform requires a <XPath> child element".into(),
-            )
-        })?;
+    let mut xpath_node = None;
+
+    for child in transform_node.children().filter(|node| node.is_element()) {
+        let tag = child.tag_name();
+        if tag.name() == "XPath" && tag.namespace() == Some(XMLDSIG_NS_URI) {
+            if xpath_node.is_some() {
+                return Err(TransformError::UnsupportedTransform(
+                    "XPath transform must contain exactly one <ds:XPath> child element".into(),
+                ));
+            }
+            xpath_node = Some(child);
+        } else {
+            return Err(TransformError::UnsupportedTransform(
+                "XPath transform allows only a single <ds:XPath> child element in the XMLDSig namespace"
+                    .into(),
+            ));
+        }
+    }
+
+    let xpath_node = xpath_node.ok_or_else(|| {
+        TransformError::UnsupportedTransform(
+            "XPath transform requires a single <ds:XPath> child element in the XMLDSig namespace"
+                .into(),
+        )
+    })?;
 
     let expr = xpath_node
         .text()
@@ -645,6 +662,67 @@ mod tests {
         let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">
             <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
                 <XPath>self::node()</XPath>
+            </Transform>
+        </Transforms>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let result = parse_transforms(doc.root_element());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TransformError::UnsupportedTransform(_)
+        ));
+    }
+
+    #[test]
+    fn parse_transforms_rejects_xpath_in_wrong_namespace() {
+        let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+                <foo:XPath xmlns:foo="http://example.com/ns">
+                    not(ancestor-or-self::dsig:Signature)
+                </foo:XPath>
+            </Transform>
+        </Transforms>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let result = parse_transforms(doc.root_element());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TransformError::UnsupportedTransform(_)
+        ));
+    }
+
+    #[test]
+    fn parse_transforms_rejects_multiple_xpath_children() {
+        let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+                <XPath xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">
+                    not(ancestor-or-self::dsig:Signature)
+                </XPath>
+                <XPath xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">
+                    not(ancestor-or-self::dsig:Signature)
+                </XPath>
+            </Transform>
+        </Transforms>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let result = parse_transforms(doc.root_element());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TransformError::UnsupportedTransform(_)
+        ));
+    }
+
+    #[test]
+    fn parse_transforms_rejects_non_xpath_element_children() {
+        let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+                <XPath xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">
+                    not(ancestor-or-self::dsig:Signature)
+                </XPath>
+                <Extra/>
             </Transform>
         </Transforms>"#;
         let doc = Document::parse(xml).unwrap();
