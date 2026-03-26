@@ -29,7 +29,7 @@ Every SAML, SOAP, and WS-Security implementation depends on libxmlsec1 — a C l
 
 **Pre-release.** API is unstable. Not ready for production use.
 
-Currently implemented:
+Currently implemented (core paths):
 - C14N 1.0, C14N 1.1, and Exclusive C14N
 - XMLDSig parsing, same-document URI dereference, transform chains, and digest verification
 - RSA PKCS#1 v1.5 verification helpers for SHA-1 / SHA-256 / SHA-384 / SHA-512
@@ -46,9 +46,9 @@ Current MSRV: Rust 1.92.
 
 | Spec | Status |
 |------|--------|
-| [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) | In progress |
-| [Exclusive C14N](https://www.w3.org/TR/xml-exc-c14n/) | In progress |
-| [XMLDSig](https://www.w3.org/TR/xmldsig-core1/) | In progress |
+| [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) | Partially implemented |
+| [Exclusive C14N](https://www.w3.org/TR/xml-exc-c14n/) | Partially implemented |
+| [XMLDSig](https://www.w3.org/TR/xmldsig-core1/) | Partially implemented |
 | [XMLEnc](https://www.w3.org/TR/xmlenc-core1/) | Planned |
 
 ## License

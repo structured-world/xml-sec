@@ -123,8 +123,10 @@ fn tampered_signed_info_fails_verification() {
     let (algorithm, mut canonical_signed_info, signature_value) =
         canonicalized_signed_info_and_signature(&xml);
 
-    let last_index = canonical_signed_info.len() - 1;
-    canonical_signed_info[last_index] ^= 0x01;
+    let last = canonical_signed_info
+        .last_mut()
+        .expect("canonical SignedInfo should not be empty");
+    *last ^= 0x01;
 
     let valid = verify_rsa_signature_pem(
         algorithm,
@@ -141,7 +143,7 @@ fn tampered_signed_info_fails_verification() {
 }
 
 #[test]
-fn wrong_spki_key_fails_verification() {
+fn wrong_public_key_pem_fails_verification() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha512-rsa-sha512.xml",
     ));

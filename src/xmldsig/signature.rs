@@ -117,10 +117,15 @@ mod tests {
 
     #[test]
     fn ecdsa_algorithms_are_rejected_for_rsa_verification() {
-        let err = verification_algorithm(SignatureAlgorithm::EcdsaP256Sha256).unwrap_err();
-        assert!(matches!(
-            err,
-            SignatureVerificationError::UnsupportedAlgorithm { .. }
-        ));
+        for algorithm in [
+            SignatureAlgorithm::EcdsaP256Sha256,
+            SignatureAlgorithm::EcdsaP384Sha384,
+        ] {
+            let err = verification_algorithm(algorithm).unwrap_err();
+            assert!(matches!(
+                err,
+                SignatureVerificationError::UnsupportedAlgorithm { .. }
+            ));
+        }
     }
 }
