@@ -6,7 +6,7 @@ Pure Rust XML Security library. Drop-in replacement for libxmlsec1.
 
 > [!WARNING]
 > Early-stage pre-release. The API is unstable, XMLDSig/XMLEnc coverage is still incomplete,
-> and this crate should not yet be used for production security decisions.
+> and this crate should not yet be used in production.
 
 ## Features
 

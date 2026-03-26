@@ -45,6 +45,7 @@ pub enum SignatureVerificationError {
 ///
 /// The PEM must contain a `PUBLIC KEY` block. Returns `Ok(false)` for signature
 /// mismatch and `Err` for algorithm/key preparation errors.
+#[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_rsa_signature_pem(
     algorithm: SignatureAlgorithm,
     public_key_pem: &str,
@@ -68,6 +69,7 @@ pub fn verify_rsa_signature_pem(
 /// The input must be an X.509 `SubjectPublicKeyInfo` wrapping an RSA key.
 /// Returns `Ok(false)` for signature mismatch and `Err` for algorithm/key
 /// preparation errors.
+#[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_rsa_signature_spki(
     algorithm: SignatureAlgorithm,
     public_key_spki_der: &[u8],
@@ -111,6 +113,9 @@ fn validate_rsa_public_key(
     if modulus.is_empty() {
         return Err(SignatureVerificationError::InvalidKeyDer);
     }
+    // Match ring's RSA parameter checks: modulus length is evaluated after
+    // rounding up to the nearest whole byte, not by exact significant-bit
+    // length of the highest non-zero byte.
     let modulus_bits = modulus
         .len()
         .checked_mul(8)
