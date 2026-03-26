@@ -8,7 +8,9 @@ use std::path::Path;
 
 use base64::Engine;
 use ring::rand::SystemRandom;
-use ring::signature::{ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair};
+use ring::signature::{
+    ECDSA_P384_SHA384_ASN1_SIGNING, ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair,
+};
 use xml_sec::c14n::canonicalize;
 use xml_sec::xmldsig::parse::{SignatureAlgorithm, find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::signature::{
@@ -96,7 +98,13 @@ fn local_p384_signature_matches() {
     ));
     let private_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime384v1-key.pem"));
     let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem"));
-    let (_, canonical_signed_info, _) = canonicalized_signed_info_and_signature(&xml);
+    let (signature_algorithm, canonical_signed_info, _) =
+        canonicalized_signed_info_and_signature(&xml);
+    assert_eq!(
+        SignatureAlgorithm::EcdsaP384Sha384,
+        signature_algorithm,
+        "fixture SignatureMethod should be EcdsaP384Sha384",
+    );
 
     let pkcs8_der = x509_parser::pem::parse_x509_pem(private_key_pem.as_bytes())
         .expect("fixture PEM should parse")
@@ -118,6 +126,43 @@ fn local_p384_signature_matches() {
     .expect("P-384 verification should not error on valid fixtures");
 
     assert!(valid, "locally signed P-384 signature should verify");
+}
+
+#[test]
+fn local_p384_der_signature_matches() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha384-ecdsa-sha384.xml",
+    ));
+    let private_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime384v1-key.pem"));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem"));
+    let (signature_algorithm, canonical_signed_info, _) =
+        canonicalized_signed_info_and_signature(&xml);
+    assert_eq!(
+        SignatureAlgorithm::EcdsaP384Sha384,
+        signature_algorithm,
+        "fixture SignatureMethod should be EcdsaP384Sha384",
+    );
+
+    let pkcs8_der = x509_parser::pem::parse_x509_pem(private_key_pem.as_bytes())
+        .expect("fixture PEM should parse")
+        .1
+        .contents;
+    let rng = SystemRandom::new();
+    let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, &pkcs8_der, &rng)
+        .expect("fixture PKCS#8 should parse");
+    let signature = key_pair
+        .sign(&rng, &canonical_signed_info)
+        .expect("fixture P-384 key should sign");
+
+    let valid = verify_ecdsa_signature_pem(
+        SignatureAlgorithm::EcdsaP384Sha384,
+        &public_key_pem,
+        &canonical_signed_info,
+        signature.as_ref(),
+    )
+    .expect("P-384 DER verification should not error on valid fixtures");
+
+    assert!(valid, "locally signed DER P-384 signature should verify");
 }
 
 #[test]
@@ -149,7 +194,7 @@ fn tampered_signed_info_fails_verification() {
 }
 
 #[test]
-fn curve_mismatched_public_key_returns_unsupported_algorithm() {
+fn curve_mismatched_public_key_returns_typed_key_error() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
     ));
@@ -167,7 +212,7 @@ fn curve_mismatched_public_key_returns_unsupported_algorithm() {
 
     assert!(matches!(
         err,
-        SignatureVerificationError::UnsupportedAlgorithm { .. }
+        SignatureVerificationError::KeyAlgorithmMismatch { .. }
     ));
 }
 
@@ -242,6 +287,30 @@ fn signature_with_wrong_length_returns_typed_error() {
         &[0_u8; 63],
     )
     .expect_err("odd-sized XMLDSig ECDSA signature should be rejected");
+
+    assert!(matches!(
+        err,
+        SignatureVerificationError::InvalidSignatureFormat
+    ));
+}
+
+#[test]
+fn malformed_der_signature_returns_typed_error() {
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem"));
+    let malformed_der_signature = {
+        let mut signature = vec![0_u8; 96];
+        signature[0] = 0x30;
+        signature[1] = 94;
+        signature
+    };
+
+    let err = verify_ecdsa_signature_pem(
+        SignatureAlgorithm::EcdsaP384Sha384,
+        &public_key_pem,
+        b"payload",
+        &malformed_der_signature,
+    )
+    .expect_err("malformed DER-encoded signature should be rejected");
 
     assert!(matches!(
         err,
