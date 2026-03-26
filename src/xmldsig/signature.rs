@@ -340,6 +340,9 @@ fn inspect_der_encoded_ecdsa_signature(
         return Ok(None);
     }
 
+    // Do not silently fall back to raw `r || s` once input starts with DER
+    // SEQUENCE tag (0x30): malformed DER must stay a typed format error rather
+    // than being treated as an ordinary signature mismatch.
     let sequence = parse_der_length(rest)
         .ok_or(SignatureVerificationError::InvalidSignatureFormat)?
         .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
