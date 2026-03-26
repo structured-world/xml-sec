@@ -8,10 +8,10 @@ use std::collections::{HashMap, HashSet};
 
 use roxmltree::{Document, Node, NodeType};
 
+use super::C14nError;
 use super::escape::{escape_attr, escape_cr, escape_text};
 use super::prefix::{attribute_prefix, element_prefix};
 use super::xml_base::{compute_effective_xml_base, resolve_uri};
-use super::C14nError;
 
 /// The XML namespace URI.
 ///
@@ -143,10 +143,8 @@ fn serialize_children(
                 if in_set {
                     // Document-level text nodes are ignored by C14N.
                     // Only text inside elements is serialized.
-                    if !is_doc_root {
-                        if let Some(text) = child.text() {
-                            escape_text(text, output);
-                        }
+                    if !is_doc_root && let Some(text) = child.text() {
+                        escape_text(text, output);
                     }
                 }
             }
@@ -164,20 +162,18 @@ fn serialize_children(
                 }
             }
             NodeType::PI => {
-                if in_set {
-                    if let Some(pi) = child.pi() {
-                        if is_doc_root {
-                            write_doc_level_separator(&child, output);
-                        }
-                        output.extend_from_slice(b"<?");
-                        output.extend_from_slice(pi.target.as_bytes());
-                        if let Some(value) = pi.value {
-                            output.push(b' ');
-                            // C14N spec: \r in PI content must be escaped to &#xD;
-                            escape_cr(value, output);
-                        }
-                        output.extend_from_slice(b"?>");
+                if in_set && let Some(pi) = child.pi() {
+                    if is_doc_root {
+                        write_doc_level_separator(&child, output);
                     }
+                    output.extend_from_slice(b"<?");
+                    output.extend_from_slice(pi.target.as_bytes());
+                    if let Some(value) = pi.value {
+                        output.push(b' ');
+                        // C14N spec: \r in PI content must be escaped to &#xD;
+                        escape_cr(value, output);
+                    }
+                    output.extend_from_slice(b"?>");
                 }
             }
             NodeType::Root => {
@@ -389,10 +385,11 @@ fn collect_inherited_xml_attrs<'a>(
 
     // If parent element is in the node set, no inheritance needed — the parent
     // will render its own xml:* attributes, and the element inherits normally.
-    if let Some(parent) = node.parent() {
-        if parent.is_element() && pred(parent) {
-            return Vec::new();
-        }
+    if let Some(parent) = node.parent()
+        && parent.is_element()
+        && pred(parent)
+    {
+        return Vec::new();
     }
 
     // Collect inheritable xml:* attr names already on this element (own attrs

@@ -8,9 +8,20 @@
 //! - ID attribute resolution with configurable attribute names
 //! - Node set types for the transform pipeline
 
+pub mod digest;
+pub mod parse;
 pub mod transforms;
 pub mod types;
 pub mod uri;
+pub mod verify;
 
-pub use transforms::{execute_transforms, parse_transforms, Transform};
+pub use digest::{DigestAlgorithm, compute_digest, constant_time_eq};
+pub use parse::{
+    ParseError, Reference, SignatureAlgorithm, SignedInfo, find_signature_node, parse_signed_info,
+};
+pub use transforms::{Transform, execute_transforms, parse_transforms};
 pub use types::{NodeSet, TransformData, TransformError};
+pub use verify::{
+    ReferenceProcessingError, ReferenceResult, ReferencesResult, process_all_references,
+    process_reference,
+};

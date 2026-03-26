@@ -11,9 +11,9 @@
 //! - `c14n::canonicalize` (C14N serializer)
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
-use xml_sec::xmldsig::transforms::{execute_transforms, parse_transforms, Transform};
-use xml_sec::xmldsig::uri::UriReferenceResolver;
 use xml_sec::xmldsig::NodeSet;
+use xml_sec::xmldsig::transforms::{Transform, execute_transforms, parse_transforms};
+use xml_sec::xmldsig::uri::UriReferenceResolver;
 
 // ── Helper ───────────────────────────────────────────────────────────────────
 

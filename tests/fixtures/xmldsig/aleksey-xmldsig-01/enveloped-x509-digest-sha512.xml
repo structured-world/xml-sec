@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Envelope xmlns="urn:envelope">
+  <Data>
+	Hello, World!
+  </Data>
+  <Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
+    <SignedInfo>
+      <CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/>
+      <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha512"/>
+      <Reference URI="">
+        <Transforms>
+          <Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+            <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+            <XPath xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">not(ancestor-or-self::dsig:Signature)</XPath>
+            </Transform>
+        </Transforms>
+        <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha512"/>
+        <DigestValue>j12SN+LRqX4RricEwl5iEpjyand0nCMO8T5dNYR5P661F2ZrUS5wSbyMdu826KrG
+IQbvvjmkI+9+QmCrcJyXXA==</DigestValue>
+      </Reference>
+    </SignedInfo>
+    <SignatureValue>C6FvmpCXHeyuGWNi+Y4diAcAZsc4DjPr+N2pkwmYXyOBdua++UG6dduTBSuHjU3I
+EgQOWwp5zi4qdJ/J+DsWbU2vxNYNHAVsFnsEbjQDO4MQU4zXJTKntbHwPqxgNjH5
+r3YZlSdkiYtwcDxAPmhVkRdmkhqbpN6hm5CcrQiHkyLHcJ7o2sjRez1zMLl98MSa
+UG9h/OlndfUhySANPL4tw3dbJmYLX1q26lBdXTd2WoxMnPxxrQAV5CzvyODsWqaO
+7wZdun0o6YILPonOgqhFE5mEP9uvUt7ybEmwwhjl2uUqS3d2QVtTd8K47gprV2hW
+6K+cYplpQsQnC/P3SD39mP01umGG9l5xhETHSm71Z/TpJZ/hqj9CWBxjRG/bLQho
+RaDrYlpYUoQhqq8gxK+dJRJwXPQHBym0F0GsTmKNHhA49lxajl1VJyZhji4J9eod
+jA0GEWS5K3M/hv6bKPJWofiSvbG8U/ZBbSot1SFus0QBiFAHW9tpYZb4stVpAai7
+hkN3PIHweyUC3SY8Jh3JKXUFY3K/z4ER7RJ1kUfCYr1EdXC61whk6A1KKto10Z3j
+qAaG7BDdzBQvT6wZlgyspbTtTkB1KNn85RY2pNoyiGgGH9ZUpu5IYmWIf96DWl+b
+4rEzUr3wLLtLIgR5rZeeWD6Mqbqhod8pD7JIi8Jj6PU=</SignatureValue>
+    <KeyInfo>
+      <X509Data>
+        <X509Digest xmlns="http://www.w3.org/2009/xmldsig11#" Algorithm="http://www.w3.org/2001/04/xmlenc#sha512">
+        KRwh8Pv3wdTVlPlwwfc1wEygbxzxCtffw/A0zv7ChDV2Wgm3hSrvCAQXE0+5grrE
+        yTlxGTAsUCDBkpj+2LWRyw==
+        </X509Digest>
+        <X509Digest xmlns="http://www.w3.org/2009/xmldsig11#" Algorithm="http://www.w3.org/2001/04/xmlenc#sha512">
+        FNQ+V2gqs3/iDH0wVX4LgD9NrpUQhVZagsprDp42ZqmshnJjgRyPzOj++vqoghmv
+        FLVP3GJNhVZAQ8t38EBmmw==
+        </X509Digest>
+        <X509Digest xmlns="http://www.w3.org/2009/xmldsig11#" Algorithm="http://www.w3.org/2001/04/xmlenc#sha512">
+        yEAfGbAx03oA3KW+y4Bl0A9lGY8AiS4Gzd4CCDNUor+UtQltf05VeO1OfkOjmSZQ
+        5m59F7bTmgC9Yni/og1oRw==
+        </X509Digest>
+      </X509Data>
+    </KeyInfo>
+  </Signature>
+</Envelope>

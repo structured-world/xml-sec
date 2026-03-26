@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::fs;
 
 use ring::digest;
-use xml_sec::c14n::{canonicalize, canonicalize_xml, C14nAlgorithm, C14nMode};
+use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize, canonicalize_xml};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -196,7 +196,7 @@ fn find_element_by_id<'a>(
 }
 
 /// Build a node-set predicate that includes a node and all its descendants.
-fn subtree_predicate(root: roxmltree::Node) -> impl Fn(roxmltree::Node) -> bool {
+fn subtree_predicate(root: roxmltree::Node) -> impl Fn(roxmltree::Node) -> bool + use<> {
     let mut ids = HashSet::new();
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {

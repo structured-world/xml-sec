@@ -25,6 +25,9 @@ Every SAML, SOAP, and WS-Security implementation depends on libxmlsec1 — a C l
 
 **Pre-release.** API is unstable. Not ready for production use.
 
+Current toolchain target: latest stable Rust.
+Current MSRV: Rust 1.92.
+
 ## Specifications
 
 | Spec | Status |

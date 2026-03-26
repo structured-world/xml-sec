@@ -10,21 +10,51 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
-  build:
+  build-matrix:
+    name: build-matrix (${{ matrix.rust }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.92.0"]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-features
 
-  test:
+  build:
     runs-on: ubuntu-latest
+    needs: build-matrix
+    if: ${{ always() }}
+    steps:
+      - run: test "${{ needs.build-matrix.result }}" = "success"
+
+  test-matrix:
+    name: test-matrix (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.92.0"]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features
+      - run: cargo nextest run --all-features
+      - run: cargo test --doc --all-features
+
+  test:
+    runs-on: ubuntu-latest
+    needs: test-matrix
+    if: ${{ always() }}
+    steps:
+      - run: test "${{ needs.test-matrix.result }}" = "success"
 
   clippy:
     runs-on: ubuntu-latest

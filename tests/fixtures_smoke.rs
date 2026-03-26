@@ -175,8 +175,8 @@ fn fixture_file_count_matches_expected() {
     let mut count = 0;
     count_files_recursive(fixtures_dir(), &mut count);
     assert_eq!(
-        count, 62,
-        "expected 62 fixture files total (21 keys + 41 c14n); \
+        count, 66,
+        "expected 66 fixture files total (21 keys + 41 c14n + 4 donor xmldsig); \
          if you added/removed files, update this count"
     );
 }

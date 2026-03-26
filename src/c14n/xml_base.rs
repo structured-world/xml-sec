@@ -44,13 +44,13 @@ pub(crate) fn compute_effective_xml_base(
             // xml:base in the canonical output. However, we still collect
             // its xml:base value as the resolution seed, so that the
             // omitted chain below resolves against an absolute base.
-            if let Some(pred) = node_set {
-                if pred(n) {
-                    if let Some(base) = xml_base_value(n) {
-                        bases.push(base);
-                    }
-                    break;
+            if let Some(pred) = node_set
+                && pred(n)
+            {
+                if let Some(base) = xml_base_value(n) {
+                    bases.push(base);
                 }
+                break;
             }
             if let Some(base) = xml_base_value(n) {
                 bases.push(base);
@@ -157,10 +157,10 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
     if let Some(rest) = ref_path.strip_prefix("//") {
         let mut auth_end = rest.len();
         for ch in ['/', '?', '#'] {
-            if let Some(pos) = rest.find(ch) {
-                if pos < auth_end {
-                    auth_end = pos;
-                }
+            if let Some(pos) = rest.find(ch)
+                && pos < auth_end
+            {
+                auth_end = pos;
             }
         }
         let new_authority = &rest[..auth_end];
@@ -235,10 +235,10 @@ fn parse_base(base: &str) -> Option<BaseParts<'_>> {
         rest = &rest[2..];
         let mut auth_end = rest.len();
         for ch in ['/', '?', '#'] {
-            if let Some(pos) = rest.find(ch) {
-                if pos < auth_end {
-                    auth_end = pos;
-                }
+            if let Some(pos) = rest.find(ch)
+                && pos < auth_end
+            {
+                auth_end = pos;
             }
         }
         authority = Some(&rest[..auth_end]);
