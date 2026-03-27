@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use xml_sec::xmldsig::verify_signature_with_pem_key;
+use xml_sec::xmldsig::{SignatureVerificationPipelineError, verify_signature_with_pem_key};
 
 fn read_fixture(path: &Path) -> String {
     std::fs::read_to_string(path)
@@ -42,6 +42,33 @@ fn mutate_ds_tag_content(xml: &str, tag: &str) -> String {
         chars[index] = if *value == 'A' { 'B' } else { 'A' };
     } else {
         panic!("tag {tag} did not contain any mutable base64 chars");
+    }
+
+    let mutated = chars.into_iter().collect::<String>();
+    format!("{}{}{}", &xml[..start], mutated, &xml[end..])
+}
+
+fn inject_invalid_base64_in_signature_value(xml: &str) -> String {
+    let open = "<SignatureValue>";
+    let close = "</SignatureValue>";
+    let start = xml
+        .find(open)
+        .unwrap_or_else(|| panic!("missing opening tag {open}"))
+        + open.len();
+    let end = xml[start..]
+        .find(close)
+        .unwrap_or_else(|| panic!("missing closing tag {close}"))
+        + start;
+
+    let mut chars: Vec<char> = xml[start..end].chars().collect();
+    if let Some((index, _)) = chars
+        .iter()
+        .enumerate()
+        .find(|(_, ch)| ch.is_ascii_alphanumeric())
+    {
+        chars[index] = '!';
+    } else {
+        panic!("SignatureValue did not contain any mutable base64 chars");
     }
 
     let mutated = chars.into_iter().collect::<String>();
@@ -123,4 +150,21 @@ fn tampered_digest_value_fails_before_signature_stage() {
         "signature stage must not run after reference failure"
     );
     assert!(!result.signature_valid, "result should be invalid");
+}
+
+#[test]
+fn malformed_signature_value_base64_returns_decode_error() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let tampered_xml = inject_invalid_base64_in_signature_value(&xml);
+
+    let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect_err("malformed SignatureValue base64 must fail decode stage");
+
+    assert!(matches!(
+        err,
+        SignatureVerificationPipelineError::SignatureValueBase64(_)
+    ));
 }

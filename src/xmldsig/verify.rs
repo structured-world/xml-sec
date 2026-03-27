@@ -165,6 +165,7 @@ pub enum ReferenceProcessingError {
 
 /// End-to-end XMLDSig verification result for one `<Signature>`.
 #[derive(Debug)]
+#[must_use = "inspect signature_valid (and signature_checked for stage diagnostics) before accepting the document"]
 pub struct SignatureVerificationResult {
     /// Reference validation results from `<SignedInfo>`.
     pub references: ReferencesResult,
