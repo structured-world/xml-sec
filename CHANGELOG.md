@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/structured-world/xml-sec/compare/v0.1.1...v0.1.2) - 2026-03-27
+
+### Added
+
+- *(xmldsig)* add ecdsa signature verification
+
+### Documentation
+
+- *(xmldsig)* clarify strict der parsing fallback
+
+### Fixed
+
+- *(xmldsig)* reject non-ecdsa algorithms early
+- *(xmldsig)* tighten ecdsa der classification
+- *(xmldsig)* cover spki happy path and der parsing
+- *(xmldsig)* align signature format error mapping
+- *(xmldsig)* retry fixed verifier for ambiguous ecdsa
+- *(xmldsig)* prefer raw width and round ec bytes
+- *(xmldsig)* harden ecdsa key validation
+- *(xmldsig)* handle raw signatures with 0x30 prefix
+- *(xmldsig)* harden ecdsa signature parsing
+
 ## [0.1.1](https://github.com/structured-world/xml-sec/compare/v0.1.0...v0.1.1) - 2026-03-26
 
 ### Added
