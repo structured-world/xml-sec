@@ -167,13 +167,27 @@ pub fn verify_ecdsa_signature_spki(
     match public_key {
         PublicKey::EC(ec) => {
             validate_ec_public_key_encoding(&ec, &spki.subject_public_key.data)?;
-            let verification_algorithm =
-                ecdsa_verification_algorithm(&spki, &ec, algorithm, signature_value)?;
-            let key = signature::UnparsedPublicKey::new(
-                verification_algorithm,
-                spki.subject_public_key.data,
-            );
-            Ok(key.verify(signed_data, signature_value).is_ok())
+            let (fixed_algorithm, asn1_algorithm, signature_encoding) =
+                ecdsa_verification_algorithms(&spki, &ec, algorithm, signature_value)?;
+            let public_key = &spki.subject_public_key.data;
+            let fixed_key = signature::UnparsedPublicKey::new(fixed_algorithm, public_key);
+            let asn1_key = signature::UnparsedPublicKey::new(asn1_algorithm, public_key);
+
+            match signature_encoding {
+                EcdsaSignatureEncoding::XmlDsigFixed => {
+                    Ok(fixed_key.verify(signed_data, signature_value).is_ok())
+                }
+                EcdsaSignatureEncoding::Asn1Der => {
+                    Ok(asn1_key.verify(signed_data, signature_value).is_ok())
+                }
+                EcdsaSignatureEncoding::Ambiguous => {
+                    if asn1_key.verify(signed_data, signature_value).is_ok() {
+                        return Ok(true);
+                    }
+
+                    Ok(fixed_key.verify(signed_data, signature_value).is_ok())
+                }
+            }
         }
         _ => Err(SignatureVerificationError::InvalidKeyDer),
     }
@@ -242,12 +256,19 @@ fn verification_algorithm(
     }
 }
 
-fn ecdsa_verification_algorithm(
+fn ecdsa_verification_algorithms(
     spki: &SubjectPublicKeyInfo<'_>,
     ec: &ECPoint<'_>,
     algorithm: SignatureAlgorithm,
     signature_value: &[u8],
-) -> Result<&'static dyn signature::VerificationAlgorithm, SignatureVerificationError> {
+) -> Result<
+    (
+        &'static dyn signature::VerificationAlgorithm,
+        &'static dyn signature::VerificationAlgorithm,
+        EcdsaSignatureEncoding,
+    ),
+    SignatureVerificationError,
+> {
     let curve_oid = spki
         .algorithm
         .parameters
@@ -291,16 +312,18 @@ fn ecdsa_verification_algorithm(
         }
     };
 
-    match classify_ecdsa_signature_encoding(signature_value, component_len)? {
-        EcdsaSignatureEncoding::XmlDsigFixed => Ok(fixed_algorithm),
-        EcdsaSignatureEncoding::Asn1Der => Ok(asn1_algorithm),
-    }
+    Ok((
+        fixed_algorithm,
+        asn1_algorithm,
+        classify_ecdsa_signature_encoding(signature_value, component_len)?,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EcdsaSignatureEncoding {
     XmlDsigFixed,
     Asn1Der,
+    Ambiguous,
 }
 
 fn classify_ecdsa_signature_encoding(
@@ -311,14 +334,14 @@ fn classify_ecdsa_signature_encoding(
         .checked_mul(2)
         .ok_or(SignatureVerificationError::InvalidKeyDer)?;
 
-    // XMLDSig requires fixed-width raw r||s; prefer that interpretation
-    // whenever the signature has the expected fixed width.
-    if signature_value.len() == expected_len {
-        return Ok(EcdsaSignatureEncoding::XmlDsigFixed);
-    }
-
     match inspect_der_encoded_ecdsa_signature(signature_value, component_len) {
+        Ok(Some(())) if signature_value.len() == expected_len => {
+            Ok(EcdsaSignatureEncoding::Ambiguous)
+        }
         Ok(Some(())) => Ok(EcdsaSignatureEncoding::Asn1Der),
+        Ok(None) | Err(_) if signature_value.len() == expected_len => {
+            Ok(EcdsaSignatureEncoding::XmlDsigFixed)
+        }
         Ok(None) | Err(_) => Err(SignatureVerificationError::InvalidSignatureFormat),
     }
 }
@@ -505,5 +528,18 @@ mod tests {
             ec_coordinate_len_bytes(521).expect("521-bit curves require rounded byte length"),
             66
         );
+    }
+
+    #[test]
+    fn same_width_valid_der_is_marked_ambiguous() {
+        let mut signature = Vec::with_capacity(64);
+        signature.extend_from_slice(&[0x30, 0x3e, 0x02, 0x1d]);
+        signature.extend(std::iter::repeat_n(0x11_u8, 29));
+        signature.extend_from_slice(&[0x02, 0x1d]);
+        signature.extend(std::iter::repeat_n(0x22_u8, 29));
+
+        let encoding = classify_ecdsa_signature_encoding(&signature, 32)
+            .expect("same-width structurally valid DER should classify as ambiguous");
+        assert_eq!(encoding, EcdsaSignatureEncoding::Ambiguous);
     }
 }
