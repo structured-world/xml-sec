@@ -66,16 +66,13 @@ pub fn verify_rsa_signature_pem(
     signed_data: &[u8],
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
-    let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
-        .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
-    if !rest.iter().all(|byte| byte.is_ascii_whitespace()) {
-        return Err(SignatureVerificationError::InvalidKeyPem);
-    }
-    if pem.label != "PUBLIC KEY" {
-        return Err(SignatureVerificationError::InvalidKeyFormat { label: pem.label });
-    }
-
-    verify_rsa_signature_spki(algorithm, &pem.contents, signed_data, signature_value)
+    let public_key_spki_der = parse_public_key_pem(public_key_pem)?;
+    verify_rsa_signature_spki(
+        algorithm,
+        &public_key_spki_der,
+        signed_data,
+        signature_value,
+    )
 }
 
 /// Verify an ECDSA XMLDSig signature using a PEM-encoded SPKI public key.
@@ -94,6 +91,16 @@ pub fn verify_ecdsa_signature_pem(
     signed_data: &[u8],
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
+    let public_key_spki_der = parse_public_key_pem(public_key_pem)?;
+    verify_ecdsa_signature_spki(
+        algorithm,
+        &public_key_spki_der,
+        signed_data,
+        signature_value,
+    )
+}
+
+fn parse_public_key_pem(public_key_pem: &str) -> Result<Vec<u8>, SignatureVerificationError> {
     let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
         .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
     if !rest.iter().all(|byte| byte.is_ascii_whitespace()) {
@@ -103,7 +110,7 @@ pub fn verify_ecdsa_signature_pem(
         return Err(SignatureVerificationError::InvalidKeyFormat { label: pem.label });
     }
 
-    verify_ecdsa_signature_spki(algorithm, &pem.contents, signed_data, signature_value)
+    Ok(pem.contents)
 }
 
 /// Verify an RSA XMLDSig signature using DER-encoded SPKI public key bytes.
@@ -405,15 +412,6 @@ fn parse_der_integer(
         return Err(SignatureVerificationError::InvalidSignatureFormat);
     }
     if integer_bytes.len() > 1 && integer_bytes[0] == 0 && integer_bytes[1] & 0x80 == 0 {
-        return Err(SignatureVerificationError::InvalidSignatureFormat);
-    }
-
-    let magnitude = if integer_bytes[0] == 0 {
-        &integer_bytes[1..]
-    } else {
-        integer_bytes
-    };
-    if magnitude.is_empty() || magnitude.len() > component_len {
         return Err(SignatureVerificationError::InvalidSignatureFormat);
     }
 

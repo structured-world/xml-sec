@@ -280,6 +280,31 @@ fn malformed_spki_der_returns_typed_error() {
 }
 
 #[test]
+fn spki_der_valid_signature_matches() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
+    ));
+    let (algorithm, canonical_signed_info, signature_value) =
+        canonicalized_signed_info_and_signature(&xml);
+    let public_key_der = x509_parser::pem::parse_x509_pem(
+        read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem")).as_bytes(),
+    )
+    .expect("fixture PEM should parse")
+    .1
+    .contents;
+
+    let valid = verify_ecdsa_signature_spki(
+        algorithm,
+        &public_key_der,
+        &canonical_signed_info,
+        &signature_value,
+    )
+    .expect("SPKI verifier should accept valid fixture key and signature");
+
+    assert!(valid, "SPKI verifier should validate donor P-256 signature");
+}
+
+#[test]
 fn spki_with_invalid_ec_point_prefix_returns_typed_error() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
