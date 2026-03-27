@@ -9,10 +9,17 @@
 //! - [`execute_transforms`] for the transform pipeline
 //! - [`compute_digest`] + [`constant_time_eq`] for digest computation and comparison
 
-use roxmltree::Node;
+use base64::Engine;
+use roxmltree::{Document, Node};
+
+use crate::c14n::canonicalize;
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
-use super::parse::Reference;
+use super::parse::{Reference, SignatureAlgorithm};
+use super::parse::{find_signature_node, parse_signed_info};
+use super::signature::{
+    SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
+};
 use super::transforms::execute_transforms;
 use super::uri::UriReferenceResolver;
 
@@ -154,6 +161,179 @@ pub enum ReferenceProcessingError {
     /// Transform execution failed.
     #[error("transform failed: {0}")]
     Transform(super::types::TransformError),
+}
+
+/// End-to-end XMLDSig verification result for one `<Signature>`.
+#[derive(Debug)]
+pub struct SignatureVerificationResult {
+    /// Reference validation results from `<SignedInfo>`.
+    pub references: ReferencesResult,
+    /// Whether final `<SignatureValue>` verification was attempted.
+    ///
+    /// This is `false` when a reference digest mismatch happened first.
+    pub signature_checked: bool,
+    /// Whether `<SignatureValue>` verification succeeded.
+    ///
+    /// Only meaningful when `signature_checked` is `true`.
+    pub signature_valid: bool,
+}
+
+/// Errors while running end-to-end XMLDSig verification.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SignatureVerificationPipelineError {
+    /// XML parsing failed.
+    #[error("XML parse error: {0}")]
+    XmlParse(#[from] roxmltree::Error),
+
+    /// Required signature element is missing.
+    #[error("missing required element: <{element}>")]
+    MissingElement {
+        /// Name of the missing element.
+        element: &'static str,
+    },
+
+    /// `<SignedInfo>` parsing failed.
+    #[error("failed to parse SignedInfo: {0}")]
+    ParseSignedInfo(#[from] super::parse::ParseError),
+
+    /// Reference processing failed.
+    #[error("reference processing failed: {0}")]
+    Reference(#[from] ReferenceProcessingError),
+
+    /// SignedInfo canonicalization failed.
+    #[error("SignedInfo canonicalization failed: {0}")]
+    Canonicalization(#[from] crate::c14n::C14nError),
+
+    /// SignatureValue base64 decoding failed.
+    #[error("invalid SignatureValue base64: {0}")]
+    SignatureValueBase64(#[from] base64::DecodeError),
+
+    /// Cryptographic verification failed before validity decision.
+    #[error("signature verification failed: {0}")]
+    Crypto(#[from] SignatureVerificationError),
+}
+
+/// Verify one XMLDSig `<Signature>` end-to-end with a PEM public key.
+///
+/// Pipeline:
+/// 1. Parse `<SignedInfo>`
+/// 2. Validate all `<Reference>` digests (fail-fast)
+/// 3. Canonicalize `<SignedInfo>`
+/// 4. Base64-decode `<SignatureValue>`
+/// 5. Verify signature bytes against canonicalized `<SignedInfo>`
+///
+/// If any `<Reference>` digest mismatches, returns `Ok` with
+/// `signature_checked == false` and `signature_valid == false`.
+pub fn verify_signature_with_pem_key(
+    xml: &str,
+    public_key_pem: &str,
+    store_pre_digest: bool,
+) -> Result<SignatureVerificationResult, SignatureVerificationPipelineError> {
+    let doc = Document::parse(xml)?;
+    let signature_node =
+        find_signature_node(&doc).ok_or(SignatureVerificationPipelineError::MissingElement {
+            element: "Signature",
+        })?;
+    let signed_info_node = signature_node
+        .children()
+        .find(|node| {
+            node.is_element()
+                && node.tag_name().name() == "SignedInfo"
+                && node.tag_name().namespace() == Some("http://www.w3.org/2000/09/xmldsig#")
+        })
+        .ok_or(SignatureVerificationPipelineError::MissingElement {
+            element: "SignedInfo",
+        })?;
+
+    let signed_info = parse_signed_info(signed_info_node)?;
+    let resolver = UriReferenceResolver::new(&doc);
+    let references = process_all_references(
+        &signed_info.references,
+        &resolver,
+        signature_node,
+        store_pre_digest,
+    )?;
+
+    if references.first_failure.is_some() {
+        return Ok(SignatureVerificationResult {
+            references,
+            signature_checked: false,
+            signature_valid: false,
+        });
+    }
+
+    let mut canonical_signed_info = Vec::new();
+    canonicalize(
+        &doc,
+        Some(&|node| {
+            node == signed_info_node
+                || node
+                    .ancestors()
+                    .any(|ancestor| ancestor == signed_info_node)
+        }),
+        &signed_info.c14n_method,
+        &mut canonical_signed_info,
+    )?;
+
+    let signature_value = decode_signature_value(signature_node)?;
+    let signature_valid = verify_with_algorithm(
+        signed_info.signature_method,
+        public_key_pem,
+        &canonical_signed_info,
+        &signature_value,
+    )?;
+
+    Ok(SignatureVerificationResult {
+        references,
+        signature_checked: true,
+        signature_valid,
+    })
+}
+
+fn decode_signature_value(
+    signature_node: Node<'_, '_>,
+) -> Result<Vec<u8>, SignatureVerificationPipelineError> {
+    let signature_value_text = signature_node
+        .children()
+        .find(|node| {
+            node.is_element()
+                && node.tag_name().name() == "SignatureValue"
+                && node.tag_name().namespace() == Some("http://www.w3.org/2000/09/xmldsig#")
+        })
+        .and_then(|node| node.text())
+        .ok_or(SignatureVerificationPipelineError::MissingElement {
+            element: "SignatureValue",
+        })?;
+
+    let normalized: String = signature_value_text
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+
+    Ok(base64::engine::general_purpose::STANDARD.decode(normalized)?)
+}
+
+fn verify_with_algorithm(
+    algorithm: SignatureAlgorithm,
+    public_key_pem: &str,
+    signed_data: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationPipelineError> {
+    match algorithm {
+        SignatureAlgorithm::RsaSha1
+        | SignatureAlgorithm::RsaSha256
+        | SignatureAlgorithm::RsaSha384
+        | SignatureAlgorithm::RsaSha512 => Ok(verify_rsa_signature_pem(
+            algorithm,
+            public_key_pem,
+            signed_data,
+            signature_value,
+        )?),
+        SignatureAlgorithm::EcdsaP256Sha256 | SignatureAlgorithm::EcdsaP384Sha384 => Ok(
+            verify_ecdsa_signature_pem(algorithm, public_key_pem, signed_data, signature_value)?,
+        ),
+    }
 }
 
 #[cfg(test)]
