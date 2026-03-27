@@ -332,7 +332,7 @@ fn classify_ecdsa_signature_encoding(
 ) -> Result<EcdsaSignatureEncoding, SignatureVerificationError> {
     let expected_len = component_len
         .checked_mul(2)
-        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+        .ok_or(SignatureVerificationError::InvalidSignatureFormat)?;
 
     match inspect_der_encoded_ecdsa_signature(signature_value, component_len) {
         Ok(Some(())) if signature_value.len() == expected_len => {
