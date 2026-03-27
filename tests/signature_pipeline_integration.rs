@@ -65,30 +65,17 @@ fn replace_ds_tag_content_with(
 }
 
 fn inject_invalid_base64_in_signature_value(xml: &str) -> String {
-    let open = "<SignatureValue>";
-    let close = "</SignatureValue>";
-    let start = xml
-        .find(open)
-        .unwrap_or_else(|| panic!("missing opening tag {open}"))
-        + open.len();
-    let end = xml[start..]
-        .find(close)
-        .unwrap_or_else(|| panic!("missing closing tag {close}"))
-        + start;
-
-    let mut chars: Vec<char> = xml[start..end].chars().collect();
-    if let Some((index, _)) = chars
-        .iter()
-        .enumerate()
-        .find(|(_, ch)| ch.is_ascii_alphanumeric())
-    {
-        chars[index] = '!';
-    } else {
-        panic!("SignatureValue did not contain any mutable base64 chars");
-    }
-
-    let mutated = chars.into_iter().collect::<String>();
-    format!("{}{}{}", &xml[..start], mutated, &xml[end..])
+    replace_ds_tag_content_with(xml, "SignatureValue", |chars| {
+        if let Some((index, _)) = chars
+            .iter()
+            .enumerate()
+            .find(|(_, ch)| ch.is_ascii_alphanumeric())
+        {
+            chars[index] = '!';
+        } else {
+            panic!("SignatureValue did not contain any mutable base64 chars");
+        }
+    })
 }
 
 #[test]
