@@ -13,6 +13,31 @@ fn read_fixture(path: &Path) -> String {
 }
 
 fn mutate_ds_tag_content(xml: &str, tag: &str) -> String {
+    replace_ds_tag_content_with(xml, tag, |chars| {
+        if let Some((index, value)) = chars
+            .iter()
+            .enumerate()
+            .find(|(_, ch)| ch.is_ascii_alphanumeric())
+        {
+            chars[index] = if *value == 'A' { 'B' } else { 'A' };
+        } else {
+            panic!("tag {tag} did not contain any mutable base64 chars");
+        }
+    })
+}
+
+fn replace_ds_tag_content(xml: &str, tag: &str, replacement: &str) -> String {
+    replace_ds_tag_content_with(xml, tag, |chars| {
+        chars.clear();
+        chars.extend(replacement.chars());
+    })
+}
+
+fn replace_ds_tag_content_with(
+    xml: &str,
+    tag: &str,
+    mutate: impl FnOnce(&mut Vec<char>),
+) -> String {
     let prefixed_open = format!("<ds:{tag}>");
     let prefixed_close = format!("</ds:{tag}>");
     let plain_open = format!("<{tag}>");
@@ -34,16 +59,7 @@ fn mutate_ds_tag_content(xml: &str, tag: &str) -> String {
         + start;
 
     let mut chars: Vec<char> = xml[start..end].chars().collect();
-    if let Some((index, value)) = chars
-        .iter()
-        .enumerate()
-        .find(|(_, ch)| ch.is_ascii_alphanumeric())
-    {
-        chars[index] = if *value == 'A' { 'B' } else { 'A' };
-    } else {
-        panic!("tag {tag} did not contain any mutable base64 chars");
-    }
-
+    mutate(&mut chars);
     let mutated = chars.into_iter().collect::<String>();
     format!("{}{}{}", &xml[..start], mutated, &xml[end..])
 }
@@ -167,4 +183,20 @@ fn malformed_signature_value_base64_returns_decode_error() {
         err,
         SignatureVerificationPipelineError::SignatureValueBase64(_)
     ));
+}
+
+#[test]
+fn empty_signature_value_is_not_reported_as_missing_element() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let tampered_xml = replace_ds_tag_content(&xml, "SignatureValue", "");
+
+    let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect("empty SignatureValue should not be treated as missing element");
+
+    assert!(result.references.all_valid());
+    assert!(result.signature_checked);
+    assert!(!result.signature_valid);
 }

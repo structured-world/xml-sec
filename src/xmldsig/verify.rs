@@ -295,17 +295,17 @@ pub fn verify_signature_with_pem_key(
 fn decode_signature_value(
     signature_node: Node<'_, '_>,
 ) -> Result<Vec<u8>, SignatureVerificationPipelineError> {
-    let signature_value_text = signature_node
+    let signature_value_node = signature_node
         .children()
         .find(|node| {
             node.is_element()
                 && node.tag_name().name() == "SignatureValue"
                 && node.tag_name().namespace() == Some("http://www.w3.org/2000/09/xmldsig#")
         })
-        .and_then(|node| node.text())
         .ok_or(SignatureVerificationPipelineError::MissingElement {
             element: "SignatureValue",
         })?;
+    let signature_value_text = signature_value_node.text().unwrap_or("");
 
     let normalized: String = signature_value_text
         .chars()
