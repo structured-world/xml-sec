@@ -303,6 +303,31 @@ fn non_ec_spki_key_returns_algorithm_mismatch_error() {
 }
 
 #[test]
+fn non_ecdsa_algorithm_is_rejected_before_key_parsing() {
+    let rsa_public_key_der = x509_parser::pem::parse_x509_pem(
+        read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem")).as_bytes(),
+    )
+    .expect("fixture PEM should parse")
+    .1
+    .contents;
+
+    for public_key_der in [&rsa_public_key_der[..], &[0x01_u8, 0x02, 0x03]] {
+        let err = verify_ecdsa_signature_spki(
+            SignatureAlgorithm::RsaSha256,
+            public_key_der,
+            b"payload",
+            &[0_u8; 64],
+        )
+        .expect_err("non-ECDSA algorithm must be rejected before key parsing");
+
+        assert!(matches!(
+            err,
+            SignatureVerificationError::UnsupportedAlgorithm { .. }
+        ));
+    }
+}
+
+#[test]
 fn spki_der_valid_signature_matches() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",

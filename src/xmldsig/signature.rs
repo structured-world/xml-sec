@@ -162,6 +162,15 @@ pub fn verify_ecdsa_signature_spki(
     signed_data: &[u8],
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
+    if !matches!(
+        algorithm,
+        SignatureAlgorithm::EcdsaP256Sha256 | SignatureAlgorithm::EcdsaP384Sha384
+    ) {
+        return Err(SignatureVerificationError::UnsupportedAlgorithm {
+            uri: algorithm.uri().to_string(),
+        });
+    }
+
     let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
     if !rest.is_empty() {
