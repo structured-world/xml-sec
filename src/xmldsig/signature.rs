@@ -42,7 +42,7 @@ pub enum SignatureVerificationError {
     #[error("invalid SubjectPublicKeyInfo DER")]
     InvalidKeyDer,
 
-    /// The provided public key curve does not match the signature algorithm.
+    /// The provided public key does not match the signature algorithm.
     #[error("public key does not match signature algorithm: {uri}")]
     KeyAlgorithmMismatch {
         /// XMLDSig algorithm URI used for diagnostics.
@@ -196,7 +196,9 @@ pub fn verify_ecdsa_signature_spki(
                 }
             }
         }
-        _ => Err(SignatureVerificationError::InvalidKeyDer),
+        _ => Err(SignatureVerificationError::KeyAlgorithmMismatch {
+            uri: algorithm.uri().to_string(),
+        }),
     }
 }
 
@@ -408,6 +410,9 @@ fn parse_der_integer(
     if integer_bytes.len() > component_len + 1 {
         return Err(SignatureVerificationError::InvalidSignatureFormat);
     }
+    if integer_bytes.len() == component_len + 1 && integer_bytes[0] != 0 {
+        return Err(SignatureVerificationError::InvalidSignatureFormat);
+    }
     if integer_bytes[0] & 0x80 != 0 {
         return Err(SignatureVerificationError::InvalidSignatureFormat);
     }
@@ -539,5 +544,20 @@ mod tests {
         let encoding = classify_ecdsa_signature_encoding(&signature, 32)
             .expect("same-width structurally valid DER should classify as ambiguous");
         assert_eq!(encoding, EcdsaSignatureEncoding::Ambiguous);
+    }
+
+    #[test]
+    fn der_integer_longer_than_component_requires_sign_byte() {
+        let mut signature = Vec::with_capacity(72);
+        signature.extend_from_slice(&[0x30, 0x46, 0x02, 0x21, 0x01]);
+        signature.extend(std::iter::repeat_n(0x11_u8, 32));
+        signature.extend_from_slice(&[0x02, 0x21, 0x01]);
+        signature.extend(std::iter::repeat_n(0x22_u8, 32));
+
+        let encoding = classify_ecdsa_signature_encoding(&signature, 32);
+        assert!(matches!(
+            encoding,
+            Err(SignatureVerificationError::InvalidSignatureFormat)
+        ));
     }
 }
