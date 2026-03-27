@@ -129,58 +129,6 @@ fn local_p384_signature_matches() {
 }
 
 #[test]
-fn local_p384_raw_signature_with_der_like_prefix_matches() {
-    const MAX_ATTEMPTS: usize = 8192;
-
-    let xml = read_fixture(Path::new(
-        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha384-ecdsa-sha384.xml",
-    ));
-    let private_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime384v1-key.pem"));
-    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem"));
-    let (signature_algorithm, canonical_signed_info, _) =
-        canonicalized_signed_info_and_signature(&xml);
-    assert_eq!(
-        SignatureAlgorithm::EcdsaP384Sha384,
-        signature_algorithm,
-        "fixture SignatureMethod should be EcdsaP384Sha384",
-    );
-
-    let pkcs8_der = x509_parser::pem::parse_x509_pem(private_key_pem.as_bytes())
-        .expect("fixture PEM should parse")
-        .1
-        .contents;
-    let rng = SystemRandom::new();
-    let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &pkcs8_der, &rng)
-        .expect("fixture PKCS#8 should parse");
-
-    for _ in 0..MAX_ATTEMPTS {
-        let signature = key_pair
-            .sign(&rng, &canonical_signed_info)
-            .expect("fixture P-384 key should sign");
-        if signature.as_ref().first().copied() != Some(0x30) {
-            continue;
-        }
-
-        let valid = verify_ecdsa_signature_pem(
-            SignatureAlgorithm::EcdsaP384Sha384,
-            &public_key_pem,
-            &canonical_signed_info,
-            signature.as_ref(),
-        );
-
-        assert!(
-            matches!(valid, Ok(true)),
-            "fixed-width signature with leading 0x30 must verify as raw r||s, got {valid:?}"
-        );
-        return;
-    }
-
-    panic!(
-        "failed to generate a fixed-width P-384 signature starting with 0x30 after {MAX_ATTEMPTS} attempts"
-    );
-}
-
-#[test]
 fn local_p384_der_signature_matches() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha384-ecdsa-sha384.xml",
@@ -325,7 +273,48 @@ fn malformed_spki_der_returns_typed_error() {
     )
     .expect_err("malformed SPKI DER should be rejected");
 
-    assert!(matches!(err, SignatureVerificationError::InvalidKeyDer));
+    assert!(
+        matches!(err, SignatureVerificationError::InvalidKeyDer),
+        "expected InvalidKeyDer, got {err:?}"
+    );
+}
+
+#[test]
+fn spki_with_invalid_ec_point_prefix_returns_typed_error() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
+    ));
+    let (algorithm, canonical_signed_info, signature_value) =
+        canonicalized_signed_info_and_signature(&xml);
+    let mut public_key_der = x509_parser::pem::parse_x509_pem(
+        read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem")).as_bytes(),
+    )
+    .expect("fixture PEM should parse")
+    .1
+    .contents;
+
+    // For P-256 fixtures we expect BIT STRING header 03 42 00 followed by
+    // uncompressed SEC1 prefix 0x04; mutating it to 0x02 keeps SPKI parseable
+    // but should be rejected as invalid key encoding for ring.
+    let marker = [0x03_u8, 0x42, 0x00, 0x04];
+    let marker_pos = public_key_der
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("fixture SPKI should contain uncompressed EC point marker");
+    public_key_der[marker_pos + 3] = 0x02;
+
+    let err = verify_ecdsa_signature_spki(
+        algorithm,
+        &public_key_der,
+        &canonical_signed_info,
+        &signature_value,
+    )
+    .expect_err("invalid EC point encoding should be rejected as key error");
+
+    assert!(
+        matches!(err, SignatureVerificationError::InvalidKeyDer),
+        "expected InvalidKeyDer, got {err:?}"
+    );
 }
 
 #[test]

@@ -166,6 +166,7 @@ pub fn verify_ecdsa_signature_spki(
 
     match public_key {
         PublicKey::EC(ec) => {
+            validate_ec_public_key_encoding(&ec, &spki.subject_public_key.data)?;
             let verification_algorithm =
                 ecdsa_verification_algorithm(&spki, &ec, algorithm, signature_value)?;
             let key = signature::UnparsedPublicKey::new(
@@ -264,16 +265,10 @@ fn ecdsa_verification_algorithm(
                     &signature::ECDSA_P256_SHA256_ASN1,
                     32,
                 )
-            } else if curve_oid == "1.2.840.10045.3.1.7"
-                || curve_oid == "1.3.132.0.34"
-                || point_len == 256
-                || point_len == 384
-            {
+            } else {
                 return Err(SignatureVerificationError::KeyAlgorithmMismatch {
                     uri: algorithm.uri().to_string(),
                 });
-            } else {
-                return Err(SignatureVerificationError::InvalidKeyDer);
             }
         }
         SignatureAlgorithm::EcdsaP384Sha384 => {
@@ -283,16 +278,10 @@ fn ecdsa_verification_algorithm(
                     &signature::ECDSA_P384_SHA384_ASN1,
                     48,
                 )
-            } else if curve_oid == "1.2.840.10045.3.1.7"
-                || curve_oid == "1.3.132.0.34"
-                || point_len == 256
-                || point_len == 384
-            {
+            } else {
                 return Err(SignatureVerificationError::KeyAlgorithmMismatch {
                     uri: algorithm.uri().to_string(),
                 });
-            } else {
-                return Err(SignatureVerificationError::InvalidKeyDer);
             }
         }
         _ => {
@@ -434,7 +423,33 @@ fn parse_der_length(input: &[u8]) -> Option<Result<(usize, &[u8]), ()>> {
         };
     }
 
+    if declared_len < 128 {
+        return Some(Err(()));
+    }
+
     Some(Ok((declared_len, remainder)))
+}
+
+fn validate_ec_public_key_encoding(
+    ec: &ECPoint<'_>,
+    public_key_bytes: &[u8],
+) -> Result<(), SignatureVerificationError> {
+    let coordinate_len = ec
+        .key_size()
+        .checked_div(8)
+        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+    let expected_len = coordinate_len
+        .checked_mul(2)
+        .and_then(|len| len.checked_add(1))
+        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+
+    let is_uncompressed_sec1 =
+        public_key_bytes.len() == expected_len && public_key_bytes.first() == Some(&0x04);
+    if !is_uncompressed_sec1 {
+        return Err(SignatureVerificationError::InvalidKeyDer);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -454,5 +469,26 @@ mod tests {
                 SignatureVerificationError::UnsupportedAlgorithm { .. }
             ));
         }
+    }
+
+    #[test]
+    fn der_like_prefix_with_fixed_width_len_is_classified_as_raw() {
+        let mut signature = vec![0xAA_u8; 96];
+        signature[0] = 0x30;
+        signature[1] = 0x20;
+
+        let encoding = classify_ecdsa_signature_encoding(&signature, 48)
+            .expect("same-width signature with invalid DER must fall back to raw");
+        assert_eq!(encoding, EcdsaSignatureEncoding::XmlDsigFixed);
+    }
+
+    #[test]
+    fn overlong_der_length_below_128_is_rejected() {
+        let bad = [0x81_u8, 0x7f];
+        let parsed = parse_der_length(&bad).expect("length bytes should be present");
+        assert!(
+            matches!(parsed, Err(())),
+            "DER must reject long-form lengths below 128"
+        );
     }
 }
