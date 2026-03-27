@@ -311,11 +311,14 @@ fn classify_ecdsa_signature_encoding(
         .checked_mul(2)
         .ok_or(SignatureVerificationError::InvalidKeyDer)?;
 
+    // XMLDSig requires fixed-width raw r||s; prefer that interpretation
+    // whenever the signature has the expected fixed width.
+    if signature_value.len() == expected_len {
+        return Ok(EcdsaSignatureEncoding::XmlDsigFixed);
+    }
+
     match inspect_der_encoded_ecdsa_signature(signature_value, component_len) {
         Ok(Some(())) => Ok(EcdsaSignatureEncoding::Asn1Der),
-        Ok(None) | Err(_) if signature_value.len() == expected_len => {
-            Ok(EcdsaSignatureEncoding::XmlDsigFixed)
-        }
         Ok(None) | Err(_) => Err(SignatureVerificationError::InvalidSignatureFormat),
     }
 }
@@ -434,10 +437,7 @@ fn validate_ec_public_key_encoding(
     ec: &ECPoint<'_>,
     public_key_bytes: &[u8],
 ) -> Result<(), SignatureVerificationError> {
-    let coordinate_len = ec
-        .key_size()
-        .checked_div(8)
-        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+    let coordinate_len = ec_coordinate_len_bytes(ec.key_size())?;
     let expected_len = coordinate_len
         .checked_mul(2)
         .and_then(|len| len.checked_add(1))
@@ -450,6 +450,13 @@ fn validate_ec_public_key_encoding(
     }
 
     Ok(())
+}
+
+fn ec_coordinate_len_bytes(key_bits: usize) -> Result<usize, SignatureVerificationError> {
+    key_bits
+        .checked_add(7)
+        .and_then(|bits| bits.checked_div(8))
+        .ok_or(SignatureVerificationError::InvalidKeyDer)
 }
 
 #[cfg(test)]
@@ -489,6 +496,14 @@ mod tests {
         assert!(
             matches!(parsed, Err(())),
             "DER must reject long-form lengths below 128"
+        );
+    }
+
+    #[test]
+    fn ec_coordinate_length_rounds_up_for_non_byte_aligned_curves() {
+        assert_eq!(
+            ec_coordinate_len_bytes(521).expect("521-bit curves require rounded byte length"),
+            66
         );
     }
 }
