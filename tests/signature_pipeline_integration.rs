@@ -156,6 +156,47 @@ fn tampered_digest_value_fails_before_signature_stage() {
 }
 
 #[test]
+fn tampered_signature_value_fails_after_references_pass_ecdsa() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem"));
+    let tampered_xml = mutate_ds_tag_content(&xml, "SignatureValue");
+
+    let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect("pipeline should still run for invalid signature bytes");
+
+    assert!(
+        result.references.all_valid(),
+        "digest stage should still pass when only signature bytes are tampered"
+    );
+    assert!(result.signature_checked, "signature stage must run");
+    assert!(!result.signature_valid, "tampered SignatureValue must fail");
+}
+
+#[test]
+fn tampered_digest_value_fails_before_signature_stage_ecdsa() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem"));
+    let tampered_xml = mutate_ds_tag_content(&xml, "DigestValue");
+
+    let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect("pipeline should return structured invalid result on digest mismatch");
+
+    assert!(
+        !result.references.all_valid(),
+        "digest mismatch must invalidate SignedInfo references"
+    );
+    assert!(
+        !result.signature_checked,
+        "signature stage must not run after reference failure"
+    );
+    assert!(!result.signature_valid, "result should be invalid");
+}
+
+#[test]
 fn malformed_signature_value_base64_returns_decode_error() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
