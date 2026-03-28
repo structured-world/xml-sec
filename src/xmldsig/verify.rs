@@ -50,10 +50,10 @@ pub trait VerifyingKey {
 /// cross-thread sharing can wrap resolvers/keys in their own thread-safe types.
 pub trait KeyResolver {
     /// Resolve a verification key for the provided XML document.
-    fn resolve(
-        &self,
+    fn resolve<'a>(
+        &'a self,
         xml: &str,
-    ) -> Result<Box<dyn VerifyingKey>, SignatureVerificationPipelineError>;
+    ) -> Result<Box<dyn VerifyingKey + 'a>, SignatureVerificationPipelineError>;
 }
 
 /// Allowed URI classes for `<Reference URI="...">`.
@@ -578,7 +578,7 @@ fn has_manifest_children(signature_node: Node<'_, '_>) -> bool {
 
 enum ResolvedVerifyingKey<'a> {
     Borrowed(&'a dyn VerifyingKey),
-    Owned(Box<dyn VerifyingKey>),
+    Owned(Box<dyn VerifyingKey + 'a>),
 }
 
 impl ResolvedVerifyingKey<'_> {
