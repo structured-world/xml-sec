@@ -28,6 +28,7 @@ use super::uri::UriReferenceResolver;
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
 const XPATH_TRANSFORM_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+const DEFAULT_IMPLICIT_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
 
 /// Cryptographic verifier used by [`VerifyContext`].
 pub trait VerifyingKey {
@@ -584,7 +585,9 @@ fn enforce_reference_policies(
     allowed_transforms: Option<&HashSet<String>>,
 ) -> Result<(), SignatureVerificationPipelineError> {
     for reference in references {
-        let uri = reference.uri.as_deref().unwrap_or("");
+        let uri = reference.uri.as_deref().ok_or(
+            SignatureVerificationPipelineError::Reference(ReferenceProcessingError::MissingUri),
+        )?;
         if !allowed_uri_types.allows(uri) {
             return Err(SignatureVerificationPipelineError::DisallowedUri {
                 uri: uri.to_owned(),
@@ -599,6 +602,16 @@ fn enforce_reference_policies(
                         algorithm: transform_uri.to_owned(),
                     });
                 }
+            }
+
+            let has_explicit_c14n = reference
+                .transforms
+                .iter()
+                .any(|transform| matches!(transform, Transform::C14n(_)));
+            if !has_explicit_c14n && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI) {
+                return Err(SignatureVerificationPipelineError::DisallowedTransform {
+                    algorithm: DEFAULT_IMPLICIT_C14N_URI.to_owned(),
+                });
             }
         }
     }
