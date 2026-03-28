@@ -267,19 +267,18 @@ pub fn verify_signature_with_pem_key(
     };
 
     let mut signature_element_children = signature_node.children().filter(|node| node.is_element());
+    let is_ds_signed_info = |node: Node<'_, '_>| {
+        node.tag_name().name() == "SignedInfo" && node.tag_name().namespace() == Some(XMLDSIG_NS)
+    };
+
     let signed_info_node = match signature_element_children.next() {
-        Some(node)
-            if node.tag_name().name() == "SignedInfo"
-                && node.tag_name().namespace() == Some(XMLDSIG_NS) =>
-        {
-            node
-        }
-        Some(_) => {
+        Some(node) if is_ds_signed_info(node) => node,
+        Some(_) if signature_element_children.any(is_ds_signed_info) => {
             return Err(SignatureVerificationPipelineError::InvalidStructure {
                 reason: "SignedInfo must be the first element child of Signature",
             });
         }
-        None => {
+        Some(_) | None => {
             return Err(SignatureVerificationPipelineError::MissingElement {
                 element: "SignedInfo",
             });
