@@ -236,16 +236,24 @@ pub fn verify_signature_with_pem_key(
         find_signature_node(&doc).ok_or(SignatureVerificationPipelineError::MissingElement {
             element: "Signature",
         })?;
-    let signed_info_node = signature_node
-        .children()
-        .find(|node| {
-            node.is_element()
-                && node.tag_name().name() == "SignedInfo"
+    let mut signature_element_children = signature_node.children().filter(|node| node.is_element());
+    let signed_info_node = signature_element_children
+        .next()
+        .filter(|node| {
+            node.tag_name().name() == "SignedInfo"
                 && node.tag_name().namespace() == Some("http://www.w3.org/2000/09/xmldsig#")
         })
         .ok_or(SignatureVerificationPipelineError::MissingElement {
             element: "SignedInfo",
         })?;
+    if signature_element_children.any(|node| {
+        node.tag_name().name() == "SignedInfo"
+            && node.tag_name().namespace() == Some("http://www.w3.org/2000/09/xmldsig#")
+    }) {
+        return Err(SignatureVerificationPipelineError::MissingElement {
+            element: "SignedInfo",
+        });
+    }
 
     let signed_info = parse_signed_info(signed_info_node)?;
     let resolver = UriReferenceResolver::new(&doc);

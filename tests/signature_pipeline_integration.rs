@@ -42,8 +42,7 @@ fn replace_ds_tag_content_with(
     let prefixed_close = format!("</ds:{tag}>");
     let plain_open_prefix = format!("<{tag}");
     let plain_close = format!("</{tag}>");
-    let (open_start, close) = if let Some(index) = find_open_tag_start(xml, &prefixed_open_prefix)
-    {
+    let (open_start, close) = if let Some(index) = find_open_tag_start(xml, &prefixed_open_prefix) {
         (index, prefixed_close)
     } else if let Some(index) = find_open_tag_start(xml, &plain_open_prefix) {
         (index, plain_close)
@@ -121,6 +120,36 @@ fn inject_comment_in_signature_value(xml: &str) -> String {
         with_comment.extend_from_slice(&chars[split_at..]);
         *chars = with_comment;
     })
+}
+
+fn insert_object_before_signed_info(xml: &str) -> String {
+    let (signed_info_open, object_xml) = if xml.contains("<ds:SignedInfo") {
+        ("<ds:SignedInfo", "<ds:Object/>")
+    } else {
+        ("<SignedInfo", "<Object/>")
+    };
+    let start = xml
+        .find(signed_info_open)
+        .unwrap_or_else(|| panic!("missing opening tag prefix {signed_info_open}"));
+    format!("{}{}{}", &xml[..start], object_xml, &xml[start..])
+}
+
+fn duplicate_signed_info(xml: &str) -> String {
+    let (open, close) = if xml.contains("<ds:SignedInfo") {
+        ("<ds:SignedInfo", "</ds:SignedInfo>")
+    } else {
+        ("<SignedInfo", "</SignedInfo>")
+    };
+    let start = xml
+        .find(open)
+        .unwrap_or_else(|| panic!("missing opening tag prefix {open}"));
+    let end = xml[start..]
+        .find(close)
+        .unwrap_or_else(|| panic!("missing closing tag {close}"))
+        + start
+        + close.len();
+    let signed_info_block = &xml[start..end];
+    format!("{}{}{}", &xml[..end], signed_info_block, &xml[end..])
 }
 
 #[test]
@@ -301,6 +330,44 @@ fn signature_value_split_by_comment_still_verifies() {
     assert!(result.references.all_valid());
     assert!(result.signature_checked);
     assert!(result.signature_valid);
+}
+
+#[test]
+fn signed_info_must_be_first_element_child_of_signature() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let tampered_xml = insert_object_before_signed_info(&xml);
+
+    let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect_err("SignedInfo not-first child must be rejected");
+
+    assert!(matches!(
+        err,
+        SignatureVerificationPipelineError::MissingElement {
+            element: "SignedInfo"
+        }
+    ));
+}
+
+#[test]
+fn duplicate_signed_info_is_rejected() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let tampered_xml = duplicate_signed_info(&xml);
+
+    let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect_err("duplicate SignedInfo must be rejected");
+
+    assert!(matches!(
+        err,
+        SignatureVerificationPipelineError::MissingElement {
+            element: "SignedInfo"
+        }
+    ));
 }
 
 #[test]
