@@ -389,7 +389,7 @@ fn decode_signature_value(
         .filter(|child| child.is_text())
         .filter_map(|child| child.text())
         .flat_map(str::chars)
-        .filter(|ch| !matches!(ch, ' ' | '\t' | '\r' | '\n'))
+        .filter(|ch| !ch.is_ascii_whitespace())
         .collect();
 
     Ok(base64::engine::general_purpose::STANDARD.decode(normalized)?)
