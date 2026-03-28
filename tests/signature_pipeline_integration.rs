@@ -80,6 +80,17 @@ fn find_open_tag_start(xml: &str, open_prefix: &str) -> Option<usize> {
     None
 }
 
+fn strip_xml_declaration(xml: &str) -> &str {
+    let trimmed_start = xml.trim_start_matches(char::is_whitespace);
+    if let Some(rest) = trimmed_start.strip_prefix("<?xml") {
+        if let Some(end_idx) = rest.find("?>") {
+            let after_decl = &rest[end_idx + 2..];
+            return after_decl.trim_start_matches(char::is_whitespace);
+        }
+    }
+    xml
+}
+
 fn assert_invalid_structure_reason(
     err: SignatureVerificationPipelineError,
     expected_reason: &'static str,
@@ -444,7 +455,7 @@ fn multiple_signature_elements_are_rejected() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
     ));
-    let xml_without_decl = xml.replace("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n", "");
+    let xml_without_decl = strip_xml_declaration(&xml);
     let additional_signature =
         "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"></Signature>";
     let tampered_xml = format!("<Root>{xml_without_decl}{additional_signature}</Root>");
