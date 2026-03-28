@@ -860,10 +860,10 @@ mod tests {
     struct PanicResolver;
 
     impl KeyResolver for PanicResolver {
-        fn resolve(
-            &self,
+        fn resolve<'a>(
+            &'a self,
             _xml: &str,
-        ) -> Result<Box<dyn VerifyingKey>, SignatureVerificationPipelineError> {
+        ) -> Result<Box<dyn VerifyingKey + 'a>, SignatureVerificationPipelineError> {
             panic!("resolver should not be called when references already fail");
         }
     }
