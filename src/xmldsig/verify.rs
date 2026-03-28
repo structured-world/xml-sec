@@ -235,6 +235,12 @@ pub enum SignatureVerificationPipelineError {
 ///
 /// If any `<Reference>` digest mismatches, returns `Ok` with
 /// `signature_checked == false` and `signature_valid == false`.
+///
+/// Structural constraints enforced by this API:
+/// - The document must contain exactly one XMLDSig `<Signature>` element.
+/// - `<SignedInfo>` must be the first element child of `<Signature>` and appear once.
+/// - `<SignatureValue>` must be the second element child of `<Signature>` and appear once.
+/// - `<SignatureValue>` must not contain nested element children.
 pub fn verify_signature_with_pem_key(
     xml: &str,
     public_key_pem: &str,
