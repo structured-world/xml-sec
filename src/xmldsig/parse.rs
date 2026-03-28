@@ -348,8 +348,19 @@ fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 
-    // Strip all whitespace (newlines, spaces, tabs) before decoding
-    let cleaned: String = b64.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let mut cleaned = String::with_capacity(b64.len());
+    for ch in b64.chars() {
+        if matches!(ch, ' ' | '\t' | '\r' | '\n') {
+            continue;
+        }
+        if ch.is_ascii_whitespace() {
+            return Err(ParseError::Base64(format!(
+                "invalid XML whitespace U+{:04X} in DigestValue",
+                u32::from(ch)
+            )));
+        }
+        cleaned.push(ch);
+    }
     let digest = STANDARD
         .decode(&cleaned)
         .map_err(|e| ParseError::Base64(e.to_string()))?;
@@ -842,6 +853,24 @@ mod tests {
         let doc = Document::parse(xml).unwrap();
         let si = parse_signed_info(doc.root_element()).unwrap();
         assert_eq!(si.references[0].digest_value, vec![0u8; 20]);
+    }
+
+    #[test]
+    fn base64_decode_digest_accepts_xml_whitespace_chars() {
+        let digest =
+            base64_decode_digest("AAAA\tAAAA\rAAAA\nAAAA AAAAAAAAAAA=", DigestAlgorithm::Sha1)
+                .expect("XML whitespace in DigestValue must be accepted");
+        assert_eq!(digest, vec![0u8; 20]);
+    }
+
+    #[test]
+    fn base64_decode_digest_rejects_non_xml_ascii_whitespace() {
+        let err = base64_decode_digest(
+            "AAAA\u{000C}AAAAAAAAAAAAAAAAAAAAAAA=",
+            DigestAlgorithm::Sha1,
+        )
+        .expect_err("form-feed/vertical-tab in DigestValue must be rejected");
+        assert!(matches!(err, ParseError::Base64(_)));
     }
 
     // ── Real-world SAML structure ────────────────────────────────────
