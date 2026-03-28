@@ -23,7 +23,7 @@ use super::transforms::{self, Transform};
 use crate::c14n::C14nAlgorithm;
 
 /// XMLDSig namespace URI.
-const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+pub(crate) const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -254,8 +254,20 @@ fn parse_reference(reference_node: Node) -> Result<Reference, ParseError> {
         element: "DigestValue",
     })?;
     verify_ds_element(digest_value_node, "DigestValue")?;
-    let digest_b64 = digest_value_node.text().unwrap_or("");
-    let digest_value = base64_decode_digest(digest_b64, digest_method)?;
+    let mut digest_b64 = String::new();
+    for child in digest_value_node.children() {
+        if child.is_element() {
+            return Err(ParseError::InvalidStructure(
+                "DigestValue must not contain element children".into(),
+            ));
+        }
+        if child.is_text()
+            && let Some(text) = child.text()
+        {
+            digest_b64.push_str(text);
+        }
+    }
+    let digest_value = base64_decode_digest(&digest_b64, digest_method)?;
 
     // No more children expected
     if let Some(unexpected) = children.next() {
@@ -348,8 +360,19 @@ fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 
-    // Strip all whitespace (newlines, spaces, tabs) before decoding
-    let cleaned: String = b64.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let mut cleaned = String::with_capacity(b64.len());
+    for ch in b64.chars() {
+        if matches!(ch, ' ' | '\t' | '\r' | '\n') {
+            continue;
+        }
+        if ch.is_ascii_whitespace() {
+            return Err(ParseError::Base64(format!(
+                "invalid XML whitespace U+{:04X} in DigestValue",
+                u32::from(ch)
+            )));
+        }
+        cleaned.push(ch);
+    }
     let digest = STANDARD
         .decode(&cleaned)
         .map_err(|e| ParseError::Base64(e.to_string()))?;
@@ -812,6 +835,25 @@ mod tests {
     }
 
     #[test]
+    fn digest_value_with_element_child_is_rejected() {
+        let xml = r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+            <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+            <Reference URI="">
+                <DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+                <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=<Junk/>AAAA</DigestValue>
+            </Reference>
+        </SignedInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let result = parse_signed_info(doc.root_element());
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::InvalidStructure(_)
+        ));
+    }
+
+    #[test]
     fn wrong_namespace_on_signed_info() {
         let xml = r#"<SignedInfo xmlns="http://example.com/fake">
             <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
@@ -842,6 +884,24 @@ mod tests {
         let doc = Document::parse(xml).unwrap();
         let si = parse_signed_info(doc.root_element()).unwrap();
         assert_eq!(si.references[0].digest_value, vec![0u8; 20]);
+    }
+
+    #[test]
+    fn base64_decode_digest_accepts_xml_whitespace_chars() {
+        let digest =
+            base64_decode_digest("AAAA\tAAAA\rAAAA\nAAAA AAAAAAAAAAA=", DigestAlgorithm::Sha1)
+                .expect("XML whitespace in DigestValue must be accepted");
+        assert_eq!(digest, vec![0u8; 20]);
+    }
+
+    #[test]
+    fn base64_decode_digest_rejects_non_xml_ascii_whitespace() {
+        let err = base64_decode_digest(
+            "AAAA\u{000C}AAAAAAAAAAAAAAAAAAAAAAA=",
+            DigestAlgorithm::Sha1,
+        )
+        .expect_err("form-feed/vertical-tab in DigestValue must be rejected");
+        assert!(matches!(err, ParseError::Base64(_)));
     }
 
     // ── Real-world SAML structure ────────────────────────────────────

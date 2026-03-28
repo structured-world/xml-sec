@@ -1,4 +1,4 @@
-//! Reference processing and digest verification for XMLDSig.
+//! XMLDSig reference processing and end-to-end signature verification pipeline.
 //!
 //! Implements [XMLDSig §4.3.3](https://www.w3.org/TR/xmldsig-core1/#sec-CoreValidation):
 //! for each `<Reference>` in `<SignedInfo>`, dereference the URI, apply transforms,
@@ -8,16 +8,29 @@
 //! - [`UriReferenceResolver`] for URI dereference
 //! - [`execute_transforms`] for the transform pipeline
 //! - [`compute_digest`] + [`constant_time_eq`] for digest computation and comparison
+//! - [`verify_signature_with_pem_key`] for full pipeline validation (`SignedInfo` + `SignatureValue`)
 
-use roxmltree::Node;
+use base64::Engine;
+use roxmltree::{Document, Node};
+use std::collections::HashSet;
+
+use crate::c14n::canonicalize;
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
-use super::parse::Reference;
+use super::parse::parse_signed_info;
+use super::parse::{Reference, SignatureAlgorithm, XMLDSIG_NS};
+use super::signature::{
+    SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
+};
 use super::transforms::execute_transforms;
 use super::uri::UriReferenceResolver;
 
+const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
+const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
+
 /// Per-reference verification result.
 #[derive(Debug)]
+#[must_use = "inspect valid before accepting the reference result"]
 pub struct ReferenceResult {
     /// URI from the `<Reference>` element (for diagnostics).
     pub uri: Option<String>,
@@ -31,6 +44,7 @@ pub struct ReferenceResult {
 
 /// Result of processing all `<Reference>` elements in `<SignedInfo>`.
 #[derive(Debug)]
+#[must_use = "check first_failure/results before accepting the reference set"]
 pub struct ReferencesResult {
     /// Per-reference results (one per `<Reference>` in order).
     /// On fail-fast, only references up to and including the failed one are present.
@@ -156,6 +170,315 @@ pub enum ReferenceProcessingError {
     Transform(super::types::TransformError),
 }
 
+/// End-to-end XMLDSig verification result for one `<Signature>`.
+#[derive(Debug)]
+#[must_use = "inspect signature_valid (and signature_checked for stage diagnostics) before accepting the document"]
+pub struct SignatureVerificationResult {
+    /// Reference validation results from `<SignedInfo>`.
+    pub references: ReferencesResult,
+    /// Whether final `<SignatureValue>` verification was attempted.
+    ///
+    /// This is `false` when a reference digest mismatch happened first.
+    pub signature_checked: bool,
+    /// Whether `<SignatureValue>` verification succeeded.
+    ///
+    /// Only meaningful when `signature_checked` is `true`.
+    pub signature_valid: bool,
+}
+
+/// Errors while running end-to-end XMLDSig verification.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SignatureVerificationPipelineError {
+    /// XML parsing failed.
+    #[error("XML parse error: {0}")]
+    XmlParse(#[from] roxmltree::Error),
+
+    /// Required signature element is missing.
+    #[error("missing required element: <{element}>")]
+    MissingElement {
+        /// Name of the missing element.
+        element: &'static str,
+    },
+
+    /// Signature element tree shape violates XMLDSig structure requirements.
+    #[error("invalid Signature structure: {reason}")]
+    InvalidStructure {
+        /// Validation failure reason.
+        reason: &'static str,
+    },
+
+    /// `<SignedInfo>` parsing failed.
+    #[error("failed to parse SignedInfo: {0}")]
+    ParseSignedInfo(#[from] super::parse::ParseError),
+
+    /// Reference processing failed.
+    #[error("reference processing failed: {0}")]
+    Reference(#[from] ReferenceProcessingError),
+
+    /// SignedInfo canonicalization failed.
+    #[error("SignedInfo canonicalization failed: {0}")]
+    Canonicalization(#[from] crate::c14n::C14nError),
+
+    /// SignatureValue base64 decoding failed.
+    #[error("invalid SignatureValue base64: {0}")]
+    SignatureValueBase64(#[from] base64::DecodeError),
+
+    /// Cryptographic verification failed before validity decision.
+    #[error("signature verification failed: {0}")]
+    Crypto(#[from] SignatureVerificationError),
+}
+
+/// Verify one XMLDSig `<Signature>` end-to-end with a PEM public key.
+///
+/// Pipeline:
+/// 1. Parse `<SignedInfo>`
+/// 2. Validate all `<Reference>` digests (fail-fast)
+/// 3. Canonicalize `<SignedInfo>`
+/// 4. Base64-decode `<SignatureValue>`
+/// 5. Verify signature bytes against canonicalized `<SignedInfo>`
+///
+/// If any `<Reference>` digest mismatches, returns `Ok` with
+/// `signature_checked == false` and `signature_valid == false`.
+///
+/// Structural constraints enforced by this API:
+/// - The document must contain exactly one XMLDSig `<Signature>` element.
+/// - `<SignedInfo>` must be the first element child of `<Signature>` and appear once.
+/// - `<SignatureValue>` must be the second element child of `<Signature>` and appear once.
+/// - `<SignatureValue>` must not contain nested element children.
+pub fn verify_signature_with_pem_key(
+    xml: &str,
+    public_key_pem: &str,
+    store_pre_digest: bool,
+) -> Result<SignatureVerificationResult, SignatureVerificationPipelineError> {
+    let doc = Document::parse(xml)?;
+    let mut signatures = doc.descendants().filter(|node| {
+        node.is_element()
+            && node.tag_name().name() == "Signature"
+            && node.tag_name().namespace() == Some(XMLDSIG_NS)
+    });
+    let signature_node = match (signatures.next(), signatures.next()) {
+        (None, _) => {
+            return Err(SignatureVerificationPipelineError::MissingElement {
+                element: "Signature",
+            });
+        }
+        (Some(node), None) => node,
+        (Some(_), Some(_)) => {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Signature must appear exactly once in document",
+            });
+        }
+    };
+
+    let signature_children = parse_signature_children(signature_node)?;
+    let signed_info_node = signature_children.signed_info_node;
+
+    let signed_info = parse_signed_info(signed_info_node)?;
+    let resolver = UriReferenceResolver::new(&doc);
+    let references = process_all_references(
+        &signed_info.references,
+        &resolver,
+        signature_node,
+        store_pre_digest,
+    )?;
+
+    if references.first_failure.is_some() {
+        return Ok(SignatureVerificationResult {
+            references,
+            signature_checked: false,
+            signature_valid: false,
+        });
+    }
+
+    let signed_info_subtree: HashSet<_> = signed_info_node
+        .descendants()
+        .map(|node: Node<'_, '_>| node.id())
+        .collect();
+    let mut canonical_signed_info = Vec::new();
+    canonicalize(
+        &doc,
+        Some(&|node| signed_info_subtree.contains(&node.id())),
+        &signed_info.c14n_method,
+        &mut canonical_signed_info,
+    )?;
+
+    let signature_value = decode_signature_value(signature_children.signature_value_node)?;
+    let signature_valid = verify_with_algorithm(
+        signed_info.signature_method,
+        public_key_pem,
+        &canonical_signed_info,
+        &signature_value,
+    )?;
+
+    Ok(SignatureVerificationResult {
+        references,
+        signature_checked: true,
+        signature_valid,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SignatureChildNodes<'a, 'input> {
+    signed_info_node: Node<'a, 'input>,
+    signature_value_node: Node<'a, 'input>,
+}
+
+fn parse_signature_children<'a, 'input>(
+    signature_node: Node<'a, 'input>,
+) -> Result<SignatureChildNodes<'a, 'input>, SignatureVerificationPipelineError> {
+    let mut signed_info_node: Option<Node<'_, '_>> = None;
+    let mut signature_value_node: Option<Node<'_, '_>> = None;
+    let mut signed_info_index: Option<usize> = None;
+    let mut signature_value_index: Option<usize> = None;
+    for (zero_based_index, child) in signature_node
+        .children()
+        .filter(|node| node.is_element())
+        .enumerate()
+    {
+        let element_index = zero_based_index + 1;
+        if child.tag_name().namespace() != Some(XMLDSIG_NS) {
+            continue;
+        }
+        match child.tag_name().name() {
+            "SignedInfo" => {
+                if signed_info_node.is_some() {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "SignedInfo must appear exactly once under Signature",
+                    });
+                }
+                signed_info_node = Some(child);
+                signed_info_index = Some(element_index);
+            }
+            "SignatureValue" => {
+                if signature_value_node.is_some() {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "SignatureValue must appear exactly once under Signature",
+                    });
+                }
+                signature_value_node = Some(child);
+                signature_value_index = Some(element_index);
+            }
+            _ => {}
+        }
+    }
+
+    let signed_info_node =
+        signed_info_node.ok_or(SignatureVerificationPipelineError::MissingElement {
+            element: "SignedInfo",
+        })?;
+    let signature_value_node =
+        signature_value_node.ok_or(SignatureVerificationPipelineError::MissingElement {
+            element: "SignatureValue",
+        })?;
+    if signed_info_index != Some(1) {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignedInfo must be the first element child of Signature",
+        });
+    }
+    if signature_value_index != Some(2) {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignatureValue must be the second element child of Signature",
+        });
+    }
+    Ok(SignatureChildNodes {
+        signed_info_node,
+        signature_value_node,
+    })
+}
+
+fn decode_signature_value(
+    signature_value_node: Node<'_, '_>,
+) -> Result<Vec<u8>, SignatureVerificationPipelineError> {
+    if signature_value_node
+        .children()
+        .any(|child| child.is_element())
+    {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignatureValue must not contain element children",
+        });
+    }
+
+    let mut normalized = String::new();
+    let mut raw_text_len = 0usize;
+    for child in signature_value_node
+        .children()
+        .filter(|child| child.is_text())
+    {
+        if let Some(text) = child.text() {
+            push_normalized_signature_text(text, &mut raw_text_len, &mut normalized)?;
+        }
+    }
+
+    Ok(base64::engine::general_purpose::STANDARD.decode(normalized)?)
+}
+
+fn push_normalized_signature_text(
+    text: &str,
+    raw_text_len: &mut usize,
+    normalized: &mut String,
+) -> Result<(), SignatureVerificationPipelineError> {
+    for ch in text.chars() {
+        if raw_text_len.saturating_add(ch.len_utf8()) > MAX_SIGNATURE_VALUE_TEXT_LEN {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignatureValue exceeds maximum allowed text length",
+            });
+        }
+        *raw_text_len = raw_text_len.saturating_add(ch.len_utf8());
+        if matches!(ch, ' ' | '\t' | '\r' | '\n') {
+            continue;
+        }
+        if ch.is_ascii_whitespace() {
+            let invalid_byte =
+                u8::try_from(u32::from(ch)).expect("ASCII whitespace always fits into u8");
+            return Err(SignatureVerificationPipelineError::SignatureValueBase64(
+                base64::DecodeError::InvalidByte(normalized.len(), invalid_byte),
+            ));
+        }
+        if normalized.len().saturating_add(ch.len_utf8()) > MAX_SIGNATURE_VALUE_LEN {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignatureValue exceeds maximum allowed length",
+            });
+        }
+        normalized.push(ch);
+    }
+    Ok(())
+}
+
+fn verify_with_algorithm(
+    algorithm: SignatureAlgorithm,
+    public_key_pem: &str,
+    signed_data: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationPipelineError> {
+    match algorithm {
+        SignatureAlgorithm::RsaSha1
+        | SignatureAlgorithm::RsaSha256
+        | SignatureAlgorithm::RsaSha384
+        | SignatureAlgorithm::RsaSha512 => Ok(verify_rsa_signature_pem(
+            algorithm,
+            public_key_pem,
+            signed_data,
+            signature_value,
+        )?),
+        SignatureAlgorithm::EcdsaP256Sha256 | SignatureAlgorithm::EcdsaP384Sha384 => {
+            // Malformed ECDSA signature bytes are treated as a verification miss
+            // (Ok(false)) instead of a pipeline error; only key/algorithm and
+            // crypto-operation failures propagate as Err.
+            match verify_ecdsa_signature_pem(
+                algorithm,
+                public_key_pem,
+                signed_data,
+                signature_value,
+            ) {
+                Ok(valid) => Ok(valid),
+                Err(SignatureVerificationError::InvalidSignatureFormat) => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
@@ -183,6 +506,35 @@ mod tests {
             digest_method,
             digest_value,
         }
+    }
+
+    #[test]
+    fn push_normalized_signature_text_rejects_form_feed() {
+        let mut normalized = String::new();
+        let mut raw_text_len = 0usize;
+        let err =
+            push_normalized_signature_text("ab\u{000C}cd", &mut raw_text_len, &mut normalized)
+                .expect_err("form-feed must not be treated as XML base64 whitespace");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::SignatureValueBase64(
+                base64::DecodeError::InvalidByte(_, 0x0C)
+            )
+        ));
+    }
+
+    #[test]
+    fn push_normalized_signature_text_enforces_byte_limit_for_multibyte_chars() {
+        let mut normalized = "A".repeat(MAX_SIGNATURE_VALUE_LEN - 1);
+        let mut raw_text_len = normalized.len();
+        let err = push_normalized_signature_text("é", &mut raw_text_len, &mut normalized)
+            .expect_err("multibyte characters must not bypass byte-size limit");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignatureValue exceeds maximum allowed length"
+            }
+        ));
     }
 
     // ── process_reference: happy path ────────────────────────────────
@@ -529,5 +881,40 @@ mod tests {
             !pre_digest_str.contains("SignatureValue"),
             "pre-digest should NOT contain Signature"
         );
+    }
+
+    #[test]
+    fn pipeline_missing_signed_info_returns_missing_element() {
+        let xml = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"></ds:Signature>"#;
+
+        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
+            .expect_err("missing SignedInfo must fail before crypto stage");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::MissingElement {
+                element: "SignedInfo"
+            }
+        ));
+    }
+
+    #[test]
+    fn pipeline_multiple_signature_elements_are_rejected() {
+        let xml = r#"
+<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:Signature>
+    <ds:SignedInfo/>
+  </ds:Signature>
+  <ds:Signature/>
+</root>
+"#;
+
+        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
+            .expect_err("multiple signatures must fail closed");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Signature must appear exactly once in document",
+            }
+        ));
     }
 }
