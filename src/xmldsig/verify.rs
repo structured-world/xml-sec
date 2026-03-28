@@ -11,6 +11,7 @@
 
 use base64::Engine;
 use roxmltree::{Document, Node};
+use std::collections::HashSet;
 
 use crate::c14n::canonicalize;
 
@@ -24,6 +25,7 @@ use super::transforms::execute_transforms;
 use super::uri::UriReferenceResolver;
 
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 
 /// Per-reference verification result.
 #[derive(Debug)]
@@ -310,15 +312,14 @@ pub fn verify_signature_with_pem_key(
         });
     }
 
+    let signed_info_subtree: HashSet<_> = signed_info_node
+        .descendants()
+        .map(|node| node.id())
+        .collect();
     let mut canonical_signed_info = Vec::new();
     canonicalize(
         &doc,
-        Some(&|node| {
-            node == signed_info_node
-                || node
-                    .ancestors()
-                    .any(|ancestor| ancestor == signed_info_node)
-        }),
+        Some(&|node| signed_info_subtree.contains(&node.id())),
         &signed_info.c14n_method,
         &mut canonical_signed_info,
     )?;
@@ -383,13 +384,25 @@ fn decode_signature_value(
         });
     }
 
-    let normalized: String = signature_value_node
+    let mut normalized = String::new();
+    for child in signature_value_node
         .children()
         .filter(|child| child.is_text())
-        .filter_map(|child| child.text())
-        .flat_map(str::chars)
-        .filter(|ch| !ch.is_ascii_whitespace())
-        .collect();
+    {
+        if let Some(text) = child.text() {
+            for ch in text.chars() {
+                if ch.is_ascii_whitespace() {
+                    continue;
+                }
+                if normalized.len() >= MAX_SIGNATURE_VALUE_LEN {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "SignatureValue exceeds maximum allowed length",
+                    });
+                }
+                normalized.push(ch);
+            }
+        }
+    }
 
     Ok(base64::engine::general_purpose::STANDARD.decode(normalized)?)
 }
