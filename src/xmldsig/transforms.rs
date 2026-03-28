@@ -19,6 +19,7 @@
 
 use roxmltree::Node;
 
+use super::parse::XMLDSIG_NS;
 use super::types::{TransformData, TransformError};
 use crate::c14n::{self, C14nAlgorithm};
 
@@ -29,9 +30,6 @@ const XPATH_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
 /// xmlsec1 donor vectors use this XPath expression as a compatibility form of
 /// enveloped-signature exclusion.
 const ENVELOPED_SIGNATURE_XPATH_EXPR: &str = "not(ancestor-or-self::dsig:Signature)";
-
-/// XMLDSig namespace URI for `<Transform>` elements.
-const XMLDSIG_NS_URI: &str = "http://www.w3.org/2000/09/xmldsig#";
 
 /// Namespace URI for Exclusive C14N `<InclusiveNamespaces>` elements.
 const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
@@ -94,7 +92,7 @@ pub(crate) fn apply_transform<'a>(
             for node in doc.descendants().filter(|node| {
                 node.is_element()
                     && node.tag_name().name() == "Signature"
-                    && node.tag_name().namespace() == Some(XMLDSIG_NS_URI)
+                    && node.tag_name().namespace() == Some(XMLDSIG_NS)
             }) {
                 nodes.exclude_subtree(node);
             }
@@ -164,7 +162,7 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
         ));
     }
     let transforms_tag = transforms_node.tag_name();
-    if transforms_tag.name() != "Transforms" || transforms_tag.namespace() != Some(XMLDSIG_NS_URI) {
+    if transforms_tag.name() != "Transforms" || transforms_tag.namespace() != Some(XMLDSIG_NS) {
         return Err(TransformError::UnsupportedTransform(
             "expected <ds:Transforms> element in XMLDSig namespace".into(),
         ));
@@ -179,7 +177,7 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
 
         // Only <ds:Transform> children are allowed; fail closed on any other element.
         let tag = child.tag_name();
-        if tag.name() != "Transform" || tag.namespace() != Some(XMLDSIG_NS_URI) {
+        if tag.name() != "Transform" || tag.namespace() != Some(XMLDSIG_NS) {
             return Err(TransformError::UnsupportedTransform(
                 "unexpected child element of <ds:Transforms>; only <ds:Transform> is allowed"
                     .into(),
@@ -222,7 +220,7 @@ fn parse_xpath_compat_transform(transform_node: Node) -> Result<Transform, Trans
 
     for child in transform_node.children().filter(|node| node.is_element()) {
         let tag = child.tag_name();
-        if tag.name() == "XPath" && tag.namespace() == Some(XMLDSIG_NS_URI) {
+        if tag.name() == "XPath" && tag.namespace() == Some(XMLDSIG_NS) {
             if xpath_node.is_some() {
                 return Err(TransformError::UnsupportedTransform(
                     "XPath transform must contain exactly one XMLDSig <XPath> child element".into(),
@@ -249,7 +247,7 @@ fn parse_xpath_compat_transform(transform_node: Node) -> Result<Transform, Trans
 
     if expr == ENVELOPED_SIGNATURE_XPATH_EXPR {
         let dsig_ns = xpath_node.lookup_namespace_uri(Some("dsig"));
-        if dsig_ns == Some(XMLDSIG_NS_URI) {
+        if dsig_ns == Some(XMLDSIG_NS) {
             Ok(Transform::XpathExcludeAllSignatures)
         } else {
             Err(TransformError::UnsupportedTransform(
@@ -819,7 +817,7 @@ mod tests {
             .filter(|node| {
                 node.is_element()
                     && node.tag_name().name() == "Signature"
-                    && node.tag_name().namespace() == Some(XMLDSIG_NS_URI)
+                    && node.tag_name().namespace() == Some(XMLDSIG_NS)
             })
             .collect();
         let sig_node = signature_nodes[0];
