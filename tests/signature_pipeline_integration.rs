@@ -187,6 +187,19 @@ fn insert_object_before_signature_value(xml: &str) -> String {
     format!("{}{}{}", &xml[..start], object_xml, &xml[start..])
 }
 
+fn replace_signed_info_with_object(xml: &str) -> String {
+    if xml.contains("<ds:SignedInfo") {
+        xml.replacen("<ds:SignedInfo", "<ds:Object", 1).replacen(
+            "</ds:SignedInfo>",
+            "</ds:Object>",
+            1,
+        )
+    } else {
+        xml.replacen("<SignedInfo", "<Object", 1)
+            .replacen("</SignedInfo>", "</Object>", 1)
+    }
+}
+
 fn duplicate_signature_value(xml: &str) -> String {
     let (open, close) = if xml.contains("<ds:SignatureValue") {
         ("<ds:SignatureValue", "</ds:SignatureValue>")
@@ -458,6 +471,24 @@ fn missing_signed_info_is_reported_as_missing_element() {
 
     let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect_err("missing SignedInfo must be rejected as missing element");
+    assert!(matches!(
+        err,
+        SignatureVerificationPipelineError::MissingElement {
+            element: "SignedInfo"
+        }
+    ));
+}
+
+#[test]
+fn non_empty_signature_without_signed_info_is_reported_as_missing_element() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let tampered_xml = replace_signed_info_with_object(&xml);
+
+    let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect_err("non-empty Signature without SignedInfo must be rejected as missing element");
     assert!(matches!(
         err,
         SignatureVerificationPipelineError::MissingElement {
