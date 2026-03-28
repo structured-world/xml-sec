@@ -429,11 +429,7 @@ fn push_normalized_signature_text(
             continue;
         }
         if ch.is_ascii_whitespace() {
-            let invalid_byte = u8::try_from(u32::from(ch)).map_err(|_| {
-                SignatureVerificationPipelineError::SignatureValueBase64(
-                    base64::DecodeError::InvalidByte(normalized.len(), 0),
-                )
-            })?;
+            let invalid_byte = ch as u8;
             return Err(SignatureVerificationPipelineError::SignatureValueBase64(
                 base64::DecodeError::InvalidByte(normalized.len(), invalid_byte),
             ));
