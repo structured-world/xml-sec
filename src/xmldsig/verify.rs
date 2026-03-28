@@ -15,8 +15,8 @@ use roxmltree::{Document, Node};
 use crate::c14n::canonicalize;
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
-use super::parse::{Reference, SignatureAlgorithm};
 use super::parse::parse_signed_info;
+use super::parse::{Reference, SignatureAlgorithm};
 use super::signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
 };

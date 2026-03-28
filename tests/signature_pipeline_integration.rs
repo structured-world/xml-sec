@@ -445,7 +445,8 @@ fn multiple_signature_elements_are_rejected() {
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
     ));
     let xml_without_decl = xml.replace("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n", "");
-    let additional_signature = "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"></Signature>";
+    let additional_signature =
+        "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"></Signature>";
     let tampered_xml = format!("<Root>{xml_without_decl}{additional_signature}</Root>");
     let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
 
@@ -485,7 +486,10 @@ fn duplicate_signature_value_is_rejected() {
 
     let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect_err("duplicate SignatureValue must be rejected");
-    assert_invalid_structure_reason(err, "SignatureValue must appear exactly once under Signature");
+    assert_invalid_structure_reason(
+        err,
+        "SignatureValue must appear exactly once under Signature",
+    );
 }
 
 #[test]
