@@ -151,6 +151,12 @@ fn inject_oversized_signature_value(xml: &str) -> String {
     })
 }
 
+fn inject_excessive_xml_whitespace_in_signature_value(xml: &str) -> String {
+    replace_ds_tag_content_with(xml, "SignatureValue", |chars| {
+        chars.extend(std::iter::repeat_n(' ', 70_000));
+    })
+}
+
 fn insert_object_before_signed_info(xml: &str) -> String {
     let (signed_info_open, object_xml) = if xml.contains("<ds:SignedInfo") {
         ("<ds:SignedInfo", "<ds:Object/>")
@@ -580,6 +586,19 @@ fn oversized_signature_value_is_rejected_early() {
     let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect_err("oversized SignatureValue must be rejected");
     assert_invalid_structure_reason(err, "SignatureValue exceeds maximum allowed length");
+}
+
+#[test]
+fn excessive_signature_value_whitespace_is_rejected_early() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let tampered_xml = inject_excessive_xml_whitespace_in_signature_value(&xml);
+
+    let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect_err("SignatureValue with excessive XML whitespace must be rejected");
+    assert_invalid_structure_reason(err, "SignatureValue exceeds maximum allowed text length");
 }
 
 #[test]

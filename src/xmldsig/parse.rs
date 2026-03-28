@@ -23,7 +23,7 @@ use super::transforms::{self, Transform};
 use crate::c14n::C14nAlgorithm;
 
 /// XMLDSig namespace URI.
-const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+pub(crate) const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

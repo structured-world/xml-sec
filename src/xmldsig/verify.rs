@@ -18,15 +18,15 @@ use crate::c14n::canonicalize;
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 use super::parse::parse_signed_info;
-use super::parse::{Reference, SignatureAlgorithm};
+use super::parse::{Reference, SignatureAlgorithm, XMLDSIG_NS};
 use super::signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
 };
 use super::transforms::execute_transforms;
 use super::uri::UriReferenceResolver;
 
-const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
+const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
 
 /// Per-reference verification result.
 #[derive(Debug)]
@@ -396,12 +396,13 @@ fn decode_signature_value(
     }
 
     let mut normalized = String::new();
+    let mut raw_text_len = 0usize;
     for child in signature_value_node
         .children()
         .filter(|child| child.is_text())
     {
         if let Some(text) = child.text() {
-            push_normalized_signature_text(text, &mut normalized)?;
+            push_normalized_signature_text(text, &mut raw_text_len, &mut normalized)?;
         }
     }
 
@@ -410,9 +411,16 @@ fn decode_signature_value(
 
 fn push_normalized_signature_text(
     text: &str,
+    raw_text_len: &mut usize,
     normalized: &mut String,
 ) -> Result<(), SignatureVerificationPipelineError> {
     for ch in text.chars() {
+        if raw_text_len.saturating_add(ch.len_utf8()) > MAX_SIGNATURE_VALUE_TEXT_LEN {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignatureValue exceeds maximum allowed text length",
+            });
+        }
+        *raw_text_len = raw_text_len.saturating_add(ch.len_utf8());
         if matches!(ch, ' ' | '\t' | '\r' | '\n') {
             continue;
         }
@@ -499,8 +507,10 @@ mod tests {
     #[test]
     fn push_normalized_signature_text_rejects_form_feed() {
         let mut normalized = String::new();
-        let err = push_normalized_signature_text("ab\u{000C}cd", &mut normalized)
-            .expect_err("form-feed must not be treated as XML base64 whitespace");
+        let mut raw_text_len = 0usize;
+        let err =
+            push_normalized_signature_text("ab\u{000C}cd", &mut raw_text_len, &mut normalized)
+                .expect_err("form-feed must not be treated as XML base64 whitespace");
         assert!(matches!(
             err,
             SignatureVerificationPipelineError::SignatureValueBase64(
@@ -512,7 +522,8 @@ mod tests {
     #[test]
     fn push_normalized_signature_text_enforces_byte_limit_for_multibyte_chars() {
         let mut normalized = "A".repeat(MAX_SIGNATURE_VALUE_LEN - 1);
-        let err = push_normalized_signature_text("é", &mut normalized)
+        let mut raw_text_len = normalized.len();
+        let err = push_normalized_signature_text("é", &mut raw_text_len, &mut normalized)
             .expect_err("multibyte characters must not bypass byte-size limit");
         assert!(matches!(
             err,
