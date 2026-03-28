@@ -411,9 +411,18 @@ fn verify_with_algorithm(
             signed_data,
             signature_value,
         )?),
-        SignatureAlgorithm::EcdsaP256Sha256 | SignatureAlgorithm::EcdsaP384Sha384 => Ok(
-            verify_ecdsa_signature_pem(algorithm, public_key_pem, signed_data, signature_value)?,
-        ),
+        SignatureAlgorithm::EcdsaP256Sha256 | SignatureAlgorithm::EcdsaP384Sha384 => {
+            match verify_ecdsa_signature_pem(
+                algorithm,
+                public_key_pem,
+                signed_data,
+                signature_value,
+            ) {
+                Ok(valid) => Ok(valid),
+                Err(SignatureVerificationError::InvalidSignatureFormat) => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        }
     }
 }
 

@@ -328,6 +328,22 @@ fn tampered_signature_value_fails_after_references_pass_ecdsa() {
 }
 
 #[test]
+fn malformed_ecdsa_signature_value_returns_invalid_not_error() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem"));
+    let tampered_xml = replace_ds_tag_content(&xml, "SignatureValue", "AQ==");
+
+    let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect("malformed-but-base64 SignatureValue should be reported as invalid signature");
+
+    assert!(result.references.all_valid());
+    assert!(result.signature_checked);
+    assert!(!result.signature_valid);
+}
+
+#[test]
 fn tampered_digest_value_fails_before_signature_stage_ecdsa() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
