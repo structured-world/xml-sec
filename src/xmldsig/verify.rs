@@ -107,6 +107,7 @@ impl Default for UriTypeSet {
 }
 
 /// Verification builder/configuration.
+#[must_use = "configure the context and call verify(), or store it for reuse"]
 pub struct VerifyContext<'a> {
     key: Option<&'a dyn VerifyingKey>,
     key_resolver: Option<&'a dyn KeyResolver>,
