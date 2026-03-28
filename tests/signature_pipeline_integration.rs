@@ -82,11 +82,11 @@ fn find_open_tag_start(xml: &str, open_prefix: &str) -> Option<usize> {
 
 fn strip_xml_declaration(xml: &str) -> &str {
     let trimmed_start = xml.trim_start_matches(char::is_whitespace);
-    if let Some(rest) = trimmed_start.strip_prefix("<?xml") {
-        if let Some(end_idx) = rest.find("?>") {
-            let after_decl = &rest[end_idx + 2..];
-            return after_decl.trim_start_matches(char::is_whitespace);
-        }
+    if let Some(rest) = trimmed_start.strip_prefix("<?xml")
+        && let Some(end_idx) = rest.find("?>")
+    {
+        let after_decl = &rest[end_idx + 2..];
+        return after_decl.trim_start_matches(char::is_whitespace);
     }
     xml
 }
