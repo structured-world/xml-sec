@@ -153,6 +153,10 @@ impl<'a> VerifyContext<'a> {
     }
 
     /// Enable or disable `<Manifest>` processing.
+    ///
+    /// Note: manifest verification is not implemented yet. When enabled, the
+    /// verifier fails closed with `ManifestProcessingUnsupported` if a
+    /// `<ds:Manifest>` is present under `<ds:Object>`.
     #[must_use]
     pub fn process_manifests(mut self, enabled: bool) -> Self {
         self.process_manifests = enabled;
