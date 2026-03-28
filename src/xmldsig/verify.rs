@@ -585,9 +585,12 @@ fn enforce_reference_policies(
     allowed_transforms: Option<&HashSet<String>>,
 ) -> Result<(), SignatureVerificationPipelineError> {
     for reference in references {
-        let uri = reference.uri.as_deref().ok_or(
-            SignatureVerificationPipelineError::Reference(ReferenceProcessingError::MissingUri),
-        )?;
+        let uri = reference
+            .uri
+            .as_deref()
+            .ok_or(SignatureVerificationPipelineError::Reference(
+                ReferenceProcessingError::MissingUri,
+            ))?;
         if !allowed_uri_types.allows(uri) {
             return Err(SignatureVerificationPipelineError::DisallowedUri {
                 uri: uri.to_owned(),
