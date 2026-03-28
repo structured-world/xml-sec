@@ -152,6 +152,50 @@ fn duplicate_signed_info(xml: &str) -> String {
     format!("{}{}{}", &xml[..end], signed_info_block, &xml[end..])
 }
 
+fn insert_object_before_signature_value(xml: &str) -> String {
+    let (signature_value_open, object_xml) = if xml.contains("<ds:SignatureValue") {
+        ("<ds:SignatureValue", "<ds:Object/>")
+    } else {
+        ("<SignatureValue", "<Object/>")
+    };
+    let start = xml
+        .find(signature_value_open)
+        .unwrap_or_else(|| panic!("missing opening tag prefix {signature_value_open}"));
+    format!("{}{}{}", &xml[..start], object_xml, &xml[start..])
+}
+
+fn duplicate_signature_value(xml: &str) -> String {
+    let (open, close) = if xml.contains("<ds:SignatureValue") {
+        ("<ds:SignatureValue", "</ds:SignatureValue>")
+    } else {
+        ("<SignatureValue", "</SignatureValue>")
+    };
+    let start = xml
+        .find(open)
+        .unwrap_or_else(|| panic!("missing opening tag prefix {open}"));
+    let end = xml[start..]
+        .find(close)
+        .unwrap_or_else(|| panic!("missing closing tag {close}"))
+        + start
+        + close.len();
+    let signature_value_block = &xml[start..end];
+    format!("{}{}{}", &xml[..end], signature_value_block, &xml[end..])
+}
+
+fn insert_nested_element_in_signature_value(xml: &str) -> String {
+    replace_ds_tag_content_with(xml, "SignatureValue", |chars| {
+        if chars.len() < 4 {
+            panic!("SignatureValue too short for nested-element mutation");
+        }
+        let split_at = chars.len() / 2;
+        let mut mixed = Vec::with_capacity(chars.len() + 6);
+        mixed.extend_from_slice(&chars[..split_at]);
+        mixed.extend("<x/>".chars());
+        mixed.extend_from_slice(&chars[split_at..]);
+        *chars = mixed;
+    })
+}
+
 #[test]
 fn replace_ds_tag_content_with_allows_whitespace_before_closing_bracket() {
     let xml = "<Root><ds:SignatureValue   >ABC</ds:SignatureValue></Root>";
@@ -345,9 +389,7 @@ fn signed_info_must_be_first_element_child_of_signature() {
 
     assert!(matches!(
         err,
-        SignatureVerificationPipelineError::MissingElement {
-            element: "SignedInfo"
-        }
+        SignatureVerificationPipelineError::InvalidStructure { .. }
     ));
 }
 
@@ -364,9 +406,55 @@ fn duplicate_signed_info_is_rejected() {
 
     assert!(matches!(
         err,
-        SignatureVerificationPipelineError::MissingElement {
-            element: "SignedInfo"
-        }
+        SignatureVerificationPipelineError::InvalidStructure { .. }
+    ));
+}
+
+#[test]
+fn signature_value_must_be_second_element_child_of_signature() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let tampered_xml = insert_object_before_signature_value(&xml);
+
+    let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect_err("SignatureValue not-second child must be rejected");
+    assert!(matches!(
+        err,
+        SignatureVerificationPipelineError::InvalidStructure { .. }
+    ));
+}
+
+#[test]
+fn duplicate_signature_value_is_rejected() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let tampered_xml = duplicate_signature_value(&xml);
+
+    let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect_err("duplicate SignatureValue must be rejected");
+    assert!(matches!(
+        err,
+        SignatureVerificationPipelineError::InvalidStructure { .. }
+    ));
+}
+
+#[test]
+fn signature_value_with_nested_element_is_rejected() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let tampered_xml = insert_nested_element_in_signature_value(&xml);
+
+    let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect_err("nested elements inside SignatureValue must be rejected");
+    assert!(matches!(
+        err,
+        SignatureVerificationPipelineError::InvalidStructure { .. }
     ));
 }
 

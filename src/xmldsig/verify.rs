@@ -23,6 +23,8 @@ use super::signature::{
 use super::transforms::execute_transforms;
 use super::uri::UriReferenceResolver;
 
+const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
 /// Per-reference verification result.
 #[derive(Debug)]
 pub struct ReferenceResult {
@@ -194,6 +196,13 @@ pub enum SignatureVerificationPipelineError {
         element: &'static str,
     },
 
+    /// Signature element tree shape violates XMLDSig structure requirements.
+    #[error("invalid Signature structure: {reason}")]
+    InvalidStructure {
+        /// Validation failure reason.
+        reason: &'static str,
+    },
+
     /// `<SignedInfo>` parsing failed.
     #[error("failed to parse SignedInfo: {0}")]
     ParseSignedInfo(#[from] super::parse::ParseError),
@@ -236,22 +245,23 @@ pub fn verify_signature_with_pem_key(
         find_signature_node(&doc).ok_or(SignatureVerificationPipelineError::MissingElement {
             element: "Signature",
         })?;
+
     let mut signature_element_children = signature_node.children().filter(|node| node.is_element());
     let signed_info_node = signature_element_children
         .next()
         .filter(|node| {
             node.tag_name().name() == "SignedInfo"
-                && node.tag_name().namespace() == Some("http://www.w3.org/2000/09/xmldsig#")
+                && node.tag_name().namespace() == Some(XMLDSIG_NS)
         })
-        .ok_or(SignatureVerificationPipelineError::MissingElement {
-            element: "SignedInfo",
+        .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignedInfo must be the first element child of Signature",
         })?;
+
     if signature_element_children.any(|node| {
-        node.tag_name().name() == "SignedInfo"
-            && node.tag_name().namespace() == Some("http://www.w3.org/2000/09/xmldsig#")
+        node.tag_name().name() == "SignedInfo" && node.tag_name().namespace() == Some(XMLDSIG_NS)
     }) {
-        return Err(SignatureVerificationPipelineError::MissingElement {
-            element: "SignedInfo",
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignedInfo must appear exactly once under Signature",
         });
     }
 
@@ -303,16 +313,48 @@ pub fn verify_signature_with_pem_key(
 fn decode_signature_value(
     signature_node: Node<'_, '_>,
 ) -> Result<Vec<u8>, SignatureVerificationPipelineError> {
-    let signature_value_node = signature_node
-        .children()
-        .find(|node| {
-            node.is_element()
-                && node.tag_name().name() == "SignatureValue"
-                && node.tag_name().namespace() == Some("http://www.w3.org/2000/09/xmldsig#")
-        })
-        .ok_or(SignatureVerificationPipelineError::MissingElement {
+    let mut element_index = 0usize;
+    let mut seen_signed_info = false;
+    let mut signature_value_node: Option<Node<'_, '_>> = None;
+    for child in signature_node.children().filter(|node| node.is_element()) {
+        element_index += 1;
+        if child.tag_name().namespace() != Some(XMLDSIG_NS) {
+            continue;
+        }
+        match child.tag_name().name() {
+            "SignedInfo" => {
+                seen_signed_info = true;
+            }
+            "SignatureValue" => {
+                if !seen_signed_info || element_index != 2 {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "SignatureValue must be the second element child of Signature",
+                    });
+                }
+                if signature_value_node.is_some() {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "SignatureValue must appear exactly once under Signature",
+                    });
+                }
+                signature_value_node = Some(child);
+            }
+            _ => {}
+        }
+    }
+
+    let signature_value_node =
+        signature_value_node.ok_or(SignatureVerificationPipelineError::MissingElement {
             element: "SignatureValue",
         })?;
+    if signature_value_node
+        .children()
+        .any(|child| child.is_element())
+    {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignatureValue must not contain element children",
+        });
+    }
+
     let normalized: String = signature_value_node
         .children()
         .filter(|child| child.is_text())
