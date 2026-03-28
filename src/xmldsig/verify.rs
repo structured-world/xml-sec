@@ -390,21 +390,34 @@ fn decode_signature_value(
         .filter(|child| child.is_text())
     {
         if let Some(text) = child.text() {
-            for ch in text.chars() {
-                if ch.is_ascii_whitespace() {
-                    continue;
-                }
-                if normalized.len() >= MAX_SIGNATURE_VALUE_LEN {
-                    return Err(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "SignatureValue exceeds maximum allowed length",
-                    });
-                }
-                normalized.push(ch);
-            }
+            push_normalized_signature_text(text, &mut normalized)?;
         }
     }
 
     Ok(base64::engine::general_purpose::STANDARD.decode(normalized)?)
+}
+
+fn push_normalized_signature_text(
+    text: &str,
+    normalized: &mut String,
+) -> Result<(), SignatureVerificationPipelineError> {
+    for ch in text.chars() {
+        if matches!(ch, ' ' | '\t' | '\r' | '\n') {
+            continue;
+        }
+        if ch.is_ascii_whitespace() {
+            return Err(SignatureVerificationPipelineError::SignatureValueBase64(
+                base64::DecodeError::InvalidByte(normalized.len(), ch as u8),
+            ));
+        }
+        if normalized.len() >= MAX_SIGNATURE_VALUE_LEN {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignatureValue exceeds maximum allowed length",
+            });
+        }
+        normalized.push(ch);
+    }
+    Ok(())
 }
 
 fn verify_with_algorithm(
@@ -465,6 +478,19 @@ mod tests {
             digest_method,
             digest_value,
         }
+    }
+
+    #[test]
+    fn push_normalized_signature_text_rejects_form_feed() {
+        let mut normalized = String::new();
+        let err = push_normalized_signature_text("ab\u{000C}cd", &mut normalized)
+            .expect_err("form-feed must not be treated as XML base64 whitespace");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::SignatureValueBase64(
+                base64::DecodeError::InvalidByte(_, 0x0C)
+            )
+        ));
     }
 
     // ── process_reference: happy path ────────────────────────────────
