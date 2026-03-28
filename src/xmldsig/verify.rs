@@ -875,6 +875,88 @@ mod tests {
         ));
     }
 
+    fn signature_with_manifest_xml() -> String {
+        r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:SignedInfo>
+    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    <ds:Reference URI="">
+      <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+      <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
+    </ds:Reference>
+  </ds:SignedInfo>
+  <ds:SignatureValue>AQ==</ds:SignatureValue>
+  <ds:Object>
+    <ds:Manifest>
+      <ds:Reference URI="">
+        <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+        <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
+      </ds:Reference>
+    </ds:Manifest>
+  </ds:Object>
+</ds:Signature>"#
+            .to_owned()
+    }
+
+    #[test]
+    fn verify_context_manifest_policy_toggle_is_enforced() {
+        let xml = signature_with_manifest_xml();
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(true)
+            .verify(&xml)
+            .expect_err("manifest processing must fail closed while unsupported");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::ManifestProcessingUnsupported
+        ));
+
+        let result = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(false)
+            .verify(&xml)
+            .expect("manifest processing disabled should preserve prior behavior");
+        assert!(!result.signature_valid);
+    }
+
+    #[test]
+    fn verify_context_rejects_implicit_default_c14n_when_not_allowlisted() {
+        let xml = minimal_signature_xml("", "");
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .allowed_transforms(["http://www.w3.org/2001/10/xml-exc-c14n#"])
+            .verify(&xml)
+            .expect_err("implicit default C14N must be checked against allowlist");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::DisallowedTransform { .. }
+        ));
+    }
+
+    #[test]
+    fn enforce_reference_policies_rejects_missing_uri_before_uri_type_checks() {
+        let references = vec![Reference {
+            uri: None,
+            id: None,
+            ref_type: None,
+            transforms: vec![],
+            digest_method: DigestAlgorithm::Sha256,
+            digest_value: vec![0; 32],
+        }];
+        let uri_types = UriTypeSet {
+            allow_empty: false,
+            allow_same_document: true,
+            allow_external: false,
+        };
+
+        let err = enforce_reference_policies(&references, uri_types, None)
+            .expect_err("missing URI must fail before allow_empty policy is evaluated");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::Reference(ReferenceProcessingError::MissingUri)
+        ));
+    }
+
     #[test]
     fn push_normalized_signature_text_rejects_form_feed() {
         let mut normalized = String::new();
