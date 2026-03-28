@@ -1,4 +1,4 @@
-//! Reference processing and digest verification for XMLDSig.
+//! XMLDSig reference processing and end-to-end signature verification pipeline.
 //!
 //! Implements [XMLDSig §4.3.3](https://www.w3.org/TR/xmldsig-core1/#sec-CoreValidation):
 //! for each `<Reference>` in `<SignedInfo>`, dereference the URI, apply transforms,
@@ -8,6 +8,7 @@
 //! - [`UriReferenceResolver`] for URI dereference
 //! - [`execute_transforms`] for the transform pipeline
 //! - [`compute_digest`] + [`constant_time_eq`] for digest computation and comparison
+//! - [`verify_signature_with_pem_key`] for full pipeline validation (`SignedInfo` + `SignatureValue`)
 
 use base64::Engine;
 use roxmltree::{Document, Node};
@@ -410,7 +411,7 @@ fn push_normalized_signature_text(
                 base64::DecodeError::InvalidByte(normalized.len(), ch as u8),
             ));
         }
-        if normalized.len() >= MAX_SIGNATURE_VALUE_LEN {
+        if normalized.len().saturating_add(ch.len_utf8()) > MAX_SIGNATURE_VALUE_LEN {
             return Err(SignatureVerificationPipelineError::InvalidStructure {
                 reason: "SignatureValue exceeds maximum allowed length",
             });
@@ -490,6 +491,19 @@ mod tests {
             SignatureVerificationPipelineError::SignatureValueBase64(
                 base64::DecodeError::InvalidByte(_, 0x0C)
             )
+        ));
+    }
+
+    #[test]
+    fn push_normalized_signature_text_enforces_byte_limit_for_multibyte_chars() {
+        let mut normalized = "A".repeat(MAX_SIGNATURE_VALUE_LEN - 1);
+        let err = push_normalized_signature_text("é", &mut normalized)
+            .expect_err("multibyte characters must not bypass byte-size limit");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignatureValue exceeds maximum allowed length"
+            }
         ));
     }
 
