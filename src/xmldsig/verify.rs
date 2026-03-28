@@ -31,6 +31,9 @@ const XPATH_TRANSFORM_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116"
 const DEFAULT_IMPLICIT_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
 
 /// Cryptographic verifier used by [`VerifyContext`].
+///
+/// This trait intentionally has no `Send + Sync` supertraits so lightweight
+/// single-threaded verifiers can be used without additional bounds.
 pub trait VerifyingKey {
     /// Verify `signature_value` over `signed_data` with the declared algorithm.
     fn verify(
@@ -42,6 +45,9 @@ pub trait VerifyingKey {
 }
 
 /// Key resolver hook used by [`VerifyContext`] when no pre-set key is provided.
+///
+/// This trait intentionally has no `Send + Sync` supertraits; callers that need
+/// cross-thread sharing can wrap resolvers/keys in their own thread-safe types.
 pub trait KeyResolver {
     /// Resolve a verification key for the provided XML document.
     fn resolve(
@@ -59,6 +65,15 @@ pub struct UriTypeSet {
 }
 
 impl UriTypeSet {
+    /// Create a custom URI policy.
+    pub const fn new(allow_empty: bool, allow_same_document: bool, allow_external: bool) -> Self {
+        Self {
+            allow_empty,
+            allow_same_document,
+            allow_external,
+        }
+    }
+
     /// Allow only same-document references (`""`, `#id`, `#xpointer(...)`).
     pub const SAME_DOCUMENT: Self = Self {
         allow_empty: true,
@@ -154,6 +169,11 @@ impl<'a> VerifyContext<'a> {
     /// Example values:
     /// - `http://www.w3.org/2000/09/xmldsig#enveloped-signature`
     /// - `http://www.w3.org/2001/10/xml-exc-c14n#`
+    ///
+    /// When a `<Reference>` has no explicit canonicalization transform, XMLDSig
+    /// applies implicit default C14N (`http://www.w3.org/TR/2001/REC-xml-c14n-20010315`).
+    /// If an allowlist is configured, include that URI as well unless all
+    /// references use explicit `Transform::C14n(...)`.
     #[must_use]
     pub fn allowed_transforms<I, S>(mut self, transforms: I) -> Self
     where
@@ -495,8 +515,10 @@ fn verify_signature_with_context(
         ctx.allowed_transform_uris(),
     )?;
 
-    let resolved_key = resolve_verifying_key(ctx, xml)?;
-    let verifier = resolved_key.as_ref();
+    if ctx.key.is_none() && ctx.key_resolver.is_none() {
+        return Err(SignatureVerificationPipelineError::KeyNotFound);
+    }
+
     let resolver = UriReferenceResolver::new(&doc);
     let references = process_all_references(
         &signed_info.references,
@@ -513,6 +535,8 @@ fn verify_signature_with_context(
         });
     }
 
+    let resolved_key = resolve_verifying_key(ctx, xml)?;
+    let verifier = resolved_key.as_ref();
     let signed_info_subtree: HashSet<_> = signed_info_node
         .descendants()
         .map(|node: Node<'_, '_>| node.id())
@@ -566,10 +590,10 @@ impl ResolvedVerifyingKey<'_> {
     }
 }
 
-fn resolve_verifying_key<'a>(
-    ctx: &'a VerifyContext<'a>,
+fn resolve_verifying_key<'k>(
+    ctx: &VerifyContext<'k>,
     xml: &str,
-) -> Result<ResolvedVerifyingKey<'a>, SignatureVerificationPipelineError> {
+) -> Result<ResolvedVerifyingKey<'k>, SignatureVerificationPipelineError> {
     if let Some(key) = ctx.key {
         return Ok(ResolvedVerifyingKey::Borrowed(key));
     }
@@ -832,6 +856,17 @@ mod tests {
         }
     }
 
+    struct PanicResolver;
+
+    impl KeyResolver for PanicResolver {
+        fn resolve(
+            &self,
+            _xml: &str,
+        ) -> Result<Box<dyn VerifyingKey>, SignatureVerificationPipelineError> {
+            panic!("resolver should not be called when references already fail");
+        }
+    }
+
     fn minimal_signature_xml(reference_uri: &str, transforms_xml: &str) -> String {
         format!(
             r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
@@ -871,6 +906,20 @@ mod tests {
         assert!(matches!(
             err,
             SignatureVerificationPipelineError::DisallowedUri { .. }
+        ));
+    }
+
+    #[test]
+    fn verify_context_rejects_empty_uri_when_policy_disallows_empty() {
+        let xml = minimal_signature_xml("", "");
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .allowed_uri_types(UriTypeSet::new(false, true, false))
+            .verify(&xml)
+            .expect_err("empty URI must be rejected when empty references are disabled");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::DisallowedUri { ref uri } if uri.is_empty()
         ));
     }
 
@@ -947,6 +996,17 @@ mod tests {
             err,
             SignatureVerificationPipelineError::DisallowedTransform { .. }
         ));
+    }
+
+    #[test]
+    fn verify_context_skips_resolver_when_reference_processing_fails() {
+        let xml = minimal_signature_xml("", "");
+        let result = VerifyContext::new()
+            .key_resolver(&PanicResolver)
+            .verify(&xml)
+            .expect("reference digest mismatch should short-circuit before resolver");
+        assert!(!result.signature_checked);
+        assert!(!result.signature_valid);
     }
 
     #[test]
