@@ -30,6 +30,7 @@ const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 
 /// Per-reference verification result.
 #[derive(Debug)]
+#[must_use = "inspect valid before accepting the reference result"]
 pub struct ReferenceResult {
     /// URI from the `<Reference>` element (for diagnostics).
     pub uri: Option<String>,
@@ -43,6 +44,7 @@ pub struct ReferenceResult {
 
 /// Result of processing all `<Reference>` elements in `<SignedInfo>`.
 #[derive(Debug)]
+#[must_use = "check first_failure/results before accepting the reference set"]
 pub struct ReferencesResult {
     /// Per-reference results (one per `<Reference>` in order).
     /// On fail-fast, only references up to and including the failed one are present.
@@ -407,8 +409,13 @@ fn push_normalized_signature_text(
             continue;
         }
         if ch.is_ascii_whitespace() {
+            let invalid_byte = u8::try_from(u32::from(ch)).map_err(|_| {
+                SignatureVerificationPipelineError::SignatureValueBase64(
+                    base64::DecodeError::InvalidByte(normalized.len(), 0),
+                )
+            })?;
             return Err(SignatureVerificationPipelineError::SignatureValueBase64(
-                base64::DecodeError::InvalidByte(normalized.len(), ch as u8),
+                base64::DecodeError::InvalidByte(normalized.len(), invalid_byte),
             ));
         }
         if normalized.len().saturating_add(ch.len_utf8()) > MAX_SIGNATURE_VALUE_LEN {
