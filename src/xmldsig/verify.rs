@@ -22,11 +22,172 @@ use super::parse::{Reference, SignatureAlgorithm, XMLDSIG_NS};
 use super::signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
 };
-use super::transforms::execute_transforms;
+use super::transforms::{Transform, execute_transforms};
 use super::uri::UriReferenceResolver;
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
+const XPATH_TRANSFORM_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+
+/// Cryptographic verifier used by [`VerifyContext`].
+pub trait VerifyingKey {
+    /// Verify `signature_value` over `signed_data` with the declared algorithm.
+    fn verify(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, SignatureVerificationPipelineError>;
+}
+
+/// Key resolver hook used by [`VerifyContext`] when no pre-set key is provided.
+pub trait KeyResolver {
+    /// Resolve a verification key for the provided XML document.
+    fn resolve(
+        &self,
+        xml: &str,
+    ) -> Result<Box<dyn VerifyingKey>, SignatureVerificationPipelineError>;
+}
+
+/// Allowed URI classes for `<Reference URI="...">`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UriTypeSet {
+    allow_empty: bool,
+    allow_same_document: bool,
+    allow_external: bool,
+}
+
+impl UriTypeSet {
+    /// Allow only same-document references (`""`, `#id`, `#xpointer(...)`).
+    pub const SAME_DOCUMENT: Self = Self {
+        allow_empty: true,
+        allow_same_document: true,
+        allow_external: false,
+    };
+
+    /// Allow all URI classes.
+    pub const ALL: Self = Self {
+        allow_empty: true,
+        allow_same_document: true,
+        allow_external: true,
+    };
+
+    fn allows(self, uri: &str) -> bool {
+        if uri.is_empty() {
+            return self.allow_empty;
+        }
+        if uri.starts_with('#') {
+            return self.allow_same_document;
+        }
+        self.allow_external
+    }
+}
+
+impl Default for UriTypeSet {
+    fn default() -> Self {
+        Self::SAME_DOCUMENT
+    }
+}
+
+/// Verification builder/configuration.
+pub struct VerifyContext<'a> {
+    key: Option<&'a dyn VerifyingKey>,
+    key_resolver: Option<&'a dyn KeyResolver>,
+    process_manifests: bool,
+    allowed_uri_types: UriTypeSet,
+    allowed_transforms: Option<HashSet<String>>,
+    store_pre_digest: bool,
+}
+
+impl<'a> VerifyContext<'a> {
+    /// Create a context with conservative defaults.
+    ///
+    /// Defaults:
+    /// - no pre-set key, no key resolver
+    /// - manifests disabled
+    /// - same-document URIs only
+    /// - all transforms allowed
+    /// - pre-digest buffers not stored
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            key: None,
+            key_resolver: None,
+            process_manifests: false,
+            allowed_uri_types: UriTypeSet::default(),
+            allowed_transforms: None,
+            store_pre_digest: false,
+        }
+    }
+
+    /// Set a pre-resolved verification key.
+    #[must_use]
+    pub fn key(mut self, key: &'a dyn VerifyingKey) -> Self {
+        self.key = Some(key);
+        self
+    }
+
+    /// Set a key resolver fallback used when `key()` is not provided.
+    #[must_use]
+    pub fn key_resolver(mut self, resolver: &'a dyn KeyResolver) -> Self {
+        self.key_resolver = Some(resolver);
+        self
+    }
+
+    /// Enable or disable `<Manifest>` processing.
+    #[must_use]
+    pub fn process_manifests(mut self, enabled: bool) -> Self {
+        self.process_manifests = enabled;
+        self
+    }
+
+    /// Restrict allowed reference URI classes.
+    #[must_use]
+    pub fn allowed_uri_types(mut self, types: UriTypeSet) -> Self {
+        self.allowed_uri_types = types;
+        self
+    }
+
+    /// Restrict allowed transform algorithms by URI.
+    ///
+    /// Example values:
+    /// - `http://www.w3.org/2000/09/xmldsig#enveloped-signature`
+    /// - `http://www.w3.org/2001/10/xml-exc-c14n#`
+    #[must_use]
+    pub fn allowed_transforms<I, S>(mut self, transforms: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_transforms = Some(transforms.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Store pre-digest buffers for diagnostics.
+    #[must_use]
+    pub fn store_pre_digest(mut self, enabled: bool) -> Self {
+        self.store_pre_digest = enabled;
+        self
+    }
+
+    fn allowed_transform_uris(&self) -> Option<&HashSet<String>> {
+        self.allowed_transforms.as_ref()
+    }
+
+    /// Verify one XMLDSig signature using this context.
+    pub fn verify(
+        &self,
+        xml: &str,
+    ) -> Result<SignatureVerificationResult, SignatureVerificationPipelineError> {
+        verify_signature_with_context(xml, self)
+    }
+}
+
+impl Default for VerifyContext<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Per-reference verification result.
 #[derive(Debug)]
@@ -227,6 +388,28 @@ pub enum SignatureVerificationPipelineError {
     /// Cryptographic verification failed before validity decision.
     #[error("signature verification failed: {0}")]
     Crypto(#[from] SignatureVerificationError),
+
+    /// No verification key was configured or resolved.
+    #[error("no verification key available (set key() or key_resolver())")]
+    KeyNotFound,
+
+    /// A `<Reference>` URI class is rejected by policy.
+    #[error("reference URI is not allowed by policy: {uri}")]
+    DisallowedUri {
+        /// Offending URI value from `<Reference URI="...">`.
+        uri: String,
+    },
+
+    /// A `<Transform>` algorithm is rejected by policy.
+    #[error("transform is not allowed by policy: {algorithm}")]
+    DisallowedTransform {
+        /// Rejected transform algorithm URI.
+        algorithm: String,
+    },
+
+    /// Manifest processing was requested but is not implemented in this phase.
+    #[error("manifest processing is not implemented yet")]
+    ManifestProcessingUnsupported,
 }
 
 /// Verify one XMLDSig `<Signature>` end-to-end with a PEM public key.
@@ -251,6 +434,32 @@ pub fn verify_signature_with_pem_key(
     public_key_pem: &str,
     store_pre_digest: bool,
 ) -> Result<SignatureVerificationResult, SignatureVerificationPipelineError> {
+    struct PemVerifyingKey<'a> {
+        public_key_pem: &'a str,
+    }
+
+    impl VerifyingKey for PemVerifyingKey<'_> {
+        fn verify(
+            &self,
+            algorithm: SignatureAlgorithm,
+            signed_data: &[u8],
+            signature_value: &[u8],
+        ) -> Result<bool, SignatureVerificationPipelineError> {
+            verify_with_algorithm(algorithm, self.public_key_pem, signed_data, signature_value)
+        }
+    }
+
+    let key = PemVerifyingKey { public_key_pem };
+    VerifyContext::new()
+        .key(&key)
+        .store_pre_digest(store_pre_digest)
+        .verify(xml)
+}
+
+fn verify_signature_with_context(
+    xml: &str,
+    ctx: &VerifyContext<'_>,
+) -> Result<SignatureVerificationResult, SignatureVerificationPipelineError> {
     let doc = Document::parse(xml)?;
     let mut signatures = doc.descendants().filter(|node| {
         node.is_element()
@@ -274,13 +483,25 @@ pub fn verify_signature_with_pem_key(
     let signature_children = parse_signature_children(signature_node)?;
     let signed_info_node = signature_children.signed_info_node;
 
+    if ctx.process_manifests && has_manifest_children(signature_node) {
+        return Err(SignatureVerificationPipelineError::ManifestProcessingUnsupported);
+    }
+
     let signed_info = parse_signed_info(signed_info_node)?;
+    enforce_reference_policies(
+        &signed_info.references,
+        ctx.allowed_uri_types,
+        ctx.allowed_transform_uris(),
+    )?;
+
+    let resolved_key = resolve_verifying_key(ctx, xml)?;
+    let verifier = resolved_key.as_ref();
     let resolver = UriReferenceResolver::new(&doc);
     let references = process_all_references(
         &signed_info.references,
         &resolver,
         signature_node,
-        store_pre_digest,
+        ctx.store_pre_digest,
     )?;
 
     if references.first_failure.is_some() {
@@ -304,9 +525,8 @@ pub fn verify_signature_with_pem_key(
     )?;
 
     let signature_value = decode_signature_value(signature_children.signature_value_node)?;
-    let signature_valid = verify_with_algorithm(
+    let signature_valid = verifier.verify(
         signed_info.signature_method,
-        public_key_pem,
         &canonical_signed_info,
         &signature_value,
     )?;
@@ -316,6 +536,81 @@ pub fn verify_signature_with_pem_key(
         signature_checked: true,
         signature_valid,
     })
+}
+
+fn has_manifest_children(signature_node: Node<'_, '_>) -> bool {
+    signature_node.children().any(|child| {
+        child.is_element()
+            && child.tag_name().namespace() == Some(XMLDSIG_NS)
+            && child.tag_name().name() == "Object"
+            && child.children().any(|inner| {
+                inner.is_element()
+                    && inner.tag_name().namespace() == Some(XMLDSIG_NS)
+                    && inner.tag_name().name() == "Manifest"
+            })
+    })
+}
+
+enum ResolvedVerifyingKey<'a> {
+    Borrowed(&'a dyn VerifyingKey),
+    Owned(Box<dyn VerifyingKey>),
+}
+
+impl ResolvedVerifyingKey<'_> {
+    fn as_ref(&self) -> &dyn VerifyingKey {
+        match self {
+            Self::Borrowed(key) => *key,
+            Self::Owned(key) => key.as_ref(),
+        }
+    }
+}
+
+fn resolve_verifying_key<'a>(
+    ctx: &'a VerifyContext<'a>,
+    xml: &str,
+) -> Result<ResolvedVerifyingKey<'a>, SignatureVerificationPipelineError> {
+    if let Some(key) = ctx.key {
+        return Ok(ResolvedVerifyingKey::Borrowed(key));
+    }
+    if let Some(resolver) = ctx.key_resolver {
+        return Ok(ResolvedVerifyingKey::Owned(resolver.resolve(xml)?));
+    }
+    Err(SignatureVerificationPipelineError::KeyNotFound)
+}
+
+fn enforce_reference_policies(
+    references: &[Reference],
+    allowed_uri_types: UriTypeSet,
+    allowed_transforms: Option<&HashSet<String>>,
+) -> Result<(), SignatureVerificationPipelineError> {
+    for reference in references {
+        let uri = reference.uri.as_deref().unwrap_or("");
+        if !allowed_uri_types.allows(uri) {
+            return Err(SignatureVerificationPipelineError::DisallowedUri {
+                uri: uri.to_owned(),
+            });
+        }
+
+        if let Some(allowed) = allowed_transforms {
+            for transform in &reference.transforms {
+                let transform_uri = transform_uri(transform);
+                if !allowed.contains(transform_uri) {
+                    return Err(SignatureVerificationPipelineError::DisallowedTransform {
+                        algorithm: transform_uri.to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn transform_uri(transform: &Transform) -> &'static str {
+    match transform {
+        Transform::Enveloped => super::transforms::ENVELOPED_SIGNATURE_URI,
+        Transform::XpathExcludeAllSignatures => XPATH_TRANSFORM_URI,
+        Transform::C14n(algo) => algo.uri(),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -506,6 +801,78 @@ mod tests {
             digest_method,
             digest_value,
         }
+    }
+
+    struct RejectingKey;
+
+    impl VerifyingKey for RejectingKey {
+        fn verify(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _signed_data: &[u8],
+            _signature_value: &[u8],
+        ) -> Result<bool, SignatureVerificationPipelineError> {
+            Ok(false)
+        }
+    }
+
+    fn minimal_signature_xml(reference_uri: &str, transforms_xml: &str) -> String {
+        format!(
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:SignedInfo>
+    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    <ds:Reference URI="{reference_uri}">
+      {transforms_xml}
+      <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+      <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
+    </ds:Reference>
+  </ds:SignedInfo>
+  <ds:SignatureValue>AQ==</ds:SignatureValue>
+</ds:Signature>"#
+        )
+    }
+
+    #[test]
+    fn verify_context_requires_key_or_resolver() {
+        let xml = minimal_signature_xml("", "");
+        let err = VerifyContext::new()
+            .verify(&xml)
+            .expect_err("missing key config must be rejected");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::KeyNotFound
+        ));
+    }
+
+    #[test]
+    fn verify_context_rejects_disallowed_uri() {
+        let xml = minimal_signature_xml("http://example.com/external", "");
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .verify(&xml)
+            .expect_err("external URI should be rejected by default policy");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::DisallowedUri { .. }
+        ));
+    }
+
+    #[test]
+    fn verify_context_rejects_disallowed_transform() {
+        let xml = minimal_signature_xml(
+            "",
+            r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></ds:Transforms>"#,
+        );
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .allowed_transforms(["http://www.w3.org/2001/10/xml-exc-c14n#"])
+            .verify(&xml)
+            .expect_err("enveloped transform should be rejected by allowlist");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::DisallowedTransform { .. }
+        ));
     }
 
     #[test]
