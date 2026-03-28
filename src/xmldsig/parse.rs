@@ -254,8 +254,20 @@ fn parse_reference(reference_node: Node) -> Result<Reference, ParseError> {
         element: "DigestValue",
     })?;
     verify_ds_element(digest_value_node, "DigestValue")?;
-    let digest_b64 = digest_value_node.text().unwrap_or("");
-    let digest_value = base64_decode_digest(digest_b64, digest_method)?;
+    let mut digest_b64 = String::new();
+    for child in digest_value_node.children() {
+        if child.is_element() {
+            return Err(ParseError::InvalidStructure(
+                "DigestValue must not contain element children".into(),
+            ));
+        }
+        if child.is_text()
+            && let Some(text) = child.text()
+        {
+            digest_b64.push_str(text);
+        }
+    }
+    let digest_value = base64_decode_digest(&digest_b64, digest_method)?;
 
     // No more children expected
     if let Some(unexpected) = children.next() {
@@ -815,6 +827,25 @@ mod tests {
             </Reference>
         </SignedInfo>"#;
         let doc = Document::parse(xml).unwrap();
+        let result = parse_signed_info(doc.root_element());
+        assert!(matches!(
+            result.unwrap_err(),
+            ParseError::InvalidStructure(_)
+        ));
+    }
+
+    #[test]
+    fn digest_value_with_element_child_is_rejected() {
+        let xml = r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+            <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+            <Reference URI="">
+                <DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+                <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=<Junk/>AAAA</DigestValue>
+            </Reference>
+        </SignedInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
         let result = parse_signed_info(doc.root_element());
         assert!(matches!(
             result.unwrap_err(),

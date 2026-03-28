@@ -329,6 +329,8 @@ fn parse_signature_children<'a, 'input>(
 ) -> Result<SignatureChildNodes<'a, 'input>, SignatureVerificationPipelineError> {
     let mut signed_info_node: Option<Node<'_, '_>> = None;
     let mut signature_value_node: Option<Node<'_, '_>> = None;
+    let mut signed_info_index: Option<usize> = None;
+    let mut signature_value_index: Option<usize> = None;
     for (zero_based_index, child) in signature_node
         .children()
         .filter(|node| node.is_element())
@@ -345,12 +347,8 @@ fn parse_signature_children<'a, 'input>(
                         reason: "SignedInfo must appear exactly once under Signature",
                     });
                 }
-                if element_index != 1 {
-                    return Err(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "SignedInfo must be the first element child of Signature",
-                    });
-                }
                 signed_info_node = Some(child);
+                signed_info_index = Some(element_index);
             }
             "SignatureValue" => {
                 if signature_value_node.is_some() {
@@ -358,12 +356,8 @@ fn parse_signature_children<'a, 'input>(
                         reason: "SignatureValue must appear exactly once under Signature",
                     });
                 }
-                if element_index != 2 {
-                    return Err(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "SignatureValue must be the second element child of Signature",
-                    });
-                }
                 signature_value_node = Some(child);
+                signature_value_index = Some(element_index);
             }
             _ => {}
         }
@@ -377,6 +371,16 @@ fn parse_signature_children<'a, 'input>(
         signature_value_node.ok_or(SignatureVerificationPipelineError::MissingElement {
             element: "SignatureValue",
         })?;
+    if signed_info_index != Some(1) {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignedInfo must be the first element child of Signature",
+        });
+    }
+    if signature_value_index != Some(2) {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignatureValue must be the second element child of Signature",
+        });
+    }
     Ok(SignatureChildNodes {
         signed_info_node,
         signature_value_node,

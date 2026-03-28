@@ -510,6 +510,25 @@ fn non_empty_signature_without_signed_info_is_reported_as_missing_element() {
 }
 
 #[test]
+fn signature_value_only_without_signed_info_reports_missing_element() {
+    let xml = r#"
+<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:SignatureValue>AQ==</ds:SignatureValue>
+</ds:Signature>
+"#;
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+
+    let err = verify_signature_with_pem_key(xml, &public_key_pem, false)
+        .expect_err("Signature without SignedInfo must report missing SignedInfo");
+    assert!(matches!(
+        err,
+        SignatureVerificationPipelineError::MissingElement {
+            element: "SignedInfo"
+        }
+    ));
+}
+
+#[test]
 fn multiple_signature_elements_are_rejected() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
