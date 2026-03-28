@@ -27,6 +27,7 @@ pub use signature::{
 pub use transforms::{Transform, execute_transforms, parse_transforms};
 pub use types::{NodeSet, TransformData, TransformError};
 pub use verify::{
-    ReferenceProcessingError, ReferenceResult, ReferencesResult, process_all_references,
-    process_reference,
+    ReferenceProcessingError, ReferenceResult, ReferencesResult,
+    SignatureVerificationPipelineError, SignatureVerificationResult, process_all_references,
+    process_reference, verify_signature_with_pem_key,
 };
