@@ -536,8 +536,6 @@ fn verify_signature_with_context(
         });
     }
 
-    let resolved_key = resolve_verifying_key(ctx, xml)?;
-    let verifier = resolved_key.as_ref();
     let signed_info_subtree: HashSet<_> = signed_info_node
         .descendants()
         .map(|node: Node<'_, '_>| node.id())
@@ -551,6 +549,8 @@ fn verify_signature_with_context(
     )?;
 
     let signature_value = decode_signature_value(signature_children.signature_value_node)?;
+    let resolved_key = resolve_verifying_key(ctx, xml)?;
+    let verifier = resolved_key.as_ref();
     let signature_valid = verifier.verify(
         signed_info.signature_method,
         &canonical_signed_info,
