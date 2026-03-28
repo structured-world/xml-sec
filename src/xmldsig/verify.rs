@@ -16,7 +16,7 @@ use crate::c14n::canonicalize;
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 use super::parse::{Reference, SignatureAlgorithm};
-use super::parse::{find_signature_node, parse_signed_info};
+use super::parse::parse_signed_info;
 use super::signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
 };
@@ -241,10 +241,24 @@ pub fn verify_signature_with_pem_key(
     store_pre_digest: bool,
 ) -> Result<SignatureVerificationResult, SignatureVerificationPipelineError> {
     let doc = Document::parse(xml)?;
-    let signature_node =
-        find_signature_node(&doc).ok_or(SignatureVerificationPipelineError::MissingElement {
-            element: "Signature",
-        })?;
+    let mut signatures = doc.descendants().filter(|node| {
+        node.is_element()
+            && node.tag_name().name() == "Signature"
+            && node.tag_name().namespace() == Some(XMLDSIG_NS)
+    });
+    let signature_node = match (signatures.next(), signatures.next()) {
+        (None, _) => {
+            return Err(SignatureVerificationPipelineError::MissingElement {
+                element: "Signature",
+            });
+        }
+        (Some(node), None) => node,
+        (Some(_), Some(_)) => {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Signature must appear exactly once in document",
+            });
+        }
+    };
 
     let mut signature_element_children = signature_node.children().filter(|node| node.is_element());
     let signed_info_node = match signature_element_children.next() {
@@ -335,14 +349,14 @@ fn decode_signature_value(
                 seen_signed_info = true;
             }
             "SignatureValue" => {
-                if !seen_signed_info || element_index != 2 {
-                    return Err(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "SignatureValue must be the second element child of Signature",
-                    });
-                }
                 if signature_value_node.is_some() {
                     return Err(SignatureVerificationPipelineError::InvalidStructure {
                         reason: "SignatureValue must appear exactly once under Signature",
+                    });
+                }
+                if !seen_signed_info || element_index != 2 {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "SignatureValue must be the second element child of Signature",
                     });
                 }
                 signature_value_node = Some(child);

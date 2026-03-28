@@ -80,6 +80,18 @@ fn find_open_tag_start(xml: &str, open_prefix: &str) -> Option<usize> {
     None
 }
 
+fn assert_invalid_structure_reason(
+    err: SignatureVerificationPipelineError,
+    expected_reason: &'static str,
+) {
+    match err {
+        SignatureVerificationPipelineError::InvalidStructure { reason } => {
+            assert_eq!(reason, expected_reason);
+        }
+        other => panic!("expected InvalidStructure error, got: {other:?}"),
+    }
+}
+
 fn inject_invalid_base64_in_signature_value(xml: &str) -> String {
     replace_ds_tag_content_with(xml, "SignatureValue", |chars| {
         if let Some((index, _)) = chars
@@ -387,10 +399,10 @@ fn signed_info_must_be_first_element_child_of_signature() {
     let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect_err("SignedInfo not-first child must be rejected");
 
-    assert!(matches!(
+    assert_invalid_structure_reason(
         err,
-        SignatureVerificationPipelineError::InvalidStructure { .. }
-    ));
+        "SignedInfo must be the first element child of Signature",
+    );
 }
 
 #[test]
@@ -404,10 +416,7 @@ fn duplicate_signed_info_is_rejected() {
     let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect_err("duplicate SignedInfo must be rejected");
 
-    assert!(matches!(
-        err,
-        SignatureVerificationPipelineError::InvalidStructure { .. }
-    ));
+    assert_invalid_structure_reason(err, "SignedInfo must appear exactly once under Signature");
 }
 
 #[test]
@@ -431,6 +440,26 @@ fn missing_signed_info_is_reported_as_missing_element() {
 }
 
 #[test]
+fn multiple_signature_elements_are_rejected() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let xml_without_decl = xml.replace("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n", "");
+    let additional_signature = "<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"></Signature>";
+    let tampered_xml = format!("<Root>{xml_without_decl}{additional_signature}</Root>");
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+
+    let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect_err("documents with multiple Signature elements must be rejected");
+    assert!(matches!(
+        err,
+        SignatureVerificationPipelineError::InvalidStructure {
+            reason: "Signature must appear exactly once in document",
+        }
+    ));
+}
+
+#[test]
 fn signature_value_must_be_second_element_child_of_signature() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
@@ -440,10 +469,10 @@ fn signature_value_must_be_second_element_child_of_signature() {
 
     let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect_err("SignatureValue not-second child must be rejected");
-    assert!(matches!(
+    assert_invalid_structure_reason(
         err,
-        SignatureVerificationPipelineError::InvalidStructure { .. }
-    ));
+        "SignatureValue must be the second element child of Signature",
+    );
 }
 
 #[test]
@@ -456,10 +485,7 @@ fn duplicate_signature_value_is_rejected() {
 
     let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect_err("duplicate SignatureValue must be rejected");
-    assert!(matches!(
-        err,
-        SignatureVerificationPipelineError::InvalidStructure { .. }
-    ));
+    assert_invalid_structure_reason(err, "SignatureValue must appear exactly once under Signature");
 }
 
 #[test]
@@ -472,10 +498,7 @@ fn signature_value_with_nested_element_is_rejected() {
 
     let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect_err("nested elements inside SignatureValue must be rejected");
-    assert!(matches!(
-        err,
-        SignatureVerificationPipelineError::InvalidStructure { .. }
-    ));
+    assert_invalid_structure_reason(err, "SignatureValue must not contain element children");
 }
 
 #[test]
