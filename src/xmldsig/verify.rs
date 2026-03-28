@@ -305,11 +305,12 @@ fn decode_signature_value(
         .ok_or(SignatureVerificationPipelineError::MissingElement {
             element: "SignatureValue",
         })?;
-    let signature_value_text = signature_value_node.text().unwrap_or("");
-
-    let normalized: String = signature_value_text
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
+    let normalized: String = signature_value_node
+        .children()
+        .filter(|child| child.is_text())
+        .filter_map(|child| child.text())
+        .flat_map(str::chars)
+        .filter(|ch| !matches!(ch, ' ' | '\t' | '\r' | '\n'))
         .collect();
 
     Ok(base64::engine::general_purpose::STANDARD.decode(normalized)?)

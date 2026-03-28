@@ -95,6 +95,34 @@ fn inject_invalid_base64_in_signature_value(xml: &str) -> String {
     })
 }
 
+fn inject_non_ascii_whitespace_in_signature_value(xml: &str) -> String {
+    replace_ds_tag_content_with(xml, "SignatureValue", |chars| {
+        if let Some((index, _)) = chars
+            .iter()
+            .enumerate()
+            .find(|(_, ch)| ch.is_ascii_alphanumeric())
+        {
+            chars.insert(index + 1, '\u{00A0}');
+        } else {
+            panic!("SignatureValue did not contain any mutable base64 chars");
+        }
+    })
+}
+
+fn inject_comment_in_signature_value(xml: &str) -> String {
+    replace_ds_tag_content_with(xml, "SignatureValue", |chars| {
+        if chars.len() < 4 {
+            panic!("SignatureValue too short for comment split mutation");
+        }
+        let split_at = chars.len() / 2;
+        let mut with_comment = Vec::with_capacity(chars.len() + 8);
+        with_comment.extend_from_slice(&chars[..split_at]);
+        with_comment.extend("<!--x-->".chars());
+        with_comment.extend_from_slice(&chars[split_at..]);
+        *chars = with_comment;
+    })
+}
+
 #[test]
 fn replace_ds_tag_content_with_allows_whitespace_before_closing_bracket() {
     let xml = "<Root><ds:SignatureValue   >ABC</ds:SignatureValue></Root>";
@@ -240,6 +268,39 @@ fn malformed_signature_value_base64_returns_decode_error() {
         err,
         SignatureVerificationPipelineError::SignatureValueBase64(_)
     ));
+}
+
+#[test]
+fn signature_value_with_non_ascii_whitespace_is_rejected() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let tampered_xml = inject_non_ascii_whitespace_in_signature_value(&xml);
+
+    let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect_err("non-XML whitespace in SignatureValue must fail base64 decode");
+
+    assert!(matches!(
+        err,
+        SignatureVerificationPipelineError::SignatureValueBase64(_)
+    ));
+}
+
+#[test]
+fn signature_value_split_by_comment_still_verifies() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let tampered_xml = inject_comment_in_signature_value(&xml);
+
+    let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect("SignatureValue split by comment should still decode and verify");
+
+    assert!(result.references.all_valid());
+    assert!(result.signature_checked);
+    assert!(result.signature_valid);
 }
 
 #[test]
