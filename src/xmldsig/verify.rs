@@ -66,6 +66,7 @@ pub struct UriTypeSet {
 
 impl UriTypeSet {
     /// Create a custom URI policy.
+    #[must_use]
     pub const fn new(allow_empty: bool, allow_same_document: bool, allow_external: bool) -> Self {
         Self {
             allow_empty,
@@ -568,7 +569,7 @@ fn has_manifest_children(signature_node: Node<'_, '_>) -> bool {
         child.is_element()
             && child.tag_name().namespace() == Some(XMLDSIG_NS)
             && child.tag_name().name() == "Object"
-            && child.children().any(|inner| {
+            && child.descendants().any(|inner| {
                 inner.is_element()
                     && inner.tag_name().namespace() == Some(XMLDSIG_NS)
                     && inner.tag_name().name() == "Manifest"
