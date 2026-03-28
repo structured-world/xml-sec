@@ -785,4 +785,39 @@ mod tests {
             "pre-digest should NOT contain Signature"
         );
     }
+
+    #[test]
+    fn pipeline_missing_signed_info_returns_missing_element() {
+        let xml = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"></ds:Signature>"#;
+
+        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
+            .expect_err("missing SignedInfo must fail before crypto stage");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::MissingElement {
+                element: "SignedInfo"
+            }
+        ));
+    }
+
+    #[test]
+    fn pipeline_multiple_signature_elements_are_rejected() {
+        let xml = r#"
+<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:Signature>
+    <ds:SignedInfo/>
+  </ds:Signature>
+  <ds:Signature/>
+</root>
+"#;
+
+        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
+            .expect_err("multiple signatures must fail closed");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Signature must appear exactly once in document",
+            }
+        ));
+    }
 }
