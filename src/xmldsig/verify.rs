@@ -271,32 +271,8 @@ pub fn verify_signature_with_pem_key(
         }
     };
 
-    let mut signature_element_children = signature_node.children().filter(|node| node.is_element());
-    let is_ds_signed_info = |node: Node<'_, '_>| {
-        node.tag_name().name() == "SignedInfo" && node.tag_name().namespace() == Some(XMLDSIG_NS)
-    };
-
-    let signed_info_node = match signature_element_children.next() {
-        Some(node) if is_ds_signed_info(node) => node,
-        Some(_) if signature_element_children.any(is_ds_signed_info) => {
-            return Err(SignatureVerificationPipelineError::InvalidStructure {
-                reason: "SignedInfo must be the first element child of Signature",
-            });
-        }
-        Some(_) | None => {
-            return Err(SignatureVerificationPipelineError::MissingElement {
-                element: "SignedInfo",
-            });
-        }
-    };
-
-    if signature_element_children.any(|node| {
-        node.tag_name().name() == "SignedInfo" && node.tag_name().namespace() == Some(XMLDSIG_NS)
-    }) {
-        return Err(SignatureVerificationPipelineError::InvalidStructure {
-            reason: "SignedInfo must appear exactly once under Signature",
-        });
-    }
+    let signature_children = parse_signature_children(signature_node)?;
+    let signed_info_node = signature_children.signed_info_node;
 
     let signed_info = parse_signed_info(signed_info_node)?;
     let resolver = UriReferenceResolver::new(&doc);
@@ -317,7 +293,7 @@ pub fn verify_signature_with_pem_key(
 
     let signed_info_subtree: HashSet<_> = signed_info_node
         .descendants()
-        .map(|node| node.id())
+        .map(|node: Node<'_, '_>| node.id())
         .collect();
     let mut canonical_signed_info = Vec::new();
     canonicalize(
@@ -327,7 +303,7 @@ pub fn verify_signature_with_pem_key(
         &mut canonical_signed_info,
     )?;
 
-    let signature_value = decode_signature_value(signature_node)?;
+    let signature_value = decode_signature_value(signature_children.signature_value_node)?;
     let signature_valid = verify_with_algorithm(
         signed_info.signature_method,
         public_key_pem,
@@ -342,20 +318,39 @@ pub fn verify_signature_with_pem_key(
     })
 }
 
-fn decode_signature_value(
-    signature_node: Node<'_, '_>,
-) -> Result<Vec<u8>, SignatureVerificationPipelineError> {
-    let mut element_index = 0usize;
-    let mut seen_signed_info = false;
+#[derive(Debug, Clone, Copy)]
+struct SignatureChildNodes<'a, 'input> {
+    signed_info_node: Node<'a, 'input>,
+    signature_value_node: Node<'a, 'input>,
+}
+
+fn parse_signature_children<'a, 'input>(
+    signature_node: Node<'a, 'input>,
+) -> Result<SignatureChildNodes<'a, 'input>, SignatureVerificationPipelineError> {
+    let mut signed_info_node: Option<Node<'_, '_>> = None;
     let mut signature_value_node: Option<Node<'_, '_>> = None;
-    for child in signature_node.children().filter(|node| node.is_element()) {
-        element_index += 1;
+    for (zero_based_index, child) in signature_node
+        .children()
+        .filter(|node| node.is_element())
+        .enumerate()
+    {
+        let element_index = zero_based_index + 1;
         if child.tag_name().namespace() != Some(XMLDSIG_NS) {
             continue;
         }
         match child.tag_name().name() {
             "SignedInfo" => {
-                seen_signed_info = true;
+                if signed_info_node.is_some() {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "SignedInfo must appear exactly once under Signature",
+                    });
+                }
+                if element_index != 1 {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "SignedInfo must be the first element child of Signature",
+                    });
+                }
+                signed_info_node = Some(child);
             }
             "SignatureValue" => {
                 if signature_value_node.is_some() {
@@ -363,7 +358,7 @@ fn decode_signature_value(
                         reason: "SignatureValue must appear exactly once under Signature",
                     });
                 }
-                if !seen_signed_info || element_index != 2 {
+                if element_index != 2 {
                     return Err(SignatureVerificationPipelineError::InvalidStructure {
                         reason: "SignatureValue must be the second element child of Signature",
                     });
@@ -374,10 +369,23 @@ fn decode_signature_value(
         }
     }
 
+    let signed_info_node =
+        signed_info_node.ok_or(SignatureVerificationPipelineError::MissingElement {
+            element: "SignedInfo",
+        })?;
     let signature_value_node =
         signature_value_node.ok_or(SignatureVerificationPipelineError::MissingElement {
             element: "SignatureValue",
         })?;
+    Ok(SignatureChildNodes {
+        signed_info_node,
+        signature_value_node,
+    })
+}
+
+fn decode_signature_value(
+    signature_value_node: Node<'_, '_>,
+) -> Result<Vec<u8>, SignatureVerificationPipelineError> {
     if signature_value_node
         .children()
         .any(|child| child.is_element())
