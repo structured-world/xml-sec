@@ -38,21 +38,24 @@ fn replace_ds_tag_content_with(
     tag: &str,
     mutate: impl FnOnce(&mut Vec<char>),
 ) -> String {
-    let prefixed_open = format!("<ds:{tag}>");
+    let prefixed_open_prefix = format!("<ds:{tag}");
     let prefixed_close = format!("</ds:{tag}>");
-    let plain_open = format!("<{tag}>");
+    let plain_open_prefix = format!("<{tag}");
     let plain_close = format!("</{tag}>");
-    let (open, close) = if xml.contains(&prefixed_open) {
-        (prefixed_open, prefixed_close)
-    } else if xml.contains(&plain_open) {
-        (plain_open, plain_close)
+    let (open_start, close) = if let Some(index) = find_open_tag_start(xml, &prefixed_open_prefix)
+    {
+        (index, prefixed_close)
+    } else if let Some(index) = find_open_tag_start(xml, &plain_open_prefix) {
+        (index, plain_close)
     } else {
         panic!("missing opening tag for {tag}");
     };
-    let start = xml
-        .find(&open)
-        .unwrap_or_else(|| panic!("missing opening tag {open}"))
-        + open.len();
+
+    let start = xml[open_start..]
+        .find('>')
+        .unwrap_or_else(|| panic!("missing '>' for opening tag {tag}"))
+        + open_start
+        + 1;
     let end = xml[start..]
         .find(&close)
         .unwrap_or_else(|| panic!("missing closing tag {close}"))
@@ -62,6 +65,20 @@ fn replace_ds_tag_content_with(
     mutate(&mut chars);
     let mutated = chars.into_iter().collect::<String>();
     format!("{}{}{}", &xml[..start], mutated, &xml[end..])
+}
+
+fn find_open_tag_start(xml: &str, open_prefix: &str) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(relative_index) = xml[offset..].find(open_prefix) {
+        let absolute_index = offset + relative_index;
+        let boundary_index = absolute_index + open_prefix.len();
+        let next_char = xml[boundary_index..].chars().next();
+        if matches!(next_char, Some('>')) || next_char.is_some_and(|ch| ch.is_ascii_whitespace()) {
+            return Some(absolute_index);
+        }
+        offset = boundary_index;
+    }
+    None
 }
 
 fn inject_invalid_base64_in_signature_value(xml: &str) -> String {
@@ -76,6 +93,18 @@ fn inject_invalid_base64_in_signature_value(xml: &str) -> String {
             panic!("SignatureValue did not contain any mutable base64 chars");
         }
     })
+}
+
+#[test]
+fn replace_ds_tag_content_with_allows_whitespace_before_closing_bracket() {
+    let xml = "<Root><ds:SignatureValue   >ABC</ds:SignatureValue></Root>";
+
+    let mutated = replace_ds_tag_content(xml, "SignatureValue", "XYZ");
+
+    assert_eq!(
+        mutated,
+        "<Root><ds:SignatureValue   >XYZ</ds:SignatureValue></Root>"
+    );
 }
 
 #[test]
