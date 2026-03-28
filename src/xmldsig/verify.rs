@@ -429,7 +429,8 @@ fn push_normalized_signature_text(
             continue;
         }
         if ch.is_ascii_whitespace() {
-            let invalid_byte = ch as u8;
+            let invalid_byte =
+                u8::try_from(u32::from(ch)).expect("ASCII whitespace always fits into u8");
             return Err(SignatureVerificationPipelineError::SignatureValueBase64(
                 base64::DecodeError::InvalidByte(normalized.len(), invalid_byte),
             ));
