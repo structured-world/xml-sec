@@ -145,6 +145,12 @@ fn inject_comment_in_signature_value(xml: &str) -> String {
     })
 }
 
+fn inject_oversized_signature_value(xml: &str) -> String {
+    replace_ds_tag_content_with(xml, "SignatureValue", |chars| {
+        *chars = vec!['A'; 9000];
+    })
+}
+
 fn insert_object_before_signed_info(xml: &str) -> String {
     let (signed_info_open, object_xml) = if xml.contains("<ds:SignedInfo") {
         ("<ds:SignedInfo", "<ds:Object/>")
@@ -561,6 +567,19 @@ fn signature_value_with_nested_element_is_rejected() {
     let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect_err("nested elements inside SignatureValue must be rejected");
     assert_invalid_structure_reason(err, "SignatureValue must not contain element children");
+}
+
+#[test]
+fn oversized_signature_value_is_rejected_early() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let tampered_xml = inject_oversized_signature_value(&xml);
+
+    let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect_err("oversized SignatureValue must be rejected");
+    assert_invalid_structure_reason(err, "SignatureValue exceeds maximum allowed length");
 }
 
 #[test]
