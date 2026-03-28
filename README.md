@@ -11,7 +11,7 @@ Pure Rust XML Security library. Drop-in replacement for libxmlsec1.
 ## Features
 
 - **C14N** — XML Canonicalization (inclusive + exclusive, W3C compliant)
-- **XMLDSig** — XML Digital Signatures (sign + verify, enveloped/enveloping/detached)
+- **XMLDSig** — XML Digital Signatures (verify pipeline implemented; signing in progress, enveloped/enveloping/detached)
 - **XMLEnc** — XML Encryption (symmetric + asymmetric)
 - **X.509** — Certificate-based key extraction and validation
 
