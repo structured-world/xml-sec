@@ -411,6 +411,26 @@ fn duplicate_signed_info_is_rejected() {
 }
 
 #[test]
+fn missing_signed_info_is_reported_as_missing_element() {
+    let xml = read_fixture(Path::new(
+        "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+    ));
+    let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
+    let tampered_xml = replace_ds_tag_content_with(&xml, "Signature", |chars| {
+        chars.clear();
+    });
+
+    let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
+        .expect_err("missing SignedInfo must be rejected as missing element");
+    assert!(matches!(
+        err,
+        SignatureVerificationPipelineError::MissingElement {
+            element: "SignedInfo"
+        }
+    ));
+}
+
+#[test]
 fn signature_value_must_be_second_element_child_of_signature() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",

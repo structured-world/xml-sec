@@ -247,15 +247,24 @@ pub fn verify_signature_with_pem_key(
         })?;
 
     let mut signature_element_children = signature_node.children().filter(|node| node.is_element());
-    let signed_info_node = signature_element_children
-        .next()
-        .filter(|node| {
-            node.tag_name().name() == "SignedInfo"
-                && node.tag_name().namespace() == Some(XMLDSIG_NS)
-        })
-        .ok_or(SignatureVerificationPipelineError::InvalidStructure {
-            reason: "SignedInfo must be the first element child of Signature",
-        })?;
+    let signed_info_node = match signature_element_children.next() {
+        Some(node)
+            if node.tag_name().name() == "SignedInfo"
+                && node.tag_name().namespace() == Some(XMLDSIG_NS) =>
+        {
+            node
+        }
+        Some(_) => {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignedInfo must be the first element child of Signature",
+            });
+        }
+        None => {
+            return Err(SignatureVerificationPipelineError::MissingElement {
+                element: "SignedInfo",
+            });
+        }
+    };
 
     if signature_element_children.any(|node| {
         node.tag_name().name() == "SignedInfo" && node.tag_name().namespace() == Some(XMLDSIG_NS)
