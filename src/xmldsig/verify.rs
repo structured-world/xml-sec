@@ -126,7 +126,6 @@ impl<'a> VerifyContext<'a> {
     /// - same-document URIs only
     /// - all transforms allowed
     /// - pre-digest buffers not stored
-    #[must_use]
     pub fn new() -> Self {
         Self {
             key: None,
@@ -139,14 +138,12 @@ impl<'a> VerifyContext<'a> {
     }
 
     /// Set a pre-resolved verification key.
-    #[must_use]
     pub fn key(mut self, key: &'a dyn VerifyingKey) -> Self {
         self.key = Some(key);
         self
     }
 
     /// Set a key resolver fallback used when `key()` is not provided.
-    #[must_use]
     pub fn key_resolver(mut self, resolver: &'a dyn KeyResolver) -> Self {
         self.key_resolver = Some(resolver);
         self
@@ -157,14 +154,12 @@ impl<'a> VerifyContext<'a> {
     /// Note: manifest verification is not implemented yet. When enabled, the
     /// verifier fails closed with `ManifestProcessingUnsupported` if a
     /// `<ds:Manifest>` is present under `<ds:Object>`.
-    #[must_use]
     pub fn process_manifests(mut self, enabled: bool) -> Self {
         self.process_manifests = enabled;
         self
     }
 
     /// Restrict allowed reference URI classes.
-    #[must_use]
     pub fn allowed_uri_types(mut self, types: UriTypeSet) -> Self {
         self.allowed_uri_types = types;
         self
@@ -180,7 +175,6 @@ impl<'a> VerifyContext<'a> {
     /// applies implicit default C14N (`http://www.w3.org/TR/2001/REC-xml-c14n-20010315`).
     /// If an allowlist is configured, include that URI as well unless all
     /// references use explicit `Transform::C14n(...)`.
-    #[must_use]
     pub fn allowed_transforms<I, S>(mut self, transforms: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -191,7 +185,6 @@ impl<'a> VerifyContext<'a> {
     }
 
     /// Store pre-digest buffers for diagnostics.
-    #[must_use]
     pub fn store_pre_digest(mut self, enabled: bool) -> Self {
         self.store_pre_digest = enabled;
         self
