@@ -963,6 +963,31 @@ mod tests {
             .to_owned()
     }
 
+    fn signature_with_nested_manifest_xml() -> String {
+        r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:SignedInfo>
+    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    <ds:Reference URI="">
+      <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+      <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
+    </ds:Reference>
+  </ds:SignedInfo>
+  <ds:SignatureValue>AQ==</ds:SignatureValue>
+  <ds:Object>
+    <wrapper>
+      <ds:Manifest>
+        <ds:Reference URI="">
+          <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+          <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
+        </ds:Reference>
+      </ds:Manifest>
+    </wrapper>
+  </ds:Object>
+</ds:Signature>"#
+            .to_owned()
+    }
+
     #[test]
     fn verify_context_manifest_policy_toggle_is_enforced() {
         let xml = signature_with_manifest_xml();
@@ -982,6 +1007,20 @@ mod tests {
             .verify(&xml)
             .expect("manifest processing disabled should preserve prior behavior");
         assert!(!result.signature_valid);
+    }
+
+    #[test]
+    fn verify_context_rejects_nested_manifest_when_processing_enabled() {
+        let xml = signature_with_nested_manifest_xml();
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(true)
+            .verify(&xml)
+            .expect_err("nested manifests under <Object> must also be rejected");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::ManifestProcessingUnsupported
+        ));
     }
 
     #[test]
