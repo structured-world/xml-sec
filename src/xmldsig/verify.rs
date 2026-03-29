@@ -29,6 +29,7 @@ use super::uri::UriReferenceResolver;
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
+const MANIFEST_REFERENCE_TYPE_URI: &str = "http://www.w3.org/2000/09/xmldsig#Manifest";
 /// Cryptographic verifier used by [`VerifyContext`].
 ///
 /// This trait intentionally has no `Send + Sync` supertraits so lightweight
@@ -152,7 +153,8 @@ impl<'a> VerifyContext<'a> {
     ///
     /// Note: manifest verification is not implemented yet. When enabled, the
     /// verifier fails closed with `ManifestProcessingUnsupported` if a
-    /// `<ds:Manifest>` is present under `<ds:Object>`.
+    /// `<ds:Manifest>` is present under `<ds:Object>` or if a
+    /// `<Reference Type="http://www.w3.org/2000/09/xmldsig#Manifest">` is present.
     pub fn process_manifests(mut self, enabled: bool) -> Self {
         self.process_manifests = enabled;
         self
@@ -507,6 +509,9 @@ fn verify_signature_with_context(
     }
 
     let signed_info = parse_signed_info(signed_info_node)?;
+    if ctx.process_manifests && has_manifest_type_references(&signed_info.references) {
+        return Err(SignatureVerificationPipelineError::ManifestProcessingUnsupported);
+    }
     enforce_reference_policies(
         &signed_info.references,
         ctx.allowed_uri_types,
@@ -572,6 +577,12 @@ fn has_manifest_children(signature_node: Node<'_, '_>) -> bool {
                     && inner.tag_name().name() == "Manifest"
             })
     })
+}
+
+fn has_manifest_type_references(references: &[Reference]) -> bool {
+    references
+        .iter()
+        .any(|reference| reference.ref_type.as_deref() == Some(MANIFEST_REFERENCE_TYPE_URI))
 }
 
 enum ResolvedVerifyingKey<'a> {
@@ -986,6 +997,21 @@ mod tests {
             .to_owned()
     }
 
+    fn signature_with_manifest_type_reference_xml() -> String {
+        r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:SignedInfo>
+    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    <ds:Reference URI="" Type="http://www.w3.org/2000/09/xmldsig#Manifest">
+      <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+      <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
+    </ds:Reference>
+  </ds:SignedInfo>
+  <ds:SignatureValue>AQ==</ds:SignatureValue>
+</ds:Signature>"#
+            .to_owned()
+    }
+
     #[test]
     fn verify_context_manifest_policy_toggle_is_enforced() {
         let xml = signature_with_manifest_xml();
@@ -1015,6 +1041,20 @@ mod tests {
             .process_manifests(true)
             .verify(&xml)
             .expect_err("nested manifests under <Object> must also be rejected");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::ManifestProcessingUnsupported
+        ));
+    }
+
+    #[test]
+    fn verify_context_rejects_manifest_type_reference_when_processing_enabled() {
+        let xml = signature_with_manifest_type_reference_xml();
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(true)
+            .verify(&xml)
+            .expect_err("manifest-typed references must fail closed while unsupported");
         assert!(matches!(
             err,
             SignatureVerificationPipelineError::ManifestProcessingUnsupported
