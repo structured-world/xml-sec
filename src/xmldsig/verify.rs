@@ -1319,7 +1319,12 @@ mod tests {
             .find(|n| n.is_element() && n.tag_name().name() == "Signature")
             .unwrap();
 
-        let reference = make_reference("", vec![Transform::Enveloped], DigestAlgorithm::Sha256, vec![0u8; 32]);
+        let reference = make_reference(
+            "",
+            vec![Transform::Enveloped],
+            DigestAlgorithm::Sha256,
+            vec![0u8; 32],
+        );
         let result = process_reference(&reference, &resolver, sig_node, 7, false).unwrap();
         assert!(matches!(
             result.status,
@@ -1519,7 +1524,8 @@ mod tests {
         let digest = compute_digest(DigestAlgorithm::Sha1, &pre_digest);
 
         let reference = make_reference("", vec![], DigestAlgorithm::Sha1, digest);
-        let result = process_reference(&reference, &resolver, doc.root_element(), 0, false).unwrap();
+        let result =
+            process_reference(&reference, &resolver, doc.root_element(), 0, false).unwrap();
         assert!(matches!(result.status, DsigStatus::Valid));
         assert_eq!(result.digest_algorithm, DigestAlgorithm::Sha1);
     }
@@ -1536,7 +1542,8 @@ mod tests {
         let digest = compute_digest(DigestAlgorithm::Sha512, &pre_digest);
 
         let reference = make_reference("", vec![], DigestAlgorithm::Sha512, digest);
-        let result = process_reference(&reference, &resolver, doc.root_element(), 0, false).unwrap();
+        let result =
+            process_reference(&reference, &resolver, doc.root_element(), 0, false).unwrap();
         assert!(matches!(result.status, DsigStatus::Valid));
         assert_eq!(result.digest_algorithm, DigestAlgorithm::Sha512);
     }

@@ -15,7 +15,9 @@ use xml_sec::xmldsig::digest::{DigestAlgorithm, compute_digest};
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::transforms::execute_transforms;
 use xml_sec::xmldsig::uri::UriReferenceResolver;
-use xml_sec::xmldsig::verify::{DsigStatus, FailureReason, process_all_references, process_reference};
+use xml_sec::xmldsig::verify::{
+    DsigStatus, FailureReason, process_all_references, process_reference,
+};
 
 // ── Helper ───────────────────────────────────────────────────────────────────
 
