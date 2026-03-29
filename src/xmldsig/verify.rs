@@ -57,6 +57,7 @@ pub trait KeyResolver {
 
 /// Allowed URI classes for `<Reference URI="...">`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "pass the policy to VerifyContext::allowed_uri_types(), or store it for reuse"]
 pub struct UriTypeSet {
     allow_empty: bool,
     allow_same_document: bool,
@@ -65,7 +66,6 @@ pub struct UriTypeSet {
 
 impl UriTypeSet {
     /// Create a custom URI policy.
-    #[must_use]
     pub const fn new(allow_empty: bool, allow_same_document: bool, allow_external: bool) -> Self {
         Self {
             allow_empty,
