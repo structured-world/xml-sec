@@ -52,7 +52,9 @@ pub trait KeyResolver {
     /// Resolve a verification key for the provided XML document.
     ///
     /// Return `Ok(None)` when no suitable key could be resolved from available
-    /// key material (for example, missing `<KeyInfo>` candidates).
+    /// key material (for example, missing `<KeyInfo>` candidates). `VerifyContext`
+    /// maps `Ok(None)` to `DsigStatus::Invalid(FailureReason::KeyNotFound)`;
+    /// reserve `Err(...)` for resolver failures.
     fn resolve<'a>(
         &'a self,
         xml: &str,
