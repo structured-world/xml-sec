@@ -22,14 +22,13 @@ use super::parse::{Reference, SignatureAlgorithm, XMLDSIG_NS};
 use super::signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
 };
-use super::transforms::{Transform, execute_transforms};
+use super::transforms::{
+    DEFAULT_IMPLICIT_C14N_URI, Transform, XPATH_TRANSFORM_URI, execute_transforms,
+};
 use super::uri::UriReferenceResolver;
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
-const XPATH_TRANSFORM_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
-const DEFAULT_IMPLICIT_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
-
 /// Cryptographic verifier used by [`VerifyContext`].
 ///
 /// This trait intentionally has no `Send + Sync` supertraits so lightweight

@@ -26,7 +26,10 @@ use crate::c14n::{self, C14nAlgorithm};
 /// The algorithm URI for the enveloped signature transform.
 pub const ENVELOPED_SIGNATURE_URI: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
 /// The algorithm URI for the XPath 1.0 transform.
-const XPATH_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+pub const XPATH_TRANSFORM_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+/// The implicit default canonicalization URI applied when no explicit C14N
+/// transform is present in a `<Reference>`.
+pub const DEFAULT_IMPLICIT_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
 /// xmlsec1 donor vectors use this XPath expression as a compatibility form of
 /// enveloped-signature exclusion.
 const ENVELOPED_SIGNATURE_XPATH_EXPR: &str = "not(ancestor-or-self::dsig:Signature)";
@@ -135,7 +138,7 @@ pub fn execute_transforms<'a>(
         TransformData::Binary(bytes) => Ok(bytes),
         TransformData::NodeSet(nodes) => {
             #[expect(clippy::expect_used, reason = "hardcoded URI is a known constant")]
-            let algo = C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315")
+            let algo = C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI)
                 .expect("default C14N algorithm URI must be supported by C14nAlgorithm::from_uri");
             let mut output = Vec::new();
             let predicate = |node: Node| nodes.contains(node);
@@ -191,7 +194,7 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
 
         let transform = if uri == ENVELOPED_SIGNATURE_URI {
             Transform::Enveloped
-        } else if uri == XPATH_URI {
+        } else if uri == XPATH_TRANSFORM_URI {
             parse_xpath_compat_transform(child)?
         } else if let Some(mut algo) = C14nAlgorithm::from_uri(uri) {
             // For exclusive C14N, check for InclusiveNamespaces child
