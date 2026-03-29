@@ -7,6 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/structured-world/xml-sec/compare/v0.1.1...v0.1.2) - 2026-03-29
+
+### Added
+
+- *(xmldsig)* add VerifyResult status model
+- *(xmldsig)* add VerifyContext builder policies
+- *(xmldsig)* add full signature verify pipeline
+- *(xmldsig)* add ecdsa signature verification
+
+### Documentation
+
+- *(xmldsig)* document verify ok/err contract
+- *(xmldsig)* note fail-fast truncation in verify result
+- *(xmldsig)* clarify resolver miss contract
+- *(xmldsig)* clarify canonicalized SignedInfo pre-digest semantics
+- *(xmldsig)* clarify external uri policy limitation
+- *(xmldsig)* clarify manifest fail-closed behavior
+- *(readme)* clarify xmldsig verify-only status
+- *(xmldsig)* document pipeline structural constraints
+- *(xmldsig)* clarify strict der parsing fallback
+
+### Fixed
+
+- *(xmldsig)* preserve decode errors before key lookup
+- *(xmldsig)* carry reference index at mismatch source
+- *(xmldsig)* fail closed on manifest-typed references
+- *(xmldsig)* remove redundant builder must_use attrs
+- *(xmldsig)* detect nested manifests in object subtree
+- *(xmldsig)* address verifier policy review feedback
+- *(xmldsig)* enforce URI and implicit C14N policies
+- *(xmldsig)* tighten digest and signature child parsing
+- *(xmldsig)* align DigestValue whitespace normalization
+- *(xmldsig)* harden SignatureValue text parsing
+- *(xmldsig)* tighten verify result and char handling
+- *(xmldsig)* tighten signaturevalue limits and module docs
+- *(xmldsig)* enforce xml whitespace set in signaturevalue
+- *(xmldsig)* bound signaturevalue size and c14n node checks
+- *(xmldsig)* return MissingElement when SignedInfo absent
+- *(xmldsig)* treat malformed ecdsa signature bytes as invalid
+- *(xmldsig)* align signaturevalue base64 whitespace rules
+- *(xmldsig)* reject ambiguous signature selection
+- *(xmldsig)* classify missing signedinfo as missing element
+- *(xmldsig)* enforce signaturevalue structure
+- *(xmldsig)* enforce SignedInfo position and uniqueness
+- *(xmldsig)* normalize signature value text nodes
+- *(xmldsig)* handle empty SignatureValue as present element
+- *(xmldsig)* reject non-ecdsa algorithms early
+- *(xmldsig)* tighten ecdsa der classification
+- *(xmldsig)* cover spki happy path and der parsing
+- *(xmldsig)* align signature format error mapping
+- *(xmldsig)* retry fixed verifier for ambiguous ecdsa
+- *(xmldsig)* prefer raw width and round ec bytes
+- *(xmldsig)* harden ecdsa key validation
+- *(xmldsig)* handle raw signatures with 0x30 prefix
+- *(xmldsig)* harden ecdsa signature parsing
+
+### Performance
+
+- *(xmldsig)* defer key resolution to final verify step
+
+### Refactored
+
+- *(xmldsig)* require URI in ReferenceResult
+- *(xmldsig)* reuse per-reference invalid status
+- *(xmldsig)* re-export transform uri constants
+- *(xmldsig)* mark uri policy type as must-use
+- *(xmldsig)* share transform URI constants
+- *(xmldsig)* mark verify context as must-use
+- *(xmldsig)* relax key resolver object lifetime
+- *(xmldsig)* make ascii narrowing explicit
+- *(xmldsig)* simplify ascii whitespace byte path
+- *(xmldsig)* clarify shared constants and ECDSA flow
+- *(xmldsig)* unify signature child parsing
+
+### Testing
+
+- *(xmldsig)* harden verify result API and resolver-miss checks
+- *(xmldsig)* assert mismatch reasons in tamper tests
+- *(xmldsig)* rename key-not-found status test
+- *(xmldsig)* align panic resolver with trait lifetime
+- *(xmldsig)* cover nested manifest rejection
+- *(xmldsig)* add verify context policy regressions
+- *(xmldsig)* reject oversized SignatureValue payloads
+- *(xmldsig)* cover non-empty signature without SignedInfo
+- *(xmldsig)* make xml decl stripping line-ending agnostic
+- *(xmldsig)* cover signature selection guards
+- *(xmldsig)* relax ds tag opener parsing in fixtures
+- *(xmldsig)* add ecdsa tamper pipeline coverage
+- *(xmldsig)* reuse ds-aware helper for SignatureValue mutation
+- *(xmldsig)* harden verify pipeline review fixes
+
 ## [0.1.1](https://github.com/structured-world/xml-sec/compare/v0.1.0...v0.1.1) - 2026-03-26
 
 ### Added
