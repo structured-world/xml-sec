@@ -50,10 +50,13 @@ pub trait VerifyingKey {
 /// cross-thread sharing can wrap resolvers/keys in their own thread-safe types.
 pub trait KeyResolver {
     /// Resolve a verification key for the provided XML document.
+    ///
+    /// Return `Ok(None)` when no suitable key could be resolved from available
+    /// key material (for example, missing `<KeyInfo>` candidates).
     fn resolve<'a>(
         &'a self,
         xml: &str,
-    ) -> Result<Box<dyn VerifyingKey + 'a>, SignatureVerificationPipelineError>;
+    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>;
 }
 
 /// Allowed URI classes for `<Reference URI="...">`.
@@ -579,21 +582,19 @@ fn verify_signature_with_context(
         &mut canonical_signed_info,
     )?;
 
-    let canonicalized_signed_info = if ctx.store_pre_digest {
-        Some(canonical_signed_info.clone())
-    } else {
-        None
-    };
-
+    let signature_value = decode_signature_value(signature_children.signature_value_node)?;
     let Some(resolved_key) = resolve_verifying_key(ctx, xml)? else {
         return Ok(VerifyResult {
             status: DsigStatus::Invalid(FailureReason::KeyNotFound),
             signed_info_references: references.results,
             manifest_references: Vec::new(),
-            canonicalized_signed_info,
+            canonicalized_signed_info: if ctx.store_pre_digest {
+                Some(canonical_signed_info)
+            } else {
+                None
+            },
         });
     };
-    let signature_value = decode_signature_value(signature_children.signature_value_node)?;
     let verifier = resolved_key.as_ref();
     let signature_valid = verifier.verify(
         signed_info.signature_method,
@@ -609,7 +610,11 @@ fn verify_signature_with_context(
         },
         signed_info_references: references.results,
         manifest_references: Vec::new(),
-        canonicalized_signed_info,
+        canonicalized_signed_info: if ctx.store_pre_digest {
+            Some(canonical_signed_info)
+        } else {
+            None
+        },
     })
 }
 
@@ -654,7 +659,8 @@ fn resolve_verifying_key<'k>(
         return Ok(Some(ResolvedVerifyingKey::Borrowed(key)));
     }
     if let Some(resolver) = ctx.key_resolver {
-        return Ok(Some(ResolvedVerifyingKey::Owned(resolver.resolve(xml)?)));
+        let resolved = resolver.resolve(xml)?;
+        return Ok(resolved.map(ResolvedVerifyingKey::Owned));
     }
     Ok(None)
 }
@@ -919,8 +925,21 @@ mod tests {
         fn resolve<'a>(
             &'a self,
             _xml: &str,
-        ) -> Result<Box<dyn VerifyingKey + 'a>, SignatureVerificationPipelineError> {
+        ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
+        {
             panic!("resolver should not be called when references already fail");
+        }
+    }
+
+    struct MissingKeyResolver;
+
+    impl KeyResolver for MissingKeyResolver {
+        fn resolve<'a>(
+            &'a self,
+            _xml: &str,
+        ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
+        {
+            Ok(None)
         }
     }
 
@@ -941,8 +960,7 @@ mod tests {
         )
     }
 
-    #[test]
-    fn verify_context_reports_key_not_found_status_without_key_or_resolver() {
+    fn signature_with_target_reference(signature_value_b64: &str) -> String {
         let xml_template = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
   <target ID="target">payload</target>
   <ds:Signature>
@@ -957,9 +975,10 @@ mod tests {
         <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
       </ds:Reference>
     </ds:SignedInfo>
-    <ds:SignatureValue>AQ==</ds:SignatureValue>
+    <ds:SignatureValue>SIGNATURE_VALUE_PLACEHOLDER</ds:SignatureValue>
   </ds:Signature>
 </root>"##;
+
         let doc = Document::parse(xml_template).unwrap();
         let sig_node = doc
             .descendants()
@@ -980,7 +999,14 @@ mod tests {
                 .unwrap();
         let digest = compute_digest(reference.digest_method, &pre_digest);
         let digest_b64 = base64::engine::general_purpose::STANDARD.encode(digest);
-        let xml = xml_template.replace("AAAAAAAAAAAAAAAAAAAAAAAAAAA=", &digest_b64);
+        xml_template
+            .replace("AAAAAAAAAAAAAAAAAAAAAAAAAAA=", &digest_b64)
+            .replace("SIGNATURE_VALUE_PLACEHOLDER", signature_value_b64)
+    }
+
+    #[test]
+    fn verify_context_reports_key_not_found_status_without_key_or_resolver() {
+        let xml = signature_with_target_reference("AQ==");
 
         let result = VerifyContext::new()
             .verify(&xml)
@@ -1178,6 +1204,32 @@ mod tests {
         assert!(matches!(
             result.status,
             DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+        ));
+    }
+
+    #[test]
+    fn verify_context_reports_key_not_found_when_resolver_misses() {
+        let xml = signature_with_target_reference("AQ==");
+        let result = VerifyContext::new()
+            .key_resolver(&MissingKeyResolver)
+            .verify(&xml)
+            .expect("resolver miss should report status, not pipeline error");
+        assert!(matches!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::KeyNotFound)
+        ));
+    }
+
+    #[test]
+    fn verify_context_preserves_signaturevalue_decode_errors_without_key() {
+        let xml = signature_with_target_reference("@@@");
+
+        let err = VerifyContext::new()
+            .verify(&xml)
+            .expect_err("invalid SignatureValue must remain a decode error");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::SignatureValueBase64(_)
         ));
     }
 
