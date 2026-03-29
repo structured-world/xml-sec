@@ -5,7 +5,9 @@
 
 use std::path::Path;
 
-use xml_sec::xmldsig::{SignatureVerificationPipelineError, verify_signature_with_pem_key};
+use xml_sec::xmldsig::{
+    DsigStatus, FailureReason, SignatureVerificationPipelineError, verify_signature_with_pem_key,
+};
 
 fn read_fixture(path: &Path) -> String {
     std::fs::read_to_string(path)
@@ -101,6 +103,12 @@ fn assert_invalid_structure_reason(
         }
         other => panic!("expected InvalidStructure error, got: {other:?}"),
     }
+}
+
+fn all_signed_info_refs_valid(results: &[xml_sec::xmldsig::ReferenceResult]) -> bool {
+    results
+        .iter()
+        .all(|reference| matches!(reference.status, DsigStatus::Valid))
 }
 
 fn inject_invalid_base64_in_signature_value(xml: &str) -> String {
@@ -267,11 +275,10 @@ fn donor_rsa_sha256_full_pipeline_matches() {
         verify_signature_with_pem_key(&xml, &public_key_pem, false).expect("pipeline should run");
 
     assert!(
-        result.references.all_valid(),
+        all_signed_info_refs_valid(&result.signed_info_references),
         "all SignedInfo references must be valid"
     );
-    assert!(result.signature_checked, "signature stage must run");
-    assert!(result.signature_valid, "signature must verify");
+    assert!(matches!(result.status, DsigStatus::Valid));
 }
 
 #[test]
@@ -285,11 +292,10 @@ fn donor_ecdsa_sha256_full_pipeline_matches() {
         verify_signature_with_pem_key(&xml, &public_key_pem, false).expect("pipeline should run");
 
     assert!(
-        result.references.all_valid(),
+        all_signed_info_refs_valid(&result.signed_info_references),
         "all SignedInfo references must be valid"
     );
-    assert!(result.signature_checked, "signature stage must run");
-    assert!(result.signature_valid, "signature must verify");
+    assert!(matches!(result.status, DsigStatus::Valid));
 }
 
 #[test]
@@ -304,11 +310,13 @@ fn tampered_signature_value_fails_after_references_pass() {
         .expect("pipeline should still run for invalid signature bytes");
 
     assert!(
-        result.references.all_valid(),
+        all_signed_info_refs_valid(&result.signed_info_references),
         "digest stage should still pass when only signature bytes are tampered"
     );
-    assert!(result.signature_checked, "signature stage must run");
-    assert!(!result.signature_valid, "tampered SignatureValue must fail");
+    assert!(matches!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::SignatureMismatch)
+    ));
 }
 
 #[test]
@@ -323,14 +331,13 @@ fn tampered_digest_value_fails_before_signature_stage() {
         .expect("pipeline should return structured invalid result on digest mismatch");
 
     assert!(
-        !result.references.all_valid(),
+        !all_signed_info_refs_valid(&result.signed_info_references),
         "digest mismatch must invalidate SignedInfo references"
     );
-    assert!(
-        !result.signature_checked,
-        "signature stage must not run after reference failure"
-    );
-    assert!(!result.signature_valid, "result should be invalid");
+    assert!(matches!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { .. })
+    ));
 }
 
 #[test]
@@ -345,11 +352,13 @@ fn tampered_signature_value_fails_after_references_pass_ecdsa() {
         .expect("pipeline should still run for invalid signature bytes");
 
     assert!(
-        result.references.all_valid(),
+        all_signed_info_refs_valid(&result.signed_info_references),
         "digest stage should still pass when only signature bytes are tampered"
     );
-    assert!(result.signature_checked, "signature stage must run");
-    assert!(!result.signature_valid, "tampered SignatureValue must fail");
+    assert!(matches!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::SignatureMismatch)
+    ));
 }
 
 #[test]
@@ -363,9 +372,11 @@ fn malformed_ecdsa_signature_value_returns_invalid_not_error() {
     let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect("malformed-but-base64 SignatureValue should be reported as invalid signature");
 
-    assert!(result.references.all_valid());
-    assert!(result.signature_checked);
-    assert!(!result.signature_valid);
+    assert!(all_signed_info_refs_valid(&result.signed_info_references));
+    assert!(matches!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::SignatureMismatch)
+    ));
 }
 
 #[test]
@@ -380,14 +391,13 @@ fn tampered_digest_value_fails_before_signature_stage_ecdsa() {
         .expect("pipeline should return structured invalid result on digest mismatch");
 
     assert!(
-        !result.references.all_valid(),
+        !all_signed_info_refs_valid(&result.signed_info_references),
         "digest mismatch must invalidate SignedInfo references"
     );
-    assert!(
-        !result.signature_checked,
-        "signature stage must not run after reference failure"
-    );
-    assert!(!result.signature_valid, "result should be invalid");
+    assert!(matches!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { .. })
+    ));
 }
 
 #[test]
@@ -435,9 +445,8 @@ fn signature_value_split_by_comment_still_verifies() {
     let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect("SignatureValue split by comment should still decode and verify");
 
-    assert!(result.references.all_valid());
-    assert!(result.signature_checked);
-    assert!(result.signature_valid);
+    assert!(all_signed_info_refs_valid(&result.signed_info_references));
+    assert!(matches!(result.status, DsigStatus::Valid));
 }
 
 #[test]
@@ -631,7 +640,9 @@ fn empty_signature_value_is_not_reported_as_missing_element() {
     let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect("empty SignatureValue should not be treated as missing element");
 
-    assert!(result.references.all_valid());
-    assert!(result.signature_checked);
-    assert!(!result.signature_valid);
+    assert!(all_signed_info_refs_valid(&result.signed_info_references));
+    assert!(matches!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::SignatureMismatch)
+    ));
 }
