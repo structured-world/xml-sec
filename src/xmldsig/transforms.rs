@@ -106,8 +106,7 @@ pub(crate) fn apply_transform<'a>(
             let nodes = input.into_node_set()?;
             let mut output = Vec::new();
             let predicate = |node: Node| nodes.contains(node);
-            c14n::canonicalize(nodes.document(), Some(&predicate), algo, &mut output)
-                .map_err(|e| TransformError::C14n(e.to_string()))?;
+            c14n::canonicalize(nodes.document(), Some(&predicate), algo, &mut output)?;
             Ok(TransformData::Binary(output))
         }
     }
@@ -142,8 +141,7 @@ pub fn execute_transforms<'a>(
                 .expect("default C14N algorithm URI must be supported by C14nAlgorithm::from_uri");
             let mut output = Vec::new();
             let predicate = |node: Node| nodes.contains(node);
-            c14n::canonicalize(nodes.document(), Some(&predicate), &algo, &mut output)
-                .map_err(|e| TransformError::C14n(e.to_string()))?;
+            c14n::canonicalize(nodes.document(), Some(&predicate), &algo, &mut output)?;
             Ok(output)
         }
     }

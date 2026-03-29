@@ -30,7 +30,7 @@ pub use transforms::{
 };
 pub use types::{NodeSet, TransformData, TransformError};
 pub use verify::{
-    DsigStatus, FailureReason, KeyResolver, ReferenceProcessingError, ReferenceResult,
-    ReferencesResult, SignatureVerificationPipelineError, UriTypeSet, VerifyContext, VerifyResult,
-    VerifyingKey, process_all_references, process_reference, verify_signature_with_pem_key,
+    DsigError, DsigStatus, FailureReason, KeyResolver, ReferenceProcessingError, ReferenceResult,
+    ReferencesResult, UriTypeSet, VerifyContext, VerifyResult, VerifyingKey,
+    process_all_references, process_reference, verify_signature_with_pem_key,
 };

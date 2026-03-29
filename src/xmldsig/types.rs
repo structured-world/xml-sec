@@ -226,7 +226,7 @@ pub enum TransformError {
 
     /// Canonicalization error during transform.
     #[error("C14N error: {0}")]
-    C14n(String),
+    C14n(#[from] crate::c14n::C14nError),
 
     /// The Signature node passed to the enveloped transform belongs to a
     /// different `Document` than the input `NodeSet`.

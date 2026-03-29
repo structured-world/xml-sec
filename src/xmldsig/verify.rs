@@ -41,7 +41,7 @@ pub trait VerifyingKey {
         algorithm: SignatureAlgorithm,
         signed_data: &[u8],
         signature_value: &[u8],
-    ) -> Result<bool, SignatureVerificationPipelineError>;
+    ) -> Result<bool, DsigError>;
 }
 
 /// Key resolver hook used by [`VerifyContext`] when no pre-set key is provided.
@@ -55,10 +55,7 @@ pub trait KeyResolver {
     /// key material (for example, missing `<KeyInfo>` candidates). `VerifyContext`
     /// maps `Ok(None)` to `DsigStatus::Invalid(FailureReason::KeyNotFound)`;
     /// reserve `Err(...)` for resolver failures.
-    fn resolve<'a>(
-        &'a self,
-        xml: &str,
-    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>;
+    fn resolve<'a>(&'a self, xml: &str) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError>;
 }
 
 /// Allowed URI classes for `<Reference URI="...">`.
@@ -212,7 +209,7 @@ impl<'a> VerifyContext<'a> {
     /// Returns `Ok(VerifyResult)` for both valid and invalid signatures; inspect
     /// `VerifyResult::status` for the verification outcome. `Err(...)` is
     /// reserved for pipeline failures.
-    pub fn verify(&self, xml: &str) -> Result<VerifyResult, SignatureVerificationPipelineError> {
+    pub fn verify(&self, xml: &str) -> Result<VerifyResult, DsigError> {
         verify_signature_with_context(xml, self)
     }
 }
@@ -422,7 +419,7 @@ pub struct VerifyResult {
 /// Errors while running end-to-end XMLDSig verification.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum SignatureVerificationPipelineError {
+pub enum DsigError {
     /// XML parsing failed.
     #[error("XML parse error: {0}")]
     XmlParse(#[from] roxmltree::Error),
@@ -480,6 +477,8 @@ pub enum SignatureVerificationPipelineError {
     ManifestProcessingUnsupported,
 }
 
+type SignatureVerificationPipelineError = DsigError;
+
 /// Verify one XMLDSig `<Signature>` end-to-end with a PEM public key.
 ///
 /// Pipeline:
@@ -501,7 +500,7 @@ pub fn verify_signature_with_pem_key(
     xml: &str,
     public_key_pem: &str,
     store_pre_digest: bool,
-) -> Result<VerifyResult, SignatureVerificationPipelineError> {
+) -> Result<VerifyResult, DsigError> {
     struct PemVerifyingKey<'a> {
         public_key_pem: &'a str,
     }
@@ -512,7 +511,7 @@ pub fn verify_signature_with_pem_key(
             algorithm: SignatureAlgorithm,
             signed_data: &[u8],
             signature_value: &[u8],
-        ) -> Result<bool, SignatureVerificationPipelineError> {
+        ) -> Result<bool, DsigError> {
             verify_with_algorithm(algorithm, self.public_key_pem, signed_data, signature_value)
         }
     }
