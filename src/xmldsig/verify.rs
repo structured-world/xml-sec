@@ -391,11 +391,11 @@ pub enum ReferenceProcessingError {
 
     /// URI dereference failed.
     #[error("URI dereference failed: {0}")]
-    UriDereference(super::types::TransformError),
+    UriDereference(#[source] super::types::TransformError),
 
     /// Transform execution failed.
     #[error("transform failed: {0}")]
-    Transform(super::types::TransformError),
+    Transform(#[source] super::types::TransformError),
 }
 
 /// End-to-end XMLDSig verification result for one `<Signature>`.
