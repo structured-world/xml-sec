@@ -208,6 +208,10 @@ impl<'a> VerifyContext<'a> {
     }
 
     /// Verify one XMLDSig signature using this context.
+    ///
+    /// Returns `Ok(VerifyResult)` for both valid and invalid signatures; inspect
+    /// `VerifyResult::status` for the verification outcome. `Err(...)` is
+    /// reserved for pipeline failures.
     pub fn verify(&self, xml: &str) -> Result<VerifyResult, SignatureVerificationPipelineError> {
         verify_signature_with_context(xml, self)
     }
