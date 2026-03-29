@@ -574,10 +574,9 @@ fn verify_signature_with_context(
     )?;
 
     if let Some(first_failure) = references.first_failure {
+        let status = references.results[first_failure].status;
         return Ok(VerifyResult {
-            status: DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch {
-                ref_index: first_failure,
-            }),
+            status,
             signed_info_references: references.results,
             manifest_references: Vec::new(),
             canonicalized_signed_info: None,
