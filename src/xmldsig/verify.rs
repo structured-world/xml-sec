@@ -942,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_context_requires_key_or_resolver() {
+    fn verify_context_reports_key_not_found_status_without_key_or_resolver() {
         let xml_template = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
   <target ID="target">payload</target>
   <ds:Signature>
