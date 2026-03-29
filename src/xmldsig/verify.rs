@@ -265,6 +265,7 @@ pub enum FailureReason {
 
 /// Result of processing all `<Reference>` elements in `<SignedInfo>`.
 #[derive(Debug)]
+#[non_exhaustive]
 #[must_use = "check first_failure/results before accepting the reference set"]
 pub struct ReferencesResult {
     /// Per-reference results (one per `<Reference>` in order).
