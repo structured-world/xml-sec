@@ -57,6 +57,10 @@ pub trait KeyResolver {
 }
 
 /// Allowed URI classes for `<Reference URI="...">`.
+///
+/// Note: `UriReferenceResolver` currently supports only same-document URIs.
+/// Allowing external URIs via this policy only disables the early policy
+/// rejection; dereference still fails until an external resolver path is added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "pass the policy to VerifyContext::allowed_uri_types(), or store it for reuse"]
 pub struct UriTypeSet {
@@ -83,6 +87,9 @@ impl UriTypeSet {
     };
 
     /// Allow all URI classes.
+    ///
+    /// This includes external URI classes at policy level, but external
+    /// dereference is not implemented yet by the default resolver.
     pub const ALL: Self = Self {
         allow_empty: true,
         allow_same_document: true,
