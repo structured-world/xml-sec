@@ -24,10 +24,13 @@ pub use signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_ecdsa_signature_spki,
     verify_rsa_signature_pem, verify_rsa_signature_spki,
 };
-pub use transforms::{Transform, execute_transforms, parse_transforms};
+pub use transforms::{
+    DEFAULT_IMPLICIT_C14N_URI, ENVELOPED_SIGNATURE_URI, Transform, XPATH_TRANSFORM_URI,
+    execute_transforms, parse_transforms,
+};
 pub use types::{NodeSet, TransformData, TransformError};
 pub use verify::{
-    ReferenceProcessingError, ReferenceResult, ReferencesResult,
-    SignatureVerificationPipelineError, SignatureVerificationResult, process_all_references,
-    process_reference, verify_signature_with_pem_key,
+    KeyResolver, ReferenceProcessingError, ReferenceResult, ReferencesResult,
+    SignatureVerificationPipelineError, SignatureVerificationResult, UriTypeSet, VerifyContext,
+    VerifyingKey, process_all_references, process_reference, verify_signature_with_pem_key,
 };

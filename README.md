@@ -37,7 +37,6 @@ Currently implemented (core paths):
 - ECDSA verification helpers for P-256/SHA-256 and P-384/SHA-384
 
 Still in progress:
-- XMLDSig `VerifyContext` builder API
 - XMLDSig signing pipeline
 - XMLEnc encryption/decryption pipeline
 
