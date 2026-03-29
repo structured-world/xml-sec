@@ -229,7 +229,7 @@ impl Default for VerifyContext<'_> {
 #[must_use = "inspect status before accepting the reference result"]
 pub struct ReferenceResult {
     /// URI from the `<Reference>` element (for diagnostics).
-    pub uri: Option<String>,
+    pub uri: String,
     /// Digest algorithm used.
     pub digest_algorithm: DigestAlgorithm,
     /// Reference verification status.
@@ -333,7 +333,7 @@ pub fn process_reference(
     };
 
     Ok(ReferenceResult {
-        uri: reference.uri.clone(),
+        uri: uri.to_owned(),
         digest_algorithm: reference.digest_method,
         status,
         pre_digest_data: if store_pre_digest {

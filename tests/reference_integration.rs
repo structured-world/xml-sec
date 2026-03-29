@@ -626,7 +626,7 @@ fn process_single_reference_with_pre_digest_valid() {
     .unwrap();
 
     assert!(matches!(result.status, DsigStatus::Valid));
-    assert_eq!(result.uri.as_deref(), Some(""));
+    assert_eq!(result.uri, "");
     assert_eq!(result.digest_algorithm, DigestAlgorithm::Sha256);
 
     let pre_digest = result.pre_digest_data.unwrap();
