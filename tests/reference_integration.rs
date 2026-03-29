@@ -15,7 +15,7 @@ use xml_sec::xmldsig::digest::{DigestAlgorithm, compute_digest};
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::transforms::execute_transforms;
 use xml_sec::xmldsig::uri::UriReferenceResolver;
-use xml_sec::xmldsig::verify::{DsigStatus, process_all_references, process_reference};
+use xml_sec::xmldsig::verify::{DsigStatus, FailureReason, process_all_references, process_reference};
 
 // ── Helper ───────────────────────────────────────────────────────────────────
 
@@ -293,7 +293,10 @@ fn tampered_document_detected() {
         "tampered document should fail digest verification"
     );
     assert_eq!(result.first_failure, Some(0));
-    assert!(matches!(result.results[0].status, DsigStatus::Invalid(_)));
+    assert!(matches!(
+        result.results[0].status,
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+    ));
 }
 
 // ── Multiple references: fail-fast behavior ──────────────────────────────────
@@ -377,8 +380,11 @@ fn multiple_references_fail_fast_on_second() {
         "first ref should pass"
     );
     assert!(
-        matches!(result.results[1].status, DsigStatus::Invalid(_)),
-        "second (tampered) ref should fail"
+        matches!(
+            result.results[1].status,
+            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 1 })
+        ),
+        "second (tampered) ref should fail with the second-reference index"
     );
 }
 
