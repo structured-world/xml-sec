@@ -405,7 +405,8 @@ pub struct VerifyResult {
     pub signed_info_references: Vec<ReferenceResult>,
     /// `<Manifest>` reference results. Empty until manifest processing is implemented.
     pub manifest_references: Vec<ReferenceResult>,
-    /// Canonicalized `<SignedInfo>` bytes when `store_pre_digest` is enabled.
+    /// Canonicalized `<SignedInfo>` bytes when `store_pre_digest` is enabled
+    /// and verification reaches SignedInfo canonicalization.
     pub canonicalized_signed_info: Option<Vec<u8>>,
 }
 
