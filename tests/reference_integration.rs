@@ -293,10 +293,7 @@ fn tampered_document_detected() {
         "tampered document should fail digest verification"
     );
     assert_eq!(result.first_failure, Some(0));
-    assert!(matches!(
-        result.results[0].status,
-        DsigStatus::Invalid(_)
-    ));
+    assert!(matches!(result.results[0].status, DsigStatus::Invalid(_)));
 }
 
 // ── Multiple references: fail-fast behavior ──────────────────────────────────

@@ -203,10 +203,7 @@ impl<'a> VerifyContext<'a> {
     }
 
     /// Verify one XMLDSig signature using this context.
-    pub fn verify(
-        &self,
-        xml: &str,
-    ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
+    pub fn verify(&self, xml: &str) -> Result<VerifyResult, SignatureVerificationPipelineError> {
         verify_signature_with_context(xml, self)
     }
 }
@@ -355,9 +352,8 @@ pub fn process_all_references(
         let mut result = process_reference(reference, resolver, signature_node, store_pre_digest)?;
         let failed = matches!(result.status, DsigStatus::Invalid(_));
         if failed {
-            result.status = DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch {
-                ref_index: i,
-            });
+            result.status =
+                DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: i });
         }
         results.push(result);
 
@@ -880,11 +876,11 @@ fn verify_with_algorithm(
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
     use super::*;
-    use base64::Engine;
     use crate::xmldsig::digest::DigestAlgorithm;
     use crate::xmldsig::parse::{Reference, parse_signed_info};
     use crate::xmldsig::transforms::Transform;
     use crate::xmldsig::uri::UriReferenceResolver;
+    use base64::Engine;
     use roxmltree::Document;
 
     // ── Helpers ──────────────────────────────────────────────────────
@@ -978,7 +974,9 @@ mod tests {
         let signed_info = parse_signed_info(signed_info_node).unwrap();
         let reference = &signed_info.references[0];
         let resolver = UriReferenceResolver::new(&doc);
-        let initial_data = resolver.dereference(reference.uri.as_deref().unwrap()).unwrap();
+        let initial_data = resolver
+            .dereference(reference.uri.as_deref().unwrap())
+            .unwrap();
         let pre_digest =
             crate::xmldsig::execute_transforms(sig_node, initial_data, &reference.transforms)
                 .unwrap();
@@ -990,7 +988,10 @@ mod tests {
             .verify(&xml)
             .expect("missing key config must be reported as verification status");
         assert!(
-            matches!(result.status, DsigStatus::Invalid(FailureReason::KeyNotFound)),
+            matches!(
+                result.status,
+                DsigStatus::Invalid(FailureReason::KeyNotFound)
+            ),
             "unexpected status: {:?}",
             result.status
         );
@@ -1271,7 +1272,10 @@ mod tests {
         let reference = make_reference("", transforms, DigestAlgorithm::Sha256, expected_digest);
 
         let result = process_reference(&reference, &resolver, sig_node, false).unwrap();
-        assert!(matches!(result.status, DsigStatus::Valid), "digest should match");
+        assert!(
+            matches!(result.status, DsigStatus::Valid),
+            "digest should match"
+        );
         assert!(result.pre_digest_data.is_none());
     }
 
