@@ -280,6 +280,7 @@ impl ReferencesResult {
 /// - `reference`: The parsed `<Reference>` element.
 /// - `resolver`: URI resolver for the document.
 /// - `signature_node`: The `<Signature>` element (for enveloped-signature transform).
+/// - `ref_index`: Zero-based index of this reference in `<SignedInfo>`.
 /// - `store_pre_digest`: If true, store the pre-digest bytes in the result.
 ///
 /// # Errors
@@ -291,6 +292,7 @@ pub fn process_reference(
     reference: &Reference,
     resolver: &UriReferenceResolver<'_>,
     signature_node: Node<'_, '_>,
+    ref_index: usize,
     store_pre_digest: bool,
 ) -> Result<ReferenceResult, ReferenceProcessingError> {
     // 1. Dereference URI. Omitted URI is distinct from URI="" in XMLDSig and
@@ -314,7 +316,7 @@ pub fn process_reference(
     let status = if constant_time_eq(&computed_digest, &reference.digest_value) {
         DsigStatus::Valid
     } else {
-        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index })
     };
 
     Ok(ReferenceResult {
@@ -349,12 +351,8 @@ pub fn process_all_references(
     let mut results = Vec::with_capacity(references.len());
 
     for (i, reference) in references.iter().enumerate() {
-        let mut result = process_reference(reference, resolver, signature_node, store_pre_digest)?;
+        let result = process_reference(reference, resolver, signature_node, i, store_pre_digest)?;
         let failed = matches!(result.status, DsigStatus::Invalid(_));
-        if failed {
-            result.status =
-                DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: i });
-        }
         results.push(result);
 
         if failed {
@@ -1271,7 +1269,7 @@ mod tests {
         // Now build a Reference with the correct digest and verify
         let reference = make_reference("", transforms, DigestAlgorithm::Sha256, expected_digest);
 
-        let result = process_reference(&reference, &resolver, sig_node, false).unwrap();
+        let result = process_reference(&reference, &resolver, sig_node, 0, false).unwrap();
         assert!(
             matches!(result.status, DsigStatus::Valid),
             "digest should match"
@@ -1299,10 +1297,33 @@ mod tests {
         let wrong_digest = vec![0u8; 32];
         let reference = make_reference("", transforms, DigestAlgorithm::Sha256, wrong_digest);
 
-        let result = process_reference(&reference, &resolver, sig_node, false).unwrap();
+        let result = process_reference(&reference, &resolver, sig_node, 0, false).unwrap();
         assert!(matches!(
             result.status,
             DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+        ));
+    }
+
+    #[test]
+    fn reference_with_wrong_digest_preserves_supplied_ref_index() {
+        let xml = r##"<root>
+            <data>hello</data>
+            <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+                <ds:SignedInfo/>
+            </ds:Signature>
+        </root>"##;
+        let doc = Document::parse(xml).unwrap();
+        let resolver = UriReferenceResolver::new(&doc);
+        let sig_node = doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "Signature")
+            .unwrap();
+
+        let reference = make_reference("", vec![Transform::Enveloped], DigestAlgorithm::Sha256, vec![0u8; 32]);
+        let result = process_reference(&reference, &resolver, sig_node, 7, false).unwrap();
+        assert!(matches!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 7 })
         ));
     }
 
@@ -1319,7 +1340,7 @@ mod tests {
         let digest = compute_digest(DigestAlgorithm::Sha256, &pre_digest);
 
         let reference = make_reference("", vec![], DigestAlgorithm::Sha256, digest);
-        let result = process_reference(&reference, &resolver, doc.root_element(), true).unwrap();
+        let result = process_reference(&reference, &resolver, doc.root_element(), 0, true).unwrap();
 
         assert!(matches!(result.status, DsigStatus::Valid));
         assert!(result.pre_digest_data.is_some());
@@ -1359,7 +1380,7 @@ mod tests {
             DigestAlgorithm::Sha256,
             expected_digest,
         );
-        let result = process_reference(&reference, &resolver, sig_node, false).unwrap();
+        let result = process_reference(&reference, &resolver, sig_node, 0, false).unwrap();
         assert!(matches!(result.status, DsigStatus::Valid));
     }
 
@@ -1371,7 +1392,7 @@ mod tests {
 
         let reference =
             make_reference("#nonexistent", vec![], DigestAlgorithm::Sha256, vec![0; 32]);
-        let result = process_reference(&reference, &resolver, doc.root_element(), false);
+        let result = process_reference(&reference, &resolver, doc.root_element(), 0, false);
         assert!(result.is_err());
     }
 
@@ -1390,7 +1411,7 @@ mod tests {
             digest_value: vec![0; 32],
         };
 
-        let result = process_reference(&reference, &resolver, doc.root_element(), false);
+        let result = process_reference(&reference, &resolver, doc.root_element(), 0, false);
         assert!(matches!(result, Err(ReferenceProcessingError::MissingUri)));
     }
 
@@ -1498,7 +1519,7 @@ mod tests {
         let digest = compute_digest(DigestAlgorithm::Sha1, &pre_digest);
 
         let reference = make_reference("", vec![], DigestAlgorithm::Sha1, digest);
-        let result = process_reference(&reference, &resolver, doc.root_element(), false).unwrap();
+        let result = process_reference(&reference, &resolver, doc.root_element(), 0, false).unwrap();
         assert!(matches!(result.status, DsigStatus::Valid));
         assert_eq!(result.digest_algorithm, DigestAlgorithm::Sha1);
     }
@@ -1515,7 +1536,7 @@ mod tests {
         let digest = compute_digest(DigestAlgorithm::Sha512, &pre_digest);
 
         let reference = make_reference("", vec![], DigestAlgorithm::Sha512, digest);
-        let result = process_reference(&reference, &resolver, doc.root_element(), false).unwrap();
+        let result = process_reference(&reference, &resolver, doc.root_element(), 0, false).unwrap();
         assert!(matches!(result.status, DsigStatus::Valid));
         assert_eq!(result.digest_algorithm, DigestAlgorithm::Sha512);
     }
@@ -1578,7 +1599,7 @@ mod tests {
         );
 
         // Verify: should pass
-        let result = process_reference(&corrected_ref, &resolver, sig_node, true).unwrap();
+        let result = process_reference(&corrected_ref, &resolver, sig_node, 0, true).unwrap();
         assert!(
             matches!(result.status, DsigStatus::Valid),
             "SAML reference should verify"

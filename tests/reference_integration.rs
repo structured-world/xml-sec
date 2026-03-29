@@ -612,6 +612,7 @@ fn process_single_reference_with_pre_digest_valid() {
         &signed_info.references[0],
         &resolver,
         sig_node,
+        0,
         true, // store pre-digest
     )
     .unwrap();
