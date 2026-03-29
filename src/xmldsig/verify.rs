@@ -404,6 +404,8 @@ pub struct VerifyResult {
     /// Final XMLDSig status for this signature.
     pub status: DsigStatus,
     /// `<Reference>` verification results from `<SignedInfo>`.
+    /// On fail-fast, this includes references up to and including
+    /// the first digest mismatch only.
     pub signed_info_references: Vec<ReferenceResult>,
     /// `<Manifest>` reference results. Empty until manifest processing is implemented.
     pub manifest_references: Vec<ReferenceResult>,
