@@ -219,6 +219,7 @@ impl Default for VerifyContext<'_> {
 
 /// Per-reference verification result.
 #[derive(Debug)]
+#[non_exhaustive]
 #[must_use = "inspect status before accepting the reference result"]
 pub struct ReferenceResult {
     /// URI from the `<Reference>` element (for diagnostics).
@@ -233,6 +234,7 @@ pub struct ReferenceResult {
 
 /// Verification status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DsigStatus {
     /// Signature/reference is cryptographically valid.
     Valid,
@@ -242,6 +244,7 @@ pub enum DsigStatus {
 
 /// Why XMLDSig verification failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FailureReason {
     /// `<DigestValue>` mismatch for a `<Reference>` at `ref_index`.
     ReferenceDigestMismatch {
@@ -393,6 +396,7 @@ pub enum ReferenceProcessingError {
 
 /// End-to-end XMLDSig verification result for one `<Signature>`.
 #[derive(Debug)]
+#[non_exhaustive]
 #[must_use = "inspect status before accepting the document"]
 pub struct VerifyResult {
     /// Final XMLDSig status for this signature.
@@ -1217,6 +1221,29 @@ mod tests {
         assert!(matches!(
             result.status,
             DsigStatus::Invalid(FailureReason::KeyNotFound)
+        ));
+        assert_eq!(
+            result.signed_info_references.len(),
+            1,
+            "KeyNotFound path must preserve SignedInfo reference diagnostics",
+        );
+        assert!(matches!(
+            result.signed_info_references[0].status,
+            DsigStatus::Valid
+        ));
+    }
+
+    #[test]
+    fn verify_context_preserves_signaturevalue_decode_errors_when_resolver_misses() {
+        let xml = signature_with_target_reference("@@@");
+
+        let err = VerifyContext::new()
+            .key_resolver(&MissingKeyResolver)
+            .verify(&xml)
+            .expect_err("invalid SignatureValue must remain a decode error on resolver miss");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::SignatureValueBase64(_)
         ));
     }
 
