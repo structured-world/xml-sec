@@ -15,7 +15,7 @@ use xml_sec::xmldsig::digest::{DigestAlgorithm, compute_digest};
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::transforms::execute_transforms;
 use xml_sec::xmldsig::uri::UriReferenceResolver;
-use xml_sec::xmldsig::verify::{process_all_references, process_reference};
+use xml_sec::xmldsig::verify::{DsigStatus, process_all_references, process_reference};
 
 // ── Helper ───────────────────────────────────────────────────────────────────
 
@@ -293,7 +293,10 @@ fn tampered_document_detected() {
         "tampered document should fail digest verification"
     );
     assert_eq!(result.first_failure, Some(0));
-    assert!(!result.results[0].valid);
+    assert!(matches!(
+        result.results[0].status,
+        DsigStatus::Invalid(_)
+    ));
 }
 
 // ── Multiple references: fail-fast behavior ──────────────────────────────────
@@ -372,9 +375,12 @@ fn multiple_references_fail_fast_on_second() {
     assert!(!result.all_valid());
     assert_eq!(result.first_failure, Some(1));
     assert_eq!(result.results.len(), 2);
-    assert!(result.results[0].valid, "first ref should pass");
     assert!(
-        !result.results[1].valid,
+        matches!(result.results[0].status, DsigStatus::Valid),
+        "first ref should pass"
+    );
+    assert!(
+        matches!(result.results[1].status, DsigStatus::Invalid(_)),
         "second (tampered) ref should fail"
     );
 }
@@ -613,7 +619,7 @@ fn process_single_reference_with_pre_digest_valid() {
     )
     .unwrap();
 
-    assert!(result.valid);
+    assert!(matches!(result.status, DsigStatus::Valid));
     assert_eq!(result.uri.as_deref(), Some(""));
     assert_eq!(result.digest_algorithm, DigestAlgorithm::Sha256);
 

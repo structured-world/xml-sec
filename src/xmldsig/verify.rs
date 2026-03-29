@@ -206,7 +206,7 @@ impl<'a> VerifyContext<'a> {
     pub fn verify(
         &self,
         xml: &str,
-    ) -> Result<SignatureVerificationResult, SignatureVerificationPipelineError> {
+    ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
         verify_signature_with_context(xml, self)
     }
 }
@@ -219,16 +219,39 @@ impl Default for VerifyContext<'_> {
 
 /// Per-reference verification result.
 #[derive(Debug)]
-#[must_use = "inspect valid before accepting the reference result"]
+#[must_use = "inspect status before accepting the reference result"]
 pub struct ReferenceResult {
     /// URI from the `<Reference>` element (for diagnostics).
     pub uri: Option<String>,
     /// Digest algorithm used.
     pub digest_algorithm: DigestAlgorithm,
-    /// Whether the computed digest matched the stored `<DigestValue>`.
-    pub valid: bool,
+    /// Reference verification status.
+    pub status: DsigStatus,
     /// Pre-digest bytes (populated when `store_pre_digest` is enabled).
     pub pre_digest_data: Option<Vec<u8>>,
+}
+
+/// Verification status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsigStatus {
+    /// Signature/reference is cryptographically valid.
+    Valid,
+    /// Signature/reference is invalid with a concrete reason.
+    Invalid(FailureReason),
+}
+
+/// Why XMLDSig verification failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureReason {
+    /// `<DigestValue>` mismatch for a `<Reference>` at `ref_index`.
+    ReferenceDigestMismatch {
+        /// Zero-based index of the failing `<Reference>` in `<SignedInfo>`.
+        ref_index: usize,
+    },
+    /// `<SignatureValue>` does not match canonicalized `<SignedInfo>`.
+    SignatureMismatch,
+    /// No verification key was configured or could be resolved.
+    KeyNotFound,
 }
 
 /// Result of processing all `<Reference>` elements in `<SignedInfo>`.
@@ -246,7 +269,9 @@ impl ReferencesResult {
     /// Whether all references passed digest verification.
     #[must_use]
     pub fn all_valid(&self) -> bool {
-        self.first_failure.is_none()
+        self.results
+            .iter()
+            .all(|result| matches!(result.status, DsigStatus::Valid))
     }
 }
 
@@ -263,7 +288,8 @@ impl ReferencesResult {
 /// # Errors
 ///
 /// Returns `Err` for processing failures (URI dereference, transform errors).
-/// Digest mismatch is NOT an error — it produces `Ok(ReferenceResult { valid: false })`.
+/// Digest mismatch is NOT an error — it produces
+/// `Ok(ReferenceResult { status: Invalid(ReferenceDigestMismatch { .. }) })`.
 pub fn process_reference(
     reference: &Reference,
     resolver: &UriReferenceResolver<'_>,
@@ -288,12 +314,16 @@ pub fn process_reference(
     let computed_digest = compute_digest(reference.digest_method, &pre_digest_bytes);
 
     // 4. Compare with stored DigestValue (constant-time)
-    let valid = constant_time_eq(&computed_digest, &reference.digest_value);
+    let status = if constant_time_eq(&computed_digest, &reference.digest_value) {
+        DsigStatus::Valid
+    } else {
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+    };
 
     Ok(ReferenceResult {
         uri: reference.uri.clone(),
         digest_algorithm: reference.digest_method,
-        valid,
+        status,
         pre_digest_data: if store_pre_digest {
             Some(pre_digest_bytes)
         } else {
@@ -322,8 +352,13 @@ pub fn process_all_references(
     let mut results = Vec::with_capacity(references.len());
 
     for (i, reference) in references.iter().enumerate() {
-        let result = process_reference(reference, resolver, signature_node, store_pre_digest)?;
-        let failed = !result.valid;
+        let mut result = process_reference(reference, resolver, signature_node, store_pre_digest)?;
+        let failed = matches!(result.status, DsigStatus::Invalid(_));
+        if failed {
+            result.status = DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch {
+                ref_index: i,
+            });
+        }
         results.push(result);
 
         if failed {
@@ -361,18 +396,16 @@ pub enum ReferenceProcessingError {
 
 /// End-to-end XMLDSig verification result for one `<Signature>`.
 #[derive(Debug)]
-#[must_use = "inspect signature_valid (and signature_checked for stage diagnostics) before accepting the document"]
-pub struct SignatureVerificationResult {
-    /// Reference validation results from `<SignedInfo>`.
-    pub references: ReferencesResult,
-    /// Whether final `<SignatureValue>` verification was attempted.
-    ///
-    /// This is `false` when a reference digest mismatch happened first.
-    pub signature_checked: bool,
-    /// Whether `<SignatureValue>` verification succeeded.
-    ///
-    /// Only meaningful when `signature_checked` is `true`.
-    pub signature_valid: bool,
+#[must_use = "inspect status before accepting the document"]
+pub struct VerifyResult {
+    /// Final XMLDSig status for this signature.
+    pub status: DsigStatus,
+    /// `<Reference>` verification results from `<SignedInfo>`.
+    pub signed_info_references: Vec<ReferenceResult>,
+    /// `<Manifest>` reference results. Empty until manifest processing is implemented.
+    pub manifest_references: Vec<ReferenceResult>,
+    /// Canonicalized `<SignedInfo>` bytes when `store_pre_digest` is enabled.
+    pub canonicalized_signed_info: Option<Vec<u8>>,
 }
 
 /// Errors while running end-to-end XMLDSig verification.
@@ -417,10 +450,6 @@ pub enum SignatureVerificationPipelineError {
     #[error("signature verification failed: {0}")]
     Crypto(#[from] SignatureVerificationError),
 
-    /// No verification key was configured or resolved.
-    #[error("no verification key available (set key() or key_resolver())")]
-    KeyNotFound,
-
     /// A `<Reference>` URI class is rejected by policy.
     #[error("reference URI is not allowed by policy: {uri}")]
     DisallowedUri {
@@ -450,7 +479,7 @@ pub enum SignatureVerificationPipelineError {
 /// 5. Verify signature bytes against canonicalized `<SignedInfo>`
 ///
 /// If any `<Reference>` digest mismatches, returns `Ok` with
-/// `signature_checked == false` and `signature_valid == false`.
+/// `status == Invalid(ReferenceDigestMismatch { .. })`.
 ///
 /// Structural constraints enforced by this API:
 /// - The document must contain exactly one XMLDSig `<Signature>` element.
@@ -461,7 +490,7 @@ pub fn verify_signature_with_pem_key(
     xml: &str,
     public_key_pem: &str,
     store_pre_digest: bool,
-) -> Result<SignatureVerificationResult, SignatureVerificationPipelineError> {
+) -> Result<VerifyResult, SignatureVerificationPipelineError> {
     struct PemVerifyingKey<'a> {
         public_key_pem: &'a str,
     }
@@ -487,7 +516,7 @@ pub fn verify_signature_with_pem_key(
 fn verify_signature_with_context(
     xml: &str,
     ctx: &VerifyContext<'_>,
-) -> Result<SignatureVerificationResult, SignatureVerificationPipelineError> {
+) -> Result<VerifyResult, SignatureVerificationPipelineError> {
     let doc = Document::parse(xml)?;
     let mut signatures = doc.descendants().filter(|node| {
         node.is_element()
@@ -525,10 +554,6 @@ fn verify_signature_with_context(
         ctx.allowed_transform_uris(),
     )?;
 
-    if ctx.key.is_none() && ctx.key_resolver.is_none() {
-        return Err(SignatureVerificationPipelineError::KeyNotFound);
-    }
-
     let resolver = UriReferenceResolver::new(&doc);
     let references = process_all_references(
         &signed_info.references,
@@ -537,11 +562,14 @@ fn verify_signature_with_context(
         ctx.store_pre_digest,
     )?;
 
-    if references.first_failure.is_some() {
-        return Ok(SignatureVerificationResult {
-            references,
-            signature_checked: false,
-            signature_valid: false,
+    if let Some(first_failure) = references.first_failure {
+        return Ok(VerifyResult {
+            status: DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch {
+                ref_index: first_failure,
+            }),
+            signed_info_references: references.results,
+            manifest_references: Vec::new(),
+            canonicalized_signed_info: None,
         });
     }
 
@@ -557,8 +585,21 @@ fn verify_signature_with_context(
         &mut canonical_signed_info,
     )?;
 
+    let canonicalized_signed_info = if ctx.store_pre_digest {
+        Some(canonical_signed_info.clone())
+    } else {
+        None
+    };
+
+    let Some(resolved_key) = resolve_verifying_key(ctx, xml)? else {
+        return Ok(VerifyResult {
+            status: DsigStatus::Invalid(FailureReason::KeyNotFound),
+            signed_info_references: references.results,
+            manifest_references: Vec::new(),
+            canonicalized_signed_info,
+        });
+    };
     let signature_value = decode_signature_value(signature_children.signature_value_node)?;
-    let resolved_key = resolve_verifying_key(ctx, xml)?;
     let verifier = resolved_key.as_ref();
     let signature_valid = verifier.verify(
         signed_info.signature_method,
@@ -566,10 +607,15 @@ fn verify_signature_with_context(
         &signature_value,
     )?;
 
-    Ok(SignatureVerificationResult {
-        references,
-        signature_checked: true,
-        signature_valid,
+    Ok(VerifyResult {
+        status: if signature_valid {
+            DsigStatus::Valid
+        } else {
+            DsigStatus::Invalid(FailureReason::SignatureMismatch)
+        },
+        signed_info_references: references.results,
+        manifest_references: Vec::new(),
+        canonicalized_signed_info,
     })
 }
 
@@ -609,14 +655,14 @@ impl ResolvedVerifyingKey<'_> {
 fn resolve_verifying_key<'k>(
     ctx: &VerifyContext<'k>,
     xml: &str,
-) -> Result<ResolvedVerifyingKey<'k>, SignatureVerificationPipelineError> {
+) -> Result<Option<ResolvedVerifyingKey<'k>>, SignatureVerificationPipelineError> {
     if let Some(key) = ctx.key {
-        return Ok(ResolvedVerifyingKey::Borrowed(key));
+        return Ok(Some(ResolvedVerifyingKey::Borrowed(key)));
     }
     if let Some(resolver) = ctx.key_resolver {
-        return Ok(ResolvedVerifyingKey::Owned(resolver.resolve(xml)?));
+        return Ok(Some(ResolvedVerifyingKey::Owned(resolver.resolve(xml)?)));
     }
-    Err(SignatureVerificationPipelineError::KeyNotFound)
+    Ok(None)
 }
 
 fn enforce_reference_policies(
@@ -834,6 +880,7 @@ fn verify_with_algorithm(
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
     use super::*;
+    use base64::Engine;
     use crate::xmldsig::digest::DigestAlgorithm;
     use crate::xmldsig::parse::{Reference, parse_signed_info};
     use crate::xmldsig::transforms::Transform;
@@ -902,14 +949,51 @@ mod tests {
 
     #[test]
     fn verify_context_requires_key_or_resolver() {
-        let xml = minimal_signature_xml("", "");
-        let err = VerifyContext::new()
+        let xml_template = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <target ID="target">payload</target>
+  <ds:Signature>
+    <ds:SignedInfo>
+      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+      <ds:Reference URI="#target">
+        <ds:Transforms>
+          <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+        </ds:Transforms>
+        <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+        <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
+      </ds:Reference>
+    </ds:SignedInfo>
+    <ds:SignatureValue>AQ==</ds:SignatureValue>
+  </ds:Signature>
+</root>"##;
+        let doc = Document::parse(xml_template).unwrap();
+        let sig_node = doc
+            .descendants()
+            .find(|node| node.is_element() && node.tag_name().name() == "Signature")
+            .unwrap();
+        let signed_info_node = sig_node
+            .children()
+            .find(|node| node.is_element() && node.tag_name().name() == "SignedInfo")
+            .unwrap();
+        let signed_info = parse_signed_info(signed_info_node).unwrap();
+        let reference = &signed_info.references[0];
+        let resolver = UriReferenceResolver::new(&doc);
+        let initial_data = resolver.dereference(reference.uri.as_deref().unwrap()).unwrap();
+        let pre_digest =
+            crate::xmldsig::execute_transforms(sig_node, initial_data, &reference.transforms)
+                .unwrap();
+        let digest = compute_digest(reference.digest_method, &pre_digest);
+        let digest_b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+        let xml = xml_template.replace("AAAAAAAAAAAAAAAAAAAAAAAAAAA=", &digest_b64);
+
+        let result = VerifyContext::new()
             .verify(&xml)
-            .expect_err("missing key config must be rejected");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::KeyNotFound
-        ));
+            .expect("missing key config must be reported as verification status");
+        assert!(
+            matches!(result.status, DsigStatus::Invalid(FailureReason::KeyNotFound)),
+            "unexpected status: {:?}",
+            result.status
+        );
     }
 
     #[test]
@@ -1037,7 +1121,10 @@ mod tests {
             .process_manifests(false)
             .verify(&xml)
             .expect("manifest processing disabled should preserve prior behavior");
-        assert!(!result.signature_valid);
+        assert!(matches!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+        ));
     }
 
     #[test]
@@ -1089,8 +1176,10 @@ mod tests {
             .key_resolver(&PanicResolver)
             .verify(&xml)
             .expect("reference digest mismatch should short-circuit before resolver");
-        assert!(!result.signature_checked);
-        assert!(!result.signature_valid);
+        assert!(matches!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+        ));
     }
 
     #[test]
@@ -1151,7 +1240,7 @@ mod tests {
     #[test]
     fn reference_with_correct_digest_passes() {
         // Create a simple document, compute its canonical form digest,
-        // then verify that process_reference returns valid=true.
+        // then verify that process_reference returns Valid status.
         let xml = r##"<root>
             <data>hello world</data>
             <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="sig1">
@@ -1182,7 +1271,7 @@ mod tests {
         let reference = make_reference("", transforms, DigestAlgorithm::Sha256, expected_digest);
 
         let result = process_reference(&reference, &resolver, sig_node, false).unwrap();
-        assert!(result.valid, "digest should match");
+        assert!(matches!(result.status, DsigStatus::Valid), "digest should match");
         assert!(result.pre_digest_data.is_none());
     }
 
@@ -1207,7 +1296,10 @@ mod tests {
         let reference = make_reference("", transforms, DigestAlgorithm::Sha256, wrong_digest);
 
         let result = process_reference(&reference, &resolver, sig_node, false).unwrap();
-        assert!(!result.valid, "wrong digest should fail");
+        assert!(matches!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+        ));
     }
 
     #[test]
@@ -1225,7 +1317,7 @@ mod tests {
         let reference = make_reference("", vec![], DigestAlgorithm::Sha256, digest);
         let result = process_reference(&reference, &resolver, doc.root_element(), true).unwrap();
 
-        assert!(result.valid);
+        assert!(matches!(result.status, DsigStatus::Valid));
         assert!(result.pre_digest_data.is_some());
         assert_eq!(result.pre_digest_data.unwrap(), pre_digest);
     }
@@ -1264,7 +1356,7 @@ mod tests {
             expected_digest,
         );
         let result = process_reference(&reference, &resolver, sig_node, false).unwrap();
-        assert!(result.valid);
+        assert!(matches!(result.status, DsigStatus::Valid));
     }
 
     #[test]
@@ -1341,7 +1433,10 @@ mod tests {
         assert_eq!(result.first_failure, Some(0));
         // Only first reference should be in results (fail-fast)
         assert_eq!(result.results.len(), 1);
-        assert!(!result.results[0].valid);
+        assert!(matches!(
+            result.results[0].status,
+            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+        ));
     }
 
     #[test]
@@ -1367,8 +1462,11 @@ mod tests {
         assert_eq!(result.first_failure, Some(1));
         // Both references should be in results
         assert_eq!(result.results.len(), 2);
-        assert!(result.results[0].valid);
-        assert!(!result.results[1].valid);
+        assert!(matches!(result.results[0].status, DsigStatus::Valid));
+        assert!(matches!(
+            result.results[1].status,
+            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 1 })
+        ));
     }
 
     #[test]
@@ -1397,7 +1495,7 @@ mod tests {
 
         let reference = make_reference("", vec![], DigestAlgorithm::Sha1, digest);
         let result = process_reference(&reference, &resolver, doc.root_element(), false).unwrap();
-        assert!(result.valid);
+        assert!(matches!(result.status, DsigStatus::Valid));
         assert_eq!(result.digest_algorithm, DigestAlgorithm::Sha1);
     }
 
@@ -1414,7 +1512,7 @@ mod tests {
 
         let reference = make_reference("", vec![], DigestAlgorithm::Sha512, digest);
         let result = process_reference(&reference, &resolver, doc.root_element(), false).unwrap();
-        assert!(result.valid);
+        assert!(matches!(result.status, DsigStatus::Valid));
         assert_eq!(result.digest_algorithm, DigestAlgorithm::Sha512);
     }
 
@@ -1477,7 +1575,10 @@ mod tests {
 
         // Verify: should pass
         let result = process_reference(&corrected_ref, &resolver, sig_node, true).unwrap();
-        assert!(result.valid, "SAML reference should verify");
+        assert!(
+            matches!(result.status, DsigStatus::Valid),
+            "SAML reference should verify"
+        );
         assert!(result.pre_digest_data.is_some());
 
         // Verify the pre-digest data contains the canonicalized document without Signature
