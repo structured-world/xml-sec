@@ -5,9 +5,7 @@
 
 use std::path::Path;
 
-use xml_sec::xmldsig::{
-    DsigStatus, FailureReason, SignatureVerificationPipelineError, verify_signature_with_pem_key,
-};
+use xml_sec::xmldsig::{DsigError, DsigStatus, FailureReason, verify_signature_with_pem_key};
 
 fn read_fixture(path: &Path) -> String {
     std::fs::read_to_string(path)
@@ -93,12 +91,9 @@ fn strip_xml_declaration(xml: &str) -> &str {
     xml
 }
 
-fn assert_invalid_structure_reason(
-    err: SignatureVerificationPipelineError,
-    expected_reason: &'static str,
-) {
+fn assert_invalid_structure_reason(err: DsigError, expected_reason: &'static str) {
     match err {
-        SignatureVerificationPipelineError::InvalidStructure { reason } => {
+        DsigError::InvalidStructure { reason } => {
             assert_eq!(reason, expected_reason);
         }
         other => panic!("expected InvalidStructure error, got: {other:?}"),
@@ -411,10 +406,7 @@ fn malformed_signature_value_base64_returns_decode_error() {
     let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect_err("malformed SignatureValue base64 must fail decode stage");
 
-    assert!(matches!(
-        err,
-        SignatureVerificationPipelineError::SignatureValueBase64(_)
-    ));
+    assert!(matches!(err, DsigError::SignatureValueBase64(_)));
 }
 
 #[test]
@@ -428,10 +420,7 @@ fn signature_value_with_non_ascii_whitespace_is_rejected() {
     let err = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect_err("non-XML whitespace in SignatureValue must fail base64 decode");
 
-    assert!(matches!(
-        err,
-        SignatureVerificationPipelineError::SignatureValueBase64(_)
-    ));
+    assert!(matches!(err, DsigError::SignatureValueBase64(_)));
 }
 
 #[test]
@@ -494,7 +483,7 @@ fn missing_signed_info_is_reported_as_missing_element() {
         .expect_err("missing SignedInfo must be rejected as missing element");
     assert!(matches!(
         err,
-        SignatureVerificationPipelineError::MissingElement {
+        DsigError::MissingElement {
             element: "SignedInfo"
         }
     ));
@@ -512,7 +501,7 @@ fn non_empty_signature_without_signed_info_is_reported_as_missing_element() {
         .expect_err("non-empty Signature without SignedInfo must be rejected as missing element");
     assert!(matches!(
         err,
-        SignatureVerificationPipelineError::MissingElement {
+        DsigError::MissingElement {
             element: "SignedInfo"
         }
     ));
@@ -531,7 +520,7 @@ fn signature_value_only_without_signed_info_reports_missing_element() {
         .expect_err("Signature without SignedInfo must report missing SignedInfo");
     assert!(matches!(
         err,
-        SignatureVerificationPipelineError::MissingElement {
+        DsigError::MissingElement {
             element: "SignedInfo"
         }
     ));
@@ -552,7 +541,7 @@ fn multiple_signature_elements_are_rejected() {
         .expect_err("documents with multiple Signature elements must be rejected");
     assert!(matches!(
         err,
-        SignatureVerificationPipelineError::InvalidStructure {
+        DsigError::InvalidStructure {
             reason: "Signature must appear exactly once in document",
         }
     ));
