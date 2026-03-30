@@ -135,9 +135,9 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
     let mut skipped = Vec::<String>::new();
 
     for case in cases() {
-        let xml = read_fixture(&root.join(case.xml_path));
         match case.expectation {
             Expectation::ValidWithKey { key_path } => {
+                let xml = read_fixture(&root.join(case.xml_path));
                 let key = read_fixture(&root.join(key_path));
                 match verify_signature_with_pem_key(&xml, &key, false) {
                     Ok(result) if matches!(result.status, DsigStatus::Valid) => {
