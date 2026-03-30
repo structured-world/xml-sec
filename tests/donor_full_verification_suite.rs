@@ -144,7 +144,10 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
                         passed += 1;
                     }
                     Ok(result) => {
-                        failed.push(format!("{}: expected Valid, got {:?}", case.name, result.status));
+                        failed.push(format!(
+                            "{}: expected Valid, got {:?}",
+                            case.name, result.status
+                        ));
                     }
                     Err(err) => {
                         failed.push(format!("{}: verification error {err}", case.name));
