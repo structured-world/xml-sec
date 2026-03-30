@@ -160,8 +160,9 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
         }
     }
 
-    assert!(
-        failed.is_empty(),
+    assert_eq!(
+        failed.len(),
+        0,
         "donor full verification suite had failures:\n{}",
         failed.join("\n")
     );
