@@ -100,35 +100,35 @@ fn cases() -> Vec<VectorCase> {
             name: "merlin-x509-crt",
             xml_path: "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt.xml",
             expectation: Expectation::Skip {
-                reason: "X509 KeyInfo resolution is not implemented yet (planned P2-009)",
+                reason: "DSA signature method is not implemented yet (planned P4-009); X509 KeyInfo resolution is not implemented yet (planned P2-009)",
             },
         },
         VectorCase {
             name: "merlin-x509-crt-crl",
             xml_path: "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt-crl.xml",
             expectation: Expectation::Skip {
-                reason: "X509/CRL KeyInfo resolution is not implemented yet (planned P2-009/P2-005)",
+                reason: "DSA signature method is not implemented yet (planned P4-009); X509/CRL KeyInfo resolution is not implemented yet (planned P2-009/P2-005)",
             },
         },
         VectorCase {
             name: "merlin-x509-is",
             xml_path: "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-is.xml",
             expectation: Expectation::Skip {
-                reason: "X509IssuerSerial resolution is not implemented yet (planned P2-009)",
+                reason: "DSA signature method is not implemented yet (planned P4-009); X509IssuerSerial resolution is not implemented yet (planned P2-009)",
             },
         },
         VectorCase {
             name: "merlin-x509-ski",
             xml_path: "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-ski.xml",
             expectation: Expectation::Skip {
-                reason: "X509SKI resolution is not implemented yet (planned P2-009)",
+                reason: "DSA signature method is not implemented yet (planned P4-009); X509SKI resolution is not implemented yet (planned P2-009)",
             },
         },
         VectorCase {
             name: "merlin-x509-sn",
             xml_path: "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-sn.xml",
             expectation: Expectation::Skip {
-                reason: "X509SubjectName resolution is not implemented yet (planned P2-009)",
+                reason: "DSA signature method is not implemented yet (planned P4-009); X509SubjectName resolution is not implemented yet (planned P2-009)",
             },
         },
     ]
@@ -191,11 +191,11 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
         "aleksey-rsa-sha512-x509-digest: X509Digest key resolution is not implemented yet (planned P2-009)",
         "merlin-enveloped-dsa: DSA signature method is not implemented yet (planned P4-009)",
         "merlin-enveloping-rsa-keyvalue: KeyValue auto-resolution is not implemented yet (planned P2-009)",
-        "merlin-x509-crt: X509 KeyInfo resolution is not implemented yet (planned P2-009)",
-        "merlin-x509-crt-crl: X509/CRL KeyInfo resolution is not implemented yet (planned P2-009/P2-005)",
-        "merlin-x509-is: X509IssuerSerial resolution is not implemented yet (planned P2-009)",
-        "merlin-x509-ski: X509SKI resolution is not implemented yet (planned P2-009)",
-        "merlin-x509-sn: X509SubjectName resolution is not implemented yet (planned P2-009)",
+        "merlin-x509-crt: DSA signature method is not implemented yet (planned P4-009); X509 KeyInfo resolution is not implemented yet (planned P2-009)",
+        "merlin-x509-crt-crl: DSA signature method is not implemented yet (planned P4-009); X509/CRL KeyInfo resolution is not implemented yet (planned P2-009/P2-005)",
+        "merlin-x509-is: DSA signature method is not implemented yet (planned P4-009); X509IssuerSerial resolution is not implemented yet (planned P2-009)",
+        "merlin-x509-ski: DSA signature method is not implemented yet (planned P4-009); X509SKI resolution is not implemented yet (planned P2-009)",
+        "merlin-x509-sn: DSA signature method is not implemented yet (planned P4-009); X509SubjectName resolution is not implemented yet (planned P2-009)",
     ];
 
     // P1-025 minimum expected accounting:
