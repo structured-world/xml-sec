@@ -137,6 +137,7 @@ fn cases() -> Vec<VectorCase> {
 #[test]
 fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
     let root = project_root();
+    let skip_probe_key = read_fixture(&root.join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
     let mut passed = 0usize;
     let mut failed = Vec::<String>::new();
     let mut skipped = Vec::<String>::new();
@@ -162,8 +163,18 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
                 }
             }
             Expectation::Skip { reason } => {
-                // Keep this as a plain call: `let _ = ...` triggers clippy::let_underscore_drop.
-                read_fixture(&root.join(case.xml_path));
+                let xml = read_fixture(&root.join(case.xml_path));
+                roxmltree::Document::parse(&xml)
+                    .unwrap_or_else(|err| panic!("{}: fixture XML must parse: {err}", case.name));
+                if let Ok(result) = verify_signature_with_pem_key(&xml, &skip_probe_key, false)
+                    && matches!(result.status, DsigStatus::Valid)
+                {
+                    failed.push(format!(
+                        "{}: expected non-Valid for skipped vector, got {:?}",
+                        case.name, result.status
+                    ));
+                    continue;
+                }
                 skipped.push(format!("{}: {}", case.name, reason));
             }
         }

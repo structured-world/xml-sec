@@ -1,7 +1,8 @@
 //! Signature verification helpers for XMLDSig.
 //!
 //! This module currently covers roadmap task P1-019 (RSA PKCS#1 v1.5) and
-//! P1-020 (ECDSA P-256/P-384) verification.
+//! P1-020 (ECDSA P-256/P-384) verification, plus donor P-521 interop under
+//! the XMLDSig `ecdsa-sha384` URI.
 //!
 //! Input public keys are accepted in SubjectPublicKeyInfo (SPKI) form because
 //! that is how the vendored PEM fixtures are stored.
