@@ -3,9 +3,11 @@
 //! Implements [XMLDSig §6.1](https://www.w3.org/TR/xmldsig-core1/#sec-DigestMethod):
 //! compute message digests over transform output bytes using SHA-family algorithms.
 //!
-//! All digest computation uses `ring::digest` (no custom implementations).
+//! All digest computation uses RustCrypto hash implementations.
 
-use ring::digest;
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha384, Sha512};
+use subtle::ConstantTimeEq;
 
 /// Digest algorithms supported by XMLDSig.
 ///
@@ -73,24 +75,18 @@ impl DigestAlgorithm {
             Self::Sha512 => 64,
         }
     }
-
-    /// Map to the corresponding `ring::digest` algorithm.
-    fn ring_algorithm(self) -> &'static digest::Algorithm {
-        match self {
-            Self::Sha1 => &digest::SHA1_FOR_LEGACY_USE_ONLY,
-            Self::Sha256 => &digest::SHA256,
-            Self::Sha384 => &digest::SHA384,
-            Self::Sha512 => &digest::SHA512,
-        }
-    }
 }
 
 /// Compute the digest of `data` using the specified algorithm.
 ///
 /// Returns the raw digest bytes (not base64-encoded).
 pub fn compute_digest(algorithm: DigestAlgorithm, data: &[u8]) -> Vec<u8> {
-    let result = digest::digest(algorithm.ring_algorithm(), data);
-    result.as_ref().to_vec()
+    match algorithm {
+        DigestAlgorithm::Sha1 => Sha1::digest(data).to_vec(),
+        DigestAlgorithm::Sha256 => Sha256::digest(data).to_vec(),
+        DigestAlgorithm::Sha384 => Sha384::digest(data).to_vec(),
+        DigestAlgorithm::Sha512 => Sha512::digest(data).to_vec(),
+    }
 }
 
 /// Constant-time comparison of two byte slices.
@@ -100,13 +96,9 @@ pub fn compute_digest(algorithm: DigestAlgorithm, data: &[u8]) -> Vec<u8> {
 /// where they differ — preventing timing side-channel attacks on digest
 /// comparison.
 ///
-/// Uses `ring::constant_time::verify_slices_are_equal` internally.
+/// Uses `subtle` constant-time equality.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    #[expect(
-        deprecated,
-        reason = "legacy ring constant-time helper is still used here"
-    )]
-    ring::constant_time::verify_slices_are_equal(a, b).is_ok()
+    a.ct_eq(b).into()
 }
 
 #[cfg(test)]

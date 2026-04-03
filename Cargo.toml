@@ -17,7 +17,14 @@ readme = "README.md"
 roxmltree = { version = "0.21", features = ["positions"] }
 
 # Crypto
-ring = "0.17"
+rsa = "0.9"
+sha1 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+p521 = { version = "0.13", features = ["ecdsa"] }
+signature = "2"
+subtle = "2"
 
 # X.509 certificates
 x509-parser = "0.18"

@@ -69,8 +69,8 @@ fn cases() -> Vec<VectorCase> {
         VectorCase {
             name: "aleksey-ecdsa-p521-sha384",
             xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha384-ecdsa-sha384.xml",
-            expectation: Expectation::Skip {
-                reason: "vector uses KeyName ec-prime521v1 (P-521), which is not supported yet",
+            expectation: Expectation::ValidWithKey {
+                key_path: "tests/fixtures/keys/ec/ec-prime521v1-pubkey.pem",
             },
         },
         VectorCase {
@@ -175,9 +175,20 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
         failed.join("\n")
     );
 
+    let expected_skipped = vec![
+        "aleksey-rsa-sha512-x509-digest: X509Digest key resolution is not implemented yet (planned P2-009)",
+        "merlin-enveloped-dsa: DSA signature method is not implemented yet (planned P4-009)",
+        "merlin-enveloping-rsa-keyvalue: KeyValue auto-resolution is not implemented yet (planned P2-009)",
+        "merlin-x509-crt: X509 KeyInfo resolution is not implemented yet (planned P2-009)",
+        "merlin-x509-crt-crl: X509/CRL KeyInfo resolution is not implemented yet (planned P2-009/P2-005)",
+        "merlin-x509-is: X509IssuerSerial resolution is not implemented yet (planned P2-009)",
+        "merlin-x509-ski: X509SKI resolution is not implemented yet (planned P2-009)",
+        "merlin-x509-sn: X509SubjectName resolution is not implemented yet (planned P2-009)",
+    ];
+
     // P1-025 minimum expected accounting:
     // - all supported aleksey RSA/ECDSA vectors pass
     // - unsupported/deferred merlin vectors are tracked as skips with explicit reasons
-    assert_eq!(passed, 5, "unexpected pass count");
-    assert_eq!(skipped.len(), 9, "unexpected skip count");
+    assert_eq!(passed, 6, "unexpected pass count");
+    assert_eq!(skipped, expected_skipped, "unexpected skip inventory");
 }
