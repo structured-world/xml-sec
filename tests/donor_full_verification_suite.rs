@@ -1,7 +1,7 @@
 //! Donor full verification suite for ROADMAP task P1-025.
 //!
 //! This suite tracks pass/fail/skip accounting across donor vectors and
-//! enforces that all currently supported algorithms verify end-to-end.
+//! enforces that all supported donor vectors verify end-to-end.
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +15,7 @@ enum Expectation {
 
 struct VectorCase {
     name: &'static str,
-    xml_path: &'static str,
+    xml_path: Option<&'static str>,
     expectation: Expectation,
 }
 
@@ -33,42 +33,50 @@ fn cases() -> Vec<VectorCase> {
         // Aleksey donor vectors: supported algorithms must pass end-to-end.
         VectorCase {
             name: "aleksey-rsa-sha1",
-            xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha1-rsa-sha1.xml",
+            xml_path: Some("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha1-rsa-sha1.xml"),
             expectation: Expectation::ValidWithKey {
                 key_path: "tests/fixtures/keys/rsa/rsa-4096-pubkey.pem",
             },
         },
         VectorCase {
             name: "aleksey-rsa-sha256",
-            xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+            xml_path: Some(
+                "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+            ),
             expectation: Expectation::ValidWithKey {
                 key_path: "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem",
             },
         },
         VectorCase {
             name: "aleksey-rsa-sha384",
-            xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha384-rsa-sha384.xml",
+            xml_path: Some(
+                "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha384-rsa-sha384.xml",
+            ),
             expectation: Expectation::ValidWithKey {
                 key_path: "tests/fixtures/keys/rsa/rsa-4096-pubkey.pem",
             },
         },
         VectorCase {
             name: "aleksey-rsa-sha512",
-            xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha512-rsa-sha512.xml",
+            xml_path: Some(
+                "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha512-rsa-sha512.xml",
+            ),
             expectation: Expectation::ValidWithKey {
                 key_path: "tests/fixtures/keys/rsa/rsa-4096-pubkey.pem",
             },
         },
         VectorCase {
             name: "aleksey-ecdsa-p256-sha256",
-            xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
+            xml_path: Some(
+                "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
+            ),
             expectation: Expectation::ValidWithKey {
                 key_path: "tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem",
             },
         },
         VectorCase {
-            name: "aleksey-ecdsa-p384-sha384",
-            xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha384-ecdsa-sha384.xml",
+            name: "aleksey-ecdsa-p521-sha384",
+            xml_path: None,
             expectation: Expectation::Skip {
                 reason: "vector uses KeyName ec-prime521v1 (P-521), which is not supported yet",
             },
@@ -77,49 +85,49 @@ fn cases() -> Vec<VectorCase> {
         // These are tracked explicitly as skips until P2/P4 capabilities exist.
         VectorCase {
             name: "merlin-enveloped-dsa",
-            xml_path: "donors/xmlsec/tests/merlin-xmldsig-twenty-three/signature-enveloped-dsa.xml",
+            xml_path: None,
             expectation: Expectation::Skip {
                 reason: "DSA signature method is not implemented yet (planned P4-009)",
             },
         },
         VectorCase {
             name: "merlin-enveloping-rsa-keyvalue",
-            xml_path: "donors/xmlsec/tests/merlin-xmldsig-twenty-three/signature-enveloping-rsa.xml",
+            xml_path: None,
             expectation: Expectation::Skip {
                 reason: "KeyValue auto-resolution is not implemented yet (planned P2-009)",
             },
         },
         VectorCase {
             name: "merlin-x509-crt",
-            xml_path: "donors/xmlsec/tests/merlin-xmldsig-twenty-three/signature-x509-crt.xml",
+            xml_path: None,
             expectation: Expectation::Skip {
                 reason: "X509 KeyInfo resolution is not implemented yet (planned P2-009)",
             },
         },
         VectorCase {
             name: "merlin-x509-crt-crl",
-            xml_path: "donors/xmlsec/tests/merlin-xmldsig-twenty-three/signature-x509-crt-crl.xml",
+            xml_path: None,
             expectation: Expectation::Skip {
                 reason: "X509/CRL KeyInfo resolution is not implemented yet (planned P2-009/P2-005)",
             },
         },
         VectorCase {
             name: "merlin-x509-is",
-            xml_path: "donors/xmlsec/tests/merlin-xmldsig-twenty-three/signature-x509-is.xml",
+            xml_path: None,
             expectation: Expectation::Skip {
                 reason: "X509IssuerSerial resolution is not implemented yet (planned P2-009)",
             },
         },
         VectorCase {
             name: "merlin-x509-ski",
-            xml_path: "donors/xmlsec/tests/merlin-xmldsig-twenty-three/signature-x509-ski.xml",
+            xml_path: None,
             expectation: Expectation::Skip {
                 reason: "X509SKI resolution is not implemented yet (planned P2-009)",
             },
         },
         VectorCase {
             name: "merlin-x509-sn",
-            xml_path: "donors/xmlsec/tests/merlin-xmldsig-twenty-three/signature-x509-sn.xml",
+            xml_path: None,
             expectation: Expectation::Skip {
                 reason: "X509SubjectName resolution is not implemented yet (planned P2-009)",
             },
@@ -137,7 +145,10 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
     for case in cases() {
         match case.expectation {
             Expectation::ValidWithKey { key_path } => {
-                let xml = read_fixture(&root.join(case.xml_path));
+                let xml_path = case
+                    .xml_path
+                    .expect("ValidWithKey vectors must provide xml_path");
+                let xml = read_fixture(&root.join(xml_path));
                 let key = read_fixture(&root.join(key_path));
                 match verify_signature_with_pem_key(&xml, &key, false) {
                     Ok(result) if matches!(result.status, DsigStatus::Valid) => {
