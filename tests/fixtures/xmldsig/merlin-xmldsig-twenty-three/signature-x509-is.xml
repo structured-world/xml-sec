@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<fixture name="signature-x509-is" suite="merlin-xmldsig-twenty-three">
+  <note>Presence marker for deferred donor vector coverage.</note>
+</fixture>

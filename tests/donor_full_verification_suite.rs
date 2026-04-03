@@ -76,7 +76,9 @@ fn cases() -> Vec<VectorCase> {
         },
         VectorCase {
             name: "aleksey-ecdsa-p521-sha384",
-            xml_path: None,
+            xml_path: Some(
+                "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha384-ecdsa-sha384.xml",
+            ),
             expectation: Expectation::Skip {
                 reason: "vector uses KeyName ec-prime521v1 (P-521), which is not supported yet",
             },
@@ -85,49 +87,63 @@ fn cases() -> Vec<VectorCase> {
         // These are tracked explicitly as skips until P2/P4 capabilities exist.
         VectorCase {
             name: "merlin-enveloped-dsa",
-            xml_path: None,
+            xml_path: Some(
+                "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloped-dsa.xml",
+            ),
             expectation: Expectation::Skip {
                 reason: "DSA signature method is not implemented yet (planned P4-009)",
             },
         },
         VectorCase {
             name: "merlin-enveloping-rsa-keyvalue",
-            xml_path: None,
+            xml_path: Some(
+                "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-rsa.xml",
+            ),
             expectation: Expectation::Skip {
                 reason: "KeyValue auto-resolution is not implemented yet (planned P2-009)",
             },
         },
         VectorCase {
             name: "merlin-x509-crt",
-            xml_path: None,
+            xml_path: Some(
+                "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt.xml",
+            ),
             expectation: Expectation::Skip {
                 reason: "X509 KeyInfo resolution is not implemented yet (planned P2-009)",
             },
         },
         VectorCase {
             name: "merlin-x509-crt-crl",
-            xml_path: None,
+            xml_path: Some(
+                "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt-crl.xml",
+            ),
             expectation: Expectation::Skip {
                 reason: "X509/CRL KeyInfo resolution is not implemented yet (planned P2-009/P2-005)",
             },
         },
         VectorCase {
             name: "merlin-x509-is",
-            xml_path: None,
+            xml_path: Some(
+                "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-is.xml",
+            ),
             expectation: Expectation::Skip {
                 reason: "X509IssuerSerial resolution is not implemented yet (planned P2-009)",
             },
         },
         VectorCase {
             name: "merlin-x509-ski",
-            xml_path: None,
+            xml_path: Some(
+                "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-ski.xml",
+            ),
             expectation: Expectation::Skip {
                 reason: "X509SKI resolution is not implemented yet (planned P2-009)",
             },
         },
         VectorCase {
             name: "merlin-x509-sn",
-            xml_path: None,
+            xml_path: Some(
+                "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-sn.xml",
+            ),
             expectation: Expectation::Skip {
                 reason: "X509SubjectName resolution is not implemented yet (planned P2-009)",
             },
@@ -166,6 +182,8 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
                 }
             }
             Expectation::Skip { reason } => {
+                let xml_path = case.xml_path.expect("Skip vectors must provide xml_path");
+                let _ = read_fixture(&root.join(xml_path));
                 skipped.push(format!("{}: {}", case.name, reason));
             }
         }
