@@ -4,10 +4,11 @@
 //! P1-020 (ECDSA P-256/P-384) verification.
 //!
 //! Input public keys are accepted in SubjectPublicKeyInfo (SPKI) form because
-//! that is how the vendored PEM fixtures are stored. `ring` expects the inner
-//! SPKI payload for both algorithm families:
-//! - RSA: ASN.1 `RSAPublicKey`
-//! - ECDSA: uncompressed SEC1 EC point bytes from the SPKI bit string
+//! that is how the vendored PEM fixtures are stored.
+//! - RSA keys are parsed from full SPKI DER (`PUBLIC KEY`) and verified via
+//!   RustCrypto `rsa::pkcs1v15`.
+//! - ECDSA keys are validated as uncompressed SEC1 points from the SPKI bit
+//!   string and verified with RustCrypto curve crates (`p256`/`p384`/`p521`).
 
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
@@ -330,7 +331,11 @@ fn ecdsa_curve_and_component_len(
         SignatureAlgorithm::EcdsaP384Sha384 => {
             if curve_oid == "1.3.132.0.34" && point_len == 384 {
                 Ok((EcCurve::P384, 48))
-            } else if curve_oid == "1.3.132.0.35" {
+            // XMLDSig `ecdsa-sha384` identifies the digest/signature method URI,
+            // not a single curve. For interop we accept secp521r1 donor vectors;
+            // x509-parser reports ECPoint::key_size() as byte-aligned bits (528)
+            // for P-521 uncompressed points, so allow both exact and aligned size.
+            } else if curve_oid == "1.3.132.0.35" && matches!(point_len, 521 | 528) {
                 Ok((EcCurve::P521, 66))
             } else {
                 Err(SignatureVerificationError::KeyAlgorithmMismatch {

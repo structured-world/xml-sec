@@ -162,15 +162,14 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
                 }
             }
             Expectation::Skip { reason } => {
-                let _ = read_fixture(&root.join(case.xml_path));
+                read_fixture(&root.join(case.xml_path));
                 skipped.push(format!("{}: {}", case.name, reason));
             }
         }
     }
 
-    assert_eq!(
-        failed.len(),
-        0,
+    assert!(
+        failed.is_empty(),
         "donor full verification suite had failures:\n{}",
         failed.join("\n")
     );
