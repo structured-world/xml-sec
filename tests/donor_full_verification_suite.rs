@@ -73,6 +73,13 @@ fn cases() -> Vec<VectorCase> {
                 reason: "vector uses KeyName ec-prime521v1 (P-521), which is not supported yet",
             },
         },
+        VectorCase {
+            name: "aleksey-rsa-sha512-x509-digest",
+            xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-x509-digest-sha512.xml",
+            expectation: Expectation::Skip {
+                reason: "X509Digest key resolution is not implemented yet (planned P2-009)",
+            },
+        },
         // Merlin "basic signatures" required by P1-025.
         // These are tracked explicitly as skips until P2/P4 capabilities exist.
         VectorCase {
@@ -172,5 +179,5 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
     // - all supported aleksey RSA/ECDSA vectors pass
     // - unsupported/deferred merlin vectors are tracked as skips with explicit reasons
     assert_eq!(passed, 5, "unexpected pass count");
-    assert_eq!(skipped.len(), 8, "unexpected skip count");
+    assert_eq!(skipped.len(), 9, "unexpected skip count");
 }
