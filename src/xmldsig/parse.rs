@@ -40,9 +40,10 @@ pub enum SignatureAlgorithm {
     EcdsaP256Sha256,
     /// XMLDSig `ecdsa-sha384` URI.
     ///
-    /// The variant name is historical; verification may allow multiple curves
-    /// for this URI in interop mode (for example P-384 and specific donor
-    /// P-521 fixtures).
+    /// The variant name is historical.
+    ///
+    /// Verification currently accepts this XMLDSig URI for P-384 and for the
+    /// donor P-521 interop case.
     EcdsaP384Sha384,
 }
 

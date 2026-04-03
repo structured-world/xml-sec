@@ -179,7 +179,9 @@ pub fn verify_rsa_signature_spki(
 
             Ok(verified)
         }
-        _ => Err(SignatureVerificationError::InvalidKeyDer),
+        _ => Err(SignatureVerificationError::KeyAlgorithmMismatch {
+            uri: algorithm.uri().to_string(),
+        }),
     }
 }
 
