@@ -134,7 +134,6 @@ pub fn verify_rsa_signature_spki(
     signed_data: &[u8],
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
-    minimum_rsa_modulus_bits(algorithm)?;
     let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
     if !rest.is_empty() {
