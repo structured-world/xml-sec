@@ -162,6 +162,7 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
                 }
             }
             Expectation::Skip { reason } => {
+                // Keep this as a plain call: `let _ = ...` triggers clippy::let_underscore_drop.
                 read_fixture(&root.join(case.xml_path));
                 skipped.push(format!("{}: {}", case.name, reason));
             }
