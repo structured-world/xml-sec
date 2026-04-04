@@ -6,7 +6,7 @@
 use xml_sec::xmldsig::{DsigStatus, FailureReason, verify_signature_with_pem_key};
 
 const IDP_RESPONSE_SIGNED_XML: &str =
-    include_str!("../donors/samael/test_vectors/response_signed_by_idp_ecdsa.xml");
+    include_str!("fixtures/saml/response_signed_by_idp_ecdsa.xml");
 
 const IDP_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----
 MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEyjU9gkG4ffc3WwyLF2Q4lmRlMmnw
@@ -37,7 +37,17 @@ fn real_saml_idp_response_signature_is_valid() {
 
 #[test]
 fn real_saml_idp_response_detects_reference_tampering() {
+    assert!(
+        IDP_RESPONSE_SIGNED_XML.contains("test@example.com"),
+        "fixture must contain the signed value being tampered with"
+    );
+
     let tampered = IDP_RESPONSE_SIGNED_XML.replacen("test@example.com", "tampered@example.com", 1);
+
+    assert_ne!(
+        tampered, IDP_RESPONSE_SIGNED_XML,
+        "tampering must change the XML so this test exercises reference digest validation"
+    );
 
     let result = verify_signature_with_pem_key(&tampered, IDP_PUBLIC_KEY_PEM, false)
         .expect("pipeline should complete with Invalid status on tampering");
