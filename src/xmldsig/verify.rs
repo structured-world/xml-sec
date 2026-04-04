@@ -707,7 +707,26 @@ fn process_manifest_references(
                 ));
                 continue;
             }
+            Err(SignatureVerificationPipelineError::Reference(
+                ReferenceProcessingError::MissingUri,
+            )) => {
+                tracing::debug!(
+                    reference_set = "manifest",
+                    reference_index = index,
+                    failure_reason = ?FailureReason::ReferenceProcessingFailure { ref_index: index },
+                    uri = ?reference.uri,
+                    "manifest reference missing URI during policy precheck"
+                );
+                results.push(manifest_reference_invalid_result(
+                    reference,
+                    index,
+                    FailureReason::ReferenceProcessingFailure { ref_index: index },
+                ));
+                continue;
+            }
             Err(err) => {
+                // Defensive fallback for future enforce_reference_policies variants:
+                // record as non-fatal per-reference processing failure instead of aborting.
                 tracing::debug!(
                     reference_set = "manifest",
                     reference_index = index,
@@ -786,13 +805,24 @@ fn parse_manifest_references(
                 && node.tag_name().namespace() == Some(XMLDSIG_NS)
                 && node.tag_name().name() == "Manifest"
         }) {
-            let manifest_children: Vec<_> = manifest_node
-                .children()
-                .filter(|node| node.is_element())
-                .collect();
+            let mut manifest_children = Vec::new();
+            for child in manifest_node.children() {
+                if child.is_text()
+                    && child.text().is_some_and(|text| {
+                        text.chars().any(|c| !matches!(c, ' ' | '\t' | '\n' | '\r'))
+                    })
+                {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "Manifest contains non-whitespace mixed content",
+                    });
+                }
+                if child.is_element() {
+                    manifest_children.push(child);
+                }
+            }
             if manifest_children.is_empty() {
-                return Err(SignatureVerificationPipelineError::MissingElement {
-                    element: "Reference",
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "Manifest must contain at least one ds:Reference element child",
                 });
             }
             for child in manifest_children {
@@ -1533,6 +1563,48 @@ mod tests {
         assert!(matches!(
             err,
             SignatureVerificationPipelineError::ParseManifestReference(_)
+        ));
+    }
+
+    #[test]
+    fn verify_context_rejects_manifest_non_whitespace_mixed_content() {
+        let xml =
+            signature_with_manifest_xml(true).replacen("<ds:Manifest>", "<ds:Manifest>junk", 1);
+
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(true)
+            .verify(&xml)
+            .expect_err("Manifest mixed content must fail verification");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Manifest contains non-whitespace mixed content"
+            }
+        ));
+    }
+
+    #[test]
+    fn verify_context_rejects_empty_manifest_children() {
+        let xml = signature_with_manifest_xml(true);
+        let (prefix, rest) = xml
+            .split_once("<ds:Manifest>")
+            .expect("fixture should contain Manifest");
+        let (_, suffix) = rest
+            .split_once("</ds:Manifest>")
+            .expect("fixture should contain closing Manifest");
+        let xml = format!("{prefix}<ds:Manifest></ds:Manifest>{suffix}");
+
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(true)
+            .verify(&xml)
+            .expect_err("empty Manifest must fail verification");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Manifest must contain at least one ds:Reference element child"
+            }
         ));
     }
 
