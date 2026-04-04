@@ -682,26 +682,47 @@ fn process_manifest_references(
     }
     let mut results = Vec::with_capacity(manifest_references.len());
     for (index, reference) in manifest_references.iter().enumerate() {
-        if enforce_reference_policies(
+        match enforce_reference_policies(
             std::slice::from_ref(reference),
             ctx.allowed_uri_types,
             ctx.allowed_transform_uris(),
-        )
-        .is_err()
-        {
-            tracing::debug!(
-                reference_set = "manifest",
-                reference_index = index,
-                failure_reason = ?FailureReason::ReferencePolicyViolation { ref_index: index },
-                uri = ?reference.uri,
-                "manifest reference policy rejected"
-            );
-            results.push(manifest_reference_invalid_result(
-                reference,
-                index,
-                FailureReason::ReferencePolicyViolation { ref_index: index },
-            ));
-            continue;
+        ) {
+            Ok(()) => {}
+            Err(
+                err @ (SignatureVerificationPipelineError::DisallowedUri { .. }
+                | SignatureVerificationPipelineError::DisallowedTransform { .. }),
+            ) => {
+                tracing::debug!(
+                    reference_set = "manifest",
+                    reference_index = index,
+                    failure_reason = ?FailureReason::ReferencePolicyViolation { ref_index: index },
+                    uri = ?reference.uri,
+                    error = %err,
+                    "manifest reference policy rejected"
+                );
+                results.push(manifest_reference_invalid_result(
+                    reference,
+                    index,
+                    FailureReason::ReferencePolicyViolation { ref_index: index },
+                ));
+                continue;
+            }
+            Err(err) => {
+                tracing::debug!(
+                    reference_set = "manifest",
+                    reference_index = index,
+                    failure_reason = ?FailureReason::ReferenceProcessingFailure { ref_index: index },
+                    uri = ?reference.uri,
+                    error = %err,
+                    "manifest reference policy precheck failed as processing error"
+                );
+                results.push(manifest_reference_invalid_result(
+                    reference,
+                    index,
+                    FailureReason::ReferenceProcessingFailure { ref_index: index },
+                ));
+                continue;
+            }
         }
 
         match process_reference(
@@ -741,7 +762,10 @@ fn manifest_reference_invalid_result(
     ReferenceResult {
         reference_set: ReferenceSet::Manifest,
         reference_index: index,
-        uri: reference.uri.clone().unwrap_or_default(),
+        uri: reference
+            .uri
+            .clone()
+            .unwrap_or_else(|| "<omitted>".to_owned()),
         digest_algorithm: reference.digest_method,
         status: DsigStatus::Invalid(reason),
         pre_digest_data: None,
@@ -1415,6 +1439,32 @@ mod tests {
         assert!(matches!(
             result.manifest_references[0].status,
             DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
+        ));
+    }
+
+    #[test]
+    fn verify_context_records_manifest_missing_uri_as_processing_failure() {
+        let xml = signature_with_manifest_xml(true);
+        let (prefix, object_suffix) = xml
+            .split_once("<ds:Object>")
+            .expect("fixture should contain ds:Object");
+        let mutated_object_suffix = object_suffix.replacen(
+            "<ds:Reference URI=\"#target\">",
+            "<ds:Reference>",
+            1,
+        );
+        let broken_xml = format!("{prefix}<ds:Object>{mutated_object_suffix}");
+
+        let result = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(true)
+            .verify(&broken_xml)
+            .expect("manifest missing URI should be recorded as non-fatal processing failure");
+        assert_eq!(result.manifest_references.len(), 1);
+        assert_eq!(result.manifest_references[0].uri, "<omitted>");
+        assert!(matches!(
+            result.manifest_references[0].status,
+            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
         ));
     }
 
