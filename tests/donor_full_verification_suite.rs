@@ -5,12 +5,25 @@
 
 use std::path::{Path, PathBuf};
 
-use xml_sec::xmldsig::{DsigStatus, verify_signature_with_pem_key};
+use xml_sec::xmldsig::{
+    DsigError, DsigStatus, FailureReason, ParseError, VerifyContext, verify_signature_with_pem_key,
+};
+
+#[derive(Clone, Copy)]
+enum SkipProbe {
+    KeyNotFound,
+    UnsupportedSignatureAlgorithm,
+}
 
 #[derive(Clone, Copy)]
 enum Expectation {
-    ValidWithKey { key_path: &'static str },
-    Skip { reason: &'static str },
+    ValidWithKey {
+        key_path: &'static str,
+    },
+    Skip {
+        reason: &'static str,
+        probe: SkipProbe,
+    },
 }
 
 struct VectorCase {
@@ -78,6 +91,7 @@ fn cases() -> Vec<VectorCase> {
             xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-x509-digest-sha512.xml",
             expectation: Expectation::Skip {
                 reason: "X509Digest key resolution is not implemented yet (planned P2-009)",
+                probe: SkipProbe::KeyNotFound,
             },
         },
         // Merlin "basic signatures" required by P1-025.
@@ -87,6 +101,7 @@ fn cases() -> Vec<VectorCase> {
             xml_path: "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloped-dsa.xml",
             expectation: Expectation::Skip {
                 reason: "DSA signature method is not implemented yet (planned P4-009)",
+                probe: SkipProbe::UnsupportedSignatureAlgorithm,
             },
         },
         VectorCase {
@@ -94,6 +109,7 @@ fn cases() -> Vec<VectorCase> {
             xml_path: "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-rsa.xml",
             expectation: Expectation::Skip {
                 reason: "KeyValue auto-resolution is not implemented yet (planned P2-009)",
+                probe: SkipProbe::KeyNotFound,
             },
         },
         VectorCase {
@@ -101,6 +117,7 @@ fn cases() -> Vec<VectorCase> {
             xml_path: "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt.xml",
             expectation: Expectation::Skip {
                 reason: "DSA signature method is not implemented yet (planned P4-009); X509 KeyInfo resolution is not implemented yet (planned P2-009)",
+                probe: SkipProbe::UnsupportedSignatureAlgorithm,
             },
         },
         VectorCase {
@@ -108,6 +125,7 @@ fn cases() -> Vec<VectorCase> {
             xml_path: "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt-crl.xml",
             expectation: Expectation::Skip {
                 reason: "DSA signature method is not implemented yet (planned P4-009); X509/CRL KeyInfo resolution is not implemented yet (planned P2-009/P2-005)",
+                probe: SkipProbe::UnsupportedSignatureAlgorithm,
             },
         },
         VectorCase {
@@ -115,6 +133,7 @@ fn cases() -> Vec<VectorCase> {
             xml_path: "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-is.xml",
             expectation: Expectation::Skip {
                 reason: "DSA signature method is not implemented yet (planned P4-009); X509IssuerSerial resolution is not implemented yet (planned P2-009)",
+                probe: SkipProbe::UnsupportedSignatureAlgorithm,
             },
         },
         VectorCase {
@@ -122,6 +141,7 @@ fn cases() -> Vec<VectorCase> {
             xml_path: "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-ski.xml",
             expectation: Expectation::Skip {
                 reason: "DSA signature method is not implemented yet (planned P4-009); X509SKI resolution is not implemented yet (planned P2-009)",
+                probe: SkipProbe::UnsupportedSignatureAlgorithm,
             },
         },
         VectorCase {
@@ -129,6 +149,7 @@ fn cases() -> Vec<VectorCase> {
             xml_path: "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-sn.xml",
             expectation: Expectation::Skip {
                 reason: "DSA signature method is not implemented yet (planned P4-009); X509SubjectName resolution is not implemented yet (planned P2-009)",
+                probe: SkipProbe::UnsupportedSignatureAlgorithm,
             },
         },
     ]
@@ -137,7 +158,6 @@ fn cases() -> Vec<VectorCase> {
 #[test]
 fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
     let root = project_root();
-    let skip_probe_key = read_fixture(&root.join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"));
     let mut passed = 0usize;
     let mut failed = Vec::<String>::new();
     let mut skipped = Vec::<String>::new();
@@ -162,18 +182,40 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
                     }
                 }
             }
-            Expectation::Skip { reason } => {
+            Expectation::Skip { reason, probe } => {
                 let xml = read_fixture(&root.join(case.xml_path));
                 roxmltree::Document::parse(&xml)
                     .unwrap_or_else(|err| panic!("{}: fixture XML must parse: {err}", case.name));
-                if let Ok(result) = verify_signature_with_pem_key(&xml, &skip_probe_key, false)
-                    && matches!(result.status, DsigStatus::Valid)
-                {
-                    failed.push(format!(
-                        "{}: expected non-Valid for skipped vector, got {:?}",
-                        case.name, result.status
-                    ));
-                    continue;
+                match probe {
+                    SkipProbe::KeyNotFound => match VerifyContext::new().verify(&xml) {
+                        Ok(result)
+                            if matches!(
+                                result.status,
+                                DsigStatus::Invalid(FailureReason::KeyNotFound)
+                            ) => {}
+                        Ok(result) => failed.push(format!(
+                            "{}: expected Invalid(KeyNotFound) for skipped vector, got {:?}",
+                            case.name, result.status
+                        )),
+                        Err(err) => failed.push(format!(
+                            "{}: expected Invalid(KeyNotFound) for skipped vector, got error {err}",
+                            case.name
+                        )),
+                    },
+                    SkipProbe::UnsupportedSignatureAlgorithm => match VerifyContext::new().verify(&xml)
+                    {
+                        Err(DsigError::ParseSignedInfo(ParseError::UnsupportedAlgorithm {
+                            ..
+                        })) => {}
+                        Ok(result) => failed.push(format!(
+                            "{}: expected unsupported signature algorithm error for skipped vector, got {:?}",
+                            case.name, result.status
+                        )),
+                        Err(err) => failed.push(format!(
+                            "{}: expected unsupported signature algorithm error for skipped vector, got {err}",
+                            case.name
+                        )),
+                    },
                 }
                 skipped.push(format!("{}: {}", case.name, reason));
             }
