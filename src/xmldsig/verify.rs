@@ -162,10 +162,14 @@ impl<'a> VerifyContext<'a> {
     /// When enabled, references under `<ds:Object><ds:Manifest>` are processed
     /// and returned in `VerifyResult::manifest_references`.
     ///
-    /// Manifest reference policy violations and processing failures are
-    /// reported as per-reference statuses and do not alter the final
-    /// `VerifyResult::status` (non-fatal semantics). Structural/parse errors
-    /// in Manifest content abort `verify()` and are returned as `Err(...)`.
+    /// Manifest reference digest mismatches, policy violations, and processing
+    /// failures are reported in `VerifyResult::manifest_references` and do not
+    /// alter the final `VerifyResult::status`.
+    /// Callers that enable `process_manifests(true)` must inspect
+    /// `VerifyResult::manifest_references` in addition to `VerifyResult::status`
+    /// when interpreting `verify()` results.
+    /// Structural/parse errors in Manifest content abort `verify()` and are
+    /// returned as `Err(...)`.
     pub fn process_manifests(mut self, enabled: bool) -> Self {
         self.process_manifests = enabled;
         self
@@ -689,17 +693,9 @@ fn process_manifest_references(
         ) {
             Ok(()) => {}
             Err(
-                err @ (SignatureVerificationPipelineError::DisallowedUri { .. }
-                | SignatureVerificationPipelineError::DisallowedTransform { .. }),
+                SignatureVerificationPipelineError::DisallowedUri { .. }
+                | SignatureVerificationPipelineError::DisallowedTransform { .. },
             ) => {
-                tracing::debug!(
-                    reference_set = "manifest",
-                    reference_index = index,
-                    failure_reason = ?FailureReason::ReferencePolicyViolation { ref_index: index },
-                    uri = ?reference.uri,
-                    error = %err,
-                    "manifest reference policy rejected"
-                );
                 results.push(manifest_reference_invalid_result(
                     reference,
                     index,
@@ -710,13 +706,6 @@ fn process_manifest_references(
             Err(SignatureVerificationPipelineError::Reference(
                 ReferenceProcessingError::MissingUri,
             )) => {
-                tracing::debug!(
-                    reference_set = "manifest",
-                    reference_index = index,
-                    failure_reason = ?FailureReason::ReferenceProcessingFailure { ref_index: index },
-                    uri = ?reference.uri,
-                    "manifest reference missing URI during policy precheck"
-                );
                 results.push(manifest_reference_invalid_result(
                     reference,
                     index,
@@ -724,17 +713,9 @@ fn process_manifest_references(
                 ));
                 continue;
             }
-            Err(err) => {
+            Err(_) => {
                 // Defensive fallback for future enforce_reference_policies variants:
                 // record as non-fatal per-reference processing failure instead of aborting.
-                tracing::debug!(
-                    reference_set = "manifest",
-                    reference_index = index,
-                    failure_reason = ?FailureReason::ReferenceProcessingFailure { ref_index: index },
-                    uri = ?reference.uri,
-                    error = %err,
-                    "manifest reference policy precheck failed as processing error"
-                );
                 results.push(manifest_reference_invalid_result(
                     reference,
                     index,
@@ -753,21 +734,11 @@ fn process_manifest_references(
             ctx.store_pre_digest,
         ) {
             Ok(result) => results.push(result),
-            Err(err) => {
-                tracing::debug!(
-                    reference_set = "manifest",
-                    reference_index = index,
-                    failure_reason = ?FailureReason::ReferenceProcessingFailure { ref_index: index },
-                    uri = ?reference.uri,
-                    error = %err,
-                    "manifest reference processing failed"
-                );
-                results.push(manifest_reference_invalid_result(
-                    reference,
-                    index,
-                    FailureReason::ReferenceProcessingFailure { ref_index: index },
-                ))
-            }
+            Err(_) => results.push(manifest_reference_invalid_result(
+                reference,
+                index,
+                FailureReason::ReferenceProcessingFailure { ref_index: index },
+            )),
         }
     }
     Ok(results)
@@ -1125,6 +1096,19 @@ mod tests {
         }
     }
 
+    struct AcceptingKey;
+
+    impl VerifyingKey for AcceptingKey {
+        fn verify(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _signed_data: &[u8],
+            _signature_value: &[u8],
+        ) -> Result<bool, SignatureVerificationPipelineError> {
+            Ok(true)
+        }
+    }
+
     struct PanicResolver;
 
     impl KeyResolver for PanicResolver {
@@ -1424,6 +1408,22 @@ mod tests {
     }
 
     #[test]
+    fn verify_context_manifest_digest_mismatch_is_non_fatal_with_accepting_key() {
+        let xml = signature_with_manifest_xml(false);
+        let result = VerifyContext::new()
+            .key(&AcceptingKey)
+            .process_manifests(true)
+            .verify(&xml)
+            .expect("manifest digest mismatches should be recorded while signature stays valid");
+        assert_eq!(result.manifest_references.len(), 1);
+        assert!(matches!(
+            result.manifest_references[0].status,
+            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+        ));
+        assert!(matches!(result.status, DsigStatus::Valid));
+    }
+
+    #[test]
     fn verify_context_keeps_manifest_results_when_signedinfo_reference_fails() {
         let xml = signature_with_manifest_xml(true);
         let (signed_info_prefix, object_suffix) = xml
@@ -1488,6 +1488,28 @@ mod tests {
     }
 
     #[test]
+    fn verify_context_records_manifest_policy_violations_with_accepting_key() {
+        let xml = signature_with_manifest_xml(true);
+        let (prefix, object_suffix) = xml
+            .split_once("<ds:Object>")
+            .expect("fixture should contain ds:Object");
+        let mutated_object_suffix =
+            object_suffix.replacen("URI=\"#target\"", "URI=\"http://example.com/external\"", 1);
+        let broken_xml = format!("{prefix}<ds:Object>{mutated_object_suffix}");
+        let result = VerifyContext::new()
+            .key(&AcceptingKey)
+            .process_manifests(true)
+            .verify(&broken_xml)
+            .expect("manifest policy violations should be recorded while signature stays valid");
+        assert_eq!(result.manifest_references.len(), 1);
+        assert!(matches!(
+            result.manifest_references[0].status,
+            DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
+        ));
+        assert!(matches!(result.status, DsigStatus::Valid));
+    }
+
+    #[test]
     fn verify_context_records_manifest_missing_uri_as_processing_failure() {
         let xml = signature_with_manifest_xml(true);
         let (prefix, object_suffix) = xml
@@ -1512,6 +1534,30 @@ mod tests {
             result.status,
             DsigStatus::Invalid(FailureReason::SignatureMismatch)
         ));
+    }
+
+    #[test]
+    fn verify_context_records_manifest_missing_uri_with_accepting_key() {
+        let xml = signature_with_manifest_xml(true);
+        let (prefix, object_suffix) = xml
+            .split_once("<ds:Object>")
+            .expect("fixture should contain ds:Object");
+        let mutated_object_suffix =
+            object_suffix.replacen("<ds:Reference URI=\"#target\">", "<ds:Reference>", 1);
+        let broken_xml = format!("{prefix}<ds:Object>{mutated_object_suffix}");
+
+        let result = VerifyContext::new()
+            .key(&AcceptingKey)
+            .process_manifests(true)
+            .verify(&broken_xml)
+            .expect("manifest missing URI should be recorded while signature stays valid");
+        assert_eq!(result.manifest_references.len(), 1);
+        assert_eq!(result.manifest_references[0].uri, "<omitted>");
+        assert!(matches!(
+            result.manifest_references[0].status,
+            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
+        ));
+        assert!(matches!(result.status, DsigStatus::Valid));
     }
 
     #[test]
