@@ -270,6 +270,16 @@ pub enum FailureReason {
         /// Use `ReferenceResult::reference_set` to distinguish SignedInfo vs Manifest.
         ref_index: usize,
     },
+    /// `<Reference>` rejected by URI/transform allowlist policy.
+    ReferencePolicyViolation {
+        /// Zero-based index of the failing `<Reference>` in its processed set.
+        ref_index: usize,
+    },
+    /// `<Reference>` processing failed (dereference, transform, missing URI).
+    ReferenceProcessingFailure {
+        /// Zero-based index of the failing `<Reference>` in its processed set.
+        ref_index: usize,
+    },
     /// `<SignatureValue>` does not match canonicalized `<SignedInfo>`.
     SignatureMismatch,
     /// No verification key was configured or could be resolved.
@@ -594,20 +604,21 @@ fn verify_signature_with_context(
         ctx.store_pre_digest,
     )?;
 
-    if let Some(first_failure) = references.first_failure {
-        let status = references.results[first_failure].status;
-        return Ok(VerifyResult {
-            status,
-            signed_info_references: references.results,
-            manifest_references: Vec::new(),
-            canonicalized_signed_info: None,
-        });
-    }
     let manifest_references = if ctx.process_manifests {
         process_manifest_references(signature_node, &resolver, ctx)?
     } else {
         Vec::new()
     };
+
+    if let Some(first_failure) = references.first_failure {
+        let status = references.results[first_failure].status;
+        return Ok(VerifyResult {
+            status,
+            signed_info_references: references.results,
+            manifest_references,
+            canonicalized_signed_info: None,
+        });
+    }
 
     let signed_info_subtree: HashSet<_> = signed_info_node
         .descendants()
@@ -666,24 +677,55 @@ fn process_manifest_references(
     if manifest_references.is_empty() {
         return Ok(Vec::new());
     }
-    enforce_reference_policies(
-        &manifest_references,
-        ctx.allowed_uri_types,
-        ctx.allowed_transform_uris(),
-    )?;
-
     let mut results = Vec::with_capacity(manifest_references.len());
     for (index, reference) in manifest_references.iter().enumerate() {
-        results.push(process_reference(
+        if enforce_reference_policies(
+            std::slice::from_ref(reference),
+            ctx.allowed_uri_types,
+            ctx.allowed_transform_uris(),
+        )
+        .is_err()
+        {
+            results.push(manifest_reference_invalid_result(
+                reference,
+                index,
+                FailureReason::ReferencePolicyViolation { ref_index: index },
+            ));
+            continue;
+        }
+
+        match process_reference(
             reference,
             resolver,
             signature_node,
             ReferenceSet::Manifest,
             index,
             ctx.store_pre_digest,
-        )?);
+        ) {
+            Ok(result) => results.push(result),
+            Err(_) => results.push(manifest_reference_invalid_result(
+                reference,
+                index,
+                FailureReason::ReferenceProcessingFailure { ref_index: index },
+            )),
+        }
     }
     Ok(results)
+}
+
+fn manifest_reference_invalid_result(
+    reference: &Reference,
+    index: usize,
+    reason: FailureReason,
+) -> ReferenceResult {
+    ReferenceResult {
+        reference_set: ReferenceSet::Manifest,
+        reference_index: index,
+        uri: reference.uri.clone().unwrap_or_default(),
+        digest_algorithm: reference.digest_method,
+        status: DsigStatus::Invalid(reason),
+        pre_digest_data: None,
+    }
 }
 
 fn parse_manifest_references(
@@ -1293,6 +1335,66 @@ mod tests {
         assert!(matches!(
             result.status,
             DsigStatus::Invalid(FailureReason::SignatureMismatch)
+        ));
+    }
+
+    #[test]
+    fn verify_context_keeps_manifest_results_when_signedinfo_reference_fails() {
+        let xml = signature_with_manifest_xml(true);
+        let (signed_info_prefix, object_suffix) = xml
+            .split_once("<ds:Object>")
+            .expect("fixture should contain ds:Object");
+        let open = "<ds:DigestValue>";
+        let close = "</ds:DigestValue>";
+        let digest_start = signed_info_prefix
+            .find(open)
+            .expect("SignedInfo should contain DigestValue");
+        let digest_end = signed_info_prefix[digest_start + open.len()..]
+            .find(close)
+            .map(|offset| digest_start + open.len() + offset)
+            .expect("SignedInfo DigestValue must be closed");
+        let broken_signed_info_prefix = format!(
+            "{}{}AAAAAAAAAAAAAAAAAAAAAAAAAAA={}{}",
+            &signed_info_prefix[..digest_start],
+            open,
+            close,
+            &signed_info_prefix[digest_end + close.len()..],
+        );
+        let broken_xml = format!("{broken_signed_info_prefix}<ds:Object>{object_suffix}");
+        let result = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(true)
+            .verify(&broken_xml)
+            .expect("manifest references should still be processed on SignedInfo digest failure");
+        assert!(matches!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+        ));
+        assert_eq!(
+            result.manifest_references.len(),
+            1,
+            "manifest diagnostics must be preserved even when SignedInfo fails early",
+        );
+    }
+
+    #[test]
+    fn verify_context_records_manifest_policy_violations_without_aborting() {
+        let xml = signature_with_manifest_xml(true);
+        let (prefix, object_suffix) = xml
+            .split_once("<ds:Object>")
+            .expect("fixture should contain ds:Object");
+        let mutated_object_suffix =
+            object_suffix.replacen("URI=\"#target\"", "URI=\"http://example.com/external\"", 1);
+        let broken_xml = format!("{prefix}<ds:Object>{mutated_object_suffix}");
+        let result = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(true)
+            .verify(&broken_xml)
+            .expect("manifest policy violations should be recorded, not abort verify()");
+        assert_eq!(result.manifest_references.len(), 1);
+        assert!(matches!(
+            result.manifest_references[0].status,
+            DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
         ));
     }
 
