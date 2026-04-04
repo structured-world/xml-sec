@@ -18,7 +18,7 @@ use crate::c14n::canonicalize;
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 use super::parse::{ParseError, Reference, SignatureAlgorithm, XMLDSIG_NS};
-use super::parse::{parse_reference, parse_signed_info};
+use super::parse::{parse_key_info, parse_reference, parse_signed_info};
 use super::signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
 };
@@ -510,6 +510,10 @@ pub enum DsigError {
     #[error("failed to parse SignedInfo: {0}")]
     ParseSignedInfo(#[from] super::parse::ParseError),
 
+    /// `<KeyInfo>` parsing failed.
+    #[error("failed to parse KeyInfo: {0}")]
+    ParseKeyInfo(#[source] super::parse::ParseError),
+
     /// `<Object>/<Manifest>/<Reference>` parsing failed.
     #[error("failed to parse Manifest reference: {0}")]
     ParseManifestReference(#[source] ParseError),
@@ -617,6 +621,9 @@ fn verify_signature_with_context(
 
     let signature_children = parse_signature_children(signature_node)?;
     let signed_info_node = signature_children.signed_info_node;
+    if let Some(key_info_node) = signature_children.key_info_node {
+        parse_key_info(key_info_node).map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
+    }
 
     let signed_info = parse_signed_info(signed_info_node)?;
     enforce_reference_policies(
@@ -951,6 +958,7 @@ fn transform_uri(transform: &Transform) -> &'static str {
 struct SignatureChildNodes<'a, 'input> {
     signed_info_node: Node<'a, 'input>,
     signature_value_node: Node<'a, 'input>,
+    key_info_node: Option<Node<'a, 'input>>,
 }
 
 fn parse_signature_children<'a, 'input>(
@@ -958,8 +966,13 @@ fn parse_signature_children<'a, 'input>(
 ) -> Result<SignatureChildNodes<'a, 'input>, SignatureVerificationPipelineError> {
     let mut signed_info_node: Option<Node<'_, '_>> = None;
     let mut signature_value_node: Option<Node<'_, '_>> = None;
+    let mut key_info_node: Option<Node<'_, '_>> = None;
     let mut signed_info_index: Option<usize> = None;
     let mut signature_value_index: Option<usize> = None;
+    let mut key_info_index: Option<usize> = None;
+    let mut object_indices: Vec<usize> = Vec::new();
+    let mut first_unexpected_dsig_index: Option<usize> = None;
+
     for (zero_based_index, child) in signature_node
         .children()
         .filter(|node| node.is_element())
@@ -988,7 +1001,23 @@ fn parse_signature_children<'a, 'input>(
                 signature_value_node = Some(child);
                 signature_value_index = Some(element_index);
             }
-            _ => {}
+            "KeyInfo" => {
+                if key_info_node.is_some() {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "KeyInfo must appear at most once under Signature",
+                    });
+                }
+                key_info_node = Some(child);
+                key_info_index = Some(element_index);
+            }
+            "Object" => {
+                object_indices.push(element_index);
+            }
+            _ => {
+                if first_unexpected_dsig_index.is_none() {
+                    first_unexpected_dsig_index = Some(element_index);
+                }
+            }
         }
     }
 
@@ -1010,9 +1039,42 @@ fn parse_signature_children<'a, 'input>(
             reason: "SignatureValue must be the second element child of Signature",
         });
     }
+    if let Some(index) = key_info_index
+        && index != 3
+    {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "KeyInfo must be the third element child of Signature when present",
+        });
+    }
+
+    let allowed_prefix_end = key_info_index.unwrap_or(2);
+    if let Some(unexpected_index) = first_unexpected_dsig_index {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: if unexpected_index > allowed_prefix_end {
+                "After SignedInfo, SignatureValue, and optional KeyInfo, Signature may contain only Object elements"
+            } else {
+                "Signature may contain SignedInfo first, SignatureValue second, optional KeyInfo third, and Object elements thereafter"
+            },
+        });
+    }
+
+    if object_indices
+        .iter()
+        .any(|&index| index <= allowed_prefix_end)
+    {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: if allowed_prefix_end == 3 {
+                "KeyInfo must be the third element child of Signature when present"
+            } else {
+                "SignatureValue must be the second element child of Signature"
+            },
+        });
+    }
+
     Ok(SignatureChildNodes {
         signed_info_node,
         signature_value_node,
+        key_info_node,
     })
 }
 
@@ -2441,6 +2503,48 @@ mod tests {
             err,
             SignatureVerificationPipelineError::InvalidStructure {
                 reason: "Signature must appear exactly once in document",
+            }
+        ));
+    }
+
+    #[test]
+    fn pipeline_reports_keyinfo_parse_error() {
+        let xml = r#"
+<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
+              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+  <ds:SignedInfo/>
+  <ds:SignatureValue>AA==</ds:SignatureValue>
+  <ds:KeyInfo>
+    <dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue>
+  </ds:KeyInfo>
+</ds:Signature>
+"#;
+
+        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
+            .expect_err("invalid KeyInfo must map to ParseKeyInfo");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::ParseKeyInfo(_)
+        ));
+    }
+
+    #[test]
+    fn pipeline_rejects_keyinfo_out_of_order() {
+        let xml = r#"
+<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:SignedInfo/>
+  <ds:SignatureValue>AA==</ds:SignatureValue>
+  <ds:Object/>
+  <ds:KeyInfo><ds:KeyName>late</ds:KeyName></ds:KeyInfo>
+</ds:Signature>
+"#;
+
+        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
+            .expect_err("KeyInfo after Object must be rejected by Signature child order checks");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "KeyInfo must be the third element child of Signature when present"
             }
         ));
     }
