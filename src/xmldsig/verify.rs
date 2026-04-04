@@ -161,13 +161,18 @@ impl<'a> VerifyContext<'a> {
     ///
     /// When enabled, references in `<ds:Manifest>` elements that are direct
     /// element children of `<ds:Object>` are processed only when the direct-child
-    /// `<ds:Object>` or `<ds:Manifest>` itself is referenced from `<SignedInfo>`.
+    /// `<ds:Object>` or `<ds:Manifest>` itself is referenced from `<SignedInfo>`
+    /// by an ID-based same-document fragment URI such as `#id` or
+    /// `#xpointer(id('id'))`.
     /// Only those signed Manifest references are returned in
     /// `VerifyResult::manifest_references`.
     /// Nested `<ds:Manifest>` descendants under `<ds:Object>` are not
     /// processed.
     /// Direct-child unsigned/unreferenced Manifests are skipped and do not
     /// appear in `VerifyResult::manifest_references`.
+    /// Whole-document same-document references such as `URI=""` or
+    /// `URI="#xpointer(/)"` do not mark a specific direct-child
+    /// `<ds:Object>`/`<ds:Manifest>` as signed for this option.
     ///
     /// Manifest reference digest mismatches, policy violations, and processing
     /// failures are reported in `VerifyResult::manifest_references` and do not
@@ -1465,6 +1470,35 @@ mod tests {
         assert!(matches!(
             result_with_manifests.status,
             DsigStatus::Invalid(FailureReason::SignatureMismatch)
+        ));
+    }
+
+    #[test]
+    fn verify_context_processes_manifest_when_signedinfo_references_object() {
+        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
+            xml.replacen("URI=\"#manifest\"", "URI=\"#object-id\"", 1)
+                .replacen("<ds:Object>", "<ds:Object ID=\"object-id\">", 1)
+                .replacen("<ds:Manifest ID=\"manifest\">", "<ds:Manifest>", 1)
+        });
+
+        let result = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(true)
+            .verify(&xml)
+            .expect("manifest references should be processed when SignedInfo references ds:Object");
+        assert_eq!(
+            result.manifest_references.len(),
+            1,
+            "signed ds:Object should enable processing of its direct-child ds:Manifest",
+        );
+        assert_eq!(
+            result.manifest_references[0].reference_set,
+            ReferenceSet::Manifest
+        );
+        assert_eq!(result.manifest_references[0].reference_index, 0);
+        assert!(matches!(
+            result.manifest_references[0].status,
+            DsigStatus::Valid
         ));
     }
 
