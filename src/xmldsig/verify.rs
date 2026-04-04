@@ -160,10 +160,14 @@ impl<'a> VerifyContext<'a> {
     /// Enable or disable `<Manifest>` processing.
     ///
     /// When enabled, references in `<ds:Manifest>` elements that are direct
-    /// element children of `<ds:Object>` are processed and returned in
+    /// element children of `<ds:Object>` are processed only when the direct-child
+    /// `<ds:Object>` or `<ds:Manifest>` itself is referenced from `<SignedInfo>`.
+    /// Only those signed Manifest references are returned in
     /// `VerifyResult::manifest_references`.
     /// Nested `<ds:Manifest>` descendants under `<ds:Object>` are not
     /// processed.
+    /// Direct-child unsigned/unreferenced Manifests are skipped and do not
+    /// appear in `VerifyResult::manifest_references`.
     ///
     /// Manifest reference digest mismatches, policy violations, and processing
     /// failures are reported in `VerifyResult::manifest_references` and do not
@@ -465,6 +469,10 @@ pub struct VerifyResult {
     pub signed_info_references: Vec<ReferenceResult>,
     /// `<Manifest>` reference results.
     /// Populated only when `VerifyContext::process_manifests(true)` is enabled.
+    /// Includes only references from signed direct-child `<ds:Object>/<ds:Manifest>`
+    /// blocks that are referenced from `<SignedInfo>`.
+    /// Unsigned/unreferenced direct-child Manifest blocks are skipped, so an
+    /// empty list does not imply that no Manifest elements existed in `verify()` input.
     pub manifest_references: Vec<ReferenceResult>,
     /// Canonicalized `<SignedInfo>` bytes when `store_pre_digest` is enabled
     /// and verification reaches SignedInfo canonicalization.
@@ -1312,6 +1320,16 @@ mod tests {
     }
 
     fn signature_with_manifest_xml(valid_manifest_digest: bool) -> String {
+        signature_with_manifest_xml_with_manifest_mutation(valid_manifest_digest, |xml| xml)
+    }
+
+    fn signature_with_manifest_xml_with_manifest_mutation<F>(
+        valid_manifest_digest: bool,
+        mutate_manifest: F,
+    ) -> String
+    where
+        F: FnOnce(String) -> String,
+    {
         const TMP_SIGNED_INFO_DIGEST: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         const INVALID_MANIFEST_DIGEST: &str = "//////////////////////////8=";
         let xml_template = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
@@ -1363,8 +1381,9 @@ mod tests {
         } else {
             INVALID_MANIFEST_DIGEST
         };
-        let xml_with_manifest_digest =
-            seed_xml.replace("MANIFEST_DIGEST_PLACEHOLDER", final_manifest_digest_b64);
+        let xml_with_manifest_digest = mutate_manifest(
+            seed_xml.replace("MANIFEST_DIGEST_PLACEHOLDER", final_manifest_digest_b64),
+        );
         let signed_doc = Document::parse(&xml_with_manifest_digest).unwrap();
         let signed_signature_node = signed_doc
             .descendants()
@@ -1569,13 +1588,9 @@ mod tests {
 
     #[test]
     fn verify_context_records_manifest_policy_violations_with_accepting_key() {
-        let xml = signature_with_manifest_xml(true);
-        let (prefix, object_suffix) = xml
-            .split_once("<ds:Object>")
-            .expect("fixture should contain ds:Object");
-        let mutated_object_suffix =
-            object_suffix.replacen("URI=\"#target\"", "URI=\"http://example.com/external\"", 1);
-        let broken_xml = format!("{prefix}<ds:Object>{mutated_object_suffix}");
+        let broken_xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
+            xml.replacen("URI=\"#target\"", "URI=\"http://example.com/external\"", 1)
+        });
         let result = VerifyContext::new()
             .key(&AcceptingKey)
             .process_manifests(true)
@@ -1586,10 +1601,7 @@ mod tests {
             result.manifest_references[0].status,
             DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
         ));
-        assert!(matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
-        ));
+        assert!(matches!(result.status, DsigStatus::Valid));
     }
 
     #[test]
@@ -1621,13 +1633,9 @@ mod tests {
 
     #[test]
     fn verify_context_records_manifest_missing_uri_with_accepting_key() {
-        let xml = signature_with_manifest_xml(true);
-        let (prefix, object_suffix) = xml
-            .split_once("<ds:Object>")
-            .expect("fixture should contain ds:Object");
-        let mutated_object_suffix =
-            object_suffix.replacen("<ds:Reference URI=\"#target\">", "<ds:Reference>", 1);
-        let broken_xml = format!("{prefix}<ds:Object>{mutated_object_suffix}");
+        let broken_xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
+            xml.replacen("<ds:Reference URI=\"#target\">", "<ds:Reference>", 1)
+        });
 
         let result = VerifyContext::new()
             .key(&AcceptingKey)
@@ -1640,10 +1648,7 @@ mod tests {
             result.manifest_references[0].status,
             DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
         ));
-        assert!(matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
-        ));
+        assert!(matches!(result.status, DsigStatus::Valid));
     }
 
     #[test]
