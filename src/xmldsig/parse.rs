@@ -114,6 +114,7 @@ pub struct Reference {
 
 /// Parsed `<KeyInfo>` element.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeyInfo {
     /// Sources discovered under `<KeyInfo>` in document order.
     pub sources: Vec<KeyInfoSource>,
@@ -121,6 +122,7 @@ pub struct KeyInfo {
 
 /// Top-level key material source parsed from `<KeyInfo>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyInfoSource {
     /// `<KeyName>` source.
     KeyName(String),
@@ -134,6 +136,7 @@ pub enum KeyInfoSource {
 
 /// Parsed `<KeyValue>` dispatch result.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyValueInfo {
     /// `<RSAKeyValue>`.
     RsaKeyValue,
@@ -145,6 +148,7 @@ pub enum KeyValueInfo {
 
 /// Parsed `<X509Data>` children (dispatch-only in P2-001).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct X509DataInfo {
     /// Number of `<X509Certificate>` children.
     pub certificate_count: usize,
@@ -353,17 +357,14 @@ pub(crate) fn parse_reference(reference_node: Node) -> Result<Reference, ParseEr
 /// Unknown elements are ignored (lax processing), matching XMLDSig behavior.
 pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
     verify_ds_element(key_info_node, "KeyInfo")?;
+    ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
 
     let mut sources = Vec::new();
     for child in element_children(key_info_node) {
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "KeyName") => {
-                let key_name = collect_text_content(child).trim().to_string();
-                if key_name.is_empty() {
-                    return Err(ParseError::InvalidStructure(
-                        "KeyName must contain non-empty text".into(),
-                    ));
-                }
+                ensure_no_element_children(child, "KeyName")?;
+                let key_name = collect_text_content(child);
                 sources.push(KeyInfoSource::KeyName(key_name));
             }
             (Some(XMLDSIG_NS), "KeyValue") => {
@@ -375,6 +376,7 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
                 sources.push(KeyInfoSource::X509Data(x509));
             }
             (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
+                ensure_no_element_children(child, "DEREncodedKeyValue")?;
                 let der = decode_base64_xml_text(&collect_text_content(child))?;
                 sources.push(KeyInfoSource::DerEncodedKeyValue(der));
             }
@@ -453,6 +455,7 @@ fn parse_inclusive_prefixes(node: Node) -> Result<Option<String>, ParseError> {
 
 fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
     verify_ds_element(node, "KeyValue")?;
+    ensure_no_non_whitespace_text(node, "KeyValue")?;
 
     let mut children = element_children(node);
     let Some(first_child) = children.next() else {
@@ -480,6 +483,7 @@ fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
 
 fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
     verify_ds_element(node, "X509Data")?;
+    ensure_no_non_whitespace_text(node, "X509Data")?;
 
     let mut info = X509DataInfo::default();
     let mut saw_child = false;
@@ -567,6 +571,28 @@ fn collect_text_content(node: Node<'_, '_>) -> String {
     node.children()
         .filter_map(|child| child.is_text().then(|| child.text()).flatten())
         .collect()
+}
+
+fn ensure_no_element_children(node: Node<'_, '_>, element_name: &str) -> Result<(), ParseError> {
+    if node.children().any(|child| child.is_element()) {
+        return Err(ParseError::InvalidStructure(format!(
+            "{element_name} must not contain child elements"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Result<(), ParseError> {
+    for child in node.children().filter(|child| child.is_text()) {
+        if let Some(text) = child.text()
+            && !text.trim().is_empty()
+        {
+            return Err(ParseError::InvalidStructure(format!(
+                "{element_name} must not contain non-whitespace mixed content"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -790,6 +816,40 @@ mod tests {
                 "DSAKeyValue".into()
             ))]
         );
+    }
+
+    #[test]
+    fn parse_key_info_rejects_keyname_with_child_elements() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyName>ok<foo/></KeyName>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_preserves_keyname_text_without_trimming() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyName>  signing key  </KeyName>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyName("  signing key  ".into())]
+        );
+    }
+
+    #[test]
+    fn parse_key_info_rejects_non_whitespace_mixed_content() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">oops<KeyName>k</KeyName></KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
     }
 
     // ── parse_signed_info: happy path ────────────────────────────────

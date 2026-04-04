@@ -970,6 +970,9 @@ fn parse_signature_children<'a, 'input>(
     let mut signed_info_index: Option<usize> = None;
     let mut signature_value_index: Option<usize> = None;
     let mut key_info_index: Option<usize> = None;
+    let mut object_indices: Vec<usize> = Vec::new();
+    let mut first_unexpected_dsig_index: Option<usize> = None;
+
     for (zero_based_index, child) in signature_node
         .children()
         .filter(|node| node.is_element())
@@ -1007,7 +1010,14 @@ fn parse_signature_children<'a, 'input>(
                 key_info_node = Some(child);
                 key_info_index = Some(element_index);
             }
-            _ => {}
+            "Object" => {
+                object_indices.push(element_index);
+            }
+            _ => {
+                if first_unexpected_dsig_index.is_none() {
+                    first_unexpected_dsig_index = Some(element_index);
+                }
+            }
         }
     }
 
@@ -1036,6 +1046,31 @@ fn parse_signature_children<'a, 'input>(
             reason: "KeyInfo must be the third element child of Signature when present",
         });
     }
+
+    let allowed_prefix_end = key_info_index.unwrap_or(2);
+    if let Some(unexpected_index) = first_unexpected_dsig_index {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: if unexpected_index > allowed_prefix_end {
+                "Signature may contain only Object elements after the allowed prefix"
+            } else {
+                "unexpected XMLDSIG child element under Signature"
+            },
+        });
+    }
+
+    if object_indices
+        .iter()
+        .any(|&index| index <= allowed_prefix_end)
+    {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: if allowed_prefix_end == 3 {
+                "KeyInfo must be the third element child of Signature when present"
+            } else {
+                "SignatureValue must be the second element child of Signature"
+            },
+        });
+    }
+
     Ok(SignatureChildNodes {
         signed_info_node,
         signature_value_node,
