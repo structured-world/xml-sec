@@ -11,7 +11,7 @@
 //! - [`verify_signature_with_pem_key`] for full pipeline validation (`SignedInfo` + `SignatureValue`)
 
 use base64::Engine;
-use roxmltree::{Document, Node};
+use roxmltree::{Document, Node, NodeId};
 use std::collections::HashSet;
 
 use crate::c14n::canonicalize;
@@ -25,7 +25,7 @@ use super::signature::{
 use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, XPATH_TRANSFORM_URI, execute_transforms,
 };
-use super::uri::UriReferenceResolver;
+use super::uri::{UriReferenceResolver, parse_xpointer_id_fragment};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
@@ -629,8 +629,9 @@ fn verify_signature_with_context(
     )?;
 
     let manifest_references = if ctx.process_manifests {
-        let signed_info_reference_ids = collect_signed_info_reference_ids(&signed_info.references);
-        process_manifest_references(signature_node, &resolver, ctx, &signed_info_reference_ids)?
+        let signed_info_reference_nodes =
+            collect_signed_info_reference_nodes(&signed_info.references, &resolver);
+        process_manifest_references(signature_node, &resolver, ctx, &signed_info_reference_nodes)?
     } else {
         Vec::new()
     };
@@ -697,9 +698,10 @@ fn process_manifest_references(
     signature_node: Node<'_, '_>,
     resolver: &UriReferenceResolver<'_>,
     ctx: &VerifyContext<'_>,
-    signed_info_reference_ids: &HashSet<String>,
+    signed_info_reference_nodes: &HashSet<NodeId>,
 ) -> Result<Vec<ReferenceResult>, SignatureVerificationPipelineError> {
-    let manifest_references = parse_manifest_references(signature_node, signed_info_reference_ids)?;
+    let manifest_references =
+        parse_manifest_references(signature_node, signed_info_reference_nodes)?;
     if manifest_references.is_empty() {
         return Ok(Vec::new());
     }
@@ -783,7 +785,7 @@ fn manifest_reference_invalid_result(
 
 fn parse_manifest_references(
     signature_node: Node<'_, '_>,
-    signed_info_reference_ids: &HashSet<String>,
+    signed_info_reference_nodes: &HashSet<NodeId>,
 ) -> Result<Vec<Reference>, SignatureVerificationPipelineError> {
     let mut references = Vec::new();
     for object_node in signature_node.children().filter(|node| {
@@ -791,15 +793,13 @@ fn parse_manifest_references(
             && node.tag_name().namespace() == Some(XMLDSIG_NS)
             && node.tag_name().name() == "Object"
     }) {
-        let object_is_signed =
-            node_id_value(object_node).is_some_and(|id| signed_info_reference_ids.contains(id));
+        let object_is_signed = signed_info_reference_nodes.contains(&object_node.id());
         for manifest_node in object_node.children().filter(|node| {
             node.is_element()
                 && node.tag_name().namespace() == Some(XMLDSIG_NS)
                 && node.tag_name().name() == "Manifest"
         }) {
-            let manifest_is_signed = node_id_value(manifest_node)
-                .is_some_and(|id| signed_info_reference_ids.contains(id));
+            let manifest_is_signed = signed_info_reference_nodes.contains(&manifest_node.id());
             if !object_is_signed && !manifest_is_signed {
                 continue;
             }
@@ -841,12 +841,15 @@ fn parse_manifest_references(
     Ok(references)
 }
 
-fn collect_signed_info_reference_ids(references: &[Reference]) -> HashSet<String> {
+fn collect_signed_info_reference_nodes(
+    references: &[Reference],
+    resolver: &UriReferenceResolver<'_>,
+) -> HashSet<NodeId> {
     references
         .iter()
         .filter_map(|reference| reference.uri.as_deref())
         .filter_map(signed_info_reference_id_from_uri)
-        .map(str::to_owned)
+        .filter_map(|id| resolver.node_id_for_id(id))
         .collect()
 }
 
@@ -859,23 +862,6 @@ fn signed_info_reference_id_from_uri(uri: &str) -> Option<&str> {
         return (!id.is_empty()).then_some(id);
     }
     (!fragment.starts_with("xpointer(")).then_some(fragment)
-}
-
-fn parse_xpointer_id_fragment(fragment: &str) -> Option<&str> {
-    let inner = fragment.strip_prefix("xpointer(id(")?.strip_suffix("))")?;
-    if let Some(stripped) = inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
-        Some(stripped)
-    } else if let Some(stripped) = inner.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        Some(stripped)
-    } else {
-        None
-    }
-}
-
-fn node_id_value<'a, 'input>(node: Node<'a, 'input>) -> Option<&'a str> {
-    node.attribute("ID")
-        .or_else(|| node.attribute("Id"))
-        .or_else(|| node.attribute("id"))
 }
 
 enum ResolvedVerifyingKey<'a> {
@@ -1770,6 +1756,28 @@ mod tests {
             "only signed Manifest references must be reported",
         );
         assert!(matches!(result.status, DsigStatus::Valid));
+    }
+
+    #[test]
+    fn verify_context_skips_ambiguous_manifest_id_blocks() {
+        let xml = signature_with_manifest_xml(true).replacen(
+            "</ds:Object>",
+            "</ds:Object><ds:Object><ds:Manifest ID=\"manifest\">junk<ds:Foo/></ds:Manifest></ds:Object>",
+            1,
+        );
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(true)
+            .verify(&xml)
+            .expect_err("ambiguous manifest IDs should make SignedInfo #manifest dereference fail");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::Reference(
+                ReferenceProcessingError::UriDereference(
+                    crate::xmldsig::types::TransformError::ElementNotFound(id)
+                )
+            ) if id == "manifest"
+        ));
     }
 
     #[test]

@@ -14,7 +14,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
-use roxmltree::{Document, Node};
+use roxmltree::{Document, Node, NodeId};
 
 use super::types::{NodeSet, TransformData, TransformError};
 
@@ -169,7 +169,7 @@ impl<'a> UriReferenceResolver<'a> {
             Ok(TransformData::NodeSet(
                 NodeSet::entire_document_with_comments(self.doc),
             ))
-        } else if let Some(id) = parse_xpointer_id(fragment) {
+        } else if let Some(id) = parse_xpointer_id_fragment(fragment) {
             // xpointer(id('foo')) → same as bare-name #foo
             // Reject empty parsed ID (e.g., xpointer(id(''))) — not a valid XML Name
             if id.is_empty() {
@@ -198,6 +198,14 @@ impl<'a> UriReferenceResolver<'a> {
         self.id_map.contains_key(id)
     }
 
+    /// Resolve a same-document ID token to a stable node identity.
+    ///
+    /// Returns `None` when the ID is absent or ambiguous (duplicate ID collision),
+    /// matching the resolver behavior used by `dereference()`.
+    pub(crate) fn node_id_for_id(&self, id: &str) -> Option<NodeId> {
+        self.id_map.get(id).map(|node| node.id())
+    }
+
     /// Get the number of registered IDs.
     pub fn id_count(&self) -> usize {
         self.id_map.len()
@@ -206,7 +214,7 @@ impl<'a> UriReferenceResolver<'a> {
 
 /// Parse `xpointer(id('value'))` or `xpointer(id("value"))` and return the ID value.
 /// Returns `None` if the fragment doesn't match this pattern.
-fn parse_xpointer_id(fragment: &str) -> Option<&str> {
+pub(crate) fn parse_xpointer_id_fragment(fragment: &str) -> Option<&str> {
     let inner = fragment.strip_prefix("xpointer(id(")?.strip_suffix("))")?;
 
     // Strip single or double quotes using safe helpers to avoid panics
@@ -622,21 +630,27 @@ mod tests {
     #[test]
     fn parse_xpointer_id_variants() {
         // Valid forms
-        assert_eq!(super::parse_xpointer_id("xpointer(id('foo'))"), Some("foo"));
         assert_eq!(
-            super::parse_xpointer_id(r#"xpointer(id("bar"))"#),
+            super::parse_xpointer_id_fragment("xpointer(id('foo'))"),
+            Some("foo")
+        );
+        assert_eq!(
+            super::parse_xpointer_id_fragment(r#"xpointer(id("bar"))"#),
             Some("bar")
         );
 
         // Invalid forms
-        assert_eq!(super::parse_xpointer_id("xpointer(/)"), None);
-        assert_eq!(super::parse_xpointer_id("xpointer(id(foo))"), None); // no quotes
-        assert_eq!(super::parse_xpointer_id("not-xpointer"), None);
-        assert_eq!(super::parse_xpointer_id(""), None);
+        assert_eq!(super::parse_xpointer_id_fragment("xpointer(/)"), None);
+        assert_eq!(super::parse_xpointer_id_fragment("xpointer(id(foo))"), None); // no quotes
+        assert_eq!(super::parse_xpointer_id_fragment("not-xpointer"), None);
+        assert_eq!(super::parse_xpointer_id_fragment(""), None);
 
         // Malformed: single quote char — must not panic (was slicing bug)
-        assert_eq!(super::parse_xpointer_id("xpointer(id('))"), None);
-        assert_eq!(super::parse_xpointer_id(r#"xpointer(id("))"#), None);
+        assert_eq!(super::parse_xpointer_id_fragment("xpointer(id('))"), None);
+        assert_eq!(
+            super::parse_xpointer_id_fragment(r#"xpointer(id("))"#),
+            None
+        );
     }
 
     #[test]
