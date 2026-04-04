@@ -38,7 +38,12 @@ pub enum SignatureAlgorithm {
     RsaSha512,
     /// ECDSA P-256 with SHA-256.
     EcdsaP256Sha256,
-    /// ECDSA P-384 with SHA-384.
+    /// XMLDSig `ecdsa-sha384` URI.
+    ///
+    /// The variant name is historical.
+    ///
+    /// Verification currently accepts this XMLDSig URI for P-384 and for the
+    /// donor P-521 interop case.
     EcdsaP384Sha384,
 }
 

@@ -7,10 +7,9 @@
 use std::path::Path;
 
 use base64::Engine;
-use ring::rand::SystemRandom;
-use ring::signature::{
-    ECDSA_P384_SHA384_ASN1_SIGNING, ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair,
-};
+use p384::ecdsa::signature::Signer;
+use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey};
+use p384::pkcs8::DecodePrivateKey;
 use xml_sec::c14n::canonicalize;
 use xml_sec::xmldsig::parse::{SignatureAlgorithm, find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::{
@@ -110,18 +109,16 @@ fn local_p384_signature_matches() {
         .expect("fixture PEM should parse")
         .1
         .contents;
-    let rng = SystemRandom::new();
-    let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &pkcs8_der, &rng)
-        .expect("fixture PKCS#8 should parse");
-    let signature = key_pair
-        .sign(&rng, &canonical_signed_info)
-        .expect("fixture P-384 key should sign");
+    let signing_key =
+        P384SigningKey::from_pkcs8_der(&pkcs8_der).expect("fixture PKCS#8 should parse");
+    let signature: P384Signature = signing_key.sign(&canonical_signed_info);
+    let signature_bytes = signature.to_bytes();
 
     let valid = verify_ecdsa_signature_pem(
         SignatureAlgorithm::EcdsaP384Sha384,
         &public_key_pem,
         &canonical_signed_info,
-        signature.as_ref(),
+        signature_bytes.as_ref(),
     )
     .expect("P-384 verification should not error on valid fixtures");
 
@@ -147,18 +144,16 @@ fn local_p384_der_signature_matches() {
         .expect("fixture PEM should parse")
         .1
         .contents;
-    let rng = SystemRandom::new();
-    let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, &pkcs8_der, &rng)
-        .expect("fixture PKCS#8 should parse");
-    let signature = key_pair
-        .sign(&rng, &canonical_signed_info)
-        .expect("fixture P-384 key should sign");
+    let signing_key =
+        P384SigningKey::from_pkcs8_der(&pkcs8_der).expect("fixture PKCS#8 should parse");
+    let signature: P384Signature = signing_key.sign(&canonical_signed_info);
+    let signature_der = signature.to_der();
 
     let valid = verify_ecdsa_signature_pem(
         SignatureAlgorithm::EcdsaP384Sha384,
         &public_key_pem,
         &canonical_signed_info,
-        signature.as_ref(),
+        signature_der.as_bytes(),
     )
     .expect("P-384 DER verification should not error on valid fixtures");
 

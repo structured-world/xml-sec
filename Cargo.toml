@@ -17,11 +17,18 @@ readme = "README.md"
 roxmltree = { version = "0.21", features = ["positions"] }
 
 # Crypto
-ring = "0.17"
+rsa = { version = "0.9", optional = true }
+sha1 = { version = "0.10", features = ["oid"], optional = true }
+sha2 = { version = "0.10", features = ["oid"], optional = true }
+p256 = { version = "0.13", features = ["ecdsa"], optional = true }
+p384 = { version = "0.13", features = ["ecdsa"], optional = true }
+p521 = { version = "0.13", features = ["ecdsa"], optional = true }
+signature = { version = "2", optional = true }
+subtle = { version = "2", optional = true }
 
 # X.509 certificates
-x509-parser = "0.18"
-der = "0.8"
+x509-parser = { version = "0.18", optional = true }
+der = { version = "0.8", optional = true }
 
 # Base64 encoding/decoding
 base64 = "0.22"
@@ -31,6 +38,17 @@ thiserror = "2"
 
 [features]
 default = ["xmldsig", "c14n"]
-xmldsig = []           # XML Digital Signatures (sign + verify)
+xmldsig = [            # XML Digital Signatures (sign + verify)
+    "dep:der",
+    "dep:p256",
+    "dep:p384",
+    "dep:p521",
+    "dep:rsa",
+    "dep:sha1",
+    "dep:sha2",
+    "dep:signature",
+    "dep:subtle",
+    "dep:x509-parser",
+]
 xmlenc = []            # XML Encryption (encrypt + decrypt)
 c14n = []              # XML Canonicalization (inclusive + exclusive)

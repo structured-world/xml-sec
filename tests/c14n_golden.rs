@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 use std::fs;
 
-use ring::digest;
+use sha1::{Digest, Sha1};
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize, canonicalize_xml};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -36,8 +36,7 @@ fn fixture_bytes(path: &str) -> Vec<u8> {
 }
 
 fn sha1_base64(data: &[u8]) -> String {
-    let hash = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, data);
-    base64_encode(hash.as_ref())
+    base64_encode(&Sha1::digest(data))
 }
 
 fn base64_encode(data: &[u8]) -> String {
