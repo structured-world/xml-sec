@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/structured-world/xml-sec/compare/v0.1.2...v0.1.3) - 2026-04-04
+
+### Fixed
+
+- *(xmldsig)* remove redundant rsa modulus check
+- *(xmldsig)* align review feedback on docs and mismatch errors
+- *(xmldsig)* tighten p521 checks and docs
+- *(xmldsig)* preserve source chain for reference errors
+
+### Refactored
+
+- *(xmldsig)* migrate ring to rustcrypto
+- *(test)* make donor vector xml_path required
+
+### Testing
+
+- *(xmldsig)* assert concrete skip outcomes
+- *(xmldsig)* clarify x509 skip blocker reasons
+- *(xmldsig)* tighten skipped vector guardrails
+- *(xmldsig)* document intentional fixture discard pattern
+- *(xmldsig)* align donor vector fixture coverage
+- *(xmldsig)* validate skip vector fixture paths
+- *(xmldsig)* align donor skip case metadata
+- *(xmldsig)* use assert_eq for failure count
+- *(xmldsig)* skip fixture reads for skipped vectors
+- *(xmldsig)* add donor full verification suite accounting
+
 ## [0.1.2](https://github.com/structured-world/xml-sec/compare/v0.1.1...v0.1.2) - 2026-03-29
 
 ### Added
