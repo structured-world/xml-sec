@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/structured-world/xml-sec/compare/v0.1.3...v0.1.4) - 2026-04-04
+
+### Added
+
+- *(xmldsig)* process manifest references
+
+### Documentation
+
+- *(xmldsig)* clarify manifest error semantics
+- *(xmldsig)* update process_reference rustdoc
+
+### Fixed
+
+- *(xmldsig)* match signed manifests by node identity
+- *(xmldsig)* gate manifest processing to signed refs
+- *(xmldsig)* refine manifest verdict contract
+- *(xmldsig)* harden manifest child validation
+- *(xmldsig)* classify manifest precheck failures accurately
+- *(xmldsig)* make manifest processing non-fatal
+- *(xmldsig)* clarify manifest reference diagnostics
+
+### Testing
+
+- *(xmldsig)* cover signed-object manifest path
+- *(xmldsig)* keep accepting-key manifest tests valid
+- *(xmldsig)* tighten manifest non-fatal contracts
+- *(xmldsig)* decouple manifest fixture from parser
+
 ## [0.1.3](https://github.com/structured-world/xml-sec/compare/v0.1.2...v0.1.3) - 2026-04-04
 
 ### Fixed
