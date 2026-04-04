@@ -24,6 +24,8 @@ use crate::c14n::C14nAlgorithm;
 
 /// XMLDSig namespace URI.
 pub(crate) const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+/// XMLDSig 1.1 namespace URI.
+pub(crate) const XMLDSIG11_NS: &str = "http://www.w3.org/2009/xmldsig11#";
 
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,6 +110,54 @@ pub struct Reference {
     pub digest_method: DigestAlgorithm,
     /// Raw digest value (base64-decoded).
     pub digest_value: Vec<u8>,
+}
+
+/// Parsed `<KeyInfo>` element.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct KeyInfo {
+    /// Sources discovered under `<KeyInfo>` in document order.
+    pub sources: Vec<KeyInfoSource>,
+}
+
+/// Top-level key material source parsed from `<KeyInfo>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyInfoSource {
+    /// `<KeyName>` source.
+    KeyName(String),
+    /// `<KeyValue>` source.
+    KeyValue(KeyValueInfo),
+    /// `<X509Data>` source.
+    X509Data(X509DataInfo),
+    /// `dsig11:DEREncodedKeyValue` source (base64-decoded DER bytes).
+    DerEncodedKeyValue(Vec<u8>),
+}
+
+/// Parsed `<KeyValue>` dispatch result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyValueInfo {
+    /// `<RSAKeyValue>`.
+    RsaKeyValue,
+    /// `<ECKeyValue>`.
+    EcKeyValue,
+    /// Any other `<KeyValue>` child not yet supported by this phase.
+    Unsupported(String),
+}
+
+/// Parsed `<X509Data>` children (dispatch-only in P2-001).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct X509DataInfo {
+    /// Number of `<X509Certificate>` children.
+    pub certificate_count: usize,
+    /// Number of `<X509SubjectName>` children.
+    pub subject_name_count: usize,
+    /// Number of `<X509IssuerSerial>` children.
+    pub issuer_serial_count: usize,
+    /// Number of `<X509SKI>` children.
+    pub ski_count: usize,
+    /// Number of `<X509CRL>` children.
+    pub crl_count: usize,
+    /// Number of `<X509Digest>` children.
+    pub digest_count: usize,
 }
 
 /// Errors during XMLDSig element parsing.
@@ -292,6 +342,49 @@ pub(crate) fn parse_reference(reference_node: Node) -> Result<Reference, ParseEr
     })
 }
 
+/// Parse `<ds:KeyInfo>` and dispatch supported child sources.
+///
+/// Supported source elements:
+/// - `<ds:KeyName>`
+/// - `<ds:KeyValue>` (dispatch to RSA vs EC by child element name)
+/// - `<ds:X509Data>`
+/// - `<dsig11:DEREncodedKeyValue>`
+///
+/// Unknown elements are ignored (lax processing), matching XMLDSig behavior.
+pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
+    verify_ds_element(key_info_node, "KeyInfo")?;
+
+    let mut sources = Vec::new();
+    for child in element_children(key_info_node) {
+        match (child.tag_name().namespace(), child.tag_name().name()) {
+            (Some(XMLDSIG_NS), "KeyName") => {
+                let key_name = collect_text_content(child).trim().to_string();
+                if key_name.is_empty() {
+                    return Err(ParseError::InvalidStructure(
+                        "KeyName must contain non-empty text".into(),
+                    ));
+                }
+                sources.push(KeyInfoSource::KeyName(key_name));
+            }
+            (Some(XMLDSIG_NS), "KeyValue") => {
+                let key_value = parse_key_value_dispatch(child)?;
+                sources.push(KeyInfoSource::KeyValue(key_value));
+            }
+            (Some(XMLDSIG_NS), "X509Data") => {
+                let x509 = parse_x509_data_dispatch(child)?;
+                sources.push(KeyInfoSource::X509Data(x509));
+            }
+            (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
+                let der = decode_base64_xml_text(&collect_text_content(child))?;
+                sources.push(KeyInfoSource::DerEncodedKeyValue(der));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(KeyInfo { sources })
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Iterate only element children (skip text, comments, PIs).
@@ -358,6 +451,60 @@ fn parse_inclusive_prefixes(node: Node) -> Result<Option<String>, ParseError> {
     Ok(None)
 }
 
+fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
+    verify_ds_element(node, "KeyValue")?;
+
+    let mut children = element_children(node);
+    let Some(first_child) = children.next() else {
+        return Err(ParseError::InvalidStructure(
+            "KeyValue must contain exactly one key-value child".into(),
+        ));
+    };
+    if children.next().is_some() {
+        return Err(ParseError::InvalidStructure(
+            "KeyValue must contain exactly one key-value child".into(),
+        ));
+    }
+
+    match (
+        first_child.tag_name().namespace(),
+        first_child.tag_name().name(),
+    ) {
+        (Some(XMLDSIG_NS), "RSAKeyValue") => Ok(KeyValueInfo::RsaKeyValue),
+        (Some(XMLDSIG_NS), "ECKeyValue") | (Some(XMLDSIG11_NS), "ECKeyValue") => {
+            Ok(KeyValueInfo::EcKeyValue)
+        }
+        (_, child_name) => Ok(KeyValueInfo::Unsupported(child_name.to_string())),
+    }
+}
+
+fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
+    verify_ds_element(node, "X509Data")?;
+
+    let mut info = X509DataInfo::default();
+    let mut saw_child = false;
+    for child in element_children(node) {
+        saw_child = true;
+        match (child.tag_name().namespace(), child.tag_name().name()) {
+            (Some(XMLDSIG_NS), "X509Certificate") => info.certificate_count += 1,
+            (Some(XMLDSIG_NS), "X509SubjectName") => info.subject_name_count += 1,
+            (Some(XMLDSIG_NS), "X509IssuerSerial") => info.issuer_serial_count += 1,
+            (Some(XMLDSIG_NS), "X509SKI") => info.ski_count += 1,
+            (Some(XMLDSIG_NS), "X509CRL") => info.crl_count += 1,
+            (Some(XMLDSIG11_NS), "X509Digest") => info.digest_count += 1,
+            _ => {}
+        }
+    }
+
+    if !saw_child {
+        return Err(ParseError::InvalidStructure(
+            "X509Data must contain at least one child element".into(),
+        ));
+    }
+
+    Ok(info)
+}
+
 /// Base64-decode a digest value string, stripping whitespace.
 ///
 /// XMLDSig allows whitespace within base64 content (line-wrapped encodings).
@@ -391,6 +538,35 @@ fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec
         });
     }
     Ok(digest)
+}
+
+fn decode_base64_xml_text(b64: &str) -> Result<Vec<u8>, ParseError> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let mut cleaned = String::with_capacity(b64.len());
+    for ch in b64.chars() {
+        if matches!(ch, ' ' | '\t' | '\r' | '\n') {
+            continue;
+        }
+        if ch.is_ascii_whitespace() {
+            return Err(ParseError::Base64(format!(
+                "invalid XML whitespace U+{:04X} in base64 text",
+                u32::from(ch)
+            )));
+        }
+        cleaned.push(ch);
+    }
+
+    STANDARD
+        .decode(&cleaned)
+        .map_err(|e| ParseError::Base64(e.to_string()))
+}
+
+fn collect_text_content(node: Node<'_, '_>) -> String {
+    node.children()
+        .filter_map(|child| child.is_text().then(|| child.text()).flatten())
+        .collect()
 }
 
 #[cfg(test)]
@@ -484,6 +660,136 @@ mod tests {
         let xml = r#"<root><Signature xmlns="http://example.com/fake"/></root>"#;
         let doc = Document::parse(xml).unwrap();
         assert!(find_signature_node(&doc).is_none());
+    }
+
+    // ── parse_key_info: dispatch parsing ──────────────────────────────
+
+    #[test]
+    fn parse_key_info_dispatches_supported_children() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <KeyName>idp-signing-key</KeyName>
+            <KeyValue>
+                <RSAKeyValue>
+                    <Modulus>AQAB</Modulus>
+                    <Exponent>AQAB</Exponent>
+                </RSAKeyValue>
+            </KeyValue>
+            <X509Data>
+                <X509Certificate>MIIB</X509Certificate>
+                <X509SubjectName>CN=Example</X509SubjectName>
+            </X509Data>
+            <dsig11:DEREncodedKeyValue>AQIDBA==</dsig11:DEREncodedKeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(key_info.sources.len(), 4);
+
+        assert_eq!(
+            key_info.sources[0],
+            KeyInfoSource::KeyName("idp-signing-key".to_string())
+        );
+        assert_eq!(
+            key_info.sources[1],
+            KeyInfoSource::KeyValue(KeyValueInfo::RsaKeyValue)
+        );
+        assert_eq!(
+            key_info.sources[2],
+            KeyInfoSource::X509Data(X509DataInfo {
+                certificate_count: 1,
+                subject_name_count: 1,
+                issuer_serial_count: 0,
+                ski_count: 0,
+                crl_count: 0,
+                digest_count: 0,
+            })
+        );
+        assert_eq!(
+            key_info.sources[3],
+            KeyInfoSource::DerEncodedKeyValue(vec![1, 2, 3, 4])
+        );
+    }
+
+    #[test]
+    fn parse_key_info_ignores_unknown_children() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <Foo>bar</Foo>
+            <KeyName>ok</KeyName>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(key_info.sources, vec![KeyInfoSource::KeyName("ok".into())]);
+    }
+
+    #[test]
+    fn parse_key_info_keyvalue_requires_single_child() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue/>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_x509data_must_not_be_empty() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <X509Data/>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_der_encoded_key_value_rejects_invalid_base64() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::Base64(_)));
+    }
+
+    #[test]
+    fn parse_key_info_dispatches_dsig11_ec_keyvalue() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <KeyValue>
+                <dsig11:ECKeyValue/>
+            </KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::EcKeyValue)]
+        );
+    }
+
+    #[test]
+    fn parse_key_info_keeps_unsupported_keyvalue_child_as_marker() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue>
+                <DSAKeyValue/>
+            </KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported(
+                "DSAKeyValue".into()
+            ))]
+        );
     }
 
     // ── parse_signed_info: happy path ────────────────────────────────
