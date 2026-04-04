@@ -1290,24 +1290,12 @@ mod tests {
                     && node.tag_name().name() == "Signature"
             })
             .unwrap();
-        let manifest_reference = parse_manifest_references(signature_node)
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("manifest reference should be present");
         let resolver = UriReferenceResolver::new(&doc);
-        let initial_data = resolver
-            .dereference(manifest_reference.uri.as_deref().unwrap())
-            .unwrap();
-        let manifest_pre_digest = crate::xmldsig::execute_transforms(
-            signature_node,
-            initial_data,
-            &manifest_reference.transforms,
-        )
-        .unwrap();
-        let computed_manifest_digest_b64 = base64::engine::general_purpose::STANDARD.encode(
-            compute_digest(manifest_reference.digest_method, &manifest_pre_digest),
-        );
+        let initial_data = resolver.dereference("#target").unwrap();
+        let manifest_pre_digest =
+            crate::xmldsig::execute_transforms(signature_node, initial_data, &[]).unwrap();
+        let computed_manifest_digest_b64 = base64::engine::general_purpose::STANDARD
+            .encode(compute_digest(DigestAlgorithm::Sha1, &manifest_pre_digest));
         let final_manifest_digest_b64 = if valid_manifest_digest {
             computed_manifest_digest_b64.as_str()
         } else {
@@ -1448,11 +1436,8 @@ mod tests {
         let (prefix, object_suffix) = xml
             .split_once("<ds:Object>")
             .expect("fixture should contain ds:Object");
-        let mutated_object_suffix = object_suffix.replacen(
-            "<ds:Reference URI=\"#target\">",
-            "<ds:Reference>",
-            1,
-        );
+        let mutated_object_suffix =
+            object_suffix.replacen("<ds:Reference URI=\"#target\">", "<ds:Reference>", 1);
         let broken_xml = format!("{prefix}<ds:Object>{mutated_object_suffix}");
 
         let result = VerifyContext::new()
