@@ -26,6 +26,9 @@ use crate::c14n::C14nAlgorithm;
 pub(crate) const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 /// XMLDSig 1.1 namespace URI.
 pub(crate) const XMLDSIG11_NS: &str = "http://www.w3.org/2009/xmldsig11#";
+const MAX_DER_ENCODED_KEY_VALUE_LEN: usize = 8192;
+const MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN: usize = 65_536;
+const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LEN.div_ceil(3) * 4;
 
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -549,7 +552,14 @@ fn decode_base64_xml_text(b64: &str) -> Result<Vec<u8>, ParseError> {
     use base64::engine::general_purpose::STANDARD;
 
     let mut cleaned = String::with_capacity(b64.len());
+    let mut raw_text_len = 0usize;
     for ch in b64.chars() {
+        if raw_text_len.saturating_add(ch.len_utf8()) > MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN {
+            return Err(ParseError::InvalidStructure(
+                "DEREncodedKeyValue exceeds maximum allowed text length".into(),
+            ));
+        }
+        raw_text_len = raw_text_len.saturating_add(ch.len_utf8());
         if matches!(ch, ' ' | '\t' | '\r' | '\n') {
             continue;
         }
@@ -560,11 +570,22 @@ fn decode_base64_xml_text(b64: &str) -> Result<Vec<u8>, ParseError> {
             )));
         }
         cleaned.push(ch);
+        if cleaned.len() > MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN {
+            return Err(ParseError::InvalidStructure(
+                "DEREncodedKeyValue exceeds maximum allowed length".into(),
+            ));
+        }
     }
 
-    STANDARD
+    let der = STANDARD
         .decode(&cleaned)
-        .map_err(|e| ParseError::Base64(e.to_string()))
+        .map_err(|e| ParseError::Base64(e.to_string()))?;
+    if der.len() > MAX_DER_ENCODED_KEY_VALUE_LEN {
+        return Err(ParseError::InvalidStructure(
+            "DEREncodedKeyValue exceeds maximum allowed length".into(),
+        ));
+    }
+    Ok(der)
 }
 
 fn collect_text_content(node: Node<'_, '_>) -> String {
@@ -585,7 +606,7 @@ fn ensure_no_element_children(node: Node<'_, '_>, element_name: &str) -> Result<
 fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Result<(), ParseError> {
     for child in node.children().filter(|child| child.is_text()) {
         if let Some(text) = child.text()
-            && !text.trim().is_empty()
+            && !is_xml_whitespace_only(text)
         {
             return Err(ParseError::InvalidStructure(format!(
                 "{element_name} must not contain non-whitespace mixed content"
@@ -595,10 +616,16 @@ fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Resu
     Ok(())
 }
 
+fn is_xml_whitespace_only(text: &str) -> bool {
+    text.chars()
+        .all(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'))
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     // ── SignatureAlgorithm ───────────────────────────────────────────
 
@@ -847,6 +874,29 @@ mod tests {
     fn parse_key_info_rejects_non_whitespace_mixed_content() {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">oops<KeyName>k</KeyName></KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_nbsp_as_non_xml_whitespace_mixed_content() {
+        let xml = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\u{00A0}<KeyName>k</KeyName></KeyInfo>";
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_der_encoded_key_value_rejects_oversized_payload() {
+        let oversized =
+            base64::engine::general_purpose::STANDARD
+                .encode(vec![0u8; MAX_DER_ENCODED_KEY_VALUE_LEN + 1]);
+        let xml = format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\"><dsig11:DEREncodedKeyValue>{oversized}</dsig11:DEREncodedKeyValue></KeyInfo>"
+        );
+        let doc = Document::parse(&xml).unwrap();
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
         assert!(matches!(err, ParseError::InvalidStructure(_)));

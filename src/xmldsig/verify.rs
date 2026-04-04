@@ -1051,9 +1051,9 @@ fn parse_signature_children<'a, 'input>(
     if let Some(unexpected_index) = first_unexpected_dsig_index {
         return Err(SignatureVerificationPipelineError::InvalidStructure {
             reason: if unexpected_index > allowed_prefix_end {
-                "Signature may contain only Object elements after the allowed prefix"
+                "After SignedInfo, SignatureValue, and optional KeyInfo, Signature may contain only Object elements"
             } else {
-                "unexpected XMLDSIG child element under Signature"
+                "Signature may contain SignedInfo first, SignatureValue second, optional KeyInfo third, and Object elements thereafter"
             },
         });
     }
