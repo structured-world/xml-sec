@@ -55,6 +55,7 @@ fn ec_p256_key_files_are_valid_pem() {
     assert_pem_file(&dir.join("ec-prime256v1-key.pem"), "PRIVATE KEY");
     assert_pem_file(&dir.join("ec-prime256v1-cert.pem"), "CERTIFICATE");
     assert_pem_file(&dir.join("ec-prime256v1-pubkey.pem"), "PUBLIC KEY");
+    assert_pem_file(&dir.join("saml-idp-ecdsa-pubkey.pem"), "PUBLIC KEY");
 }
 
 /// Verify EC P-384 key triplet exists and contains valid PEM markers.
@@ -175,8 +176,8 @@ fn fixture_file_count_matches_expected() {
     let mut count = 0;
     count_files_recursive(fixtures_dir(), &mut count);
     assert_eq!(
-        count, 78,
-        "expected 78 fixture files total (22 keys + 41 c14n + 14 donor xmldsig + 1 saml); \
+        count, 79,
+        "expected 79 fixture files total (23 keys + 41 c14n + 14 donor xmldsig + 1 saml); \
          if you added/removed files, update this count"
     );
 }
