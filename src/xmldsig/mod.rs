@@ -31,6 +31,6 @@ pub use transforms::{
 pub use types::{NodeSet, TransformData, TransformError};
 pub use verify::{
     DsigError, DsigStatus, FailureReason, KeyResolver, ReferenceProcessingError, ReferenceResult,
-    ReferencesResult, UriTypeSet, VerifyContext, VerifyResult, VerifyingKey,
+    ReferenceSet, ReferencesResult, UriTypeSet, VerifyContext, VerifyResult, VerifyingKey,
     process_all_references, process_reference, verify_signature_with_pem_key,
 };

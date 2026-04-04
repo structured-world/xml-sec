@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use crate::c14n::canonicalize;
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
-use super::parse::{Reference, SignatureAlgorithm, XMLDSIG_NS};
+use super::parse::{ParseError, Reference, SignatureAlgorithm, XMLDSIG_NS};
 use super::parse::{parse_reference, parse_signed_info};
 use super::signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
@@ -225,6 +225,10 @@ impl Default for VerifyContext<'_> {
 #[non_exhaustive]
 #[must_use = "inspect status before accepting the reference result"]
 pub struct ReferenceResult {
+    /// Whether this reference came from `<SignedInfo>` or `<Manifest>`.
+    pub reference_set: ReferenceSet,
+    /// Zero-based index within `reference_set`.
+    pub reference_index: usize,
     /// URI from the `<Reference>` element (for diagnostics).
     pub uri: String,
     /// Digest algorithm used.
@@ -233,6 +237,16 @@ pub struct ReferenceResult {
     pub status: DsigStatus,
     /// Pre-digest bytes (populated when `store_pre_digest` is enabled).
     pub pre_digest_data: Option<Vec<u8>>,
+}
+
+/// Origin of a processed `<Reference>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReferenceSet {
+    /// `<Reference>` under `<SignedInfo>`.
+    SignedInfo,
+    /// `<Reference>` under `<Object>/<Manifest>`.
+    Manifest,
 }
 
 /// Verification status.
@@ -251,7 +265,9 @@ pub enum DsigStatus {
 pub enum FailureReason {
     /// `<DigestValue>` mismatch for a `<Reference>` at `ref_index`.
     ReferenceDigestMismatch {
-        /// Zero-based index of the failing `<Reference>` in `<SignedInfo>`.
+        /// Zero-based index of the failing `<Reference>` in its processed set.
+        ///
+        /// Use `ReferenceResult::reference_set` to distinguish SignedInfo vs Manifest.
         ref_index: usize,
     },
     /// `<SignatureValue>` does not match canonicalized `<SignedInfo>`.
@@ -302,7 +318,8 @@ pub fn process_reference(
     reference: &Reference,
     resolver: &UriReferenceResolver<'_>,
     signature_node: Node<'_, '_>,
-    ref_index: usize,
+    reference_set: ReferenceSet,
+    reference_index: usize,
     store_pre_digest: bool,
 ) -> Result<ReferenceResult, ReferenceProcessingError> {
     // 1. Dereference URI. Omitted URI is distinct from URI="" in XMLDSig and
@@ -326,10 +343,14 @@ pub fn process_reference(
     let status = if constant_time_eq(&computed_digest, &reference.digest_value) {
         DsigStatus::Valid
     } else {
-        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index })
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch {
+            ref_index: reference_index,
+        })
     };
 
     Ok(ReferenceResult {
+        reference_set,
+        reference_index,
         uri: uri.to_owned(),
         digest_algorithm: reference.digest_method,
         status,
@@ -361,7 +382,14 @@ pub fn process_all_references(
     let mut results = Vec::with_capacity(references.len());
 
     for (i, reference) in references.iter().enumerate() {
-        let result = process_reference(reference, resolver, signature_node, i, store_pre_digest)?;
+        let result = process_reference(
+            reference,
+            resolver,
+            signature_node,
+            ReferenceSet::SignedInfo,
+            i,
+            store_pre_digest,
+        )?;
         let failed = matches!(result.status, DsigStatus::Invalid(_));
         results.push(result);
 
@@ -442,6 +470,10 @@ pub enum DsigError {
     /// `<SignedInfo>` parsing failed.
     #[error("failed to parse SignedInfo: {0}")]
     ParseSignedInfo(#[from] super::parse::ParseError),
+
+    /// `<Object>/<Manifest>/<Reference>` parsing failed.
+    #[error("failed to parse Manifest reference: {0}")]
+    ParseManifestReference(#[source] ParseError),
 
     /// Reference processing failed.
     #[error("reference processing failed: {0}")]
@@ -646,6 +678,7 @@ fn process_manifest_references(
             reference,
             resolver,
             signature_node,
+            ReferenceSet::Manifest,
             index,
             ctx.store_pre_digest,
         )?);
@@ -662,7 +695,7 @@ fn parse_manifest_references(
             && node.tag_name().namespace() == Some(XMLDSIG_NS)
             && node.tag_name().name() == "Object"
     }) {
-        for manifest_node in object_node.descendants().filter(|node| {
+        for manifest_node in object_node.children().filter(|node| {
             node.is_element()
                 && node.tag_name().namespace() == Some(XMLDSIG_NS)
                 && node.tag_name().name() == "Manifest"
@@ -684,7 +717,10 @@ fn parse_manifest_references(
                         reason: "Manifest must contain only ds:Reference element children",
                     });
                 }
-                references.push(parse_reference(child)?);
+                references.push(
+                    parse_reference(child)
+                        .map_err(SignatureVerificationPipelineError::ParseManifestReference)?,
+                );
             }
         }
     }
@@ -1218,6 +1254,14 @@ mod tests {
             .verify(&xml)
             .expect("manifest references should be processed when enabled");
         assert_eq!(result_with_manifests.manifest_references.len(), 1);
+        assert_eq!(
+            result_with_manifests.manifest_references[0].reference_set,
+            ReferenceSet::Manifest
+        );
+        assert_eq!(
+            result_with_manifests.manifest_references[0].reference_index,
+            0
+        );
         assert!(matches!(
             result_with_manifests.manifest_references[0].status,
             DsigStatus::Valid
@@ -1237,6 +1281,11 @@ mod tests {
             .verify(&xml)
             .expect("manifest digest mismatches should be reported as reference status");
         assert_eq!(result.manifest_references.len(), 1);
+        assert_eq!(
+            result.manifest_references[0].reference_set,
+            ReferenceSet::Manifest
+        );
+        assert_eq!(result.manifest_references[0].reference_index, 0);
         assert!(matches!(
             result.manifest_references[0].status,
             DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
@@ -1244,6 +1293,58 @@ mod tests {
         assert!(matches!(
             result.status,
             DsigStatus::Invalid(FailureReason::SignatureMismatch)
+        ));
+    }
+
+    #[test]
+    fn verify_context_ignores_nested_manifests_in_object() {
+        let xml = signature_with_manifest_xml(true)
+            .replace("<ds:Manifest>", "<wrapper><ds:Manifest>")
+            .replace("</ds:Manifest>", "</ds:Manifest></wrapper>");
+
+        let result = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(true)
+            .verify(&xml)
+            .expect("nested Manifest nodes are ignored in strict mode");
+        assert!(
+            result.manifest_references.is_empty(),
+            "only direct ds:Manifest children of ds:Object must be processed"
+        );
+    }
+
+    #[test]
+    fn verify_context_reports_manifest_reference_parse_errors_explicitly() {
+        let xml = signature_with_manifest_xml(true);
+        let (prefix, object_suffix) = xml
+            .split_once("<ds:Object>")
+            .expect("fixture should contain ds:Object");
+        let open = "<ds:DigestValue>";
+        let close = "</ds:DigestValue>";
+        let digest_start = object_suffix
+            .find(open)
+            .expect("manifest should contain DigestValue");
+        let digest_end = object_suffix[digest_start + open.len()..]
+            .find(close)
+            .map(|offset| digest_start + open.len() + offset)
+            .expect("manifest DigestValue must be closed");
+        let broken_object_suffix = format!(
+            "{}{}!!!{}{}",
+            &object_suffix[..digest_start],
+            open,
+            close,
+            &object_suffix[digest_end + close.len()..],
+        );
+        let broken_xml = format!("{prefix}<ds:Object>{broken_object_suffix}");
+
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(true)
+            .verify(&broken_xml)
+            .expect_err("invalid Manifest DigestValue must map to ParseManifestReference");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::ParseManifestReference(_)
         ));
     }
 
@@ -1411,7 +1512,15 @@ mod tests {
         // Now build a Reference with the correct digest and verify
         let reference = make_reference("", transforms, DigestAlgorithm::Sha256, expected_digest);
 
-        let result = process_reference(&reference, &resolver, sig_node, 0, false).unwrap();
+        let result = process_reference(
+            &reference,
+            &resolver,
+            sig_node,
+            ReferenceSet::SignedInfo,
+            0,
+            false,
+        )
+        .unwrap();
         assert!(
             matches!(result.status, DsigStatus::Valid),
             "digest should match"
@@ -1439,7 +1548,15 @@ mod tests {
         let wrong_digest = vec![0u8; 32];
         let reference = make_reference("", transforms, DigestAlgorithm::Sha256, wrong_digest);
 
-        let result = process_reference(&reference, &resolver, sig_node, 0, false).unwrap();
+        let result = process_reference(
+            &reference,
+            &resolver,
+            sig_node,
+            ReferenceSet::SignedInfo,
+            0,
+            false,
+        )
+        .unwrap();
         assert!(matches!(
             result.status,
             DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
@@ -1467,7 +1584,15 @@ mod tests {
             DigestAlgorithm::Sha256,
             vec![0u8; 32],
         );
-        let result = process_reference(&reference, &resolver, sig_node, 7, false).unwrap();
+        let result = process_reference(
+            &reference,
+            &resolver,
+            sig_node,
+            ReferenceSet::SignedInfo,
+            7,
+            false,
+        )
+        .unwrap();
         assert!(matches!(
             result.status,
             DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 7 })
@@ -1487,7 +1612,15 @@ mod tests {
         let digest = compute_digest(DigestAlgorithm::Sha256, &pre_digest);
 
         let reference = make_reference("", vec![], DigestAlgorithm::Sha256, digest);
-        let result = process_reference(&reference, &resolver, doc.root_element(), 0, true).unwrap();
+        let result = process_reference(
+            &reference,
+            &resolver,
+            doc.root_element(),
+            ReferenceSet::SignedInfo,
+            0,
+            true,
+        )
+        .unwrap();
 
         assert!(matches!(result.status, DsigStatus::Valid));
         assert!(result.pre_digest_data.is_some());
@@ -1527,7 +1660,15 @@ mod tests {
             DigestAlgorithm::Sha256,
             expected_digest,
         );
-        let result = process_reference(&reference, &resolver, sig_node, 0, false).unwrap();
+        let result = process_reference(
+            &reference,
+            &resolver,
+            sig_node,
+            ReferenceSet::SignedInfo,
+            0,
+            false,
+        )
+        .unwrap();
         assert!(matches!(result.status, DsigStatus::Valid));
     }
 
@@ -1539,7 +1680,14 @@ mod tests {
 
         let reference =
             make_reference("#nonexistent", vec![], DigestAlgorithm::Sha256, vec![0; 32]);
-        let result = process_reference(&reference, &resolver, doc.root_element(), 0, false);
+        let result = process_reference(
+            &reference,
+            &resolver,
+            doc.root_element(),
+            ReferenceSet::SignedInfo,
+            0,
+            false,
+        );
         assert!(result.is_err());
     }
 
@@ -1558,7 +1706,14 @@ mod tests {
             digest_value: vec![0; 32],
         };
 
-        let result = process_reference(&reference, &resolver, doc.root_element(), 0, false);
+        let result = process_reference(
+            &reference,
+            &resolver,
+            doc.root_element(),
+            ReferenceSet::SignedInfo,
+            0,
+            false,
+        );
         assert!(matches!(result, Err(ReferenceProcessingError::MissingUri)));
     }
 
@@ -1666,8 +1821,15 @@ mod tests {
         let digest = compute_digest(DigestAlgorithm::Sha1, &pre_digest);
 
         let reference = make_reference("", vec![], DigestAlgorithm::Sha1, digest);
-        let result =
-            process_reference(&reference, &resolver, doc.root_element(), 0, false).unwrap();
+        let result = process_reference(
+            &reference,
+            &resolver,
+            doc.root_element(),
+            ReferenceSet::SignedInfo,
+            0,
+            false,
+        )
+        .unwrap();
         assert!(matches!(result.status, DsigStatus::Valid));
         assert_eq!(result.digest_algorithm, DigestAlgorithm::Sha1);
     }
@@ -1684,8 +1846,15 @@ mod tests {
         let digest = compute_digest(DigestAlgorithm::Sha512, &pre_digest);
 
         let reference = make_reference("", vec![], DigestAlgorithm::Sha512, digest);
-        let result =
-            process_reference(&reference, &resolver, doc.root_element(), 0, false).unwrap();
+        let result = process_reference(
+            &reference,
+            &resolver,
+            doc.root_element(),
+            ReferenceSet::SignedInfo,
+            0,
+            false,
+        )
+        .unwrap();
         assert!(matches!(result.status, DsigStatus::Valid));
         assert_eq!(result.digest_algorithm, DigestAlgorithm::Sha512);
     }
@@ -1748,7 +1917,15 @@ mod tests {
         );
 
         // Verify: should pass
-        let result = process_reference(&corrected_ref, &resolver, sig_node, 0, true).unwrap();
+        let result = process_reference(
+            &corrected_ref,
+            &resolver,
+            sig_node,
+            ReferenceSet::SignedInfo,
+            0,
+            true,
+        )
+        .unwrap();
         assert!(
             matches!(result.status, DsigStatus::Valid),
             "SAML reference should verify"

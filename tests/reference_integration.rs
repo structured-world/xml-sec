@@ -16,7 +16,7 @@ use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::transforms::execute_transforms;
 use xml_sec::xmldsig::uri::UriReferenceResolver;
 use xml_sec::xmldsig::verify::{
-    DsigStatus, FailureReason, process_all_references, process_reference,
+    DsigStatus, FailureReason, ReferenceSet, process_all_references, process_reference,
 };
 
 // ── Helper ───────────────────────────────────────────────────────────────────
@@ -620,6 +620,7 @@ fn process_single_reference_with_pre_digest_valid() {
         &signed_info.references[0],
         &resolver,
         sig_node,
+        ReferenceSet::SignedInfo,
         0,
         true, // store pre-digest
     )
