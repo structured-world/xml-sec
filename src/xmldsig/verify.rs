@@ -973,14 +973,30 @@ fn parse_signature_children<'a, 'input>(
     let mut object_indices: Vec<usize> = Vec::new();
     let mut first_unexpected_dsig_index: Option<usize> = None;
 
-    for (zero_based_index, child) in signature_node
-        .children()
-        .filter(|node| node.is_element())
-        .enumerate()
-    {
-        let element_index = zero_based_index + 1;
-        if child.tag_name().namespace() != Some(XMLDSIG_NS) {
+    let mut element_index = 0usize;
+    for child in signature_node.children() {
+        if child.is_text() {
+            if child
+                .text()
+                .is_some_and(|text| !is_xml_whitespace_only(text))
+            {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "Signature must not contain non-whitespace mixed content",
+                });
+            }
             continue;
+        }
+        if !child.is_element() {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Signature must not contain non-element children",
+            });
+        }
+
+        element_index += 1;
+        if child.tag_name().namespace() != Some(XMLDSIG_NS) {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Signature must contain only XMLDSIG element children",
+            });
         }
         match child.tag_name().name() {
             "SignedInfo" => {
@@ -1102,6 +1118,11 @@ fn decode_signature_value(
     }
 
     Ok(base64::engine::general_purpose::STANDARD.decode(normalized)?)
+}
+
+fn is_xml_whitespace_only(text: &str) -> bool {
+    text.chars()
+        .all(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r'))
 }
 
 fn push_normalized_signature_text(
@@ -2512,7 +2533,14 @@ mod tests {
         let xml = r#"
 <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
-  <ds:SignedInfo/>
+  <ds:SignedInfo>
+    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    <ds:Reference URI="">
+      <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+      <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
+    </ds:Reference>
+  </ds:SignedInfo>
   <ds:SignatureValue>AA==</ds:SignatureValue>
   <ds:KeyInfo>
     <dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue>
@@ -2525,6 +2553,47 @@ mod tests {
         assert!(matches!(
             err,
             SignatureVerificationPipelineError::ParseKeyInfo(_)
+        ));
+    }
+
+    #[test]
+    fn pipeline_rejects_foreign_element_children_under_signature() {
+        let xml = r#"
+<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
+              xmlns:foo="urn:example:foo">
+  <ds:SignedInfo/>
+  <foo:Bar/>
+  <ds:SignatureValue>AA==</ds:SignatureValue>
+</ds:Signature>
+"#;
+
+        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
+            .expect_err("foreign element children under Signature must fail closed");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Signature must contain only XMLDSIG element children",
+            }
+        ));
+    }
+
+    #[test]
+    fn pipeline_rejects_non_whitespace_mixed_content_under_signature() {
+        let xml = r#"
+<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <ds:SignedInfo/>
+  oops
+  <ds:SignatureValue>AA==</ds:SignatureValue>
+</ds:Signature>
+"#;
+
+        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
+            .expect_err("non-whitespace mixed content under Signature must fail closed");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Signature must not contain non-whitespace mixed content",
+            }
         ));
     }
 

@@ -380,7 +380,7 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
             }
             (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
                 ensure_no_element_children(child, "DEREncodedKeyValue")?;
-                let der = decode_base64_xml_text(&collect_text_content(child))?;
+                let der = decode_base64_xml_children(child)?;
                 sources.push(KeyInfoSource::DerEncodedKeyValue(der));
             }
             _ => {}
@@ -547,33 +547,39 @@ fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec
     Ok(digest)
 }
 
-fn decode_base64_xml_text(b64: &str) -> Result<Vec<u8>, ParseError> {
+fn decode_base64_xml_children(node: Node<'_, '_>) -> Result<Vec<u8>, ParseError> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 
-    let mut cleaned = String::with_capacity(b64.len());
+    let mut cleaned = String::new();
     let mut raw_text_len = 0usize;
-    for ch in b64.chars() {
-        if raw_text_len.saturating_add(ch.len_utf8()) > MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN {
-            return Err(ParseError::InvalidStructure(
-                "DEREncodedKeyValue exceeds maximum allowed text length".into(),
-            ));
-        }
-        raw_text_len = raw_text_len.saturating_add(ch.len_utf8());
-        if matches!(ch, ' ' | '\t' | '\r' | '\n') {
-            continue;
-        }
-        if ch.is_ascii_whitespace() {
-            return Err(ParseError::Base64(format!(
-                "invalid XML whitespace U+{:04X} in base64 text",
-                u32::from(ch)
-            )));
-        }
-        cleaned.push(ch);
-        if cleaned.len() > MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN {
-            return Err(ParseError::InvalidStructure(
-                "DEREncodedKeyValue exceeds maximum allowed length".into(),
-            ));
+    for text in node
+        .children()
+        .filter(|child| child.is_text())
+        .filter_map(|child| child.text())
+    {
+        for ch in text.chars() {
+            if raw_text_len.saturating_add(ch.len_utf8()) > MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN {
+                return Err(ParseError::InvalidStructure(
+                    "DEREncodedKeyValue exceeds maximum allowed text length".into(),
+                ));
+            }
+            raw_text_len = raw_text_len.saturating_add(ch.len_utf8());
+            if matches!(ch, ' ' | '\t' | '\r' | '\n') {
+                continue;
+            }
+            if ch.is_ascii_whitespace() {
+                return Err(ParseError::Base64(format!(
+                    "invalid XML whitespace U+{:04X} in base64 text",
+                    u32::from(ch)
+                )));
+            }
+            cleaned.push(ch);
+            if cleaned.len() > MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN {
+                return Err(ParseError::InvalidStructure(
+                    "DEREncodedKeyValue exceeds maximum allowed length".into(),
+                ));
+            }
         }
     }
 
