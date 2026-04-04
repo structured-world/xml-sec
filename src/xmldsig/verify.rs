@@ -316,7 +316,8 @@ impl ReferencesResult {
 /// - `reference`: The parsed `<Reference>` element.
 /// - `resolver`: URI resolver for the document.
 /// - `signature_node`: The `<Signature>` element (for enveloped-signature transform).
-/// - `ref_index`: Zero-based index of this reference in `<SignedInfo>`.
+/// - `reference_set`: Whether this reference belongs to `<SignedInfo>` or `<Manifest>`.
+/// - `reference_index`: Zero-based index of this reference inside `reference_set`.
 /// - `store_pre_digest`: If true, store the pre-digest bytes in the result.
 ///
 /// # Errors
