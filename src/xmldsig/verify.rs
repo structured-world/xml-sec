@@ -162,8 +162,10 @@ impl<'a> VerifyContext<'a> {
     /// When enabled, references under `<ds:Object><ds:Manifest>` are processed
     /// and returned in `VerifyResult::manifest_references`.
     ///
-    /// Manifest failures are reported as per-reference statuses and do not
-    /// alter the final `VerifyResult::status` (non-fatal semantics).
+    /// Manifest reference policy violations and processing failures are
+    /// reported as per-reference statuses and do not alter the final
+    /// `VerifyResult::status` (non-fatal semantics). Structural/parse errors
+    /// in Manifest content abort `verify()` and are returned as `Err(...)`.
     pub fn process_manifests(mut self, enabled: bool) -> Self {
         self.process_manifests = enabled;
         self
@@ -687,6 +689,13 @@ fn process_manifest_references(
         )
         .is_err()
         {
+            tracing::debug!(
+                reference_set = "manifest",
+                reference_index = index,
+                failure_reason = ?FailureReason::ReferencePolicyViolation { ref_index: index },
+                uri = ?reference.uri,
+                "manifest reference policy rejected"
+            );
             results.push(manifest_reference_invalid_result(
                 reference,
                 index,
@@ -704,11 +713,21 @@ fn process_manifest_references(
             ctx.store_pre_digest,
         ) {
             Ok(result) => results.push(result),
-            Err(_) => results.push(manifest_reference_invalid_result(
-                reference,
-                index,
-                FailureReason::ReferenceProcessingFailure { ref_index: index },
-            )),
+            Err(err) => {
+                tracing::debug!(
+                    reference_set = "manifest",
+                    reference_index = index,
+                    failure_reason = ?FailureReason::ReferenceProcessingFailure { ref_index: index },
+                    uri = ?reference.uri,
+                    error = %err,
+                    "manifest reference processing failed"
+                );
+                results.push(manifest_reference_invalid_result(
+                    reference,
+                    index,
+                    FailureReason::ReferenceProcessingFailure { ref_index: index },
+                ))
+            }
         }
     }
     Ok(results)
