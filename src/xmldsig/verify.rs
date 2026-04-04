@@ -1322,6 +1322,29 @@ mod tests {
             DsigStatus::Invalid(FailureReason::SignatureMismatch)
         ));
 
+        let xml_with_manifest = signature_with_manifest_xml(true);
+        let (prefix, object_suffix) = xml_with_manifest
+            .split_once("<ds:Object>")
+            .expect("fixture should contain ds:Object");
+        let malformed_object_suffix = object_suffix
+            .replacen("<ds:Reference URI=\"#target\">", "<ds:Foo>", 1)
+            .replacen("</ds:Reference>", "</ds:Foo>", 1);
+        let malformed_manifest_xml = format!("{prefix}<ds:Object>{malformed_object_suffix}");
+        let malformed_with_manifests_disabled = VerifyContext::new()
+            .key(&RejectingKey)
+            .verify(&malformed_manifest_xml)
+            .expect("malformed Manifest must be ignored when manifest processing is disabled");
+        assert!(
+            malformed_with_manifests_disabled
+                .manifest_references
+                .is_empty(),
+            "manifest parser must not run when process_manifests is disabled",
+        );
+        assert!(matches!(
+            malformed_with_manifests_disabled.status,
+            DsigStatus::Invalid(FailureReason::SignatureMismatch)
+        ));
+
         let result_with_manifests = VerifyContext::new()
             .key(&RejectingKey)
             .process_manifests(true)
@@ -1428,6 +1451,10 @@ mod tests {
             result.manifest_references[0].status,
             DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
         ));
+        assert!(matches!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::SignatureMismatch)
+        ));
     }
 
     #[test]
@@ -1450,6 +1477,10 @@ mod tests {
         assert!(matches!(
             result.manifest_references[0].status,
             DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
+        ));
+        assert!(matches!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::SignatureMismatch)
         ));
     }
 
