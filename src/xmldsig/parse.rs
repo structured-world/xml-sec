@@ -30,6 +30,7 @@ pub(crate) const XMLDSIG11_NS: &str = "http://www.w3.org/2009/xmldsig11#";
 const MAX_DER_ENCODED_KEY_VALUE_LEN: usize = 8192;
 const MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN: usize = 65_536;
 const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LEN.div_ceil(3) * 4;
+const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
 
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -368,7 +369,8 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "KeyName") => {
                 ensure_no_element_children(child, "KeyName")?;
-                let key_name = collect_text_content(child);
+                let key_name =
+                    collect_text_content_bounded(child, MAX_KEY_NAME_TEXT_LEN, "KeyName")?;
                 sources.push(KeyInfoSource::KeyName(key_name));
             }
             (Some(XMLDSIG_NS), "KeyValue") => {
@@ -600,10 +602,24 @@ fn decode_base64_xml_children(node: Node<'_, '_>) -> Result<Vec<u8>, ParseError>
     Ok(der)
 }
 
-fn collect_text_content(node: Node<'_, '_>) -> String {
-    node.children()
+fn collect_text_content_bounded(
+    node: Node<'_, '_>,
+    max_len: usize,
+    element_name: &'static str,
+) -> Result<String, ParseError> {
+    let mut text = String::new();
+    for chunk in node
+        .children()
         .filter_map(|child| child.is_text().then(|| child.text()).flatten())
-        .collect()
+    {
+        if text.len().saturating_add(chunk.len()) > max_len {
+            return Err(ParseError::InvalidStructure(format!(
+                "{element_name} exceeds maximum allowed text length"
+            )));
+        }
+        text.push_str(chunk);
+    }
+    Ok(text)
 }
 
 fn ensure_no_element_children(node: Node<'_, '_>, element_name: &str) -> Result<(), ParseError> {
@@ -875,6 +891,18 @@ mod tests {
             key_info.sources,
             vec![KeyInfoSource::KeyName("  signing key  ".into())]
         );
+    }
+
+    #[test]
+    fn parse_key_info_rejects_oversized_keyname_text() {
+        let oversized = "A".repeat(4097);
+        let xml = format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>{oversized}</KeyName></KeyInfo>"
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
     }
 
     #[test]
