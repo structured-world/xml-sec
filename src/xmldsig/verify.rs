@@ -627,6 +627,7 @@ fn verify_signature_with_context(
     let signature_children = parse_signature_children(signature_node)?;
     let signed_info_node = signature_children.signed_info_node;
     if let Some(key_info_node) = signature_children.key_info_node {
+        // P2-001: validate KeyInfo structure now; key material consumption is deferred.
         parse_key_info(key_info_node).map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
     }
 
