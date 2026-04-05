@@ -555,11 +555,13 @@ type SignatureVerificationPipelineError = DsigError;
 /// Verify one XMLDSig `<Signature>` end-to-end with a PEM public key.
 ///
 /// Pipeline:
-/// 1. Parse `<SignedInfo>`
-/// 2. Validate all `<Reference>` digests (fail-fast)
-/// 3. Canonicalize `<SignedInfo>`
-/// 4. Base64-decode `<SignatureValue>`
-/// 5. Verify signature bytes against canonicalized `<SignedInfo>`
+/// 1. Parse `<Signature>` children and enforce structural constraints
+/// 2. Parse and validate optional `<KeyInfo>` (when present)
+/// 3. Parse `<SignedInfo>`
+/// 4. Validate all `<Reference>` digests (fail-fast)
+/// 5. Canonicalize `<SignedInfo>`
+/// 6. Base64-decode `<SignatureValue>`
+/// 7. Verify signature bytes against canonicalized `<SignedInfo>`
 ///
 /// If any `<Reference>` digest mismatches, returns `Ok` with
 /// `status == Invalid(ReferenceDigestMismatch { .. })`.
