@@ -568,6 +568,10 @@ type SignatureVerificationPipelineError = DsigError;
 /// - The document must contain exactly one XMLDSig `<Signature>` element.
 /// - `<SignedInfo>` must be the first element child of `<Signature>` and appear once.
 /// - `<SignatureValue>` must be the second element child of `<Signature>` and appear once.
+/// - `<KeyInfo>` is optional and, when present, must be the third element child.
+/// - Only XMLDSig namespace element children are allowed under `<Signature>`.
+/// - Non-whitespace mixed text content under `<Signature>` is rejected.
+/// - After `<SignedInfo>`, `<SignatureValue>`, and optional `<KeyInfo>`, only `<Object>` elements are allowed.
 /// - `<SignatureValue>` must not contain nested element children.
 pub fn verify_signature_with_pem_key(
     xml: &str,
