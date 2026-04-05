@@ -2557,16 +2557,20 @@ mod tests {
 
     #[test]
     fn pipeline_rejects_foreign_element_children_under_signature() {
-        let xml = r#"
-<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
-              xmlns:foo="urn:example:foo">
-  <ds:SignedInfo/>
-  <foo:Bar/>
-  <ds:SignatureValue>AA==</ds:SignatureValue>
-</ds:Signature>
-"#;
+        let base_xml = signature_with_target_reference("AQ==");
+        let xml = base_xml
+            .replace(
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:foo="urn:example:foo">"#,
+            )
+            .replace(
+                "</ds:SignedInfo>\n    <ds:SignatureValue>",
+                "</ds:SignedInfo>\n    <foo:Bar/>\n    <ds:SignatureValue>",
+            );
 
-        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .verify(&xml)
             .expect_err("foreign element children under Signature must fail closed");
         assert!(matches!(
             err,
@@ -2578,15 +2582,15 @@ mod tests {
 
     #[test]
     fn pipeline_rejects_non_whitespace_mixed_content_under_signature() {
-        let xml = r#"
-<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-  <ds:SignedInfo/>
-  oops
-  <ds:SignatureValue>AA==</ds:SignatureValue>
-</ds:Signature>
-"#;
+        let base_xml = signature_with_target_reference("AQ==");
+        let xml = base_xml.replace(
+            "</ds:SignedInfo>\n    <ds:SignatureValue>",
+            "</ds:SignedInfo>\n    oops\n    <ds:SignatureValue>",
+        );
 
-        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .verify(&xml)
             .expect_err("non-whitespace mixed content under Signature must fail closed");
         assert!(matches!(
             err,
@@ -2598,16 +2602,15 @@ mod tests {
 
     #[test]
     fn pipeline_rejects_keyinfo_out_of_order() {
-        let xml = r#"
-<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-  <ds:SignedInfo/>
-  <ds:SignatureValue>AA==</ds:SignatureValue>
-  <ds:Object/>
-  <ds:KeyInfo><ds:KeyName>late</ds:KeyName></ds:KeyInfo>
-</ds:Signature>
-"#;
+        let base_xml = signature_with_target_reference("AQ==");
+        let xml = base_xml.replace(
+            "</ds:SignatureValue>\n  </ds:Signature>",
+            "</ds:SignatureValue>\n    <ds:Object/>\n    <ds:KeyInfo><ds:KeyName>late</ds:KeyName></ds:KeyInfo>\n  </ds:Signature>",
+        );
 
-        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .verify(&xml)
             .expect_err("KeyInfo after Object must be rejected by Signature child order checks");
         assert!(matches!(
             err,
