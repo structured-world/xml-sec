@@ -20,6 +20,7 @@ use roxmltree::{Document, Node};
 
 use super::digest::DigestAlgorithm;
 use super::transforms::{self, Transform};
+use super::whitespace::is_xml_whitespace_only;
 use crate::c14n::C14nAlgorithm;
 
 /// XMLDSig namespace URI.
@@ -586,6 +587,11 @@ fn decode_base64_xml_children(node: Node<'_, '_>) -> Result<Vec<u8>, ParseError>
     let der = STANDARD
         .decode(&cleaned)
         .map_err(|e| ParseError::Base64(e.to_string()))?;
+    if der.is_empty() {
+        return Err(ParseError::InvalidStructure(
+            "DEREncodedKeyValue must not be empty".into(),
+        ));
+    }
     if der.len() > MAX_DER_ENCODED_KEY_VALUE_LEN {
         return Err(ParseError::InvalidStructure(
             "DEREncodedKeyValue exceeds maximum allowed length".into(),
@@ -620,11 +626,6 @@ fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Resu
         }
     }
     Ok(())
-}
-
-fn is_xml_whitespace_only(text: &str) -> bool {
-    text.chars()
-        .all(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'))
 }
 
 #[cfg(test)]
@@ -903,6 +904,20 @@ mod tests {
             "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\"><dsig11:DEREncodedKeyValue>{oversized}</dsig11:DEREncodedKeyValue></KeyInfo>"
         );
         let doc = Document::parse(&xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_der_encoded_key_value_rejects_empty_payload() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <dsig11:DEREncodedKeyValue>
+                
+            </dsig11:DEREncodedKeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
         assert!(matches!(err, ParseError::InvalidStructure(_)));

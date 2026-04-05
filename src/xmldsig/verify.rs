@@ -26,6 +26,7 @@ use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, XPATH_TRANSFORM_URI, execute_transforms,
 };
 use super::uri::{UriReferenceResolver, parse_xpointer_id_fragment};
+use super::whitespace::is_xml_whitespace_only;
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
@@ -987,9 +988,7 @@ fn parse_signature_children<'a, 'input>(
             continue;
         }
         if !child.is_element() {
-            return Err(SignatureVerificationPipelineError::InvalidStructure {
-                reason: "Signature must not contain non-element children",
-            });
+            continue;
         }
 
         element_index += 1;
@@ -1118,11 +1117,6 @@ fn decode_signature_value(
     }
 
     Ok(base64::engine::general_purpose::STANDARD.decode(normalized)?)
-}
-
-fn is_xml_whitespace_only(text: &str) -> bool {
-    text.chars()
-        .all(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r'))
 }
 
 fn push_normalized_signature_text(
@@ -2616,5 +2610,37 @@ mod tests {
                 reason: "KeyInfo must be the third element child of Signature when present"
             }
         ));
+    }
+
+    #[test]
+    fn pipeline_accepts_comments_and_processing_instructions_under_signature() {
+        let xml = r#"
+<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <?dbg keep ?>
+  <!-- signature metadata -->
+  <ds:SignedInfo>
+    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    <ds:Reference URI="">
+      <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+      <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
+    </ds:Reference>
+  </ds:SignedInfo>
+  <!-- between required children -->
+  <ds:SignatureValue>AA==</ds:SignatureValue>
+</ds:Signature>
+"#;
+
+        let doc = Document::parse(xml).expect("test XML must parse");
+        let signature_node = doc.root_element();
+        let parsed = parse_signature_children(signature_node)
+            .expect("comment/PI nodes under Signature must be ignored");
+
+        assert_eq!(parsed.signed_info_node.tag_name().name(), "SignedInfo");
+        assert_eq!(
+            parsed.signature_value_node.tag_name().name(),
+            "SignatureValue"
+        );
+        assert!(parsed.key_info_node.is_none());
     }
 }

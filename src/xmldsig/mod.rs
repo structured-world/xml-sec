@@ -15,6 +15,7 @@ pub mod transforms;
 pub mod types;
 pub mod uri;
 pub mod verify;
+pub(crate) mod whitespace;
 
 pub use digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 pub use parse::{
