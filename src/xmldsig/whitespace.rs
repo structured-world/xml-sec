@@ -26,8 +26,9 @@ pub(crate) fn normalize_xml_base64_text(
             continue;
         }
         if ch.is_ascii_whitespace() {
-            let invalid_byte =
-                u8::try_from(u32::from(ch)).expect("ASCII whitespace always fits into u8");
+            let mut utf8 = [0_u8; 4];
+            let encoded = ch.encode_utf8(&mut utf8);
+            let invalid_byte = encoded.as_bytes()[0];
             return Err(XmlBase64NormalizeError {
                 invalid_byte,
                 normalized_offset: normalized.len(),

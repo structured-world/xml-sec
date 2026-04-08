@@ -323,20 +323,7 @@ pub(crate) fn parse_reference(reference_node: Node) -> Result<Reference, ParseEr
         element: "DigestValue",
     })?;
     verify_ds_element(digest_value_node, "DigestValue")?;
-    let mut digest_b64 = String::new();
-    for child in digest_value_node.children() {
-        if child.is_element() {
-            return Err(ParseError::InvalidStructure(
-                "DigestValue must not contain element children".into(),
-            ));
-        }
-        if child.is_text()
-            && let Some(text) = child.text()
-        {
-            digest_b64.push_str(text);
-        }
-    }
-    let digest_value = base64_decode_digest(&digest_b64, digest_method)?;
+    let digest_value = decode_digest_value_children(digest_value_node, digest_method)?;
 
     // No more children expected
     if let Some(unexpected) = children.next() {
@@ -566,6 +553,37 @@ fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec
         });
     }
     Ok(digest)
+}
+
+fn decode_digest_value_children(
+    digest_value_node: Node<'_, '_>,
+    digest_method: DigestAlgorithm,
+) -> Result<Vec<u8>, ParseError> {
+    let max_base64_len = digest_method.output_len().div_ceil(3) * 4;
+    let mut cleaned = String::with_capacity(max_base64_len);
+
+    for child in digest_value_node.children() {
+        if child.is_element() {
+            return Err(ParseError::InvalidStructure(
+                "DigestValue must not contain element children".into(),
+            ));
+        }
+        if let Some(text) = child.text() {
+            normalize_xml_base64_text(text, &mut cleaned).map_err(|err| {
+                ParseError::Base64(format!(
+                    "invalid XML whitespace U+{:04X} in DigestValue",
+                    err.invalid_byte
+                ))
+            })?;
+            if cleaned.len() > max_base64_len {
+                return Err(ParseError::Base64(
+                    "DigestValue exceeds maximum allowed base64 length".into(),
+                ));
+            }
+        }
+    }
+
+    base64_decode_digest(&cleaned, digest_method)
 }
 
 fn decode_der_encoded_key_value_base64(node: Node<'_, '_>) -> Result<Vec<u8>, ParseError> {
