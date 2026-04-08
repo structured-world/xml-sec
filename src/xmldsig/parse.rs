@@ -148,7 +148,12 @@ pub enum KeyValueInfo {
     /// `<ECKeyValue>`.
     EcKeyValue,
     /// Any other `<KeyValue>` child not yet supported by this phase.
-    Unsupported(String),
+    Unsupported {
+        /// Namespace URI of the unsupported child, when present.
+        namespace: Option<String>,
+        /// Local name of the unsupported child element.
+        local_name: String,
+    },
 }
 
 /// Parsed `<X509Data>` children (dispatch-only in P2-001).
@@ -484,7 +489,10 @@ fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
     ) {
         (Some(XMLDSIG_NS), "RSAKeyValue") => Ok(KeyValueInfo::RsaKeyValue),
         (Some(XMLDSIG11_NS), "ECKeyValue") => Ok(KeyValueInfo::EcKeyValue),
-        (_, child_name) => Ok(KeyValueInfo::Unsupported(child_name.to_string())),
+        (namespace, child_name) => Ok(KeyValueInfo::Unsupported {
+            namespace: namespace.map(str::to_string),
+            local_name: child_name.to_string(),
+        }),
     }
 }
 
@@ -891,6 +899,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_key_info_der_encoded_key_value_accepts_xml_whitespace() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <dsig11:DEREncodedKeyValue>
+                AQID
+                BA==
+            </dsig11:DEREncodedKeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::DerEncodedKeyValue(vec![1, 2, 3, 4])]
+        );
+    }
+
+    #[test]
     fn parse_key_info_dispatches_dsig11_ec_keyvalue() {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
@@ -919,9 +945,10 @@ mod tests {
         let key_info = parse_key_info(doc.root_element()).unwrap();
         assert_eq!(
             key_info.sources,
-            vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported(
-                "ECKeyValue".into()
-            ))]
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
+                namespace: Some(XMLDSIG_NS.to_string()),
+                local_name: "ECKeyValue".into(),
+            })]
         );
     }
 
@@ -937,9 +964,10 @@ mod tests {
         let key_info = parse_key_info(doc.root_element()).unwrap();
         assert_eq!(
             key_info.sources,
-            vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported(
-                "DSAKeyValue".into()
-            ))]
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
+                namespace: Some(XMLDSIG_NS.to_string()),
+                local_name: "DSAKeyValue".into(),
+            })]
         );
     }
 
