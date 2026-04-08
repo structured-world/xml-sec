@@ -56,6 +56,16 @@ pub trait KeyResolver {
     /// maps `Ok(None)` to `DsigStatus::Invalid(FailureReason::KeyNotFound)`;
     /// reserve `Err(...)` for resolver failures.
     fn resolve<'a>(&'a self, xml: &str) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError>;
+
+    /// Return `true` when this resolver consumes document `<KeyInfo>` material.
+    ///
+    /// The verification pipeline uses this to decide whether malformed
+    /// `<KeyInfo>` should raise `DsigError::ParseKeyInfo` before resolver
+    /// execution. Resolvers that ignore document key material can keep the
+    /// default `false` to avoid fail-closed parsing on advisory `<KeyInfo>`.
+    fn consumes_document_key_info(&self) -> bool {
+        false
+    }
 }
 
 /// Allowed URI classes for `<Reference URI="...">`.
@@ -556,15 +566,19 @@ type SignatureVerificationPipelineError = DsigError;
 ///
 /// Pipeline:
 /// 1. Parse `<Signature>` children and enforce structural constraints
-/// 2. Parse and validate optional `<KeyInfo>` (when present)
-/// 3. Parse `<SignedInfo>`
-/// 4. Validate all `<Reference>` digests (fail-fast)
-/// 5. Canonicalize `<SignedInfo>`
-/// 6. Base64-decode `<SignatureValue>`
-/// 7. Verify signature bytes against canonicalized `<SignedInfo>`
+/// 2. Parse `<SignedInfo>`
+/// 3. Validate all `<Reference>` digests (fail-fast)
+/// 4. Canonicalize `<SignedInfo>`
+/// 5. Base64-decode `<SignatureValue>`
+/// 6. Verify signature bytes against canonicalized `<SignedInfo>` using the provided PEM key
 ///
 /// If any `<Reference>` digest mismatches, returns `Ok` with
 /// `status == Invalid(ReferenceDigestMismatch { .. })`.
+///
+/// This API uses only the provided PEM key and does not parse embedded
+/// `<KeyInfo>` key material for key selection/validation. Consequently,
+/// malformed optional `<KeyInfo>` does not produce `DsigError::ParseKeyInfo`
+/// on this API path.
 ///
 /// Structural constraints enforced by this API:
 /// - The document must contain exactly one XMLDSig `<Signature>` element.
@@ -628,9 +642,12 @@ fn verify_signature_with_context(
 
     let signature_children = parse_signature_children(signature_node)?;
     let signed_info_node = signature_children.signed_info_node;
-    if ctx.key.is_none()
-        && let Some(key_info_node) = signature_children.key_info_node
-    {
+    let should_parse_key_info = match (ctx.key, ctx.key_resolver) {
+        (Some(_), _) => false,
+        (None, Some(resolver)) => resolver.consumes_document_key_info(),
+        (None, None) => true,
+    };
+    if should_parse_key_info && let Some(key_info_node) = signature_children.key_info_node {
         // P2-001: validate KeyInfo structure now; key material consumption is deferred.
         parse_key_info(key_info_node).map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
     }
@@ -1253,6 +1270,22 @@ mod tests {
         ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
         {
             Ok(None)
+        }
+    }
+
+    struct ConsumingKeyInfoResolver;
+
+    impl KeyResolver for ConsumingKeyInfoResolver {
+        fn resolve<'a>(
+            &'a self,
+            _xml: &str,
+        ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
+        {
+            Ok(None)
+        }
+
+        fn consumes_document_key_info(&self) -> bool {
+            true
         }
     }
 
@@ -1928,6 +1961,52 @@ mod tests {
         assert!(matches!(
             result.signed_info_references[0].status,
             DsigStatus::Valid
+        ));
+    }
+
+    #[test]
+    fn verify_context_resolver_can_ignore_malformed_keyinfo_by_default() {
+        let base_xml = signature_with_target_reference("AQ==");
+        let xml = base_xml
+            .replace(
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">"#,
+            )
+            .replace(
+                "</ds:SignatureValue>\n  </ds:Signature>",
+                "</ds:SignatureValue>\n    <ds:KeyInfo><dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue></ds:KeyInfo>\n  </ds:Signature>",
+            );
+
+        let result = VerifyContext::new()
+            .key_resolver(&MissingKeyResolver)
+            .verify(&xml)
+            .expect("resolver path should not hard-fail on advisory malformed KeyInfo by default");
+        assert!(matches!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::KeyNotFound)
+        ));
+    }
+
+    #[test]
+    fn verify_context_resolver_can_opt_in_to_keyinfo_parse_failures() {
+        let base_xml = signature_with_target_reference("AQ==");
+        let xml = base_xml
+            .replace(
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">"#,
+            )
+            .replace(
+                "</ds:SignatureValue>\n  </ds:Signature>",
+                "</ds:SignatureValue>\n    <ds:KeyInfo><dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue></ds:KeyInfo>\n  </ds:Signature>",
+            );
+
+        let err = VerifyContext::new()
+            .key_resolver(&ConsumingKeyInfoResolver)
+            .verify(&xml)
+            .expect_err("resolver opted into KeyInfo parsing, malformed KeyInfo must fail");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::ParseKeyInfo(_)
         ));
     }
 

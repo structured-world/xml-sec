@@ -540,17 +540,23 @@ fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 
-    let mut cleaned = String::with_capacity(b64.len());
+    let expected = digest_method.output_len();
+    let max_base64_len = expected.div_ceil(3) * 4;
+    let mut cleaned = String::with_capacity(b64.len().min(max_base64_len));
     normalize_xml_base64_text(b64, &mut cleaned).map_err(|err| {
         ParseError::Base64(format!(
             "invalid XML whitespace U+{:04X} in DigestValue",
             err.invalid_byte
         ))
     })?;
+    if cleaned.len() > max_base64_len {
+        return Err(ParseError::Base64(
+            "DigestValue exceeds maximum allowed base64 length".into(),
+        ));
+    }
     let digest = STANDARD
         .decode(&cleaned)
         .map_err(|e| ParseError::Base64(e.to_string()))?;
-    let expected = digest_method.output_len();
     let actual = digest.len();
     if actual != expected {
         return Err(ParseError::DigestLengthMismatch {
@@ -1469,6 +1475,21 @@ mod tests {
         )
         .expect_err("form-feed/vertical-tab in DigestValue must be rejected");
         assert!(matches!(err, ParseError::Base64(_)));
+    }
+
+    #[test]
+    fn base64_decode_digest_rejects_oversized_base64_before_decode() {
+        let err = base64_decode_digest("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", DigestAlgorithm::Sha1)
+            .expect_err("oversized DigestValue base64 must fail before decode");
+        match err {
+            ParseError::Base64(message) => {
+                assert!(
+                    message.contains("DigestValue exceeds maximum allowed base64 length"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected ParseError::Base64, got {other:?}"),
+        }
     }
 
     // ── Real-world SAML structure ────────────────────────────────────
