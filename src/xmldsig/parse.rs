@@ -360,7 +360,8 @@ pub(crate) fn parse_reference(reference_node: Node) -> Result<Reference, ParseEr
 /// - `<dsig11:DEREncodedKeyValue>`
 ///
 /// Unknown top-level `<KeyInfo>` children are ignored (lax processing), while
-/// unknown XMLDSig (`ds:*`) children inside `<X509Data>` are rejected fail-closed.
+/// unknown XMLDSig-owned (`ds:*` / `dsig11:*`) children inside `<X509Data>` are
+/// rejected fail-closed.
 pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
     verify_ds_element(key_info_node, "KeyInfo")?;
     ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
@@ -384,7 +385,7 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
             }
             (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
                 ensure_no_element_children(child, "DEREncodedKeyValue")?;
-                let der = decode_base64_xml_children(child)?;
+                let der = decode_der_encoded_key_value_base64(child)?;
                 sources.push(KeyInfoSource::DerEncodedKeyValue(der));
             }
             _ => {}
@@ -503,9 +504,9 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
             (Some(XMLDSIG_NS), "X509SKI") => info.ski_count += 1,
             (Some(XMLDSIG_NS), "X509CRL") => info.crl_count += 1,
             (Some(XMLDSIG11_NS), "X509Digest") => info.digest_count += 1,
-            (Some(XMLDSIG_NS), child_name) => {
+            (Some(XMLDSIG_NS), child_name) | (Some(XMLDSIG11_NS), child_name) => {
                 return Err(ParseError::InvalidStructure(format!(
-                    "X509Data contains unsupported ds child element <{child_name}>"
+                    "X509Data contains unsupported XMLDSig child element <{child_name}>"
                 )));
             }
             _ => {}
@@ -556,7 +557,7 @@ fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec
     Ok(digest)
 }
 
-fn decode_base64_xml_children(node: Node<'_, '_>) -> Result<Vec<u8>, ParseError> {
+fn decode_der_encoded_key_value_base64(node: Node<'_, '_>) -> Result<Vec<u8>, ParseError> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 
@@ -832,6 +833,20 @@ mod tests {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <X509Data>
                 <Foo/>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_unknown_xmlsig11_child_in_x509data() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <X509Data>
+                <dsig11:Foo/>
             </X509Data>
         </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
