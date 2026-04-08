@@ -502,6 +502,11 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
             (Some(XMLDSIG_NS), "X509SKI") => info.ski_count += 1,
             (Some(XMLDSIG_NS), "X509CRL") => info.crl_count += 1,
             (Some(XMLDSIG11_NS), "X509Digest") => info.digest_count += 1,
+            (Some(XMLDSIG_NS), child_name) => {
+                return Err(ParseError::InvalidStructure(format!(
+                    "X509Data contains unsupported ds child element <{child_name}>"
+                )));
+            }
             _ => {}
         }
     }
@@ -822,6 +827,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_key_info_rejects_unknown_xmlsig_child_in_x509data() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <X509Data>
+                <Foo/>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
     fn parse_key_info_der_encoded_key_value_rejects_invalid_base64() {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
@@ -949,6 +967,12 @@ mod tests {
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
         assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_der_encoded_key_value_non_xml_ascii_whitespace_is_not_parseable_xml() {
+        let xml = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\"><dsig11:DEREncodedKeyValue>\u{000C}</dsig11:DEREncodedKeyValue></KeyInfo>";
+        assert!(Document::parse(xml).is_err());
     }
 
     // ── parse_signed_info: happy path ────────────────────────────────
