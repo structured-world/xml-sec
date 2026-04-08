@@ -483,9 +483,7 @@ fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
         first_child.tag_name().name(),
     ) {
         (Some(XMLDSIG_NS), "RSAKeyValue") => Ok(KeyValueInfo::RsaKeyValue),
-        (Some(XMLDSIG_NS), "ECKeyValue") | (Some(XMLDSIG11_NS), "ECKeyValue") => {
-            Ok(KeyValueInfo::EcKeyValue)
-        }
+        (Some(XMLDSIG11_NS), "ECKeyValue") => Ok(KeyValueInfo::EcKeyValue),
         (_, child_name) => Ok(KeyValueInfo::Unsupported(child_name.to_string())),
     }
 }
@@ -906,6 +904,24 @@ mod tests {
         assert_eq!(
             key_info.sources,
             vec![KeyInfoSource::KeyValue(KeyValueInfo::EcKeyValue)]
+        );
+    }
+
+    #[test]
+    fn parse_key_info_marks_ds_namespace_ec_keyvalue_as_unsupported() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue>
+                <ECKeyValue/>
+            </KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported(
+                "ECKeyValue".into()
+            ))]
         );
     }
 
