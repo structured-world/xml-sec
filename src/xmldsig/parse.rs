@@ -359,7 +359,8 @@ pub(crate) fn parse_reference(reference_node: Node) -> Result<Reference, ParseEr
 /// - `<ds:X509Data>`
 /// - `<dsig11:DEREncodedKeyValue>`
 ///
-/// Unknown elements are ignored (lax processing), matching XMLDSig behavior.
+/// Unknown top-level `<KeyInfo>` children are ignored (lax processing), while
+/// unknown XMLDSig (`ds:*`) children inside `<X509Data>` are rejected fail-closed.
 pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
     verify_ds_element(key_info_node, "KeyInfo")?;
     ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
