@@ -362,6 +362,7 @@ pub(crate) fn parse_reference(reference_node: Node) -> Result<Reference, ParseEr
 /// Unknown top-level `<KeyInfo>` children are ignored (lax processing), while
 /// unknown XMLDSig-owned (`ds:*` / `dsig11:*`) children inside `<X509Data>` are
 /// rejected fail-closed.
+/// `<X509Data>` may still be empty or contain only non-XMLDSig extension children.
 pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
     verify_ds_element(key_info_node, "KeyInfo")?;
     ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
@@ -494,31 +495,24 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
     ensure_no_non_whitespace_text(node, "X509Data")?;
 
     let mut info = X509DataInfo::default();
-    let mut saw_supported_xmlsig_child = false;
     for child in element_children(node) {
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "X509Certificate") => {
-                saw_supported_xmlsig_child = true;
                 info.certificate_count += 1;
             }
             (Some(XMLDSIG_NS), "X509SubjectName") => {
-                saw_supported_xmlsig_child = true;
                 info.subject_name_count += 1;
             }
             (Some(XMLDSIG_NS), "X509IssuerSerial") => {
-                saw_supported_xmlsig_child = true;
                 info.issuer_serial_count += 1;
             }
             (Some(XMLDSIG_NS), "X509SKI") => {
-                saw_supported_xmlsig_child = true;
                 info.ski_count += 1;
             }
             (Some(XMLDSIG_NS), "X509CRL") => {
-                saw_supported_xmlsig_child = true;
                 info.crl_count += 1;
             }
             (Some(XMLDSIG11_NS), "X509Digest") => {
-                saw_supported_xmlsig_child = true;
                 info.digest_count += 1;
             }
             (Some(XMLDSIG_NS), child_name) | (Some(XMLDSIG11_NS), child_name) => {
@@ -528,12 +522,6 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
             }
             _ => {}
         }
-    }
-
-    if !saw_supported_xmlsig_child {
-        return Err(ParseError::InvalidStructure(
-            "X509Data must contain at least one supported XMLDSig child element".into(),
-        ));
     }
 
     Ok(info)
@@ -835,14 +823,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_key_info_x509data_must_not_be_empty() {
+    fn parse_key_info_accepts_empty_x509data() {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <X509Data/>
         </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
 
-        let err = parse_key_info(doc.root_element()).unwrap_err();
-        assert!(matches!(err, ParseError::InvalidStructure(_)));
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::X509Data(X509DataInfo::default())]
+        );
     }
 
     #[test]
@@ -873,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_key_info_rejects_x509data_with_only_foreign_namespace_children() {
+    fn parse_key_info_accepts_x509data_with_only_foreign_namespace_children() {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:foo="urn:example:foo">
             <X509Data>
@@ -882,8 +873,11 @@ mod tests {
         </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
 
-        let err = parse_key_info(doc.root_element()).unwrap_err();
-        assert!(matches!(err, ParseError::InvalidStructure(_)));
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::X509Data(X509DataInfo::default())]
+        );
     }
 
     #[test]
