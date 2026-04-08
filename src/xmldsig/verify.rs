@@ -26,7 +26,7 @@ use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, XPATH_TRANSFORM_URI, execute_transforms,
 };
 use super::uri::{UriReferenceResolver, parse_xpointer_id_fragment};
-use super::whitespace::is_xml_whitespace_only;
+use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_text};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
@@ -628,7 +628,9 @@ fn verify_signature_with_context(
 
     let signature_children = parse_signature_children(signature_node)?;
     let signed_info_node = signature_children.signed_info_node;
-    if let Some(key_info_node) = signature_children.key_info_node {
+    if ctx.key.is_none()
+        && let Some(key_info_node) = signature_children.key_info_node
+    {
         // P2-001: validate KeyInfo structure now; key material consumption is deferred.
         parse_key_info(key_info_node).map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
     }
@@ -1118,30 +1120,25 @@ fn push_normalized_signature_text(
     raw_text_len: &mut usize,
     normalized: &mut String,
 ) -> Result<(), SignatureVerificationPipelineError> {
-    for ch in text.chars() {
-        if raw_text_len.saturating_add(ch.len_utf8()) > MAX_SIGNATURE_VALUE_TEXT_LEN {
-            return Err(SignatureVerificationPipelineError::InvalidStructure {
-                reason: "SignatureValue exceeds maximum allowed text length",
-            });
-        }
-        *raw_text_len = raw_text_len.saturating_add(ch.len_utf8());
-        if matches!(ch, ' ' | '\t' | '\r' | '\n') {
-            continue;
-        }
-        if ch.is_ascii_whitespace() {
-            let invalid_byte =
-                u8::try_from(u32::from(ch)).expect("ASCII whitespace always fits into u8");
-            return Err(SignatureVerificationPipelineError::SignatureValueBase64(
-                base64::DecodeError::InvalidByte(normalized.len(), invalid_byte),
-            ));
-        }
-        if normalized.len().saturating_add(ch.len_utf8()) > MAX_SIGNATURE_VALUE_LEN {
-            return Err(SignatureVerificationPipelineError::InvalidStructure {
-                reason: "SignatureValue exceeds maximum allowed length",
-            });
-        }
-        normalized.push(ch);
+    if raw_text_len.saturating_add(text.len()) > MAX_SIGNATURE_VALUE_TEXT_LEN {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignatureValue exceeds maximum allowed text length",
+        });
     }
+    *raw_text_len = raw_text_len.saturating_add(text.len());
+
+    normalize_xml_base64_text(text, normalized).map_err(|err| {
+        SignatureVerificationPipelineError::SignatureValueBase64(base64::DecodeError::InvalidByte(
+            err.normalized_offset,
+            err.invalid_byte,
+        ))
+    })?;
+    if normalized.len() > MAX_SIGNATURE_VALUE_LEN {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignatureValue exceeds maximum allowed length",
+        });
+    }
+
     Ok(())
 }
 
@@ -2536,11 +2533,35 @@ mod tests {
 </ds:Signature>
 "#;
 
-        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
-            .expect_err("invalid KeyInfo must map to ParseKeyInfo");
+        let err = VerifyContext::new().verify(xml).expect_err(
+            "invalid KeyInfo must map to ParseKeyInfo when no explicit key is supplied",
+        );
         assert!(matches!(
             err,
             SignatureVerificationPipelineError::ParseKeyInfo(_)
+        ));
+    }
+
+    #[test]
+    fn pipeline_ignores_malformed_keyinfo_when_explicit_key_is_supplied() {
+        let base_xml = signature_with_target_reference("AQ==");
+        let xml = base_xml
+            .replace(
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">"#,
+            )
+            .replace(
+                "</ds:SignatureValue>\n  </ds:Signature>",
+                "</ds:SignatureValue>\n    <ds:KeyInfo><dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue></ds:KeyInfo>\n  </ds:Signature>",
+            );
+
+        let result = VerifyContext::new()
+            .key(&RejectingKey)
+            .verify(&xml)
+            .expect("explicit key path should not fail on malformed KeyInfo");
+        assert!(matches!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::SignatureMismatch)
         ));
     }
 

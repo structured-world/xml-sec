@@ -20,7 +20,7 @@ use roxmltree::{Document, Node};
 
 use super::digest::DigestAlgorithm;
 use super::transforms::{self, Transform};
-use super::whitespace::is_xml_whitespace_only;
+use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_text};
 use crate::c14n::C14nAlgorithm;
 
 /// XMLDSig namespace URI.
@@ -145,7 +145,7 @@ pub enum KeyInfoSource {
 pub enum KeyValueInfo {
     /// `<RSAKeyValue>`.
     RsaKeyValue,
-    /// `<ECKeyValue>`.
+    /// `dsig11:ECKeyValue` (the XMLDSig 1.1 namespace form).
     EcKeyValue,
     /// Any other `<KeyValue>` child not yet supported by this phase.
     Unsupported {
@@ -360,7 +360,7 @@ pub(crate) fn parse_reference(reference_node: Node) -> Result<Reference, ParseEr
 ///
 /// Supported source elements:
 /// - `<ds:KeyName>`
-/// - `<ds:KeyValue>` (dispatch to RSA vs EC by child element name)
+/// - `<ds:KeyValue>` (dispatch by child QName; only `dsig11:ECKeyValue` is treated as supported EC)
 /// - `<ds:X509Data>`
 /// - `<dsig11:DEREncodedKeyValue>`
 ///
@@ -541,18 +541,12 @@ fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec
     use base64::engine::general_purpose::STANDARD;
 
     let mut cleaned = String::with_capacity(b64.len());
-    for ch in b64.chars() {
-        if matches!(ch, ' ' | '\t' | '\r' | '\n') {
-            continue;
-        }
-        if ch.is_ascii_whitespace() {
-            return Err(ParseError::Base64(format!(
-                "invalid XML whitespace U+{:04X} in DigestValue",
-                u32::from(ch)
-            )));
-        }
-        cleaned.push(ch);
-    }
+    normalize_xml_base64_text(b64, &mut cleaned).map_err(|err| {
+        ParseError::Base64(format!(
+            "invalid XML whitespace U+{:04X} in DigestValue",
+            err.invalid_byte
+        ))
+    })?;
     let digest = STANDARD
         .decode(&cleaned)
         .map_err(|e| ParseError::Base64(e.to_string()))?;
@@ -579,28 +573,22 @@ fn decode_der_encoded_key_value_base64(node: Node<'_, '_>) -> Result<Vec<u8>, Pa
         .filter(|child| child.is_text())
         .filter_map(|child| child.text())
     {
-        for ch in text.chars() {
-            if raw_text_len.saturating_add(ch.len_utf8()) > MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN {
-                return Err(ParseError::InvalidStructure(
-                    "DEREncodedKeyValue exceeds maximum allowed text length".into(),
-                ));
-            }
-            raw_text_len = raw_text_len.saturating_add(ch.len_utf8());
-            if matches!(ch, ' ' | '\t' | '\r' | '\n') {
-                continue;
-            }
-            if ch.is_ascii_whitespace() {
-                return Err(ParseError::Base64(format!(
-                    "invalid XML whitespace U+{:04X} in base64 text",
-                    u32::from(ch)
-                )));
-            }
-            cleaned.push(ch);
-            if cleaned.len() > MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN {
-                return Err(ParseError::InvalidStructure(
-                    "DEREncodedKeyValue exceeds maximum allowed length".into(),
-                ));
-            }
+        if raw_text_len.saturating_add(text.len()) > MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN {
+            return Err(ParseError::InvalidStructure(
+                "DEREncodedKeyValue exceeds maximum allowed text length".into(),
+            ));
+        }
+        raw_text_len = raw_text_len.saturating_add(text.len());
+        normalize_xml_base64_text(text, &mut cleaned).map_err(|err| {
+            ParseError::Base64(format!(
+                "invalid XML whitespace U+{:04X} in base64 text",
+                err.invalid_byte
+            ))
+        })?;
+        if cleaned.len() > MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN {
+            return Err(ParseError::InvalidStructure(
+                "DEREncodedKeyValue exceeds maximum allowed length".into(),
+            ));
         }
     }
 
