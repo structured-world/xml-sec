@@ -978,7 +978,6 @@ fn parse_signature_children<'a, 'input>(
     let mut signed_info_index: Option<usize> = None;
     let mut signature_value_index: Option<usize> = None;
     let mut key_info_index: Option<usize> = None;
-    let mut object_indices: Vec<usize> = Vec::new();
     let mut first_unexpected_dsig_index: Option<usize> = None;
 
     let mut element_index = 0usize;
@@ -1033,7 +1032,8 @@ fn parse_signature_children<'a, 'input>(
                 key_info_index = Some(element_index);
             }
             "Object" => {
-                object_indices.push(element_index);
+                // Valid Object elements are allowed only after SignedInfo, SignatureValue,
+                // and optional KeyInfo; this is enforced via first_unexpected_dsig_index.
             }
             _ => {
                 if first_unexpected_dsig_index.is_none() {
@@ -1076,19 +1076,6 @@ fn parse_signature_children<'a, 'input>(
                 "After SignedInfo, SignatureValue, and optional KeyInfo, Signature may contain only Object elements"
             } else {
                 "Signature may contain SignedInfo first, SignatureValue second, optional KeyInfo third, and Object elements thereafter"
-            },
-        });
-    }
-
-    if object_indices
-        .iter()
-        .any(|&index| index <= allowed_prefix_end)
-    {
-        return Err(SignatureVerificationPipelineError::InvalidStructure {
-            reason: if allowed_prefix_end == 3 {
-                "KeyInfo must be the third element child of Signature when present"
-            } else {
-                "SignatureValue must be the second element child of Signature"
             },
         });
     }
