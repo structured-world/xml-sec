@@ -547,8 +547,8 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
                 ensure_no_element_children(child, "X509Certificate")?;
                 ensure_x509_data_entry_budget(&info)?;
                 let cert = decode_x509_base64(child, "X509Certificate")?;
-                let parsed_cert = parse_x509_certificate(cert.as_slice())?;
                 add_x509_data_usage(&mut total_binary_len, cert.len())?;
+                let parsed_cert = parse_x509_certificate(cert.as_slice())?;
                 info.parsed_certificates.push(parsed_cert);
                 info.certificates.push(cert);
             }
