@@ -18,7 +18,7 @@ use crate::c14n::canonicalize;
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 use super::parse::{ParseError, Reference, SignatureAlgorithm, XMLDSIG_NS};
-use super::parse::{parse_reference, parse_signed_info};
+use super::parse::{parse_key_info, parse_reference, parse_signed_info};
 use super::signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
 };
@@ -26,6 +26,7 @@ use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, XPATH_TRANSFORM_URI, execute_transforms,
 };
 use super::uri::{UriReferenceResolver, parse_xpointer_id_fragment};
+use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_text};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
@@ -55,6 +56,16 @@ pub trait KeyResolver {
     /// maps `Ok(None)` to `DsigStatus::Invalid(FailureReason::KeyNotFound)`;
     /// reserve `Err(...)` for resolver failures.
     fn resolve<'a>(&'a self, xml: &str) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError>;
+
+    /// Return `true` when this resolver consumes document `<KeyInfo>` material.
+    ///
+    /// The verification pipeline uses this to decide whether malformed
+    /// `<KeyInfo>` should raise `DsigError::ParseKeyInfo` before resolver
+    /// execution. Resolvers that ignore document key material can keep the
+    /// default `false` to avoid fail-closed parsing on advisory `<KeyInfo>`.
+    fn consumes_document_key_info(&self) -> bool {
+        false
+    }
 }
 
 /// Allowed URI classes for `<Reference URI="...">`.
@@ -510,6 +521,10 @@ pub enum DsigError {
     #[error("failed to parse SignedInfo: {0}")]
     ParseSignedInfo(#[from] super::parse::ParseError),
 
+    /// `<KeyInfo>` parsing failed.
+    #[error("failed to parse KeyInfo: {0}")]
+    ParseKeyInfo(#[source] super::parse::ParseError),
+
     /// `<Object>/<Manifest>/<Reference>` parsing failed.
     #[error("failed to parse Manifest reference: {0}")]
     ParseManifestReference(#[source] ParseError),
@@ -550,19 +565,29 @@ type SignatureVerificationPipelineError = DsigError;
 /// Verify one XMLDSig `<Signature>` end-to-end with a PEM public key.
 ///
 /// Pipeline:
-/// 1. Parse `<SignedInfo>`
-/// 2. Validate all `<Reference>` digests (fail-fast)
-/// 3. Canonicalize `<SignedInfo>`
-/// 4. Base64-decode `<SignatureValue>`
-/// 5. Verify signature bytes against canonicalized `<SignedInfo>`
+/// 1. Parse `<Signature>` children and enforce structural constraints
+/// 2. Parse `<SignedInfo>`
+/// 3. Validate all `<Reference>` digests (fail-fast)
+/// 4. Canonicalize `<SignedInfo>`
+/// 5. Base64-decode `<SignatureValue>`
+/// 6. Verify signature bytes against canonicalized `<SignedInfo>` using the provided PEM key
 ///
 /// If any `<Reference>` digest mismatches, returns `Ok` with
 /// `status == Invalid(ReferenceDigestMismatch { .. })`.
+///
+/// This API uses only the provided PEM key and does not parse embedded
+/// `<KeyInfo>` key material for key selection/validation. Consequently,
+/// malformed optional `<KeyInfo>` does not produce `DsigError::ParseKeyInfo`
+/// on this API path.
 ///
 /// Structural constraints enforced by this API:
 /// - The document must contain exactly one XMLDSig `<Signature>` element.
 /// - `<SignedInfo>` must be the first element child of `<Signature>` and appear once.
 /// - `<SignatureValue>` must be the second element child of `<Signature>` and appear once.
+/// - `<KeyInfo>` is optional and, when present, must be the third element child.
+/// - Only XMLDSig namespace element children are allowed under `<Signature>`.
+/// - Non-whitespace mixed text content under `<Signature>` is rejected.
+/// - After `<SignedInfo>`, `<SignatureValue>`, and optional `<KeyInfo>`, only `<Object>` elements are allowed.
 /// - `<SignatureValue>` must not contain nested element children.
 pub fn verify_signature_with_pem_key(
     xml: &str,
@@ -617,6 +642,15 @@ fn verify_signature_with_context(
 
     let signature_children = parse_signature_children(signature_node)?;
     let signed_info_node = signature_children.signed_info_node;
+    let should_parse_key_info = match (ctx.key, ctx.key_resolver) {
+        (Some(_), _) => false,
+        (None, Some(resolver)) => resolver.consumes_document_key_info(),
+        (None, None) => true,
+    };
+    if should_parse_key_info && let Some(key_info_node) = signature_children.key_info_node {
+        // P2-001: validate KeyInfo structure now; key material consumption is deferred.
+        parse_key_info(key_info_node).map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
+    }
 
     let signed_info = parse_signed_info(signed_info_node)?;
     enforce_reference_policies(
@@ -951,6 +985,7 @@ fn transform_uri(transform: &Transform) -> &'static str {
 struct SignatureChildNodes<'a, 'input> {
     signed_info_node: Node<'a, 'input>,
     signature_value_node: Node<'a, 'input>,
+    key_info_node: Option<Node<'a, 'input>>,
 }
 
 fn parse_signature_children<'a, 'input>(
@@ -958,16 +993,34 @@ fn parse_signature_children<'a, 'input>(
 ) -> Result<SignatureChildNodes<'a, 'input>, SignatureVerificationPipelineError> {
     let mut signed_info_node: Option<Node<'_, '_>> = None;
     let mut signature_value_node: Option<Node<'_, '_>> = None;
+    let mut key_info_node: Option<Node<'_, '_>> = None;
     let mut signed_info_index: Option<usize> = None;
     let mut signature_value_index: Option<usize> = None;
-    for (zero_based_index, child) in signature_node
-        .children()
-        .filter(|node| node.is_element())
-        .enumerate()
-    {
-        let element_index = zero_based_index + 1;
-        if child.tag_name().namespace() != Some(XMLDSIG_NS) {
+    let mut key_info_index: Option<usize> = None;
+    let mut first_unexpected_dsig_index: Option<usize> = None;
+
+    let mut element_index = 0usize;
+    for child in signature_node.children() {
+        if child.is_text() {
+            if child
+                .text()
+                .is_some_and(|text| !is_xml_whitespace_only(text))
+            {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "Signature must not contain non-whitespace mixed content",
+                });
+            }
             continue;
+        }
+        if !child.is_element() {
+            continue;
+        }
+
+        element_index += 1;
+        if child.tag_name().namespace() != Some(XMLDSIG_NS) {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Signature must contain only XMLDSIG element children",
+            });
         }
         match child.tag_name().name() {
             "SignedInfo" => {
@@ -988,7 +1041,24 @@ fn parse_signature_children<'a, 'input>(
                 signature_value_node = Some(child);
                 signature_value_index = Some(element_index);
             }
-            _ => {}
+            "KeyInfo" => {
+                if key_info_node.is_some() {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "KeyInfo must appear at most once under Signature",
+                    });
+                }
+                key_info_node = Some(child);
+                key_info_index = Some(element_index);
+            }
+            "Object" => {
+                // Valid Object elements are allowed only after SignedInfo, SignatureValue,
+                // and optional KeyInfo; this is enforced via first_unexpected_dsig_index.
+            }
+            _ => {
+                if first_unexpected_dsig_index.is_none() {
+                    first_unexpected_dsig_index = Some(element_index);
+                }
+            }
         }
     }
 
@@ -1010,9 +1080,29 @@ fn parse_signature_children<'a, 'input>(
             reason: "SignatureValue must be the second element child of Signature",
         });
     }
+    if let Some(index) = key_info_index
+        && index != 3
+    {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "KeyInfo must be the third element child of Signature when present",
+        });
+    }
+
+    let allowed_prefix_end = key_info_index.unwrap_or(2);
+    if let Some(unexpected_index) = first_unexpected_dsig_index {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: if unexpected_index > allowed_prefix_end {
+                "After SignedInfo, SignatureValue, and optional KeyInfo, Signature may contain only Object elements"
+            } else {
+                "Signature may contain SignedInfo first, SignatureValue second, optional KeyInfo third, and Object elements thereafter"
+            },
+        });
+    }
+
     Ok(SignatureChildNodes {
         signed_info_node,
         signature_value_node,
+        key_info_node,
     })
 }
 
@@ -1047,30 +1137,25 @@ fn push_normalized_signature_text(
     raw_text_len: &mut usize,
     normalized: &mut String,
 ) -> Result<(), SignatureVerificationPipelineError> {
-    for ch in text.chars() {
-        if raw_text_len.saturating_add(ch.len_utf8()) > MAX_SIGNATURE_VALUE_TEXT_LEN {
-            return Err(SignatureVerificationPipelineError::InvalidStructure {
-                reason: "SignatureValue exceeds maximum allowed text length",
-            });
-        }
-        *raw_text_len = raw_text_len.saturating_add(ch.len_utf8());
-        if matches!(ch, ' ' | '\t' | '\r' | '\n') {
-            continue;
-        }
-        if ch.is_ascii_whitespace() {
-            let invalid_byte =
-                u8::try_from(u32::from(ch)).expect("ASCII whitespace always fits into u8");
-            return Err(SignatureVerificationPipelineError::SignatureValueBase64(
-                base64::DecodeError::InvalidByte(normalized.len(), invalid_byte),
-            ));
-        }
-        if normalized.len().saturating_add(ch.len_utf8()) > MAX_SIGNATURE_VALUE_LEN {
-            return Err(SignatureVerificationPipelineError::InvalidStructure {
-                reason: "SignatureValue exceeds maximum allowed length",
-            });
-        }
-        normalized.push(ch);
+    if raw_text_len.saturating_add(text.len()) > MAX_SIGNATURE_VALUE_TEXT_LEN {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignatureValue exceeds maximum allowed text length",
+        });
     }
+    *raw_text_len = raw_text_len.saturating_add(text.len());
+
+    normalize_xml_base64_text(text, normalized).map_err(|err| {
+        SignatureVerificationPipelineError::SignatureValueBase64(base64::DecodeError::InvalidByte(
+            err.normalized_offset,
+            err.invalid_byte,
+        ))
+    })?;
+    if normalized.len() > MAX_SIGNATURE_VALUE_LEN {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignatureValue exceeds maximum allowed length",
+        });
+    }
+
     Ok(())
 }
 
@@ -1185,6 +1270,22 @@ mod tests {
         ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
         {
             Ok(None)
+        }
+    }
+
+    struct ConsumingKeyInfoResolver;
+
+    impl KeyResolver for ConsumingKeyInfoResolver {
+        fn resolve<'a>(
+            &'a self,
+            _xml: &str,
+        ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
+        {
+            Ok(None)
+        }
+
+        fn consumes_document_key_info(&self) -> bool {
+            true
         }
     }
 
@@ -1864,6 +1965,52 @@ mod tests {
     }
 
     #[test]
+    fn verify_context_resolver_can_ignore_malformed_keyinfo_by_default() {
+        let base_xml = signature_with_target_reference("AQ==");
+        let xml = base_xml
+            .replace(
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">"#,
+            )
+            .replace(
+                "</ds:SignatureValue>\n  </ds:Signature>",
+                "</ds:SignatureValue>\n    <ds:KeyInfo><dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue></ds:KeyInfo>\n  </ds:Signature>",
+            );
+
+        let result = VerifyContext::new()
+            .key_resolver(&MissingKeyResolver)
+            .verify(&xml)
+            .expect("resolver path should not hard-fail on advisory malformed KeyInfo by default");
+        assert!(matches!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::KeyNotFound)
+        ));
+    }
+
+    #[test]
+    fn verify_context_resolver_can_opt_in_to_keyinfo_parse_failures() {
+        let base_xml = signature_with_target_reference("AQ==");
+        let xml = base_xml
+            .replace(
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">"#,
+            )
+            .replace(
+                "</ds:SignatureValue>\n  </ds:Signature>",
+                "</ds:SignatureValue>\n    <ds:KeyInfo><dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue></ds:KeyInfo>\n  </ds:Signature>",
+            );
+
+        let err = VerifyContext::new()
+            .key_resolver(&ConsumingKeyInfoResolver)
+            .verify(&xml)
+            .expect_err("resolver opted into KeyInfo parsing, malformed KeyInfo must fail");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::ParseKeyInfo(_)
+        ));
+    }
+
+    #[test]
     fn verify_context_preserves_signaturevalue_decode_errors_when_resolver_misses() {
         let xml = signature_with_target_reference("@@@");
 
@@ -2443,5 +2590,154 @@ mod tests {
                 reason: "Signature must appear exactly once in document",
             }
         ));
+    }
+
+    #[test]
+    fn pipeline_reports_keyinfo_parse_error() {
+        let xml = r#"
+<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
+              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+  <ds:SignedInfo>
+    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    <ds:Reference URI="">
+      <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+      <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
+    </ds:Reference>
+  </ds:SignedInfo>
+  <ds:SignatureValue>AA==</ds:SignatureValue>
+  <ds:KeyInfo>
+    <dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue>
+  </ds:KeyInfo>
+</ds:Signature>
+"#;
+
+        let err = VerifyContext::new().verify(xml).expect_err(
+            "invalid KeyInfo must map to ParseKeyInfo when no explicit key is supplied",
+        );
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::ParseKeyInfo(_)
+        ));
+    }
+
+    #[test]
+    fn pipeline_ignores_malformed_keyinfo_when_explicit_key_is_supplied() {
+        let base_xml = signature_with_target_reference("AQ==");
+        let xml = base_xml
+            .replace(
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">"#,
+            )
+            .replace(
+                "</ds:SignatureValue>\n  </ds:Signature>",
+                "</ds:SignatureValue>\n    <ds:KeyInfo><dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue></ds:KeyInfo>\n  </ds:Signature>",
+            );
+
+        let result = VerifyContext::new()
+            .key(&RejectingKey)
+            .verify(&xml)
+            .expect("explicit key path should not fail on malformed KeyInfo");
+        assert!(matches!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::SignatureMismatch)
+        ));
+    }
+
+    #[test]
+    fn pipeline_rejects_foreign_element_children_under_signature() {
+        let base_xml = signature_with_target_reference("AQ==");
+        let xml = base_xml
+            .replace(
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
+                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:foo="urn:example:foo">"#,
+            )
+            .replace(
+                "</ds:SignedInfo>\n    <ds:SignatureValue>",
+                "</ds:SignedInfo>\n    <foo:Bar/>\n    <ds:SignatureValue>",
+            );
+
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .verify(&xml)
+            .expect_err("foreign element children under Signature must fail closed");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Signature must contain only XMLDSIG element children",
+            }
+        ));
+    }
+
+    #[test]
+    fn pipeline_rejects_non_whitespace_mixed_content_under_signature() {
+        let base_xml = signature_with_target_reference("AQ==");
+        let xml = base_xml.replace(
+            "</ds:SignedInfo>\n    <ds:SignatureValue>",
+            "</ds:SignedInfo>\n    oops\n    <ds:SignatureValue>",
+        );
+
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .verify(&xml)
+            .expect_err("non-whitespace mixed content under Signature must fail closed");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "Signature must not contain non-whitespace mixed content",
+            }
+        ));
+    }
+
+    #[test]
+    fn pipeline_rejects_keyinfo_out_of_order() {
+        let base_xml = signature_with_target_reference("AQ==");
+        let xml = base_xml.replace(
+            "</ds:SignatureValue>\n  </ds:Signature>",
+            "</ds:SignatureValue>\n    <ds:Object/>\n    <ds:KeyInfo><ds:KeyName>late</ds:KeyName></ds:KeyInfo>\n  </ds:Signature>",
+        );
+
+        let err = VerifyContext::new()
+            .key(&RejectingKey)
+            .verify(&xml)
+            .expect_err("KeyInfo after Object must be rejected by Signature child order checks");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "KeyInfo must be the third element child of Signature when present"
+            }
+        ));
+    }
+
+    #[test]
+    fn pipeline_accepts_comments_and_processing_instructions_under_signature() {
+        let xml = r#"
+<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <?dbg keep ?>
+  <!-- signature metadata -->
+  <ds:SignedInfo>
+    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    <ds:Reference URI="">
+      <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+      <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
+    </ds:Reference>
+  </ds:SignedInfo>
+  <!-- between required children -->
+  <ds:SignatureValue>AA==</ds:SignatureValue>
+</ds:Signature>
+"#;
+
+        let doc = Document::parse(xml).expect("test XML must parse");
+        let signature_node = doc.root_element();
+        let parsed = parse_signature_children(signature_node)
+            .expect("comment/PI nodes under Signature must be ignored");
+
+        assert_eq!(parsed.signed_info_node.tag_name().name(), "SignedInfo");
+        assert_eq!(
+            parsed.signature_value_node.tag_name().name(),
+            "SignatureValue"
+        );
+        assert!(parsed.key_info_node.is_none());
     }
 }

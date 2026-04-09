@@ -20,10 +20,17 @@ use roxmltree::{Document, Node};
 
 use super::digest::DigestAlgorithm;
 use super::transforms::{self, Transform};
+use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_text};
 use crate::c14n::C14nAlgorithm;
 
 /// XMLDSig namespace URI.
 pub(crate) const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+/// XMLDSig 1.1 namespace URI.
+pub(crate) const XMLDSIG11_NS: &str = "http://www.w3.org/2009/xmldsig11#";
+const MAX_DER_ENCODED_KEY_VALUE_LEN: usize = 8192;
+const MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN: usize = 65_536;
+const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LEN.div_ceil(3) * 4;
+const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
 
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,6 +115,63 @@ pub struct Reference {
     pub digest_method: DigestAlgorithm,
     /// Raw digest value (base64-decoded).
     pub digest_value: Vec<u8>,
+}
+
+/// Parsed `<KeyInfo>` element.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyInfo {
+    /// Sources discovered under `<KeyInfo>` in document order.
+    pub sources: Vec<KeyInfoSource>,
+}
+
+/// Top-level key material source parsed from `<KeyInfo>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyInfoSource {
+    /// `<KeyName>` source.
+    KeyName(String),
+    /// `<KeyValue>` source.
+    KeyValue(KeyValueInfo),
+    /// `<X509Data>` source.
+    X509Data(X509DataInfo),
+    /// `dsig11:DEREncodedKeyValue` source (base64-decoded DER bytes).
+    DerEncodedKeyValue(Vec<u8>),
+}
+
+/// Parsed `<KeyValue>` dispatch result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyValueInfo {
+    /// `<RSAKeyValue>`.
+    RsaKeyValue,
+    /// `dsig11:ECKeyValue` (the XMLDSig 1.1 namespace form).
+    EcKeyValue,
+    /// Any other `<KeyValue>` child not yet supported by this phase.
+    Unsupported {
+        /// Namespace URI of the unsupported child, when present.
+        namespace: Option<String>,
+        /// Local name of the unsupported child element.
+        local_name: String,
+    },
+}
+
+/// Parsed `<X509Data>` children (dispatch-only in P2-001).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct X509DataInfo {
+    /// Number of `<X509Certificate>` children.
+    pub certificate_count: usize,
+    /// Number of `<X509SubjectName>` children.
+    pub subject_name_count: usize,
+    /// Number of `<X509IssuerSerial>` children.
+    pub issuer_serial_count: usize,
+    /// Number of `<X509SKI>` children.
+    pub ski_count: usize,
+    /// Number of `<X509CRL>` children.
+    pub crl_count: usize,
+    /// Number of `<X509Digest>` children.
+    pub digest_count: usize,
 }
 
 /// Errors during XMLDSig element parsing.
@@ -259,20 +323,7 @@ pub(crate) fn parse_reference(reference_node: Node) -> Result<Reference, ParseEr
         element: "DigestValue",
     })?;
     verify_ds_element(digest_value_node, "DigestValue")?;
-    let mut digest_b64 = String::new();
-    for child in digest_value_node.children() {
-        if child.is_element() {
-            return Err(ParseError::InvalidStructure(
-                "DigestValue must not contain element children".into(),
-            ));
-        }
-        if child.is_text()
-            && let Some(text) = child.text()
-        {
-            digest_b64.push_str(text);
-        }
-    }
-    let digest_value = base64_decode_digest(&digest_b64, digest_method)?;
+    let digest_value = decode_digest_value_children(digest_value_node, digest_method)?;
 
     // No more children expected
     if let Some(unexpected) = children.next() {
@@ -290,6 +341,51 @@ pub(crate) fn parse_reference(reference_node: Node) -> Result<Reference, ParseEr
         digest_method,
         digest_value,
     })
+}
+
+/// Parse `<ds:KeyInfo>` and dispatch supported child sources.
+///
+/// Supported source elements:
+/// - `<ds:KeyName>`
+/// - `<ds:KeyValue>` (dispatch by child QName; only `dsig11:ECKeyValue` is treated as supported EC)
+/// - `<ds:X509Data>`
+/// - `<dsig11:DEREncodedKeyValue>`
+///
+/// Unknown top-level `<KeyInfo>` children are ignored (lax processing), while
+/// unknown XMLDSig-owned (`ds:*` / `dsig11:*`) children inside `<X509Data>` are
+/// rejected fail-closed.
+/// `<X509Data>` may still be empty or contain only non-XMLDSig extension children.
+pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
+    verify_ds_element(key_info_node, "KeyInfo")?;
+    ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
+
+    let mut sources = Vec::new();
+    for child in element_children(key_info_node) {
+        match (child.tag_name().namespace(), child.tag_name().name()) {
+            (Some(XMLDSIG_NS), "KeyName") => {
+                ensure_no_element_children(child, "KeyName")?;
+                let key_name =
+                    collect_text_content_bounded(child, MAX_KEY_NAME_TEXT_LEN, "KeyName")?;
+                sources.push(KeyInfoSource::KeyName(key_name));
+            }
+            (Some(XMLDSIG_NS), "KeyValue") => {
+                let key_value = parse_key_value_dispatch(child)?;
+                sources.push(KeyInfoSource::KeyValue(key_value));
+            }
+            (Some(XMLDSIG_NS), "X509Data") => {
+                let x509 = parse_x509_data_dispatch(child)?;
+                sources.push(KeyInfoSource::X509Data(x509));
+            }
+            (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
+                ensure_no_element_children(child, "DEREncodedKeyValue")?;
+                let der = decode_der_encoded_key_value_base64(child)?;
+                sources.push(KeyInfoSource::DerEncodedKeyValue(der));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(KeyInfo { sources })
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -358,6 +454,72 @@ fn parse_inclusive_prefixes(node: Node) -> Result<Option<String>, ParseError> {
     Ok(None)
 }
 
+fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
+    verify_ds_element(node, "KeyValue")?;
+    ensure_no_non_whitespace_text(node, "KeyValue")?;
+
+    let mut children = element_children(node);
+    let Some(first_child) = children.next() else {
+        return Err(ParseError::InvalidStructure(
+            "KeyValue must contain exactly one key-value child".into(),
+        ));
+    };
+    if children.next().is_some() {
+        return Err(ParseError::InvalidStructure(
+            "KeyValue must contain exactly one key-value child".into(),
+        ));
+    }
+
+    match (
+        first_child.tag_name().namespace(),
+        first_child.tag_name().name(),
+    ) {
+        (Some(XMLDSIG_NS), "RSAKeyValue") => Ok(KeyValueInfo::RsaKeyValue),
+        (Some(XMLDSIG11_NS), "ECKeyValue") => Ok(KeyValueInfo::EcKeyValue),
+        (namespace, child_name) => Ok(KeyValueInfo::Unsupported {
+            namespace: namespace.map(str::to_string),
+            local_name: child_name.to_string(),
+        }),
+    }
+}
+
+fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
+    verify_ds_element(node, "X509Data")?;
+    ensure_no_non_whitespace_text(node, "X509Data")?;
+
+    let mut info = X509DataInfo::default();
+    for child in element_children(node) {
+        match (child.tag_name().namespace(), child.tag_name().name()) {
+            (Some(XMLDSIG_NS), "X509Certificate") => {
+                info.certificate_count += 1;
+            }
+            (Some(XMLDSIG_NS), "X509SubjectName") => {
+                info.subject_name_count += 1;
+            }
+            (Some(XMLDSIG_NS), "X509IssuerSerial") => {
+                info.issuer_serial_count += 1;
+            }
+            (Some(XMLDSIG_NS), "X509SKI") => {
+                info.ski_count += 1;
+            }
+            (Some(XMLDSIG_NS), "X509CRL") => {
+                info.crl_count += 1;
+            }
+            (Some(XMLDSIG11_NS), "X509Digest") => {
+                info.digest_count += 1;
+            }
+            (Some(XMLDSIG_NS), child_name) | (Some(XMLDSIG11_NS), child_name) => {
+                return Err(ParseError::InvalidStructure(format!(
+                    "X509Data contains unsupported XMLDSig child element <{child_name}>"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(info)
+}
+
 /// Base64-decode a digest value string, stripping whitespace.
 ///
 /// XMLDSig allows whitespace within base64 content (line-wrapped encodings).
@@ -365,23 +527,23 @@ fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 
-    let mut cleaned = String::with_capacity(b64.len());
-    for ch in b64.chars() {
-        if matches!(ch, ' ' | '\t' | '\r' | '\n') {
-            continue;
-        }
-        if ch.is_ascii_whitespace() {
-            return Err(ParseError::Base64(format!(
-                "invalid XML whitespace U+{:04X} in DigestValue",
-                u32::from(ch)
-            )));
-        }
-        cleaned.push(ch);
+    let expected = digest_method.output_len();
+    let max_base64_len = expected.div_ceil(3) * 4;
+    let mut cleaned = String::with_capacity(b64.len().min(max_base64_len));
+    normalize_xml_base64_text(b64, &mut cleaned).map_err(|err| {
+        ParseError::Base64(format!(
+            "invalid XML whitespace U+{:04X} in DigestValue",
+            err.invalid_byte
+        ))
+    })?;
+    if cleaned.len() > max_base64_len {
+        return Err(ParseError::Base64(
+            "DigestValue exceeds maximum allowed base64 length".into(),
+        ));
     }
     let digest = STANDARD
         .decode(&cleaned)
         .map_err(|e| ParseError::Base64(e.to_string()))?;
-    let expected = digest_method.output_len();
     let actual = digest.len();
     if actual != expected {
         return Err(ParseError::DigestLengthMismatch {
@@ -393,10 +555,130 @@ fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec
     Ok(digest)
 }
 
+fn decode_digest_value_children(
+    digest_value_node: Node<'_, '_>,
+    digest_method: DigestAlgorithm,
+) -> Result<Vec<u8>, ParseError> {
+    let max_base64_len = digest_method.output_len().div_ceil(3) * 4;
+    let mut cleaned = String::with_capacity(max_base64_len);
+
+    for child in digest_value_node.children() {
+        if child.is_element() {
+            return Err(ParseError::InvalidStructure(
+                "DigestValue must not contain element children".into(),
+            ));
+        }
+        if let Some(text) = child.text() {
+            normalize_xml_base64_text(text, &mut cleaned).map_err(|err| {
+                ParseError::Base64(format!(
+                    "invalid XML whitespace U+{:04X} in DigestValue",
+                    err.invalid_byte
+                ))
+            })?;
+            if cleaned.len() > max_base64_len {
+                return Err(ParseError::Base64(
+                    "DigestValue exceeds maximum allowed base64 length".into(),
+                ));
+            }
+        }
+    }
+
+    base64_decode_digest(&cleaned, digest_method)
+}
+
+fn decode_der_encoded_key_value_base64(node: Node<'_, '_>) -> Result<Vec<u8>, ParseError> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let mut cleaned = String::new();
+    let mut raw_text_len = 0usize;
+    for text in node
+        .children()
+        .filter(|child| child.is_text())
+        .filter_map(|child| child.text())
+    {
+        if raw_text_len.saturating_add(text.len()) > MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN {
+            return Err(ParseError::InvalidStructure(
+                "DEREncodedKeyValue exceeds maximum allowed text length".into(),
+            ));
+        }
+        raw_text_len = raw_text_len.saturating_add(text.len());
+        normalize_xml_base64_text(text, &mut cleaned).map_err(|err| {
+            ParseError::Base64(format!(
+                "invalid XML whitespace U+{:04X} in base64 text",
+                err.invalid_byte
+            ))
+        })?;
+        if cleaned.len() > MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN {
+            return Err(ParseError::InvalidStructure(
+                "DEREncodedKeyValue exceeds maximum allowed length".into(),
+            ));
+        }
+    }
+
+    let der = STANDARD
+        .decode(&cleaned)
+        .map_err(|e| ParseError::Base64(e.to_string()))?;
+    if der.is_empty() {
+        return Err(ParseError::InvalidStructure(
+            "DEREncodedKeyValue must not be empty".into(),
+        ));
+    }
+    if der.len() > MAX_DER_ENCODED_KEY_VALUE_LEN {
+        return Err(ParseError::InvalidStructure(
+            "DEREncodedKeyValue exceeds maximum allowed length".into(),
+        ));
+    }
+    Ok(der)
+}
+
+fn collect_text_content_bounded(
+    node: Node<'_, '_>,
+    max_len: usize,
+    element_name: &'static str,
+) -> Result<String, ParseError> {
+    let mut text = String::new();
+    for chunk in node
+        .children()
+        .filter_map(|child| child.is_text().then(|| child.text()).flatten())
+    {
+        if text.len().saturating_add(chunk.len()) > max_len {
+            return Err(ParseError::InvalidStructure(format!(
+                "{element_name} exceeds maximum allowed text length"
+            )));
+        }
+        text.push_str(chunk);
+    }
+    Ok(text)
+}
+
+fn ensure_no_element_children(node: Node<'_, '_>, element_name: &str) -> Result<(), ParseError> {
+    if node.children().any(|child| child.is_element()) {
+        return Err(ParseError::InvalidStructure(format!(
+            "{element_name} must not contain child elements"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Result<(), ParseError> {
+    for child in node.children().filter(|child| child.is_text()) {
+        if let Some(text) = child.text()
+            && !is_xml_whitespace_only(text)
+        {
+            return Err(ParseError::InvalidStructure(format!(
+                "{element_name} must not contain non-whitespace mixed content"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     // ── SignatureAlgorithm ───────────────────────────────────────────
 
@@ -484,6 +766,310 @@ mod tests {
         let xml = r#"<root><Signature xmlns="http://example.com/fake"/></root>"#;
         let doc = Document::parse(xml).unwrap();
         assert!(find_signature_node(&doc).is_none());
+    }
+
+    // ── parse_key_info: dispatch parsing ──────────────────────────────
+
+    #[test]
+    fn parse_key_info_dispatches_supported_children() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <KeyName>idp-signing-key</KeyName>
+            <KeyValue>
+                <RSAKeyValue>
+                    <Modulus>AQAB</Modulus>
+                    <Exponent>AQAB</Exponent>
+                </RSAKeyValue>
+            </KeyValue>
+            <X509Data>
+                <X509Certificate>MIIB</X509Certificate>
+                <X509SubjectName>CN=Example</X509SubjectName>
+            </X509Data>
+            <dsig11:DEREncodedKeyValue>AQIDBA==</dsig11:DEREncodedKeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(key_info.sources.len(), 4);
+
+        assert_eq!(
+            key_info.sources[0],
+            KeyInfoSource::KeyName("idp-signing-key".to_string())
+        );
+        assert_eq!(
+            key_info.sources[1],
+            KeyInfoSource::KeyValue(KeyValueInfo::RsaKeyValue)
+        );
+        assert_eq!(
+            key_info.sources[2],
+            KeyInfoSource::X509Data(X509DataInfo {
+                certificate_count: 1,
+                subject_name_count: 1,
+                issuer_serial_count: 0,
+                ski_count: 0,
+                crl_count: 0,
+                digest_count: 0,
+            })
+        );
+        assert_eq!(
+            key_info.sources[3],
+            KeyInfoSource::DerEncodedKeyValue(vec![1, 2, 3, 4])
+        );
+    }
+
+    #[test]
+    fn parse_key_info_ignores_unknown_children() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <Foo>bar</Foo>
+            <KeyName>ok</KeyName>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(key_info.sources, vec![KeyInfoSource::KeyName("ok".into())]);
+    }
+
+    #[test]
+    fn parse_key_info_keyvalue_requires_single_child() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue/>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_accepts_empty_x509data() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <X509Data/>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::X509Data(X509DataInfo::default())]
+        );
+    }
+
+    #[test]
+    fn parse_key_info_rejects_unknown_xmlsig_child_in_x509data() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <X509Data>
+                <Foo/>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_unknown_xmlsig11_child_in_x509data() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <X509Data>
+                <dsig11:Foo/>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_accepts_x509data_with_only_foreign_namespace_children() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:foo="urn:example:foo">
+            <X509Data>
+                <foo:Bar/>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::X509Data(X509DataInfo::default())]
+        );
+    }
+
+    #[test]
+    fn parse_key_info_der_encoded_key_value_rejects_invalid_base64() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::Base64(_)));
+    }
+
+    #[test]
+    fn parse_key_info_der_encoded_key_value_accepts_xml_whitespace() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <dsig11:DEREncodedKeyValue>
+                AQID
+                BA==
+            </dsig11:DEREncodedKeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::DerEncodedKeyValue(vec![1, 2, 3, 4])]
+        );
+    }
+
+    #[test]
+    fn parse_key_info_dispatches_dsig11_ec_keyvalue() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <KeyValue>
+                <dsig11:ECKeyValue/>
+            </KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::EcKeyValue)]
+        );
+    }
+
+    #[test]
+    fn parse_key_info_marks_ds_namespace_ec_keyvalue_as_unsupported() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue>
+                <ECKeyValue/>
+            </KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
+                namespace: Some(XMLDSIG_NS.to_string()),
+                local_name: "ECKeyValue".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn parse_key_info_keeps_unsupported_keyvalue_child_as_marker() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue>
+                <DSAKeyValue/>
+            </KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
+                namespace: Some(XMLDSIG_NS.to_string()),
+                local_name: "DSAKeyValue".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn parse_key_info_rejects_keyname_with_child_elements() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyName>ok<foo/></KeyName>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_preserves_keyname_text_without_trimming() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyName>  signing key  </KeyName>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyName("  signing key  ".into())]
+        );
+    }
+
+    #[test]
+    fn parse_key_info_rejects_oversized_keyname_text() {
+        let oversized = "A".repeat(4097);
+        let xml = format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>{oversized}</KeyName></KeyInfo>"
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_non_whitespace_mixed_content() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">oops<KeyName>k</KeyName></KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_nbsp_as_non_xml_whitespace_mixed_content() {
+        let xml = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\u{00A0}<KeyName>k</KeyName></KeyInfo>";
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_der_encoded_key_value_rejects_oversized_payload() {
+        let oversized =
+            base64::engine::general_purpose::STANDARD
+                .encode(vec![0u8; MAX_DER_ENCODED_KEY_VALUE_LEN + 1]);
+        let xml = format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\"><dsig11:DEREncodedKeyValue>{oversized}</dsig11:DEREncodedKeyValue></KeyInfo>"
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_der_encoded_key_value_rejects_empty_payload() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <dsig11:DEREncodedKeyValue>
+                
+            </dsig11:DEREncodedKeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_der_encoded_key_value_non_xml_ascii_whitespace_is_not_parseable_xml() {
+        let xml = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\"><dsig11:DEREncodedKeyValue>\u{000C}</dsig11:DEREncodedKeyValue></KeyInfo>";
+        assert!(Document::parse(xml).is_err());
     }
 
     // ── parse_signed_info: happy path ────────────────────────────────
@@ -907,6 +1493,21 @@ mod tests {
         )
         .expect_err("form-feed/vertical-tab in DigestValue must be rejected");
         assert!(matches!(err, ParseError::Base64(_)));
+    }
+
+    #[test]
+    fn base64_decode_digest_rejects_oversized_base64_before_decode() {
+        let err = base64_decode_digest("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", DigestAlgorithm::Sha1)
+            .expect_err("oversized DigestValue base64 must fail before decode");
+        match err {
+            ParseError::Base64(message) => {
+                assert!(
+                    message.contains("DigestValue exceeds maximum allowed base64 length"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected ParseError::Base64, got {other:?}"),
+        }
     }
 
     // ── Real-world SAML structure ────────────────────────────────────

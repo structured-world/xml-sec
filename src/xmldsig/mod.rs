@@ -15,10 +15,12 @@ pub mod transforms;
 pub mod types;
 pub mod uri;
 pub mod verify;
+pub(crate) mod whitespace;
 
 pub use digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 pub use parse::{
-    ParseError, Reference, SignatureAlgorithm, SignedInfo, find_signature_node, parse_signed_info,
+    KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, SignatureAlgorithm, SignedInfo,
+    X509DataInfo, find_signature_node, parse_key_info, parse_signed_info,
 };
 pub use signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_ecdsa_signature_spki,
