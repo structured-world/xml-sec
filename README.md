@@ -1,5 +1,11 @@
 # xml-sec
 
+[![crates.io](https://img.shields.io/crates/v/xml-sec.svg)](https://crates.io/crates/xml-sec)
+[![docs.rs](https://docs.rs/xml-sec/badge.svg)](https://docs.rs/xml-sec)
+[![CI](https://github.com/structured-world/xml-sec/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/structured-world/xml-sec/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/rustc-1.92%2B-blue.svg)](https://www.rust-lang.org)
+[![License](https://img.shields.io/crates/l/xml-sec.svg)](https://github.com/structured-world/xml-sec/blob/main/LICENSE)
+
 Pure Rust XML Security library. Drop-in replacement for libxmlsec1.
 
 **No C dependencies. No cmake. No system libraries. Just `cargo add xml-sec`.**
