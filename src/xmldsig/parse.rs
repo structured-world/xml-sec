@@ -514,16 +514,11 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
                     MAX_X509_SUBJECT_NAME_TEXT_LEN,
                     "X509SubjectName",
                 )?;
-                add_x509_data_usage(&mut total_binary_len, subject_name.len())?;
                 info.subject_names.push(subject_name);
             }
             (Some(XMLDSIG_NS), "X509IssuerSerial") => {
                 ensure_x509_data_entry_budget(&info)?;
                 let issuer_serial = parse_x509_issuer_serial(child)?;
-                add_x509_data_usage(
-                    &mut total_binary_len,
-                    issuer_serial.0.len() + issuer_serial.1.len(),
-                )?;
                 info.issuer_serials.push(issuer_serial);
             }
             (Some(XMLDSIG_NS), "X509SKI") => {
@@ -640,56 +635,47 @@ fn parse_x509_issuer_serial(node: Node<'_, '_>) -> Result<(String, String), Pars
     verify_ds_element(node, "X509IssuerSerial")?;
     ensure_no_non_whitespace_text(node, "X509IssuerSerial")?;
 
-    let mut issuer_name = None;
-    let mut serial_number = None;
-
-    for child in element_children(node) {
-        match (child.tag_name().namespace(), child.tag_name().name()) {
-            (Some(XMLDSIG_NS), "X509IssuerName") => {
-                ensure_no_element_children(child, "X509IssuerName")?;
-                if issuer_name.is_some() {
-                    return Err(ParseError::InvalidStructure(
-                        "X509IssuerSerial must contain exactly one X509IssuerName".into(),
-                    ));
-                }
-                issuer_name = Some(collect_text_content_bounded(
-                    child,
-                    MAX_X509_ISSUER_NAME_TEXT_LEN,
-                    "X509IssuerName",
-                )?);
-            }
-            (Some(XMLDSIG_NS), "X509SerialNumber") => {
-                ensure_no_element_children(child, "X509SerialNumber")?;
-                if serial_number.is_some() {
-                    return Err(ParseError::InvalidStructure(
-                        "X509IssuerSerial must contain exactly one X509SerialNumber".into(),
-                    ));
-                }
-                serial_number = Some(collect_text_content_bounded(
-                    child,
-                    MAX_X509_SERIAL_NUMBER_TEXT_LEN,
-                    "X509SerialNumber",
-                )?);
-            }
-            (Some(XMLDSIG_NS), child_name) | (Some(XMLDSIG11_NS), child_name) => {
-                return Err(ParseError::InvalidStructure(format!(
-                    "X509IssuerSerial contains unsupported XMLDSig child element <{child_name}>"
-                )));
-            }
-            _ => {}
-        }
+    let children = element_children(node).collect::<Vec<_>>();
+    if children.len() != 2 {
+        return Err(ParseError::InvalidStructure(
+            "X509IssuerSerial must contain exactly X509IssuerName then X509SerialNumber".into(),
+        ));
+    }
+    if !matches!(
+        (
+            children[0].tag_name().namespace(),
+            children[0].tag_name().name()
+        ),
+        (Some(XMLDSIG_NS), "X509IssuerName")
+    ) {
+        return Err(ParseError::InvalidStructure(
+            "X509IssuerSerial must contain X509IssuerName as the first child element".into(),
+        ));
+    }
+    if !matches!(
+        (
+            children[1].tag_name().namespace(),
+            children[1].tag_name().name()
+        ),
+        (Some(XMLDSIG_NS), "X509SerialNumber")
+    ) {
+        return Err(ParseError::InvalidStructure(
+            "X509IssuerSerial must contain X509SerialNumber as the second child element".into(),
+        ));
     }
 
-    let issuer_name = issuer_name.ok_or_else(|| {
-        ParseError::InvalidStructure(
-            "X509IssuerSerial must contain X509IssuerName and X509SerialNumber".into(),
-        )
-    })?;
-    let serial_number = serial_number.ok_or_else(|| {
-        ParseError::InvalidStructure(
-            "X509IssuerSerial must contain X509IssuerName and X509SerialNumber".into(),
-        )
-    })?;
+    let issuer_node = children[0];
+    ensure_no_element_children(issuer_node, "X509IssuerName")?;
+    let issuer_name =
+        collect_text_content_bounded(issuer_node, MAX_X509_ISSUER_NAME_TEXT_LEN, "X509IssuerName")?;
+
+    let serial_node = children[1];
+    ensure_no_element_children(serial_node, "X509SerialNumber")?;
+    let serial_number = collect_text_content_bounded(
+        serial_node,
+        MAX_X509_SERIAL_NUMBER_TEXT_LEN,
+        "X509SerialNumber",
+    )?;
     if issuer_name.trim().is_empty() || serial_number.trim().is_empty() {
         return Err(ParseError::InvalidStructure(
             "X509IssuerSerial requires non-empty X509IssuerName and X509SerialNumber".into(),
@@ -1138,6 +1124,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_key_info_rejects_x509_issuer_serial_with_wrong_child_order() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <X509Data>
+                <X509IssuerSerial>
+                    <X509SerialNumber>42</X509SerialNumber>
+                    <X509IssuerName>CN=CA</X509IssuerName>
+                </X509IssuerSerial>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_x509_issuer_serial_with_extra_child_element() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:foo="urn:example:foo">
+            <X509Data>
+                <X509IssuerSerial>
+                    <X509IssuerName>CN=CA</X509IssuerName>
+                    <X509SerialNumber>42</X509SerialNumber>
+                    <foo:Extra/>
+                </X509IssuerSerial>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
     fn parse_key_info_rejects_x509_digest_without_algorithm() {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
@@ -1193,6 +1213,31 @@ mod tests {
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
         assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_accepts_large_textual_x509_entries_within_entry_budget() {
+        let issuer_name = "C".repeat(MAX_X509_ISSUER_NAME_TEXT_LEN);
+        let serial_number = "7".repeat(MAX_X509_SERIAL_NUMBER_TEXT_LEN);
+        let issuer_serials = (0..52)
+            .map(|_| {
+                format!(
+                    "<X509IssuerSerial><X509IssuerName>{issuer_name}</X509IssuerName><X509SerialNumber>{serial_number}</X509SerialNumber></X509IssuerSerial>"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let xml = format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>{issuer_serials}</X509Data></KeyInfo>"
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        let parsed = match &key_info.sources[0] {
+            KeyInfoSource::X509Data(x509) => x509,
+            _ => panic!("expected X509Data source"),
+        };
+        assert_eq!(parsed.issuer_serials.len(), 52);
     }
 
     #[test]
