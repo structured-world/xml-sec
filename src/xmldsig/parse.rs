@@ -17,6 +17,9 @@
 //! ```
 
 use roxmltree::{Document, Node};
+use x509_parser::extensions::ParsedExtension;
+use x509_parser::prelude::FromDer;
+use x509_parser::public_key::PublicKey;
 
 use super::digest::DigestAlgorithm;
 use super::transforms::{self, Transform};
@@ -180,6 +183,47 @@ pub struct X509DataInfo {
     pub crls: Vec<Vec<u8>>,
     /// `(Algorithm URI, digest bytes)` tuples from `dsig11:X509Digest`.
     pub digests: Vec<(String, Vec<u8>)>,
+    /// Parsed metadata for each `<X509Certificate>` entry.
+    pub parsed_certificates: Vec<ParsedX509Certificate>,
+}
+
+/// Parsed X.509 certificate details extracted from DER.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ParsedX509Certificate {
+    /// Subject distinguished name.
+    pub subject_dn: String,
+    /// Issuer distinguished name.
+    pub issuer_dn: String,
+    /// Subject Key Identifier extension bytes (if present).
+    pub subject_key_identifier: Option<Vec<u8>>,
+    /// Parsed certificate public key material.
+    pub public_key: X509PublicKeyInfo,
+}
+
+/// Public key material extracted from certificate SubjectPublicKeyInfo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum X509PublicKeyInfo {
+    /// RSA public key (`modulus`, `exponent`).
+    Rsa {
+        /// Unsigned big-endian RSA modulus (`n`), normalized without leading zeroes.
+        modulus: Vec<u8>,
+        /// Unsigned big-endian RSA public exponent (`e`), normalized without leading zeroes.
+        exponent: Vec<u8>,
+    },
+    /// EC public key (`curve_oid`, uncompressed point bytes).
+    Ec {
+        /// Named-curve OID from SubjectPublicKeyInfo parameters.
+        curve_oid: String,
+        /// Raw EC point bytes from SubjectPublicKeyInfo.
+        public_key: Vec<u8>,
+    },
+    /// Public key algorithm is present but not parsed into a concrete key type.
+    Unsupported {
+        /// SubjectPublicKeyInfo algorithm OID.
+        algorithm_oid: String,
+    },
 }
 
 /// Errors during XMLDSig element parsing.
@@ -503,7 +547,9 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
                 ensure_no_element_children(child, "X509Certificate")?;
                 ensure_x509_data_entry_budget(&info)?;
                 let cert = decode_x509_base64(child, "X509Certificate")?;
+                let parsed_cert = parse_x509_certificate(cert.as_slice())?;
                 add_x509_data_usage(&mut total_binary_len, cert.len())?;
+                info.parsed_certificates.push(parsed_cert);
                 info.certificates.push(cert);
             }
             (Some(XMLDSIG_NS), "X509SubjectName") => {
@@ -629,6 +675,79 @@ fn decode_x509_base64(
         )));
     }
     Ok(decoded)
+}
+
+fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certificate, ParseError> {
+    let (rest, cert) =
+        x509_parser::certificate::X509Certificate::from_der(cert_der).map_err(|err| {
+            ParseError::InvalidStructure(format!("X509Certificate is not valid DER X.509: {err}"))
+        })?;
+    if !rest.is_empty() {
+        return Err(ParseError::InvalidStructure(
+            "X509Certificate contains trailing bytes after DER certificate".into(),
+        ));
+    }
+
+    let subject_dn = cert.subject().to_string();
+    let issuer_dn = cert.issuer().to_string();
+
+    let subject_key_identifier = cert.extensions().iter().find_map(|ext| {
+        if let ParsedExtension::SubjectKeyIdentifier(ski) = ext.parsed_extension() {
+            Some(ski.0.to_vec())
+        } else {
+            None
+        }
+    });
+
+    let spki = cert.public_key();
+    let public_key = match spki.parsed().map_err(|err| {
+        ParseError::InvalidStructure(format!("X509Certificate public key parse error: {err}"))
+    })? {
+        PublicKey::RSA(rsa) => {
+            let modulus = trim_leading_zeroes(rsa.modulus);
+            let exponent = trim_leading_zeroes(rsa.exponent);
+            if modulus.is_empty() || exponent.is_empty() {
+                return Err(ParseError::InvalidStructure(
+                    "X509Certificate RSA key contains empty modulus or exponent".into(),
+                ));
+            }
+            X509PublicKeyInfo::Rsa { modulus, exponent }
+        }
+        PublicKey::EC(ec_point) => {
+            let curve_oid = spki
+                .algorithm
+                .parameters
+                .as_ref()
+                .and_then(|params| params.as_oid().ok().map(|oid| oid.to_id_string()))
+                .ok_or_else(|| {
+                    ParseError::InvalidStructure(
+                        "X509Certificate EC key is missing curve OID parameters".into(),
+                    )
+                })?;
+            X509PublicKeyInfo::Ec {
+                curve_oid,
+                public_key: ec_point.data().to_vec(),
+            }
+        }
+        _ => X509PublicKeyInfo::Unsupported {
+            algorithm_oid: spki.algorithm.algorithm.to_id_string(),
+        },
+    };
+
+    Ok(ParsedX509Certificate {
+        subject_dn,
+        issuer_dn,
+        subject_key_identifier,
+        public_key,
+    })
+}
+
+fn trim_leading_zeroes(bytes: &[u8]) -> Vec<u8> {
+    let first_non_zero = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len());
+    bytes[first_non_zero..].to_vec()
 }
 
 fn parse_x509_issuer_serial(node: Node<'_, '_>) -> Result<(String, String), ParseError> {
@@ -845,6 +964,13 @@ mod tests {
     use super::*;
     use base64::Engine;
 
+    fn fixture_rsa_cert_base64() -> String {
+        include_str!("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem")
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<String>()
+    }
+
     // ── SignatureAlgorithm ───────────────────────────────────────────
 
     #[test]
@@ -937,7 +1063,9 @@ mod tests {
 
     #[test]
     fn parse_key_info_dispatches_supported_children() {
-        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+        let cert_base64 = fixture_rsa_cert_base64();
+        let xml = format!(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
             <KeyName>idp-signing-key</KeyName>
             <KeyValue>
@@ -947,7 +1075,7 @@ mod tests {
                 </RSAKeyValue>
             </KeyValue>
             <X509Data>
-                <X509Certificate>AQID</X509Certificate>
+                <X509Certificate>{cert_base64}</X509Certificate>
                 <X509SubjectName>CN=Example</X509SubjectName>
                 <X509IssuerSerial>
                     <X509IssuerName>CN=CA</X509IssuerName>
@@ -958,8 +1086,9 @@ mod tests {
                 <dsig11:X509Digest Algorithm="http://www.w3.org/2001/04/xmlenc#sha256">CAkK</dsig11:X509Digest>
             </X509Data>
             <dsig11:DEREncodedKeyValue>AQIDBA==</dsig11:DEREncodedKeyValue>
-        </KeyInfo>"#;
-        let doc = Document::parse(xml).unwrap();
+        </KeyInfo>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
 
         let key_info = parse_key_info(doc.root_element()).unwrap();
         assert_eq!(key_info.sources.len(), 4);
@@ -972,20 +1101,38 @@ mod tests {
             key_info.sources[1],
             KeyInfoSource::KeyValue(KeyValueInfo::RsaKeyValue)
         );
+        let x509_info = match &key_info.sources[2] {
+            KeyInfoSource::X509Data(x509) => x509,
+            other => panic!("expected X509Data source, got {other:?}"),
+        };
+        let expected_cert = base64::engine::general_purpose::STANDARD
+            .decode(&cert_base64)
+            .expect("fixture PEM must contain valid base64");
+        assert_eq!(x509_info.certificates, vec![expected_cert]);
+        assert_eq!(x509_info.subject_names, vec!["CN=Example".to_string()]);
         assert_eq!(
-            key_info.sources[2],
-            KeyInfoSource::X509Data(X509DataInfo {
-                certificates: vec![vec![1, 2, 3]],
-                subject_names: vec!["CN=Example".into()],
-                issuer_serials: vec![("CN=CA".into(), "42".into())],
-                skis: vec![vec![1, 2, 3, 4]],
-                crls: vec![vec![4, 5, 6, 7]],
-                digests: vec![(
-                    "http://www.w3.org/2001/04/xmlenc#sha256".into(),
-                    vec![8, 9, 10]
-                )],
-            })
+            x509_info.issuer_serials,
+            vec![("CN=CA".to_string(), "42".to_string())]
         );
+        assert_eq!(x509_info.skis, vec![vec![1, 2, 3, 4]]);
+        assert_eq!(x509_info.crls, vec![vec![4, 5, 6, 7]]);
+        assert_eq!(
+            x509_info.digests,
+            vec![(
+                "http://www.w3.org/2001/04/xmlenc#sha256".to_string(),
+                vec![8, 9, 10]
+            )]
+        );
+        assert_eq!(x509_info.parsed_certificates.len(), 1);
+        let parsed_cert = &x509_info.parsed_certificates[0];
+        assert!(!parsed_cert.subject_dn.is_empty());
+        assert!(!parsed_cert.issuer_dn.is_empty());
+        assert!(parsed_cert.subject_key_identifier.is_some());
+        assert!(matches!(
+            parsed_cert.public_key,
+            X509PublicKeyInfo::Rsa { .. }
+        ));
+
         assert_eq!(
             key_info.sources[3],
             KeyInfoSource::DerEncodedKeyValue(vec![1, 2, 3, 4])
@@ -1202,14 +1349,27 @@ mod tests {
     #[test]
     fn parse_key_info_rejects_x509_data_exceeding_total_binary_budget() {
         let payload = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 190_000]);
-        let certs = (0..6)
-            .map(|_| format!("<X509Certificate>{payload}</X509Certificate>"))
+        let entries = (0..6)
+            .map(|_| format!("<X509SKI>{payload}</X509SKI>"))
             .collect::<Vec<_>>()
             .join("");
         let xml = format!(
-            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>{certs}</X509Data></KeyInfo>"
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>{entries}</X509Data></KeyInfo>"
         );
         let doc = Document::parse(&xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_x509_certificate_with_invalid_der() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <X509Data>
+                <X509Certificate>AQID</X509Certificate>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
         assert!(matches!(err, ParseError::InvalidStructure(_)));
