@@ -172,6 +172,8 @@ pub enum KeyValueInfo {
 #[non_exhaustive]
 pub struct X509DataInfo {
     /// DER-encoded certificates from `<X509Certificate>`.
+    ///
+    /// This vector has a 1:1 index correspondence with `parsed_certificates`.
     pub certificates: Vec<Vec<u8>>,
     /// Text values from `<X509SubjectName>`.
     pub subject_names: Vec<String>,
@@ -184,6 +186,8 @@ pub struct X509DataInfo {
     /// `(Algorithm URI, digest bytes)` tuples from `dsig11:X509Digest`.
     pub digests: Vec<(String, Vec<u8>)>,
     /// Parsed metadata for each `<X509Certificate>` entry.
+    ///
+    /// This vector has a 1:1 index correspondence with `certificates`.
     pub parsed_certificates: Vec<ParsedX509Certificate>,
 }
 
