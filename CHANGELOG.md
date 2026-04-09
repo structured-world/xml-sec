@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/structured-world/xml-sec/compare/v0.1.5...v0.1.6) - 2026-04-09
+
+### Added
+
+- *(xmldsig)* parse full x509data sub-elements
+
+### Documentation
+
+- *(readme)* add crates and ci badges
+
+### Fixed
+
+- *(xmldsig)* tighten x509 issuer serial parsing
+- *(xmldsig)* harden x509data parsing bounds
+
 ## [0.1.5](https://github.com/structured-world/xml-sec/compare/v0.1.4...v0.1.5) - 2026-04-09
 
 ### Added
