@@ -32,9 +32,13 @@ const MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN: usize = 65_536;
 const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LEN.div_ceil(3) * 4;
 const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
 const MAX_X509_BASE64_TEXT_LEN: usize = 262_144;
+const MAX_X509_BASE64_NORMALIZED_LEN: usize = MAX_X509_BASE64_TEXT_LEN;
+const MAX_X509_DECODED_BINARY_LEN: usize = MAX_X509_BASE64_NORMALIZED_LEN.div_ceil(4) * 3;
 const MAX_X509_SUBJECT_NAME_TEXT_LEN: usize = 16_384;
 const MAX_X509_ISSUER_NAME_TEXT_LEN: usize = 16_384;
 const MAX_X509_SERIAL_NUMBER_TEXT_LEN: usize = 4096;
+const MAX_X509_DATA_ENTRY_COUNT: usize = 64;
+const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
 
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -492,40 +496,56 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
     ensure_no_non_whitespace_text(node, "X509Data")?;
 
     let mut info = X509DataInfo::default();
+    let mut total_binary_len = 0usize;
     for child in element_children(node) {
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "X509Certificate") => {
                 ensure_no_element_children(child, "X509Certificate")?;
-                info.certificates
-                    .push(decode_x509_base64(child, "X509Certificate")?);
+                ensure_x509_data_entry_budget(&info)?;
+                let cert = decode_x509_base64(child, "X509Certificate")?;
+                add_x509_data_usage(&mut total_binary_len, cert.len())?;
+                info.certificates.push(cert);
             }
             (Some(XMLDSIG_NS), "X509SubjectName") => {
                 ensure_no_element_children(child, "X509SubjectName")?;
-                info.subject_names.push(collect_text_content_bounded(
+                ensure_x509_data_entry_budget(&info)?;
+                let subject_name = collect_text_content_bounded(
                     child,
                     MAX_X509_SUBJECT_NAME_TEXT_LEN,
                     "X509SubjectName",
-                )?);
+                )?;
+                add_x509_data_usage(&mut total_binary_len, subject_name.len())?;
+                info.subject_names.push(subject_name);
             }
             (Some(XMLDSIG_NS), "X509IssuerSerial") => {
-                info.issuer_serials.push(parse_x509_issuer_serial(child)?);
+                ensure_x509_data_entry_budget(&info)?;
+                let issuer_serial = parse_x509_issuer_serial(child)?;
+                add_x509_data_usage(
+                    &mut total_binary_len,
+                    issuer_serial.0.len() + issuer_serial.1.len(),
+                )?;
+                info.issuer_serials.push(issuer_serial);
             }
             (Some(XMLDSIG_NS), "X509SKI") => {
                 ensure_no_element_children(child, "X509SKI")?;
-                info.skis.push(decode_x509_base64(child, "X509SKI")?);
+                ensure_x509_data_entry_budget(&info)?;
+                let ski = decode_x509_base64(child, "X509SKI")?;
+                add_x509_data_usage(&mut total_binary_len, ski.len())?;
+                info.skis.push(ski);
             }
             (Some(XMLDSIG_NS), "X509CRL") => {
                 ensure_no_element_children(child, "X509CRL")?;
-                info.crls.push(decode_x509_base64(child, "X509CRL")?);
+                ensure_x509_data_entry_budget(&info)?;
+                let crl = decode_x509_base64(child, "X509CRL")?;
+                add_x509_data_usage(&mut total_binary_len, crl.len())?;
+                info.crls.push(crl);
             }
             (Some(XMLDSIG11_NS), "X509Digest") => {
                 ensure_no_element_children(child, "X509Digest")?;
-                let algorithm = child.attribute("Algorithm").ok_or_else(|| {
-                    ParseError::InvalidStructure(
-                        "X509Digest must include Algorithm attribute".into(),
-                    )
-                })?;
+                ensure_x509_data_entry_budget(&info)?;
+                let algorithm = required_algorithm_attr(child, "X509Digest")?;
                 let digest = decode_x509_base64(child, "X509Digest")?;
+                add_x509_data_usage(&mut total_binary_len, digest.len())?;
                 info.digests.push((algorithm.to_string(), digest));
             }
             (Some(XMLDSIG_NS), child_name) | (Some(XMLDSIG11_NS), child_name) => {
@@ -538,6 +558,33 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
     }
 
     Ok(info)
+}
+
+fn ensure_x509_data_entry_budget(info: &X509DataInfo) -> Result<(), ParseError> {
+    let total_entries = info.certificates.len()
+        + info.subject_names.len()
+        + info.issuer_serials.len()
+        + info.skis.len()
+        + info.crls.len()
+        + info.digests.len();
+    if total_entries >= MAX_X509_DATA_ENTRY_COUNT {
+        return Err(ParseError::InvalidStructure(
+            "X509Data contains too many entries".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn add_x509_data_usage(total_binary_len: &mut usize, delta: usize) -> Result<(), ParseError> {
+    *total_binary_len = total_binary_len.checked_add(delta).ok_or_else(|| {
+        ParseError::InvalidStructure("X509Data exceeds maximum allowed total binary length".into())
+    })?;
+    if *total_binary_len > MAX_X509_DATA_TOTAL_BINARY_LEN {
+        return Err(ParseError::InvalidStructure(
+            "X509Data exceeds maximum allowed total binary length".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn decode_x509_base64(
@@ -566,6 +613,11 @@ fn decode_x509_base64(
                 err.invalid_byte
             ))
         })?;
+        if cleaned.len() > MAX_X509_BASE64_NORMALIZED_LEN {
+            return Err(ParseError::InvalidStructure(format!(
+                "{element_name} exceeds maximum allowed base64 length"
+            )));
+        }
     }
 
     let decoded = STANDARD
@@ -574,6 +626,11 @@ fn decode_x509_base64(
     if decoded.is_empty() {
         return Err(ParseError::InvalidStructure(format!(
             "{element_name} must not be empty"
+        )));
+    }
+    if decoded.len() > MAX_X509_DECODED_BINARY_LEN {
+        return Err(ParseError::InvalidStructure(format!(
+            "{element_name} exceeds maximum allowed binary length"
         )));
     }
     Ok(decoded)
@@ -633,6 +690,11 @@ fn parse_x509_issuer_serial(node: Node<'_, '_>) -> Result<(String, String), Pars
             "X509IssuerSerial must contain X509IssuerName and X509SerialNumber".into(),
         )
     })?;
+    if issuer_name.trim().is_empty() || serial_number.trim().is_empty() {
+        return Err(ParseError::InvalidStructure(
+            "X509IssuerSerial requires non-empty X509IssuerName and X509SerialNumber".into(),
+        ));
+    }
 
     Ok((issuer_name, serial_number))
 }
@@ -1024,6 +1086,58 @@ mod tests {
     }
 
     #[test]
+    fn parse_key_info_rejects_x509_issuer_serial_with_duplicate_issuer_name() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <X509Data>
+                <X509IssuerSerial>
+                    <X509IssuerName>CN=CA-1</X509IssuerName>
+                    <X509IssuerName>CN=CA-2</X509IssuerName>
+                    <X509SerialNumber>42</X509SerialNumber>
+                </X509IssuerSerial>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_x509_issuer_serial_with_duplicate_serial_number() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <X509Data>
+                <X509IssuerSerial>
+                    <X509IssuerName>CN=CA</X509IssuerName>
+                    <X509SerialNumber>1</X509SerialNumber>
+                    <X509SerialNumber>2</X509SerialNumber>
+                </X509IssuerSerial>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_x509_issuer_serial_with_whitespace_only_values() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <X509Data>
+                <X509IssuerSerial>
+                    <X509IssuerName>   </X509IssuerName>
+                    <X509SerialNumber>
+                        
+                    </X509SerialNumber>
+                </X509IssuerSerial>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
     fn parse_key_info_rejects_x509_digest_without_algorithm() {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
@@ -1048,6 +1162,37 @@ mod tests {
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
         assert!(matches!(err, ParseError::Base64(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_x509_data_exceeding_entry_budget() {
+        let subjects = (0..(MAX_X509_DATA_ENTRY_COUNT + 1))
+            .map(|idx| format!("<X509SubjectName>CN={idx}</X509SubjectName>"))
+            .collect::<Vec<_>>()
+            .join("");
+        let xml = format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>{subjects}</X509Data></KeyInfo>"
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_x509_data_exceeding_total_binary_budget() {
+        let payload = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 190_000]);
+        let certs = (0..6)
+            .map(|_| format!("<X509Certificate>{payload}</X509Certificate>"))
+            .collect::<Vec<_>>()
+            .join("");
+        let xml = format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>{certs}</X509Data></KeyInfo>"
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
     }
 
     #[test]
