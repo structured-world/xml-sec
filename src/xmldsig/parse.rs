@@ -31,6 +31,10 @@ const MAX_DER_ENCODED_KEY_VALUE_LEN: usize = 8192;
 const MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN: usize = 65_536;
 const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LEN.div_ceil(3) * 4;
 const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
+const MAX_X509_BASE64_TEXT_LEN: usize = 262_144;
+const MAX_X509_SUBJECT_NAME_TEXT_LEN: usize = 16_384;
+const MAX_X509_ISSUER_NAME_TEXT_LEN: usize = 16_384;
+const MAX_X509_SERIAL_NUMBER_TEXT_LEN: usize = 4096;
 
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,22 +160,22 @@ pub enum KeyValueInfo {
     },
 }
 
-/// Parsed `<X509Data>` children (dispatch-only in P2-001).
+/// Parsed `<X509Data>` children.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct X509DataInfo {
-    /// Number of `<X509Certificate>` children.
-    pub certificate_count: usize,
-    /// Number of `<X509SubjectName>` children.
-    pub subject_name_count: usize,
-    /// Number of `<X509IssuerSerial>` children.
-    pub issuer_serial_count: usize,
-    /// Number of `<X509SKI>` children.
-    pub ski_count: usize,
-    /// Number of `<X509CRL>` children.
-    pub crl_count: usize,
-    /// Number of `<X509Digest>` children.
-    pub digest_count: usize,
+    /// DER-encoded certificates from `<X509Certificate>`.
+    pub certificates: Vec<Vec<u8>>,
+    /// Text values from `<X509SubjectName>`.
+    pub subject_names: Vec<String>,
+    /// `(IssuerName, SerialNumber)` tuples from `<X509IssuerSerial>`.
+    pub issuer_serials: Vec<(String, String)>,
+    /// Raw bytes from `<X509SKI>`.
+    pub skis: Vec<Vec<u8>>,
+    /// DER-encoded CRLs from `<X509CRL>`.
+    pub crls: Vec<Vec<u8>>,
+    /// `(Algorithm URI, digest bytes)` tuples from `dsig11:X509Digest`.
+    pub digests: Vec<(String, Vec<u8>)>,
 }
 
 /// Errors during XMLDSig element parsing.
@@ -491,22 +495,38 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
     for child in element_children(node) {
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "X509Certificate") => {
-                info.certificate_count += 1;
+                ensure_no_element_children(child, "X509Certificate")?;
+                info.certificates
+                    .push(decode_x509_base64(child, "X509Certificate")?);
             }
             (Some(XMLDSIG_NS), "X509SubjectName") => {
-                info.subject_name_count += 1;
+                ensure_no_element_children(child, "X509SubjectName")?;
+                info.subject_names.push(collect_text_content_bounded(
+                    child,
+                    MAX_X509_SUBJECT_NAME_TEXT_LEN,
+                    "X509SubjectName",
+                )?);
             }
             (Some(XMLDSIG_NS), "X509IssuerSerial") => {
-                info.issuer_serial_count += 1;
+                info.issuer_serials.push(parse_x509_issuer_serial(child)?);
             }
             (Some(XMLDSIG_NS), "X509SKI") => {
-                info.ski_count += 1;
+                ensure_no_element_children(child, "X509SKI")?;
+                info.skis.push(decode_x509_base64(child, "X509SKI")?);
             }
             (Some(XMLDSIG_NS), "X509CRL") => {
-                info.crl_count += 1;
+                ensure_no_element_children(child, "X509CRL")?;
+                info.crls.push(decode_x509_base64(child, "X509CRL")?);
             }
             (Some(XMLDSIG11_NS), "X509Digest") => {
-                info.digest_count += 1;
+                ensure_no_element_children(child, "X509Digest")?;
+                let algorithm = child.attribute("Algorithm").ok_or_else(|| {
+                    ParseError::InvalidStructure(
+                        "X509Digest must include Algorithm attribute".into(),
+                    )
+                })?;
+                let digest = decode_x509_base64(child, "X509Digest")?;
+                info.digests.push((algorithm.to_string(), digest));
             }
             (Some(XMLDSIG_NS), child_name) | (Some(XMLDSIG11_NS), child_name) => {
                 return Err(ParseError::InvalidStructure(format!(
@@ -518,6 +538,103 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
     }
 
     Ok(info)
+}
+
+fn decode_x509_base64(
+    node: Node<'_, '_>,
+    element_name: &'static str,
+) -> Result<Vec<u8>, ParseError> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let mut cleaned = String::new();
+    let mut raw_text_len = 0usize;
+    for text in node
+        .children()
+        .filter(|child| child.is_text())
+        .filter_map(|child| child.text())
+    {
+        if raw_text_len.saturating_add(text.len()) > MAX_X509_BASE64_TEXT_LEN {
+            return Err(ParseError::InvalidStructure(format!(
+                "{element_name} exceeds maximum allowed text length"
+            )));
+        }
+        raw_text_len = raw_text_len.saturating_add(text.len());
+        normalize_xml_base64_text(text, &mut cleaned).map_err(|err| {
+            ParseError::Base64(format!(
+                "invalid XML whitespace U+{:04X} in {element_name}",
+                err.invalid_byte
+            ))
+        })?;
+    }
+
+    let decoded = STANDARD
+        .decode(&cleaned)
+        .map_err(|e| ParseError::Base64(format!("{element_name}: {e}")))?;
+    if decoded.is_empty() {
+        return Err(ParseError::InvalidStructure(format!(
+            "{element_name} must not be empty"
+        )));
+    }
+    Ok(decoded)
+}
+
+fn parse_x509_issuer_serial(node: Node<'_, '_>) -> Result<(String, String), ParseError> {
+    verify_ds_element(node, "X509IssuerSerial")?;
+    ensure_no_non_whitespace_text(node, "X509IssuerSerial")?;
+
+    let mut issuer_name = None;
+    let mut serial_number = None;
+
+    for child in element_children(node) {
+        match (child.tag_name().namespace(), child.tag_name().name()) {
+            (Some(XMLDSIG_NS), "X509IssuerName") => {
+                ensure_no_element_children(child, "X509IssuerName")?;
+                if issuer_name.is_some() {
+                    return Err(ParseError::InvalidStructure(
+                        "X509IssuerSerial must contain exactly one X509IssuerName".into(),
+                    ));
+                }
+                issuer_name = Some(collect_text_content_bounded(
+                    child,
+                    MAX_X509_ISSUER_NAME_TEXT_LEN,
+                    "X509IssuerName",
+                )?);
+            }
+            (Some(XMLDSIG_NS), "X509SerialNumber") => {
+                ensure_no_element_children(child, "X509SerialNumber")?;
+                if serial_number.is_some() {
+                    return Err(ParseError::InvalidStructure(
+                        "X509IssuerSerial must contain exactly one X509SerialNumber".into(),
+                    ));
+                }
+                serial_number = Some(collect_text_content_bounded(
+                    child,
+                    MAX_X509_SERIAL_NUMBER_TEXT_LEN,
+                    "X509SerialNumber",
+                )?);
+            }
+            (Some(XMLDSIG_NS), child_name) | (Some(XMLDSIG11_NS), child_name) => {
+                return Err(ParseError::InvalidStructure(format!(
+                    "X509IssuerSerial contains unsupported XMLDSig child element <{child_name}>"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let issuer_name = issuer_name.ok_or_else(|| {
+        ParseError::InvalidStructure(
+            "X509IssuerSerial must contain X509IssuerName and X509SerialNumber".into(),
+        )
+    })?;
+    let serial_number = serial_number.ok_or_else(|| {
+        ParseError::InvalidStructure(
+            "X509IssuerSerial must contain X509IssuerName and X509SerialNumber".into(),
+        )
+    })?;
+
+    Ok((issuer_name, serial_number))
 }
 
 /// Base64-decode a digest value string, stripping whitespace.
@@ -782,8 +899,15 @@ mod tests {
                 </RSAKeyValue>
             </KeyValue>
             <X509Data>
-                <X509Certificate>MIIB</X509Certificate>
+                <X509Certificate>AQID</X509Certificate>
                 <X509SubjectName>CN=Example</X509SubjectName>
+                <X509IssuerSerial>
+                    <X509IssuerName>CN=CA</X509IssuerName>
+                    <X509SerialNumber>42</X509SerialNumber>
+                </X509IssuerSerial>
+                <X509SKI>AQIDBA==</X509SKI>
+                <X509CRL>BAUGBw==</X509CRL>
+                <dsig11:X509Digest Algorithm="http://www.w3.org/2001/04/xmlenc#sha256">CAkK</dsig11:X509Digest>
             </X509Data>
             <dsig11:DEREncodedKeyValue>AQIDBA==</dsig11:DEREncodedKeyValue>
         </KeyInfo>"#;
@@ -803,12 +927,15 @@ mod tests {
         assert_eq!(
             key_info.sources[2],
             KeyInfoSource::X509Data(X509DataInfo {
-                certificate_count: 1,
-                subject_name_count: 1,
-                issuer_serial_count: 0,
-                ski_count: 0,
-                crl_count: 0,
-                digest_count: 0,
+                certificates: vec![vec![1, 2, 3]],
+                subject_names: vec!["CN=Example".into()],
+                issuer_serials: vec![("CN=CA".into(), "42".into())],
+                skis: vec![vec![1, 2, 3, 4]],
+                crls: vec![vec![4, 5, 6, 7]],
+                digests: vec![(
+                    "http://www.w3.org/2001/04/xmlenc#sha256".into(),
+                    vec![8, 9, 10]
+                )],
             })
         );
         assert_eq!(
@@ -879,6 +1006,48 @@ mod tests {
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
         assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_x509_issuer_serial_without_required_children() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <X509Data>
+                <X509IssuerSerial>
+                    <X509IssuerName>CN=CA</X509IssuerName>
+                </X509IssuerSerial>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_x509_digest_without_algorithm() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <X509Data>
+                <dsig11:X509Digest>AQID</dsig11:X509Digest>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_invalid_x509_certificate_base64() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <X509Data>
+                <X509Certificate>%%%invalid%%%</X509Certificate>
+            </X509Data>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::Base64(_)));
     }
 
     #[test]
