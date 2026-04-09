@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/structured-world/xml-sec/compare/v0.1.4...v0.1.5) - 2026-04-09
+
+### Added
+
+- *(xmldsig)* add keyinfo dispatch parsing
+
+### Documentation
+
+- *(xmldsig)* clarify keyinfo lax vs strict behavior
+- *(xmldsig)* align verify pipeline rustdoc
+- *(xmldsig)* clarify deferred keyinfo consumption
+- *(xmldsig)* document whitespace helper and signature checks
+
+### Fixed
+
+- *(xmldsig)* stream digestvalue normalization
+- *(xmldsig)* gate keyinfo parse by resolver intent
+- *(xmldsig)* address KeyInfo review feedback
+- *(xmldsig)* preserve keyvalue qname and whitespace coverage
+- *(xmldsig)* restrict eckeyvalue dispatch to dsig11
+- *(xmldsig)* allow lax empty x509data parsing
+- *(xmldsig)* require supported x509data children
+- *(xmldsig)* harden x509data namespace validation
+- *(xmldsig)* reject unknown ds children in x509data
+- *(xmldsig)* bound keyname text length
+- *(xmldsig)* tighten keyinfo and signature child parsing
+- *(xmldsig)* harden signature child validation
+- *(xmldsig)* cap keyinfo der payload and clarify errors
+- *(xmldsig)* harden keyinfo and signature child parsing
+
+### Refactored
+
+- *(xmldsig)* remove unreachable signature child check
+
+### Testing
+
+- *(xmldsig)* isolate signature-child structure regressions
+- *(xmldsig)* tighten saml idp fixture coverage
+- *(xmldsig)* stabilize saml fixture integration
+- *(xmldsig)* add real saml idp integration test
+
 ## [0.1.4](https://github.com/structured-world/xml-sec/compare/v0.1.3...v0.1.4) - 2026-04-04
 
 ### Added
