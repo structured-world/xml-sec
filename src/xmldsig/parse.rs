@@ -718,19 +718,20 @@ fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certificate, Pars
             X509PublicKeyInfo::Rsa { modulus, exponent }
         }
         PublicKey::EC(ec_point) => {
-            let curve_oid = spki
-                .algorithm
-                .parameters
-                .as_ref()
-                .and_then(|params| params.as_oid().ok().map(|oid| oid.to_id_string()))
-                .ok_or_else(|| {
-                    ParseError::InvalidStructure(
-                        "X509Certificate EC key is missing curve OID parameters".into(),
-                    )
-                })?;
-            X509PublicKeyInfo::Ec {
-                curve_oid,
-                public_key: ec_point.data().to_vec(),
+            let Some(params) = spki.algorithm.parameters.as_ref() else {
+                return Err(ParseError::InvalidStructure(
+                    "X509Certificate EC key is missing curve parameters".into(),
+                ));
+            };
+
+            match params.as_oid() {
+                Ok(oid) => X509PublicKeyInfo::Ec {
+                    curve_oid: oid.to_id_string(),
+                    public_key: ec_point.data().to_vec(),
+                },
+                Err(_) => X509PublicKeyInfo::Unsupported {
+                    algorithm_oid: spki.algorithm.algorithm.to_id_string(),
+                },
             }
         }
         _ => X509PublicKeyInfo::Unsupported {
@@ -1377,6 +1378,34 @@ mod tests {
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
         assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_marks_unsupported_spki_algorithm_as_unsupported() {
+        let xml = include_str!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt.xml"
+        );
+        let doc = Document::parse(xml).unwrap();
+        let key_info_node = doc
+            .descendants()
+            .find(|node| {
+                node.is_element()
+                    && node.tag_name().namespace() == Some(XMLDSIG_NS)
+                    && node.tag_name().name() == "KeyInfo"
+            })
+            .expect("fixture must contain ds:KeyInfo");
+
+        let key_info = parse_key_info(key_info_node).expect("KeyInfo parse should succeed");
+        let x509_info = match &key_info.sources[0] {
+            KeyInfoSource::X509Data(x509) => x509,
+            other => panic!("expected X509Data source, got {other:?}"),
+        };
+        assert_eq!(x509_info.certificates.len(), 1);
+        assert_eq!(x509_info.parsed_certificates.len(), 1);
+        assert!(matches!(
+            x509_info.parsed_certificates[0].public_key,
+            X509PublicKeyInfo::Unsupported { .. }
+        ));
     }
 
     #[test]
