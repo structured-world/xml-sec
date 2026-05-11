@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Delete stale release-plz branches
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const branches = await github.paginate(
