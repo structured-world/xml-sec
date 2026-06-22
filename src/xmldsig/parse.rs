@@ -816,7 +816,7 @@ fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certificate, Pars
     let subject_dn = cert.subject().to_string();
     let issuer_dn = cert.issuer().to_string();
     let serial_number = cert.tbs_certificate.raw_serial().to_vec();
-    let serial_number_hex = format_x509_serial_hex(&serial_number);
+    let serial_number_hex = format_x509_serial_value_hex(&serial_number);
 
     let subject_key_identifier = cert.extensions().iter().find_map(|ext| {
         if let ParsedExtension::SubjectKeyIdentifier(ski) = ext.parsed_extension() {
@@ -879,6 +879,19 @@ fn format_x509_serial_hex(serial: &[u8]) -> String {
         .collect::<String>()
 }
 
+fn format_x509_serial_value_hex(serial: &[u8]) -> String {
+    let first_non_zero = serial
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(serial.len());
+    let canonical = if first_non_zero == serial.len() {
+        &[0]
+    } else {
+        &serial[first_non_zero..]
+    };
+    format_x509_serial_hex(canonical)
+}
+
 fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
     let serial = serial.trim();
     let serial = serial.strip_prefix('+').unwrap_or(serial);
@@ -900,16 +913,7 @@ fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
         }
     }
 
-    let first_non_zero = bytes
-        .iter()
-        .position(|byte| *byte != 0)
-        .unwrap_or(bytes.len());
-    let canonical = if first_non_zero == bytes.len() {
-        &[0]
-    } else {
-        &bytes[first_non_zero..]
-    };
-    Some(format_x509_serial_hex(canonical))
+    Some(format_x509_serial_value_hex(&bytes))
 }
 
 fn trim_leading_zeroes(bytes: &[u8]) -> Vec<u8> {
@@ -1758,6 +1762,13 @@ mod tests {
         assert!(
             matches!(err, ParseError::InvalidStructure(message) if message.contains("maximum depth"))
         );
+    }
+
+    #[test]
+    fn x509_serial_hex_strips_der_sign_extension_zeroes() {
+        assert_eq!(format_x509_serial_value_hex(&[0x00, 0xFF]), "FF");
+        assert_eq!(format_x509_serial_value_hex(&[0x00, 0x7F]), "7F");
+        assert_eq!(format_x509_serial_value_hex(&[0x00, 0x00]), "00");
     }
 
     #[test]
