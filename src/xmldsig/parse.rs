@@ -652,6 +652,11 @@ fn build_x509_certificate_chain(info: &X509DataInfo) -> Result<Vec<usize>, Parse
                         "X509Data certificate chain contains a cycle".into(),
                     ));
                 }
+                if chain.len() == MAX_X509_CHAIN_DEPTH {
+                    return Err(ParseError::InvalidStructure(
+                        "X509Data certificate chain exceeds maximum depth".into(),
+                    ));
+                }
                 chain.push(*issuer_idx);
             }
             _ => {
@@ -675,7 +680,8 @@ fn select_x509_signing_certificate(info: &X509DataInfo) -> Result<usize, ParseEr
             .any(|subject_name| subject_name.trim() == cert.subject_dn)
             || info.issuer_serials.iter().any(|(issuer_name, serial)| {
                 issuer_name.trim() == cert.issuer_dn
-                    && normalize_x509_serial_text(serial) == cert.serial_number_hex
+                    && x509_serial_decimal_to_hex(serial).as_deref()
+                        == Some(cert.serial_number_hex.as_str())
             })
             || info.skis.iter().any(|ski| {
                 cert.subject_key_identifier
@@ -873,13 +879,37 @@ fn format_x509_serial_hex(serial: &[u8]) -> String {
         .collect::<String>()
 }
 
-fn normalize_x509_serial_text(serial: &str) -> String {
-    serial
-        .trim()
-        .chars()
-        .filter(|ch| !matches!(ch, ':' | ' ' | '\t' | '\r' | '\n'))
-        .flat_map(char::to_uppercase)
-        .collect::<String>()
+fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
+    let serial = serial.trim();
+    let serial = serial.strip_prefix('+').unwrap_or(serial);
+    if serial.is_empty() || !serial.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    let mut bytes = Vec::<u8>::new();
+    for digit in serial.bytes().map(|byte| byte - b'0') {
+        let mut carry = u16::from(digit);
+        for byte in bytes.iter_mut().rev() {
+            let value = u16::from(*byte) * 10 + carry;
+            *byte = value as u8;
+            carry = value >> 8;
+        }
+        while carry > 0 {
+            bytes.insert(0, carry as u8);
+            carry >>= 8;
+        }
+    }
+
+    let first_non_zero = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len());
+    let canonical = if first_non_zero == bytes.len() {
+        &[0]
+    } else {
+        &bytes[first_non_zero..]
+    };
+    Some(format_x509_serial_hex(canonical))
 }
 
 fn trim_leading_zeroes(bytes: &[u8]) -> Vec<u8> {
@@ -1627,12 +1657,48 @@ mod tests {
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
                     <X509IssuerSerial>
-                        <X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, E=xmlsec@aleksey.com</X509IssuerName>
-                        <X509SerialNumber>7735EE487F6862DAF1B3956D961CCB0FA6F34F53</X509SerialNumber>
+                        <X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName>
+                        <X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber>
                     </X509IssuerSerial>
                     <X509Certificate>{root}</X509Certificate>
                     <X509Certificate>{intermediate}</X509Certificate>
                     <X509Certificate>{leaf}</X509Certificate>
+                </X509Data>
+            </KeyInfo>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        let x509_info = match &key_info.sources[0] {
+            KeyInfoSource::X509Data(x509) => x509,
+            other => panic!("expected X509Data source, got {other:?}"),
+        };
+
+        assert_eq!(x509_info.certificate_chain, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn parse_key_info_uses_decimal_issuer_serial_to_select_x509_signing_certificate() {
+        assert_eq!(
+            x509_serial_decimal_to_hex("680572598617295163017172295025714171905498632019")
+                .as_deref(),
+            Some("7735EE487F6862DAF1B3956D961CCB0FA6F34F53")
+        );
+        let root = fixture_cert_base64("../../tests/fixtures/keys/cacert.pem");
+        let intermediate = fixture_cert_base64("../../tests/fixtures/keys/ca2cert.pem");
+        let leaf = fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let other_leaf = fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+        let xml = format!(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <X509Data>
+                    <X509IssuerSerial>
+                        <X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName>
+                        <X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber>
+                    </X509IssuerSerial>
+                    <X509Certificate>{root}</X509Certificate>
+                    <X509Certificate>{intermediate}</X509Certificate>
+                    <X509Certificate>{leaf}</X509Certificate>
+                    <X509Certificate>{other_leaf}</X509Certificate>
                 </X509Data>
             </KeyInfo>"#
         );
@@ -1663,6 +1729,35 @@ mod tests {
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
         assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn build_x509_certificate_chain_rejects_chain_exceeding_max_depth() {
+        let parsed_certificates = (0..=MAX_X509_CHAIN_DEPTH)
+            .map(|idx| ParsedX509Certificate {
+                subject_dn: format!("CN=cert-{idx}"),
+                issuer_dn: if idx == MAX_X509_CHAIN_DEPTH {
+                    format!("CN=cert-{idx}")
+                } else {
+                    format!("CN=cert-{}", idx + 1)
+                },
+                serial_number: vec![u8::try_from(idx).unwrap()],
+                serial_number_hex: format!("{idx:02X}"),
+                subject_key_identifier: None,
+                public_key: X509PublicKeyInfo::Unsupported {
+                    algorithm_oid: "1.2.3.4".into(),
+                },
+            })
+            .collect();
+        let info = X509DataInfo {
+            parsed_certificates,
+            ..X509DataInfo::default()
+        };
+
+        let err = build_x509_certificate_chain(&info).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidStructure(message) if message.contains("maximum depth"))
+        );
     }
 
     #[test]
