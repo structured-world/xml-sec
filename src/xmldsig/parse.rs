@@ -216,11 +216,11 @@ pub enum X509PublicKeyInfo {
         /// Unsigned big-endian RSA public exponent (`e`), normalized without leading zeroes.
         exponent: Vec<u8>,
     },
-    /// EC public key (`curve_oid`, uncompressed point bytes).
+    /// EC public key (`curve_oid`, encoded point bytes).
     Ec {
         /// Named-curve OID from SubjectPublicKeyInfo parameters.
         curve_oid: String,
-        /// Raw EC point bytes from SubjectPublicKeyInfo.
+        /// Encoded EC point bytes from SubjectPublicKeyInfo.
         public_key: Vec<u8>,
     },
     /// Public key algorithm is present but not parsed into a concrete key type.
@@ -1381,6 +1381,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_key_info_rejects_x509_certificate_with_trailing_der_bytes() {
+        let mut cert = base64::engine::general_purpose::STANDARD
+            .decode(fixture_rsa_cert_base64())
+            .unwrap();
+        cert.extend_from_slice(&[0x00, 0x01]);
+        let cert_base64 = base64::engine::general_purpose::STANDARD.encode(cert);
+        let xml = format!(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <X509Data>
+                    <X509Certificate>{cert_base64}</X509Certificate>
+                </X509Data>
+            </KeyInfo>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
     fn parse_key_info_marks_unsupported_spki_algorithm_as_unsupported() {
         let xml = include_str!(
             "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt.xml"
@@ -1402,8 +1422,12 @@ mod tests {
         };
         assert_eq!(x509_info.certificates.len(), 1);
         assert_eq!(x509_info.parsed_certificates.len(), 1);
+        let parsed_cert = &x509_info.parsed_certificates[0];
+        assert!(!parsed_cert.subject_dn.is_empty());
+        assert!(!parsed_cert.issuer_dn.is_empty());
+        assert!(parsed_cert.subject_key_identifier.is_some());
         assert!(matches!(
-            x509_info.parsed_certificates[0].public_key,
+            parsed_cert.public_key,
             X509PublicKeyInfo::Unsupported { .. }
         ));
     }
