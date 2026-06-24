@@ -672,33 +672,73 @@ fn build_x509_certificate_chain(info: &X509DataInfo) -> Result<Vec<usize>, Parse
 
 fn select_x509_signing_certificate(info: &X509DataInfo) -> Result<usize, ParseError> {
     let mut candidates = Vec::new();
-    let issuer_serial_hints = info
-        .issuer_serials
-        .iter()
-        .filter_map(|(issuer_name, serial)| {
-            x509_serial_decimal_to_hex(serial).map(|serial_hex| (issuer_name.trim(), serial_hex))
-        })
-        .collect::<Vec<_>>();
     let has_lookup_identifiers =
         !info.subject_names.is_empty() || !info.issuer_serials.is_empty() || !info.skis.is_empty();
 
-    for (idx, cert) in info.parsed_certificates.iter().enumerate() {
-        if info
-            .subject_names
+    for subject_name in &info.subject_names {
+        let subject_name = subject_name.trim();
+        let matches = info
+            .parsed_certificates
             .iter()
-            .any(|subject_name| subject_name.trim() == cert.subject_dn)
-            || issuer_serial_hints.iter().any(|(issuer_name, serial_hex)| {
-                *issuer_name == cert.issuer_dn.as_str()
-                    && serial_hex.as_str() == cert.serial_number_hex.as_str()
+            .enumerate()
+            .filter(|(_, cert)| subject_name == cert.subject_dn)
+            .map(|(idx, _)| idx)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Err(ParseError::InvalidStructure(
+                "X509Data lookup identifiers do not match any embedded certificate".into(),
+            ));
+        }
+        candidates.extend(matches);
+    }
+
+    for (issuer_name, serial) in &info.issuer_serials {
+        let serial_hex = x509_serial_decimal_to_hex(serial).ok_or_else(|| {
+            ParseError::InvalidStructure(
+                "X509Data lookup identifiers do not match any embedded certificate".into(),
+            )
+        })?;
+        let issuer_name = issuer_name.trim();
+        let matches = info
+            .parsed_certificates
+            .iter()
+            .enumerate()
+            .filter(|(_, cert)| {
+                issuer_name == cert.issuer_dn && serial_hex == cert.serial_number_hex
             })
-            || info.skis.iter().any(|ski| {
+            .map(|(idx, _)| idx)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Err(ParseError::InvalidStructure(
+                "X509Data lookup identifiers do not match any embedded certificate".into(),
+            ));
+        }
+        candidates.extend(matches);
+    }
+
+    for ski in &info.skis {
+        let matches = info
+            .parsed_certificates
+            .iter()
+            .enumerate()
+            .filter(|(_, cert)| {
                 cert.subject_key_identifier
                     .as_ref()
                     .is_some_and(|subject_key_identifier| subject_key_identifier == ski)
             })
-        {
-            candidates.push(idx);
+            .map(|(idx, _)| idx)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Err(ParseError::InvalidStructure(
+                "X509Data lookup identifiers do not match any embedded certificate".into(),
+            ));
         }
+        candidates.extend(matches);
+    }
+
+    if has_lookup_identifiers {
+        candidates.sort_unstable();
+        candidates.dedup();
     }
 
     match candidates.as_slice() {
@@ -1285,10 +1325,10 @@ mod tests {
                 <X509Certificate>{cert_base64}</X509Certificate>
                 <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
                 <X509IssuerSerial>
-                    <X509IssuerName>CN=CA</X509IssuerName>
-                    <X509SerialNumber>42</X509SerialNumber>
+                    <X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName>
+                    <X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber>
                 </X509IssuerSerial>
-                <X509SKI>AQIDBA==</X509SKI>
+                <X509SKI>bcOXN/nsVl8GatRbcKrPbzIbw0Y=</X509SKI>
                 <X509CRL>BAUGBw==</X509CRL>
                 <dsig11:X509Digest Algorithm="http://www.w3.org/2001/04/xmlenc#sha256">CAkK</dsig11:X509Digest>
             </X509Data>
@@ -1325,9 +1365,18 @@ mod tests {
         );
         assert_eq!(
             x509_info.issuer_serials,
-            vec![("CN=CA".to_string(), "42".to_string())]
+            vec![(
+                "C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com".to_string(),
+                "680572598617295163017172295025714171905498632019".to_string()
+            )]
         );
-        assert_eq!(x509_info.skis, vec![vec![1, 2, 3, 4]]);
+        assert_eq!(
+            x509_info.skis,
+            vec![vec![
+                109, 195, 151, 55, 249, 236, 86, 95, 6, 106, 212, 91, 112, 170, 207, 111, 50, 27,
+                195, 70
+            ]]
+        );
         assert_eq!(x509_info.crls, vec![vec![4, 5, 6, 7]]);
         assert_eq!(
             x509_info.digests,
@@ -1761,6 +1810,49 @@ mod tests {
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
                     <X509SubjectName>CN=Not The Embedded Certificate</X509SubjectName>
+                    <X509Certificate>{cert}</X509Certificate>
+                </X509Data>
+            </KeyInfo>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidStructure(message) if message.contains("lookup identifiers"))
+        );
+    }
+
+    #[test]
+    fn parse_key_info_rejects_malformed_issuer_serial_even_with_matching_subject() {
+        let cert = fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let xml = format!(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <X509Data>
+                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509IssuerSerial>
+                        <X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName>
+                        <X509SerialNumber>not-a-decimal-serial</X509SerialNumber>
+                    </X509IssuerSerial>
+                    <X509Certificate>{cert}</X509Certificate>
+                </X509Data>
+            </KeyInfo>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidStructure(message) if message.contains("lookup identifiers"))
+        );
+    }
+
+    #[test]
+    fn parse_key_info_rejects_unmatched_ski_even_with_matching_subject() {
+        let cert = fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let xml = format!(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <X509Data>
+                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SKI>AQIDBA==</X509SKI>
                     <X509Certificate>{cert}</X509Certificate>
                 </X509Data>
             </KeyInfo>"#
