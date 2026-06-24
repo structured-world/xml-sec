@@ -672,16 +672,24 @@ fn build_x509_certificate_chain(info: &X509DataInfo) -> Result<Vec<usize>, Parse
 
 fn select_x509_signing_certificate(info: &X509DataInfo) -> Result<usize, ParseError> {
     let mut candidates = Vec::new();
+    let issuer_serial_hints = info
+        .issuer_serials
+        .iter()
+        .filter_map(|(issuer_name, serial)| {
+            x509_serial_decimal_to_hex(serial).map(|serial_hex| (issuer_name.trim(), serial_hex))
+        })
+        .collect::<Vec<_>>();
+    let has_lookup_identifiers =
+        !info.subject_names.is_empty() || !info.issuer_serials.is_empty() || !info.skis.is_empty();
 
     for (idx, cert) in info.parsed_certificates.iter().enumerate() {
         if info
             .subject_names
             .iter()
             .any(|subject_name| subject_name.trim() == cert.subject_dn)
-            || info.issuer_serials.iter().any(|(issuer_name, serial)| {
-                issuer_name.trim() == cert.issuer_dn
-                    && x509_serial_decimal_to_hex(serial).as_deref()
-                        == Some(cert.serial_number_hex.as_str())
+            || issuer_serial_hints.iter().any(|(issuer_name, serial_hex)| {
+                *issuer_name == cert.issuer_dn.as_str()
+                    && serial_hex.as_str() == cert.serial_number_hex.as_str()
             })
             || info.skis.iter().any(|ski| {
                 cert.subject_key_identifier
@@ -695,6 +703,11 @@ fn select_x509_signing_certificate(info: &X509DataInfo) -> Result<usize, ParseEr
 
     match candidates.as_slice() {
         [idx] => return Ok(*idx),
+        [] if has_lookup_identifiers => {
+            return Err(ParseError::InvalidStructure(
+                "X509Data lookup identifiers do not match any embedded certificate".into(),
+            ));
+        }
         [] => {}
         _ => {
             return Err(ParseError::InvalidStructure(
@@ -1270,7 +1283,7 @@ mod tests {
             </KeyValue>
             <X509Data>
                 <X509Certificate>{cert_base64}</X509Certificate>
-                <X509SubjectName>CN=Example</X509SubjectName>
+                <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
                 <X509IssuerSerial>
                     <X509IssuerName>CN=CA</X509IssuerName>
                     <X509SerialNumber>42</X509SerialNumber>
@@ -1303,7 +1316,13 @@ mod tests {
             .decode(&cert_base64)
             .expect("fixture PEM must contain valid base64");
         assert_eq!(x509_info.certificates, vec![expected_cert]);
-        assert_eq!(x509_info.subject_names, vec!["CN=Example".to_string()]);
+        assert_eq!(
+            x509_info.subject_names,
+            vec![
+                "C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048"
+                    .to_string()
+            ]
+        );
         assert_eq!(
             x509_info.issuer_serials,
             vec![("CN=CA".to_string(), "42".to_string())]
@@ -1733,6 +1752,25 @@ mod tests {
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
         assert!(matches!(err, ParseError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_unmatched_x509_lookup_identifier() {
+        let cert = fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let xml = format!(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <X509Data>
+                    <X509SubjectName>CN=Not The Embedded Certificate</X509SubjectName>
+                    <X509Certificate>{cert}</X509Certificate>
+                </X509Data>
+            </KeyInfo>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidStructure(message) if message.contains("lookup identifiers"))
+        );
     }
 
     #[test]
