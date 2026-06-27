@@ -36,6 +36,10 @@ base64 = "0.22"
 # Error handling
 thiserror = "2"
 
+[dev-dependencies]
+rcgen = "0.14.6"
+time = "0.3"
+
 [features]
 default = ["xmldsig", "c14n"]
 xmldsig = [            # XML Digital Signatures (sign + verify)
