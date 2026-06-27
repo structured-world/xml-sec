@@ -233,7 +233,13 @@ fn rejects_ca_without_key_cert_sign_usage() {
     let info = generated_info(vec![leaf, intermediate, root.clone()]);
     let anchors = [root];
 
-    assert!(verify_x509_certificate_chain(&info, &options(&anchors, false)).is_err());
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&anchors, false)),
+        Err(X509ChainError::InvalidKeyUsage {
+            position: 1,
+            required: "keyCertSign",
+        })
+    );
 }
 
 #[test]
@@ -395,5 +401,11 @@ fn rejects_crl_signed_by_certificate_without_crl_sign_usage() {
     info.crls.push(crl.der().to_vec());
     let anchors = [root.der().to_vec()];
 
-    assert!(verify_x509_certificate_chain(&info, &options(&anchors, true)).is_err());
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&anchors, true)),
+        Err(X509ChainError::InvalidKeyUsage {
+            position: 1,
+            required: "cRLSign",
+        })
+    );
 }

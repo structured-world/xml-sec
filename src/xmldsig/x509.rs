@@ -57,6 +57,14 @@ pub enum X509ChainError {
         /// Maximum permitted subordinate CA count.
         limit: u32,
     },
+    /// A certificate key usage extension forbids the required operation.
+    #[error("certificate at chain position {position} does not permit {required}")]
+    InvalidKeyUsage {
+        /// Position of the certificate in the validated path.
+        position: usize,
+        /// RFC 5280 key usage required for the operation.
+        required: &'static str,
+    },
     /// A certificate signature does not verify under its issuer key.
     #[error("certificate signature at chain position {0} is invalid or unsupported")]
     InvalidSignature(usize),
@@ -96,17 +104,22 @@ pub fn verify_x509_certificate_chain(
             .copied()
             .ok_or(X509ChainError::UntrustedRoot)?,
     )?;
-    let embedded_anchor = options
+    let trusted_anchors = options
         .trusted_certs
         .iter()
-        .any(|anchor| anchor.as_slice() == last.as_raw());
+        .map(|der| parse_certificate(der).map(|cert| (der, cert)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let embedded_anchor = trusted_anchors
+        .iter()
+        .any(|(der, _)| der.as_slice() == last.as_raw());
     if !embedded_anchor {
-        let anchor = options
-            .trusted_certs
+        let anchor = trusted_anchors
             .iter()
-            .find(|anchor| {
-                parse_certificate(anchor).is_ok_and(|cert| cert.subject() == last.issuer())
+            .find(|(_, cert)| {
+                cert.subject() == last.issuer()
+                    && last.verify_signature(Some(cert.public_key())).is_ok()
             })
+            .map(|(der, _)| *der)
             .ok_or(X509ChainError::UntrustedRoot)?;
         path_der.push(anchor);
     }
@@ -188,6 +201,20 @@ fn validate_ca_constraints(
         .filter(|constraints| constraints.ca)
         .ok_or(X509ChainError::IssuerNotCa(position))?;
 
+    if cert
+        .key_usage()
+        .map_err(|error| X509ChainError::InvalidDer {
+            kind: "certificate KeyUsage",
+            message: error.to_string(),
+        })?
+        .is_some_and(|usage| !usage.value.key_cert_sign())
+    {
+        return Err(X509ChainError::InvalidKeyUsage {
+            position,
+            required: "keyCertSign",
+        });
+    }
+
     if let Some(limit) = constraints.path_len_constraint {
         let subordinate_ca_count = position.saturating_sub(1);
         if subordinate_ca_count > limit as usize {
@@ -225,6 +252,19 @@ fn verify_crls(
     for (position, cert) in path.iter().enumerate().take(path.len().saturating_sub(1)) {
         let issuer = &path[position + 1];
         for (crl_index, crl) in crls.iter().filter(|(_, crl)| crl.issuer() == cert.issuer()) {
+            if issuer
+                .key_usage()
+                .map_err(|error| X509ChainError::InvalidDer {
+                    kind: "certificate KeyUsage",
+                    message: error.to_string(),
+                })?
+                .is_some_and(|usage| !usage.value.crl_sign())
+            {
+                return Err(X509ChainError::InvalidKeyUsage {
+                    position: position + 1,
+                    required: "cRLSign",
+                });
+            }
             let time_valid = crl.last_update() <= verification_time
                 && crl
                     .next_update()
