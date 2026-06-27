@@ -16,6 +16,7 @@ pub mod types;
 pub mod uri;
 pub mod verify;
 pub(crate) mod whitespace;
+pub mod x509;
 
 pub use digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 pub use parse::{
@@ -36,3 +37,4 @@ pub use verify::{
     ReferenceSet, ReferencesResult, UriTypeSet, VerifyContext, VerifyResult, VerifyingKey,
     process_all_references, process_reference, verify_signature_with_pem_key,
 };
+pub use x509::{X509ChainError, X509ChainOptions, verify_x509_certificate_chain};

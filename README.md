@@ -41,6 +41,7 @@ Currently implemented (core paths):
 - XMLDSig full verify pipeline (`SignedInfo` canonicalization + `SignatureValue` verification)
 - RSA PKCS#1 v1.5 verification helpers for SHA-1 / SHA-256 / SHA-384 / SHA-512
 - ECDSA verification helpers for P-256/SHA-256 and P-384/SHA-384
+- Opt-in X.509 certificate-chain validation with explicit trust anchors, validity checks, CA constraints, and CRLs
 
 Still in progress:
 - XMLDSig signing pipeline
