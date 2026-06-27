@@ -251,6 +251,66 @@ fn selects_fully_valid_anchor_when_signing_keys_match() {
 }
 
 #[test]
+fn replaces_embedded_rollover_root_with_trusted_anchor() {
+    let root_key = KeyPair::generate().unwrap();
+    let root_key_der = root_key.serialize_der();
+
+    let mut expired_params = CertificateParams::new(Vec::new()).unwrap();
+    expired_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "shared root");
+    expired_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    expired_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    expired_params.not_before = date_time_ymd(2020, 1, 1);
+    expired_params.not_after = date_time_ymd(2021, 1, 1);
+    let expired = rcgen::CertifiedIssuer::self_signed(expired_params, root_key).unwrap();
+
+    let mut renewed_params = CertificateParams::new(Vec::new()).unwrap();
+    renewed_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "shared root");
+    renewed_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    renewed_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let renewed = rcgen::CertifiedIssuer::self_signed(
+        renewed_params,
+        KeyPair::try_from(root_key_der.as_slice()).unwrap(),
+    )
+    .unwrap();
+
+    let mut intermediate_params = CertificateParams::new(Vec::new()).unwrap();
+    intermediate_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "intermediate");
+    intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    intermediate_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let intermediate = rcgen::CertifiedIssuer::signed_by(
+        intermediate_params,
+        KeyPair::generate().unwrap(),
+        &expired,
+    )
+    .unwrap();
+
+    let mut leaf_params = CertificateParams::new(Vec::new()).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "leaf");
+    let leaf = leaf_params
+        .signed_by(&KeyPair::generate().unwrap(), &intermediate)
+        .unwrap();
+    let info = generated_info(vec![
+        leaf.der().to_vec(),
+        intermediate.der().to_vec(),
+        expired.der().to_vec(),
+    ]);
+    let anchors = [renewed.der().to_vec()];
+
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&anchors, false)),
+        Ok(())
+    );
+}
+
+#[test]
 fn rejects_leaf_without_signature_key_usage() {
     let mut root_params = CertificateParams::new(Vec::new()).unwrap();
     root_params
