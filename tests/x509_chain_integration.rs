@@ -208,6 +208,80 @@ fn selects_signature_verifying_anchor_when_subjects_match() {
 }
 
 #[test]
+fn selects_fully_valid_anchor_when_signing_keys_match() {
+    let anchor_key = KeyPair::generate().unwrap();
+    let anchor_key_der = anchor_key.serialize_der();
+
+    let mut expired_params = CertificateParams::new(Vec::new()).unwrap();
+    expired_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "shared root");
+    expired_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    expired_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    expired_params.not_before = date_time_ymd(2020, 1, 1);
+    expired_params.not_after = date_time_ymd(2021, 1, 1);
+    let expired = rcgen::CertifiedIssuer::self_signed(
+        expired_params,
+        KeyPair::try_from(anchor_key_der.as_slice()).unwrap(),
+    )
+    .unwrap();
+
+    let mut valid_params = CertificateParams::new(Vec::new()).unwrap();
+    valid_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "shared root");
+    valid_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    valid_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let valid = rcgen::CertifiedIssuer::self_signed(valid_params, anchor_key).unwrap();
+
+    let mut leaf_params = CertificateParams::new(Vec::new()).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "leaf");
+    let leaf = leaf_params
+        .signed_by(&KeyPair::generate().unwrap(), &valid)
+        .unwrap();
+    let info = generated_info(vec![leaf.der().to_vec()]);
+    let anchors = [expired.der().to_vec(), valid.der().to_vec()];
+
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&anchors, false)),
+        Ok(())
+    );
+}
+
+#[test]
+fn rejects_leaf_without_signature_key_usage() {
+    let mut root_params = CertificateParams::new(Vec::new()).unwrap();
+    root_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "root");
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let root =
+        rcgen::CertifiedIssuer::self_signed(root_params, KeyPair::generate().unwrap()).unwrap();
+
+    let mut leaf_params = CertificateParams::new(Vec::new()).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "leaf");
+    leaf_params.key_usages = vec![KeyUsagePurpose::KeyEncipherment];
+    let leaf = leaf_params
+        .signed_by(&KeyPair::generate().unwrap(), &root)
+        .unwrap();
+    let info = generated_info(vec![leaf.der().to_vec()]);
+    let anchors = [root.der().to_vec()];
+
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&anchors, false)),
+        Err(X509ChainError::InvalidKeyUsage {
+            position: 0,
+            required: "digitalSignature or nonRepudiation",
+        })
+    );
+}
+
+#[test]
 fn rejects_non_ca_issuer() {
     let (leaf, intermediate, root) = generated_chain(
         BasicConstraints::Unconstrained,
