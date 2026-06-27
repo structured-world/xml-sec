@@ -116,9 +116,15 @@ pub fn verify_x509_certificate_chain(
         return validate_path(&path_der, info, options, verification_time);
     }
 
-    let replace_untrusted_root = path_der.len() > 1
+    let replace_untrusted_root = if path_der.len() > 1
         && last.subject() == last.issuer()
-        && last.verify_signature(None).is_ok();
+        && last.verify_signature(None).is_ok()
+    {
+        let child = parse_certificate(path_der[path_der.len() - 2])?;
+        child.issuer() == last.subject() && child.verify_signature(Some(last.public_key())).is_ok()
+    } else {
+        false
+    };
     let candidate_base = if replace_untrusted_root {
         &path_der[..path_der.len() - 1]
     } else {

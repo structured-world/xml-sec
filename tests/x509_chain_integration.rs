@@ -327,12 +327,9 @@ fn rejects_unrelated_self_signed_certificate_at_path_tail() {
         .push(rcgen::DnType::CommonName, "intermediate");
     intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     intermediate_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
-    let intermediate = rcgen::CertifiedIssuer::signed_by(
-        intermediate_params,
-        KeyPair::generate().unwrap(),
-        &root,
-    )
-    .unwrap();
+    let intermediate =
+        rcgen::CertifiedIssuer::signed_by(intermediate_params, KeyPair::generate().unwrap(), &root)
+            .unwrap();
 
     let mut leaf_params = CertificateParams::new(Vec::new()).unwrap();
     leaf_params
@@ -349,7 +346,8 @@ fn rejects_unrelated_self_signed_certificate_at_path_tail() {
     unrelated_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     unrelated_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
     let unrelated =
-        rcgen::CertifiedIssuer::self_signed(unrelated_params, KeyPair::generate().unwrap()).unwrap();
+        rcgen::CertifiedIssuer::self_signed(unrelated_params, KeyPair::generate().unwrap())
+            .unwrap();
 
     let info = generated_info(vec![
         leaf.der().to_vec(),
