@@ -311,6 +311,60 @@ fn replaces_embedded_rollover_root_with_trusted_anchor() {
 }
 
 #[test]
+fn rejects_unrelated_self_signed_certificate_at_path_tail() {
+    let mut root_params = CertificateParams::new(Vec::new()).unwrap();
+    root_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "trusted root");
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let root =
+        rcgen::CertifiedIssuer::self_signed(root_params, KeyPair::generate().unwrap()).unwrap();
+
+    let mut intermediate_params = CertificateParams::new(Vec::new()).unwrap();
+    intermediate_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "intermediate");
+    intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    intermediate_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let intermediate = rcgen::CertifiedIssuer::signed_by(
+        intermediate_params,
+        KeyPair::generate().unwrap(),
+        &root,
+    )
+    .unwrap();
+
+    let mut leaf_params = CertificateParams::new(Vec::new()).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "leaf");
+    let leaf = leaf_params
+        .signed_by(&KeyPair::generate().unwrap(), &intermediate)
+        .unwrap();
+
+    let mut unrelated_params = CertificateParams::new(Vec::new()).unwrap();
+    unrelated_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "unrelated root");
+    unrelated_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    unrelated_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let unrelated =
+        rcgen::CertifiedIssuer::self_signed(unrelated_params, KeyPair::generate().unwrap()).unwrap();
+
+    let info = generated_info(vec![
+        leaf.der().to_vec(),
+        intermediate.der().to_vec(),
+        unrelated.der().to_vec(),
+    ]);
+    let anchors = [root.der().to_vec()];
+
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&anchors, false)),
+        Err(X509ChainError::UntrustedRoot)
+    );
+}
+
+#[test]
 fn rejects_leaf_without_signature_key_usage() {
     let mut root_params = CertificateParams::new(Vec::new()).unwrap();
     root_params
