@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/structured-world/xml-sec/compare/v0.1.6...v0.1.7) - 2026-06-27
+
+### Added
+
+- *(xmldsig)* build x509 certificate chains
+
+### Fixed
+
+- *(xmldsig)* validate x509 lookup hints
+- *(xmldsig)* reject unmatched x509 hints
+- *(xmldsig)* canonicalize x509 serial value hex
+- *(xmldsig)* match decimal x509 serial hints
+- fix xmldsig verification imports for signature v3 PR
+
+### Testing
+
+- *(xmldsig)* cover conflicting x509 hints
+
 ## [0.1.6](https://github.com/structured-world/xml-sec/compare/v0.1.5...v0.1.6) - 2026-04-09
 
 ### Added
