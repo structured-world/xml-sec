@@ -27,7 +27,7 @@ signature = { version = "3", optional = true }
 subtle = { version = "2", optional = true }
 
 # X.509 certificates
-x509-parser = { version = "0.18", optional = true }
+x509-parser = { version = "0.18", features = ["verify"], optional = true }
 der = { version = "0.8", optional = true }
 
 # Base64 encoding/decoding
