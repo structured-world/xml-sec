@@ -1866,6 +1866,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_key_info_rejects_lookup_hints_for_different_certificates() {
+        let first_cert = fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let second_cert = fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+        let xml = format!(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <X509Data>
+                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SKI>60zMLKCfzQ3qnXAzABzRNpdgQ8Q=</X509SKI>
+                    <X509Certificate>{first_cert}</X509Certificate>
+                    <X509Certificate>{second_cert}</X509Certificate>
+                </X509Data>
+            </KeyInfo>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidStructure(message) if message.contains("lookup identifiers match multiple certificates"))
+        );
+    }
+
+    #[test]
     fn build_x509_certificate_chain_rejects_chain_exceeding_max_depth() {
         let parsed_certificates = (0..=MAX_X509_CHAIN_DEPTH)
             .map(|idx| ParsedX509Certificate {
