@@ -265,6 +265,7 @@ fn rejects_leaf_without_signature_key_usage() {
     leaf_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "leaf");
+    leaf_params.is_ca = IsCa::ExplicitNoCa;
     leaf_params.key_usages = vec![KeyUsagePurpose::KeyEncipherment];
     let leaf = leaf_params
         .signed_by(&KeyPair::generate().unwrap(), &root)

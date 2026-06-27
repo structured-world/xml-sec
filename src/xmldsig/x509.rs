@@ -88,12 +88,13 @@ pub fn verify_x509_certificate_chain(
         return Err(X509ChainError::UntrustedRoot);
     }
 
-    let mut path_der = info
+    let path_der = info
         .certificate_chain
         .iter()
         .map(|&idx| {
             info.certificates
                 .get(idx)
+                .map(Vec::as_slice)
                 .ok_or(X509ChainError::UntrustedRoot)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -107,23 +108,35 @@ pub fn verify_x509_certificate_chain(
     let trusted_anchors = options
         .trusted_certs
         .iter()
-        .map(|der| parse_certificate(der).map(|cert| (der, cert)))
+        .map(|der| parse_certificate(der).map(|cert| (der.as_slice(), cert)))
         .collect::<Result<Vec<_>, _>>()?;
-    let embedded_anchor = trusted_anchors
-        .iter()
-        .any(|(der, _)| der.as_slice() == last.as_raw());
-    if !embedded_anchor {
-        let anchor = trusted_anchors
-            .iter()
-            .find(|(_, cert)| {
-                cert.subject() == last.issuer()
-                    && last.verify_signature(Some(cert.public_key())).is_ok()
-            })
-            .map(|(der, _)| *der)
-            .ok_or(X509ChainError::UntrustedRoot)?;
-        path_der.push(anchor);
+    let verification_time = system_time_to_asn1(options.verification_time)?;
+    let embedded_anchor = trusted_anchors.iter().any(|(der, _)| *der == last.as_raw());
+    if embedded_anchor {
+        return validate_path(&path_der, info, options, verification_time);
     }
 
+    let mut first_validation_error = None;
+    for (anchor_der, _) in trusted_anchors.iter().filter(|(_, cert)| {
+        cert.subject() == last.issuer() && last.verify_signature(Some(cert.public_key())).is_ok()
+    }) {
+        let mut candidate_path = path_der.clone();
+        candidate_path.push(anchor_der);
+        match validate_path(&candidate_path, info, options, verification_time) {
+            Ok(()) => return Ok(()),
+            Err(error) => first_validation_error.get_or_insert(error),
+        };
+    }
+
+    Err(first_validation_error.unwrap_or(X509ChainError::UntrustedRoot))
+}
+
+fn validate_path(
+    path_der: &[&[u8]],
+    info: &X509DataInfo,
+    options: &X509ChainOptions<'_>,
+    verification_time: ASN1Time,
+) -> Result<(), X509ChainError> {
     if path_der.len() > options.max_chain_depth {
         return Err(X509ChainError::DepthExceeded(options.max_chain_depth));
     }
@@ -132,13 +145,14 @@ pub fn verify_x509_certificate_chain(
         .iter()
         .map(|der| parse_certificate(der))
         .collect::<Result<Vec<_>, _>>()?;
-    let verification_time = system_time_to_asn1(options.verification_time)?;
 
     for (position, cert) in path.iter().enumerate() {
         if !cert.validity().is_valid_at(verification_time) {
             return Err(X509ChainError::CertificateNotValid(position));
         }
-        if position > 0 {
+        if position == 0 {
+            validate_leaf_key_usage(cert)?;
+        } else {
             validate_ca_constraints(cert, position)?;
         }
     }
@@ -156,6 +170,23 @@ pub fn verify_x509_certificate_chain(
 
     if options.check_crls {
         verify_crls(&path, &info.crls, verification_time)?;
+    }
+    Ok(())
+}
+
+fn validate_leaf_key_usage(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
+    if cert
+        .key_usage()
+        .map_err(|error| X509ChainError::InvalidDer {
+            kind: "certificate KeyUsage",
+            message: error.to_string(),
+        })?
+        .is_some_and(|usage| !usage.value.digital_signature() && !usage.value.non_repudiation())
+    {
+        return Err(X509ChainError::InvalidKeyUsage {
+            position: 0,
+            required: "digitalSignature or nonRepudiation",
+        });
     }
     Ok(())
 }
