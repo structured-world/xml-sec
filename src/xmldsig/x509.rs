@@ -116,11 +116,29 @@ pub fn verify_x509_certificate_chain(
         return validate_path(&path_der, info, options, verification_time);
     }
 
+    let replace_untrusted_root = path_der.len() > 1
+        && last.subject() == last.issuer()
+        && last.verify_signature(None).is_ok();
+    let candidate_base = if replace_untrusted_root {
+        &path_der[..path_der.len() - 1]
+    } else {
+        path_der.as_slice()
+    };
+    let candidate_child = parse_certificate(
+        candidate_base
+            .last()
+            .copied()
+            .ok_or(X509ChainError::UntrustedRoot)?,
+    )?;
+
     let mut first_validation_error = None;
     for (anchor_der, _) in trusted_anchors.iter().filter(|(_, cert)| {
-        cert.subject() == last.issuer() && last.verify_signature(Some(cert.public_key())).is_ok()
+        cert.subject() == candidate_child.issuer()
+            && candidate_child
+                .verify_signature(Some(cert.public_key()))
+                .is_ok()
     }) {
-        let mut candidate_path = path_der.clone();
+        let mut candidate_path = candidate_base.to_vec();
         candidate_path.push(anchor_der);
         match validate_path(&candidate_path, info, options, verification_time) {
             Ok(()) => return Ok(()),
@@ -175,6 +193,7 @@ fn validate_path(
 }
 
 fn validate_leaf_key_usage(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
+    // RFC 5280 section 4.2.1.3 restricts key purpose only when KeyUsage is present.
     if cert
         .key_usage()
         .map_err(|error| X509ChainError::InvalidDer {
