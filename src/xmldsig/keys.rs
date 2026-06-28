@@ -248,8 +248,9 @@ fn validate_spki_algorithm(
         {
             Ok(())
         }
-        // The XMLDSig ecdsa-sha384 URI identifies the digest, not a curve. The
-        // verifier intentionally supports the donor P-521/SHA-384 interop case.
+        // xmlsec's OpenSSL backend maps ecdsa-sha384 to EVP_sha384() plus the
+        // generic EC key class, without restricting the curve to P-384. Keep
+        // P-521/SHA-384 compatible with that donor contract.
         (SignatureAlgorithm::EcdsaP384Sha384, PublicKey::EC(_))
             if matches!(curve_oid.as_deref(), Some("1.3.132.0.34" | "1.3.132.0.35")) =>
         {
