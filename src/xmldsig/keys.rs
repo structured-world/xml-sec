@@ -274,6 +274,9 @@ mod tests {
     const SAML_PUBLIC_KEY: &str =
         include_str!("../../tests/fixtures/keys/ec/saml-idp-ecdsa-pubkey.pem");
     const RSA_PUBLIC_KEY: &str = include_str!("../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    const RSA_KEY_VALUE_SIGNATURE: &str = include_str!(
+        "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-rsa.xml"
+    );
 
     fn replace_key_info(xml: &str, replacement: &str) -> String {
         let start = xml.find("<ds:KeyInfo>").expect("fixture has KeyInfo");
@@ -372,6 +375,18 @@ mod tests {
             .key_resolver(&resolver)
             .verify(&xml)
             .expect("DER key should resolve");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn resolves_rsa_key_value_end_to_end() {
+        // Embedded CryptoBinary parameters must become the key used by verification.
+        let resolver = DefaultKeyResolver::default();
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(RSA_KEY_VALUE_SIGNATURE)
+            .expect("RSAKeyValue should resolve");
 
         assert_eq!(result.status, super::super::DsigStatus::Valid);
     }
