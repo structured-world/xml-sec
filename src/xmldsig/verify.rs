@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use crate::c14n::canonicalize;
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
-use super::parse::{ParseError, Reference, SignatureAlgorithm, XMLDSIG_NS};
+use super::parse::{KeyInfo, ParseError, Reference, SignatureAlgorithm, XMLDSIG_NS};
 use super::parse::{parse_key_info, parse_reference, parse_signed_info};
 use super::signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
@@ -49,13 +49,17 @@ pub trait VerifyingKey {
 /// This trait intentionally has no `Send + Sync` supertraits; callers that need
 /// cross-thread sharing can wrap resolvers/keys in their own thread-safe types.
 pub trait KeyResolver {
-    /// Resolve a verification key for the provided XML document.
+    /// Resolve a verification key from parsed `<KeyInfo>` sources.
     ///
     /// Return `Ok(None)` when no suitable key could be resolved from available
     /// key material (for example, missing `<KeyInfo>` candidates). `VerifyContext`
     /// maps `Ok(None)` to `DsigStatus::Invalid(FailureReason::KeyNotFound)`;
     /// reserve `Err(...)` for resolver failures.
-    fn resolve<'a>(&'a self, xml: &str) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError>;
+    fn resolve<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError>;
 
     /// Return `true` when this resolver consumes document `<KeyInfo>` material.
     ///
@@ -525,6 +529,10 @@ pub enum DsigError {
     #[error("failed to parse KeyInfo: {0}")]
     ParseKeyInfo(#[source] super::parse::ParseError),
 
+    /// Configuration-driven key resolution failed.
+    #[error("key resolution failed: {0}")]
+    KeyResolution(#[from] super::keys::KeyResolutionError),
+
     /// `<Object>/<Manifest>/<Reference>` parsing failed.
     #[error("failed to parse Manifest reference: {0}")]
     ParseManifestReference(#[source] ParseError),
@@ -647,10 +655,15 @@ fn verify_signature_with_context(
         (None, Some(resolver)) => resolver.consumes_document_key_info(),
         (None, None) => true,
     };
-    if should_parse_key_info && let Some(key_info_node) = signature_children.key_info_node {
-        // P2-001: validate KeyInfo structure now; key material consumption is deferred.
-        parse_key_info(key_info_node).map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
-    }
+    let key_info = if should_parse_key_info {
+        signature_children
+            .key_info_node
+            .map(parse_key_info)
+            .transpose()
+            .map_err(SignatureVerificationPipelineError::ParseKeyInfo)?
+    } else {
+        None
+    };
 
     let signed_info = parse_signed_info(signed_info_node)?;
     enforce_reference_policies(
@@ -698,7 +711,9 @@ fn verify_signature_with_context(
     )?;
 
     let signature_value = decode_signature_value(signature_children.signature_value_node)?;
-    let Some(resolved_key) = resolve_verifying_key(ctx, xml)? else {
+    let Some(resolved_key) =
+        resolve_verifying_key(ctx, key_info.as_ref(), signed_info.signature_method)?
+    else {
         return Ok(VerifyResult {
             status: DsigStatus::Invalid(FailureReason::KeyNotFound),
             signed_info_references: references.results,
@@ -919,13 +934,14 @@ impl ResolvedVerifyingKey<'_> {
 
 fn resolve_verifying_key<'k>(
     ctx: &VerifyContext<'k>,
-    xml: &str,
+    key_info: Option<&KeyInfo>,
+    algorithm: SignatureAlgorithm,
 ) -> Result<Option<ResolvedVerifyingKey<'k>>, SignatureVerificationPipelineError> {
     if let Some(key) = ctx.key {
         return Ok(Some(ResolvedVerifyingKey::Borrowed(key)));
     }
     if let Some(resolver) = ctx.key_resolver {
-        let resolved = resolver.resolve(xml)?;
+        let resolved = resolver.resolve(key_info, algorithm)?;
         return Ok(resolved.map(ResolvedVerifyingKey::Owned));
     }
     Ok(None)
@@ -1254,7 +1270,8 @@ mod tests {
     impl KeyResolver for PanicResolver {
         fn resolve<'a>(
             &'a self,
-            _xml: &str,
+            _key_info: Option<&KeyInfo>,
+            _algorithm: SignatureAlgorithm,
         ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
         {
             panic!("resolver should not be called when references already fail");
@@ -1266,7 +1283,8 @@ mod tests {
     impl KeyResolver for MissingKeyResolver {
         fn resolve<'a>(
             &'a self,
-            _xml: &str,
+            _key_info: Option<&KeyInfo>,
+            _algorithm: SignatureAlgorithm,
         ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
         {
             Ok(None)
@@ -1278,7 +1296,8 @@ mod tests {
     impl KeyResolver for ConsumingKeyInfoResolver {
         fn resolve<'a>(
             &'a self,
-            _xml: &str,
+            _key_info: Option<&KeyInfo>,
+            _algorithm: SignatureAlgorithm,
         ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
         {
             Ok(None)
