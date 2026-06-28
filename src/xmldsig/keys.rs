@@ -199,6 +199,7 @@ impl KeyResolver for DefaultKeyResolver {
                         if key.algorithm != algorithm {
                             return Err(KeyResolutionError::AlgorithmMismatch);
                         }
+                        validate_spki_algorithm(&key.public_key_bytes, algorithm)?;
                         Ok(key.clone())
                     })
                     .transpose()?,
@@ -247,6 +248,8 @@ fn validate_spki_algorithm(
         {
             Ok(())
         }
+        // The XMLDSig ecdsa-sha384 URI identifies the digest, not a curve. The
+        // verifier intentionally supports the donor P-521/SHA-384 interop case.
         (SignatureAlgorithm::EcdsaP384Sha384, PublicKey::EC(_))
             if matches!(curve_oid.as_deref(), Some("1.3.132.0.34" | "1.3.132.0.35")) =>
         {
