@@ -477,9 +477,9 @@ mod tests {
             .verify(&xml)
             .expect_err("malformed named key must fail during resolution");
 
-        assert_eq!(
-            error.to_string(),
-            "key resolution failed: invalid public key DER"
-        );
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::InvalidPublicKey)
+        ));
     }
 }
