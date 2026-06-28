@@ -266,6 +266,7 @@ mod tests {
         include_str!("../../tests/fixtures/saml/response_signed_by_idp_ecdsa.xml");
     const SAML_PUBLIC_KEY: &str =
         include_str!("../../tests/fixtures/keys/ec/saml-idp-ecdsa-pubkey.pem");
+    const RSA_PUBLIC_KEY: &str = include_str!("../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
 
     fn replace_key_info(xml: &str, replacement: &str) -> String {
         let start = xml.find("<ds:KeyInfo>").expect("fixture has KeyInfo");
@@ -276,8 +277,8 @@ mod tests {
         format!("{}{}{}", &xml[..start], replacement, &xml[end..])
     }
 
-    fn public_key_der() -> Vec<u8> {
-        let (rest, pem) = x509_parser::pem::parse_x509_pem(SAML_PUBLIC_KEY.as_bytes())
+    fn public_key_der(pem_text: &str) -> Vec<u8> {
+        let (rest, pem) = x509_parser::pem::parse_x509_pem(pem_text.as_bytes())
             .expect("fixture public key is PEM");
         assert!(rest.iter().all(|byte| byte.is_ascii_whitespace()));
         assert_eq!(pem.label, "PUBLIC KEY");
@@ -335,7 +336,7 @@ mod tests {
             "idp-signing".into(),
             VerificationKey {
                 algorithm: SignatureAlgorithm::EcdsaP256Sha256,
-                public_key_bytes: public_key_der(),
+                public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
                 certificate_der: None,
                 name: Some("idp-signing".into()),
             },
@@ -352,7 +353,7 @@ mod tests {
     #[test]
     fn resolves_der_encoded_key_end_to_end() {
         // DSig 1.1 DEREncodedKeyValue must feed the same SPKI verifier path.
-        let encoded = STANDARD.encode(public_key_der());
+        let encoded = STANDARD.encode(public_key_der(SAML_PUBLIC_KEY));
         let xml = replace_key_info(
             SIGNED_SAML,
             &format!(
@@ -400,7 +401,7 @@ mod tests {
             "wrong-algorithm".into(),
             VerificationKey {
                 algorithm: SignatureAlgorithm::RsaSha256,
-                public_key_bytes: public_key_der(),
+                public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
                 certificate_der: None,
                 name: Some("wrong-algorithm".into()),
             },
@@ -410,6 +411,35 @@ mod tests {
             .key_resolver(&resolver)
             .verify(&xml)
             .expect_err("algorithm mismatch must fail closed");
+
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::AlgorithmMismatch)
+        ));
+    }
+
+    #[test]
+    fn named_key_spki_type_mismatch_fails_during_resolution() {
+        // The configured algorithm label cannot override the actual SPKI key type.
+        let xml = replace_key_info(
+            SIGNED_SAML,
+            "<ds:KeyInfo><ds:KeyName>mislabeled</ds:KeyName></ds:KeyInfo>",
+        );
+        let mut config = KeyResolverConfig::default();
+        config.named_keys.insert(
+            "mislabeled".into(),
+            VerificationKey {
+                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                public_key_bytes: public_key_der(RSA_PUBLIC_KEY),
+                certificate_der: None,
+                name: Some("mislabeled".into()),
+            },
+        );
+        let resolver = DefaultKeyResolver::new(config);
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect_err("mislabeled named key must fail during resolution");
 
         assert!(matches!(
             error,
