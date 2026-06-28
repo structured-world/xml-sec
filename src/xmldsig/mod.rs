@@ -20,7 +20,7 @@ pub(crate) mod whitespace;
 pub mod x509;
 
 pub use digest::{DigestAlgorithm, compute_digest, constant_time_eq};
-pub use keys::{KeyResolverConfig, VerificationKey};
+pub use keys::{DefaultKeyResolver, KeyResolutionError, KeyResolverConfig, VerificationKey};
 pub use parse::{
     KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, SignatureAlgorithm, SignedInfo,
     X509DataInfo, find_signature_node, parse_key_info, parse_signed_info,
