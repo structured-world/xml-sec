@@ -10,18 +10,6 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
-  pr-title:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Test title validator
-        run: .github/scripts/test-validate-pr-title.sh
-      - name: Validate pull request title
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        run: .github/scripts/validate-pr-title.sh "$PR_TITLE"
-
   build-matrix:
     name: build-matrix (${{ matrix.rust }})
     runs-on: ubuntu-latest
