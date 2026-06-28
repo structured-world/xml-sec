@@ -34,6 +34,8 @@ const MAX_DER_ENCODED_KEY_VALUE_LEN: usize = 8192;
 const MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN: usize = 65_536;
 const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LEN.div_ceil(3) * 4;
 const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
+const MAX_RSA_MODULUS_LEN: usize = 1024;
+const MAX_RSA_EXPONENT_LEN: usize = 8;
 const MAX_X509_BASE64_TEXT_LEN: usize = 262_144;
 const MAX_X509_BASE64_NORMALIZED_LEN: usize = MAX_X509_BASE64_TEXT_LEN;
 const MAX_X509_DECODED_BINARY_LEN: usize = MAX_X509_BASE64_NORMALIZED_LEN.div_ceil(4) * 3;
@@ -155,8 +157,13 @@ pub enum KeyInfoSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeyValueInfo {
-    /// `<RSAKeyValue>`.
-    RsaKeyValue,
+    /// `<RSAKeyValue>` with unsigned big-endian CryptoBinary parameters.
+    Rsa {
+        /// RSA modulus.
+        modulus: Vec<u8>,
+        /// RSA public exponent.
+        exponent: Vec<u8>,
+    },
     /// `dsig11:ECKeyValue` (the XMLDSig 1.1 namespace form).
     EcKeyValue,
     /// Any other `<KeyValue>` child not yet supported by this phase.
@@ -537,13 +544,81 @@ fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
         first_child.tag_name().namespace(),
         first_child.tag_name().name(),
     ) {
-        (Some(XMLDSIG_NS), "RSAKeyValue") => Ok(KeyValueInfo::RsaKeyValue),
+        (Some(XMLDSIG_NS), "RSAKeyValue") => parse_rsa_key_value(first_child),
         (Some(XMLDSIG11_NS), "ECKeyValue") => Ok(KeyValueInfo::EcKeyValue),
         (namespace, child_name) => Ok(KeyValueInfo::Unsupported {
             namespace: namespace.map(str::to_string),
             local_name: child_name.to_string(),
         }),
     }
+}
+
+fn parse_rsa_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
+    verify_ds_element(node, "RSAKeyValue")?;
+    ensure_no_non_whitespace_text(node, "RSAKeyValue")?;
+
+    let mut children = element_children(node);
+    let modulus_node = children.next().ok_or_else(|| {
+        ParseError::InvalidStructure("RSAKeyValue requires Modulus and Exponent".into())
+    })?;
+    verify_ds_element(modulus_node, "Modulus")?;
+    ensure_no_element_children(modulus_node, "Modulus")?;
+
+    let exponent_node = children.next().ok_or_else(|| {
+        ParseError::InvalidStructure("RSAKeyValue requires Modulus and Exponent".into())
+    })?;
+    verify_ds_element(exponent_node, "Exponent")?;
+    ensure_no_element_children(exponent_node, "Exponent")?;
+    if children.next().is_some() {
+        return Err(ParseError::InvalidStructure(
+            "RSAKeyValue must contain exactly Modulus followed by Exponent".into(),
+        ));
+    }
+
+    Ok(KeyValueInfo::Rsa {
+        modulus: decode_crypto_binary(modulus_node, "Modulus", MAX_RSA_MODULUS_LEN)?,
+        exponent: decode_crypto_binary(exponent_node, "Exponent", MAX_RSA_EXPONENT_LEN)?,
+    })
+}
+
+fn decode_crypto_binary(
+    node: Node<'_, '_>,
+    element_name: &'static str,
+    max_decoded_len: usize,
+) -> Result<Vec<u8>, ParseError> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let max_base64_len = max_decoded_len.div_ceil(3) * 4;
+    let mut cleaned = String::with_capacity(max_base64_len);
+    for text in node.children().filter_map(|child| child.text()) {
+        normalize_xml_base64_text(text, &mut cleaned).map_err(|err| {
+            ParseError::Base64(format!(
+                "invalid XML whitespace U+{:04X} in {element_name}",
+                err.invalid_byte
+            ))
+        })?;
+        if cleaned.len() > max_base64_len {
+            return Err(ParseError::InvalidStructure(format!(
+                "{element_name} exceeds maximum allowed base64 length"
+            )));
+        }
+    }
+
+    let value = STANDARD
+        .decode(&cleaned)
+        .map_err(|err| ParseError::Base64(format!("{element_name}: {err}")))?;
+    if value.is_empty() {
+        return Err(ParseError::InvalidStructure(format!(
+            "{element_name} must not be empty"
+        )));
+    }
+    if value.len() > max_decoded_len {
+        return Err(ParseError::InvalidStructure(format!(
+            "{element_name} exceeds maximum allowed binary length"
+        )));
+    }
+    Ok(value)
 }
 
 fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
@@ -1346,7 +1421,10 @@ mod tests {
         );
         assert_eq!(
             key_info.sources[1],
-            KeyInfoSource::KeyValue(KeyValueInfo::RsaKeyValue)
+            KeyInfoSource::KeyValue(KeyValueInfo::Rsa {
+                modulus: vec![1, 0, 1],
+                exponent: vec![1, 0, 1],
+            })
         );
         let x509_info = match &key_info.sources[2] {
             KeyInfoSource::X509Data(x509) => x509,
@@ -1404,6 +1482,140 @@ mod tests {
             key_info.sources[3],
             KeyInfoSource::DerEncodedKeyValue(vec![1, 2, 3, 4])
         );
+    }
+
+    #[test]
+    fn parse_rsa_key_value_preserves_wrapped_crypto_binary() {
+        // CryptoBinary is unsigned big-endian data and XML whitespace is insignificant.
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue><RSAKeyValue>
+                <Modulus> AQID
+BA== </Modulus>
+                <Exponent> AQAB </Exponent>
+            </RSAKeyValue></KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        assert_eq!(
+            parse_key_info(doc.root_element()).unwrap().sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::Rsa {
+                modulus: vec![1, 2, 3, 4],
+                exponent: vec![1, 0, 1],
+            })]
+        );
+    }
+
+    #[test]
+    fn parse_rsa_key_value_rejects_reordered_parameters() {
+        // XMLDSig defines Modulus followed by Exponent; accepting reordered input is ambiguous.
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue><RSAKeyValue>
+                <Exponent>AQAB</Exponent><Modulus>AQID</Modulus>
+            </RSAKeyValue></KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element()),
+            Err(ParseError::InvalidStructure(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rsa_key_value_rejects_missing_exponent() {
+        // Both RSA public parameters are required to construct a usable key.
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue><RSAKeyValue><Modulus>AQID</Modulus></RSAKeyValue></KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element()),
+            Err(ParseError::InvalidStructure(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rsa_key_value_rejects_duplicate_exponent() {
+        // RSAKeyValue has a closed two-child schema; duplicate parameters are invalid.
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue><RSAKeyValue>
+                <Modulus>AQID</Modulus><Exponent>AQAB</Exponent><Exponent>AQAB</Exponent>
+            </RSAKeyValue></KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element()),
+            Err(ParseError::InvalidStructure(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rsa_key_value_rejects_wrong_parameter_namespace() {
+        // Local names from an extension namespace must not be treated as XMLDSig parameters.
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:bad="urn:bad">
+            <KeyValue><RSAKeyValue>
+                <bad:Modulus>AQID</bad:Modulus><Exponent>AQAB</Exponent>
+            </RSAKeyValue></KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element()),
+            Err(ParseError::InvalidStructure(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rsa_key_value_rejects_nested_crypto_binary() {
+        // CryptoBinary values are text-only and must not hide extension elements.
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue><RSAKeyValue>
+                <Modulus><chunk>AQID</chunk></Modulus><Exponent>AQAB</Exponent>
+            </RSAKeyValue></KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element()),
+            Err(ParseError::InvalidStructure(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rsa_key_value_rejects_malformed_base64() {
+        // Malformed key parameters must be processing errors, not unresolved keys.
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue><RSAKeyValue>
+                <Modulus>%%%%</Modulus><Exponent>AQAB</Exponent>
+            </RSAKeyValue></KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element()),
+            Err(ParseError::Base64(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rsa_key_value_rejects_oversized_exponent_before_decode() {
+        // Bound normalized text before allocation or integer construction.
+        let exponent = "A".repeat(MAX_RSA_EXPONENT_LEN.div_ceil(3) * 4 + 1);
+        let xml = format!(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <KeyValue><RSAKeyValue>
+                    <Modulus>AQID</Modulus><Exponent>{exponent}</Exponent>
+                </RSAKeyValue></KeyValue>
+            </KeyInfo>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element()),
+            Err(ParseError::InvalidStructure(_))
+        ));
     }
 
     #[test]
