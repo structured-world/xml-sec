@@ -70,6 +70,9 @@ pub enum KeyResolutionError {
     /// An embedded certificate could not be parsed completely.
     #[error("invalid embedded certificate DER")]
     InvalidCertificate,
+    /// Configured or embedded public key DER could not be parsed completely.
+    #[error("invalid public key DER")]
+    InvalidPublicKey,
     /// Embedded certificate path validation failed.
     #[error("certificate chain validation failed: {0}")]
     Chain(#[from] super::X509ChainError),
@@ -222,13 +225,13 @@ fn validate_spki_algorithm(
     algorithm: SignatureAlgorithm,
 ) -> Result<(), KeyResolutionError> {
     let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_bytes)
-        .map_err(|_| KeyResolutionError::InvalidCertificate)?;
+        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
     if !rest.is_empty() {
-        return Err(KeyResolutionError::InvalidCertificate);
+        return Err(KeyResolutionError::InvalidPublicKey);
     }
     let parsed = spki
         .parsed()
-        .map_err(|_| KeyResolutionError::InvalidCertificate)?;
+        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
     let curve_oid = spki
         .algorithm
         .parameters
