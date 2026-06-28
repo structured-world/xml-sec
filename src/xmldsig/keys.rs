@@ -450,4 +450,33 @@ mod tests {
             DsigError::KeyResolution(KeyResolutionError::AlgorithmMismatch)
         ));
     }
+
+    #[test]
+    fn malformed_named_key_reports_public_key_error() {
+        // Non-certificate SPKI failures must not be mislabeled as certificate errors.
+        let xml = replace_key_info(
+            SIGNED_SAML,
+            "<ds:KeyInfo><ds:KeyName>malformed</ds:KeyName></ds:KeyInfo>",
+        );
+        let mut config = KeyResolverConfig::default();
+        config.named_keys.insert(
+            "malformed".into(),
+            VerificationKey {
+                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                public_key_bytes: vec![1, 2, 3],
+                certificate_der: None,
+                name: Some("malformed".into()),
+            },
+        );
+        let resolver = DefaultKeyResolver::new(config);
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect_err("malformed named key must fail during resolution");
+
+        assert_eq!(
+            error.to_string(),
+            "key resolution failed: invalid public key DER"
+        );
+    }
 }
