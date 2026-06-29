@@ -23,7 +23,10 @@ use x509_parser::public_key::PublicKey;
 
 use super::digest::DigestAlgorithm;
 use super::transforms::{self, Transform};
-use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_text};
+use super::whitespace::{
+    XmlBase64NormalizeLimitedError, is_xml_whitespace_only, normalize_xml_base64_text,
+    normalize_xml_base64_text_with_limit,
+};
 use crate::c14n::C14nAlgorithm;
 
 /// XMLDSig namespace URI.
@@ -592,17 +595,19 @@ fn decode_crypto_binary(
     let max_base64_len = max_decoded_len.div_ceil(3) * 4;
     let mut cleaned = String::with_capacity(max_base64_len);
     for text in node.children().filter_map(|child| child.text()) {
-        normalize_xml_base64_text(text, &mut cleaned).map_err(|err| {
-            ParseError::Base64(format!(
-                "invalid XML whitespace U+{:04X} in {element_name}",
-                err.invalid_byte
-            ))
-        })?;
-        if cleaned.len() > max_base64_len {
-            return Err(ParseError::InvalidStructure(format!(
-                "{element_name} exceeds maximum allowed base64 length"
-            )));
-        }
+        normalize_xml_base64_text_with_limit(text, &mut cleaned, max_base64_len).map_err(
+            |err| match err {
+                XmlBase64NormalizeLimitedError::InvalidWhitespace(err) => {
+                    ParseError::Base64(format!(
+                        "invalid XML whitespace U+{:04X} in {element_name}",
+                        err.invalid_byte
+                    ))
+                }
+                XmlBase64NormalizeLimitedError::TooLong(_) => ParseError::InvalidStructure(
+                    format!("{element_name} exceeds maximum allowed base64 length"),
+                ),
+            },
+        )?;
     }
 
     let value = STANDARD
