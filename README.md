@@ -39,7 +39,7 @@ Currently implemented (core paths):
 - C14N 1.0, C14N 1.1, and Exclusive C14N
 - XMLDSig parsing, same-document URI dereference, transform chains, and digest verification
 - XMLDSig full verify pipeline (`SignedInfo` canonicalization + `SignatureValue` verification)
-- Built-in verification-key resolution from X.509, DER, `KeyName`, and RSA `KeyValue` sources
+- Built-in verification-key resolution from X.509, DER, `KeyName`, RSA `KeyValue`, and EC `KeyValue` sources
 - RSA PKCS#1 v1.5 verification helpers for SHA-1 / SHA-256 / SHA-384 / SHA-512
 - ECDSA verification helpers for P-256/SHA-256 and P-384/SHA-384
 - Opt-in X.509 certificate-chain validation with explicit trust anchors, validity checks, CA constraints, and CRLs

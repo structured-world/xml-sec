@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, time::SystemTime};
 
-use rsa::pkcs8::EncodePublicKey;
+use p256::pkcs8::EncodePublicKey;
 use x509_parser::{
     prelude::{FromDer, X509Certificate},
     public_key::PublicKey,
@@ -177,29 +177,33 @@ impl DefaultKeyResolver {
         key_value: &KeyValueInfo,
         algorithm: SignatureAlgorithm,
     ) -> Result<Option<VerificationKey>, KeyResolutionError> {
-        let KeyValueInfo::Rsa { modulus, exponent } = key_value else {
-            return Ok(None);
+        let public_key_bytes = match key_value {
+            KeyValueInfo::Rsa { modulus, exponent } => {
+                if !matches!(
+                    algorithm,
+                    SignatureAlgorithm::RsaSha1
+                        | SignatureAlgorithm::RsaSha256
+                        | SignatureAlgorithm::RsaSha384
+                        | SignatureAlgorithm::RsaSha512
+                ) {
+                    return Err(KeyResolutionError::AlgorithmMismatch);
+                }
+                rsa_key_value_to_spki_der(modulus, exponent)?
+            }
+            KeyValueInfo::Ec {
+                curve_oid,
+                public_key,
+            } => {
+                if !matches!(
+                    algorithm,
+                    SignatureAlgorithm::EcdsaP256Sha256 | SignatureAlgorithm::EcdsaP384Sha384
+                ) {
+                    return Err(KeyResolutionError::AlgorithmMismatch);
+                }
+                ec_key_value_to_spki_der(curve_oid, public_key)?
+            }
+            KeyValueInfo::Unsupported { .. } => return Ok(None),
         };
-        if !matches!(
-            algorithm,
-            SignatureAlgorithm::RsaSha1
-                | SignatureAlgorithm::RsaSha256
-                | SignatureAlgorithm::RsaSha384
-                | SignatureAlgorithm::RsaSha512
-        ) {
-            return Err(KeyResolutionError::AlgorithmMismatch);
-        }
-
-        let key = rsa::RsaPublicKey::new(
-            rsa::BigUint::from_bytes_be(modulus),
-            rsa::BigUint::from_bytes_be(exponent),
-        )
-        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
-        let public_key_bytes = key
-            .to_public_key_der()
-            .map_err(|_| KeyResolutionError::InvalidPublicKey)?
-            .as_bytes()
-            .to_vec();
         validate_spki_algorithm(&public_key_bytes, algorithm)?;
 
         Ok(Some(VerificationKey {
@@ -257,6 +261,39 @@ impl KeyResolver for DefaultKeyResolver {
 
     fn consumes_document_key_info(&self) -> bool {
         true
+    }
+}
+
+fn rsa_key_value_to_spki_der(
+    modulus: &[u8],
+    exponent: &[u8],
+) -> Result<Vec<u8>, KeyResolutionError> {
+    let key = rsa::RsaPublicKey::new(
+        rsa::BigUint::from_bytes_be(modulus),
+        rsa::BigUint::from_bytes_be(exponent),
+    )
+    .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+    key.to_public_key_der()
+        .map_err(|_| KeyResolutionError::InvalidPublicKey)
+        .map(|der| der.as_bytes().to_vec())
+}
+
+fn ec_key_value_to_spki_der(
+    curve_oid: &str,
+    public_key: &[u8],
+) -> Result<Vec<u8>, KeyResolutionError> {
+    match curve_oid {
+        "1.2.840.10045.3.1.7" => p256::PublicKey::from_sec1_bytes(public_key)
+            .map_err(|_| KeyResolutionError::InvalidPublicKey)?
+            .to_public_key_der()
+            .map_err(|_| KeyResolutionError::InvalidPublicKey)
+            .map(|der| der.as_bytes().to_vec()),
+        "1.3.132.0.34" => p384::PublicKey::from_sec1_bytes(public_key)
+            .map_err(|_| KeyResolutionError::InvalidPublicKey)?
+            .to_public_key_der()
+            .map_err(|_| KeyResolutionError::InvalidPublicKey)
+            .map(|der| der.as_bytes().to_vec()),
+        _ => Err(KeyResolutionError::InvalidPublicKey),
     }
 }
 
@@ -320,6 +357,12 @@ mod tests {
     );
     const LEGACY_RSA_KEY_VALUE_SIGNATURE: &str = include_str!(
         "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-rsa.xml"
+    );
+    const EC_P256_KEY_VALUE_SIGNATURE: &str = include_str!(
+        "../../donors/xmlsec/tests/xmldsig11-interop-2012/signature-enveloping-p256_sha256.xml"
+    );
+    const EC_P384_KEY_VALUE_SIGNATURE: &str = include_str!(
+        "../../donors/xmlsec/tests/xmldsig11-interop-2012/signature-enveloping-p384_sha384.xml"
     );
 
     fn replace_key_info(xml: &str, replacement: &str) -> String {
@@ -480,6 +523,47 @@ mod tests {
             .key_resolver(&resolver)
             .verify(&xml)
             .expect_err("RSAKeyValue must not resolve for ECDSA");
+
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::AlgorithmMismatch)
+        ));
+    }
+
+    #[test]
+    fn resolves_ec_p256_key_value_end_to_end() {
+        // XMLDSig 1.1 ECKeyValue must verify without a preset key or certificate.
+        let resolver = DefaultKeyResolver::default();
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(EC_P256_KEY_VALUE_SIGNATURE)
+            .expect("P-256 ECKeyValue should resolve");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn resolves_ec_p384_key_value_end_to_end() {
+        // The donor P-384 vector uses NamedCurve + uncompressed PublicKey.
+        let resolver = DefaultKeyResolver::default();
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(EC_P384_KEY_VALUE_SIGNATURE)
+            .expect("P-384 ECKeyValue should resolve");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn ec_key_value_rejects_rsa_signature_method() {
+        // Embedded EC key material must not be relabeled for an RSA SignatureMethod.
+        let key_info = r#"<KeyInfo xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><KeyValue><dsig11:ECKeyValue><dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/><dsig11:PublicKey>BJ/yaXNlq4FRObyJCBhb5jAz8GVzinK3bBGLjSDfjbJwNfydtgjnlS4EsDmxSRhWyJWq6GIqy5wvnaiARK04uB4=</dsig11:PublicKey></dsig11:ECKeyValue></KeyValue></KeyInfo>"#;
+        let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, key_info);
+        let resolver = DefaultKeyResolver::default();
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect_err("ECKeyValue must not resolve for RSA");
 
         assert!(matches!(
             error,
