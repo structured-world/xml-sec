@@ -6,12 +6,14 @@
 use std::path::{Path, PathBuf};
 
 use xml_sec::xmldsig::{
-    DsigError, DsigStatus, FailureReason, ParseError, VerifyContext, verify_signature_with_pem_key,
+    DefaultKeyResolver, DsigError, DsigStatus, FailureReason, ParseError, VerifyContext,
+    verify_signature_with_pem_key,
 };
 
 #[derive(Clone, Copy)]
 enum SkipProbe {
     KeyNotFound,
+    WeakRsaKey,
     UnsupportedSignatureAlgorithm,
 }
 
@@ -108,8 +110,8 @@ fn cases() -> Vec<VectorCase> {
             name: "merlin-enveloping-rsa-keyvalue",
             xml_path: "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-rsa.xml",
             expectation: Expectation::Skip {
-                reason: "KeyValue auto-resolution is not implemented yet (planned P2-009)",
-                probe: SkipProbe::KeyNotFound,
+                reason: "RSAKeyValue resolves but its legacy 1024-bit modulus is below policy",
+                probe: SkipProbe::WeakRsaKey,
             },
         },
         VectorCase {
@@ -202,6 +204,22 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
                             case.name
                         )),
                     },
+                    SkipProbe::WeakRsaKey => match VerifyContext::new()
+                        .key_resolver(&DefaultKeyResolver::default())
+                        .verify(&xml)
+                    {
+                        Err(DsigError::Crypto(
+                            xml_sec::xmldsig::SignatureVerificationError::InvalidKeyDer,
+                        )) => {}
+                        Ok(result) => failed.push(format!(
+                            "{}: expected weak RSA key error for skipped vector, got {:?}",
+                            case.name, result.status
+                        )),
+                        Err(err) => failed.push(format!(
+                            "{}: expected weak RSA key error for skipped vector, got {err}",
+                            case.name
+                        )),
+                    },
                     SkipProbe::UnsupportedSignatureAlgorithm => match VerifyContext::new().verify(&xml)
                     {
                         Err(DsigError::ParseSignedInfo(ParseError::UnsupportedAlgorithm {
@@ -232,7 +250,7 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
     let expected_skipped = vec![
         "aleksey-rsa-sha512-x509-digest: X509Digest key resolution is not implemented yet (planned P2-009)",
         "merlin-enveloped-dsa: DSA signature method is not implemented yet (planned P4-009)",
-        "merlin-enveloping-rsa-keyvalue: KeyValue auto-resolution is not implemented yet (planned P2-009)",
+        "merlin-enveloping-rsa-keyvalue: RSAKeyValue resolves but its legacy 1024-bit modulus is below policy",
         "merlin-x509-crt: DSA signature method is not implemented yet (planned P4-009); X509 KeyInfo resolution is not implemented yet (planned P2-009)",
         "merlin-x509-crt-crl: DSA signature method is not implemented yet (planned P4-009); X509/CRL KeyInfo resolution is not implemented yet (planned P2-009/P2-005)",
         "merlin-x509-is: DSA signature method is not implemented yet (planned P4-009); X509IssuerSerial resolution is not implemented yet (planned P2-009)",

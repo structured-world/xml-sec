@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, time::SystemTime};
 
+use rsa::pkcs8::EncodePublicKey;
 use x509_parser::{
     prelude::{FromDer, X509Certificate},
     public_key::PublicKey,
@@ -9,7 +10,7 @@ use x509_parser::{
 };
 
 use super::{
-    DsigError, KeyInfo, KeyInfoSource, KeyResolver, SignatureAlgorithm, VerifyingKey,
+    DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
     X509ChainOptions, X509DataInfo, verify_ecdsa_signature_spki, verify_rsa_signature_spki,
     verify_x509_certificate_chain,
 };
@@ -171,6 +172,43 @@ impl DefaultKeyResolver {
             name: None,
         }))
     }
+
+    fn resolve_key_value(
+        key_value: &KeyValueInfo,
+        algorithm: SignatureAlgorithm,
+    ) -> Result<Option<VerificationKey>, KeyResolutionError> {
+        let KeyValueInfo::Rsa { modulus, exponent } = key_value else {
+            return Ok(None);
+        };
+        if !matches!(
+            algorithm,
+            SignatureAlgorithm::RsaSha1
+                | SignatureAlgorithm::RsaSha256
+                | SignatureAlgorithm::RsaSha384
+                | SignatureAlgorithm::RsaSha512
+        ) {
+            return Err(KeyResolutionError::AlgorithmMismatch);
+        }
+
+        let key = rsa::RsaPublicKey::new(
+            rsa::BigUint::from_bytes_be(modulus),
+            rsa::BigUint::from_bytes_be(exponent),
+        )
+        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+        let public_key_bytes = key
+            .to_public_key_der()
+            .map_err(|_| KeyResolutionError::InvalidPublicKey)?
+            .as_bytes()
+            .to_vec();
+        validate_spki_algorithm(&public_key_bytes, algorithm)?;
+
+        Ok(Some(VerificationKey {
+            algorithm,
+            public_key_bytes,
+            certificate_der: None,
+            name: None,
+        }))
+    }
 }
 
 impl KeyResolver for DefaultKeyResolver {
@@ -206,7 +244,9 @@ impl KeyResolver for DefaultKeyResolver {
                         Ok(key.clone())
                     })
                     .transpose()?,
-                KeyInfoSource::KeyValue(_) => None,
+                KeyInfoSource::KeyValue(key_value) => {
+                    Self::resolve_key_value(key_value, algorithm)?
+                }
             };
             if let Some(key) = resolved {
                 return Ok(Some(Box::new(key)));
@@ -266,6 +306,7 @@ fn validate_spki_algorithm(
 #[cfg(test)]
 mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD};
+    use rsa::{pkcs8::DecodePublicKey, traits::PublicKeyParts};
 
     use super::*;
 
@@ -274,6 +315,12 @@ mod tests {
     const SAML_PUBLIC_KEY: &str =
         include_str!("../../tests/fixtures/keys/ec/saml-idp-ecdsa-pubkey.pem");
     const RSA_PUBLIC_KEY: &str = include_str!("../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    const RSA_KEY_VALUE_SIGNATURE: &str = include_str!(
+        "../../tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml"
+    );
+    const LEGACY_RSA_KEY_VALUE_SIGNATURE: &str = include_str!(
+        "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-rsa.xml"
+    );
 
     fn replace_key_info(xml: &str, replacement: &str) -> String {
         let start = xml.find("<ds:KeyInfo>").expect("fixture has KeyInfo");
@@ -281,6 +328,12 @@ mod tests {
             .find("</ds:KeyInfo>")
             .expect("fixture has closing KeyInfo")
             + "</ds:KeyInfo>".len();
+        format!("{}{}{}", &xml[..start], replacement, &xml[end..])
+    }
+
+    fn replace_unprefixed_key_info(xml: &str, replacement: &str) -> String {
+        let start = xml.find("<KeyInfo>").expect("fixture has KeyInfo");
+        let end = xml.find("</KeyInfo>").expect("fixture has closing KeyInfo") + "</KeyInfo>".len();
         format!("{}{}{}", &xml[..start], replacement, &xml[end..])
     }
 
@@ -374,6 +427,64 @@ mod tests {
             .expect("DER key should resolve");
 
         assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn resolves_rsa_key_value_end_to_end() {
+        // Embedded CryptoBinary parameters must verify the original RSA-2048 donor signature.
+        let public_key = rsa::RsaPublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
+            .expect("fixture must contain an RSA public key");
+        let key_info = format!(
+            "<KeyInfo><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>",
+            STANDARD.encode(public_key.n().to_bytes_be()),
+            STANDARD.encode(public_key.e().to_bytes_be()),
+        );
+        let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, &key_info);
+        let resolver = DefaultKeyResolver::default();
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect("RSAKeyValue should resolve");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn rsa_key_value_rejects_legacy_weak_modulus() {
+        // Embedded keys must obey the same 2048-bit minimum as certificate and DER keys.
+        let resolver = DefaultKeyResolver::default();
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(LEGACY_RSA_KEY_VALUE_SIGNATURE)
+            .expect_err("1024-bit RSAKeyValue must fail closed");
+
+        assert!(matches!(
+            error,
+            DsigError::Crypto(super::super::SignatureVerificationError::InvalidKeyDer)
+        ));
+    }
+
+    #[test]
+    fn rsa_key_value_rejects_ecdsa_signature_method() {
+        // Embedded RSA parameters must not be relabeled for an ECDSA SignatureMethod.
+        let public_key = rsa::RsaPublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
+            .expect("fixture must contain an RSA public key");
+        let key_info = format!(
+            "<ds:KeyInfo><ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{}</ds:Modulus><ds:Exponent>{}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue></ds:KeyInfo>",
+            STANDARD.encode(public_key.n().to_bytes_be()),
+            STANDARD.encode(public_key.e().to_bytes_be()),
+        );
+        let xml = replace_key_info(SIGNED_SAML, &key_info);
+        let resolver = DefaultKeyResolver::default();
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect_err("RSAKeyValue must not resolve for ECDSA");
+
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::AlgorithmMismatch)
+        ));
     }
 
     #[test]
