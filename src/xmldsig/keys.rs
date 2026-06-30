@@ -739,6 +739,41 @@ mod tests {
     }
 
     #[test]
+    fn malformed_ec_key_value_children_fall_back_to_later_key_name() {
+        // An unusable EC source must not prevent later ordered KeyInfo sources
+        // from resolving, regardless of which required child-shape check fails.
+        let malformed_ec_key_values = [
+            r#"<dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/>"#,
+            r#"<dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/><dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/>"#,
+            r#"<dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/><dsig11:PublicKey>BA==</dsig11:PublicKey><dsig11:PublicKey>BA==</dsig11:PublicKey>"#,
+        ];
+
+        for malformed_children in malformed_ec_key_values {
+            let key_info = format!(
+                r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:KeyValue><dsig11:ECKeyValue>{malformed_children}</dsig11:ECKeyValue></ds:KeyValue><ds:KeyName>idp-signing</ds:KeyName></ds:KeyInfo>"#
+            );
+            let xml = replace_key_info(SIGNED_SAML, &key_info);
+            let mut config = KeyResolverConfig::default();
+            config.named_keys.insert(
+                "idp-signing".into(),
+                VerificationKey {
+                    algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                    public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
+                    certificate_der: None,
+                    name: Some("idp-signing".into()),
+                },
+            );
+            let resolver = DefaultKeyResolver::new(config);
+            let result = super::super::VerifyContext::new()
+                .key_resolver(&resolver)
+                .verify(&xml)
+                .expect("later KeyName should resolve after malformed EC child shape");
+
+            assert_eq!(result.status, super::super::DsigStatus::Valid);
+        }
+    }
+
+    #[test]
     fn mismatched_ec_curve_falls_back_to_later_key_name() {
         // A valid P-384 key is unusable for an ECDSA-SHA256 signature but must not
         // prevent a later P-256 KeyName from resolving the same document.

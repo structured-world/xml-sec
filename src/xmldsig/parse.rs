@@ -591,9 +591,9 @@ fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
     ensure_no_non_whitespace_text(node, "ECKeyValue")?;
 
     let mut children = element_children(node);
-    let named_curve_node = children.next().ok_or_else(|| {
-        ParseError::InvalidStructure("ECKeyValue requires NamedCurve and PublicKey".into())
-    })?;
+    let Some(named_curve_node) = children.next() else {
+        return Ok(KeyValueInfo::InvalidEcKeyValue);
+    };
     if named_curve_node.tag_name().namespace() == Some(XMLDSIG11_NS)
         && named_curve_node.tag_name().name() == "ECParameters"
     {
@@ -602,7 +602,11 @@ fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
             local_name: "ECKeyValue".into(),
         });
     }
-    verify_dsig11_element(named_curve_node, "NamedCurve")?;
+    if named_curve_node.tag_name().namespace() != Some(XMLDSIG11_NS)
+        || named_curve_node.tag_name().name() != "NamedCurve"
+    {
+        return Ok(KeyValueInfo::InvalidEcKeyValue);
+    }
     ensure_no_element_children(named_curve_node, "NamedCurve")?;
     ensure_no_non_whitespace_text(named_curve_node, "NamedCurve")?;
     let Some((curve_oid, expected_public_key_len)) =
@@ -617,15 +621,17 @@ fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
         });
     };
 
-    let public_key_node = children.next().ok_or_else(|| {
-        ParseError::InvalidStructure("ECKeyValue requires NamedCurve and PublicKey".into())
-    })?;
-    verify_dsig11_element(public_key_node, "PublicKey")?;
+    let Some(public_key_node) = children.next() else {
+        return Ok(KeyValueInfo::InvalidEcKeyValue);
+    };
+    if public_key_node.tag_name().namespace() != Some(XMLDSIG11_NS)
+        || public_key_node.tag_name().name() != "PublicKey"
+    {
+        return Ok(KeyValueInfo::InvalidEcKeyValue);
+    }
     ensure_no_element_children(public_key_node, "PublicKey")?;
     if children.next().is_some() {
-        return Err(ParseError::InvalidStructure(
-            "ECKeyValue must contain exactly NamedCurve followed by PublicKey".into(),
-        ));
+        return Ok(KeyValueInfo::InvalidEcKeyValue);
     }
 
     let public_key = match decode_crypto_binary(public_key_node, "PublicKey", MAX_EC_PUBLIC_KEY_LEN)
@@ -2459,7 +2465,7 @@ BA== </Modulus>
     }
 
     #[test]
-    fn parse_ec_key_value_rejects_reordered_children() {
+    fn parse_ec_key_value_marks_reordered_children_invalid() {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
             <KeyValue>
@@ -2471,10 +2477,11 @@ BA== </Modulus>
         </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
 
-        assert!(matches!(
-            parse_key_info(doc.root_element()),
-            Err(ParseError::InvalidStructure(_))
-        ));
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::InvalidEcKeyValue)]
+        );
     }
 
     #[test]
