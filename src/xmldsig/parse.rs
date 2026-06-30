@@ -592,11 +592,24 @@ fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
     let named_curve_node = children.next().ok_or_else(|| {
         ParseError::InvalidStructure("ECKeyValue requires NamedCurve and PublicKey".into())
     })?;
+    if named_curve_node.tag_name().namespace() == Some(XMLDSIG11_NS)
+        && named_curve_node.tag_name().name() == "ECParameters"
+    {
+        return Ok(KeyValueInfo::Unsupported {
+            namespace: Some(XMLDSIG11_NS.to_string()),
+            local_name: "ECKeyValue".into(),
+        });
+    }
     verify_dsig11_element(named_curve_node, "NamedCurve")?;
     ensure_no_element_children(named_curve_node, "NamedCurve")?;
     ensure_no_non_whitespace_text(named_curve_node, "NamedCurve")?;
-    let curve_oid = parse_ec_named_curve_oid(named_curve_node)?;
-    let expected_public_key_len = ec_public_key_len(&curve_oid)?;
+    let Some((curve_oid, expected_public_key_len)) = parse_ec_named_curve_oid(named_curve_node)?
+    else {
+        return Ok(KeyValueInfo::Unsupported {
+            namespace: Some(XMLDSIG11_NS.to_string()),
+            local_name: "ECKeyValue".into(),
+        });
+    };
 
     let public_key_node = children.next().ok_or_else(|| {
         ParseError::InvalidStructure("ECKeyValue requires NamedCurve and PublicKey".into())
@@ -618,7 +631,7 @@ fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
     })
 }
 
-fn parse_ec_named_curve_oid(node: Node<'_, '_>) -> Result<String, ParseError> {
+fn parse_ec_named_curve_oid(node: Node<'_, '_>) -> Result<Option<(String, usize)>, ParseError> {
     let uri = node.attribute("URI").ok_or_else(|| {
         ParseError::InvalidStructure("ECKeyValue NamedCurve must include URI attribute".into())
     })?;
@@ -628,17 +641,17 @@ fn parse_ec_named_curve_oid(node: Node<'_, '_>) -> Result<String, ParseError> {
             "ECKeyValue NamedCurve URI must not be empty".into(),
         ));
     }
-    ec_public_key_len(curve_oid)?;
-    Ok(curve_oid.to_string())
+    let Some(public_key_len) = ec_public_key_len(curve_oid) else {
+        return Ok(None);
+    };
+    Ok(Some((curve_oid.to_string(), public_key_len)))
 }
 
-fn ec_public_key_len(curve_oid: &str) -> Result<usize, ParseError> {
+fn ec_public_key_len(curve_oid: &str) -> Option<usize> {
     match curve_oid {
-        EC_P256_OID => Ok(65),
-        EC_P384_OID => Ok(97),
-        _ => Err(ParseError::InvalidStructure(format!(
-            "unsupported ECKeyValue NamedCurve OID {curve_oid}"
-        ))),
+        EC_P256_OID => Some(65),
+        EC_P384_OID => Some(97),
+        _ => None,
     }
 }
 
@@ -2362,7 +2375,7 @@ BA== </Modulus>
     }
 
     #[test]
-    fn parse_ec_key_value_rejects_ec_parameters() {
+    fn parse_ec_key_value_marks_ec_parameters_as_unsupported() {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
             <KeyValue>
@@ -2374,10 +2387,37 @@ BA== </Modulus>
         </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
 
-        assert!(matches!(
-            parse_key_info(doc.root_element()),
-            Err(ParseError::InvalidStructure(_))
-        ));
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
+                namespace: Some(XMLDSIG11_NS.to_string()),
+                local_name: "ECKeyValue".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn parse_ec_key_value_marks_unsupported_curve_as_unsupported() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <KeyValue>
+                <dsig11:ECKeyValue>
+                    <dsig11:NamedCurve URI="urn:oid:1.3.132.0.35"/>
+                    <dsig11:PublicKey>BA==</dsig11:PublicKey>
+                </dsig11:ECKeyValue>
+            </KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
+                namespace: Some(XMLDSIG11_NS.to_string()),
+                local_name: "ECKeyValue".into(),
+            })]
+        );
     }
 
     #[test]

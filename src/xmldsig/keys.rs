@@ -198,7 +198,7 @@ impl DefaultKeyResolver {
                     algorithm,
                     SignatureAlgorithm::EcdsaP256Sha256 | SignatureAlgorithm::EcdsaP384Sha384
                 ) {
-                    return Err(KeyResolutionError::AlgorithmMismatch);
+                    return Ok(None);
                 }
                 ec_key_value_to_spki_der(curve_oid, public_key)?
             }
@@ -359,10 +359,10 @@ mod tests {
         "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-rsa.xml"
     );
     const EC_P256_KEY_VALUE_SIGNATURE: &str = include_str!(
-        "../../donors/xmlsec/tests/xmldsig11-interop-2012/signature-enveloping-p256_sha256.xml"
+        "../../tests/fixtures/xmldsig/xmldsig11-interop-2012/signature-enveloping-p256_sha256.xml"
     );
     const EC_P384_KEY_VALUE_SIGNATURE: &str = include_str!(
-        "../../donors/xmlsec/tests/xmldsig11-interop-2012/signature-enveloping-p384_sha384.xml"
+        "../../tests/fixtures/xmldsig/xmldsig11-interop-2012/signature-enveloping-p384_sha384.xml"
     );
 
     fn replace_key_info(xml: &str, replacement: &str) -> String {
@@ -555,20 +555,64 @@ mod tests {
     }
 
     #[test]
-    fn ec_key_value_rejects_rsa_signature_method() {
+    fn ec_key_value_ignored_for_rsa_signature_method() {
         // Embedded EC key material must not be relabeled for an RSA SignatureMethod.
         let key_info = r#"<KeyInfo xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><KeyValue><dsig11:ECKeyValue><dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/><dsig11:PublicKey>BJ/yaXNlq4FRObyJCBhb5jAz8GVzinK3bBGLjSDfjbJwNfydtgjnlS4EsDmxSRhWyJWq6GIqy5wvnaiARK04uB4=</dsig11:PublicKey></dsig11:ECKeyValue></KeyValue></KeyInfo>"#;
         let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, key_info);
         let resolver = DefaultKeyResolver::default();
-        let error = super::super::VerifyContext::new()
+        let result = super::super::VerifyContext::new()
             .key_resolver(&resolver)
             .verify(&xml)
-            .expect_err("ECKeyValue must not resolve for RSA");
+            .expect("incompatible ECKeyValue should be ignored");
 
-        assert!(matches!(
-            error,
-            DsigError::KeyResolution(KeyResolutionError::AlgorithmMismatch)
-        ));
+        assert_eq!(
+            result.status,
+            super::super::DsigStatus::Invalid(super::super::FailureReason::KeyNotFound)
+        );
+    }
+
+    #[test]
+    fn incompatible_ec_key_value_falls_back_to_later_rsa_key_value() {
+        // Mixed KeyInfo should keep scanning after an incompatible ECKeyValue source.
+        let public_key = rsa::RsaPublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
+            .expect("fixture must contain an RSA public key");
+        let key_info = format!(
+            r#"<KeyInfo xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><KeyValue><dsig11:ECKeyValue><dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/><dsig11:PublicKey>BJ/yaXNlq4FRObyJCBhb5jAz8GVzinK3bBGLjSDfjbJwNfydtgjnlS4EsDmxSRhWyJWq6GIqy5wvnaiARK04uB4=</dsig11:PublicKey></dsig11:ECKeyValue></KeyValue><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>"#,
+            STANDARD.encode(public_key.n().to_bytes_be()),
+            STANDARD.encode(public_key.e().to_bytes_be()),
+        );
+        let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, &key_info);
+        let resolver = DefaultKeyResolver::default();
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect("later RSAKeyValue should resolve");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn unsupported_ec_key_value_falls_back_to_later_key_name() {
+        // Unsupported curves are non-fatal so a later compatible source can verify.
+        let key_info = r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:KeyValue><dsig11:ECKeyValue><dsig11:NamedCurve URI="urn:oid:1.3.132.0.35"/><dsig11:PublicKey>BA==</dsig11:PublicKey></dsig11:ECKeyValue></ds:KeyValue><ds:KeyName>idp-signing</ds:KeyName></ds:KeyInfo>"#;
+        let xml = replace_key_info(SIGNED_SAML, key_info);
+        let mut config = KeyResolverConfig::default();
+        config.named_keys.insert(
+            "idp-signing".into(),
+            VerificationKey {
+                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
+                certificate_der: None,
+                name: Some("idp-signing".into()),
+            },
+        );
+        let resolver = DefaultKeyResolver::new(config);
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect("later KeyName should resolve");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
     }
 
     #[test]
