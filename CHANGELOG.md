@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/structured-world/xml-sec/compare/v0.1.7...v0.1.8) - 2026-06-30
+
+### Added
+
+- *(xmldsig)* resolve ECKeyValue keys
+- *(xmldsig)* resolve RSAKeyValue keys
+- *(xmldsig)* wire default key resolver
+- *(xmldsig)* add key resolver configuration
+- *(xmldsig)* verify x509 certificate chains
+
+### Documentation
+
+- *(xmldsig)* clarify ECDSA curve compatibility
+
+### Fixed
+
+- *(xmldsig)* preserve malformed EC fallback
+- *(xmldsig)* preserve invalid ECKeyValue fallback
+- *(xmldsig)* preserve ECKeyValue decode failures
+- *(xmldsig)* defer malformed ECKeyValue errors
+- *(xmldsig)* continue after unusable ECKeyValue
+- *(xmldsig)* keep ECKeyValue fallback non-fatal
+- *(xmldsig)* bound crypto binary normalization
+- *(xmldsig)* distinguish invalid public keys
+- *(xmldsig)* validate named key material
+- *(xmldsig)* validate rollover root linkage
+- *(xmldsig)* replace rollover trust roots
+- *(xmldsig)* validate x509 signing authority
+- *(xmldsig)* enforce x509 issuer usage
+
 ## [0.1.7](https://github.com/structured-world/xml-sec/compare/v0.1.6...v0.1.7) - 2026-06-27
 
 ### Added
