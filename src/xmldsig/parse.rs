@@ -39,6 +39,9 @@ const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LE
 const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
 const MAX_RSA_MODULUS_LEN: usize = 1024;
 const MAX_RSA_EXPONENT_LEN: usize = 8;
+pub(crate) const EC_P256_OID: &str = "1.2.840.10045.3.1.7";
+pub(crate) const EC_P384_OID: &str = "1.3.132.0.34";
+const MAX_EC_PUBLIC_KEY_LEN: usize = 97;
 const MAX_X509_BASE64_TEXT_LEN: usize = 262_144;
 const MAX_X509_BASE64_NORMALIZED_LEN: usize = MAX_X509_BASE64_TEXT_LEN;
 const MAX_X509_DECODED_BINARY_LEN: usize = MAX_X509_BASE64_NORMALIZED_LEN.div_ceil(4) * 3;
@@ -167,8 +170,15 @@ pub enum KeyValueInfo {
         /// RSA public exponent.
         exponent: Vec<u8>,
     },
-    /// `dsig11:ECKeyValue` (the XMLDSig 1.1 namespace form).
-    EcKeyValue,
+    /// `dsig11:ECKeyValue` with a supported named curve and SEC1 public point.
+    Ec {
+        /// Bare named-curve OID, without the XMLDSig `urn:oid:` prefix.
+        curve_oid: String,
+        /// Uncompressed SEC1 point (`0x04 || x || y`).
+        public_key: Vec<u8>,
+    },
+    /// `dsig11:ECKeyValue` with unusable curve or point data.
+    InvalidEcKeyValue,
     /// Any other `<KeyValue>` child not yet supported by this phase.
     Unsupported {
         /// Namespace URI of the unsupported child, when present.
@@ -420,7 +430,7 @@ pub(crate) fn parse_reference(reference_node: Node) -> Result<Reference, ParseEr
 ///
 /// Supported source elements:
 /// - `<ds:KeyName>`
-/// - `<ds:KeyValue>` (dispatch by child QName; only `dsig11:ECKeyValue` is treated as supported EC)
+/// - `<ds:KeyValue>` (dispatch by child QName; RSA and `dsig11:ECKeyValue` are parsed)
 /// - `<ds:X509Data>`
 /// - `<dsig11:DEREncodedKeyValue>`
 ///
@@ -479,6 +489,26 @@ fn verify_ds_element(node: Node, expected_name: &'static str) -> Result<(), Pars
     if tag.name() != expected_name || tag.namespace() != Some(XMLDSIG_NS) {
         return Err(ParseError::InvalidStructure(format!(
             "expected <ds:{expected_name}>, got <{}{}>",
+            tag.namespace()
+                .map(|ns| format!("{{{ns}}}"))
+                .unwrap_or_default(),
+            tag.name()
+        )));
+    }
+    Ok(())
+}
+
+/// Verify that a node is a `<dsig11:{expected_name}>` element.
+fn verify_dsig11_element(node: Node, expected_name: &'static str) -> Result<(), ParseError> {
+    if !node.is_element() {
+        return Err(ParseError::InvalidStructure(format!(
+            "expected element <{expected_name}>, got non-element node"
+        )));
+    }
+    let tag = node.tag_name();
+    if tag.name() != expected_name || tag.namespace() != Some(XMLDSIG11_NS) {
+        return Err(ParseError::InvalidStructure(format!(
+            "expected <dsig11:{expected_name}>, got <{}{}>",
             tag.namespace()
                 .map(|ns| format!("{{{ns}}}"))
                 .unwrap_or_default(),
@@ -548,12 +578,113 @@ fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
         first_child.tag_name().name(),
     ) {
         (Some(XMLDSIG_NS), "RSAKeyValue") => parse_rsa_key_value(first_child),
-        (Some(XMLDSIG11_NS), "ECKeyValue") => Ok(KeyValueInfo::EcKeyValue),
+        (Some(XMLDSIG11_NS), "ECKeyValue") => parse_ec_key_value(first_child),
         (namespace, child_name) => Ok(KeyValueInfo::Unsupported {
             namespace: namespace.map(str::to_string),
             local_name: child_name.to_string(),
         }),
     }
+}
+
+fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
+    verify_dsig11_element(node, "ECKeyValue")?;
+    ensure_no_non_whitespace_text(node, "ECKeyValue")?;
+
+    let mut children = element_children(node);
+    let Some(named_curve_node) = children.next() else {
+        return Ok(KeyValueInfo::InvalidEcKeyValue);
+    };
+    if named_curve_node.tag_name().namespace() == Some(XMLDSIG11_NS)
+        && named_curve_node.tag_name().name() == "ECParameters"
+    {
+        return Ok(KeyValueInfo::Unsupported {
+            namespace: Some(XMLDSIG11_NS.to_string()),
+            local_name: "ECKeyValue".into(),
+        });
+    }
+    if named_curve_node.tag_name().namespace() != Some(XMLDSIG11_NS)
+        || named_curve_node.tag_name().name() != "NamedCurve"
+    {
+        return Ok(KeyValueInfo::InvalidEcKeyValue);
+    }
+    ensure_no_element_children(named_curve_node, "NamedCurve")?;
+    ensure_no_non_whitespace_text(named_curve_node, "NamedCurve")?;
+    let Some((curve_oid, expected_public_key_len)) =
+        (match parse_ec_named_curve_oid(named_curve_node) {
+            Ok(curve) => curve,
+            Err(_) => return Ok(KeyValueInfo::InvalidEcKeyValue),
+        })
+    else {
+        return Ok(KeyValueInfo::Unsupported {
+            namespace: Some(XMLDSIG11_NS.to_string()),
+            local_name: "ECKeyValue".into(),
+        });
+    };
+
+    let Some(public_key_node) = children.next() else {
+        return Ok(KeyValueInfo::InvalidEcKeyValue);
+    };
+    if public_key_node.tag_name().namespace() != Some(XMLDSIG11_NS)
+        || public_key_node.tag_name().name() != "PublicKey"
+    {
+        return Ok(KeyValueInfo::InvalidEcKeyValue);
+    }
+    ensure_no_element_children(public_key_node, "PublicKey")?;
+    if children.next().is_some() {
+        return Ok(KeyValueInfo::InvalidEcKeyValue);
+    }
+
+    let public_key = match decode_crypto_binary(public_key_node, "PublicKey", MAX_EC_PUBLIC_KEY_LEN)
+    {
+        Ok(public_key) => public_key,
+        Err(_) => return Ok(KeyValueInfo::InvalidEcKeyValue),
+    };
+    if validate_ec_public_key_point(&public_key, expected_public_key_len).is_err() {
+        return Ok(KeyValueInfo::InvalidEcKeyValue);
+    }
+
+    Ok(KeyValueInfo::Ec {
+        curve_oid,
+        public_key,
+    })
+}
+
+fn parse_ec_named_curve_oid(node: Node<'_, '_>) -> Result<Option<(String, usize)>, ParseError> {
+    let uri = node.attribute("URI").ok_or_else(|| {
+        ParseError::InvalidStructure("ECKeyValue NamedCurve must include URI attribute".into())
+    })?;
+    let curve_oid = uri.strip_prefix("urn:oid:").unwrap_or(uri);
+    if curve_oid.is_empty() {
+        return Err(ParseError::InvalidStructure(
+            "ECKeyValue NamedCurve URI must not be empty".into(),
+        ));
+    }
+    let Some(public_key_len) = ec_public_key_len(curve_oid) else {
+        return Ok(None);
+    };
+    Ok(Some((curve_oid.to_string(), public_key_len)))
+}
+
+fn ec_public_key_len(curve_oid: &str) -> Option<usize> {
+    match curve_oid {
+        EC_P256_OID => Some(65),
+        EC_P384_OID => Some(97),
+        _ => None,
+    }
+}
+
+fn validate_ec_public_key_point(public_key: &[u8], expected_len: usize) -> Result<(), ParseError> {
+    if public_key.len() != expected_len {
+        return Err(ParseError::InvalidStructure(
+            "ECKeyValue PublicKey length does not match NamedCurve".into(),
+        ));
+    }
+    if public_key.first().copied() != Some(0x04) {
+        return Err(ParseError::InvalidStructure(
+            "ECKeyValue PublicKey must be an uncompressed SEC1 point".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_rsa_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
@@ -2214,10 +2345,68 @@ BA== </Modulus>
 
     #[test]
     fn parse_key_info_dispatches_dsig11_ec_keyvalue() {
+        let public_key = "BJ/yaXNlq4FRObyJCBhb5jAz8GVzinK3bBGLjSDfjbJwNfydtgjnlS4EsDmxSRhWyJWq6GIqy5wvnaiARK04uB4=";
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
             <KeyValue>
-                <dsig11:ECKeyValue/>
+                <dsig11:ECKeyValue>
+                    <dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/>
+                    <dsig11:PublicKey>BJ/yaXNlq4FRObyJCBhb5jAz8GVzinK3bBGLjSDfjbJwNfydtgjnlS4EsDmxSRhWyJWq6GIqy5wvnaiARK04uB4=</dsig11:PublicKey>
+                </dsig11:ECKeyValue>
+            </KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+        let expected_public_key = base64::engine::general_purpose::STANDARD
+            .decode(public_key)
+            .expect("fixture EC point must be valid base64");
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::Ec {
+                curve_oid: "1.2.840.10045.3.1.7".into(),
+                public_key: expected_public_key,
+            })]
+        );
+    }
+
+    #[test]
+    fn parse_ec_key_value_accepts_bare_curve_oid() {
+        use base64::Engine;
+
+        let encoded_public_key = "BO/yd/OZzDfjX4qivDY/vsUIuh6KWAxoxW5P4ukvwd+T6pVljWsX2UBJNNy5MdhTwB8e2YwB8kUbJwdsAS/XGi/fz8unFrs+lVlAgIs6s/xBYFbfUoRiAacD2SpVDe6XBA==";
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <KeyValue>
+                <dsig11:ECKeyValue>
+                    <dsig11:NamedCurve URI="1.3.132.0.34"/>
+                    <dsig11:PublicKey>BO/yd/OZzDfjX4qivDY/vsUIuh6KWAxoxW5P4ukvwd+T6pVljWsX2UBJNNy5MdhTwB8e2YwB8kUbJwdsAS/XGi/fz8unFrs+lVlAgIs6s/xBYFbfUoRiAacD2SpVDe6XBA==</dsig11:PublicKey>
+                </dsig11:ECKeyValue>
+            </KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+        let expected_public_key = base64::engine::general_purpose::STANDARD
+            .decode(encoded_public_key)
+            .unwrap();
+
+        let sources = parse_key_info(doc.root_element()).unwrap().sources;
+
+        assert!(matches!(
+            &sources[0],
+            KeyInfoSource::KeyValue(KeyValueInfo::Ec { curve_oid, public_key })
+                if curve_oid == EC_P384_OID && public_key == &expected_public_key
+        ));
+    }
+
+    #[test]
+    fn parse_ec_key_value_marks_ec_parameters_as_unsupported() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <KeyValue>
+                <dsig11:ECKeyValue>
+                    <dsig11:ECParameters/>
+                    <dsig11:PublicKey>BA==</dsig11:PublicKey>
+                </dsig11:ECKeyValue>
             </KeyValue>
         </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
@@ -2225,7 +2414,93 @@ BA== </Modulus>
         let key_info = parse_key_info(doc.root_element()).unwrap();
         assert_eq!(
             key_info.sources,
-            vec![KeyInfoSource::KeyValue(KeyValueInfo::EcKeyValue)]
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
+                namespace: Some(XMLDSIG11_NS.to_string()),
+                local_name: "ECKeyValue".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn parse_ec_key_value_marks_unsupported_curve_as_unsupported() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <KeyValue>
+                <dsig11:ECKeyValue>
+                    <dsig11:NamedCurve URI="urn:oid:1.3.132.0.35"/>
+                    <dsig11:PublicKey>BA==</dsig11:PublicKey>
+                </dsig11:ECKeyValue>
+            </KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
+                namespace: Some(XMLDSIG11_NS.to_string()),
+                local_name: "ECKeyValue".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn parse_ec_key_value_marks_missing_named_curve_uri_invalid() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <KeyValue>
+                <dsig11:ECKeyValue>
+                    <dsig11:NamedCurve/>
+                    <dsig11:PublicKey>BA==</dsig11:PublicKey>
+                </dsig11:ECKeyValue>
+            </KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::InvalidEcKeyValue)]
+        );
+    }
+
+    #[test]
+    fn parse_ec_key_value_marks_reordered_children_invalid() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <KeyValue>
+                <dsig11:ECKeyValue>
+                    <dsig11:PublicKey>BJ/yaXNlq4FRObyJCBhb5jAz8GVzinK3bBGLjSDfjbJwNfydtgjnlS4EsDmxSRhWyJWq6GIqy5wvnaiARK04uB4=</dsig11:PublicKey>
+                    <dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/>
+                </dsig11:ECKeyValue>
+            </KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::InvalidEcKeyValue)]
+        );
+    }
+
+    #[test]
+    fn parse_ec_key_value_marks_non_uncompressed_point_invalid() {
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <KeyValue>
+                <dsig11:ECKeyValue>
+                    <dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/>
+                    <dsig11:PublicKey>Ap/yaXNlq4FRObyJCBhb5jAz8GVzinK3bBGLjSDfjbJwNfydtgjnlS4EsDmxSRhWyJWq6GIqy5wvnaiARK04uB4=</dsig11:PublicKey>
+                </dsig11:ECKeyValue>
+            </KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::InvalidEcKeyValue)]
         );
     }
 
