@@ -378,6 +378,11 @@ mod tests {
     const SAML_PUBLIC_KEY: &str =
         include_str!("../../tests/fixtures/keys/ec/saml-idp-ecdsa-pubkey.pem");
     const RSA_PUBLIC_KEY: &str = include_str!("../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    const RSA_4096_CERTIFICATE: &str =
+        include_str!("../../tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    const X509_DIGEST_SIGNATURE: &str = include_str!(
+        "../../tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-x509-digest-sha512.xml"
+    );
     const RSA_KEY_VALUE_SIGNATURE: &str = include_str!(
         "../../tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml"
     );
@@ -411,6 +416,14 @@ mod tests {
             .expect("fixture public key is PEM");
         assert!(rest.iter().all(|byte| byte.is_ascii_whitespace()));
         assert_eq!(pem.label, "PUBLIC KEY");
+        pem.contents
+    }
+
+    fn certificate_der(pem_text: &str) -> Vec<u8> {
+        let (rest, pem) = x509_parser::pem::parse_x509_pem(pem_text.as_bytes())
+            .expect("fixture certificate is PEM");
+        assert!(rest.iter().all(|byte| byte.is_ascii_whitespace()));
+        assert_eq!(pem.label, "CERTIFICATE");
         pem.contents
     }
 
@@ -449,6 +462,23 @@ mod tests {
             .key_resolver(&resolver)
             .verify(SIGNED_SAML)
             .expect("embedded certificate should resolve");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn resolves_x509_digest_from_configured_certificates() {
+        // Selector-only X509Data must locate the signing certificate without
+        // embedding key material or supplying a preset verification key.
+        let certificate_der = certificate_der(RSA_4096_CERTIFICATE);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![certificate_der],
+            ..KeyResolverConfig::default()
+        });
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(X509_DIGEST_SIGNATURE)
+            .expect("X509Digest should resolve a configured certificate");
 
         assert_eq!(result.status, super::super::DsigStatus::Valid);
     }
