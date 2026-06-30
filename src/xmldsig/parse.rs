@@ -624,14 +624,10 @@ fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
         ));
     }
 
-    let public_key = match decode_crypto_binary(public_key_node, "PublicKey", MAX_EC_PUBLIC_KEY_LEN)
-        .and_then(|public_key| {
-            validate_ec_public_key_point(&public_key, expected_public_key_len)?;
-            Ok(public_key)
-        }) {
-        Ok(public_key) => public_key,
-        Err(_) => return Ok(KeyValueInfo::InvalidEcPublicKey),
-    };
+    let public_key = decode_crypto_binary(public_key_node, "PublicKey", MAX_EC_PUBLIC_KEY_LEN)?;
+    if validate_ec_public_key_point(&public_key, expected_public_key_len).is_err() {
+        return Ok(KeyValueInfo::InvalidEcPublicKey);
+    }
 
     Ok(KeyValueInfo::Ec {
         curve_oid,
