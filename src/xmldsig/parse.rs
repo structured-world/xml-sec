@@ -177,6 +177,8 @@ pub enum KeyValueInfo {
         /// Uncompressed SEC1 point (`0x04 || x || y`).
         public_key: Vec<u8>,
     },
+    /// `dsig11:ECKeyValue` with recognized curve metadata but unusable point bytes.
+    InvalidEcPublicKey,
     /// Any other `<KeyValue>` child not yet supported by this phase.
     Unsupported {
         /// Namespace URI of the unsupported child, when present.
@@ -622,8 +624,14 @@ fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
         ));
     }
 
-    let public_key = decode_crypto_binary(public_key_node, "PublicKey", MAX_EC_PUBLIC_KEY_LEN)?;
-    validate_ec_public_key_point(&public_key, expected_public_key_len)?;
+    let public_key = match decode_crypto_binary(public_key_node, "PublicKey", MAX_EC_PUBLIC_KEY_LEN)
+        .and_then(|public_key| {
+            validate_ec_public_key_point(&public_key, expected_public_key_len)?;
+            Ok(public_key)
+        }) {
+        Ok(public_key) => public_key,
+        Err(_) => return Ok(KeyValueInfo::InvalidEcPublicKey),
+    };
 
     Ok(KeyValueInfo::Ec {
         curve_oid,
@@ -2354,6 +2362,9 @@ BA== </Modulus>
 
     #[test]
     fn parse_ec_key_value_accepts_bare_curve_oid() {
+        use base64::Engine;
+
+        let encoded_public_key = "BO/yd/OZzDfjX4qivDY/vsUIuh6KWAxoxW5P4ukvwd+T6pVljWsX2UBJNNy5MdhTwB8e2YwB8kUbJwdsAS/XGi/fz8unFrs+lVlAgIs6s/xBYFbfUoRiAacD2SpVDe6XBA==";
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
             <KeyValue>
@@ -2364,13 +2375,16 @@ BA== </Modulus>
             </KeyValue>
         </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
+        let expected_public_key = base64::engine::general_purpose::STANDARD
+            .decode(encoded_public_key)
+            .unwrap();
 
         let sources = parse_key_info(doc.root_element()).unwrap().sources;
 
         assert!(matches!(
             &sources[0],
             KeyInfoSource::KeyValue(KeyValueInfo::Ec { curve_oid, public_key })
-                if curve_oid == EC_P384_OID && public_key.len() == 97
+                if curve_oid == EC_P384_OID && public_key == &expected_public_key
         ));
     }
 
@@ -2459,7 +2473,7 @@ BA== </Modulus>
     }
 
     #[test]
-    fn parse_ec_key_value_rejects_non_uncompressed_point() {
+    fn parse_ec_key_value_marks_non_uncompressed_point_invalid() {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
             <KeyValue>
@@ -2471,10 +2485,11 @@ BA== </Modulus>
         </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
 
-        assert!(matches!(
-            parse_key_info(doc.root_element()),
-            Err(ParseError::InvalidStructure(_))
-        ));
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::InvalidEcPublicKey)]
+        );
     }
 
     #[test]
