@@ -12,7 +12,10 @@ use x509_parser::{
 use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
     X509ChainOptions, X509DataInfo,
-    parse::{EC_P256_OID, EC_P384_OID},
+    parse::{
+        EC_P256_OID, EC_P384_OID, ParseError, parse_x509_certificate,
+        x509_certificate_matches_selectors, x509_data_has_lookup_identifiers,
+    },
     verify_ecdsa_signature_spki, verify_rsa_signature_spki, verify_x509_certificate_chain,
 };
 
@@ -75,6 +78,12 @@ pub enum KeyResolutionError {
     /// Configured or embedded public key DER could not be parsed completely.
     #[error("invalid public key DER")]
     InvalidPublicKey,
+    /// More than one configured certificate satisfies all X.509 selectors.
+    #[error("X.509 lookup selectors match multiple configured certificates")]
+    AmbiguousCertificate,
+    /// An X.509 selector uses a digest algorithm unsupported by this crate.
+    #[error("unsupported X.509 digest algorithm: {0}")]
+    UnsupportedDigestAlgorithm(String),
     /// Embedded certificate path validation failed.
     #[error("certificate chain validation failed: {0}")]
     Chain(#[from] super::X509ChainError),
@@ -138,15 +147,18 @@ impl DefaultKeyResolver {
         info: &X509DataInfo,
         algorithm: SignatureAlgorithm,
     ) -> Result<Option<VerificationKey>, KeyResolutionError> {
-        let Some(&signing_index) = info.certificate_chain.first() else {
-            return Ok(None);
+        let certificate_der = if let Some(&signing_index) = info.certificate_chain.first() {
+            info.certificates
+                .get(signing_index)
+                .ok_or(KeyResolutionError::InvalidCertificate)?
+        } else {
+            let Some(certificate) = self.resolve_configured_x509(info)? else {
+                return Ok(None);
+            };
+            certificate
         };
-        let certificate_der = info
-            .certificates
-            .get(signing_index)
-            .ok_or(KeyResolutionError::InvalidCertificate)?;
 
-        if self.config.verify_chains {
+        if self.config.verify_chains && !info.certificate_chain.is_empty() {
             let options = X509ChainOptions {
                 trusted_certs: &self.config.trusted_certs,
                 verification_time: self
@@ -172,6 +184,32 @@ impl DefaultKeyResolver {
             certificate_der: Some(certificate_der.clone()),
             name: None,
         }))
+    }
+
+    fn resolve_configured_x509<'a>(
+        &'a self,
+        info: &X509DataInfo,
+    ) -> Result<Option<&'a Vec<u8>>, KeyResolutionError> {
+        if !x509_data_has_lookup_identifiers(info) {
+            return Ok(None);
+        }
+
+        let mut matched = None;
+        for certificate_der in &self.config.trusted_certs {
+            let parsed = parse_x509_certificate(certificate_der)
+                .map_err(|_| KeyResolutionError::InvalidCertificate)?;
+            let is_match = x509_certificate_matches_selectors(info, &parsed, certificate_der)
+                .map_err(|error| match error {
+                    ParseError::UnsupportedAlgorithm { uri } => {
+                        KeyResolutionError::UnsupportedDigestAlgorithm(uri)
+                    }
+                    _ => KeyResolutionError::InvalidCertificate,
+                })?;
+            if is_match && matched.replace(certificate_der).is_some() {
+                return Err(KeyResolutionError::AmbiguousCertificate);
+            }
+        }
+        Ok(matched)
     }
 
     fn resolve_key_value(
@@ -481,6 +519,100 @@ mod tests {
             .expect("X509Digest should resolve a configured certificate");
 
         assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn resolves_each_x509_selector_from_configured_certificates() {
+        // Every selector form documented by KeyInfo must independently locate
+        // the same configured RSA certificate without embedded key material.
+        let selectors = [
+            "<X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>",
+            "<X509IssuerSerial><X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName><X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber></X509IssuerSerial>",
+            "<X509SKI>bcOXN/nsVl8GatRbcKrPbzIbw0Y=</X509SKI>",
+        ];
+        let configured_certificate = certificate_der(include_str!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+        ));
+
+        for selector in selectors {
+            let key_info = format!("<KeyInfo><X509Data>{selector}</X509Data></KeyInfo>");
+            let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, &key_info);
+            let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+                trusted_certs: vec![configured_certificate.clone()],
+                ..KeyResolverConfig::default()
+            });
+            let result = super::super::VerifyContext::new()
+                .key_resolver(&resolver)
+                .verify(&xml)
+                .expect("X509 selector should resolve configured certificate");
+
+            assert_eq!(result.status, super::super::DsigStatus::Valid);
+        }
+    }
+
+    #[test]
+    fn unmatched_x509_selector_does_not_resolve() {
+        // A selector mismatch must not fall back to arbitrary configured key material.
+        let key_info = "<KeyInfo><X509Data><X509SubjectName>CN=not-the-signer</X509SubjectName></X509Data></KeyInfo>";
+        let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, key_info);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![certificate_der(include_str!(
+                "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+            ))],
+            ..KeyResolverConfig::default()
+        });
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect("an unmatched selector is a key miss, not a parser failure");
+
+        assert!(matches!(
+            result.status,
+            super::super::DsigStatus::Invalid(super::super::FailureReason::KeyNotFound)
+        ));
+    }
+
+    #[test]
+    fn ambiguous_x509_digest_selector_fails_closed() {
+        // Duplicate configured certificates must not make key selection order-dependent.
+        let certificate = certificate_der(RSA_4096_CERTIFICATE);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![certificate.clone(), certificate],
+            ..KeyResolverConfig::default()
+        });
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(X509_DIGEST_SIGNATURE)
+            .expect_err("ambiguous X509Digest lookup must fail closed");
+
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::AmbiguousCertificate)
+        ));
+    }
+
+    #[test]
+    fn unsupported_x509_digest_selector_fails_closed() {
+        // Unknown digest URIs must not be treated as a normal key miss because
+        // that would silently weaken the caller's explicit selector policy.
+        let key_info = "<KeyInfo xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\"><X509Data><dsig11:X509Digest Algorithm=\"urn:unsupported\">AQ==</dsig11:X509Digest></X509Data></KeyInfo>";
+        let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, key_info);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![certificate_der(include_str!(
+                "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+            ))],
+            ..KeyResolverConfig::default()
+        });
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect_err("unsupported X509Digest algorithm must fail closed");
+
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::UnsupportedDigestAlgorithm(uri))
+                if uri == "urn:unsupported"
+        ));
     }
 
     #[test]
