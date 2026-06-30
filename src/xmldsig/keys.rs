@@ -11,8 +11,9 @@ use x509_parser::{
 
 use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
-    X509ChainOptions, X509DataInfo, verify_ecdsa_signature_spki, verify_rsa_signature_spki,
-    verify_x509_certificate_chain,
+    X509ChainOptions, X509DataInfo,
+    parse::{EC_P256_OID, EC_P384_OID},
+    verify_ecdsa_signature_spki, verify_rsa_signature_spki, verify_x509_certificate_chain,
 };
 
 /// A public verification key available to key resolvers.
@@ -224,6 +225,7 @@ impl KeyResolver for DefaultKeyResolver {
         let Some(key_info) = key_info else {
             return Ok(None);
         };
+        let mut deferred_key_value_error = None;
         for source in &key_info.sources {
             let resolved = match source {
                 KeyInfoSource::X509Data(info) => self.resolve_x509(info, algorithm)?,
@@ -249,12 +251,22 @@ impl KeyResolver for DefaultKeyResolver {
                     })
                     .transpose()?,
                 KeyInfoSource::KeyValue(key_value) => {
-                    Self::resolve_key_value(key_value, algorithm)?
+                    match Self::resolve_key_value(key_value, algorithm) {
+                        Ok(resolved) => resolved,
+                        Err(error) if ec_key_value_error_allows_fallback(key_value, &error) => {
+                            deferred_key_value_error.get_or_insert(error);
+                            None
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
             };
             if let Some(key) = resolved {
                 return Ok(Some(Box::new(key)));
             }
+        }
+        if let Some(error) = deferred_key_value_error {
+            return Err(error.into());
         }
         Ok(None)
     }
@@ -283,18 +295,29 @@ fn ec_key_value_to_spki_der(
     public_key: &[u8],
 ) -> Result<Vec<u8>, KeyResolutionError> {
     match curve_oid {
-        "1.2.840.10045.3.1.7" => p256::PublicKey::from_sec1_bytes(public_key)
+        EC_P256_OID => p256::PublicKey::from_sec1_bytes(public_key)
             .map_err(|_| KeyResolutionError::InvalidPublicKey)?
             .to_public_key_der()
             .map_err(|_| KeyResolutionError::InvalidPublicKey)
             .map(|der| der.as_bytes().to_vec()),
-        "1.3.132.0.34" => p384::PublicKey::from_sec1_bytes(public_key)
+        EC_P384_OID => p384::PublicKey::from_sec1_bytes(public_key)
             .map_err(|_| KeyResolutionError::InvalidPublicKey)?
             .to_public_key_der()
             .map_err(|_| KeyResolutionError::InvalidPublicKey)
             .map(|der| der.as_bytes().to_vec()),
         _ => Err(KeyResolutionError::InvalidPublicKey),
     }
+}
+
+fn ec_key_value_error_allows_fallback(
+    key_value: &KeyValueInfo,
+    error: &KeyResolutionError,
+) -> bool {
+    matches!(key_value, KeyValueInfo::Ec { .. })
+        && matches!(
+            error,
+            KeyResolutionError::InvalidPublicKey | KeyResolutionError::AlgorithmMismatch
+        )
 }
 
 fn validate_spki_algorithm(
@@ -563,7 +586,7 @@ mod tests {
         let result = super::super::VerifyContext::new()
             .key_resolver(&resolver)
             .verify(&xml)
-            .expect("incompatible ECKeyValue should be ignored");
+            .expect("single incompatible ECKeyValue should be ignored");
 
         assert_eq!(
             result.status,
@@ -611,6 +634,55 @@ mod tests {
             .key_resolver(&resolver)
             .verify(&xml)
             .expect("later KeyName should resolve");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn invalid_ec_key_value_falls_back_to_later_key_name() {
+        // Off-curve EC points are typed errors only if no later source can verify.
+        let key_info = r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:KeyValue><dsig11:ECKeyValue><dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/><dsig11:PublicKey>BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</dsig11:PublicKey></dsig11:ECKeyValue></ds:KeyValue><ds:KeyName>idp-signing</ds:KeyName></ds:KeyInfo>"#;
+        let xml = replace_key_info(SIGNED_SAML, key_info);
+        let mut config = KeyResolverConfig::default();
+        config.named_keys.insert(
+            "idp-signing".into(),
+            VerificationKey {
+                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
+                certificate_der: None,
+                name: Some("idp-signing".into()),
+            },
+        );
+        let resolver = DefaultKeyResolver::new(config);
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect("later KeyName should resolve after invalid ECKeyValue");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn mismatched_ec_curve_falls_back_to_later_key_name() {
+        // A valid P-384 key is unusable for an ECDSA-SHA256 signature but must not
+        // prevent a later P-256 KeyName from resolving the same document.
+        let key_info = r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:KeyValue><dsig11:ECKeyValue><dsig11:NamedCurve URI="urn:oid:1.3.132.0.34"/><dsig11:PublicKey>BO/yd/OZzDfjX4qivDY/vsUIuh6KWAxoxW5P4ukvwd+T6pVljWsX2UBJNNy5MdhTwB8e2YwB8kUbJwdsAS/XGi/fz8unFrs+lVlAgIs6s/xBYFbfUoRiAacD2SpVDe6XBA==</dsig11:PublicKey></dsig11:ECKeyValue></ds:KeyValue><ds:KeyName>idp-signing</ds:KeyName></ds:KeyInfo>"#;
+        let xml = replace_key_info(SIGNED_SAML, key_info);
+        let mut config = KeyResolverConfig::default();
+        config.named_keys.insert(
+            "idp-signing".into(),
+            VerificationKey {
+                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
+                certificate_der: None,
+                name: Some("idp-signing".into()),
+            },
+        );
+        let resolver = DefaultKeyResolver::new(config);
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect("later KeyName should resolve after mismatched ECKeyValue");
 
         assert_eq!(result.status, super::super::DsigStatus::Valid);
     }
