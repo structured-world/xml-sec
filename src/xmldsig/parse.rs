@@ -177,8 +177,8 @@ pub enum KeyValueInfo {
         /// Uncompressed SEC1 point (`0x04 || x || y`).
         public_key: Vec<u8>,
     },
-    /// `dsig11:ECKeyValue` with recognized curve metadata but unusable point bytes.
-    InvalidEcPublicKey,
+    /// `dsig11:ECKeyValue` with unusable curve or point data.
+    InvalidEcKeyValue,
     /// Any other `<KeyValue>` child not yet supported by this phase.
     Unsupported {
         /// Namespace URI of the unsupported child, when present.
@@ -605,7 +605,11 @@ fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
     verify_dsig11_element(named_curve_node, "NamedCurve")?;
     ensure_no_element_children(named_curve_node, "NamedCurve")?;
     ensure_no_non_whitespace_text(named_curve_node, "NamedCurve")?;
-    let Some((curve_oid, expected_public_key_len)) = parse_ec_named_curve_oid(named_curve_node)?
+    let Some((curve_oid, expected_public_key_len)) =
+        (match parse_ec_named_curve_oid(named_curve_node) {
+            Ok(curve) => curve,
+            Err(_) => return Ok(KeyValueInfo::InvalidEcKeyValue),
+        })
     else {
         return Ok(KeyValueInfo::Unsupported {
             namespace: Some(XMLDSIG11_NS.to_string()),
@@ -624,9 +628,13 @@ fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
         ));
     }
 
-    let public_key = decode_crypto_binary(public_key_node, "PublicKey", MAX_EC_PUBLIC_KEY_LEN)?;
+    let public_key = match decode_crypto_binary(public_key_node, "PublicKey", MAX_EC_PUBLIC_KEY_LEN)
+    {
+        Ok(public_key) => public_key,
+        Err(_) => return Ok(KeyValueInfo::InvalidEcKeyValue),
+    };
     if validate_ec_public_key_point(&public_key, expected_public_key_len).is_err() {
-        return Ok(KeyValueInfo::InvalidEcPublicKey);
+        return Ok(KeyValueInfo::InvalidEcKeyValue);
     }
 
     Ok(KeyValueInfo::Ec {
@@ -2431,7 +2439,7 @@ BA== </Modulus>
     }
 
     #[test]
-    fn parse_ec_key_value_rejects_missing_named_curve_uri() {
+    fn parse_ec_key_value_marks_missing_named_curve_uri_invalid() {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
             <KeyValue>
@@ -2443,10 +2451,11 @@ BA== </Modulus>
         </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
 
-        assert!(matches!(
-            parse_key_info(doc.root_element()),
-            Err(ParseError::InvalidStructure(_))
-        ));
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert_eq!(
+            key_info.sources,
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::InvalidEcKeyValue)]
+        );
     }
 
     #[test]
@@ -2484,7 +2493,7 @@ BA== </Modulus>
         let key_info = parse_key_info(doc.root_element()).unwrap();
         assert_eq!(
             key_info.sources,
-            vec![KeyInfoSource::KeyValue(KeyValueInfo::InvalidEcPublicKey)]
+            vec![KeyInfoSource::KeyValue(KeyValueInfo::InvalidEcKeyValue)]
         );
     }
 

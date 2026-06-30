@@ -203,7 +203,7 @@ impl DefaultKeyResolver {
                 }
                 ec_key_value_to_spki_der(curve_oid, public_key)?
             }
-            KeyValueInfo::InvalidEcPublicKey => return Err(KeyResolutionError::InvalidPublicKey),
+            KeyValueInfo::InvalidEcKeyValue => return Err(KeyResolutionError::InvalidPublicKey),
             KeyValueInfo::Unsupported { .. } => return Ok(None),
         };
         validate_spki_algorithm(&public_key_bytes, algorithm)?;
@@ -316,7 +316,7 @@ fn ec_key_value_error_allows_fallback(
 ) -> bool {
     matches!(
         key_value,
-        KeyValueInfo::Ec { .. } | KeyValueInfo::InvalidEcPublicKey
+        KeyValueInfo::Ec { .. } | KeyValueInfo::InvalidEcKeyValue
     ) && matches!(
         error,
         KeyResolutionError::InvalidPublicKey | KeyResolutionError::AlgorithmMismatch
@@ -685,6 +685,55 @@ mod tests {
             .key_resolver(&resolver)
             .verify(&xml)
             .expect("later KeyName should resolve after malformed ECKeyValue");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn invalid_base64_ec_key_value_falls_back_to_later_key_name() {
+        // A bad ECKeyValue payload is an unusable source, not a reason to skip
+        // later ordered KeyInfo sources that can verify the signature.
+        let key_info = r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:KeyValue><dsig11:ECKeyValue><dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/><dsig11:PublicKey>not base64!</dsig11:PublicKey></dsig11:ECKeyValue></ds:KeyValue><ds:KeyName>idp-signing</ds:KeyName></ds:KeyInfo>"#;
+        let xml = replace_key_info(SIGNED_SAML, key_info);
+        let mut config = KeyResolverConfig::default();
+        config.named_keys.insert(
+            "idp-signing".into(),
+            VerificationKey {
+                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
+                certificate_der: None,
+                name: Some("idp-signing".into()),
+            },
+        );
+        let resolver = DefaultKeyResolver::new(config);
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect("later KeyName should resolve after bad ECKeyValue base64");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn missing_curve_uri_ec_key_value_falls_back_to_later_key_name() {
+        // Missing EC curve parameters make only this KeyValue source unusable.
+        let key_info = r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:KeyValue><dsig11:ECKeyValue><dsig11:NamedCurve/><dsig11:PublicKey>BA==</dsig11:PublicKey></dsig11:ECKeyValue></ds:KeyValue><ds:KeyName>idp-signing</ds:KeyName></ds:KeyInfo>"#;
+        let xml = replace_key_info(SIGNED_SAML, key_info);
+        let mut config = KeyResolverConfig::default();
+        config.named_keys.insert(
+            "idp-signing".into(),
+            VerificationKey {
+                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
+                certificate_der: None,
+                name: Some("idp-signing".into()),
+            },
+        );
+        let resolver = DefaultKeyResolver::new(config);
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect("later KeyName should resolve after missing EC curve URI");
 
         assert_eq!(result.status, super::super::DsigStatus::Valid);
     }
