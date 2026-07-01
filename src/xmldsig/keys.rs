@@ -563,6 +563,29 @@ mod tests {
     }
 
     #[test]
+    fn selector_resolved_leaf_does_not_anchor_itself() {
+        // A certificate available for selector lookup is not automatically a
+        // trust anchor; chain verification still requires a separate issuer.
+        let certificate_der = certificate_der(RSA_4096_CERTIFICATE);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![certificate_der],
+            verify_chains: true,
+            ..KeyResolverConfig::default()
+        });
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(X509_DIGEST_SIGNATURE)
+            .expect_err("selector-resolved leaf must not trust itself");
+
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::Chain(
+                super::super::X509ChainError::UntrustedRoot
+            ))
+        ));
+    }
+
+    #[test]
     fn resolves_each_x509_selector_from_configured_certificates() {
         // Every selector form documented by KeyInfo must independently locate
         // the same configured RSA certificate without embedded key material.
