@@ -670,6 +670,29 @@ mod tests {
     }
 
     #[test]
+    fn resolves_configured_chain_selectors_across_certificates() {
+        // Selector categories may identify different members of one configured
+        // chain; the unique leaf remains the signing certificate.
+        let key_info = r#"<KeyInfo><X509Data><X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName><X509SKI>0X0XrEVCio75sBcl1TxymJ2IOiU=</X509SKI></X509Data></KeyInfo>"#;
+        let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, key_info);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![
+                certificate_der(include_str!(
+                    "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+                )),
+                certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
+            ],
+            ..KeyResolverConfig::default()
+        });
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect("selectors across one configured chain should resolve its leaf");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
     fn unmatched_x509_selector_does_not_resolve() {
         // A selector mismatch must not fall back to arbitrary configured key material.
         let key_info = "<KeyInfo><X509Data><X509SubjectName>CN=not-the-signer</X509SubjectName></X509Data></KeyInfo>";
