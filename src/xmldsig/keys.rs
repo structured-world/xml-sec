@@ -14,7 +14,8 @@ use super::{
     X509ChainOptions, X509DataInfo,
     parse::{
         EC_P256_OID, EC_P384_OID, ParseError, parse_x509_certificate,
-        x509_certificate_matches_selectors, x509_data_has_lookup_identifiers,
+        x509_certificate_matches_any_selector, x509_data_has_lookup_identifiers,
+        x509_selector_categories_match_chain,
     },
     verify_ecdsa_signature_spki, verify_rsa_signature_spki, verify_x509_certificate_chain,
 };
@@ -232,7 +233,7 @@ impl DefaultKeyResolver {
         for certificate_der in &self.config.trusted_certs {
             let parsed = parse_x509_certificate(certificate_der)
                 .map_err(|_| KeyResolutionError::InvalidCertificate)?;
-            let is_match = x509_certificate_matches_selectors(info, &parsed, certificate_der)
+            let is_match = x509_certificate_matches_any_selector(info, &parsed, certificate_der)
                 .map_err(|error| match error {
                     ParseError::UnsupportedAlgorithm { uri } => {
                         KeyResolutionError::UnsupportedDigestAlgorithm(uri)
@@ -242,6 +243,30 @@ impl DefaultKeyResolver {
             if is_match {
                 matches.push((certificate_der, parsed));
             }
+        }
+
+        let matched_chain = X509DataInfo {
+            certificates: matches
+                .iter()
+                .map(|(certificate, _)| (*certificate).clone())
+                .collect(),
+            parsed_certificates: matches.iter().map(|(_, parsed)| parsed.clone()).collect(),
+            ..X509DataInfo::default()
+        };
+        if !x509_selector_categories_match_chain(&X509DataInfo {
+            subject_names: info.subject_names.clone(),
+            issuer_serials: info.issuer_serials.clone(),
+            skis: info.skis.clone(),
+            digests: info.digests.clone(),
+            ..matched_chain
+        })
+        .map_err(|error| match error {
+            ParseError::UnsupportedAlgorithm { uri } => {
+                KeyResolutionError::UnsupportedDigestAlgorithm(uri)
+            }
+            _ => KeyResolutionError::InvalidCertificate,
+        })? {
+            return Ok(None);
         }
 
         match matches.as_slice() {

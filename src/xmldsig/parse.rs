@@ -958,7 +958,7 @@ pub(crate) fn x509_data_has_lookup_identifiers(info: &X509DataInfo) -> bool {
         || !info.digests.is_empty()
 }
 
-fn x509_certificate_matches_any_selector(
+pub(crate) fn x509_certificate_matches_any_selector(
     info: &X509DataInfo,
     certificate: &ParsedX509Certificate,
     certificate_der: &[u8],
@@ -993,7 +993,9 @@ fn x509_certificate_matches_any_selector(
     Ok(subject_match || issuer_serial_match || ski_match || digest_match)
 }
 
-fn x509_selector_categories_match_chain(info: &X509DataInfo) -> Result<bool, ParseError> {
+pub(crate) fn x509_selector_categories_match_chain(
+    info: &X509DataInfo,
+) -> Result<bool, ParseError> {
     let subject_match = info.subject_names.is_empty()
         || info.parsed_certificates.iter().any(|certificate| {
             info.subject_names
@@ -1035,62 +1037,6 @@ fn x509_selector_categories_match_chain(info: &X509DataInfo) -> Result<bool, Par
     }
 
     Ok(subject_match && issuer_serial_match && ski_match && digest_match)
-}
-
-pub(crate) fn x509_certificate_matches_selectors(
-    info: &X509DataInfo,
-    certificate: &ParsedX509Certificate,
-    certificate_der: &[u8],
-) -> Result<bool, ParseError> {
-    if !info.subject_names.is_empty()
-        && !info
-            .subject_names
-            .iter()
-            .any(|subject| subject.trim() == certificate.subject_dn)
-    {
-        return Ok(false);
-    }
-
-    if !info.issuer_serials.is_empty() {
-        let mut issuer_serial_match = false;
-        for (issuer, serial) in &info.issuer_serials {
-            let serial_hex = x509_serial_decimal_to_hex(serial).ok_or_else(|| {
-                ParseError::InvalidStructure(
-                    "X509Data lookup identifiers contain an invalid serial number".into(),
-                )
-            })?;
-            issuer_serial_match |= issuer.trim() == certificate.issuer_dn
-                && serial_hex == certificate.serial_number_hex;
-        }
-        if !issuer_serial_match {
-            return Ok(false);
-        }
-    }
-
-    if !info.skis.is_empty()
-        && certificate
-            .subject_key_identifier
-            .as_ref()
-            .is_none_or(|certificate_ski| !info.skis.iter().any(|ski| ski == certificate_ski))
-    {
-        return Ok(false);
-    }
-
-    let mut digest_match = info.digests.is_empty();
-    for (algorithm_uri, expected) in &info.digests {
-        let algorithm = DigestAlgorithm::from_uri(algorithm_uri).ok_or_else(|| {
-            ParseError::UnsupportedAlgorithm {
-                uri: algorithm_uri.clone(),
-            }
-        })?;
-        let actual = compute_digest(algorithm, certificate_der);
-        digest_match |= constant_time_eq(&actual, expected);
-    }
-    if !digest_match {
-        return Ok(false);
-    }
-
-    Ok(x509_data_has_lookup_identifiers(info))
 }
 
 fn ensure_x509_data_entry_budget(info: &X509DataInfo) -> Result<(), ParseError> {
