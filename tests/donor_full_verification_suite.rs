@@ -3,7 +3,10 @@
 //! This suite tracks pass/fail/skip accounting across donor vectors and
 //! enforces that all supported donor vectors verify end-to-end.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
 
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DsigError, DsigStatus, KeyResolverConfig, ParseError, SignatureAlgorithm,
@@ -262,6 +265,10 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
                 let resolver = DefaultKeyResolver::new(KeyResolverConfig {
                     trusted_certs: vec![read_pem_der(&root.join(trust_anchor_path), "CERTIFICATE")],
                     verify_chains: true,
+                    // 2027-01-15 UTC, inside the donor chain's 2026-2126 validity window.
+                    verification_time: Some(
+                        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                    ),
                     ..KeyResolverConfig::default()
                 });
                 match VerifyContext::new().key_resolver(&resolver).verify(&xml) {
