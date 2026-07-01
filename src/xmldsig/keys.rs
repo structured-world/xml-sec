@@ -153,7 +153,7 @@ impl DefaultKeyResolver {
                 .get(signing_index)
                 .ok_or(KeyResolutionError::InvalidCertificate)?;
             if self.config.verify_chains {
-                self.verify_x509_policy(info)?;
+                self.verify_x509_policy(info, None)?;
             }
             certificate_der
         } else {
@@ -169,7 +169,10 @@ impl DefaultKeyResolver {
                     certificate_chain: vec![0],
                     ..X509DataInfo::default()
                 };
-                self.verify_x509_policy(&selected)?;
+                // Validate the selected certificate's own policy before
+                // requiring a distinct configured certificate as its anchor.
+                self.verify_x509_policy(&selected, None)?;
+                self.verify_x509_policy(&selected, Some(certificate))?;
             }
             certificate
         };
@@ -189,9 +192,23 @@ impl DefaultKeyResolver {
         }))
     }
 
-    fn verify_x509_policy(&self, info: &X509DataInfo) -> Result<(), KeyResolutionError> {
+    fn verify_x509_policy(
+        &self,
+        info: &X509DataInfo,
+        selected_lookup_certificate: Option<&[u8]>,
+    ) -> Result<(), KeyResolutionError> {
+        let trusted_certs = self
+            .config
+            .trusted_certs
+            .iter()
+            .filter(|certificate| {
+                selected_lookup_certificate
+                    .is_none_or(|selected| certificate.as_slice() != selected)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let options = X509ChainOptions {
-            trusted_certs: &self.config.trusted_certs,
+            trusted_certs: &trusted_certs,
             verification_time: self
                 .config
                 .verification_time
@@ -211,7 +228,7 @@ impl DefaultKeyResolver {
             return Ok(None);
         }
 
-        let mut matched = None;
+        let mut matches = Vec::new();
         for certificate_der in &self.config.trusted_certs {
             let parsed = parse_x509_certificate(certificate_der)
                 .map_err(|_| KeyResolutionError::InvalidCertificate)?;
@@ -222,11 +239,30 @@ impl DefaultKeyResolver {
                     }
                     _ => KeyResolutionError::InvalidCertificate,
                 })?;
-            if is_match && matched.replace(certificate_der).is_some() {
-                return Err(KeyResolutionError::AmbiguousCertificate);
+            if is_match {
+                matches.push((certificate_der, parsed));
             }
         }
-        Ok(matched)
+
+        match matches.as_slice() {
+            [] => Ok(None),
+            [(certificate, _)] => Ok(Some(certificate)),
+            _ => {
+                let leaves = matches
+                    .iter()
+                    .filter(|(_, candidate)| {
+                        candidate.subject_dn != candidate.issuer_dn
+                            && !matches
+                                .iter()
+                                .any(|(_, other)| other.issuer_dn == candidate.subject_dn)
+                    })
+                    .collect::<Vec<_>>();
+                match leaves.as_slice() {
+                    [(certificate, _)] => Ok(Some(certificate)),
+                    _ => Err(KeyResolutionError::AmbiguousCertificate),
+                }
+            }
+        }
     }
 
     fn resolve_key_value(
@@ -583,6 +619,25 @@ mod tests {
                 super::super::X509ChainError::UntrustedRoot
             ))
         ));
+    }
+
+    #[test]
+    fn selector_resolved_leaf_uses_separate_anchor() {
+        // Selector lookup may use the leaf from the configured set, but chain
+        // verification must terminate at a different configured certificate.
+        let leaf = certificate_der(RSA_4096_CERTIFICATE);
+        let issuer = certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem"));
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![leaf, issuer],
+            verify_chains: true,
+            ..KeyResolverConfig::default()
+        });
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(X509_DIGEST_SIGNATURE)
+            .expect("selector-resolved leaf should chain to its configured issuer");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
     }
 
     #[test]
