@@ -148,28 +148,31 @@ impl DefaultKeyResolver {
         algorithm: SignatureAlgorithm,
     ) -> Result<Option<VerificationKey>, KeyResolutionError> {
         let certificate_der = if let Some(&signing_index) = info.certificate_chain.first() {
-            info.certificates
+            let certificate_der = info
+                .certificates
                 .get(signing_index)
-                .ok_or(KeyResolutionError::InvalidCertificate)?
+                .ok_or(KeyResolutionError::InvalidCertificate)?;
+            if self.config.verify_chains {
+                self.verify_x509_policy(info)?;
+            }
+            certificate_der
         } else {
             let Some(certificate) = self.resolve_configured_x509(info)? else {
                 return Ok(None);
             };
+            if self.config.verify_chains {
+                let parsed = parse_x509_certificate(certificate)
+                    .map_err(|_| KeyResolutionError::InvalidCertificate)?;
+                let selected = X509DataInfo {
+                    certificates: vec![certificate.clone()],
+                    parsed_certificates: vec![parsed],
+                    certificate_chain: vec![0],
+                    ..X509DataInfo::default()
+                };
+                self.verify_x509_policy(&selected)?;
+            }
             certificate
         };
-
-        if self.config.verify_chains && !info.certificate_chain.is_empty() {
-            let options = X509ChainOptions {
-                trusted_certs: &self.config.trusted_certs,
-                verification_time: self
-                    .config
-                    .verification_time
-                    .unwrap_or_else(SystemTime::now),
-                max_chain_depth: self.config.max_chain_depth,
-                check_crls: false,
-            };
-            verify_x509_certificate_chain(info, &options)?;
-        }
 
         let (rest, certificate) = X509Certificate::from_der(certificate_der)
             .map_err(|_| KeyResolutionError::InvalidCertificate)?;
@@ -184,6 +187,20 @@ impl DefaultKeyResolver {
             certificate_der: Some(certificate_der.clone()),
             name: None,
         }))
+    }
+
+    fn verify_x509_policy(&self, info: &X509DataInfo) -> Result<(), KeyResolutionError> {
+        let options = X509ChainOptions {
+            trusted_certs: &self.config.trusted_certs,
+            verification_time: self
+                .config
+                .verification_time
+                .unwrap_or_else(SystemTime::now),
+            max_chain_depth: self.config.max_chain_depth,
+            check_crls: false,
+        };
+        verify_x509_certificate_chain(info, &options)?;
+        Ok(())
     }
 
     fn resolve_configured_x509<'a>(
