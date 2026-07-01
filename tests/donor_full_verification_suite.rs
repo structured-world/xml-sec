@@ -113,7 +113,12 @@ fn cases() -> Vec<VectorCase> {
             },
         },
         VectorCase {
-            name: "aleksey-rsa-sha1-x509-chain",
+            name: "aleksey-rsa-sha1-x509-chain-tofu",
+            xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-rsa-x509chain.xml",
+            expectation: Expectation::ValidEmbedded,
+        },
+        VectorCase {
+            name: "aleksey-rsa-sha1-x509-chain-anchored",
             xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-rsa-x509chain.xml",
             expectation: Expectation::ValidChain {
                 trust_anchor_path: "tests/fixtures/keys/cacert.pem",
@@ -331,6 +336,6 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
     // P1-025 minimum expected accounting:
     // - all supported aleksey RSA/ECDSA vectors pass
     // - unsupported/deferred merlin vectors are tracked as skips with explicit reasons
-    assert_eq!(passed, 8, "unexpected pass count");
+    assert_eq!(passed, 9, "unexpected pass count");
     assert_eq!(skipped, expected_skipped, "unexpected skip inventory");
 }
