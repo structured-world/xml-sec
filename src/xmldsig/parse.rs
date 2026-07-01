@@ -891,30 +891,26 @@ fn select_x509_signing_certificate(info: &X509DataInfo) -> Result<usize, ParseEr
             .zip(&info.certificates)
             .enumerate()
         {
-            if x509_certificate_matches_selectors(info, parsed, der)? {
+            if x509_certificate_matches_any_selector(info, parsed, der)? {
                 candidates.push(idx);
             }
+        }
+        if !x509_selector_categories_match_chain(info)? {
+            return Err(ParseError::InvalidStructure(
+                "X509Data lookup identifiers do not match the embedded certificate chain".into(),
+            ));
         }
     }
 
     match candidates.as_slice() {
         [idx] => return Ok(*idx),
         [] if has_lookup_identifiers => {
-            if x509_selectors_span_multiple_certificates(info)? {
-                return Err(ParseError::InvalidStructure(
-                    "X509Data lookup identifiers match multiple certificates".into(),
-                ));
-            }
             return Err(ParseError::InvalidStructure(
                 "X509Data lookup identifiers do not match any embedded certificate".into(),
             ));
         }
         [] => {}
-        _ => {
-            return Err(ParseError::InvalidStructure(
-                "X509Data lookup identifiers match multiple certificates".into(),
-            ));
-        }
+        _ => {}
     }
 
     let leaf_candidates = info
@@ -931,11 +927,26 @@ fn select_x509_signing_certificate(info: &X509DataInfo) -> Result<usize, ParseEr
         .map(|(idx, _)| idx)
         .collect::<Vec<_>>();
 
-    match leaf_candidates.as_slice() {
+    let selected_leaves = leaf_candidates
+        .iter()
+        .filter(|idx| !has_lookup_identifiers || candidates.contains(idx))
+        .copied()
+        .collect::<Vec<_>>();
+
+    match selected_leaves.as_slice() {
         [idx] => Ok(*idx),
-        [] => Ok(0),
+        [] if !has_lookup_identifiers => Ok(0),
+        [] => Err(ParseError::InvalidStructure(
+            "X509Data lookup identifiers match multiple certificates without a unique signing certificate"
+                .into(),
+        )),
         _ => Err(ParseError::InvalidStructure(
-            "X509Data contains multiple possible signing certificates".into(),
+            if has_lookup_identifiers {
+                "X509Data lookup identifiers match multiple certificates"
+            } else {
+                "X509Data contains multiple possible signing certificates"
+            }
+            .into(),
         )),
     }
 }
@@ -947,41 +958,83 @@ pub(crate) fn x509_data_has_lookup_identifiers(info: &X509DataInfo) -> bool {
         || !info.digests.is_empty()
 }
 
-fn x509_selectors_span_multiple_certificates(info: &X509DataInfo) -> Result<bool, ParseError> {
-    let mut matching_certificates = 0usize;
-    for (certificate, certificate_der) in info.parsed_certificates.iter().zip(&info.certificates) {
-        let subject_match = info
-            .subject_names
-            .iter()
-            .any(|subject| subject.trim() == certificate.subject_dn);
-        let mut issuer_serial_match = false;
-        for (issuer, serial) in &info.issuer_serials {
-            let serial_hex = x509_serial_decimal_to_hex(serial).ok_or_else(|| {
-                ParseError::InvalidStructure(
-                    "X509Data lookup identifiers contain an invalid serial number".into(),
-                )
-            })?;
-            issuer_serial_match |= issuer.trim() == certificate.issuer_dn
-                && serial_hex == certificate.serial_number_hex;
-        }
-        let ski_match = certificate
-            .subject_key_identifier
-            .as_ref()
-            .is_some_and(|certificate_ski| info.skis.iter().any(|ski| ski == certificate_ski));
-        let mut digest_match = false;
-        for (algorithm_uri, expected) in &info.digests {
-            let algorithm = DigestAlgorithm::from_uri(algorithm_uri).ok_or_else(|| {
-                ParseError::UnsupportedAlgorithm {
-                    uri: algorithm_uri.clone(),
-                }
-            })?;
-            digest_match |= constant_time_eq(&compute_digest(algorithm, certificate_der), expected);
-        }
-        if subject_match || issuer_serial_match || ski_match || digest_match {
-            matching_certificates += 1;
-        }
+fn x509_certificate_matches_any_selector(
+    info: &X509DataInfo,
+    certificate: &ParsedX509Certificate,
+    certificate_der: &[u8],
+) -> Result<bool, ParseError> {
+    let subject_match = info
+        .subject_names
+        .iter()
+        .any(|subject| subject.trim() == certificate.subject_dn);
+    let mut issuer_serial_match = false;
+    for (issuer, serial) in &info.issuer_serials {
+        let serial_hex = x509_serial_decimal_to_hex(serial).ok_or_else(|| {
+            ParseError::InvalidStructure(
+                "X509Data lookup identifiers contain an invalid serial number".into(),
+            )
+        })?;
+        issuer_serial_match |=
+            issuer.trim() == certificate.issuer_dn && serial_hex == certificate.serial_number_hex;
     }
-    Ok(matching_certificates > 1)
+    let ski_match = certificate
+        .subject_key_identifier
+        .as_ref()
+        .is_some_and(|certificate_ski| info.skis.iter().any(|ski| ski == certificate_ski));
+    let mut digest_match = false;
+    for (algorithm_uri, expected) in &info.digests {
+        let algorithm = DigestAlgorithm::from_uri(algorithm_uri).ok_or_else(|| {
+            ParseError::UnsupportedAlgorithm {
+                uri: algorithm_uri.clone(),
+            }
+        })?;
+        digest_match |= constant_time_eq(&compute_digest(algorithm, certificate_der), expected);
+    }
+    Ok(subject_match || issuer_serial_match || ski_match || digest_match)
+}
+
+fn x509_selector_categories_match_chain(info: &X509DataInfo) -> Result<bool, ParseError> {
+    let subject_match = info.subject_names.is_empty()
+        || info.parsed_certificates.iter().any(|certificate| {
+            info.subject_names
+                .iter()
+                .any(|subject| subject.trim() == certificate.subject_dn)
+        });
+
+    let mut issuer_serial_match = info.issuer_serials.is_empty();
+    for (issuer, serial) in &info.issuer_serials {
+        let serial_hex = x509_serial_decimal_to_hex(serial).ok_or_else(|| {
+            ParseError::InvalidStructure(
+                "X509Data lookup identifiers contain an invalid serial number".into(),
+            )
+        })?;
+        issuer_serial_match |= info.parsed_certificates.iter().any(|certificate| {
+            issuer.trim() == certificate.issuer_dn && serial_hex == certificate.serial_number_hex
+        });
+    }
+
+    let ski_match = info.skis.is_empty()
+        || info.parsed_certificates.iter().any(|certificate| {
+            certificate
+                .subject_key_identifier
+                .as_ref()
+                .is_some_and(|certificate_ski| info.skis.iter().any(|ski| ski == certificate_ski))
+        });
+
+    let mut digest_match = info.digests.is_empty();
+    for (algorithm_uri, expected) in &info.digests {
+        let algorithm = DigestAlgorithm::from_uri(algorithm_uri).ok_or_else(|| {
+            ParseError::UnsupportedAlgorithm {
+                uri: algorithm_uri.clone(),
+            }
+        })?;
+        digest_match |= info
+            .certificates
+            .iter()
+            .any(|certificate| constant_time_eq(&compute_digest(algorithm, certificate), expected));
+    }
+
+    Ok(subject_match && issuer_serial_match && ski_match && digest_match)
 }
 
 pub(crate) fn x509_certificate_matches_selectors(
