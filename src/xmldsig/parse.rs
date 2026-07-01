@@ -2150,6 +2150,35 @@ BA== </Modulus>
     }
 
     #[test]
+    fn parse_key_info_allows_selectors_for_multiple_chain_members() {
+        // X509Data may identify both the signing leaf and another certificate
+        // in its chain; the unique leaf must remain the signing certificate.
+        let root = fixture_cert_base64("../../tests/fixtures/keys/cacert.pem");
+        let intermediate = fixture_cert_base64("../../tests/fixtures/keys/ca2cert.pem");
+        let leaf = fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let xml = format!(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <X509Data>
+                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SKI>0X0XrEVCio75sBcl1TxymJ2IOiU=</X509SKI>
+                    <X509Certificate>{root}</X509Certificate>
+                    <X509Certificate>{intermediate}</X509Certificate>
+                    <X509Certificate>{leaf}</X509Certificate>
+                </X509Data>
+            </KeyInfo>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        let x509_info = match &key_info.sources[0] {
+            KeyInfoSource::X509Data(x509) => x509,
+            other => panic!("expected X509Data source, got {other:?}"),
+        };
+
+        assert_eq!(x509_info.certificate_chain, vec![2, 1, 0]);
+    }
+
+    #[test]
     fn parse_key_info_uses_decimal_issuer_serial_to_select_x509_signing_certificate() {
         assert_eq!(
             x509_serial_decimal_to_hex("680572598617295163017172295025714171905498632019")
