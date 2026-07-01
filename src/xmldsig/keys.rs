@@ -522,6 +522,30 @@ mod tests {
     }
 
     #[test]
+    fn selector_resolved_certificate_obeys_chain_policy() {
+        // Enabling chain verification must apply validity policy even when
+        // X509Data contains only selectors and the matching cert is configured.
+        let certificate_der = certificate_der(RSA_4096_CERTIFICATE);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![certificate_der],
+            verify_chains: true,
+            verification_time: Some(SystemTime::UNIX_EPOCH),
+            ..KeyResolverConfig::default()
+        });
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(X509_DIGEST_SIGNATURE)
+            .expect_err("selector-resolved certificate must satisfy chain policy");
+
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::Chain(
+                super::super::X509ChainError::CertificateNotValid(_)
+            ))
+        ));
+    }
+
+    #[test]
     fn resolves_each_x509_selector_from_configured_certificates() {
         // Every selector form documented by KeyInfo must independently locate
         // the same configured RSA certificate without embedded key material.
