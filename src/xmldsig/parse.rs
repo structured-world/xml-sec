@@ -2251,6 +2251,28 @@ BA== </Modulus>
     }
 
     #[test]
+    fn parse_key_info_rejects_partially_matched_selector_category() {
+        // Every selector value is an asserted lookup constraint; one matching
+        // SubjectName must not mask another value absent from the chain.
+        let cert = fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let xml = format!(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <X509Data>
+                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SubjectName>CN=Not In The Embedded Chain</X509SubjectName>
+                    <X509Certificate>{cert}</X509Certificate>
+                </X509Data>
+            </KeyInfo>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let err = parse_key_info(doc.root_element()).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidStructure(message) if message.contains("lookup identifiers"))
+        );
+    }
+
+    #[test]
     fn parse_key_info_rejects_malformed_issuer_serial_even_with_matching_subject() {
         let cert = fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
         let xml = format!(
