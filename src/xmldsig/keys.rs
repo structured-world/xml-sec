@@ -527,6 +527,13 @@ mod tests {
         format!("{}{}{}", &xml[..start], replacement, &xml[end..])
     }
 
+    fn x509_signature_with_leaf_subject() -> String {
+        replace_unprefixed_key_info(
+            X509_DIGEST_SIGNATURE,
+            "<KeyInfo><X509Data><X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-4096</X509SubjectName></X509Data></KeyInfo>",
+        )
+    }
+
     fn public_key_der(pem_text: &str) -> Vec<u8> {
         let (rest, pem) = x509_parser::pem::parse_x509_pem(pem_text.as_bytes())
             .expect("fixture public key is PEM");
@@ -586,9 +593,13 @@ mod tests {
     fn resolves_x509_digest_from_configured_certificates() {
         // Selector-only X509Data must locate the signing certificate without
         // embedding key material or supplying a preset verification key.
-        let certificate_der = certificate_der(RSA_4096_CERTIFICATE);
+        let leaf_certificate_der = certificate_der(RSA_4096_CERTIFICATE);
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-            trusted_certs: vec![certificate_der],
+            trusted_certs: vec![
+                leaf_certificate_der,
+                certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
+                certificate_der(include_str!("../../tests/fixtures/keys/cacert.pem")),
+            ],
             ..KeyResolverConfig::default()
         });
         let result = super::super::VerifyContext::new()
@@ -612,7 +623,7 @@ mod tests {
         });
         let error = super::super::VerifyContext::new()
             .key_resolver(&resolver)
-            .verify(X509_DIGEST_SIGNATURE)
+            .verify(&x509_signature_with_leaf_subject())
             .expect_err("selector-resolved certificate must satisfy chain policy");
 
         assert!(matches!(
@@ -635,7 +646,7 @@ mod tests {
         });
         let error = super::super::VerifyContext::new()
             .key_resolver(&resolver)
-            .verify(X509_DIGEST_SIGNATURE)
+            .verify(&x509_signature_with_leaf_subject())
             .expect_err("selector-resolved leaf must not trust itself");
 
         assert!(matches!(
@@ -659,7 +670,7 @@ mod tests {
         });
         let result = super::super::VerifyContext::new()
             .key_resolver(&resolver)
-            .verify(X509_DIGEST_SIGNATURE)
+            .verify(&x509_signature_with_leaf_subject())
             .expect("selector-resolved leaf should chain to its configured issuer");
 
         assert_eq!(result.status, super::super::DsigStatus::Valid);

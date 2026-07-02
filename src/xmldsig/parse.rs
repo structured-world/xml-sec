@@ -996,41 +996,41 @@ pub(crate) fn x509_certificate_matches_any_selector(
 pub(crate) fn x509_selector_categories_match_chain(
     info: &X509DataInfo,
 ) -> Result<bool, ParseError> {
-    let subject_match = info.subject_names.is_empty()
-        || info.parsed_certificates.iter().any(|certificate| {
-            info.subject_names
-                .iter()
-                .any(|subject| subject.trim() == certificate.subject_dn)
-        });
+    let subject_match = info.subject_names.iter().all(|subject| {
+        info.parsed_certificates
+            .iter()
+            .any(|certificate| subject.trim() == certificate.subject_dn)
+    });
 
-    let mut issuer_serial_match = info.issuer_serials.is_empty();
+    let mut issuer_serial_match = true;
     for (issuer, serial) in &info.issuer_serials {
         let serial_hex = x509_serial_decimal_to_hex(serial).ok_or_else(|| {
             ParseError::InvalidStructure(
                 "X509Data lookup identifiers contain an invalid serial number".into(),
             )
         })?;
-        issuer_serial_match |= info.parsed_certificates.iter().any(|certificate| {
+        issuer_serial_match &= info.parsed_certificates.iter().any(|certificate| {
             issuer.trim() == certificate.issuer_dn && serial_hex == certificate.serial_number_hex
         });
     }
 
-    let ski_match = info.skis.is_empty()
-        || info.parsed_certificates.iter().any(|certificate| {
+    let ski_match = info.skis.iter().all(|ski| {
+        info.parsed_certificates.iter().any(|certificate| {
             certificate
                 .subject_key_identifier
                 .as_ref()
-                .is_some_and(|certificate_ski| info.skis.iter().any(|ski| ski == certificate_ski))
-        });
+                .is_some_and(|certificate_ski| ski == certificate_ski)
+        })
+    });
 
-    let mut digest_match = info.digests.is_empty();
+    let mut digest_match = true;
     for (algorithm_uri, expected) in &info.digests {
         let algorithm = DigestAlgorithm::from_uri(algorithm_uri).ok_or_else(|| {
             ParseError::UnsupportedAlgorithm {
                 uri: algorithm_uri.clone(),
             }
         })?;
-        digest_match |= info
+        digest_match &= info
             .certificates
             .iter()
             .any(|certificate| constant_time_eq(&compute_digest(algorithm, certificate), expected));

@@ -28,7 +28,7 @@ enum Expectation {
         algorithm: SignatureAlgorithm,
     },
     ValidSelected {
-        certificate_path: &'static str,
+        certificate_paths: &'static [&'static str],
     },
     ValidChain {
         trust_anchor_path: &'static str,
@@ -112,7 +112,11 @@ fn cases() -> Vec<VectorCase> {
             name: "aleksey-rsa-sha512-x509-digest",
             xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-x509-digest-sha512.xml",
             expectation: Expectation::ValidSelected {
-                certificate_path: "tests/fixtures/keys/rsa/rsa-4096-cert.pem",
+                certificate_paths: &[
+                    "tests/fixtures/keys/rsa/rsa-4096-cert.pem",
+                    "tests/fixtures/keys/ca2cert.pem",
+                    "tests/fixtures/keys/cacert.pem",
+                ],
             },
         },
         VectorCase {
@@ -243,10 +247,13 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
                     }
                 }
             }
-            Expectation::ValidSelected { certificate_path } => {
+            Expectation::ValidSelected { certificate_paths } => {
                 let xml = read_fixture(&root.join(case.xml_path));
                 let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-                    trusted_certs: vec![read_pem_der(&root.join(certificate_path), "CERTIFICATE")],
+                    trusted_certs: certificate_paths
+                        .iter()
+                        .map(|path| read_pem_der(&root.join(path), "CERTIFICATE"))
+                        .collect(),
                     ..KeyResolverConfig::default()
                 });
                 match VerifyContext::new().key_resolver(&resolver).verify(&xml) {
