@@ -751,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_x509_digest_selector_fails_closed() {
+    fn ambiguous_x509_selector_fails_closed() {
         // Duplicate configured certificates must not make key selection order-dependent.
         let certificate = certificate_der(RSA_4096_CERTIFICATE);
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
@@ -760,8 +760,8 @@ mod tests {
         });
         let error = super::super::VerifyContext::new()
             .key_resolver(&resolver)
-            .verify(X509_DIGEST_SIGNATURE)
-            .expect_err("ambiguous X509Digest lookup must fail closed");
+            .verify(&x509_signature_with_leaf_subject())
+            .expect_err("ambiguous X509 selector lookup must fail closed");
 
         assert!(matches!(
             error,
