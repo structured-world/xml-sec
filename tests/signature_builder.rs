@@ -207,9 +207,7 @@ fn rejects_non_ncname_signature_and_reference_ids() {
 
     let injected_reference_id =
         SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
-            .add_reference(
-                ReferenceBuilder::new(DigestAlgorithm::Sha256).id("?check?><valid"),
-            )
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).id("?check?><valid"))
             .build_template()
             .expect_err("markup must not satisfy Reference Id validation");
     assert!(injected_reference_id.to_string().contains("Reference Id"));
