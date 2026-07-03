@@ -13,7 +13,7 @@ use super::{
 
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const EXCLUSIVE_C14N_NS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
-const XPATH_EXCLUDE_ALL_SIGNATURES: &str = "not(ancestor-or-self::ds:Signature)";
+const XPATH_EXCLUDE_ALL_SIGNATURES: &str = "not(ancestor-or-self::dsig:Signature)";
 
 /// Errors produced while validating or serializing an XMLDSig template.
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +21,14 @@ pub enum SignatureBuilderError {
     /// A namespace prefix was not a supported XML NCName.
     #[error("invalid XML namespace prefix: {0}")]
     InvalidNamespacePrefix(String),
+    /// An XMLDSig Id attribute was not a valid XML NCName.
+    #[error("invalid {element} Id: {value}")]
+    InvalidId {
+        /// XMLDSig element carrying the Id attribute.
+        element: &'static str,
+        /// Rejected attribute value.
+        value: String,
+    },
     /// XMLDSig requires at least one reference in SignedInfo.
     #[error("a signature template requires at least one Reference")]
     MissingReference,
@@ -183,11 +191,19 @@ impl SignatureBuilder {
 
     fn validate(&self) -> Result<(), SignatureBuilderError> {
         if let Some(prefix) = &self.ns_prefix
-            && !is_ascii_ncname(prefix)
+            && !is_namespace_prefix(prefix)
         {
             return Err(SignatureBuilderError::InvalidNamespacePrefix(
                 prefix.clone(),
             ));
+        }
+        if let Some(id) = &self.signature_id
+            && !is_ncname(id)
+        {
+            return Err(SignatureBuilderError::InvalidId {
+                element: "Signature",
+                value: id.clone(),
+            });
         }
         if self.references.is_empty() {
             return Err(SignatureBuilderError::MissingReference);
@@ -198,6 +214,14 @@ impl SignatureBuilder {
             ));
         }
         for reference in &self.references {
+            if let Some(id) = &reference.id
+                && !is_ncname(id)
+            {
+                return Err(SignatureBuilderError::InvalidId {
+                    element: "Reference",
+                    value: id.clone(),
+                });
+            }
             if !reference.digest_method.signing_allowed() {
                 return Err(SignatureBuilderError::SigningAlgorithmDisabled(
                     reference.digest_method.uri(),
@@ -258,9 +282,12 @@ fn write_transform<W: Write>(
             let mut element = BytesStart::new(&name);
             element.push_attribute(("Algorithm", XPATH_TRANSFORM_URI));
             writer.write_event(Event::Start(element))?;
-            write_start(writer, prefix, "XPath")?;
+            let xpath_name = qualified_name(prefix, "XPath");
+            let mut xpath = BytesStart::new(&xpath_name);
+            xpath.push_attribute(("xmlns:dsig", XMLDSIG_NS));
+            writer.write_event(Event::Start(xpath))?;
             writer.write_event(Event::Text(BytesText::new(XPATH_EXCLUDE_ALL_SIGNATURES)))?;
-            write_end(writer, prefix, "XPath")?;
+            writer.write_event(Event::End(BytesEnd::new(xpath_name)))?;
             writer.write_event(Event::End(BytesEnd::new(name)))?;
             Ok(())
         }
@@ -349,8 +376,21 @@ fn qualified_name(prefix: Option<&str>, local_name: &str) -> String {
     )
 }
 
-fn is_ascii_ncname(value: &str) -> bool {
-    let mut chars = value.chars();
-    matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
-        && chars.all(|ch| matches!(ch, '_' | '-' | '.' | 'A'..='Z' | 'a'..='z' | '0'..='9'))
+fn is_ncname(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains(':')
+        && roxmltree::Document::parse(&format!("<{value}/>")).is_ok()
+}
+
+fn is_namespace_prefix(value: &str) -> bool {
+    if !is_ncname(value) {
+        return false;
+    }
+
+    // Parsing delegates the complete Unicode XML Name grammar and reserved-prefix
+    // rules to the same parser used by the rest of the crate.
+    roxmltree::Document::parse(&format!(
+        "<{value}:n xmlns:{value}=\"urn:xml-sec:prefix-validation\"/>"
+    ))
+    .is_ok()
 }

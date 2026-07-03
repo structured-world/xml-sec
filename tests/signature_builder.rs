@@ -150,7 +150,7 @@ fn serializes_xpath_and_exclusive_prefix_list() {
         .descendants()
         .find(|node| node.has_tag_name((DSIG_NS, "XPath")))
         .expect("XPath child");
-    assert_eq!(xpath.text(), Some("not(ancestor-or-self::ds:Signature)"));
+    assert_eq!(xpath.text(), Some("not(ancestor-or-self::dsig:Signature)"));
     let transforms = xpath
         .parent()
         .and_then(|node| node.parent())
@@ -175,7 +175,10 @@ fn accepts_unicode_xml_namespace_prefixes() {
         .build_template()
         .expect("Unicode prefix is a valid XML NCName");
     let document = roxmltree::Document::parse(&xml).expect("valid XML");
-    assert_eq!(document.root_element().tag_name().namespace(), Some(DSIG_NS));
+    assert_eq!(
+        document.root_element().tag_name().namespace(),
+        Some(DSIG_NS)
+    );
 }
 
 #[test]
