@@ -29,7 +29,7 @@ Every SAML, SOAP, and WS-Security implementation depends on libxmlsec1 — a C l
 - Has decades of CVEs in XML parsing and signature validation
 - Cannot cross-compile easily
 
-`xml-sec` is a ground-up Rust rewrite using `roxmltree` + `ring` + `x509-parser`. Single `cargo build`, works everywhere Rust works.
+`xml-sec` is a ground-up Rust rewrite using `roxmltree` for parsing, `quick-xml` for writing, RustCrypto for RSA/ECDSA/SHA, and `x509-parser` for certificates. Single `cargo build`, works everywhere Rust works.
 
 ## Status
 
