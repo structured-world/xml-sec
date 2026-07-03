@@ -3,24 +3,35 @@
 //! This suite tracks pass/fail/skip accounting across donor vectors and
 //! enforces that all supported donor vectors verify end-to-end.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
 
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, DsigError, DsigStatus, FailureReason, ParseError, VerifyContext,
-    verify_signature_with_pem_key,
+    DefaultKeyResolver, DsigError, DsigStatus, KeyResolverConfig, ParseError, SignatureAlgorithm,
+    VerificationKey, VerifyContext,
 };
 
 #[derive(Clone, Copy)]
 enum SkipProbe {
-    KeyNotFound,
     WeakRsaKey,
     UnsupportedSignatureAlgorithm,
 }
 
 #[derive(Clone, Copy)]
 enum Expectation {
-    ValidWithKey {
+    ValidEmbedded,
+    ValidNamed {
+        key_name: &'static str,
         key_path: &'static str,
+        algorithm: SignatureAlgorithm,
+    },
+    ValidSelected {
+        certificate_paths: &'static [&'static str],
+    },
+    ValidChain {
+        trust_anchor_path: &'static str,
     },
     Skip {
         reason: &'static str,
@@ -43,57 +54,81 @@ fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+fn read_pem_der(path: &Path, expected_label: &str) -> Vec<u8> {
+    let pem_text = read_fixture(path);
+    let (rest, pem) = x509_parser::pem::parse_x509_pem(pem_text.as_bytes())
+        .unwrap_or_else(|err| panic!("failed to parse PEM fixture {}: {err}", path.display()));
+    assert!(rest.iter().all(|byte| byte.is_ascii_whitespace()));
+    assert_eq!(pem.label, expected_label);
+    pem.contents
+}
+
 fn cases() -> Vec<VectorCase> {
     vec![
         // Aleksey donor vectors: supported algorithms must pass end-to-end.
         VectorCase {
             name: "aleksey-rsa-sha1",
             xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha1-rsa-sha1.xml",
-            expectation: Expectation::ValidWithKey {
+            expectation: Expectation::ValidNamed {
+                key_name: "TestKeyName-rsa-4096",
                 key_path: "tests/fixtures/keys/rsa/rsa-4096-pubkey.pem",
+                algorithm: SignatureAlgorithm::RsaSha1,
             },
         },
         VectorCase {
             name: "aleksey-rsa-sha256",
             xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
-            expectation: Expectation::ValidWithKey {
-                key_path: "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem",
-            },
+            expectation: Expectation::ValidEmbedded,
         },
         VectorCase {
             name: "aleksey-rsa-sha384",
             xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha384-rsa-sha384.xml",
-            expectation: Expectation::ValidWithKey {
-                key_path: "tests/fixtures/keys/rsa/rsa-4096-pubkey.pem",
-            },
+            expectation: Expectation::ValidEmbedded,
         },
         VectorCase {
             name: "aleksey-rsa-sha512",
             xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha512-rsa-sha512.xml",
-            expectation: Expectation::ValidWithKey {
-                key_path: "tests/fixtures/keys/rsa/rsa-4096-pubkey.pem",
-            },
+            expectation: Expectation::ValidEmbedded,
         },
         VectorCase {
             name: "aleksey-ecdsa-p256-sha256",
             xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
-            expectation: Expectation::ValidWithKey {
+            expectation: Expectation::ValidNamed {
+                key_name: "TestKeyName-ec-prime256v1",
                 key_path: "tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem",
+                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
             },
         },
         VectorCase {
             name: "aleksey-ecdsa-p521-sha384",
             xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha384-ecdsa-sha384.xml",
-            expectation: Expectation::ValidWithKey {
+            expectation: Expectation::ValidNamed {
+                key_name: "TestKeyName-ec-prime521v1",
                 key_path: "tests/fixtures/keys/ec/ec-prime521v1-pubkey.pem",
+                algorithm: SignatureAlgorithm::EcdsaP384Sha384,
             },
         },
         VectorCase {
             name: "aleksey-rsa-sha512-x509-digest",
             xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-x509-digest-sha512.xml",
-            expectation: Expectation::Skip {
-                reason: "X509Digest key resolution is not implemented yet (planned P2-009)",
-                probe: SkipProbe::KeyNotFound,
+            expectation: Expectation::ValidSelected {
+                certificate_paths: &[
+                    "tests/fixtures/keys/rsa/rsa-4096-cert.pem",
+                    "tests/fixtures/keys/ca2cert.pem",
+                    "tests/fixtures/keys/cacert.pem",
+                ],
+            },
+        },
+        VectorCase {
+            name: "aleksey-rsa-sha1-x509-chain-tofu",
+            xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-rsa-x509chain.xml",
+            expectation: Expectation::ValidEmbedded,
+        },
+        VectorCase {
+            name: "aleksey-rsa-sha1-x509-chain-anchored",
+            xml_path: "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-rsa-x509chain.xml",
+            expectation: Expectation::ValidChain {
+                trust_anchor_path: "tests/fixtures/keys/cacert.pem",
             },
         },
         // Merlin "basic signatures" required by P1-025.
@@ -166,10 +201,10 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
 
     for case in cases() {
         match case.expectation {
-            Expectation::ValidWithKey { key_path } => {
+            Expectation::ValidEmbedded => {
                 let xml = read_fixture(&root.join(case.xml_path));
-                let key = read_fixture(&root.join(key_path));
-                match verify_signature_with_pem_key(&xml, &key, false) {
+                let resolver = DefaultKeyResolver::default();
+                match VerifyContext::new().key_resolver(&resolver).verify(&xml) {
                     Ok(result) if matches!(result.status, DsigStatus::Valid) => {
                         passed += 1;
                     }
@@ -184,26 +219,81 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
                     }
                 }
             }
+            Expectation::ValidNamed {
+                key_name,
+                key_path,
+                algorithm,
+            } => {
+                let xml = read_fixture(&root.join(case.xml_path));
+                let mut config = KeyResolverConfig::default();
+                config.named_keys.insert(
+                    key_name.into(),
+                    VerificationKey {
+                        algorithm,
+                        public_key_bytes: read_pem_der(&root.join(key_path), "PUBLIC KEY"),
+                        certificate_der: None,
+                        name: Some(key_name.into()),
+                    },
+                );
+                let resolver = DefaultKeyResolver::new(config);
+                match VerifyContext::new().key_resolver(&resolver).verify(&xml) {
+                    Ok(result) if matches!(result.status, DsigStatus::Valid) => passed += 1,
+                    Ok(result) => failed.push(format!(
+                        "{}: expected Valid, got {:?}",
+                        case.name, result.status
+                    )),
+                    Err(err) => {
+                        failed.push(format!("{}: verification error {err}", case.name));
+                    }
+                }
+            }
+            Expectation::ValidSelected { certificate_paths } => {
+                let xml = read_fixture(&root.join(case.xml_path));
+                let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+                    trusted_certs: certificate_paths
+                        .iter()
+                        .map(|path| read_pem_der(&root.join(path), "CERTIFICATE"))
+                        .collect(),
+                    ..KeyResolverConfig::default()
+                });
+                match VerifyContext::new().key_resolver(&resolver).verify(&xml) {
+                    Ok(result) if matches!(result.status, DsigStatus::Valid) => passed += 1,
+                    Ok(result) => failed.push(format!(
+                        "{}: expected Valid, got {:?}",
+                        case.name, result.status
+                    )),
+                    Err(err) => {
+                        failed.push(format!("{}: verification error {err}", case.name));
+                    }
+                }
+            }
+            Expectation::ValidChain { trust_anchor_path } => {
+                let xml = read_fixture(&root.join(case.xml_path));
+                let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+                    trusted_certs: vec![read_pem_der(&root.join(trust_anchor_path), "CERTIFICATE")],
+                    verify_chains: true,
+                    // 2027-01-15 UTC, inside the donor chain's 2026-2126 validity window.
+                    verification_time: Some(
+                        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                    ),
+                    ..KeyResolverConfig::default()
+                });
+                match VerifyContext::new().key_resolver(&resolver).verify(&xml) {
+                    Ok(result) if matches!(result.status, DsigStatus::Valid) => passed += 1,
+                    Ok(result) => failed.push(format!(
+                        "{}: expected Valid, got {:?}",
+                        case.name, result.status
+                    )),
+                    Err(err) => {
+                        failed.push(format!("{}: verification error {err}", case.name));
+                    }
+                }
+            }
             Expectation::Skip { reason, probe } => {
                 let xml = read_fixture(&root.join(case.xml_path));
                 roxmltree::Document::parse(&xml)
                     .unwrap_or_else(|err| panic!("{}: fixture XML must parse: {err}", case.name));
                 match probe {
-                    SkipProbe::KeyNotFound => match VerifyContext::new().verify(&xml) {
-                        Ok(result)
-                            if matches!(
-                                result.status,
-                                DsigStatus::Invalid(FailureReason::KeyNotFound)
-                            ) => {}
-                        Ok(result) => failed.push(format!(
-                            "{}: expected Invalid(KeyNotFound) for skipped vector, got {:?}",
-                            case.name, result.status
-                        )),
-                        Err(err) => failed.push(format!(
-                            "{}: expected Invalid(KeyNotFound) for skipped vector, got error {err}",
-                            case.name
-                        )),
-                    },
                     SkipProbe::WeakRsaKey => match VerifyContext::new()
                         .key_resolver(&DefaultKeyResolver::default())
                         .verify(&xml)
@@ -248,7 +338,6 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
     );
 
     let expected_skipped = vec![
-        "aleksey-rsa-sha512-x509-digest: X509Digest key resolution is not implemented yet (planned P2-009)",
         "merlin-enveloped-dsa: DSA signature method is not implemented yet (planned P4-009)",
         "merlin-enveloping-rsa-keyvalue: RSAKeyValue resolves but its legacy 1024-bit modulus is below policy",
         "merlin-x509-crt: DSA signature method is not implemented yet (planned P4-009); X509 KeyInfo resolution is not implemented yet (planned P2-009)",
@@ -261,6 +350,6 @@ fn donor_full_verification_suite_tracks_pass_fail_skip_counts() {
     // P1-025 minimum expected accounting:
     // - all supported aleksey RSA/ECDSA vectors pass
     // - unsupported/deferred merlin vectors are tracked as skips with explicit reasons
-    assert_eq!(passed, 6, "unexpected pass count");
+    assert_eq!(passed, 9, "unexpected pass count");
     assert_eq!(skipped, expected_skipped, "unexpected skip inventory");
 }

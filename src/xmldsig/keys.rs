@@ -12,7 +12,11 @@ use x509_parser::{
 use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
     X509ChainOptions, X509DataInfo,
-    parse::{EC_P256_OID, EC_P384_OID},
+    parse::{
+        EC_P256_OID, EC_P384_OID, ParseError, parse_x509_certificate,
+        x509_certificate_matches_any_selector, x509_data_has_lookup_identifiers,
+        x509_selector_categories_match_chain,
+    },
     verify_ecdsa_signature_spki, verify_rsa_signature_spki, verify_x509_certificate_chain,
 };
 
@@ -75,6 +79,12 @@ pub enum KeyResolutionError {
     /// Configured or embedded public key DER could not be parsed completely.
     #[error("invalid public key DER")]
     InvalidPublicKey,
+    /// More than one configured certificate satisfies all X.509 selectors.
+    #[error("X.509 lookup selectors match multiple configured certificates")]
+    AmbiguousCertificate,
+    /// An X.509 selector uses a digest algorithm unsupported by this crate.
+    #[error("unsupported X.509 digest algorithm: {0}")]
+    UnsupportedDigestAlgorithm(String),
     /// Embedded certificate path validation failed.
     #[error("certificate chain validation failed: {0}")]
     Chain(#[from] super::X509ChainError),
@@ -138,26 +148,35 @@ impl DefaultKeyResolver {
         info: &X509DataInfo,
         algorithm: SignatureAlgorithm,
     ) -> Result<Option<VerificationKey>, KeyResolutionError> {
-        let Some(&signing_index) = info.certificate_chain.first() else {
-            return Ok(None);
-        };
-        let certificate_der = info
-            .certificates
-            .get(signing_index)
-            .ok_or(KeyResolutionError::InvalidCertificate)?;
-
-        if self.config.verify_chains {
-            let options = X509ChainOptions {
-                trusted_certs: &self.config.trusted_certs,
-                verification_time: self
-                    .config
-                    .verification_time
-                    .unwrap_or_else(SystemTime::now),
-                max_chain_depth: self.config.max_chain_depth,
-                check_crls: false,
+        let certificate_der = if let Some(&signing_index) = info.certificate_chain.first() {
+            let certificate_der = info
+                .certificates
+                .get(signing_index)
+                .ok_or(KeyResolutionError::InvalidCertificate)?;
+            if self.config.verify_chains {
+                self.verify_x509_policy(info, None)?;
+            }
+            certificate_der
+        } else {
+            let Some(certificate) = self.resolve_configured_x509(info)? else {
+                return Ok(None);
             };
-            verify_x509_certificate_chain(info, &options)?;
-        }
+            if self.config.verify_chains {
+                let parsed = parse_x509_certificate(certificate)
+                    .map_err(|_| KeyResolutionError::InvalidCertificate)?;
+                let selected = X509DataInfo {
+                    certificates: vec![certificate.clone()],
+                    parsed_certificates: vec![parsed],
+                    certificate_chain: vec![0],
+                    ..X509DataInfo::default()
+                };
+                // Validate the selected certificate's own policy before
+                // requiring a distinct configured certificate as its anchor.
+                self.verify_x509_policy(&selected, None)?;
+                self.verify_x509_policy(&selected, Some(certificate))?;
+            }
+            certificate
+        };
 
         let (rest, certificate) = X509Certificate::from_der(certificate_der)
             .map_err(|_| KeyResolutionError::InvalidCertificate)?;
@@ -172,6 +191,103 @@ impl DefaultKeyResolver {
             certificate_der: Some(certificate_der.clone()),
             name: None,
         }))
+    }
+
+    fn verify_x509_policy(
+        &self,
+        info: &X509DataInfo,
+        selected_lookup_certificate: Option<&[u8]>,
+    ) -> Result<(), KeyResolutionError> {
+        let trusted_certs = self
+            .config
+            .trusted_certs
+            .iter()
+            .filter(|certificate| {
+                selected_lookup_certificate
+                    .is_none_or(|selected| certificate.as_slice() != selected)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let options = X509ChainOptions {
+            trusted_certs: &trusted_certs,
+            verification_time: self
+                .config
+                .verification_time
+                .unwrap_or_else(SystemTime::now),
+            max_chain_depth: self.config.max_chain_depth,
+            check_crls: false,
+        };
+        verify_x509_certificate_chain(info, &options)?;
+        Ok(())
+    }
+
+    fn resolve_configured_x509<'a>(
+        &'a self,
+        info: &X509DataInfo,
+    ) -> Result<Option<&'a Vec<u8>>, KeyResolutionError> {
+        if !x509_data_has_lookup_identifiers(info) {
+            return Ok(None);
+        }
+
+        let mut matches = Vec::new();
+        for certificate_der in &self.config.trusted_certs {
+            let parsed = parse_x509_certificate(certificate_der)
+                .map_err(|_| KeyResolutionError::InvalidCertificate)?;
+            let is_match = x509_certificate_matches_any_selector(info, &parsed, certificate_der)
+                .map_err(|error| match error {
+                    ParseError::UnsupportedAlgorithm { uri } => {
+                        KeyResolutionError::UnsupportedDigestAlgorithm(uri)
+                    }
+                    _ => KeyResolutionError::InvalidCertificate,
+                })?;
+            if is_match {
+                matches.push((certificate_der, parsed));
+            }
+        }
+
+        let matched_chain = X509DataInfo {
+            certificates: matches
+                .iter()
+                .map(|(certificate, _)| (*certificate).clone())
+                .collect(),
+            parsed_certificates: matches.iter().map(|(_, parsed)| parsed.clone()).collect(),
+            ..X509DataInfo::default()
+        };
+        if !x509_selector_categories_match_chain(&X509DataInfo {
+            subject_names: info.subject_names.clone(),
+            issuer_serials: info.issuer_serials.clone(),
+            skis: info.skis.clone(),
+            digests: info.digests.clone(),
+            ..matched_chain
+        })
+        .map_err(|error| match error {
+            ParseError::UnsupportedAlgorithm { uri } => {
+                KeyResolutionError::UnsupportedDigestAlgorithm(uri)
+            }
+            _ => KeyResolutionError::InvalidCertificate,
+        })? {
+            return Ok(None);
+        }
+
+        match matches.as_slice() {
+            [] => Ok(None),
+            [(certificate, _)] => Ok(Some(certificate)),
+            _ => {
+                let leaves = matches
+                    .iter()
+                    .filter(|(_, candidate)| {
+                        candidate.subject_dn != candidate.issuer_dn
+                            && !matches
+                                .iter()
+                                .any(|(_, other)| other.issuer_dn == candidate.subject_dn)
+                    })
+                    .collect::<Vec<_>>();
+                match leaves.as_slice() {
+                    [(certificate, _)] => Ok(Some(certificate)),
+                    _ => Err(KeyResolutionError::AmbiguousCertificate),
+                }
+            }
+        }
     }
 
     fn resolve_key_value(
@@ -378,6 +494,11 @@ mod tests {
     const SAML_PUBLIC_KEY: &str =
         include_str!("../../tests/fixtures/keys/ec/saml-idp-ecdsa-pubkey.pem");
     const RSA_PUBLIC_KEY: &str = include_str!("../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    const RSA_4096_CERTIFICATE: &str =
+        include_str!("../../tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    const X509_DIGEST_SIGNATURE: &str = include_str!(
+        "../../tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-x509-digest-sha512.xml"
+    );
     const RSA_KEY_VALUE_SIGNATURE: &str = include_str!(
         "../../tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml"
     );
@@ -406,11 +527,31 @@ mod tests {
         format!("{}{}{}", &xml[..start], replacement, &xml[end..])
     }
 
+    fn x509_signature_with_leaf_subject() -> String {
+        replace_unprefixed_key_info(
+            X509_DIGEST_SIGNATURE,
+            "<KeyInfo><X509Data><X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-4096</X509SubjectName></X509Data></KeyInfo>",
+        )
+    }
+
+    fn fixture_certificate_time() -> SystemTime {
+        // 2027-01-15 UTC, inside the donor certificates' 2026-2126 validity window.
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000)
+    }
+
     fn public_key_der(pem_text: &str) -> Vec<u8> {
         let (rest, pem) = x509_parser::pem::parse_x509_pem(pem_text.as_bytes())
             .expect("fixture public key is PEM");
         assert!(rest.iter().all(|byte| byte.is_ascii_whitespace()));
         assert_eq!(pem.label, "PUBLIC KEY");
+        pem.contents
+    }
+
+    fn certificate_der(pem_text: &str) -> Vec<u8> {
+        let (rest, pem) = x509_parser::pem::parse_x509_pem(pem_text.as_bytes())
+            .expect("fixture certificate is PEM");
+        assert!(rest.iter().all(|byte| byte.is_ascii_whitespace()));
+        assert_eq!(pem.label, "CERTIFICATE");
         pem.contents
     }
 
@@ -451,6 +592,212 @@ mod tests {
             .expect("embedded certificate should resolve");
 
         assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn resolves_x509_digest_from_configured_certificates() {
+        // Selector-only X509Data must locate the signing certificate without
+        // embedding key material or supplying a preset verification key.
+        let leaf_certificate_der = certificate_der(RSA_4096_CERTIFICATE);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![
+                leaf_certificate_der,
+                certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
+                certificate_der(include_str!("../../tests/fixtures/keys/cacert.pem")),
+            ],
+            ..KeyResolverConfig::default()
+        });
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(X509_DIGEST_SIGNATURE)
+            .expect("X509Digest should resolve a configured certificate");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn selector_resolved_certificate_obeys_chain_policy() {
+        // Enabling chain verification must apply validity policy even when
+        // X509Data contains only selectors and the matching cert is configured.
+        let certificate_der = certificate_der(RSA_4096_CERTIFICATE);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![certificate_der],
+            verify_chains: true,
+            verification_time: Some(SystemTime::UNIX_EPOCH),
+            ..KeyResolverConfig::default()
+        });
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&x509_signature_with_leaf_subject())
+            .expect_err("selector-resolved certificate must satisfy chain policy");
+
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::Chain(
+                super::super::X509ChainError::CertificateNotValid(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn selector_resolved_leaf_does_not_anchor_itself() {
+        // A certificate available for selector lookup is not automatically a
+        // trust anchor; chain verification still requires a separate issuer.
+        let certificate_der = certificate_der(RSA_4096_CERTIFICATE);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![certificate_der],
+            verify_chains: true,
+            verification_time: Some(fixture_certificate_time()),
+            ..KeyResolverConfig::default()
+        });
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&x509_signature_with_leaf_subject())
+            .expect_err("selector-resolved leaf must not trust itself");
+
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::Chain(
+                super::super::X509ChainError::UntrustedRoot
+            ))
+        ));
+    }
+
+    #[test]
+    fn selector_resolved_leaf_uses_separate_anchor() {
+        // Selector lookup may use the leaf from the configured set, but chain
+        // verification must terminate at a different configured certificate.
+        let leaf = certificate_der(RSA_4096_CERTIFICATE);
+        let issuer = certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem"));
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![leaf, issuer],
+            verify_chains: true,
+            verification_time: Some(fixture_certificate_time()),
+            ..KeyResolverConfig::default()
+        });
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&x509_signature_with_leaf_subject())
+            .expect("selector-resolved leaf should chain to its configured issuer");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn resolves_each_x509_selector_from_configured_certificates() {
+        // Every selector form documented by KeyInfo must independently locate
+        // the same configured RSA certificate without embedded key material.
+        let selectors = [
+            "<X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>",
+            "<X509IssuerSerial><X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName><X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber></X509IssuerSerial>",
+            "<X509SKI>bcOXN/nsVl8GatRbcKrPbzIbw0Y=</X509SKI>",
+        ];
+        let configured_certificate = certificate_der(include_str!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+        ));
+
+        for selector in selectors {
+            let key_info = format!("<KeyInfo><X509Data>{selector}</X509Data></KeyInfo>");
+            let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, &key_info);
+            let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+                trusted_certs: vec![configured_certificate.clone()],
+                ..KeyResolverConfig::default()
+            });
+            let result = super::super::VerifyContext::new()
+                .key_resolver(&resolver)
+                .verify(&xml)
+                .expect("X509 selector should resolve configured certificate");
+
+            assert_eq!(result.status, super::super::DsigStatus::Valid);
+        }
+    }
+
+    #[test]
+    fn resolves_configured_chain_selectors_across_certificates() {
+        // Selector categories may identify different members of one configured
+        // chain; the unique leaf remains the signing certificate.
+        let key_info = r#"<KeyInfo><X509Data><X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName><X509SKI>0X0XrEVCio75sBcl1TxymJ2IOiU=</X509SKI></X509Data></KeyInfo>"#;
+        let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, key_info);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![
+                certificate_der(include_str!(
+                    "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+                )),
+                certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
+            ],
+            ..KeyResolverConfig::default()
+        });
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect("selectors across one configured chain should resolve its leaf");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn unmatched_x509_selector_does_not_resolve() {
+        // A selector mismatch must not fall back to arbitrary configured key material.
+        let key_info = "<KeyInfo><X509Data><X509SubjectName>CN=not-the-signer</X509SubjectName></X509Data></KeyInfo>";
+        let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, key_info);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![certificate_der(include_str!(
+                "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+            ))],
+            ..KeyResolverConfig::default()
+        });
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect("an unmatched selector is a key miss, not a parser failure");
+
+        assert!(matches!(
+            result.status,
+            super::super::DsigStatus::Invalid(super::super::FailureReason::KeyNotFound)
+        ));
+    }
+
+    #[test]
+    fn ambiguous_x509_selector_fails_closed() {
+        // Duplicate configured certificates must not make key selection order-dependent.
+        let certificate = certificate_der(RSA_4096_CERTIFICATE);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![certificate.clone(), certificate],
+            ..KeyResolverConfig::default()
+        });
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&x509_signature_with_leaf_subject())
+            .expect_err("ambiguous X509 selector lookup must fail closed");
+
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::AmbiguousCertificate)
+        ));
+    }
+
+    #[test]
+    fn unsupported_x509_digest_selector_fails_closed() {
+        // Unknown digest URIs must not be treated as a normal key miss because
+        // that would silently weaken the caller's explicit selector policy.
+        let key_info = "<KeyInfo xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\"><X509Data><dsig11:X509Digest Algorithm=\"urn:unsupported\">AQ==</dsig11:X509Digest></X509Data></KeyInfo>";
+        let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, key_info);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![certificate_der(include_str!(
+                "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+            ))],
+            ..KeyResolverConfig::default()
+        });
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect_err("unsupported X509Digest algorithm must fail closed");
+
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::UnsupportedDigestAlgorithm(uri))
+                if uri == "urn:unsupported"
+        ));
     }
 
     #[test]
