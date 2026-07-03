@@ -377,9 +377,12 @@ fn qualified_name(prefix: Option<&str>, local_name: &str) -> String {
 }
 
 fn is_ncname(value: &str) -> bool {
-    !value.is_empty()
-        && !value.contains(':')
-        && roxmltree::Document::parse(&format!("<{value}/>")).is_ok()
+    if value.is_empty() || value.contains(':') {
+        return false;
+    }
+
+    roxmltree::Document::parse(&format!("<{value}/>"))
+        .is_ok_and(|document| document.root_element().tag_name().name() == value)
 }
 
 fn is_namespace_prefix(value: &str) -> bool {
