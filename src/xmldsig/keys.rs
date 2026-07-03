@@ -534,6 +534,11 @@ mod tests {
         )
     }
 
+    fn fixture_certificate_time() -> SystemTime {
+        // 2027-01-15 UTC, inside the donor certificates' 2026-2126 validity window.
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000)
+    }
+
     fn public_key_der(pem_text: &str) -> Vec<u8> {
         let (rest, pem) = x509_parser::pem::parse_x509_pem(pem_text.as_bytes())
             .expect("fixture public key is PEM");
@@ -642,6 +647,7 @@ mod tests {
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             trusted_certs: vec![certificate_der],
             verify_chains: true,
+            verification_time: Some(fixture_certificate_time()),
             ..KeyResolverConfig::default()
         });
         let error = super::super::VerifyContext::new()
@@ -666,6 +672,7 @@ mod tests {
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             trusted_certs: vec![leaf, issuer],
             verify_chains: true,
+            verification_time: Some(fixture_certificate_time()),
             ..KeyResolverConfig::default()
         });
         let result = super::super::VerifyContext::new()
