@@ -196,4 +196,21 @@ fn rejects_non_ncname_signature_and_reference_ids() {
         .build_template()
         .expect_err("Reference Id must be an NCName");
     assert!(reference_id.to_string().contains("Reference Id"));
+
+    let injected_signature_id =
+        SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .signature_id("!--comment--><valid")
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256))
+            .build_template()
+            .expect_err("markup must not satisfy Signature Id validation");
+    assert!(injected_signature_id.to_string().contains("Signature Id"));
+
+    let injected_reference_id =
+        SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .add_reference(
+                ReferenceBuilder::new(DigestAlgorithm::Sha256).id("?check?><valid"),
+            )
+            .build_template()
+            .expect_err("markup must not satisfy Reference Id validation");
+    assert!(injected_reference_id.to_string().contains("Reference Id"));
 }
