@@ -15,7 +15,7 @@ fn builds_parseable_prefixed_template_in_required_order() {
     // This guards the schema order consumed by xmlsec1 and our strict parser.
     let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
         .ns_prefix("ds")
-        .signature_id("sig&1")
+        .signature_id("sig-1")
         .add_reference(
             ReferenceBuilder::new(DigestAlgorithm::Sha256)
                 .uri("#assertion&1")
@@ -31,7 +31,7 @@ fn builds_parseable_prefixed_template_in_required_order() {
     let document = roxmltree::Document::parse(&xml).expect("builder must emit valid XML");
     let signature = document.root_element();
     assert_eq!(signature.tag_name().namespace(), Some(DSIG_NS));
-    assert_eq!(signature.attribute("Id"), Some("sig&1"));
+    assert_eq!(signature.attribute("Id"), Some("sig-1"));
     let children: Vec<_> = signature
         .children()
         .filter(roxmltree::Node::is_element)
@@ -151,9 +151,46 @@ fn serializes_xpath_and_exclusive_prefix_list() {
         .find(|node| node.has_tag_name((DSIG_NS, "XPath")))
         .expect("XPath child");
     assert_eq!(xpath.text(), Some("not(ancestor-or-self::ds:Signature)"));
+    let transforms = xpath
+        .parent()
+        .and_then(|node| node.parent())
+        .expect("Transforms");
+    assert!(matches!(
+        parse_transforms(transforms).as_deref(),
+        Ok([Transform::XpathExcludeAllSignatures, Transform::C14n(_)])
+    ));
     let inclusive = document
         .descendants()
         .find(|node| node.tag_name().name() == "InclusiveNamespaces")
         .expect("InclusiveNamespaces child");
     assert_eq!(inclusive.attribute("PrefixList"), Some("#default ds saml"));
+}
+
+#[test]
+fn accepts_unicode_xml_namespace_prefixes() {
+    // XML 1.0 NCNames permit Unicode letters; prefix validation must not be ASCII-only.
+    let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .ns_prefix("подпись")
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256))
+        .build_template()
+        .expect("Unicode prefix is a valid XML NCName");
+    let document = roxmltree::Document::parse(&xml).expect("valid XML");
+    assert_eq!(document.root_element().tag_name().namespace(), Some(DSIG_NS));
+}
+
+#[test]
+fn rejects_non_ncname_signature_and_reference_ids() {
+    // xsd:ID derives from NCName, so escaping an invalid value is not sufficient.
+    let signature_id = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .signature_id("sig&1")
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256))
+        .build_template()
+        .expect_err("Signature Id must be an NCName");
+    assert!(signature_id.to_string().contains("Signature Id"));
+
+    let reference_id = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).id("ref:1"))
+        .build_template()
+        .expect_err("Reference Id must be an NCName");
+    assert!(reference_id.to_string().contains("Reference Id"));
 }
