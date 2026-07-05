@@ -197,6 +197,8 @@ fn rejects_non_ncname_signature_and_reference_ids() {
         .expect_err("Reference Id must be an NCName");
     assert!(reference_id.to_string().contains("Reference Id"));
 
+    // Interpolation turns these into valid documents with comment/PI nodes before
+    // `<valid/>`; parser success alone accepted them before the exact-name check.
     let injected_signature_id =
         SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
             .signature_id("!--comment--><valid")
