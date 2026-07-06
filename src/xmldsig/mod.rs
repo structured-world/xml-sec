@@ -11,6 +11,7 @@
 pub mod builder;
 pub mod digest;
 pub mod keys;
+pub mod mutation;
 pub mod parse;
 pub mod signature;
 pub mod transforms;
