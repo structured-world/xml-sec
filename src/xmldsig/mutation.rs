@@ -190,6 +190,14 @@ where
         buf.clear();
     }
 
+    if value_index != values.len() {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: local_name,
+            expected,
+            actual: value_index,
+        });
+    }
+
     let output = String::from_utf8(writer.into_inner())?;
     roxmltree::Document::parse(&output)?;
     Ok(output)
@@ -369,5 +377,20 @@ mod tests {
                 .map(|node| node.tag_name().name()),
             None
         );
+    }
+
+    #[test]
+    fn replacement_fails_when_nested_dsig_values_are_skipped() {
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:Reference><ds:DigestValue><ds:DigestValue>nested</ds:DigestValue></ds:DigestValue></ds:Reference></ds:SignedInfo></ds:Signature>"#;
+        let err =
+            fill_digest_values(source, ["outer", "nested"]).expect_err("nested target skipped");
+        assert!(matches!(
+            err,
+            XmlMutationError::ValueCountMismatch {
+                element: "DigestValue",
+                expected: 2,
+                actual: 1
+            }
+        ));
     }
 }
