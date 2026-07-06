@@ -154,7 +154,7 @@ where
         let (namespace, event) = reader.read_resolved_event_into(&mut buf)?;
         if let Some(depth) = replacing_depth.as_mut() {
             match event {
-                Event::Start(_) | Event::Empty(_) => *depth += 1,
+                Event::Start(_) => *depth += 1,
                 Event::End(end) if *depth == 0 => {
                     writer.write_event(Event::End(end))?;
                     replacing_depth = None;
@@ -351,5 +351,23 @@ mod tests {
             .find(|node| node.has_tag_name((XMLDSIG_NS, "DigestValue")))
             .expect("dsig DigestValue");
         assert_eq!(dsig.text(), Some("digest"));
+    }
+
+    #[test]
+    fn replacement_preserves_target_end_after_self_closing_child() {
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:Reference><ds:DigestValue><marker/></ds:DigestValue></ds:Reference></ds:SignedInfo></ds:Signature>"#;
+        let filled = fill_digest_values(source, ["digest"]).expect("fill digest");
+        let document = roxmltree::Document::parse(&filled).expect("parse output");
+        let digest_value = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "DigestValue")))
+            .expect("DigestValue");
+        assert_eq!(digest_value.text(), Some("digest"));
+        assert_eq!(
+            digest_value
+                .next_sibling_element()
+                .map(|node| node.tag_name().name()),
+            None
+        );
     }
 }
