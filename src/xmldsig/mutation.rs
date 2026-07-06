@@ -218,7 +218,7 @@ fn count_dsig_elements(xml: &str, local_name: &str) -> Result<usize, XmlMutation
 }
 
 fn is_dsig_element(namespace: &ResolveResult<'_>, local: &[u8], expected_local: &str) -> bool {
-    matches!(namespace, ResolveResult::Bound(Namespace(ns)) if ns.as_ref() == XMLDSIG_NS.as_bytes())
+    matches!(namespace, ResolveResult::Bound(Namespace(ns)) if *ns == XMLDSIG_NS.as_bytes())
         && local == expected_local.as_bytes()
 }
 
