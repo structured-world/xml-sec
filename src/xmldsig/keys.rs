@@ -2,7 +2,8 @@
 
 use std::{collections::HashMap, time::SystemTime};
 
-use p256::pkcs8::EncodePublicKey;
+use crypto_bigint::BoxedUint;
+use p256::pkcs8::EncodePublicKey as P256EncodePublicKey;
 use x509_parser::{
     prelude::{FromDer, X509Certificate},
     public_key::PublicKey,
@@ -398,8 +399,8 @@ fn rsa_key_value_to_spki_der(
     exponent: &[u8],
 ) -> Result<Vec<u8>, KeyResolutionError> {
     let key = rsa::RsaPublicKey::new(
-        rsa::BigUint::from_bytes_be(modulus),
-        rsa::BigUint::from_bytes_be(exponent),
+        BoxedUint::from_be_slice_vartime(modulus),
+        BoxedUint::from_be_slice_vartime(exponent),
     )
     .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
     key.to_public_key_der()
