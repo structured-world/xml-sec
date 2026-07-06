@@ -8,6 +8,7 @@
 //! - ID attribute resolution with configurable attribute names
 //! - Node set types for the transform pipeline
 
+pub mod builder;
 pub mod digest;
 pub mod keys;
 pub mod parse;
@@ -19,6 +20,7 @@ pub mod verify;
 pub(crate) mod whitespace;
 pub mod x509;
 
+pub use builder::{ReferenceBuilder, SignatureBuilder, SignatureBuilderError};
 pub use digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 pub use keys::{DefaultKeyResolver, KeyResolutionError, KeyResolverConfig, VerificationKey};
 pub use parse::{

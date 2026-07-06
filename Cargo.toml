@@ -15,6 +15,7 @@ readme = "README.md"
 [dependencies]
 # XML parsing
 roxmltree = { version = "0.21", features = ["positions"] }
+quick-xml = "0.38"
 
 # Crypto
 rsa = { version = "0.9", optional = true }
@@ -38,7 +39,7 @@ thiserror = "2"
 
 [dev-dependencies]
 rcgen = "0.14.6"
-time = "0.3"
+time = "0.3.53"
 
 [features]
 default = ["xmldsig", "c14n"]
