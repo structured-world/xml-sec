@@ -4,8 +4,9 @@ use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::uri::UriReferenceResolver;
 use xml_sec::xmldsig::verify::process_all_references;
 use xml_sec::xmldsig::{
-    DigestAlgorithm, ReferenceBuilder, SignatureAlgorithm, SignatureBuilder, SigningDigestError,
-    Transform, compute_reference_digest_values, fill_reference_digest_values,
+    DigestAlgorithm, DsigStatus, EcdsaP256SigningKey, ReferenceBuilder, RsaSigningKey, SignContext,
+    SignatureAlgorithm, SignatureBuilder, SigningDigestError, Transform,
+    compute_reference_digest_values, fill_reference_digest_values, verify_signature_with_pem_key,
 };
 
 fn exclusive_c14n() -> C14nAlgorithm {
@@ -35,6 +36,10 @@ fn assert_reference_digests_verify(xml: &str) {
     let result = process_all_references(&signed_info.references, &resolver, signature, true)
         .expect("reference verification must run");
     assert!(result.all_valid(), "filled digest values must verify");
+}
+
+fn read_fixture(path: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|err| panic!("failed to read {path}: {err}"))
 }
 
 #[test]
@@ -137,4 +142,62 @@ fn rejects_sha1_digest_for_signing_template() {
             uri: "http://www.w3.org/2000/09/xmldsig#sha1"
         }
     ));
+}
+
+#[test]
+fn signs_rsa_sha256_template_and_verifies_round_trip() {
+    // Full signing pipeline: append template, compute Reference digest,
+    // canonicalize SignedInfo, RSA-sign it, fill SignatureValue, then verify
+    // the final XML through the existing end-to-end verifier.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let public_key_pem = read_fixture("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("")
+                .transform(Transform::Enveloped)
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+
+    let signed = SignContext::new(&private_key)
+        .sign_with_builder("<root><payload>hello</payload></root>", &builder)
+        .expect("RSA signing pipeline must succeed");
+    let verify_result = verify_signature_with_pem_key(&signed, &public_key_pem, true)
+        .expect("signed RSA XML must verify without pipeline errors");
+
+    assert_eq!(verify_result.status, DsigStatus::Valid);
+    assert!(signed.contains("<SignatureValue>"));
+    assert!(!signed.contains("<DigestValue></DigestValue>"));
+}
+
+#[test]
+fn signs_ecdsa_p256_template_and_verifies_round_trip() {
+    // ECDSA XMLDSig SignatureValue must be fixed-width r||s bytes, not ASN.1
+    // DER. The verifier accepts the generated value as a final interop check.
+    let private_key = EcdsaP256SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime256v1-key.pem",
+    ))
+    .expect("P-256 private key fixture must parse");
+    let public_key_pem = read_fixture("tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaP256Sha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+
+    let signed = SignContext::new(&private_key)
+        .sign_with_builder(
+            "<root><payload ID=\"payload\">hello</payload></root>",
+            &builder,
+        )
+        .expect("ECDSA signing pipeline must succeed");
+    let verify_result = verify_signature_with_pem_key(&signed, &public_key_pem, true)
+        .expect("signed ECDSA XML must verify without pipeline errors");
+
+    assert_eq!(verify_result.status, DsigStatus::Valid);
+    assert!(signed.contains("<SignatureValue>"));
+    assert!(!signed.contains("<DigestValue></DigestValue>"));
 }
