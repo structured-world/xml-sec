@@ -2,7 +2,8 @@
 
 use std::{collections::HashMap, time::SystemTime};
 
-use p256::pkcs8::EncodePublicKey;
+use crypto_bigint::BoxedUint;
+use p256::pkcs8::EncodePublicKey as P256EncodePublicKey;
 use x509_parser::{
     prelude::{FromDer, X509Certificate},
     public_key::PublicKey,
@@ -398,8 +399,8 @@ fn rsa_key_value_to_spki_der(
     exponent: &[u8],
 ) -> Result<Vec<u8>, KeyResolutionError> {
     let key = rsa::RsaPublicKey::new(
-        rsa::BigUint::from_bytes_be(modulus),
-        rsa::BigUint::from_bytes_be(exponent),
+        BoxedUint::from_be_slice_vartime(modulus),
+        BoxedUint::from_be_slice_vartime(exponent),
     )
     .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
     key.to_public_key_der()
@@ -525,6 +526,13 @@ mod tests {
         let start = xml.find("<KeyInfo>").expect("fixture has KeyInfo");
         let end = xml.find("</KeyInfo>").expect("fixture has closing KeyInfo") + "</KeyInfo>".len();
         format!("{}{}{}", &xml[..start], replacement, &xml[end..])
+    }
+
+    fn rsa_key_value_parts(public_key: &rsa::RsaPublicKey) -> (String, String) {
+        (
+            STANDARD.encode(public_key.n().to_be_bytes_trimmed_vartime()),
+            STANDARD.encode(public_key.e().to_be_bytes_trimmed_vartime()),
+        )
     }
 
     fn x509_signature_with_leaf_subject() -> String {
@@ -850,10 +858,10 @@ mod tests {
         // Embedded CryptoBinary parameters must verify the original RSA-2048 donor signature.
         let public_key = rsa::RsaPublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
             .expect("fixture must contain an RSA public key");
+        let (modulus, exponent) = rsa_key_value_parts(&public_key);
         let key_info = format!(
             "<KeyInfo><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>",
-            STANDARD.encode(public_key.n().to_bytes_be()),
-            STANDARD.encode(public_key.e().to_bytes_be()),
+            modulus, exponent,
         );
         let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, &key_info);
         let resolver = DefaultKeyResolver::default();
@@ -885,10 +893,10 @@ mod tests {
         // Embedded RSA parameters must not be relabeled for an ECDSA SignatureMethod.
         let public_key = rsa::RsaPublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
             .expect("fixture must contain an RSA public key");
+        let (modulus, exponent) = rsa_key_value_parts(&public_key);
         let key_info = format!(
             "<ds:KeyInfo><ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{}</ds:Modulus><ds:Exponent>{}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue></ds:KeyInfo>",
-            STANDARD.encode(public_key.n().to_bytes_be()),
-            STANDARD.encode(public_key.e().to_bytes_be()),
+            modulus, exponent,
         );
         let xml = replace_key_info(SIGNED_SAML, &key_info);
         let resolver = DefaultKeyResolver::default();
@@ -949,10 +957,10 @@ mod tests {
         // Mixed KeyInfo should keep scanning after an incompatible ECKeyValue source.
         let public_key = rsa::RsaPublicKey::from_public_key_pem(RSA_PUBLIC_KEY)
             .expect("fixture must contain an RSA public key");
+        let (modulus, exponent) = rsa_key_value_parts(&public_key);
         let key_info = format!(
             r#"<KeyInfo xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><KeyValue><dsig11:ECKeyValue><dsig11:NamedCurve URI="urn:oid:1.2.840.10045.3.1.7"/><dsig11:PublicKey>BJ/yaXNlq4FRObyJCBhb5jAz8GVzinK3bBGLjSDfjbJwNfydtgjnlS4EsDmxSRhWyJWq6GIqy5wvnaiARK04uB4=</dsig11:PublicKey></dsig11:ECKeyValue></KeyValue><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>"#,
-            STANDARD.encode(public_key.n().to_bytes_be()),
-            STANDARD.encode(public_key.e().to_bytes_be()),
+            modulus, exponent,
         );
         let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, &key_info);
         let resolver = DefaultKeyResolver::default();

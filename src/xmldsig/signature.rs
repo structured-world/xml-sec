@@ -11,13 +11,13 @@
 //! - ECDSA keys are validated as uncompressed SEC1 points from the SPKI bit
 //!   string and verified with RustCrypto curve crates (`p256`/`p384`/`p521`).
 
+use p256::ecdsa::signature::Verifier as P256Verifier;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
 use p521::ecdsa::{Signature as P521Signature, VerifyingKey as P521VerifyingKey};
 use rsa::pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaVerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::hazmat::PrehashVerifier;
-use rsa::signature::{DigestVerifier, Verifier};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use x509_parser::prelude::FromDer;
@@ -359,9 +359,7 @@ fn verify_ecdsa_p256_sha256(
 ) -> Result<bool, SignatureVerificationError> {
     let key = P256VerifyingKey::from_sec1_bytes(public_key)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    let mut digest = Sha256::new();
-    digest.update(signed_data);
-    verify_p256_signature(&key, signature_value, signature_encoding, digest)
+    verify_p256_signature(&key, signature_value, signature_encoding, signed_data)
 }
 
 fn verify_ecdsa_p384_sha384(
@@ -372,9 +370,7 @@ fn verify_ecdsa_p384_sha384(
 ) -> Result<bool, SignatureVerificationError> {
     let key = P384VerifyingKey::from_sec1_bytes(public_key)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    let mut digest = Sha384::new();
-    digest.update(signed_data);
-    verify_p384_signature(&key, signature_value, signature_encoding, digest)
+    verify_p384_signature(&key, signature_value, signature_encoding, signed_data)
 }
 
 fn verify_ecdsa_p521_sha384(
@@ -393,29 +389,29 @@ fn verify_p256_signature(
     key: &P256VerifyingKey,
     signature_value: &[u8],
     signature_encoding: EcdsaSignatureEncoding,
-    digest: Sha256,
+    signed_data: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
     match signature_encoding {
         EcdsaSignatureEncoding::XmlDsigFixed => {
             let signature = P256Signature::from_slice(signature_value)
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_digest(digest, &signature).is_ok())
+            Ok(key.verify(signed_data, &signature).is_ok())
         }
         EcdsaSignatureEncoding::Asn1Der => {
             let signature = P256Signature::from_der(signature_value)
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_digest(digest, &signature).is_ok())
+            Ok(key.verify(signed_data, &signature).is_ok())
         }
         EcdsaSignatureEncoding::Ambiguous => {
             if let Ok(signature) = P256Signature::from_der(signature_value)
-                && key.verify_digest(digest.clone(), &signature).is_ok()
+                && key.verify(signed_data, &signature).is_ok()
             {
                 return Ok(true);
             }
 
             let signature = P256Signature::from_slice(signature_value)
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_digest(digest, &signature).is_ok())
+            Ok(key.verify(signed_data, &signature).is_ok())
         }
     }
 }
@@ -424,29 +420,29 @@ fn verify_p384_signature(
     key: &P384VerifyingKey,
     signature_value: &[u8],
     signature_encoding: EcdsaSignatureEncoding,
-    digest: Sha384,
+    signed_data: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
     match signature_encoding {
         EcdsaSignatureEncoding::XmlDsigFixed => {
             let signature = P384Signature::from_slice(signature_value)
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_digest(digest, &signature).is_ok())
+            Ok(key.verify(signed_data, &signature).is_ok())
         }
         EcdsaSignatureEncoding::Asn1Der => {
             let signature = P384Signature::from_der(signature_value)
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_digest(digest, &signature).is_ok())
+            Ok(key.verify(signed_data, &signature).is_ok())
         }
         EcdsaSignatureEncoding::Ambiguous => {
             if let Ok(signature) = P384Signature::from_der(signature_value)
-                && key.verify_digest(digest.clone(), &signature).is_ok()
+                && key.verify(signed_data, &signature).is_ok()
             {
                 return Ok(true);
             }
 
             let signature = P384Signature::from_slice(signature_value)
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_digest(digest, &signature).is_ok())
+            Ok(key.verify(signed_data, &signature).is_ok())
         }
     }
 }

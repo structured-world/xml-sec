@@ -18,18 +18,19 @@ roxmltree = { version = "0.21", features = ["positions"] }
 quick-xml = "0.38"
 
 # Crypto
-rsa = { version = "0.9", optional = true }
-sha1 = { version = "0.10", features = ["oid"], optional = true }
-sha2 = { version = "0.10", features = ["oid"], optional = true }
-p256 = { version = "0.13", features = ["ecdsa"], optional = true }
-p384 = { version = "0.13", features = ["ecdsa"], optional = true }
-p521 = { version = "0.13", features = ["ecdsa"], optional = true }
+rsa = { version = "0.10.0-rc.18", optional = true }
+sha1 = { version = "0.11", features = ["oid"], optional = true }
+sha2 = { version = "0.11", features = ["oid"], optional = true }
+p256 = { version = "0.14", features = ["ecdsa"], optional = true }
+p384 = { version = "0.14.0-rc.15", features = ["ecdsa"], optional = true }
+p521 = { version = "0.14.0-rc.15", features = ["ecdsa"], optional = true }
 signature = { version = "3", optional = true }
 subtle = { version = "2", optional = true }
 
 # X.509 certificates
 x509-parser = { version = "0.18", features = ["verify"], optional = true }
 der = { version = "0.8", optional = true }
+crypto-bigint = { version = "0.7", optional = true }
 
 # Base64 encoding/decoding
 base64 = "0.22"
@@ -45,6 +46,7 @@ time = "0.3.53"
 default = ["xmldsig", "c14n"]
 xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:der",
+    "dep:crypto-bigint",
     "dep:p256",
     "dep:p384",
     "dep:p521",
