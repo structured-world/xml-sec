@@ -4,9 +4,10 @@ use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::uri::UriReferenceResolver;
 use xml_sec::xmldsig::verify::process_all_references;
 use xml_sec::xmldsig::{
-    DigestAlgorithm, DsigStatus, EcdsaP256SigningKey, ReferenceBuilder, RsaSigningKey, SignContext,
-    SignatureAlgorithm, SignatureBuilder, SigningDigestError, Transform,
-    compute_reference_digest_values, fill_reference_digest_values, verify_signature_with_pem_key,
+    DigestAlgorithm, DsigStatus, EcdsaP256SigningKey, EcdsaP384SigningKey, ReferenceBuilder,
+    RsaSigningKey, SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError,
+    Transform, compute_reference_digest_values, fill_reference_digest_values,
+    verify_signature_with_pem_key,
 };
 
 fn exclusive_c14n() -> C14nAlgorithm {
@@ -196,6 +197,36 @@ fn signs_ecdsa_p256_template_and_verifies_round_trip() {
         .expect("ECDSA signing pipeline must succeed");
     let verify_result = verify_signature_with_pem_key(&signed, &public_key_pem, true)
         .expect("signed ECDSA XML must verify without pipeline errors");
+
+    assert_eq!(verify_result.status, DsigStatus::Valid);
+    assert!(signed.contains("<SignatureValue>"));
+    assert!(!signed.contains("<DigestValue></DigestValue>"));
+}
+
+#[test]
+fn signs_ecdsa_p384_template_and_verifies_round_trip() {
+    // P-384 uses the XMLDSig ecdsa-sha384 URI and the same fixed-width r||s
+    // SignatureValue encoding as P-256, with a wider component size.
+    let private_key = EcdsaP384SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime384v1-key.pem",
+    ))
+    .expect("P-384 private key fixture must parse");
+    let public_key_pem = read_fixture("tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaP384Sha384)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha384)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+
+    let signed = SignContext::new(&private_key)
+        .sign_with_builder(
+            "<root><payload ID=\"payload\">hello</payload></root>",
+            &builder,
+        )
+        .expect("P-384 signing pipeline must succeed");
+    let verify_result = verify_signature_with_pem_key(&signed, &public_key_pem, true)
+        .expect("signed P-384 XML must verify without pipeline errors");
 
     assert_eq!(verify_result.status, DsigStatus::Valid);
     assert!(signed.contains("<SignatureValue>"));

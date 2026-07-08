@@ -6,13 +6,15 @@
 //! must continue to reject empty or malformed stored digest values.
 
 use base64::Engine;
+use crypto_common::getrandom::SysRng;
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use p256::pkcs8::DecodePrivateKey;
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey};
 use roxmltree::{Document, Node};
 use rsa::RsaPrivateKey;
+use rsa::pkcs1v15::Signature as RsaPkcs1v15Signature;
 use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
-use rsa::signature::{SignatureEncoding, Signer};
+use rsa::signature::{RandomizedSigner, SignatureEncoding, Signer};
 use sha2::{Sha256, Sha384, Sha512};
 use std::collections::HashSet;
 
@@ -136,6 +138,10 @@ pub enum SigningKeyError {
         /// XMLDSig signature algorithm URI.
         uri: String,
     },
+
+    /// The private-key signing operation failed.
+    #[error("private-key signing operation failed")]
+    SigningFailed,
 }
 
 /// Private key abstraction used by [`SignContext`].
@@ -175,26 +181,33 @@ impl SigningKey for RsaSigningKey {
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
         match algorithm {
-            SignatureAlgorithm::RsaSha256 => {
-                Ok(RsaPkcs1v15SigningKey::<Sha256>::new(self.key.clone())
-                    .sign(canonical_signed_info)
-                    .to_vec())
-            }
-            SignatureAlgorithm::RsaSha384 => {
-                Ok(RsaPkcs1v15SigningKey::<Sha384>::new(self.key.clone())
-                    .sign(canonical_signed_info)
-                    .to_vec())
-            }
-            SignatureAlgorithm::RsaSha512 => {
-                Ok(RsaPkcs1v15SigningKey::<Sha512>::new(self.key.clone())
-                    .sign(canonical_signed_info)
-                    .to_vec())
-            }
+            SignatureAlgorithm::RsaSha256 => sign_rsa_pkcs1v15_with_rng(
+                RsaPkcs1v15SigningKey::<Sha256>::new(self.key.clone()),
+                canonical_signed_info,
+            ),
+            SignatureAlgorithm::RsaSha384 => sign_rsa_pkcs1v15_with_rng(
+                RsaPkcs1v15SigningKey::<Sha384>::new(self.key.clone()),
+                canonical_signed_info,
+            ),
+            SignatureAlgorithm::RsaSha512 => sign_rsa_pkcs1v15_with_rng(
+                RsaPkcs1v15SigningKey::<Sha512>::new(self.key.clone()),
+                canonical_signed_info,
+            ),
             _ => Err(SigningKeyError::UnsupportedAlgorithm {
                 uri: algorithm.uri().to_string(),
             }),
         }
     }
+}
+
+fn sign_rsa_pkcs1v15_with_rng(
+    key: impl RandomizedSigner<RsaPkcs1v15Signature>,
+    canonical_signed_info: &[u8],
+) -> Result<Vec<u8>, SigningKeyError> {
+    let signature = key
+        .try_sign_with_rng(&mut SysRng, canonical_signed_info)
+        .map_err(|_| SigningKeyError::SigningFailed)?;
+    Ok(signature.to_vec())
 }
 
 /// ECDSA P-256 private key for XMLDSig signing.
@@ -228,7 +241,10 @@ impl SigningKey for EcdsaP256SigningKey {
                 uri: algorithm.uri().to_string(),
             });
         }
-        let signature: P256Signature = self.key.sign(canonical_signed_info);
+        let signature: P256Signature = self
+            .key
+            .try_sign(canonical_signed_info)
+            .map_err(|_| SigningKeyError::SigningFailed)?;
         Ok(signature.to_bytes().to_vec())
     }
 }
@@ -264,7 +280,10 @@ impl SigningKey for EcdsaP384SigningKey {
                 uri: algorithm.uri().to_string(),
             });
         }
-        let signature: P384Signature = self.key.sign(canonical_signed_info);
+        let signature: P384Signature = self
+            .key
+            .try_sign(canonical_signed_info)
+            .map_err(|_| SigningKeyError::SigningFailed)?;
         Ok(signature.to_bytes().to_vec())
     }
 }

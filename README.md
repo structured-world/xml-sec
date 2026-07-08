@@ -17,7 +17,7 @@ Pure Rust XML Security library. Drop-in replacement for libxmlsec1.
 ## Features
 
 - **C14N** — XML Canonicalization (inclusive + exclusive, W3C compliant)
-- **XMLDSig** — XML Digital Signatures (verify pipeline implemented; signing in progress, enveloped/enveloping/detached)
+- **XMLDSig** — XML Digital Signatures (verify pipeline + template signing implemented; broader signing interop in progress)
 - **XMLEnc** — XML Encryption (symmetric + asymmetric)
 - **X.509** — Certificate-based key extraction and validation
 
@@ -39,13 +39,15 @@ Currently implemented (core paths):
 - C14N 1.0, C14N 1.1, and Exclusive C14N
 - XMLDSig parsing, same-document URI dereference, transform chains, and digest verification
 - XMLDSig full verify pipeline (`SignedInfo` canonicalization + `SignatureValue` verification)
+- XMLDSig template signing pipeline (`DigestValue` fill + `SignedInfo` canonicalization + `SignatureValue` fill)
 - Built-in verification-key resolution from embedded X.509/DER/`KeyValue` sources and configured `KeyName`, X.509 subject, issuer/serial, SKI, or digest selectors
 - RSA PKCS#1 v1.5 verification helpers for SHA-1 / SHA-256 / SHA-384 / SHA-512
 - ECDSA verification helpers for P-256/SHA-256 and P-384/SHA-384
+- RSA PKCS#1 v1.5 and ECDSA P-256/P-384 signing from PKCS#8 private keys
 - Opt-in X.509 certificate-chain validation with explicit trust anchors, validity checks, CA constraints, and CRLs
 
 Still in progress:
-- XMLDSig signing pipeline
+- XMLDSig signing KeyInfo writer, examples, and broader donor/CLI interop coverage
 - XMLEnc encryption/decryption pipeline
 
 Current toolchain target: latest stable Rust.
