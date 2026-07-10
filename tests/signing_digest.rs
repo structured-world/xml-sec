@@ -4,9 +4,10 @@ use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::uri::UriReferenceResolver;
 use xml_sec::xmldsig::verify::process_all_references;
 use xml_sec::xmldsig::{
-    DigestAlgorithm, DsigStatus, EcdsaP256SigningKey, EcdsaP384SigningKey, ReferenceBuilder,
-    RsaSigningKey, SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError,
-    Transform, compute_reference_digest_values, fill_reference_digest_values,
+    DefaultKeyResolver, DigestAlgorithm, DsigStatus, EcdsaP256SigningKey, EcdsaP384SigningKey,
+    KeyInfoWriter, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
+    SignatureBuilder, SigningDigestError, SigningError, Transform, X509CertificateKeyInfoWriter,
+    compute_reference_digest_values, fill_reference_digest_values, parse_key_info,
     verify_signature_with_pem_key,
 };
 
@@ -197,6 +198,107 @@ fn signs_rsa_sha256_template_and_verifies_round_trip() {
     assert_eq!(verify_result.status, DsigStatus::Valid);
     assert!(signed.contains("<SignatureValue>"));
     assert!(!signed.contains("<DigestValue></DigestValue>"));
+}
+
+#[test]
+fn x509_key_info_writer_serializes_certificate_data() {
+    // The writer emits XMLDSig X509Data child content, not escaped text, so the
+    // existing KeyInfo parser must be able to consume it directly.
+    let certificate = X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+        "tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+    ))
+    .expect("RSA certificate fixture must parse");
+    let key_info_xml = format!(
+        "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">{}</KeyInfo>",
+        certificate
+            .write_key_info(
+                &RsaSigningKey::from_pkcs8_pem(&read_fixture(
+                    "tests/fixtures/keys/rsa/rsa-2048-key.pem",
+                ))
+                .expect("RSA private key fixture must parse"),
+            )
+            .expect("write KeyInfo")
+    );
+    let doc = roxmltree::Document::parse(&key_info_xml).expect("writer output must parse");
+    let key_info = parse_key_info(doc.root_element()).expect("writer output must parse as KeyInfo");
+
+    assert_eq!(key_info.sources.len(), 1);
+}
+
+#[test]
+fn signs_rsa_template_with_embedded_x509_key_info() {
+    // KeyInfo is outside SignedInfo, but SAML verifiers commonly need the
+    // embedded signing certificate to resolve the public key. This verifies the
+    // writer path through the existing DefaultKeyResolver.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let key_info_writer = X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+        "tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+    ))
+    .expect("RSA certificate fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+
+    let signed = SignContext::new(&private_key)
+        .key_info_writer(&key_info_writer)
+        .sign_with_builder(
+            "<root><payload ID=\"payload\">hello</payload></root>",
+            &builder,
+        )
+        .expect("RSA signing with KeyInfo must succeed");
+    let resolver = DefaultKeyResolver::default();
+    let verify_result = xml_sec::xmldsig::VerifyContext::new()
+        .key_resolver(&resolver)
+        .verify(&signed)
+        .expect("embedded certificate KeyInfo must resolve");
+
+    assert_eq!(verify_result.status, DsigStatus::Valid);
+    assert!(signed.contains("<X509Data xmlns=\"http://www.w3.org/2000/09/xmldsig#\">"));
+    assert!(signed.contains("<X509Certificate>"));
+}
+
+#[test]
+fn key_info_writer_requires_direct_template_placeholder() {
+    // The writer is intentionally opt-in and template-scoped. Without a direct
+    // KeyInfo slot, signing fails instead of inventing insertion policy.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let key_info_writer = X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+        "tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+    ))
+    .expect("RSA certificate fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+
+    let err = SignContext::new(&private_key)
+        .key_info_writer(&key_info_writer)
+        .sign_with_builder(
+            "<root><payload ID=\"payload\">hello</payload></root>",
+            &builder,
+        )
+        .expect_err("writer without KeyInfo placeholder must fail");
+
+    assert!(matches!(
+        err,
+        SigningError::XmlMutation(
+            xml_sec::xmldsig::mutation::XmlMutationError::ValueCountMismatch {
+                element: "KeyInfo",
+                expected: 0,
+                actual: 1,
+            }
+        )
+    ));
 }
 
 #[test]

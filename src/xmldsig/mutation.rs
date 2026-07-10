@@ -166,6 +166,25 @@ pub fn fill_signature_value(xml: &str, value: &str) -> Result<String, XmlMutatio
     )
 }
 
+/// Fill the direct `<Signature>/<KeyInfo>` child with XML child content.
+pub fn fill_key_info(xml: &str, key_info_content: &str) -> Result<String, XmlMutationError> {
+    let expected = count_direct_key_infos(xml)?;
+    if expected != 1 {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "KeyInfo",
+            expected,
+            actual: 1,
+        });
+    }
+
+    fill_dsig_element_raw_matching(
+        xml,
+        "KeyInfo",
+        key_info_content,
+        is_direct_signature_context,
+    )
+}
+
 fn fill_dsig_values<I, S>(
     xml: &str,
     local_name: &'static str,
@@ -276,6 +295,80 @@ fn fill_dsig_values_matching(
     Ok(output)
 }
 
+fn fill_dsig_element_raw_matching(
+    xml: &str,
+    local_name: &'static str,
+    content: &str,
+    mut should_replace: impl FnMut(&[(bool, Vec<u8>)], &ResolveResult<'_>) -> bool,
+) -> Result<String, XmlMutationError> {
+    let mut reader = NsReader::from_str(xml);
+    let mut writer = Writer::new(Vec::new());
+    let mut buf = Vec::new();
+    let mut replacing_depth: Option<usize> = None;
+    let mut element_stack: Vec<(bool, Vec<u8>)> = Vec::new();
+
+    loop {
+        let (namespace, event) = reader.read_resolved_event_into(&mut buf)?;
+        if let Some(depth) = replacing_depth.as_mut() {
+            match event {
+                Event::Start(_) => *depth += 1,
+                Event::End(end) if *depth == 0 => {
+                    writer.write_event(Event::End(end))?;
+                    replacing_depth = None;
+                    element_stack.pop();
+                }
+                Event::End(_) => *depth -= 1,
+                Event::Eof => break,
+                _ => {}
+            }
+            buf.clear();
+            continue;
+        }
+
+        match event {
+            Event::Start(element)
+                if is_dsig_element(&namespace, element.local_name().as_ref(), local_name)
+                    && should_replace(&element_stack, &namespace) =>
+            {
+                element_stack.push((
+                    is_dsig_namespace(&namespace),
+                    element.local_name().as_ref().to_vec(),
+                ));
+                writer.write_event(Event::Start(element))?;
+                writer.get_mut().write_all(content.as_bytes())?;
+                replacing_depth = Some(0);
+            }
+            Event::Empty(element)
+                if is_dsig_element(&namespace, element.local_name().as_ref(), local_name)
+                    && should_replace(&element_stack, &namespace) =>
+            {
+                writer.write_event(Event::Start(element.borrow()))?;
+                writer.get_mut().write_all(content.as_bytes())?;
+                writer.write_event(Event::End(element.to_end()))?;
+            }
+            Event::Start(element) => {
+                element_stack.push((
+                    is_dsig_namespace(&namespace),
+                    element.local_name().as_ref().to_vec(),
+                ));
+                writer.write_event(Event::Start(element))?;
+            }
+            Event::Empty(element) => writer.write_event(Event::Empty(element))?,
+            Event::End(element) => {
+                element_stack.pop();
+                writer.write_event(Event::End(element))?;
+            }
+            Event::Eof => break,
+            event => writer.write_event(event)?,
+        }
+        buf.clear();
+    }
+
+    let output = String::from_utf8(writer.into_inner())?;
+    roxmltree::Document::parse(&output)?;
+    Ok(output)
+}
+
 fn validate_signature_template(signature_template: &str) -> Result<(), XmlMutationError> {
     let document = roxmltree::Document::parse(signature_template)?;
     let root = document.root_element();
@@ -314,6 +407,21 @@ fn count_direct_signature_values(xml: &str) -> Result<usize, XmlMutationError> {
             node.is_element()
                 && node.tag_name().namespace() == Some(XMLDSIG_NS)
                 && node.tag_name().name() == "SignatureValue"
+                && node
+                    .parent()
+                    .is_some_and(|parent| is_dsig_node(parent, "Signature"))
+        })
+        .count())
+}
+
+fn count_direct_key_infos(xml: &str) -> Result<usize, XmlMutationError> {
+    let document = roxmltree::Document::parse(xml)?;
+    Ok(document
+        .descendants()
+        .filter(|node| {
+            node.is_element()
+                && node.tag_name().namespace() == Some(XMLDSIG_NS)
+                && node.tag_name().name() == "KeyInfo"
                 && node
                     .parent()
                     .is_some_and(|parent| is_dsig_node(parent, "Signature"))

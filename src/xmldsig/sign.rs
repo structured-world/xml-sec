@@ -17,13 +17,14 @@ use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding, Signer};
 use sha2::{Sha256, Sha384, Sha512};
 use std::collections::HashSet;
+use x509_parser::prelude::FromDer;
 
 use crate::c14n::canonicalize;
 
 use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::{DigestAlgorithm, compute_digest};
 use super::mutation::{
-    XmlMutationError, append_signature_to_root, fill_signature_value,
+    XmlMutationError, append_signature_to_root, fill_key_info, fill_signature_value,
     fill_signed_info_digest_values,
 };
 use super::parse::{SignatureAlgorithm, XMLDSIG_NS, parse_signed_info};
@@ -109,6 +110,10 @@ pub enum SigningError {
     #[error("XML mutation error: {0}")]
     XmlMutation(#[from] XmlMutationError),
 
+    /// Writing `<KeyInfo>` failed.
+    #[error("KeyInfo writer error: {0}")]
+    KeyInfo(#[from] KeyInfoWriteError),
+
     /// Signature template generation failed.
     #[error("signature template error: {0}")]
     Template(#[from] SignatureBuilderError),
@@ -153,6 +158,74 @@ pub trait SigningKey {
         algorithm: SignatureAlgorithm,
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError>;
+}
+
+/// Writes signing key metadata into a template `<KeyInfo>` element.
+pub trait KeyInfoWriter {
+    /// Return XML child content for the direct `<Signature>/<KeyInfo>` element.
+    fn write_key_info(&self, signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError>;
+}
+
+/// Errors while preparing XMLDSig signing `<KeyInfo>` output.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum KeyInfoWriteError {
+    /// PEM input could not be parsed.
+    #[error("invalid PEM certificate")]
+    InvalidCertificatePem,
+
+    /// PEM block was not an X.509 certificate.
+    #[error("invalid certificate format: expected CERTIFICATE PEM, got {label}")]
+    InvalidCertificateFormat {
+        /// Actual PEM label.
+        label: String,
+    },
+
+    /// DER bytes could not be decoded as one complete X.509 certificate.
+    #[error("invalid X.509 certificate DER")]
+    InvalidCertificateDer,
+}
+
+/// `<KeyInfo>` writer that embeds one DER X.509 certificate.
+pub struct X509CertificateKeyInfoWriter {
+    certificate_der: Vec<u8>,
+}
+
+impl X509CertificateKeyInfoWriter {
+    /// Parse a PEM `CERTIFICATE` block for XMLDSig `<X509Certificate>` output.
+    pub fn from_pem(certificate_pem: &str) -> Result<Self, KeyInfoWriteError> {
+        let (rest, pem) = x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes())
+            .map_err(|_| KeyInfoWriteError::InvalidCertificatePem)?;
+        if !rest.iter().all(|byte| byte.is_ascii_whitespace()) {
+            return Err(KeyInfoWriteError::InvalidCertificatePem);
+        }
+        if pem.label != "CERTIFICATE" {
+            return Err(KeyInfoWriteError::InvalidCertificateFormat { label: pem.label });
+        }
+        Self::from_der(&pem.contents)
+    }
+
+    /// Validate and store DER certificate bytes for XMLDSig `<X509Certificate>` output.
+    pub fn from_der(certificate_der: &[u8]) -> Result<Self, KeyInfoWriteError> {
+        let (rest, _) = x509_parser::certificate::X509Certificate::from_der(certificate_der)
+            .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
+        if !rest.is_empty() {
+            return Err(KeyInfoWriteError::InvalidCertificateDer);
+        }
+        Ok(Self {
+            certificate_der: certificate_der.to_vec(),
+        })
+    }
+}
+
+impl KeyInfoWriter for X509CertificateKeyInfoWriter {
+    fn write_key_info(&self, _signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
+        let certificate_b64 =
+            base64::engine::general_purpose::STANDARD.encode(&self.certificate_der);
+        Ok(format!(
+            "<X509Data xmlns=\"{XMLDSIG_NS}\"><X509Certificate>{certificate_b64}</X509Certificate></X509Data>"
+        ))
+    }
 }
 
 /// RSA PKCS#1 v1.5 private key for XMLDSig signing.
@@ -292,12 +365,23 @@ impl SigningKey for EcdsaP384SigningKey {
 /// XMLDSig signing context.
 pub struct SignContext<'a> {
     signing_key: &'a dyn SigningKey,
+    key_info_writer: Option<&'a dyn KeyInfoWriter>,
 }
 
 impl<'a> SignContext<'a> {
     /// Create a signing context using the supplied private key.
     pub fn new(signing_key: &'a dyn SigningKey) -> Self {
-        Self { signing_key }
+        Self {
+            signing_key,
+            key_info_writer: None,
+        }
+    }
+
+    /// Configure signing to populate the direct `<Signature>/<KeyInfo>` placeholder.
+    #[must_use]
+    pub fn key_info_writer(mut self, writer: &'a dyn KeyInfoWriter) -> Self {
+        self.key_info_writer = Some(writer);
+        self
     }
 
     /// Sign XML that already contains a `<Signature>` template.
@@ -311,7 +395,13 @@ impl<'a> SignContext<'a> {
         let (algorithm, canonical_signed_info) = canonicalize_signed_info(&with_digests)?;
         let signature_value = self.signing_key.sign(algorithm, &canonical_signed_info)?;
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature_value);
-        Ok(fill_signature_value(&with_digests, &signature_b64)?)
+        let signed = fill_signature_value(&with_digests, &signature_b64)?;
+        if let Some(writer) = self.key_info_writer {
+            let key_info_content = writer.write_key_info(self.signing_key)?;
+            Ok(fill_key_info(&signed, &key_info_content)?)
+        } else {
+            Ok(signed)
+        }
     }
 
     /// Build a signature template, append it to the source root, then sign it.
