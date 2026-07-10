@@ -13,6 +13,7 @@ pub mod digest;
 pub mod keys;
 pub mod mutation;
 pub mod parse;
+pub mod sign;
 pub mod signature;
 pub mod transforms;
 pub mod types;
@@ -27,6 +28,11 @@ pub use keys::{DefaultKeyResolver, KeyResolutionError, KeyResolverConfig, Verifi
 pub use parse::{
     KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, SignatureAlgorithm, SignedInfo,
     X509DataInfo, find_signature_node, parse_key_info, parse_signed_info,
+};
+pub use sign::{
+    ComputedReferenceDigest, EcdsaP256SigningKey, EcdsaP384SigningKey, RsaSigningKey, SignContext,
+    SigningDigestError, SigningError, SigningKey, SigningKeyError, compute_reference_digest_values,
+    fill_reference_digest_values,
 };
 pub use signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_ecdsa_signature_spki,
