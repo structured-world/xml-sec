@@ -31,7 +31,7 @@ subtle = { version = "2", optional = true }
 x509-parser = { version = "0.18", features = ["verify"], optional = true }
 der = { version = "0.8", optional = true }
 crypto-bigint = { version = "0.7", optional = true }
-crypto-common = { version = "0.2", optional = true }
+crypto-common = { version = "0.2", features = ["getrandom"], optional = true }
 
 # Base64 encoding/decoding
 base64 = "0.22"
