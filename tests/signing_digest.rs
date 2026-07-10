@@ -200,6 +200,42 @@ fn signs_rsa_sha256_template_and_verifies_round_trip() {
 }
 
 #[test]
+fn signing_fills_only_top_level_signature_value() {
+    // Object payloads may contain SignatureValue-named XMLDSig elements. The
+    // signing pass must fill only the direct child of the selected Signature.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let public_key_pem = read_fixture("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let template = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        )
+        .build_template()
+        .expect("valid signature template")
+        .replace(
+            "</Signature>",
+            "<Object><SignatureValue>keep-object-signature</SignatureValue></Object></Signature>",
+        );
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">hello</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+
+    let signed = SignContext::new(&private_key)
+        .sign_template(&xml)
+        .expect("signing must ignore object SignatureValue");
+    let verify_result = verify_signature_with_pem_key(&signed, &public_key_pem, true)
+        .expect("signed RSA XML must verify without pipeline errors");
+
+    assert_eq!(verify_result.status, DsigStatus::Valid);
+    assert!(signed.contains("<SignatureValue>keep-object-signature</SignatureValue>"));
+}
+
+#[test]
 fn signs_ecdsa_p256_template_and_verifies_round_trip() {
     // ECDSA XMLDSig SignatureValue must be fixed-width r||s bytes, not ASN.1
     // DER. The verifier accepts the generated value as a final interop check.

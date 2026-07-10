@@ -23,7 +23,7 @@ use crate::c14n::canonicalize;
 use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::{DigestAlgorithm, compute_digest};
 use super::mutation::{
-    XmlMutationError, append_signature_to_root, fill_signature_values,
+    XmlMutationError, append_signature_to_root, fill_signature_value,
     fill_signed_info_digest_values,
 };
 use super::parse::{SignatureAlgorithm, XMLDSIG_NS, parse_signed_info};
@@ -311,7 +311,7 @@ impl<'a> SignContext<'a> {
         let (algorithm, canonical_signed_info) = canonicalize_signed_info(&with_digests)?;
         let signature_value = self.signing_key.sign(algorithm, &canonical_signed_info)?;
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature_value);
-        Ok(fill_signature_values(&with_digests, [signature_b64])?)
+        Ok(fill_signature_value(&with_digests, &signature_b64)?)
     }
 
     /// Build a signature template, append it to the source root, then sign it.

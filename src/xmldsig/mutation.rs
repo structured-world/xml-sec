@@ -147,6 +147,25 @@ where
     fill_dsig_values(xml, "SignatureValue", values)
 }
 
+/// Fill the direct `<Signature>/<SignatureValue>` child for a signing template.
+pub fn fill_signature_value(xml: &str, value: &str) -> Result<String, XmlMutationError> {
+    let expected = count_direct_signature_values(xml)?;
+    if expected != 1 {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "SignatureValue",
+            expected,
+            actual: 1,
+        });
+    }
+
+    fill_dsig_values_matching(
+        xml,
+        "SignatureValue",
+        vec![value.to_owned()],
+        is_direct_signature_context,
+    )
+}
+
 fn fill_dsig_values<I, S>(
     xml: &str,
     local_name: &'static str,
@@ -287,6 +306,21 @@ fn count_signed_info_digest_values(xml: &str) -> Result<usize, XmlMutationError>
         .count())
 }
 
+fn count_direct_signature_values(xml: &str) -> Result<usize, XmlMutationError> {
+    let document = roxmltree::Document::parse(xml)?;
+    Ok(document
+        .descendants()
+        .filter(|node| {
+            node.is_element()
+                && node.tag_name().namespace() == Some(XMLDSIG_NS)
+                && node.tag_name().name() == "SignatureValue"
+                && node
+                    .parent()
+                    .is_some_and(|parent| is_dsig_node(parent, "Signature"))
+        })
+        .count())
+}
+
 fn is_direct_signed_info_reference_digest(node: roxmltree::Node<'_, '_>) -> bool {
     node.is_element()
         && node.tag_name().namespace() == Some(XMLDSIG_NS)
@@ -316,6 +350,17 @@ fn is_signed_info_reference_context(
             [.., (true, signed_info), (true, reference)]
                 if signed_info.as_slice() == b"SignedInfo"
                     && reference.as_slice() == b"Reference"
+        )
+}
+
+fn is_direct_signature_context(
+    element_stack: &[(bool, Vec<u8>)],
+    namespace: &ResolveResult<'_>,
+) -> bool {
+    is_dsig_namespace(namespace)
+        && matches!(
+            element_stack,
+            [.., (true, signature)] if signature.as_slice() == b"Signature"
         )
 }
 
