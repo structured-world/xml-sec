@@ -6,7 +6,7 @@
 //! must continue to reject empty or malformed stored digest values.
 
 use base64::Engine;
-use crypto_common::getrandom::SysRng;
+use getrandom::SysRng;
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use p256::pkcs8::DecodePrivateKey;
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey};

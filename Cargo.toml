@@ -26,12 +26,12 @@ p384 = { version = "0.14", features = ["ecdsa"], optional = true }
 p521 = { version = "0.14.0-rc.15", features = ["ecdsa"], optional = true }
 signature = { version = "3", optional = true }
 subtle = { version = "2", optional = true }
+getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
 
 # X.509 certificates
 x509-parser = { version = "0.18", features = ["verify"], optional = true }
 der = { version = "0.8", optional = true }
 crypto-bigint = { version = "0.7", optional = true }
-crypto-common = { version = "0.2", features = ["getrandom"], optional = true }
 
 # Base64 encoding/decoding
 base64 = "0.22"
@@ -48,7 +48,7 @@ default = ["xmldsig", "c14n"]
 xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:der",
     "dep:crypto-bigint",
-    "dep:crypto-common",
+    "dep:getrandom",
     "dep:p256",
     "dep:p384",
     "dep:p521",
