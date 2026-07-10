@@ -113,6 +113,31 @@ where
     fill_dsig_values(xml, "DigestValue", values)
 }
 
+/// Fill `<DigestValue>` elements for direct `<SignedInfo>/<Reference>` children.
+pub fn fill_signed_info_digest_values<I, S>(
+    xml: &str,
+    values: I,
+) -> Result<String, XmlMutationError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let values: Vec<String> = values
+        .into_iter()
+        .map(|value| value.as_ref().to_owned())
+        .collect();
+    let expected = count_signed_info_digest_values(xml)?;
+    if expected != values.len() {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "DigestValue",
+            expected,
+            actual: values.len(),
+        });
+    }
+
+    fill_dsig_values_matching(xml, "DigestValue", values, is_signed_info_reference_context)
+}
+
 /// Fill XMLDSig `<SignatureValue>` elements in document order.
 pub fn fill_signature_values<I, S>(xml: &str, values: I) -> Result<String, XmlMutationError>
 where
@@ -144,11 +169,21 @@ where
         });
     }
 
+    fill_dsig_values_matching(xml, local_name, values, |_, _| true)
+}
+
+fn fill_dsig_values_matching(
+    xml: &str,
+    local_name: &'static str,
+    values: Vec<String>,
+    mut should_replace: impl FnMut(&[(bool, Vec<u8>)], &ResolveResult<'_>) -> bool,
+) -> Result<String, XmlMutationError> {
     let mut reader = NsReader::from_str(xml);
     let mut writer = Writer::new(Vec::new());
     let mut buf = Vec::new();
     let mut value_index = 0usize;
     let mut replacing_depth: Option<usize> = None;
+    let mut element_stack: Vec<(bool, Vec<u8>)> = Vec::new();
 
     loop {
         let (namespace, event) = reader.read_resolved_event_into(&mut buf)?;
@@ -158,6 +193,7 @@ where
                 Event::End(end) if *depth == 0 => {
                     writer.write_event(Event::End(end))?;
                     replacing_depth = None;
+                    element_stack.pop();
                 }
                 Event::End(_) => *depth -= 1,
                 Event::Eof => break,
@@ -169,20 +205,38 @@ where
 
         match event {
             Event::Start(element)
-                if is_dsig_element(&namespace, element.local_name().as_ref(), local_name) =>
+                if is_dsig_element(&namespace, element.local_name().as_ref(), local_name)
+                    && should_replace(&element_stack, &namespace) =>
             {
+                element_stack.push((
+                    is_dsig_namespace(&namespace),
+                    element.local_name().as_ref().to_vec(),
+                ));
                 writer.write_event(Event::Start(element))?;
                 writer.write_event(Event::Text(BytesText::new(&values[value_index])))?;
                 value_index += 1;
                 replacing_depth = Some(0);
             }
             Event::Empty(element)
-                if is_dsig_element(&namespace, element.local_name().as_ref(), local_name) =>
+                if is_dsig_element(&namespace, element.local_name().as_ref(), local_name)
+                    && should_replace(&element_stack, &namespace) =>
             {
                 writer.write_event(Event::Start(element.borrow()))?;
                 writer.write_event(Event::Text(BytesText::new(&values[value_index])))?;
                 value_index += 1;
                 writer.write_event(Event::End(element.to_end()))?;
+            }
+            Event::Start(element) => {
+                element_stack.push((
+                    is_dsig_namespace(&namespace),
+                    element.local_name().as_ref().to_vec(),
+                ));
+                writer.write_event(Event::Start(element))?;
+            }
+            Event::Empty(element) => writer.write_event(Event::Empty(element))?,
+            Event::End(element) => {
+                element_stack.pop();
+                writer.write_event(Event::End(element))?;
             }
             Event::Eof => break,
             event => writer.write_event(event)?,
@@ -193,7 +247,7 @@ where
     if value_index != values.len() {
         return Err(XmlMutationError::ValueCountMismatch {
             element: local_name,
-            expected,
+            expected: values.len(),
             actual: value_index,
         });
     }
@@ -225,9 +279,52 @@ fn count_dsig_elements(xml: &str, local_name: &str) -> Result<usize, XmlMutation
         .count())
 }
 
+fn count_signed_info_digest_values(xml: &str) -> Result<usize, XmlMutationError> {
+    let document = roxmltree::Document::parse(xml)?;
+    Ok(document
+        .descendants()
+        .filter(|node| is_direct_signed_info_reference_digest(*node))
+        .count())
+}
+
+fn is_direct_signed_info_reference_digest(node: roxmltree::Node<'_, '_>) -> bool {
+    node.is_element()
+        && node.tag_name().namespace() == Some(XMLDSIG_NS)
+        && node.tag_name().name() == "DigestValue"
+        && node
+            .parent()
+            .is_some_and(|parent| is_dsig_node(parent, "Reference"))
+        && node
+            .parent()
+            .and_then(|parent| parent.parent())
+            .is_some_and(|grandparent| is_dsig_node(grandparent, "SignedInfo"))
+}
+
+fn is_dsig_node(node: roxmltree::Node<'_, '_>, expected_local: &str) -> bool {
+    node.is_element()
+        && node.tag_name().namespace() == Some(XMLDSIG_NS)
+        && node.tag_name().name() == expected_local
+}
+
+fn is_signed_info_reference_context(
+    element_stack: &[(bool, Vec<u8>)],
+    namespace: &ResolveResult<'_>,
+) -> bool {
+    is_dsig_namespace(namespace)
+        && matches!(
+            element_stack,
+            [.., (true, signed_info), (true, reference)]
+                if signed_info.as_slice() == b"SignedInfo"
+                    && reference.as_slice() == b"Reference"
+        )
+}
+
 fn is_dsig_element(namespace: &ResolveResult<'_>, local: &[u8], expected_local: &str) -> bool {
+    is_dsig_namespace(namespace) && local == expected_local.as_bytes()
+}
+
+fn is_dsig_namespace(namespace: &ResolveResult<'_>) -> bool {
     matches!(namespace, ResolveResult::Bound(Namespace(ns)) if *ns == XMLDSIG_NS.as_bytes())
-        && local == expected_local.as_bytes()
 }
 
 #[cfg(test)]

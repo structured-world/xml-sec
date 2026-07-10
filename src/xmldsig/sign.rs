@@ -23,7 +23,8 @@ use crate::c14n::canonicalize;
 use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::{DigestAlgorithm, compute_digest};
 use super::mutation::{
-    XmlMutationError, append_signature_to_root, fill_digest_values, fill_signature_values,
+    XmlMutationError, append_signature_to_root, fill_signature_values,
+    fill_signed_info_digest_values,
 };
 use super::parse::{SignatureAlgorithm, XMLDSIG_NS, parse_signed_info};
 use super::transforms::{Transform, execute_transforms, parse_transforms};
@@ -374,7 +375,7 @@ pub fn fill_reference_digest_values(xml: &str) -> Result<String, SigningDigestEr
     let digest_values = compute_reference_digest_values(xml)?
         .into_iter()
         .map(|digest| digest.digest_value);
-    Ok(fill_digest_values(xml, digest_values)?)
+    Ok(fill_signed_info_digest_values(xml, digest_values)?)
 }
 
 fn canonicalize_signed_info(xml: &str) -> Result<(SignatureAlgorithm, Vec<u8>), SigningError> {

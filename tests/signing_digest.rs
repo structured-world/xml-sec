@@ -117,6 +117,32 @@ fn computes_enveloped_signature_digest_for_whole_document() {
 }
 
 #[test]
+fn fills_only_signed_info_reference_digest_values() {
+    // Manifests can contain their own DigestValue elements inside the same
+    // Signature. Signing the outer SignedInfo must not treat those as template
+    // reference slots or overwrite their existing values.
+    let template = template_with_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#payload")
+            .transform(Transform::C14n(exclusive_c14n())),
+    );
+    let template = template.replace(
+        "</Signature>",
+        "<Object><Manifest><Reference URI=\"#manifest-payload\"><DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/><DigestValue>keep-manifest-digest</DigestValue></Reference></Manifest></Object></Signature>",
+    );
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">hello</payload><manifest-payload ID=\"manifest-payload\">manifest</manifest-payload></root>",
+        &template,
+    )
+    .expect("append signature");
+
+    let filled = fill_reference_digest_values(&xml).expect("fill only SignedInfo digest values");
+
+    assert!(filled.contains("<DigestValue>keep-manifest-digest</DigestValue>"));
+    assert_reference_digests_verify(&filled);
+}
+
+#[test]
 fn rejects_reference_without_uri() {
     // External/object reference support is not implicit: signing must know what
     // bytes are being digested, so an omitted URI fails before mutation.
