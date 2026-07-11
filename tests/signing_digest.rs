@@ -302,6 +302,136 @@ fn key_info_writer_requires_direct_template_placeholder() {
 }
 
 #[test]
+fn key_info_writer_rejects_duplicate_direct_template_placeholders() {
+    // Duplicate direct KeyInfo slots are ambiguous: signing must fail instead of
+    // choosing one and silently leaving another template placeholder behind.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let key_info_writer = X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+        "tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+    ))
+    .expect("RSA certificate fixture must parse");
+    let template = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        )
+        .build_template()
+        .expect("valid signature template")
+        .replace("</Signature>", "<KeyInfo/></Signature>");
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">hello</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+
+    let err = SignContext::new(&private_key)
+        .key_info_writer(&key_info_writer)
+        .sign_template(&xml)
+        .expect_err("duplicate direct KeyInfo placeholders must fail");
+
+    assert!(matches!(
+        err,
+        SigningError::XmlMutation(
+            xml_sec::xmldsig::mutation::XmlMutationError::ValueCountMismatch {
+                element: "KeyInfo",
+                expected: 2,
+                actual: 1,
+            }
+        )
+    ));
+}
+
+#[test]
+fn x509_key_info_writer_rejects_certificate_for_different_key() {
+    // A successful signing call must not produce a document that embeds an
+    // unrelated certificate which the default resolver will later reject.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let key_info_writer = X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime256v1-cert.pem",
+    ))
+    .expect("EC certificate fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+
+    let err = SignContext::new(&private_key)
+        .key_info_writer(&key_info_writer)
+        .sign_with_builder(
+            "<root><payload ID=\"payload\">hello</payload></root>",
+            &builder,
+        )
+        .expect_err("mismatched certificate must fail before output");
+
+    assert!(matches!(
+        err,
+        SigningError::KeyInfo(xml_sec::xmldsig::KeyInfoWriteError::CertificateKeyMismatch)
+    ));
+}
+
+#[test]
+fn sign_with_builder_targets_appended_signature_when_existing_key_info_is_present() {
+    // Signing an already-signed document should fill only the newly appended
+    // template. Existing Signature/KeyInfo blocks are immutable historical data.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let key_info_writer = X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+        "tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+    ))
+    .expect("RSA certificate fixture must parse");
+    let first_builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#first")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    let first_signed = SignContext::new(&private_key)
+        .key_info_writer(&key_info_writer)
+        .sign_with_builder(
+            "<root><payload ID=\"first\">one</payload><payload ID=\"second\">two</payload></root>",
+            &first_builder,
+        )
+        .expect("initial signing with KeyInfo must succeed");
+    let second_builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#second")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+
+    let second_signed = SignContext::new(&private_key)
+        .key_info_writer(&key_info_writer)
+        .sign_with_builder(&first_signed, &second_builder)
+        .expect("existing Signature/KeyInfo must not block appended template signing");
+    let document = roxmltree::Document::parse(&second_signed).expect("signed XML must parse");
+    let signature_count = document
+        .descendants()
+        .filter(|node| {
+            node.is_element()
+                && node.tag_name().namespace() == Some("http://www.w3.org/2000/09/xmldsig#")
+                && node.tag_name().name() == "Signature"
+        })
+        .count();
+
+    assert_eq!(signature_count, 2);
+    assert_eq!(second_signed.matches("<X509Certificate>").count(), 2);
+    assert!(!second_signed.contains("<DigestValue></DigestValue>"));
+    assert!(!second_signed.contains("<SignatureValue></SignatureValue>"));
+}
+
+#[test]
 fn signing_fills_only_top_level_signature_value() {
     // Object payloads may contain SignatureValue-named XMLDSig elements. The
     // signing pass must fill only the direct child of the selected Signature.

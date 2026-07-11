@@ -8,7 +8,7 @@
 use base64::Engine;
 use getrandom::SysRng;
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
-use p256::pkcs8::DecodePrivateKey;
+use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey};
 use roxmltree::{Document, Node};
 use rsa::RsaPrivateKey;
@@ -148,6 +148,10 @@ pub enum SigningKeyError {
     /// The private-key signing operation failed.
     #[error("private-key signing operation failed")]
     SigningFailed,
+
+    /// Public-key encoding failed for a supported signing key.
+    #[error("failed to encode signing public key as SPKI DER")]
+    PublicKeyEncodingFailed,
 }
 
 /// Private key abstraction used by [`SignContext`].
@@ -158,6 +162,9 @@ pub trait SigningKey {
         algorithm: SignatureAlgorithm,
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError>;
+
+    /// Return the public key corresponding to this signing key as SPKI DER.
+    fn public_key_spki_der(&self) -> Result<Vec<u8>, SigningKeyError>;
 }
 
 /// Writes signing key metadata into a template `<KeyInfo>` element.
@@ -184,6 +191,14 @@ pub enum KeyInfoWriteError {
     /// DER bytes could not be decoded as one complete X.509 certificate.
     #[error("invalid X.509 certificate DER")]
     InvalidCertificateDer,
+
+    /// The signing key could not expose public-key material for validation.
+    #[error("signing key public-key extraction failed: {0}")]
+    SigningKey(#[from] SigningKeyError),
+
+    /// The configured certificate does not contain the signing key's public key.
+    #[error("X.509 certificate public key does not match signing key")]
+    CertificateKeyMismatch,
 }
 
 /// `<KeyInfo>` writer that embeds one DER X.509 certificate.
@@ -219,7 +234,17 @@ impl X509CertificateKeyInfoWriter {
 }
 
 impl KeyInfoWriter for X509CertificateKeyInfoWriter {
-    fn write_key_info(&self, _signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
+    fn write_key_info(&self, signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
+        let (rest, certificate) =
+            x509_parser::certificate::X509Certificate::from_der(&self.certificate_der)
+                .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
+        if !rest.is_empty() {
+            return Err(KeyInfoWriteError::InvalidCertificateDer);
+        }
+        if certificate.public_key().raw != signing_key.public_key_spki_der()? {
+            return Err(KeyInfoWriteError::CertificateKeyMismatch);
+        }
+
         let certificate_b64 =
             base64::engine::general_purpose::STANDARD.encode(&self.certificate_der);
         Ok(format!(
@@ -272,6 +297,14 @@ impl SigningKey for RsaSigningKey {
             }),
         }
     }
+
+    fn public_key_spki_der(&self) -> Result<Vec<u8>, SigningKeyError> {
+        self.key
+            .to_public_key()
+            .to_public_key_der()
+            .map(|doc| doc.as_bytes().to_vec())
+            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)
+    }
 }
 
 fn sign_rsa_pkcs1v15_with_rng(
@@ -321,6 +354,14 @@ impl SigningKey for EcdsaP256SigningKey {
             .map_err(|_| SigningKeyError::SigningFailed)?;
         Ok(signature.to_bytes().to_vec())
     }
+
+    fn public_key_spki_der(&self) -> Result<Vec<u8>, SigningKeyError> {
+        self.key
+            .verifying_key()
+            .to_public_key_der()
+            .map(|doc| doc.as_bytes().to_vec())
+            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)
+    }
 }
 
 /// ECDSA P-384 private key for XMLDSig signing.
@@ -359,6 +400,14 @@ impl SigningKey for EcdsaP384SigningKey {
             .try_sign(canonical_signed_info)
             .map_err(|_| SigningKeyError::SigningFailed)?;
         Ok(signature.to_bytes().to_vec())
+    }
+
+    fn public_key_spki_der(&self) -> Result<Vec<u8>, SigningKeyError> {
+        self.key
+            .verifying_key()
+            .to_public_key_der()
+            .map(|doc| doc.as_bytes().to_vec())
+            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)
     }
 }
 
@@ -425,14 +474,15 @@ struct SigningReference {
 
 /// Compute base64 digest values for every `<Reference>` in the signing template.
 ///
-/// References are processed in `<SignedInfo>` document order. The input must
-/// contain exactly one XMLDSig `<Signature>` element so an enveloped-signature
-/// transform cannot accidentally target the wrong signature subtree.
+/// References are processed in `<SignedInfo>` document order under the last
+/// XMLDSig `<Signature>` element. `sign_with_builder()` appends a new template
+/// at the end of the source root, so older signatures in an already-signed
+/// document must not become the signing target.
 pub fn compute_reference_digest_values(
     xml: &str,
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
     let doc = Document::parse(xml)?;
-    let signature = find_single_signature_node(&doc)?;
+    let signature = find_signing_signature_node(&doc)?;
     let signed_info = find_required_child(signature, "SignedInfo")?;
     let references = parse_signing_references(signed_info)?;
     let resolver = UriReferenceResolver::new(&doc);
@@ -470,7 +520,7 @@ pub fn fill_reference_digest_values(xml: &str) -> Result<String, SigningDigestEr
 
 fn canonicalize_signed_info(xml: &str) -> Result<(SignatureAlgorithm, Vec<u8>), SigningError> {
     let doc = Document::parse(xml).map_err(SigningDigestError::XmlParse)?;
-    let signature = find_single_signature_node(&doc).map_err(SigningError::Digest)?;
+    let signature = find_signing_signature_node(&doc).map_err(SigningError::Digest)?;
     let signed_info_node =
         find_required_child(signature, "SignedInfo").map_err(SigningError::Digest)?;
     let signed_info = parse_signed_info(signed_info_node)?;
@@ -500,25 +550,18 @@ fn parse_private_key_pem(private_key_pem: &str) -> Result<Vec<u8>, SigningKeyErr
     Ok(pem.contents)
 }
 
-fn find_single_signature_node<'a>(
+fn find_signing_signature_node<'a>(
     doc: &'a Document<'a>,
 ) -> Result<Node<'a, 'a>, SigningDigestError> {
-    let mut signatures = doc.descendants().filter(|node| {
-        node.is_element()
-            && node.tag_name().name() == "Signature"
-            && node.tag_name().namespace() == Some(XMLDSIG_NS)
-    });
-    let signature = signatures
-        .next()
+    doc.descendants()
+        .rfind(|node| {
+            node.is_element()
+                && node.tag_name().name() == "Signature"
+                && node.tag_name().namespace() == Some(XMLDSIG_NS)
+        })
         .ok_or(SigningDigestError::MissingElement {
             element: "Signature",
-        })?;
-    if signatures.next().is_some() {
-        return Err(SigningDigestError::InvalidStructure(
-            "expected exactly one <ds:Signature> element".into(),
-        ));
-    }
-    Ok(signature)
+        })
 }
 
 fn parse_signing_references(
