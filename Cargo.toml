@@ -15,7 +15,7 @@ readme = "README.md"
 [dependencies]
 # XML parsing
 roxmltree = { version = "0.21", features = ["positions"] }
-quick-xml = "0.38"
+quick-xml = "0.41"
 
 # Crypto
 rsa = { version = "0.10.0-rc.18", optional = true }
