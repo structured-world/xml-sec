@@ -6,9 +6,9 @@ use xml_sec::xmldsig::verify::process_all_references;
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, DsigStatus, EcdsaP256SigningKey, EcdsaP384SigningKey,
     KeyInfoWriter, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
-    SignatureBuilder, SigningDigestError, SigningError, Transform, X509CertificateKeyInfoWriter,
-    compute_reference_digest_values, fill_reference_digest_values, parse_key_info,
-    verify_signature_with_pem_key,
+    SignatureBuilder, SigningDigestError, SigningError, SigningKey, SigningKeyError,
+    SigningPublicKeyInfo, Transform, X509CertificateKeyInfoWriter, compute_reference_digest_values,
+    fill_reference_digest_values, parse_key_info, verify_signature_with_pem_key,
 };
 
 fn exclusive_c14n() -> C14nAlgorithm {
@@ -42,6 +42,147 @@ fn assert_reference_digests_verify(xml: &str) {
 
 fn read_fixture(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|err| panic!("failed to read {path}: {err}"))
+}
+
+#[test]
+fn rsa_signing_key_exposes_structured_public_key_info() {
+    // Public-key metadata must be available without reparsing the private key in
+    // each KeyInfo writer. RSA exposes SPKI plus normalized KeyValue fields.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let public_key_info = private_key
+        .public_key_info()
+        .expect("RSA public-key info must encode");
+
+    match public_key_info {
+        SigningPublicKeyInfo::Rsa {
+            spki_der,
+            modulus,
+            exponent,
+        } => {
+            assert!(!spki_der.is_empty());
+            assert_eq!(modulus.len(), 256);
+            assert_eq!(exponent, [1, 0, 1]);
+        }
+        SigningPublicKeyInfo::Ec { .. } => panic!("RSA key must expose RSA public-key info"),
+        _ => panic!("RSA key must expose known public-key info"),
+    }
+}
+
+#[test]
+fn ecdsa_signing_keys_expose_curve_public_key_info() {
+    // ECDSA metadata includes the named curve and uncompressed SEC1 point needed
+    // by XMLDSig 1.1 ECKeyValue writers.
+    let p256_key = EcdsaP256SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime256v1-key.pem",
+    ))
+    .expect("P-256 private key fixture must parse");
+    let p384_key = EcdsaP384SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime384v1-key.pem",
+    ))
+    .expect("P-384 private key fixture must parse");
+
+    for (public_key_info, expected_oid, expected_len) in [
+        (
+            p256_key
+                .public_key_info()
+                .expect("P-256 public-key info must encode"),
+            "1.2.840.10045.3.1.7",
+            65,
+        ),
+        (
+            p384_key
+                .public_key_info()
+                .expect("P-384 public-key info must encode"),
+            "1.3.132.0.34",
+            97,
+        ),
+    ] {
+        match public_key_info {
+            SigningPublicKeyInfo::Ec {
+                spki_der,
+                curve_oid,
+                public_key,
+            } => {
+                assert!(!spki_der.is_empty());
+                assert_eq!(curve_oid, expected_oid);
+                assert_eq!(public_key.len(), expected_len);
+                assert_eq!(public_key[0], 0x04);
+            }
+            SigningPublicKeyInfo::Rsa { .. } => panic!("EC key must expose EC public-key info"),
+            _ => panic!("EC key must expose known public-key info"),
+        }
+    }
+}
+
+#[test]
+fn signing_keys_reject_unsupported_signature_algorithms() {
+    // The trait abstraction must fail closed when the caller asks a key to
+    // produce an incompatible XMLDSig SignatureMethod.
+    let rsa_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let p256_key = EcdsaP256SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime256v1-key.pem",
+    ))
+    .expect("P-256 private key fixture must parse");
+    let p384_key = EcdsaP384SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime384v1-key.pem",
+    ))
+    .expect("P-384 private key fixture must parse");
+
+    for (result, expected_uri) in [
+        (
+            rsa_key.sign(SignatureAlgorithm::EcdsaP256Sha256, b"signed-info"),
+            SignatureAlgorithm::EcdsaP256Sha256.uri(),
+        ),
+        (
+            p256_key.sign(SignatureAlgorithm::RsaSha256, b"signed-info"),
+            SignatureAlgorithm::RsaSha256.uri(),
+        ),
+        (
+            p384_key.sign(SignatureAlgorithm::EcdsaP256Sha256, b"signed-info"),
+            SignatureAlgorithm::EcdsaP256Sha256.uri(),
+        ),
+    ] {
+        assert!(matches!(
+            result,
+            Err(SigningKeyError::UnsupportedAlgorithm { uri }) if uri == expected_uri
+        ));
+    }
+}
+
+#[test]
+fn x509_key_info_writer_uses_structured_public_key_info() {
+    struct PublicInfoFailingKey;
+
+    impl SigningKey for PublicInfoFailingKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            unreachable!("KeyInfo writer must not sign while serializing metadata");
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Err(SigningKeyError::PublicKeyEncodingFailed)
+        }
+    }
+
+    let certificate = X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+        "tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+    ))
+    .expect("RSA certificate fixture must parse");
+    let err = certificate
+        .write_key_info(&PublicInfoFailingKey)
+        .expect_err("writer must surface public-key info extraction failures");
+
+    assert!(matches!(
+        err,
+        xml_sec::xmldsig::KeyInfoWriteError::SigningKey(SigningKeyError::PublicKeyEncodingFailed)
+    ));
 }
 
 #[test]
