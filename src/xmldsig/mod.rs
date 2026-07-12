@@ -30,8 +30,9 @@ pub use parse::{
     X509DataInfo, find_signature_node, parse_key_info, parse_signed_info,
 };
 pub use sign::{
-    ComputedReferenceDigest, EcdsaP256SigningKey, EcdsaP384SigningKey, RsaSigningKey, SignContext,
-    SigningDigestError, SigningError, SigningKey, SigningKeyError, compute_reference_digest_values,
+    ComputedReferenceDigest, EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriteError,
+    KeyInfoWriter, RsaSigningKey, SignContext, SigningDigestError, SigningError, SigningKey,
+    SigningKeyError, X509CertificateKeyInfoWriter, compute_reference_digest_values,
     fill_reference_digest_values,
 };
 pub use signature::{
