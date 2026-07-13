@@ -15,6 +15,7 @@ commit_parsers = [
     { message = "^build", skip = true },
     { message = "^docs\\(ci\\)", skip = true },
     { message = "^docs\\(release\\)", skip = true },
+    { message = "^fix\\(release\\)", skip = true },
     { message = "^Merge", skip = true },
     { message = "^docs", group = "Documentation" },
     { message = "^feat", group = "Added" },
