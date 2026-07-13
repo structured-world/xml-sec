@@ -15,6 +15,7 @@ use rsa::RsaPrivateKey;
 use rsa::pkcs1v15::Signature as RsaPkcs1v15Signature;
 use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding, Signer};
+use rsa::traits::PublicKeyParts;
 use sha2::{Sha256, Sha384, Sha512};
 use std::collections::HashSet;
 use x509_parser::prelude::FromDer;
@@ -154,6 +155,40 @@ pub enum SigningKeyError {
     PublicKeyEncodingFailed,
 }
 
+/// Public key material corresponding to a private XMLDSig signing key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SigningPublicKeyInfo {
+    /// RSA public key with DER SubjectPublicKeyInfo and normalized parameters.
+    Rsa {
+        /// DER-encoded SubjectPublicKeyInfo bytes.
+        spki_der: Vec<u8>,
+        /// Unsigned big-endian RSA modulus (`n`), normalized without leading zeroes.
+        modulus: Vec<u8>,
+        /// Unsigned big-endian RSA public exponent (`e`), normalized without leading zeroes.
+        exponent: Vec<u8>,
+    },
+    /// EC public key with DER SubjectPublicKeyInfo and XMLDSig 1.1 KeyValue data.
+    Ec {
+        /// DER-encoded SubjectPublicKeyInfo bytes.
+        spki_der: Vec<u8>,
+        /// Bare named-curve OID, without the XMLDSig `urn:oid:` prefix.
+        curve_oid: &'static str,
+        /// Uncompressed SEC1 point (`0x04 || x || y`).
+        public_key: Vec<u8>,
+    },
+}
+
+impl SigningPublicKeyInfo {
+    /// Return DER-encoded SubjectPublicKeyInfo bytes for this public key.
+    #[must_use]
+    pub fn spki_der(&self) -> &[u8] {
+        match self {
+            Self::Rsa { spki_der, .. } | Self::Ec { spki_der, .. } => spki_der,
+        }
+    }
+}
+
 /// Private key abstraction used by [`SignContext`].
 pub trait SigningKey {
     /// Sign canonicalized `<SignedInfo>` bytes for the declared XMLDSig method.
@@ -163,8 +198,8 @@ pub trait SigningKey {
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError>;
 
-    /// Return the public key corresponding to this signing key as SPKI DER.
-    fn public_key_spki_der(&self) -> Result<Vec<u8>, SigningKeyError>;
+    /// Return structured public key material corresponding to this signing key.
+    fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError>;
 }
 
 /// Writes signing key metadata into a template `<KeyInfo>` element.
@@ -241,7 +276,8 @@ impl KeyInfoWriter for X509CertificateKeyInfoWriter {
         if !rest.is_empty() {
             return Err(KeyInfoWriteError::InvalidCertificateDer);
         }
-        if certificate.public_key().raw != signing_key.public_key_spki_der()? {
+        let signing_public_key = signing_key.public_key_info()?;
+        if certificate.public_key().raw != signing_public_key.spki_der() {
             return Err(KeyInfoWriteError::CertificateKeyMismatch);
         }
 
@@ -298,12 +334,17 @@ impl SigningKey for RsaSigningKey {
         }
     }
 
-    fn public_key_spki_der(&self) -> Result<Vec<u8>, SigningKeyError> {
-        self.key
-            .to_public_key()
+    fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+        let public_key = self.key.to_public_key();
+        let spki_der = public_key
             .to_public_key_der()
             .map(|doc| doc.as_bytes().to_vec())
-            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)
+            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)?;
+        Ok(SigningPublicKeyInfo::Rsa {
+            spki_der,
+            modulus: public_key.n().to_be_bytes_trimmed_vartime().into_vec(),
+            exponent: public_key.e().to_be_bytes_trimmed_vartime().into_vec(),
+        })
     }
 }
 
@@ -355,12 +396,17 @@ impl SigningKey for EcdsaP256SigningKey {
         Ok(signature.to_bytes().to_vec())
     }
 
-    fn public_key_spki_der(&self) -> Result<Vec<u8>, SigningKeyError> {
-        self.key
-            .verifying_key()
+    fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+        let verifying_key = self.key.verifying_key();
+        let spki_der = verifying_key
             .to_public_key_der()
             .map(|doc| doc.as_bytes().to_vec())
-            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)
+            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)?;
+        Ok(SigningPublicKeyInfo::Ec {
+            spki_der,
+            curve_oid: "1.2.840.10045.3.1.7",
+            public_key: verifying_key.to_sec1_point(false).as_bytes().to_vec(),
+        })
     }
 }
 
@@ -402,12 +448,17 @@ impl SigningKey for EcdsaP384SigningKey {
         Ok(signature.to_bytes().to_vec())
     }
 
-    fn public_key_spki_der(&self) -> Result<Vec<u8>, SigningKeyError> {
-        self.key
-            .verifying_key()
+    fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+        let verifying_key = self.key.verifying_key();
+        let spki_der = verifying_key
             .to_public_key_der()
             .map(|doc| doc.as_bytes().to_vec())
-            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)
+            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)?;
+        Ok(SigningPublicKeyInfo::Ec {
+            spki_der,
+            curve_oid: "1.3.132.0.34",
+            public_key: verifying_key.to_sec1_point(false).as_bytes().to_vec(),
+        })
     }
 }
 

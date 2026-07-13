@@ -2,11 +2,13 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
+    rebase-strategy: auto
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
   - package-ecosystem: github-actions
     directory: /
+    rebase-strategy: auto
     schedule:
       interval: weekly
     ignore:
