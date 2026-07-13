@@ -44,6 +44,16 @@ fn read_fixture(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|err| panic!("failed to read {path}: {err}"))
 }
 
+fn assert_signed_template_verifies(signed: &str, public_key_path: &str) {
+    let public_key_pem = read_fixture(public_key_path);
+    let verify_result = verify_signature_with_pem_key(signed, &public_key_pem, true)
+        .expect("signed donor template must verify without pipeline errors");
+
+    assert_eq!(verify_result.status, DsigStatus::Valid);
+    assert!(signed.contains("<SignatureValue>"));
+    assert!(!signed.contains("<DigestValue></DigestValue>"));
+}
+
 #[test]
 fn rsa_signing_key_exposes_structured_public_key_info() {
     // Public-key metadata must be available without reparsing the private key in
@@ -666,4 +676,71 @@ fn signs_ecdsa_p384_template_and_verifies_round_trip() {
     assert_eq!(verify_result.status, DsigStatus::Valid);
     assert!(signed.contains("<SignatureValue>"));
     assert!(!signed.contains("<DigestValue></DigestValue>"));
+}
+
+#[test]
+fn signs_rsa_donor_templates_and_verifies_round_trip() {
+    // These are xmlsec1's supported enveloping signing templates. They exercise
+    // template parsing, object dereference, digest fill, SignedInfo c14n, and
+    // RSA PKCS#1 v1.5 signing without relying on our SignatureBuilder output.
+    for (template_path, private_key_path, public_key_path) in [
+        (
+            "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl",
+            "tests/fixtures/keys/rsa/rsa-2048-key.pem",
+            "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem",
+        ),
+        (
+            "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha384-rsa-sha384.tmpl",
+            "tests/fixtures/keys/rsa/rsa-4096-key.pem",
+            "tests/fixtures/keys/rsa/rsa-4096-pubkey.pem",
+        ),
+        (
+            "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha512-rsa-sha512.tmpl",
+            "tests/fixtures/keys/rsa/rsa-4096-key.pem",
+            "tests/fixtures/keys/rsa/rsa-4096-pubkey.pem",
+        ),
+    ] {
+        let private_key = RsaSigningKey::from_pkcs8_pem(&read_fixture(private_key_path))
+            .expect("RSA private key fixture must parse");
+
+        let signed = SignContext::new(&private_key)
+            .sign_template(&read_fixture(template_path))
+            .expect("RSA donor template must sign");
+
+        assert_signed_template_verifies(&signed, public_key_path);
+    }
+}
+
+#[test]
+fn signs_ecdsa_donor_templates_and_verifies_round_trip() {
+    // The donor enveloped ECDSA templates include an XPath transform, which is
+    // intentionally blocked until XPath support lands. The enveloping templates
+    // cover the same ECDSA SignatureValue format without that blocked transform.
+    let p256_key = EcdsaP256SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime256v1-key.pem",
+    ))
+    .expect("P-256 private key fixture must parse");
+    let p256_signed = SignContext::new(&p256_key)
+        .sign_template(&read_fixture(
+            "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-ecdsa-sha256.tmpl",
+        ))
+        .expect("P-256 donor template must sign");
+    assert_signed_template_verifies(
+        &p256_signed,
+        "tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem",
+    );
+
+    let p384_key = EcdsaP384SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime384v1-key.pem",
+    ))
+    .expect("P-384 private key fixture must parse");
+    let p384_signed = SignContext::new(&p384_key)
+        .sign_template(&read_fixture(
+            "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha384-ecdsa-sha384.tmpl",
+        ))
+        .expect("P-384 donor template must sign");
+    assert_signed_template_verifies(
+        &p384_signed,
+        "tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem",
+    );
 }

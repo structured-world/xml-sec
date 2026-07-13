@@ -5,7 +5,7 @@ changelog_update = true
 git_tag_name = "v{{ version }}"
 publish = false
 release_always = false
-release_commits = "^(feat|fix|perf|refactor|docs)(\\([^()]+\\))?!?:"
+release_commits = "^(feat|fix|perf|refactor|docs)(\\((c14n|xmldsig|xmlenc|readme|test|ci|lint|review)\\))?!?:"
 
 [changelog]
 commit_parsers = [
@@ -14,6 +14,8 @@ commit_parsers = [
     { message = "^style", skip = true },
     { message = "^build", skip = true },
     { message = "^docs\\(ci\\)", skip = true },
+    { message = "^docs\\(release\\)", skip = true },
+    { message = "^fix\\(release\\)", skip = true },
     { message = "^Merge", skip = true },
     { message = "^docs", group = "Documentation" },
     { message = "^feat", group = "Added" },
