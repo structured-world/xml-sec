@@ -10,7 +10,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - *(xmldsig)* write x509 signing key info
-- *(xmldsig)* cover donor signing templates
 
 ### Fixed
 
