@@ -5,7 +5,7 @@ changelog_update = true
 git_tag_name = "v{{ version }}"
 publish = false
 release_always = false
-release_commits = "^(feat|fix|perf|refactor|docs)(\\(.+\\))?:"
+release_commits = "^(feat|fix|perf|refactor|docs)(\\([^()]+\\))?!?:"
 
 [changelog]
 commit_parsers = [
