@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(xmldsig)* write x509 signing key info
+- *(xmldsig)* cover donor signing templates
+
+### Fixed
+
+- *(xmldsig)* harden signing key info writer
+
 ## [0.1.8](https://github.com/structured-world/xml-sec/compare/v0.1.7...v0.1.8) - 2026-07-10
 
 ### Added
