@@ -89,7 +89,7 @@ fn sign_with_xmlsec1(
     let output = Command::new("xmlsec1")
         .arg("--sign")
         .arg("--add-id-attr")
-        .arg("ID")
+        .arg("Id")
         .arg(format!("--privkey-pem:{key_name}"))
         .arg(key_and_certificate)
         .arg("--output")

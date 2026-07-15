@@ -21,7 +21,9 @@ fn phaos_bad_digest_vector_rejects_inconsistent_embedded_x509_selectors() {
     // The Phaos fixture contains X509 selectors inconsistent with its embedded
     // certificate. KeyInfo consumers must reject that ambiguity before use.
     let xml = read_vector("signature-rsa-enveloped-bad-digest-val.xml");
+    let resolver = DefaultKeyResolver::default();
     let error = VerifyContext::new()
+        .key_resolver(&resolver)
         .verify(&xml)
         .expect_err("inconsistent X509Data must reject the vector");
 

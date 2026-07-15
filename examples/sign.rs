@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .transform(Transform::Enveloped)
                 .transform(Transform::C14n(c14n)),
         )
+        .key_info(true)
         .build_template()?;
 
     let signing_key = RsaSigningKey::from_pkcs8_pem(PRIVATE_KEY_PEM)?;
