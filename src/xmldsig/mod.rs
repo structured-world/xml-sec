@@ -31,6 +31,7 @@
 //!             .transform(Transform::Enveloped)
 //!             .transform(Transform::C14n(c14n)),
 //!     )
+//!     .key_info(true)
 //!     .build_template()?;
 //! let xml = xml_sec::xmldsig::mutation::append_signature_to_root(
 //!     "<Message ID=\"message\">hello</Message>",

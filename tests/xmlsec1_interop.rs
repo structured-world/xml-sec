@@ -55,13 +55,35 @@ fn signing_builder(algorithm: SignatureAlgorithm, digest: DigestAlgorithm) -> Si
     )
 }
 
+fn xmlsec1_is_available() -> bool {
+    Command::new("xmlsec1").arg("--version").output().is_ok()
+}
+
 fn signed_payload_xml(key: &dyn SigningKey, builder: &SignatureBuilder) -> String {
     SignContext::new(key)
         .sign_with_builder(
-            "<root><payload ID=\"payload\">external verifier contract</payload></root>",
+            "<root ID=\"payload\"><payload>external verifier contract</payload></root>",
             builder,
         )
         .expect("xml-sec must sign the XMLDSig payload")
+}
+
+#[test]
+fn interop_fixture_references_the_enveloped_root() {
+    // This CLI-independent check ensures the reciprocal tests cover excluding
+    // the appended Signature from the signed root node set.
+    let template = signing_builder(SignatureAlgorithm::RsaSha256, DigestAlgorithm::Sha256)
+        .build_template()
+        .expect("interop template must build");
+    let xml = xml_sec::xmldsig::mutation::append_signature_to_root(
+        "<root ID=\"payload\"><payload>external verifier contract</payload></root>",
+        &template,
+    )
+    .expect("interop fixture must append a signature");
+
+    assert!(xml.contains("URI=\"#payload\""));
+    assert!(xml.contains("<root ID=\"payload\""));
+    assert!(xml.contains("<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\""));
 }
 
 fn verify_with_xmlsec1(signed_xml: &str, public_key: &Path) -> std::process::Output {
@@ -125,6 +147,11 @@ fn assert_xmlsec1_accepts(signed_xml: &str, public_key: &str) {
 fn xmlsec1_verifies_rsa_sha256_signature_from_xml_sec() {
     // A separate implementation must accept the generated enveloped signature,
     // including its reference digest, exclusive C14N, and RSA SignatureValue.
+    if !xmlsec1_is_available() {
+        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        return;
+    }
+
     let key = RsaSigningKey::from_pkcs8_pem(
         &fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-key.pem")
             .expect("RSA private-key fixture must load"),
@@ -143,6 +170,11 @@ fn xmlsec1_verifies_rsa_sha256_signature_from_xml_sec() {
 fn xmlsec1_verifies_ecdsa_signatures_from_xml_sec() {
     // P-256 and P-384 prove that xml-sec emits XMLDSig raw r||s values that
     // xmlsec1 accepts for both supported ECDSA curve widths.
+    if !xmlsec1_is_available() {
+        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        return;
+    }
+
     let p256_key = EcdsaP256SigningKey::from_pkcs8_pem(
         &fs::read_to_string("tests/fixtures/keys/ec/ec-prime256v1-key.pem")
             .expect("P-256 private-key fixture must load"),
@@ -177,6 +209,11 @@ fn xmlsec1_verifies_ecdsa_signatures_from_xml_sec() {
 fn xmlsec1_rejects_tampered_signature_from_xml_sec() {
     // The external verifier must reject a changed signed payload, proving the
     // test is exercising validation rather than merely command invocation.
+    if !xmlsec1_is_available() {
+        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        return;
+    }
+
     let key = RsaSigningKey::from_pkcs8_pem(
         &fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-key.pem")
             .expect("RSA private-key fixture must load"),
@@ -204,6 +241,11 @@ fn xmlsec1_rejects_tampered_signature_from_xml_sec() {
 fn xml_sec_verifies_xmlsec1_signatures_with_embedded_certificates() {
     // xmlsec1 must create signatures that our full pipeline accepts through
     // the embedded X509Data resolver, not through a separately injected key.
+    if !xmlsec1_is_available() {
+        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        return;
+    }
+
     let resolver = DefaultKeyResolver::default();
     for (template, key_name, private_key, certificate) in [
         (
@@ -244,6 +286,11 @@ fn xml_sec_verifies_xmlsec1_signatures_with_embedded_certificates() {
 fn xml_sec_rejects_tampered_xmlsec1_signature_before_crypto_verification() {
     // Mutating the signed Object must fail reference validation before the
     // verifier reaches SignatureValue cryptography, matching XMLDSig fail-fast.
+    if !xmlsec1_is_available() {
+        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        return;
+    }
+
     let signed = sign_with_xmlsec1(
         Path::new("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl"),
         "TestKeyName-rsa-2048",
