@@ -17,7 +17,7 @@ Pure Rust XML Security library. Drop-in replacement for libxmlsec1.
 ## Features
 
 - **C14N** — XML Canonicalization (inclusive + exclusive, W3C compliant)
-- **XMLDSig** — XML Digital Signatures (verify pipeline + template signing with X.509 KeyInfo implemented; broader signing interop in progress)
+- **XMLDSig** — XML Digital Signatures (verify and signing pipelines, X.509 `KeyInfo`, and xmlsec1 CLI interoperability)
 - **XMLEnc** — XML Encryption (symmetric + asymmetric)
 - **X.509** — Certificate-based key extraction and validation
 
@@ -39,7 +39,7 @@ Currently implemented (core paths):
 - C14N 1.0, C14N 1.1, and Exclusive C14N
 - XMLDSig parsing, same-document URI dereference, transform chains, and digest verification
 - XMLDSig full verify pipeline (`SignedInfo` canonicalization + `SignatureValue` verification)
-- XMLDSig template signing pipeline (`DigestValue` fill + `SignedInfo` canonicalization + `SignatureValue` fill)
+- XMLDSig template signing pipeline (`DigestValue` fill + `SignedInfo` canonicalization + `SignatureValue` fill), including enveloped SAML Response templates
 - XMLDSig signing KeyInfo writer for embedded X.509 certificates
 - Built-in verification-key resolution from embedded X.509/DER/`KeyValue` sources and configured `KeyName`, X.509 subject, issuer/serial, SKI, or digest selectors
 - RSA PKCS#1 v1.5 verification helpers for SHA-1 / SHA-256 / SHA-384 / SHA-512
@@ -48,8 +48,29 @@ Currently implemented (core paths):
 - Opt-in X.509 certificate-chain validation with explicit trust anchors, validity checks, CA constraints, and CRLs
 
 Still in progress:
-- XMLDSig signing examples and broader donor/CLI interop coverage
+- Broader XMLDSig donor/CLI interop coverage
 - XMLEnc encryption/decryption pipeline
+
+## XMLDSig Usage
+
+`examples/sign.rs` builds an enveloped RSA-SHA256 signature with an embedded
+X.509 certificate. `examples/verify.rs` verifies a document through
+`DefaultKeyResolver` using that embedded certificate:
+
+```sh
+cargo run --example sign --all-features > signed.xml
+cargo run --example verify --all-features -- signed.xml
+```
+
+For production verification, configure `KeyResolverConfig` with explicit trust
+anchors when certificate-chain validation is required. A `Valid` status means
+the cryptographic and reference checks succeeded; `Invalid(reason)` means the
+document was processed successfully but did not validate.
+
+Malformed XMLDSig structure, unsupported algorithms, disallowed reference
+URIs, and inconsistent `KeyInfo` metadata are processing errors rather than
+validity statuses. Treat both `Invalid(reason)` and an API error as a rejected
+document; never continue an authentication flow after either outcome.
 
 Current toolchain target: latest stable Rust.
 Current MSRV: Rust 1.92.
