@@ -55,8 +55,37 @@ fn signing_builder(algorithm: SignatureAlgorithm, digest: DigestAlgorithm) -> Si
     )
 }
 
+fn xmlsec1_version_supports_interop(version: &str) -> bool {
+    version
+        .split_whitespace()
+        .find_map(|token| {
+            let mut components = token.split('.');
+            Some((
+                components.next()?.parse::<u16>().ok()?,
+                components.next()?.parse::<u16>().ok()?,
+            ))
+        })
+        .is_some_and(|(major, minor)| major > 1 || (major == 1 && minor >= 3))
+}
+
 fn xmlsec1_is_available() -> bool {
-    Command::new("xmlsec1").arg("--version").output().is_ok()
+    let Ok(output) = Command::new("xmlsec1").arg("--version").output() else {
+        return false;
+    };
+
+    output.status.success()
+        && std::str::from_utf8(&output.stdout).is_ok_and(xmlsec1_version_supports_interop)
+}
+
+#[test]
+fn xmlsec1_version_gate_requires_add_id_attr_support() {
+    assert!(xmlsec1_version_supports_interop("xmlsec1 1.3.0 (openssl)"));
+    assert!(xmlsec1_version_supports_interop("xmlsec1 1.3.12 (openssl)"));
+    assert!(xmlsec1_version_supports_interop("xmlsec1 2.0.0 (openssl)"));
+    assert!(!xmlsec1_version_supports_interop(
+        "xmlsec1 1.2.37 (openssl)"
+    ));
+    assert!(!xmlsec1_version_supports_interop("xmlsec1 unknown"));
 }
 
 fn signed_payload_xml(key: &dyn SigningKey, builder: &SignatureBuilder) -> String {

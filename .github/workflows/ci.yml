@@ -52,7 +52,7 @@ jobs:
       - name: Build pinned xmlsec1 for XMLDSig interop tests
         run: |
           sudo apt-get install --yes build-essential libltdl-dev libssl-dev libxml2-dev pkg-config
-          curl --fail --location --output xmlsec1.tar.gz "https://github.com/lsh123/xmlsec/releases/download/${XMLSEC1_VERSION}/xmlsec1-${XMLSEC1_VERSION}.tar.gz"
+          curl --fail --location --retry 3 --output xmlsec1.tar.gz "https://github.com/lsh123/xmlsec/releases/download/${XMLSEC1_VERSION}/xmlsec1-${XMLSEC1_VERSION}.tar.gz"
           echo "${XMLSEC1_SHA256}  xmlsec1.tar.gz" | sha256sum --check --strict
           tar --extract --file xmlsec1.tar.gz
           pushd "xmlsec1-${XMLSEC1_VERSION}"
