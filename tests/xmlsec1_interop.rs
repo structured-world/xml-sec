@@ -55,6 +55,7 @@ fn signing_builder(algorithm: SignatureAlgorithm, digest: DigestAlgorithm) -> Si
     )
 }
 
+// `--add-id-attr`, used by the reciprocal interop helpers below, was added in 1.3.8.
 fn xmlsec1_version_supports_interop(version: &str) -> bool {
     version
         .split_whitespace()
@@ -63,9 +64,10 @@ fn xmlsec1_version_supports_interop(version: &str) -> bool {
             Some((
                 components.next()?.parse::<u16>().ok()?,
                 components.next()?.parse::<u16>().ok()?,
+                components.next()?.parse::<u16>().ok()?,
             ))
         })
-        .is_some_and(|(major, minor)| major > 1 || (major == 1 && minor >= 3))
+        .is_some_and(|version| version >= (1, 3, 8))
 }
 
 fn xmlsec1_is_available() -> bool {
@@ -79,7 +81,9 @@ fn xmlsec1_is_available() -> bool {
 
 #[test]
 fn xmlsec1_version_gate_requires_add_id_attr_support() {
-    assert!(xmlsec1_version_supports_interop("xmlsec1 1.3.0 (openssl)"));
+    assert!(!xmlsec1_version_supports_interop("xmlsec1 1.3.0 (openssl)"));
+    assert!(!xmlsec1_version_supports_interop("xmlsec1 1.3.7 (openssl)"));
+    assert!(xmlsec1_version_supports_interop("xmlsec1 1.3.8 (openssl)"));
     assert!(xmlsec1_version_supports_interop("xmlsec1 1.3.12 (openssl)"));
     assert!(xmlsec1_version_supports_interop("xmlsec1 2.0.0 (openssl)"));
     assert!(!xmlsec1_version_supports_interop(
