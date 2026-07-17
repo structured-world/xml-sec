@@ -7,6 +7,48 @@
 //! - URI dereference: same-document references (`""`, `#id`, `#xpointer(/)`, `#xpointer(id('...'))`)
 //! - ID attribute resolution with configurable attribute names
 //! - Node set types for the transform pipeline
+//!
+//! ## Signing and verification
+//!
+//! Build an enveloped signature with a modern algorithm, then verify it with
+//! the embedded certificate. New signatures must use SHA-256 or stronger;
+//! SHA-1 remains verification-only for legacy interoperability.
+//!
+//! ```no_run
+//! use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+//! use xml_sec::xmldsig::{
+//!     DefaultKeyResolver, DigestAlgorithm, ReferenceBuilder, RsaSigningKey,
+//!     SignContext, SignatureAlgorithm, SignatureBuilder, Transform, VerifyContext,
+//!     X509CertificateKeyInfoWriter,
+//! };
+//!
+//! # fn example(private_key_pem: &str, certificate_pem: &str) -> Result<(), Box<dyn std::error::Error>> {
+//! let c14n = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
+//! let template = SignatureBuilder::new(c14n.clone(), SignatureAlgorithm::RsaSha256)
+//!     .add_reference(
+//!         ReferenceBuilder::new(DigestAlgorithm::Sha256)
+//!             .uri("#message")
+//!             .transform(Transform::Enveloped)
+//!             .transform(Transform::C14n(c14n)),
+//!     )
+//!     .key_info(true)
+//!     .build_template()?;
+//! let xml = xml_sec::xmldsig::mutation::append_signature_to_root(
+//!     "<Message ID=\"message\">hello</Message>",
+//!     &template,
+//! )?;
+//! let signing_key = RsaSigningKey::from_pkcs8_pem(private_key_pem)?;
+//! let key_info = X509CertificateKeyInfoWriter::from_pem(certificate_pem)?;
+//! let signed = SignContext::new(&signing_key)
+//!     .key_info_writer(&key_info)
+//!     .sign_template(&xml)?;
+//!
+//! let resolver = DefaultKeyResolver::default();
+//! let result = VerifyContext::new().key_resolver(&resolver).verify(&signed)?;
+//! assert!(matches!(result.status, xml_sec::xmldsig::DsigStatus::Valid));
+//! # Ok(())
+//! # }
+//! ```
 
 pub mod builder;
 pub mod digest;

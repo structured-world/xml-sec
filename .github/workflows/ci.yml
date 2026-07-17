@@ -8,6 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  XMLSEC1_VERSION: 1.3.12
+  XMLSEC1_SHA256: 24045199af12d93fe5fdbbbf7e386e823e4842071e9432e2b90ac108b889a923
 
 jobs:
   build-matrix:
@@ -45,6 +47,21 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: taiki-e/install-action@nextest
+      - name: Refresh apt package index
+        run: sudo apt-get update
+      - name: Build pinned xmlsec1 for XMLDSig interop tests
+        run: |
+          sudo apt-get install --yes build-essential libltdl-dev libssl-dev libxml2-dev pkg-config
+          curl --fail --location --retry 3 --output xmlsec1.tar.gz "https://github.com/lsh123/xmlsec/releases/download/${XMLSEC1_VERSION}/xmlsec1-${XMLSEC1_VERSION}.tar.gz"
+          echo "${XMLSEC1_SHA256}  xmlsec1.tar.gz" | sha256sum --check --strict
+          tar --extract --file xmlsec1.tar.gz
+          pushd "xmlsec1-${XMLSEC1_VERSION}"
+          ./configure --disable-static --with-openssl
+          make --jobs "$(nproc)"
+          sudo make install
+          popd
+          sudo ldconfig
+          xmlsec1 --version
       - uses: Swatinem/rust-cache@v2
       - run: cargo nextest run --all-features
       - run: cargo test --doc --all-features
