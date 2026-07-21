@@ -425,7 +425,7 @@ pub fn decrypt_data(
     resolver: &dyn DecryptionKeyResolver,
 ) -> Result<DecryptedContent, XmlEncError> {
     let algorithm = DataEncryptionAlgorithm::from_uri(&encrypted.encryption_method.algorithm)?;
-    let key = resolver.resolve_key(algorithm, encrypted.encrypted_key.as_ref())?;
+    let key = resolve_content_key(algorithm, &encrypted.encrypted_keys, resolver)?;
     validate_key_len(algorithm, &key)?;
     let ciphertext = STANDARD
         .decode(&encrypted.cipher_data.value)
@@ -437,6 +437,27 @@ pub fn decrypt_data(
         }
         Some(EncryptedDataType::Other(_)) | None => Ok(DecryptedContent::Bytes(plaintext)),
     }
+}
+
+fn resolve_content_key(
+    algorithm: DataEncryptionAlgorithm,
+    encrypted_keys: &[EncryptedKey],
+    resolver: &dyn DecryptionKeyResolver,
+) -> Result<Vec<u8>, XmlEncError> {
+    match resolver.resolve_key(algorithm, None) {
+        Ok(key) => return Ok(key),
+        Err(XmlEncError::KeyNotFound) => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut last_error = None;
+    for encrypted_key in encrypted_keys {
+        match resolver.resolve_key(algorithm, Some(encrypted_key)) {
+            Ok(key) => return Ok(key),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or(XmlEncError::KeyNotFound))
 }
 
 fn validate_key_len(algorithm: DataEncryptionAlgorithm, key: &[u8]) -> Result<(), XmlEncError> {

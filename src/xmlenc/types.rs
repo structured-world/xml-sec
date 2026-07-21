@@ -166,8 +166,8 @@ pub struct EncryptedData {
     pub key_name: Option<String>,
     /// Content-encryption method.
     pub encryption_method: EncryptionMethod,
-    /// Direct embedded session key, if one is present in `KeyInfo`.
-    pub encrypted_key: Option<EncryptedKey>,
+    /// Embedded recipient session keys in `KeyInfo` document order.
+    pub encrypted_keys: Vec<EncryptedKey>,
     /// Content ciphertext in base64 form.
     pub cipher_data: CipherData,
 }

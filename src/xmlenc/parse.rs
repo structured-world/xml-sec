@@ -10,7 +10,7 @@ use super::types::{
 
 struct ParsedKeyInfo {
     key_name: Option<String>,
-    encrypted_key: Option<EncryptedKey>,
+    encrypted_keys: Vec<EncryptedKey>,
 }
 
 /// Parse one `xenc:EncryptedData` document fragment.
@@ -31,7 +31,7 @@ pub(super) fn parse_encrypted_data_node(node: Node<'_, '_>) -> Result<EncryptedD
         }
         _ => ParsedKeyInfo {
             key_name: None,
-            encrypted_key: None,
+            encrypted_keys: Vec::new(),
         },
     };
 
@@ -48,7 +48,7 @@ pub(super) fn parse_encrypted_data_node(node: Node<'_, '_>) -> Result<EncryptedD
         encrypted_type: parse_type(node.attribute("Type")),
         key_name: key_info.key_name,
         encryption_method,
-        encrypted_key: key_info.encrypted_key,
+        encrypted_keys: key_info.encrypted_keys,
         cipher_data,
     })
 }
@@ -56,7 +56,7 @@ pub(super) fn parse_encrypted_data_node(node: Node<'_, '_>) -> Result<EncryptedD
 fn parse_key_info(node: Node<'_, '_>) -> Result<ParsedKeyInfo, XmlEncError> {
     require_element(node, XMLDSIG_NS, "KeyInfo")?;
     let mut key_name = None;
-    let mut encrypted_key = None;
+    let mut encrypted_keys = Vec::new();
     for child in node.children().filter(Node::is_element) {
         if child.has_tag_name((XMLDSIG_NS, "KeyName")) {
             if key_name.is_some() {
@@ -66,17 +66,12 @@ fn parse_key_info(node: Node<'_, '_>) -> Result<ParsedKeyInfo, XmlEncError> {
             }
             key_name = Some(parse_key_name(child)?);
         } else if child.has_tag_name((XMLENC_NS, "EncryptedKey")) {
-            if encrypted_key.is_some() {
-                return Err(XmlEncError::InvalidStructure(
-                    "KeyInfo contains more than one direct EncryptedKey".into(),
-                ));
-            }
-            encrypted_key = Some(parse_encrypted_key(child)?);
+            encrypted_keys.push(parse_encrypted_key(child)?);
         }
     }
     Ok(ParsedKeyInfo {
         key_name,
-        encrypted_key,
+        encrypted_keys,
     })
 }
 
@@ -463,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_namespaces_and_duplicate_encrypted_keys() {
+    fn rejects_wrong_namespaces_and_retains_recipient_keys() {
         // Local names alone are insufficient: accepting lookalike namespaces would
         // let an attacker change the data model interpreted by the decryptor.
         let wrong_namespace = DATA.replace(XMLENC_NS, "urn:not-xmlenc");
@@ -472,14 +467,23 @@ mod tests {
             Err(XmlEncError::InvalidStructure(_))
         ));
 
-        let encrypted_key = "<xenc:EncryptedKey><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey>";
-        let duplicate = format!(
-            "<xenc:EncryptedData xmlns:xenc=\"{XMLENC_NS}\" xmlns:ds=\"{XMLDSIG_NS}\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{encrypted_key}{encrypted_key}</ds:KeyInfo><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>"
+        let encrypted_key = |recipient: &str| format!(
+            "<xenc:EncryptedKey Recipient=\"{recipient}\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey>"
         );
-        assert!(matches!(
-            parse_encrypted_data(&duplicate),
-            Err(XmlEncError::InvalidStructure(_))
-        ));
+        let recipients = format!(
+            "<xenc:EncryptedData xmlns:xenc=\"{XMLENC_NS}\" xmlns:ds=\"{XMLDSIG_NS}\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{}{}</ds:KeyInfo><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>",
+            encrypted_key("alice"),
+            encrypted_key("bob")
+        );
+        let parsed = parse_encrypted_data(&recipients).expect("recipient keys must parse");
+        assert_eq!(
+            parsed
+                .encrypted_keys
+                .iter()
+                .filter_map(|key| key.recipient.as_deref())
+                .collect::<Vec<_>>(),
+            ["alice", "bob"]
+        );
     }
 
     #[test]
@@ -582,10 +586,14 @@ mod tests {
         );
         let parsed = parse_encrypted_data(&xml).expect("complete key metadata must parse");
         assert_eq!(parsed.key_name.as_deref(), Some("content-key"));
-        let encrypted_key = parsed.encrypted_key.expect("embedded key must be retained");
+        let encrypted_key = parsed
+            .encrypted_keys
+            .first()
+            .expect("embedded key must be retained");
         assert_eq!(encrypted_key.key_name.as_deref(), Some("wrapping-key"));
         let references = encrypted_key
             .reference_list
+            .as_ref()
             .expect("reference list must be retained");
         assert_eq!(references.data_references, ["#data-1"]);
         assert_eq!(references.key_references, ["#key-2"]);
@@ -600,7 +608,10 @@ mod tests {
         );
         let parsed = parse_encrypted_data(&xml).expect("key metadata must parse");
         assert_eq!(parsed.key_name.as_deref(), Some(" content-key "));
-        let encrypted_key = parsed.encrypted_key.expect("embedded key must be retained");
+        let encrypted_key = parsed
+            .encrypted_keys
+            .first()
+            .expect("embedded key must be retained");
         assert_eq!(encrypted_key.key_name.as_deref(), Some(" wrapping-key "));
         assert_eq!(
             encrypted_key.carried_key_name.as_deref(),
@@ -618,7 +629,8 @@ mod tests {
         let parsed = parse_encrypted_data(&xml).expect("one CarriedKeyName must parse");
         assert_eq!(
             parsed
-                .encrypted_key
+                .encrypted_keys
+                .first()
                 .expect("embedded key must be retained")
                 .carried_key_name
                 .as_deref(),
@@ -645,9 +657,11 @@ mod tests {
         let parsed = parse_encrypted_data(&xml).expect("certificate-only KeyInfo must parse");
         assert_eq!(
             parsed
-                .encrypted_key
+                .encrypted_keys
+                .first()
                 .expect("embedded key must be retained")
-                .key_name,
+                .key_name
+                .as_deref(),
             None
         );
     }
