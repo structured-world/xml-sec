@@ -63,11 +63,8 @@ impl DecryptionKeyResolver for SymmetricKeyDecryptor {
     fn resolve_key(
         &self,
         algorithm: DataEncryptionAlgorithm,
-        encrypted_key: Option<&EncryptedKey>,
+        _encrypted_key: Option<&EncryptedKey>,
     ) -> Result<Vec<u8>, XmlEncError> {
-        if encrypted_key.is_some() {
-            return Err(XmlEncError::KeyNotFound);
-        }
         validate_key_len(algorithm, &self.key)?;
         Ok(self.key.clone())
     }
