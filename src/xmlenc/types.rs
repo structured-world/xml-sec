@@ -18,6 +18,11 @@ pub const MAX_CIPHER_VALUE_BASE64_LEN: usize = 16 * 1024 * 1024;
 /// The limit leaves room for CBC/GCM framing while guaranteeing that the
 /// resulting base64 `CipherValue` fits the parser's input bound.
 pub const MAX_ENCRYPTION_PLAINTEXT_LEN: usize = (MAX_CIPHER_VALUE_BASE64_LEN / 4 * 3) - 32;
+/// Maximum caller-owned XML document size accepted for node encryption.
+///
+/// This separately bounds parser work while leaving room around a maximum-size
+/// selected plaintext element or content fragment.
+pub const MAX_ENCRYPTION_DOCUMENT_LEN: usize = MAX_CIPHER_VALUE_BASE64_LEN;
 /// Maximum number of independently wrapped copies of one content key.
 pub const MAX_ENCRYPTION_RECIPIENTS: usize = 64;
 /// Maximum byte length of one caller-controlled XML metadata value.
@@ -508,6 +513,14 @@ pub enum XmlEncError {
         /// Maximum accepted bytes.
         maximum: usize,
         /// Actual input bytes.
+        actual: usize,
+    },
+    /// Caller-owned XML exceeds the bounded document parser input size.
+    #[error("encryption document exceeds {maximum}-byte limit: got {actual} bytes")]
+    DocumentTooLarge {
+        /// Maximum accepted document bytes.
+        maximum: usize,
+        /// Actual document bytes.
         actual: usize,
     },
     /// More independently wrapped recipient keys were configured than allowed.

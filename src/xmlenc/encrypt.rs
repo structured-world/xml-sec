@@ -24,8 +24,8 @@ use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
 
 use super::types::{
-    MAX_ENCRYPTION_METADATA_LEN, MAX_ENCRYPTION_PLAINTEXT_LEN, MAX_ENCRYPTION_RECIPIENTS,
-    XMLDSIG_NS, XMLENC_NS, XMLENC11_NS,
+    MAX_ENCRYPTION_DOCUMENT_LEN, MAX_ENCRYPTION_METADATA_LEN, MAX_ENCRYPTION_PLAINTEXT_LEN,
+    MAX_ENCRYPTION_RECIPIENTS, XMLDSIG_NS, XMLENC_NS, XMLENC11_NS,
 };
 use super::{
     DataEncryptionAlgorithm, DocumentEncryptionOptions, EncryptedDataType, EncryptionRecipient,
@@ -971,6 +971,23 @@ mod tests {
                 .direct_key([0_u8; 16])
                 .encrypt_xml(&oversized_malformed),
             Err(XmlEncError::PlaintextTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn oversized_document_is_rejected_before_parsing() {
+        // The document API has a separate parser-input bound because the
+        // selected plaintext may be much smaller than its enclosing document.
+        let oversized_malformed = format!(
+            "<root>{}</unclosed>",
+            "x".repeat(MAX_ENCRYPTION_DOCUMENT_LEN)
+        );
+
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .encrypt_document(&oversized_malformed, DocumentEncryptionOptions::default()),
+            Err(XmlEncError::DocumentTooLarge { .. })
         ));
     }
 
