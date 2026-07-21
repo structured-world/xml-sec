@@ -594,6 +594,23 @@ mod tests {
     }
 
     #[test]
+    fn preserves_key_identifier_whitespace() {
+        // Key identifiers use exact string matching. Leading and trailing XML
+        // character data must not be normalized into a different key identity.
+        let xml = format!(
+            r#"<xenc:EncryptedData xmlns:xenc="{XMLENC_NS}" xmlns:ds="{XMLDSIG_NS}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><ds:KeyName> content-key </ds:KeyName><xenc:EncryptedKey><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes128"/><ds:KeyInfo><ds:KeyName> wrapping-key </ds:KeyName></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</xenc:CipherValue></xenc:CipherData><xenc:CarriedKeyName> transported-key </xenc:CarriedKeyName></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>"#
+        );
+        let parsed = parse_encrypted_data(&xml).expect("key metadata must parse");
+        assert_eq!(parsed.key_name.as_deref(), Some(" content-key "));
+        let encrypted_key = parsed.encrypted_key.expect("embedded key must be retained");
+        assert_eq!(encrypted_key.key_name.as_deref(), Some(" wrapping-key "));
+        assert_eq!(
+            encrypted_key.carried_key_name.as_deref(),
+            Some(" transported-key ")
+        );
+    }
+
+    #[test]
     fn accepts_one_carried_key_name_and_rejects_duplicates() {
         // CarriedKeyName is optional transported-key metadata after ReferenceList;
         // accepting more than one would violate EncryptedKey's content model.
