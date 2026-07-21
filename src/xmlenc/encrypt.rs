@@ -134,6 +134,7 @@ impl EncryptedDataBuilder {
         xml: &str,
         options: DocumentEncryptionOptions<'_>,
     ) -> Result<String, XmlEncError> {
+        validate_document_len(xml.len())?;
         let parsing_options = ParsingOptions {
             allow_dtd: options.allow_dtd,
             entity_resolver: None,
@@ -307,6 +308,16 @@ fn validate_plaintext_len(actual: usize) -> Result<(), XmlEncError> {
             actual,
         })
     }
+}
+
+fn validate_document_len(actual: usize) -> Result<(), XmlEncError> {
+    if actual > MAX_ENCRYPTION_DOCUMENT_LEN {
+        return Err(XmlEncError::DocumentTooLarge {
+            maximum: MAX_ENCRYPTION_DOCUMENT_LEN,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 fn validate_content_key(algorithm: DataEncryptionAlgorithm, key: &[u8]) -> Result<(), XmlEncError> {
