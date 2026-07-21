@@ -18,7 +18,7 @@ Pure Rust XML Security library. Drop-in replacement for libxmlsec1.
 
 - **C14N** — XML Canonicalization (inclusive + exclusive, W3C compliant)
 - **XMLDSig** — XML Digital Signatures (verify and signing pipelines, X.509 `KeyInfo`, and xmlsec1 CLI interoperability)
-- **XMLEnc** — XML Encryption decryption (direct, RSA-OAEP, and AES-KW keys)
+- **XMLEnc** — XML Encryption encrypt/decrypt pipelines (direct, RSA-OAEP, and AES-KW keys)
 - **X.509** — Certificate-based key extraction and validation
 
 ## Why?
@@ -46,12 +46,12 @@ Currently implemented (core paths):
 - ECDSA verification helpers for P-256/SHA-256 and P-384/SHA-384
 - RSA PKCS#1 v1.5 and ECDSA P-256/P-384 signing from PKCS#8 private keys
 - Opt-in X.509 certificate-chain validation with explicit trust anchors, validity checks, CA constraints, and CRLs
-- XMLEnc AES-128/256-CBC and AES-128/256-GCM decryption with direct keys,
-  RSA-OAEP key transport, and AES-128/256-KW key unwrapping
+- XMLEnc AES-128/256-CBC and AES-128/256-GCM encryption/decryption with direct
+  keys, RSA-OAEP key transport, AES-128/256-KW, multiple recipients, and
+  Element/Content document replacement
 
 Still in progress:
-- Broader XMLDSig donor/CLI interop coverage
-- XMLEnc encryption pipeline
+- Broader XMLDSig and XMLEnc donor/CLI interop coverage
 
 ## XMLDSig Usage
 
@@ -76,8 +76,48 @@ document; never continue an authentication flow after either outcome.
 
 ## XMLEnc Usage
 
-Enable the `xmlenc` feature, then decrypt either a standalone XML fragment or
-an `EncryptedData` value parsed once and retained by the caller:
+Enable the `xmlenc` feature. `EncryptedDataBuilder` can encrypt opaque bytes,
+one XML element, an XML content fragment, or a selected element in a complete
+document. This direct-key example creates a complete `EncryptedData` fragment
+and verifies it through the reciprocal decrypt path:
+
+```rust
+use xml_sec::xmlenc::{
+    DataEncryptionAlgorithm, DecryptedContent, EncryptedDataBuilder,
+    SymmetricKeyDecryptor, decrypt,
+};
+
+# fn example() -> Result<(), Box<dyn std::error::Error>> {
+let key = [0x42_u8; 16];
+let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+    .direct_key(key)
+    .direct_key_name("application-content-key")
+    .encrypt_xml("<secret>value</secret>")?;
+
+assert_eq!(
+    decrypt(
+        &encrypted.encrypted_data_xml,
+        &SymmetricKeyDecryptor::new(key),
+    )?,
+    DecryptedContent::Xml("<secret>value</secret>".into()),
+);
+# Ok(())
+# }
+```
+
+For recipient transport, add one or more `EncryptionRecipient::rsa_oaep`
+entries with recipient public keys, or use `recipient_aes_kw` with a shared
+KEK. A fresh content key is generated from the operating-system RNG and wrapped
+once per recipient. XMLEnc 1.1 RSA-OAEP defaults to SHA-256/MGF1-SHA-256;
+legacy SHA-1 OAEP must be selected explicitly.
+
+`encrypt_document` selects the root or an element by `Id`, `ID`, or `id`, then
+replaces either the complete element or only its child content according to
+`EncryptedDataType`. The caller retains ownership of the resulting XML string.
+See `examples/encrypt.rs` for RSA-OAEP document encryption.
+
+To decrypt either a standalone XML fragment or an `EncryptedData` value parsed
+once and retained by the caller:
 
 ```rust
 use xml_sec::xmlenc::{
@@ -98,8 +138,10 @@ match plaintext {
 ```
 
 `PrivateKeyDecryptor` unwraps embedded RSA-OAEP `EncryptedKey` values and
-`KekDecryptor` unwraps AES-KW values. Cipher references and unauthenticated
-external resource loading are rejected; only inline `CipherValue` is accepted.
+`KekDecryptor` unwraps AES-KW values. RSA PKCS#1 v1.5 transport, CipherReference,
+and unauthenticated external resource loading are rejected; only inline
+`CipherValue` is accepted. Encryption inputs and recipient counts are bounded
+before allocation.
 
 Use `decrypt_document` to replace one typed `EncryptedData` in a caller-owned
 XML string. Pass its `Id` when the document contains multiple encrypted
@@ -119,7 +161,7 @@ Current MSRV: Rust 1.92.
 | [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) | Partially implemented |
 | [Exclusive C14N](https://www.w3.org/TR/xml-exc-c14n/) | Partially implemented |
 | [XMLDSig](https://www.w3.org/TR/xmldsig-core1/) | Partially implemented |
-| [XMLEnc](https://www.w3.org/TR/xmlenc-core1/) | Decryption subset implemented |
+| [XMLEnc](https://www.w3.org/TR/xmlenc-core1/) | AES-CBC/GCM encryption and decryption subset implemented |
 
 ## License
 

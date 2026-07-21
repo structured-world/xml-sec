@@ -12,6 +12,10 @@ keywords = ["xml", "xmldsig", "xmlenc", "c14n", "saml"]
 categories = ["cryptography", "web-programming", "authentication"]
 readme = "README.md"
 
+[[example]]
+name = "encrypt"
+required-features = ["xmlenc"]
+
 [dependencies]
 # XML parsing
 roxmltree = { version = "0.21", features = ["positions"] }
@@ -64,7 +68,7 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:subtle",
     "dep:x509-parser",
 ]
-xmlenc = [             # XML Encryption decryption
+xmlenc = [             # XML Encryption (encrypt + decrypt)
     "dep:aes",
     "dep:aes-gcm",
     "dep:aes-kw",
