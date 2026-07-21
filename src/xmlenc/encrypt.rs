@@ -216,7 +216,7 @@ impl EncryptedDataBuilder {
             });
         }
         validate_metadata("EncryptedData Id", self.id.as_deref())?;
-        validate_metadata("direct KeyName", self.direct_key_name.as_deref())?;
+        validate_key_name("direct KeyName", self.direct_key_name.as_deref())?;
         for recipient in &self.recipients {
             match recipient {
                 EncryptionRecipient::RsaOaep {
@@ -226,7 +226,7 @@ impl EncryptedDataBuilder {
                     ..
                 } => {
                     validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
-                    validate_metadata("EncryptedKey KeyName", key_name.as_deref())?;
+                    validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
                     validate_metadata_len("OAEPparams", parameters.label.len())?;
                 }
                 EncryptionRecipient::AesKeyWrap {
@@ -235,7 +235,7 @@ impl EncryptedDataBuilder {
                     ..
                 } => {
                     validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
-                    validate_metadata("EncryptedKey KeyName", key_name.as_deref())?;
+                    validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
                 }
             }
         }
@@ -258,6 +258,15 @@ impl EncryptedDataBuilder {
 
 fn validate_metadata(field: &'static str, value: Option<&str>) -> Result<(), XmlEncError> {
     validate_metadata_len(field, value.map_or(0, str::len))
+}
+
+fn validate_key_name(field: &'static str, value: Option<&str>) -> Result<(), XmlEncError> {
+    if value.is_some_and(str::is_empty) {
+        return Err(XmlEncError::InvalidEncryptionConfig(format!(
+            "{field} must not be empty"
+        )));
+    }
+    validate_metadata(field, value)
 }
 
 fn validate_metadata_len(field: &'static str, actual: usize) -> Result<(), XmlEncError> {
