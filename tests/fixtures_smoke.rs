@@ -1,7 +1,6 @@
 //! Smoke tests verifying that donor test fixtures are present, readable,
-//! and structurally valid. These tests validate the P1-014a fixture setup
-//! so that downstream tasks (P1-014b, P1-018a, P1-019a, P1-020a, etc.)
-//! can rely on fixtures being available.
+//! and structurally valid. Downstream conformance tests rely on these
+//! fixture corpora remaining complete.
 
 use std::fs;
 use std::path::Path;
@@ -32,7 +31,7 @@ fn rsa_4096_key_files_are_valid_pem() {
     assert_pem_file(&dir.join("rsa-4096-pubkey.pem"), "PUBLIC KEY");
 }
 
-/// Verify RSA expired key triplet exists (needed for P2-025a negative tests).
+/// Verify the RSA expired key triplet used by negative tests exists.
 #[test]
 fn rsa_expired_key_files_are_valid_pem() {
     let dir = fixtures_dir().join("keys/rsa");
@@ -41,7 +40,7 @@ fn rsa_expired_key_files_are_valid_pem() {
     assert_pem_file(&dir.join("rsa-expired-pubkey.pem"), "PUBLIC KEY");
 }
 
-/// Verify revoked certificate CRL exists (needed for P2-005 chain verification).
+/// Verify the revoked-certificate CRL used by chain verification exists.
 #[test]
 fn rsa_revoked_crl_is_valid_pem() {
     let dir = fixtures_dir().join("keys/rsa");
@@ -170,16 +169,28 @@ fn c14n11_xml_base_input_present() {
 
 // ─── Fixture completeness summary ───────────────────────────────────────────
 
-/// Verify total fixture file count matches expected (guards against accidental deletion).
+/// Verify each fixture corpus remains complete.
+///
+/// Separate assertions prevent a newly added fixture in one corpus from hiding
+/// an accidental deletion in another corpus.
 #[test]
 fn fixture_file_count_matches_expected() {
-    let mut count = 0;
-    count_files_recursive(fixtures_dir(), &mut count);
-    assert_eq!(
-        count, 144,
-        "expected 144 fixture files total (23 keys + 41 c14n + 79 donor xmldsig + 1 saml); \
-         if you added/removed files, update this count"
-    );
+    let expected = [
+        ("keys", 24),
+        ("c14n", 41),
+        ("xmldsig", 78),
+        ("saml", 2),
+        ("xmlenc", 404),
+    ];
+
+    for (corpus, expected_count) in expected {
+        let path = fixtures_dir().join(corpus);
+        assert_eq!(
+            count_files(&path),
+            expected_count,
+            "fixture corpus {corpus} changed; verify the change is intentional and update the expected count"
+        );
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -219,4 +230,10 @@ fn count_files_recursive(dir: &Path, count: &mut usize) {
             *count += 1;
         }
     }
+}
+
+fn count_files(dir: &Path) -> usize {
+    let mut count = 0;
+    count_files_recursive(dir, &mut count);
+    count
 }
