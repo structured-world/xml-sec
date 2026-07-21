@@ -389,6 +389,31 @@ fn document_encryption_selects_one_id_and_preserves_surrounding_xml() {
 }
 
 #[test]
+fn content_encryption_preserves_cdata_with_closing_markers() {
+    // A `</` sequence inside CDATA must not be mistaken for the selected
+    // element's closing tag when calculating the content replacement range.
+    let key = [0x92; 16];
+    let document = "<root><target Id=\"chosen\"><![CDATA[</not-a-tag>]]></target></root>";
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .encryption_type(EncryptedDataType::Content)
+        .direct_key(key)
+        .encrypt_document(
+            document,
+            DocumentEncryptionOptions {
+                element_id: Some("chosen"),
+                allow_dtd: false,
+            },
+        )
+        .expect("CDATA content containing a closing marker must encrypt");
+
+    assert_eq!(
+        decrypt_document(&encrypted, None, &SymmetricKeyDecryptor::new(key))
+            .expect("CDATA content containing a closing marker must decrypt"),
+        document
+    );
+}
+
+#[test]
 fn saml_encrypted_assertion_round_trips_through_rsa_transport() {
     // A SAML EncryptedAssertion contains an XMLEnc EncryptedData child; this
     // verifies assertion namespaces, attributes, and subject data end to end.

@@ -708,6 +708,8 @@ fn element_content_boundaries(source: &str) -> Result<ContentBoundaries, XmlEncE
             start_tag_end: tag_end,
         });
     }
+    // `Node::range()` ends at this element's closing tag, so its `</` marker is
+    // necessarily the final one even when child text or CDATA contains `</`.
     let closing_start = source
         .rfind("</")
         .ok_or_else(|| XmlEncError::InvalidStructure("source element has no closing tag".into()))?;
