@@ -108,6 +108,8 @@ pub enum KeyWrapAlgorithm {
 pub struct EncryptionMethod {
     /// Algorithm URI from the mandatory `Algorithm` attribute.
     pub algorithm: String,
+    /// Optional explicit key size in bits.
+    pub key_size_bits: Option<usize>,
     /// Digest URI used by XML Encryption 1.1 OAEP.
     pub oaep_digest: Option<String>,
     /// MGF URI used by XML Encryption 1.1 OAEP.
@@ -138,6 +140,8 @@ pub struct EncryptedKey {
     pub cipher_data: CipherData,
     /// Optional references identifying data or keys associated with this key.
     pub reference_list: Option<ReferenceList>,
+    /// Optional name associated with the transported plaintext key.
+    pub carried_key_name: Option<String>,
 }
 
 /// References associated with an `EncryptedKey`.

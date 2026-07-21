@@ -20,8 +20,8 @@ use sha2::{Sha256, Sha384, Sha512};
 use super::parse::parse_encrypted_data_node;
 use super::types::XMLENC_NS;
 use super::{
-    DataEncryptionAlgorithm, DecryptedContent, EncryptedData, EncryptedKey, KeyTransportAlgorithm,
-    KeyWrapAlgorithm, XmlEncError, parse_encrypted_data,
+    DataEncryptionAlgorithm, DecryptedContent, EncryptedData, EncryptedDataType, EncryptedKey,
+    KeyTransportAlgorithm, KeyWrapAlgorithm, XmlEncError, parse_encrypted_data,
 };
 
 /// Supplies a content-encryption key for parsed XMLEnc data.
@@ -194,7 +194,8 @@ impl PrivateKeyDecryptor {
                     wrapped,
                 )
                 .map_err(rsa_error),
-            "http://www.w3.org/2001/04/xmldsig-more#sha384" => self
+            "http://www.w3.org/2001/04/xmlenc#sha384"
+            | "http://www.w3.org/2001/04/xmldsig-more#sha384" => self
                 .key
                 .decrypt_blinded(
                     &mut UnwrapErr(SysRng),
@@ -223,7 +224,8 @@ impl PrivateKeyDecryptor {
     ) -> Result<Vec<u8>, XmlEncError> {
         const SHA1: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
         const SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
-        const SHA384: &str = "http://www.w3.org/2001/04/xmldsig-more#sha384";
+        const SHA384: &str = "http://www.w3.org/2001/04/xmlenc#sha384";
+        const SHA384_COMPAT: &str = "http://www.w3.org/2001/04/xmldsig-more#sha384";
         const SHA512: &str = "http://www.w3.org/2001/04/xmlenc#sha512";
         const MGF1_SHA1: &str = "http://www.w3.org/2009/xmlenc11#mgf1sha1";
         const MGF1_SHA256: &str = "http://www.w3.org/2009/xmlenc11#mgf1sha256";
@@ -242,7 +244,11 @@ impl PrivateKeyDecryptor {
             };
         }
 
-        match (digest.unwrap_or(SHA1), mgf.unwrap_or(MGF1_SHA1)) {
+        let digest = match digest.unwrap_or(SHA1) {
+            SHA384_COMPAT => SHA384,
+            digest => digest,
+        };
+        match (digest, mgf.unwrap_or(MGF1_SHA1)) {
             (SHA1, MGF1_SHA1) => decrypt_with!(Sha1, Sha1),
             (SHA1, MGF1_SHA256) => decrypt_with!(Sha1, Sha256),
             (SHA1, MGF1_SHA384) => decrypt_with!(Sha1, Sha384),
@@ -342,8 +348,47 @@ pub fn decrypt_document_with_options(
     output.push_str(&xml[..range.start]);
     output.push_str(&plaintext);
     output.push_str(&xml[range.end..]);
-    Document::parse_with_options(&output, parsing_options())?;
+    let decrypted_document = Document::parse_with_options(&output, parsing_options())?;
+    if encrypted.encrypted_type == Some(EncryptedDataType::Element) {
+        validate_element_replacement(
+            &decrypted_document,
+            range.start,
+            range.start + plaintext.len(),
+        )?;
+    }
     Ok(output)
+}
+
+fn validate_element_replacement(
+    document: &Document<'_>,
+    replacement_start: usize,
+    replacement_end: usize,
+) -> Result<(), XmlEncError> {
+    let mut top_level_nodes = document.descendants().filter(|node| {
+        if node.is_root() {
+            return false;
+        }
+        let range = node.range();
+        if range.start < replacement_start || range.end > replacement_end {
+            return false;
+        }
+        !node.parent().is_some_and(|parent| {
+            if parent.is_root() {
+                return false;
+            }
+            let parent_range = parent.range();
+            parent_range.start >= replacement_start && parent_range.end <= replacement_end
+        })
+    });
+    if top_level_nodes.next().is_some_and(|node| node.is_element())
+        && top_level_nodes.next().is_none()
+    {
+        Ok(())
+    } else {
+        Err(XmlEncError::InvalidStructure(
+            "Element plaintext must contain exactly one element".into(),
+        ))
+    }
 }
 
 /// Decrypt an already parsed `EncryptedData` value.
@@ -556,6 +601,7 @@ mod tests {
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
                 algorithm: "http://www.w3.org/2001/04/xmlenc#kw-aes128".into(),
+                key_size_bits: None,
                 oaep_digest: None,
                 mgf_algorithm: None,
                 oaep_params: None,
@@ -564,6 +610,7 @@ mod tests {
                 value: STANDARD.encode(wrapped),
             },
             reference_list: None,
+            carried_key_name: None,
         };
         let resolved = KekDecryptor::new(kek)
             .resolve_key(DataEncryptionAlgorithm::Aes128Gcm, Some(&encrypted_key))
@@ -587,6 +634,7 @@ mod tests {
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
                 algorithm: "http://www.w3.org/2001/04/xmlenc#kw-aes128".into(),
+                key_size_bits: None,
                 oaep_digest: None,
                 mgf_algorithm: None,
                 oaep_params: None,
@@ -595,6 +643,7 @@ mod tests {
                 value: STANDARD.encode([0_u8; 24]),
             },
             reference_list: None,
+            carried_key_name: None,
         };
         assert!(matches!(
             KekDecryptor::new([0_u8; 16])
@@ -635,6 +684,7 @@ mod tests {
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
                 algorithm: "http://www.w3.org/2009/xmlenc11#rsa-oaep".into(),
+                key_size_bits: None,
                 oaep_digest: Some("http://www.w3.org/2001/04/xmlenc#sha256".into()),
                 mgf_algorithm: Some("http://www.w3.org/2009/xmlenc11#mgf1sha384".into()),
                 oaep_params: Some(label),
@@ -643,6 +693,7 @@ mod tests {
                 value: STANDARD.encode(wrapped),
             },
             reference_list: None,
+            carried_key_name: None,
         };
         let resolved = PrivateKeyDecryptor::new(private_key)
             .resolve_key(DataEncryptionAlgorithm::Aes128Gcm, Some(&encrypted_key))
@@ -672,6 +723,7 @@ mod tests {
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
                 algorithm: "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p".into(),
+                key_size_bits: None,
                 oaep_digest: Some("http://www.w3.org/2001/04/xmlenc#sha256".into()),
                 mgf_algorithm: None,
                 oaep_params: None,
@@ -680,11 +732,62 @@ mod tests {
                 value: STANDARD.encode(wrapped),
             },
             reference_list: None,
+            carried_key_name: None,
         };
         let resolved = PrivateKeyDecryptor::new(private_key)
             .resolve_key(DataEncryptionAlgorithm::Aes128Gcm, Some(&encrypted_key))
             .expect("legacy OAEP URI with SHA-256 must resolve");
         assert_eq!(resolved, session_key);
+    }
+
+    #[test]
+    fn decrypts_sha384_oaep_with_the_xmlenc_digest_uri() {
+        // XML Encryption 1.1 reserves xmlenc#sha384 for SHA-384. Exercise both
+        // OAEP algorithm URIs because the legacy form still fixes MGF1 to SHA-1.
+        let private_key = RsaPrivateKey::from_pkcs8_pem(include_str!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("RSA donor private key must parse");
+        let public_key = RsaPublicKey::from(&private_key);
+        let session_key = [9_u8; 16];
+        let digest = "http://www.w3.org/2001/04/xmlenc#sha384";
+
+        for (algorithm, mgf_algorithm) in [
+            ("http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p", None),
+            (
+                "http://www.w3.org/2009/xmlenc11#rsa-oaep",
+                Some("http://www.w3.org/2009/xmlenc11#mgf1sha1"),
+            ),
+        ] {
+            let wrapped = public_key
+                .encrypt(
+                    &mut ChaCha20Rng::from_seed([23_u8; 32]),
+                    Oaep::<Sha384, Sha1>::new_with_mgf_hash(),
+                    &session_key,
+                )
+                .expect("SHA-384 OAEP test wrapping must succeed");
+            let encrypted_key = EncryptedKey {
+                id: None,
+                recipient: None,
+                key_name: None,
+                encryption_method: super::super::EncryptionMethod {
+                    algorithm: algorithm.into(),
+                    key_size_bits: None,
+                    oaep_digest: Some(digest.into()),
+                    mgf_algorithm: mgf_algorithm.map(str::to_owned),
+                    oaep_params: None,
+                },
+                cipher_data: super::super::CipherData {
+                    value: STANDARD.encode(wrapped),
+                },
+                reference_list: None,
+                carried_key_name: None,
+            };
+            let resolved = PrivateKeyDecryptor::new(private_key.clone())
+                .resolve_key(DataEncryptionAlgorithm::Aes128Gcm, Some(&encrypted_key))
+                .expect("official XMLENC SHA-384 URI must resolve");
+            assert_eq!(resolved, session_key);
+        }
     }
 
     #[test]
@@ -701,6 +804,7 @@ mod tests {
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
                 algorithm: "http://www.w3.org/2009/xmlenc11#rsa-oaep".into(),
+                key_size_bits: None,
                 oaep_digest: Some("urn:unsupported:digest".into()),
                 mgf_algorithm: Some("http://www.w3.org/2009/xmlenc11#mgf1sha1".into()),
                 oaep_params: None,
@@ -709,6 +813,7 @@ mod tests {
                 value: STANDARD.encode([0_u8; 256]),
             },
             reference_list: None,
+            carried_key_name: None,
         };
         assert!(matches!(
             decryptor.resolve_key(DataEncryptionAlgorithm::Aes128Gcm, Some(&encrypted_key)),
@@ -817,6 +922,21 @@ mod tests {
             decrypt_document(&malformed, None, &SymmetricKeyDecryptor::new(key)),
             Err(XmlEncError::XmlParse(_))
         ));
+
+        for invalid_element in ["text-only", "<first/><second/>"] {
+            let encrypted = encrypted_gcm_element(
+                "http://www.w3.org/2001/04/xmlenc#Element",
+                invalid_element,
+                None,
+                false,
+                &key,
+            );
+            let document = format!("<root xmlns:xenc=\"{XMLENC_NS}\">{encrypted}</root>");
+            assert!(
+                decrypt_document(&document, None, &SymmetricKeyDecryptor::new(key)).is_err(),
+                "Element plaintext must contain exactly one element: {invalid_element}"
+            );
+        }
 
         let content = encrypted_gcm_element(
             "http://www.w3.org/2001/04/xmlenc#Content",

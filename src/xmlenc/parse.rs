@@ -106,6 +106,17 @@ fn parse_encrypted_key(node: Node<'_, '_>) -> Result<EncryptedKey, XmlEncError> 
     } else {
         None
     };
+    let carried_key_name = if children
+        .peek()
+        .is_some_and(|child| child.has_tag_name((XMLENC_NS, "CarriedKeyName")))
+    {
+        Some(parse_carried_key_name(next_required(
+            &mut children,
+            "CarriedKeyName",
+        )?)?)
+    } else {
+        None
+    };
     if children.next().is_some() {
         return Err(XmlEncError::InvalidStructure(
             "EncryptedKey has unexpected child after CipherData".into(),
@@ -118,7 +129,20 @@ fn parse_encrypted_key(node: Node<'_, '_>) -> Result<EncryptedKey, XmlEncError> 
         encryption_method,
         cipher_data,
         reference_list,
+        carried_key_name,
     })
+}
+
+fn parse_carried_key_name(node: Node<'_, '_>) -> Result<String, XmlEncError> {
+    require_element(node, XMLENC_NS, "CarriedKeyName")?;
+    let value = simple_text(node, "CarriedKeyName")?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(XmlEncError::InvalidStructure(
+            "CarriedKeyName is empty".into(),
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 fn parse_key_name_hint(node: Node<'_, '_>) -> Result<Option<String>, XmlEncError> {
@@ -202,8 +226,17 @@ fn parse_encryption_method(node: Node<'_, '_>) -> Result<EncryptionMethod, XmlEn
     let mut oaep_digest = None;
     let mut mgf_algorithm = None;
     let mut oaep_params = None;
+    let mut key_size_bits = None;
     for child in node.children().filter(Node::is_element) {
         match (child.tag_name().namespace(), child.tag_name().name()) {
+            (Some(XMLENC_NS), "KeySize")
+                if key_size_bits.is_none()
+                    && oaep_params.is_none()
+                    && oaep_digest.is_none()
+                    && mgf_algorithm.is_none() =>
+            {
+                key_size_bits = Some(parse_key_size(child)?);
+            }
             (Some(XMLENC_NS), "OAEPparams") if oaep_params.is_none() => {
                 oaep_params = Some(decode_base64_text(&simple_text(child, "OAEPparams")?)?);
             }
@@ -249,13 +282,47 @@ fn parse_encryption_method(node: Node<'_, '_>) -> Result<EncryptionMethod, XmlEn
             "MGF is only valid for XML Encryption 1.1 RSA-OAEP".into(),
         ));
     }
+    if let (Some(actual), Some(expected)) = (key_size_bits, fixed_aes_key_size(&algorithm))
+        && actual != expected
+    {
+        return Err(XmlEncError::InvalidStructure(format!(
+            "EncryptionMethod {algorithm} requires KeySize {expected}, got {actual}"
+        )));
+    }
 
     Ok(EncryptionMethod {
         algorithm,
+        key_size_bits,
         oaep_digest,
         mgf_algorithm,
         oaep_params,
     })
+}
+
+fn parse_key_size(node: Node<'_, '_>) -> Result<usize, XmlEncError> {
+    let value = simple_text(node, "KeySize")?;
+    let value = value.trim();
+    let bits = value
+        .parse::<usize>()
+        .map_err(|_| XmlEncError::InvalidStructure("KeySize must be a positive integer".into()))?;
+    if bits == 0 {
+        return Err(XmlEncError::InvalidStructure(
+            "KeySize must be a positive integer".into(),
+        ));
+    }
+    Ok(bits)
+}
+
+fn fixed_aes_key_size(algorithm: &str) -> Option<usize> {
+    match algorithm {
+        "http://www.w3.org/2001/04/xmlenc#aes128-cbc"
+        | "http://www.w3.org/2009/xmlenc11#aes128-gcm"
+        | "http://www.w3.org/2001/04/xmlenc#kw-aes128" => Some(128),
+        "http://www.w3.org/2001/04/xmlenc#aes256-cbc"
+        | "http://www.w3.org/2009/xmlenc11#aes256-gcm"
+        | "http://www.w3.org/2001/04/xmlenc#kw-aes256" => Some(256),
+        _ => None,
+    }
 }
 
 fn parse_cipher_data(node: Node<'_, '_>) -> Result<CipherData, XmlEncError> {
@@ -308,6 +375,11 @@ fn decode_base64_text(value: &str) -> Result<Vec<u8>, XmlEncError> {
 pub(super) fn normalize_base64(value: &str) -> Result<String, XmlEncError> {
     let mut normalized = String::with_capacity(value.len().min(MAX_CIPHER_VALUE_BASE64_LEN));
     for character in value.chars() {
+        if !character.is_ascii() {
+            return Err(XmlEncError::Base64(
+                "CipherValue contains non-ASCII data".into(),
+            ));
+        }
         if !character.is_ascii_whitespace() {
             if normalized.len() == MAX_CIPHER_VALUE_BASE64_LEN {
                 return Err(XmlEncError::Base64(format!(
@@ -442,6 +514,46 @@ mod tests {
     }
 
     #[test]
+    fn validates_explicit_key_size_for_supported_aes_methods() {
+        // KeySize is valid for every EncryptionMethod, but fixed-size AES URIs
+        // must reject a declaration that disagrees with the algorithm.
+        for (algorithm, bits) in [
+            ("http://www.w3.org/2001/04/xmlenc#aes128-cbc", 128),
+            ("http://www.w3.org/2001/04/xmlenc#aes256-cbc", 256),
+            ("http://www.w3.org/2009/xmlenc11#aes128-gcm", 128),
+            ("http://www.w3.org/2009/xmlenc11#aes256-gcm", 256),
+            ("http://www.w3.org/2001/04/xmlenc#kw-aes128", 128),
+            ("http://www.w3.org/2001/04/xmlenc#kw-aes256", 256),
+        ] {
+            let xml = format!(
+                "<xenc:EncryptionMethod xmlns:xenc=\"{XMLENC_NS}\" Algorithm=\"{algorithm}\"><xenc:KeySize>{bits}</xenc:KeySize></xenc:EncryptionMethod>"
+            );
+            let document = Document::parse(&xml).expect("test method must be XML");
+            let parsed = parse_encryption_method(document.root_element())
+                .expect("matching AES KeySize must parse");
+            assert_eq!(parsed.key_size_bits, Some(bits));
+
+            let inconsistent = xml.replace(&format!(">{bits}<"), ">192<");
+            let document = Document::parse(&inconsistent).expect("test method must be XML");
+            assert!(matches!(
+                parse_encryption_method(document.root_element()),
+                Err(XmlEncError::InvalidStructure(_))
+            ));
+        }
+
+        for key_size in ["128.0", "", "128</xenc:KeySize><xenc:KeySize>128"] {
+            let xml = format!(
+                "<xenc:EncryptionMethod xmlns:xenc=\"{XMLENC_NS}\" Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"><xenc:KeySize>{key_size}</xenc:KeySize></xenc:EncryptionMethod>"
+            );
+            let document = Document::parse(&xml).expect("test method must be XML");
+            assert!(matches!(
+                parse_encryption_method(document.root_element()),
+                Err(XmlEncError::InvalidStructure(_))
+            ));
+        }
+    }
+
+    #[test]
     fn retains_key_names_and_encrypted_key_reference_list() {
         // Key selection and reference metadata must survive parsing even though
         // sibling-key dereferencing remains the caller's responsibility.
@@ -457,6 +569,33 @@ mod tests {
             .expect("reference list must be retained");
         assert_eq!(references.data_references, ["#data-1"]);
         assert_eq!(references.key_references, ["#key-2"]);
+    }
+
+    #[test]
+    fn accepts_one_carried_key_name_and_rejects_duplicates() {
+        // CarriedKeyName is optional transported-key metadata after ReferenceList;
+        // accepting more than one would violate EncryptedKey's content model.
+        let xml = format!(
+            r##"<xenc:EncryptedData xmlns:xenc="{XMLENC_NS}" xmlns:ds="{XMLDSIG_NS}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><xenc:EncryptedKey><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes128"/><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</xenc:CipherValue></xenc:CipherData><xenc:ReferenceList><xenc:DataReference URI="#data-1"/></xenc:ReferenceList><xenc:CarriedKeyName>transported-key</xenc:CarriedKeyName></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>"##
+        );
+        let parsed = parse_encrypted_data(&xml).expect("one CarriedKeyName must parse");
+        assert_eq!(
+            parsed
+                .encrypted_key
+                .expect("embedded key must be retained")
+                .carried_key_name
+                .as_deref(),
+            Some("transported-key")
+        );
+
+        let duplicate = xml.replace(
+            "</xenc:EncryptedKey>",
+            "<xenc:CarriedKeyName>duplicate</xenc:CarriedKeyName></xenc:EncryptedKey>",
+        );
+        assert!(matches!(
+            parse_encrypted_data(&duplicate),
+            Err(XmlEncError::InvalidStructure(_))
+        ));
     }
 
     #[test]
@@ -503,6 +642,23 @@ mod tests {
         let oversized = "A".repeat(MAX_CIPHER_VALUE_BASE64_LEN + 1);
         assert!(matches!(
             normalize_base64(&oversized),
+            Err(XmlEncError::Base64(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_non_ascii_base64_before_it_can_cross_the_byte_bound() {
+        // Base64 is ASCII-only. Rejecting Unicode before insertion also prevents a
+        // multi-byte scalar from jumping from below the byte limit to above it.
+        assert!(matches!(
+            normalize_base64("YWJjéA=="),
+            Err(XmlEncError::Base64(_))
+        ));
+
+        let mut boundary = "A".repeat(MAX_CIPHER_VALUE_BASE64_LEN - 1);
+        boundary.push('é');
+        assert!(matches!(
+            normalize_base64(&boundary),
             Err(XmlEncError::Base64(_))
         ));
     }
