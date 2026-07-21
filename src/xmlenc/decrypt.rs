@@ -1001,6 +1001,27 @@ mod tests {
     }
 
     #[test]
+    fn accepts_whitespace_and_comments_around_element_plaintext() {
+        // Element serialization may carry harmless boundary whitespace/comments;
+        // they must be preserved while the fragment still contains one element.
+        let key = [0x34_u8; 16];
+        let plaintext = "\n<!--before--><secret/><!--after-->\n";
+        let encrypted = encrypted_gcm_element(
+            "http://www.w3.org/2001/04/xmlenc#Element",
+            plaintext,
+            None,
+            true,
+            &key,
+        );
+
+        assert_eq!(
+            decrypt_document(&encrypted, None, &SymmetricKeyDecryptor::new(key))
+                .expect("one element with boundary trivia must be accepted"),
+            plaintext
+        );
+    }
+
+    #[test]
     fn decrypts_unknown_and_empty_type_hints_as_opaque_bytes() {
         // Type is an application hint, not an algorithm constraint. Unknown and
         // empty values must not prevent decryption of otherwise valid binary data.
