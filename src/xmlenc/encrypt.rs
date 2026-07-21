@@ -947,6 +947,24 @@ mod tests {
     }
 
     #[test]
+    fn oversized_xml_is_rejected_before_parsing() {
+        // The input bound protects the parser and the Content wrapper
+        // allocation, so size must take precedence over malformed XML.
+        let oversized_malformed = format!(
+            "<child>{}</unclosed>",
+            "x".repeat(MAX_ENCRYPTION_PLAINTEXT_LEN)
+        );
+
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .encryption_type(EncryptedDataType::Content)
+                .direct_key([0_u8; 16])
+                .encrypt_xml(&oversized_malformed),
+            Err(XmlEncError::PlaintextTooLarge { .. })
+        ));
+    }
+
+    #[test]
     fn debug_output_redacts_symmetric_key_material() {
         let direct_key = b"direct-key-secret".to_vec();
         let kek = b"key-wrap-secret!".to_vec();
