@@ -560,6 +560,25 @@ mod tests {
 
     use super::*;
 
+    struct RecipientKeyResolver {
+        recipient: &'static str,
+        key: Vec<u8>,
+    }
+
+    impl DecryptionKeyResolver for RecipientKeyResolver {
+        fn resolve_key(
+            &self,
+            _algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+        ) -> Result<Vec<u8>, XmlEncError> {
+            if encrypted_key.and_then(|key| key.recipient.as_deref()) == Some(self.recipient) {
+                Ok(self.key.clone())
+            } else {
+                Err(XmlEncError::KeyNotFound)
+            }
+        }
+    }
+
     #[test]
     fn decrypts_gcm_and_rejects_tampering() {
         // Authentication must cover the complete ciphertext and tag before plaintext returns.
@@ -643,6 +662,40 @@ mod tests {
                 .resolve_key(DataEncryptionAlgorithm::Aes128Gcm, Some(&unrelated))
                 .expect("direct key must ignore unrelated embedded hints"),
             key
+        );
+    }
+
+    #[test]
+    fn decrypts_with_the_matching_recipient_key() {
+        // Multi-recipient KeyInfo must retain document order and continue after a
+        // resolver declines an unrelated key before accepting the intended one.
+        let key = [0x29_u8; 16];
+        let plaintext = "recipient-specific plaintext";
+        let encrypted = encrypted_gcm_element("", plaintext, None, true, &key);
+        let recipient_key = |recipient: &str| {
+            format!(
+                "<xenc:EncryptedKey Recipient=\"{recipient}\"><xenc:EncryptionMethod Algorithm=\"urn:test:recipient-key\"/><xenc:CipherData><xenc:CipherValue>YQ==</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey>"
+            )
+        };
+        let key_info = format!(
+            "<ds:KeyInfo xmlns:ds=\"{}\">{}{}</ds:KeyInfo>",
+            crate::xmlenc::types::XMLDSIG_NS,
+            recipient_key("alice"),
+            recipient_key("bob")
+        );
+        let xml = encrypted.replacen(
+            "<xenc:CipherData>",
+            &format!("{key_info}<xenc:CipherData>"),
+            1,
+        );
+        let resolver = RecipientKeyResolver {
+            recipient: "bob",
+            key: key.to_vec(),
+        };
+
+        assert_eq!(
+            decrypt(&xml, &resolver).expect("second recipient key must be tried"),
+            DecryptedContent::Bytes(plaintext.as_bytes().to_vec())
         );
     }
 
