@@ -1041,6 +1041,44 @@ mod tests {
     }
 
     #[test]
+    fn xml_forbidden_metadata_characters_are_rejected() {
+        // XML escaping cannot legalize forbidden XML 1.0 code points, so every
+        // caller-controlled attribute/text path must fail before serialization.
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .id("invalid\0id")
+                .encrypt_binary(b"data"),
+            Err(XmlEncError::InvalidEncryptionConfig(_))
+        ));
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .direct_key_name("invalid\0name")
+                .encrypt_binary(b"data"),
+            Err(XmlEncError::InvalidEncryptionConfig(_))
+        ));
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .add_recipient(
+                    EncryptionRecipient::aes_key_wrap([0_u8; 16], KeyWrapAlgorithm::AesKw128)
+                        .recipient("invalid\0recipient")
+                )
+                .encrypt_binary(b"data"),
+            Err(XmlEncError::InvalidEncryptionConfig(_))
+        ));
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .add_recipient(
+                    EncryptionRecipient::aes_key_wrap([0_u8; 16], KeyWrapAlgorithm::AesKw128)
+                        .key_name("invalid\0name")
+                )
+                .encrypt_binary(b"data"),
+            Err(XmlEncError::InvalidEncryptionConfig(_))
+        ));
+    }
+
+    #[test]
     fn debug_output_redacts_symmetric_key_material() {
         let direct_key = b"direct-key-secret".to_vec();
         let kek = b"key-wrap-secret!".to_vec();
