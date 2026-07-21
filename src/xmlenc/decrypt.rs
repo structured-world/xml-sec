@@ -619,6 +619,37 @@ mod tests {
     }
 
     #[test]
+    fn direct_symmetric_key_ignores_embedded_key_hints() {
+        // A caller-supplied content key is authoritative for this resolver;
+        // unrelated recipient hints must not disable direct-key decryption.
+        let key = [0x28_u8; 16];
+        let unrelated = EncryptedKey {
+            id: None,
+            recipient: Some("other-recipient".into()),
+            key_name: None,
+            encryption_method: super::super::EncryptionMethod {
+                algorithm: "urn:unrelated:key-transport".into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            cipher_data: super::super::CipherData {
+                value: STANDARD.encode([0_u8; 24]),
+            },
+            reference_list: None,
+            carried_key_name: None,
+        };
+
+        assert_eq!(
+            SymmetricKeyDecryptor::new(key)
+                .resolve_key(DataEncryptionAlgorithm::Aes128Gcm, Some(&unrelated))
+                .expect("direct key must ignore unrelated embedded hints"),
+            key
+        );
+    }
+
+    #[test]
     fn decrypts_session_key_wrapped_with_aes_kw() {
         // RFC 3394 unwrap must recover exactly the content algorithm's key length.
         let kek = [3_u8; 16];
