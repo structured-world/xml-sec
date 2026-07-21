@@ -467,9 +467,11 @@ mod tests {
             Err(XmlEncError::InvalidStructure(_))
         ));
 
-        let encrypted_key = |recipient: &str| format!(
-            "<xenc:EncryptedKey Recipient=\"{recipient}\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey>"
-        );
+        let encrypted_key = |recipient: &str| {
+            format!(
+                "<xenc:EncryptedKey Recipient=\"{recipient}\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes128\"/><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey>"
+            )
+        };
         let recipients = format!(
             "<xenc:EncryptedData xmlns:xenc=\"{XMLENC_NS}\" xmlns:ds=\"{XMLDSIG_NS}\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{}{}</ds:KeyInfo><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>",
             encrypted_key("alice"),
