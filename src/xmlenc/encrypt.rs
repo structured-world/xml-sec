@@ -258,7 +258,26 @@ impl EncryptedDataBuilder {
 }
 
 fn validate_metadata(field: &'static str, value: Option<&str>) -> Result<(), XmlEncError> {
+    if value.is_some_and(|value| !value.chars().all(is_xml_1_0_character)) {
+        return Err(XmlEncError::InvalidEncryptionConfig(format!(
+            "{field} contains a character forbidden by XML 1.0"
+        )));
+    }
     validate_metadata_len(field, value.map_or(0, str::len))
+}
+
+fn is_xml_1_0_character(character: char) -> bool {
+    // XML 1.0 Fifth Edition, production [2]. Rust `char` cannot represent the
+    // surrogate range between D7FF and E000, but the split keeps that exclusion explicit.
+    matches!(
+        character,
+        '\u{9}'
+            | '\u{A}'
+            | '\u{D}'
+            | '\u{20}'..='\u{D7FF}'
+            | '\u{E000}'..='\u{FFFD}'
+            | '\u{10000}'..='\u{10FFFF}'
+    )
 }
 
 fn validate_key_name(field: &'static str, value: Option<&str>) -> Result<(), XmlEncError> {
