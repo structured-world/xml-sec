@@ -67,6 +67,15 @@ fn parse_key_info(node: Node<'_, '_>) -> Result<ParsedKeyInfo, XmlEncError> {
             key_name = Some(parse_key_name(child)?);
         } else if child.has_tag_name((XMLENC_NS, "EncryptedKey")) {
             encrypted_keys.push(parse_encrypted_key(child)?);
+        } else if child.has_tag_name((XMLENC_NS, "AgreementMethod")) {
+            // Agreement methods require a separate key-derivation trust boundary.
+            // Fail on the declared URI instead of treating the present key as absent.
+            let algorithm = child
+                .attribute("Algorithm")
+                .ok_or(XmlEncError::MissingRequired(
+                    "AgreementMethod Algorithm attribute",
+                ))?;
+            return Err(XmlEncError::UnsupportedAlgorithm(algorithm.to_owned()));
         }
     }
     Ok(ParsedKeyInfo {
@@ -486,6 +495,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["alice", "bob"]
         );
+    }
+
+    #[test]
+    fn rejects_unsupported_key_agreement_explicitly() {
+        // AgreementMethod is outside the supported secure profile. Reporting its
+        // URI avoids misclassifying a present but unsupported key as missing.
+        let xml = format!(
+            r#"<xenc:EncryptedData xmlns:xenc="{XMLENC_NS}" xmlns:ds="{XMLDSIG_NS}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/><ds:KeyInfo><xenc:AgreementMethod Algorithm="http://www.w3.org/2001/04/xmlenc#dh"/></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>"#
+        );
+        assert!(matches!(
+            parse_encrypted_data(&xml),
+            Err(XmlEncError::UnsupportedAlgorithm(uri))
+                if uri == "http://www.w3.org/2001/04/xmlenc#dh"
+        ));
+
+        let missing_algorithm =
+            xml.replace(" Algorithm=\"http://www.w3.org/2001/04/xmlenc#dh\"", "");
+        assert!(matches!(
+            parse_encrypted_data(&missing_algorithm),
+            Err(XmlEncError::MissingRequired(
+                "AgreementMethod Algorithm attribute"
+            ))
+        ));
     }
 
     #[test]

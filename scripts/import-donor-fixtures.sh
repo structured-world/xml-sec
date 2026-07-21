@@ -24,6 +24,16 @@ for relative_path in "${fixture_paths[@]}"; do
     donor_path="${relative_path#xmlenc/}"
   fi
   target="$fixture_root/$relative_path"
-  mkdir -p "$(dirname "$target")"
-  install -m 0644 "$donor_root/$donor_path" "$target"
+  source="$donor_root/$donor_path"
+  if [[ -d "$source" ]]; then
+    while IFS= read -r -d '' donor_file; do
+      suffix="${donor_file#"$source/"}"
+      target_file="$target/$suffix"
+      mkdir -p "$(dirname "$target_file")"
+      install -m 0644 "$donor_file" "$target_file"
+    done < <(find "$source" -type f -print0)
+  else
+    mkdir -p "$(dirname "$target")"
+    install -m 0644 "$source" "$target"
+  fi
 done
