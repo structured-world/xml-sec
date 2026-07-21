@@ -33,22 +33,26 @@ pub use types::{
 
 fn has_single_element_with_boundary_trivia(parent: Node<'_, '_>) -> bool {
     let mut element_count = 0;
-    let valid_children = parent.children().all(|node| {
+    for node in parent.children() {
         if node.is_element() {
             element_count += 1;
-            true
+            if element_count > 1 {
+                return false;
+            }
         } else if node.is_comment() {
-            true
+            continue;
         } else if node.is_text() {
             // XML permits boundary whitespace around a document element; processing
             // instructions and every other node kind are unsafe replacement payloads.
-            node.text().is_some_and(|text| {
+            if !node.text().is_some_and(|text| {
                 text.chars()
                     .all(|character| matches!(character, ' ' | '\t' | '\n' | '\r'))
-            })
+            }) {
+                return false;
+            }
         } else {
-            false
+            return false;
         }
-    });
-    valid_children && element_count == 1
+    }
+    element_count == 1
 }
