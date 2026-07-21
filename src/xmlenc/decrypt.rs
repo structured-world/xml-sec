@@ -23,7 +23,8 @@ use super::parse::parse_encrypted_data_node;
 use super::types::XMLENC_NS;
 use super::{
     DataEncryptionAlgorithm, DecryptedContent, EncryptedData, EncryptedDataType, EncryptedKey,
-    KeyTransportAlgorithm, KeyWrapAlgorithm, XmlEncError, parse_encrypted_data,
+    KeyTransportAlgorithm, KeyWrapAlgorithm, XmlEncError, has_single_element_with_boundary_trivia,
+    parse_encrypted_data,
 };
 
 /// Supplies a content-encryption key for parsed XMLEnc data.
@@ -414,23 +415,7 @@ fn validate_plaintext_fragment(
     }
 
     if matches!(encrypted_type, Some(EncryptedDataType::Element)) {
-        let mut element_count = 0;
-        let valid_children = wrapper.children().all(|node| {
-            if node.is_element() {
-                element_count += 1;
-                true
-            } else if node.is_comment() {
-                true
-            } else if node.is_text() {
-                node.text().is_some_and(|text| {
-                    text.chars()
-                        .all(|character| matches!(character, ' ' | '\t' | '\n' | '\r'))
-                })
-            } else {
-                false
-            }
-        });
-        if !valid_children || element_count != 1 {
+        if !has_single_element_with_boundary_trivia(wrapper) {
             return Err(XmlEncError::InvalidStructure(
                 "Element plaintext must contain exactly one element".into(),
             ));

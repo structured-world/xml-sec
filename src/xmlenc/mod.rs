@@ -11,6 +11,8 @@
 //! External `CipherReference` resources, RSA PKCS#1 v1.5 key transport, and
 //! unauthenticated legacy ciphers are intentionally outside this profile.
 
+use roxmltree::Node;
+
 mod decrypt;
 mod encrypt;
 mod parse;
@@ -28,3 +30,25 @@ pub use types::{
     EncryptionResult, KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm, ReferenceList,
     ReplacementMode, RsaOaepParameters, XmlEncError,
 };
+
+fn has_single_element_with_boundary_trivia(parent: Node<'_, '_>) -> bool {
+    let mut element_count = 0;
+    let valid_children = parent.children().all(|node| {
+        if node.is_element() {
+            element_count += 1;
+            true
+        } else if node.is_comment() {
+            true
+        } else if node.is_text() {
+            // XML permits boundary whitespace around a document element; processing
+            // instructions and every other node kind are unsafe replacement payloads.
+            node.text().is_some_and(|text| {
+                text.chars()
+                    .all(|character| matches!(character, ' ' | '\t' | '\n' | '\r'))
+            })
+        } else {
+            false
+        }
+    });
+    valid_children && element_count == 1
+}

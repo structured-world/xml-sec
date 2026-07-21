@@ -30,7 +30,7 @@ use super::types::{
 use super::{
     DataEncryptionAlgorithm, DocumentEncryptionOptions, EncryptedDataType, EncryptionRecipient,
     EncryptionResult, KeyWrapAlgorithm, OaepDigestAlgorithm, ReplacementMode, RsaOaepParameters,
-    XmlEncError,
+    XmlEncError, has_single_element_with_boundary_trivia,
 };
 
 const XML_WHITESPACE: &[char] = &[' ', '\t', '\n', '\r'];
@@ -675,7 +675,7 @@ fn validate_xml_plaintext(
     match encrypted_type {
         EncryptedDataType::Element => {
             let document = Document::parse(xml)?;
-            if document.root().children().filter(Node::is_element).count() != 1 {
+            if !has_single_element_with_boundary_trivia(document.root()) {
                 return Err(XmlEncError::InvalidStructure(
                     "Element plaintext must contain exactly one element".into(),
                 ));
