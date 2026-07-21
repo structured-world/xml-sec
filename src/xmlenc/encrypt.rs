@@ -118,6 +118,7 @@ impl EncryptedDataBuilder {
 
     /// Encrypt one complete XML element or an XML content fragment.
     pub fn encrypt_xml(&self, xml: &str) -> Result<EncryptionResult, XmlEncError> {
+        validate_plaintext_len(xml.len())?;
         validate_xml_plaintext(xml, &self.encrypted_type)?;
         self.encrypt_payload(xml.as_bytes(), Some(self.encrypted_type.clone()))
     }
