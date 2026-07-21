@@ -1003,6 +1003,22 @@ mod tests {
     }
 
     #[test]
+    fn element_plaintext_enforces_replacement_node_contract() {
+        // Element ciphertext must be safe for the reciprocal document replacement:
+        // boundary whitespace/comments are harmless, but processing instructions are not.
+        let builder =
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm).direct_key([0_u8; 16]);
+        builder
+            .encrypt_xml("\n<!--before--><secret/><!--after-->\n")
+            .expect("one element with boundary trivia must be accepted");
+
+        assert!(matches!(
+            builder.encrypt_xml("<?target value?><secret/>"),
+            Err(XmlEncError::InvalidStructure(_))
+        ));
+    }
+
+    #[test]
     fn empty_key_names_are_rejected_before_serialization() {
         // The reciprocal parser rejects empty KeyName elements, so encryption
         // must not emit output that its own decrypt pipeline cannot consume.
