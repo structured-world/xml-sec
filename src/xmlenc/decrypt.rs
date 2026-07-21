@@ -409,8 +409,23 @@ fn validate_plaintext_fragment(
     }
 
     if matches!(encrypted_type, Some(EncryptedDataType::Element)) {
-        let mut children = wrapper.children();
-        if !children.next().is_some_and(|node| node.is_element()) || children.next().is_some() {
+        let mut element_count = 0;
+        let valid_children = wrapper.children().all(|node| {
+            if node.is_element() {
+                element_count += 1;
+                true
+            } else if node.is_comment() {
+                true
+            } else if node.is_text() {
+                node.text().is_some_and(|text| {
+                    text.chars()
+                        .all(|character| matches!(character, ' ' | '\t' | '\n' | '\r'))
+                })
+            } else {
+                false
+            }
+        });
+        if !valid_children || element_count != 1 {
             return Err(XmlEncError::InvalidStructure(
                 "Element plaintext must contain exactly one element".into(),
             ));
