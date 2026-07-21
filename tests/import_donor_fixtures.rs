@@ -69,3 +69,38 @@ fn directory_import_removes_files_deleted_by_the_donor() {
         "directory import must remove fixtures deleted by the donor"
     );
 }
+
+#[test]
+fn directory_import_rejects_paths_that_escape_the_fixture_root() {
+    // Directory synchronization removes its destination before copying. Reject
+    // traversal before that step so only repository fixture trees are mutable.
+    let root = TestDirectory::new();
+    let scripts = root.path().join("scripts");
+    let donor_escape = root.path().join("escape");
+    let target_escape = root.path().join("tests/fixtures/escape");
+    std::fs::create_dir_all(&scripts).expect("scripts directory must be creatable");
+    std::fs::create_dir_all(&donor_escape).expect("donor directory must be creatable");
+    std::fs::create_dir_all(&target_escape).expect("fixture directory must be creatable");
+    std::fs::copy(
+        "scripts/import-donor-fixtures.sh",
+        scripts.join("import-donor-fixtures.sh"),
+    )
+    .expect("import script must be copied into the isolated repository");
+    std::fs::write(donor_escape.join("replacement.xml"), "<replacement/>")
+        .expect("donor fixture must be writable");
+    std::fs::write(target_escape.join("sentinel.xml"), "<sentinel/>")
+        .expect("sentinel fixture must be writable");
+
+    let status = Command::new("bash")
+        .arg(scripts.join("import-donor-fixtures.sh"))
+        .arg("xmlenc/../escape")
+        .env("XMLSEC_DONOR_ROOT", root.path().join("donor"))
+        .status()
+        .expect("fixture import script must run");
+
+    assert!(!status.success(), "path traversal must be rejected");
+    assert!(
+        target_escape.join("sentinel.xml").exists(),
+        "rejected paths must not mutate files outside their corpus"
+    );
+}

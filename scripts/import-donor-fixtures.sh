@@ -19,13 +19,25 @@ if (( ${#fixture_paths[@]} == 0 )); then
 fi
 
 for relative_path in "${fixture_paths[@]}"; do
-  donor_path="${relative_path#xmldsig/}"
-  if [[ "$relative_path" == xmlenc/* ]]; then
-    donor_path="${relative_path#xmlenc/}"
+  case "$relative_path" in
+    xmldsig/*) donor_path="${relative_path#xmldsig/}" ;;
+    xmlenc/*) donor_path="${relative_path#xmlenc/}" ;;
+    *)
+      printf 'fixture path must start with xmldsig/ or xmlenc/: %s\n' "$relative_path" >&2
+      exit 1
+      ;;
+  esac
+  if [[ -z "$donor_path" || "/$donor_path/" == *"/../"* ]]; then
+    printf 'fixture path must not be empty or contain ..: %s\n' "$relative_path" >&2
+    exit 1
   fi
   target="$fixture_root/$relative_path"
   source="$donor_root/$donor_path"
   if [[ -d "$source" ]]; then
+    # A directory argument represents a complete donor snapshot. Recreate the
+    # destination so upstream deletions cannot leave stale tracked fixtures.
+    rm -rf "$target"
+    mkdir -p "$target"
     while IFS= read -r -d '' donor_file; do
       suffix="${donor_file#"$source/"}"
       target_file="$target/$suffix"
