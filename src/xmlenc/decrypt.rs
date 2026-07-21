@@ -414,12 +414,12 @@ fn validate_plaintext_fragment(
         ));
     }
 
-    if matches!(encrypted_type, Some(EncryptedDataType::Element)) {
-        if !has_single_element_with_boundary_trivia(wrapper) {
-            return Err(XmlEncError::InvalidStructure(
-                "Element plaintext must contain exactly one element".into(),
-            ));
-        }
+    if matches!(encrypted_type, Some(EncryptedDataType::Element))
+        && !has_single_element_with_boundary_trivia(wrapper)
+    {
+        return Err(XmlEncError::InvalidStructure(
+            "Element plaintext must contain exactly one element".into(),
+        ));
     }
     Ok(())
 }
