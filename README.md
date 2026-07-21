@@ -18,7 +18,7 @@ Pure Rust XML Security library. Drop-in replacement for libxmlsec1.
 
 - **C14N** — XML Canonicalization (inclusive + exclusive, W3C compliant)
 - **XMLDSig** — XML Digital Signatures (verify and signing pipelines, X.509 `KeyInfo`, and xmlsec1 CLI interoperability)
-- **XMLEnc** — XML Encryption (symmetric + asymmetric)
+- **XMLEnc** — XML Encryption decryption (direct, RSA-OAEP, and AES-KW keys)
 - **X.509** — Certificate-based key extraction and validation
 
 ## Why?
@@ -46,10 +46,12 @@ Currently implemented (core paths):
 - ECDSA verification helpers for P-256/SHA-256 and P-384/SHA-384
 - RSA PKCS#1 v1.5 and ECDSA P-256/P-384 signing from PKCS#8 private keys
 - Opt-in X.509 certificate-chain validation with explicit trust anchors, validity checks, CA constraints, and CRLs
+- XMLEnc AES-128/256-CBC and AES-128/256-GCM decryption with direct keys,
+  RSA-OAEP key transport, and AES-128/256-KW key unwrapping
 
 Still in progress:
 - Broader XMLDSig donor/CLI interop coverage
-- XMLEnc encryption/decryption pipeline
+- XMLEnc encryption pipeline
 
 ## XMLDSig Usage
 
@@ -72,6 +74,40 @@ URIs, and inconsistent `KeyInfo` metadata are processing errors rather than
 validity statuses. Treat both `Invalid(reason)` and an API error as a rejected
 document; never continue an authentication flow after either outcome.
 
+## XMLEnc Usage
+
+Enable the `xmlenc` feature, then decrypt either a standalone XML fragment or
+an `EncryptedData` value parsed once and retained by the caller:
+
+```rust
+use xml_sec::xmlenc::{
+    DecryptedContent, SymmetricKeyDecryptor, decrypt_data, parse_encrypted_data,
+};
+
+# fn example(encrypted_xml: &str) -> Result<(), Box<dyn std::error::Error>> {
+let encrypted = parse_encrypted_data(encrypted_xml)?;
+let resolver = SymmetricKeyDecryptor::new([0_u8; 16]);
+let plaintext = decrypt_data(&encrypted, &resolver)?;
+
+match plaintext {
+    DecryptedContent::Xml(xml) => println!("{xml}"),
+    DecryptedContent::Bytes(bytes) => println!("{} plaintext bytes", bytes.len()),
+}
+# Ok(())
+# }
+```
+
+`PrivateKeyDecryptor` unwraps embedded RSA-OAEP `EncryptedKey` values and
+`KekDecryptor` unwraps AES-KW values. Cipher references and unauthenticated
+external resource loading are rejected; only inline `CipherValue` is accepted.
+
+Use `decrypt_document` to replace one typed `EncryptedData` in a caller-owned
+XML string. Pass its `Id` when the document contains multiple encrypted
+regions. DTD parsing remains disabled by default; legacy documents that need
+an internal DTD can opt in through `decrypt_document_with_options` and
+`DocumentDecryptionOptions`. That API never installs an external entity
+resolver.
+
 Current toolchain target: latest stable Rust.
 Current MSRV: Rust 1.92.
 
@@ -83,7 +119,7 @@ Current MSRV: Rust 1.92.
 | [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) | Partially implemented |
 | [Exclusive C14N](https://www.w3.org/TR/xml-exc-c14n/) | Partially implemented |
 | [XMLDSig](https://www.w3.org/TR/xmldsig-core1/) | Partially implemented |
-| [XMLEnc](https://www.w3.org/TR/xmlenc-core1/) | Planned |
+| [XMLEnc](https://www.w3.org/TR/xmlenc-core1/) | Decryption subset implemented |
 
 ## License
 

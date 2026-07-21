@@ -10,7 +10,7 @@ checkouts. Import a selected upstream file with the repository helper:
 
 ```sh
 scripts/import-donor-fixtures.sh \
-  xmldsig11-interop-2012/signature-enveloping-p256_sha256.xml
+  xmldsig/xmldsig11-interop-2012/signature-enveloping-p256_sha256.xml
 ```
 
 The helper preserves the path beneath `tests/fixtures/xmldsig/` and uses a

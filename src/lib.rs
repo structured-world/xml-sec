@@ -6,7 +6,7 @@
 //!
 //! - **C14N** — XML Canonicalization (inclusive + exclusive)
 //! - **XMLDSig** — XML Digital Signatures (sign + verify)
-//! - **XMLEnc** — XML Encryption (encrypt + decrypt)
+//! - **XMLEnc** — XML Encryption decryption
 //! - **X.509** — Certificate-based key extraction
 //!
 //! ## Quick Start
