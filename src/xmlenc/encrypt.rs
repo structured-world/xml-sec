@@ -458,6 +458,9 @@ fn wrap_rsa_oaep(
     let mut rng = SysRng;
     macro_rules! encrypt_with {
         ($digest:ty, $mgf:ty) => {
+            // Call `PaddingScheme` directly: it accepts `TryCryptoRng`, so a
+            // `SysRng` failure returns `rsa::Error::Rng` for the mapping below
+            // instead of entering RSA's infallible `CryptoRng` convenience API.
             Oaep::<$digest, $mgf>::new_with_mgf_hash_and_label(parameters.label.clone()).encrypt(
                 &mut rng,
                 public_key,
