@@ -45,7 +45,7 @@ pub(super) fn parse_encrypted_data_node(node: Node<'_, '_>) -> Result<EncryptedD
 
     Ok(EncryptedData {
         id: node.attribute("Id").map(str::to_owned),
-        encrypted_type: parse_type(node.attribute("Type"))?,
+        encrypted_type: parse_type(node.attribute("Type")),
         key_name: key_info.key_name,
         encryption_method,
         encrypted_key: key_info.encrypted_key,
@@ -353,19 +353,17 @@ fn simple_text(node: Node<'_, '_>, element_name: &str) -> Result<String, XmlEncE
         .collect())
 }
 
-fn parse_type(value: Option<&str>) -> Result<Option<EncryptedDataType>, XmlEncError> {
+fn parse_type(value: Option<&str>) -> Option<EncryptedDataType> {
     match value {
-        None => Ok(None),
-        Some("http://www.w3.org/2001/04/xmlenc#Element") => Ok(Some(EncryptedDataType::Element)),
-        Some("http://www.w3.org/2001/04/xmlenc#Content") => Ok(Some(EncryptedDataType::Content)),
-        Some(other) => Err(XmlEncError::InvalidStructure(format!(
-            "unsupported EncryptedData Type {other}"
-        ))),
+        None => None,
+        Some("http://www.w3.org/2001/04/xmlenc#Element") => Some(EncryptedDataType::Element),
+        Some("http://www.w3.org/2001/04/xmlenc#Content") => Some(EncryptedDataType::Content),
+        Some(other) => Some(EncryptedDataType::Other(other.to_owned())),
     }
 }
 
 fn decode_base64_text(value: &str) -> Result<Vec<u8>, XmlEncError> {
-    let normalized = normalize_base64(value)?;
+    let normalized = normalize_base64_with_empty(value, true)?;
     STANDARD
         .decode(normalized)
         .map_err(|error| XmlEncError::Base64(error.to_string()))
@@ -373,6 +371,10 @@ fn decode_base64_text(value: &str) -> Result<Vec<u8>, XmlEncError> {
 
 /// Normalize XML base64 whitespace while applying a pre-allocation bound.
 pub(super) fn normalize_base64(value: &str) -> Result<String, XmlEncError> {
+    normalize_base64_with_empty(value, false)
+}
+
+fn normalize_base64_with_empty(value: &str, allow_empty: bool) -> Result<String, XmlEncError> {
     let mut normalized = String::with_capacity(value.len().min(MAX_CIPHER_VALUE_BASE64_LEN));
     for character in value.chars() {
         if !character.is_ascii() {
@@ -389,7 +391,7 @@ pub(super) fn normalize_base64(value: &str) -> Result<String, XmlEncError> {
             normalized.push(character);
         }
     }
-    if normalized.is_empty() {
+    if normalized.is_empty() && !allow_empty {
         return Err(XmlEncError::Base64("CipherValue is empty".into()));
     }
     Ok(normalized)
@@ -510,6 +512,26 @@ mod tests {
         assert!(matches!(
             parse_encrypted_data(&oaep_on_aes),
             Err(XmlEncError::InvalidStructure(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_empty_oaep_params_as_an_explicit_empty_label() {
+        // base64Binary permits an empty lexical value. Preserve presence separately
+        // from absence because RSA-OAEP treats both as the same empty label bytes.
+        for params in ["", " \n\t "] {
+            let xml = format!(
+                "<xenc:EncryptionMethod xmlns:xenc=\"{XMLENC_NS}\" Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"><xenc:OAEPparams>{params}</xenc:OAEPparams></xenc:EncryptionMethod>"
+            );
+            let document = Document::parse(&xml).expect("test method must be XML");
+            let parsed = parse_encryption_method(document.root_element())
+                .expect("empty OAEPparams must decode as an empty label");
+            assert_eq!(parsed.oaep_params, Some(Vec::new()));
+        }
+
+        assert!(matches!(
+            normalize_base64(" \n\t "),
+            Err(XmlEncError::Base64(_))
         ));
     }
 

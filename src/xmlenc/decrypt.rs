@@ -298,8 +298,8 @@ pub fn decrypt(
 ///
 /// When `encrypted_data_id` is `None`, the document must contain exactly one
 /// `EncryptedData`. The decrypted value must declare either the XMLEnc `Element`
-/// or `Content` type. The returned document is parsed again before it is exposed,
-/// so malformed plaintext cannot produce an invalid XML result.
+/// or `Content` type. Plaintext is parsed inside a bounded replacement wrapper
+/// before insertion, and the returned document is parsed again before exposure.
 pub fn decrypt_document(
     xml: &str,
     encrypted_data_id: Option<&str>,
@@ -344,51 +344,82 @@ pub fn decrypt_document_with_options(
         return Err(XmlEncError::ReplacementRequiresXml);
     };
 
+    validate_plaintext_fragment(
+        xml,
+        range.start,
+        range.end,
+        &plaintext,
+        encrypted.encrypted_type.as_ref(),
+        options.allow_dtd,
+    )?;
+
     let mut output = String::with_capacity(xml.len() - range.len() + plaintext.len());
     output.push_str(&xml[..range.start]);
     output.push_str(&plaintext);
     output.push_str(&xml[range.end..]);
-    let decrypted_document = Document::parse_with_options(&output, parsing_options())?;
-    if encrypted.encrypted_type == Some(EncryptedDataType::Element) {
-        validate_element_replacement(
-            &decrypted_document,
-            range.start,
-            range.start + plaintext.len(),
-        )?;
-    }
+    let _ = Document::parse_with_options(&output, parsing_options())?;
     Ok(output)
 }
 
-fn validate_element_replacement(
-    document: &Document<'_>,
+fn validate_plaintext_fragment(
+    xml: &str,
     replacement_start: usize,
     replacement_end: usize,
+    plaintext: &str,
+    encrypted_type: Option<&EncryptedDataType>,
+    allow_dtd: bool,
 ) -> Result<(), XmlEncError> {
-    let mut top_level_nodes = document.descendants().filter(|node| {
-        if node.is_root() {
-            return false;
-        }
-        let range = node.range();
-        if range.start < replacement_start || range.end > replacement_end {
-            return false;
-        }
-        !node.parent().is_some_and(|parent| {
-            if parent.is_root() {
-                return false;
-            }
-            let parent_range = parent.range();
-            parent_range.start >= replacement_start && parent_range.end <= replacement_end
+    const WRAPPER_NS: &str = "urn:structured-world:xml-sec:decrypted-fragment";
+    const WRAPPER_START: &str = "<xmlsec-internal:fragment xmlns:xmlsec-internal=\"urn:structured-world:xml-sec:decrypted-fragment\">";
+    const WRAPPER_END: &str = "</xmlsec-internal:fragment>";
+
+    let expected_end =
+        replacement_start + WRAPPER_START.len() + plaintext.len() + WRAPPER_END.len();
+    let mut wrapped = String::with_capacity(
+        xml.len() - (replacement_end - replacement_start)
+            + WRAPPER_START.len()
+            + plaintext.len()
+            + WRAPPER_END.len(),
+    );
+    wrapped.push_str(&xml[..replacement_start]);
+    wrapped.push_str(WRAPPER_START);
+    wrapped.push_str(plaintext);
+    wrapped.push_str(WRAPPER_END);
+    wrapped.push_str(&xml[replacement_end..]);
+
+    let document = Document::parse_with_options(
+        &wrapped,
+        ParsingOptions {
+            allow_dtd,
+            entity_resolver: None,
+            ..ParsingOptions::default()
+        },
+    )?;
+    let wrapper = document
+        .descendants()
+        .find(|node| {
+            node.has_tag_name((WRAPPER_NS, "fragment")) && node.range().start == replacement_start
         })
-    });
-    if top_level_nodes.next().is_some_and(|node| node.is_element())
-        && top_level_nodes.next().is_none()
-    {
-        Ok(())
-    } else {
-        Err(XmlEncError::InvalidStructure(
-            "Element plaintext must contain exactly one element".into(),
-        ))
+        .ok_or_else(|| {
+            XmlEncError::InvalidStructure(
+                "decrypted plaintext escaped its replacement boundary".into(),
+            )
+        })?;
+    if wrapper.range().end != expected_end {
+        return Err(XmlEncError::InvalidStructure(
+            "decrypted plaintext escaped its replacement boundary".into(),
+        ));
     }
+
+    if matches!(encrypted_type, Some(EncryptedDataType::Element)) {
+        let mut children = wrapper.children();
+        if !children.next().is_some_and(|node| node.is_element()) || children.next().is_some() {
+            return Err(XmlEncError::InvalidStructure(
+                "Element plaintext must contain exactly one element".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Decrypt an already parsed `EncryptedData` value.
@@ -403,9 +434,11 @@ pub fn decrypt_data(
         .decode(&encrypted.cipher_data.value)
         .map_err(|error| XmlEncError::Base64(error.to_string()))?;
     let plaintext = decrypt_content(algorithm, &key, &ciphertext)?;
-    match encrypted.encrypted_type {
-        Some(_) => Ok(DecryptedContent::Xml(String::from_utf8(plaintext)?)),
-        None => Ok(DecryptedContent::Bytes(plaintext)),
+    match encrypted.encrypted_type.as_ref() {
+        Some(EncryptedDataType::Element | EncryptedDataType::Content) => {
+            Ok(DecryptedContent::Xml(String::from_utf8(plaintext)?))
+        }
+        Some(EncryptedDataType::Other(_)) | None => Ok(DecryptedContent::Bytes(plaintext)),
     }
 }
 
@@ -866,6 +899,38 @@ mod tests {
     }
 
     #[test]
+    fn decrypts_unknown_and_empty_type_hints_as_opaque_bytes() {
+        // Type is an application hint, not an algorithm constraint. Unknown and
+        // empty values must not prevent decryption of otherwise valid binary data.
+        let key = [0x35_u8; 16];
+        let plaintext = "\0opaque\u{ff}bytes";
+        let unknown = encrypted_gcm_element("urn:example:binary", plaintext, None, true, &key);
+        let empty = encrypted_gcm_element("", plaintext, None, true, &key).replacen(
+            "<xenc:EncryptedData",
+            "<xenc:EncryptedData Type=\"\"",
+            1,
+        );
+
+        let parsed = parse_encrypted_data(&unknown).expect("unknown Type must remain parseable");
+        assert_eq!(
+            parsed.encrypted_type,
+            Some(EncryptedDataType::Other("urn:example:binary".into()))
+        );
+        assert!(matches!(
+            decrypt_document(&unknown, None, &SymmetricKeyDecryptor::new(key)),
+            Err(XmlEncError::ReplacementRequiresXml)
+        ));
+
+        for encrypted in [unknown, empty] {
+            assert_eq!(
+                decrypt(&encrypted, &SymmetricKeyDecryptor::new(key))
+                    .expect("opaque Type hints must not block decryption"),
+                DecryptedContent::Bytes(plaintext.as_bytes().to_vec())
+            );
+        }
+    }
+
+    #[test]
     fn selects_document_encrypted_data_by_id_and_rejects_ambiguity() {
         // Selection must never decrypt an arbitrary first match when a document
         // contains multiple encrypted regions.
@@ -963,6 +1028,52 @@ mod tests {
             )
             .expect("explicit internal-DTD opt-in must decrypt")
             .contains("plaintext")
+        );
+    }
+
+    #[test]
+    fn rejects_plaintext_markup_that_crosses_the_encrypted_region() {
+        // Parsing only after raw splicing is insufficient: balanced close/reopen
+        // tags can keep the document valid while moving attacker nodes outside the
+        // element whose encrypted child is being replaced.
+        let key = [0x36_u8; 16];
+        let crossing_markup = "</parent><attacker/><parent>";
+        for type_uri in [
+            "http://www.w3.org/2001/04/xmlenc#Content",
+            "http://www.w3.org/2001/04/xmlenc#Element",
+        ] {
+            let encrypted = encrypted_gcm_element(type_uri, crossing_markup, None, false, &key);
+            let document =
+                format!("<outer xmlns:xenc=\"{XMLENC_NS}\"><parent>{encrypted}</parent></outer>");
+            assert!(
+                decrypt_document(&document, None, &SymmetricKeyDecryptor::new(key)).is_err(),
+                "{type_uri} plaintext must not escape its replacement boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_replacement_plaintext_in_its_namespace_context() {
+        // Decrypted fragments inherit namespaces from the encrypted node's
+        // ancestors, so boundary validation must occur inside the source document.
+        let key = [0x37_u8; 16];
+        let encrypted = encrypted_gcm_element(
+            "http://www.w3.org/2001/04/xmlenc#Content",
+            "<shared:child/>",
+            None,
+            false,
+            &key,
+        );
+        let document = format!(
+            "<root xmlns:xenc=\"{XMLENC_NS}\" xmlns:shared=\"urn:shared\">{encrypted}</root>"
+        );
+        let decrypted = decrypt_document(&document, None, &SymmetricKeyDecryptor::new(key))
+            .expect("inherited namespace prefixes must remain valid");
+        assert_eq!(
+            decrypted,
+            format!(
+                "<root xmlns:xenc=\"{XMLENC_NS}\" xmlns:shared=\"urn:shared\"><shared:child/></root>"
+            )
         );
     }
 

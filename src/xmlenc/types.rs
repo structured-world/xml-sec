@@ -13,12 +13,14 @@ pub const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 pub const MAX_CIPHER_VALUE_BASE64_LEN: usize = 16 * 1024 * 1024;
 
 /// The `Type` attribute on an `EncryptedData` element.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncryptedDataType {
     /// The plaintext contains one complete XML element.
     Element,
     /// The plaintext contains the encrypted element's child content.
     Content,
+    /// An application-defined or empty type hint whose plaintext remains opaque.
+    Other(String),
 }
 
 /// Supported content-encryption algorithms.
@@ -175,7 +177,7 @@ pub struct EncryptedData {
 pub enum DecryptedContent {
     /// XML plaintext for `Element` and `Content` encrypted data.
     Xml(String),
-    /// Binary plaintext when the encrypted data has no XML type hint.
+    /// Binary plaintext when the encrypted data has no standard XML type hint.
     Bytes(Vec<u8>),
 }
 
