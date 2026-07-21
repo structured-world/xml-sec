@@ -966,6 +966,28 @@ mod tests {
     }
 
     #[test]
+    fn empty_key_names_are_rejected_before_serialization() {
+        // The reciprocal parser rejects empty KeyName elements, so encryption
+        // must not emit output that its own decrypt pipeline cannot consume.
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .direct_key_name("")
+                .encrypt_binary(b"data"),
+            Err(XmlEncError::InvalidEncryptionConfig(_))
+        ));
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .add_recipient(
+                    EncryptionRecipient::aes_key_wrap([0_u8; 16], KeyWrapAlgorithm::AesKw128)
+                        .key_name("")
+                )
+                .encrypt_binary(b"data"),
+            Err(XmlEncError::InvalidEncryptionConfig(_))
+        ));
+    }
+
+    #[test]
     fn debug_output_redacts_symmetric_key_material() {
         let direct_key = b"direct-key-secret".to_vec();
         let kek = b"key-wrap-secret!".to_vec();
