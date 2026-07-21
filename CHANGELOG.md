@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/structured-world/xml-sec/compare/v0.1.8...v0.1.9) - 2026-07-21
+
+### Added
+
+- *(xmlenc)* add decryption pipeline
+- *(xmldsig)* cover donor signing templates
+- *(xmldsig)* expose signing public key info
+
+### Fixed
+
+- *(xmlenc)* allow element boundary trivia
+- *(xmlenc)* select recipient keys in order
+- *(xmlenc)* accept direct keys with hints
+- *(xmlenc)* preserve exact key identifiers
+- *(xmlenc)* harden metadata and replacement
+- *(xmlenc)* enforce metadata contracts
+- *(xmldsig)* require xmlsec1 add-id support
+- *(ci)* harden xmlsec1 test setup
+- *(xmldsig)* harden xmlsec1 interop checks
+- *(xmldsig)* harden xmlsec1 interop tests
+- *(ci)* accept breaking release commits
+
 ### Added
 
 - *(xmldsig)* write x509 signing key info
