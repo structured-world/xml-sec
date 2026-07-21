@@ -1,5 +1,7 @@
 //! XMLEnc decryption entry point and key resolvers.
 
+use std::fmt;
+
 use aes::{
     Aes128, Aes256,
     cipher::{BlockModeDecrypt, KeyIvInit, block_padding::NoPadding},
@@ -11,9 +13,9 @@ use aes_gcm::{
 use aes_kw::{KwAes128, KwAes256};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use cbc::Decryptor;
-use getrandom::{SysRng, rand_core::UnwrapErr};
+use getrandom::SysRng;
 use roxmltree::{Document, ParsingOptions};
-use rsa::{Oaep, RsaPrivateKey};
+use rsa::{Oaep, RsaPrivateKey, traits::PaddingScheme};
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
 
@@ -47,9 +49,18 @@ pub struct DocumentDecryptionOptions<'a> {
 }
 
 /// Resolver for direct, pre-shared AES content keys.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SymmetricKeyDecryptor {
     key: Vec<u8>,
+}
+
+impl fmt::Debug for SymmetricKeyDecryptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SymmetricKeyDecryptor")
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl SymmetricKeyDecryptor {
@@ -77,9 +88,18 @@ pub struct PrivateKeyDecryptor {
 }
 
 /// Resolver backed by a pre-shared AES key-encryption key (KEK).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct KekDecryptor {
     kek: Vec<u8>,
+}
+
+impl fmt::Debug for KekDecryptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KekDecryptor")
+            .field("kek", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl KekDecryptor {
@@ -172,42 +192,28 @@ impl PrivateKeyDecryptor {
         label: Vec<u8>,
         wrapped: &[u8],
     ) -> Result<Vec<u8>, XmlEncError> {
-        // Every private-key operation is blinded; UnwrapErr adapts the OS RNG
-        // to rsa's infallible CryptoRng contract.
+        // Passing SysRng through PaddingScheme keeps private-key blinding while
+        // preserving operating-system RNG failures as typed errors.
         match digest.unwrap_or("http://www.w3.org/2000/09/xmldsig#sha1") {
-            "http://www.w3.org/2000/09/xmldsig#sha1" => self
-                .key
-                .decrypt_blinded(
-                    &mut UnwrapErr(SysRng),
-                    Oaep::<Sha1>::new_with_label(label),
-                    wrapped,
-                )
+            "http://www.w3.org/2000/09/xmldsig#sha1" => Oaep::<Sha1>::new_with_label(label)
+                .decrypt(Some(&mut SysRng), &self.key, wrapped)
                 .map_err(rsa_error),
-            "http://www.w3.org/2001/04/xmlenc#sha256" => self
-                .key
-                .decrypt_blinded(
-                    &mut UnwrapErr(SysRng),
-                    Oaep::<Sha256, Sha1>::new_with_mgf_hash_and_label(label),
-                    wrapped,
-                )
-                .map_err(rsa_error),
+            "http://www.w3.org/2001/04/xmlenc#sha256" => {
+                Oaep::<Sha256, Sha1>::new_with_mgf_hash_and_label(label)
+                    .decrypt(Some(&mut SysRng), &self.key, wrapped)
+                    .map_err(rsa_error)
+            }
             "http://www.w3.org/2001/04/xmlenc#sha384"
-            | "http://www.w3.org/2001/04/xmldsig-more#sha384" => self
-                .key
-                .decrypt_blinded(
-                    &mut UnwrapErr(SysRng),
-                    Oaep::<Sha384, Sha1>::new_with_mgf_hash_and_label(label),
-                    wrapped,
-                )
-                .map_err(rsa_error),
-            "http://www.w3.org/2001/04/xmlenc#sha512" => self
-                .key
-                .decrypt_blinded(
-                    &mut UnwrapErr(SysRng),
-                    Oaep::<Sha512, Sha1>::new_with_mgf_hash_and_label(label),
-                    wrapped,
-                )
-                .map_err(rsa_error),
+            | "http://www.w3.org/2001/04/xmldsig-more#sha384" => {
+                Oaep::<Sha384, Sha1>::new_with_mgf_hash_and_label(label)
+                    .decrypt(Some(&mut SysRng), &self.key, wrapped)
+                    .map_err(rsa_error)
+            }
+            "http://www.w3.org/2001/04/xmlenc#sha512" => {
+                Oaep::<Sha512, Sha1>::new_with_mgf_hash_and_label(label)
+                    .decrypt(Some(&mut SysRng), &self.key, wrapped)
+                    .map_err(rsa_error)
+            }
             unsupported => Err(XmlEncError::UnsupportedAlgorithm(unsupported.to_owned())),
         }
     }
@@ -231,12 +237,8 @@ impl PrivateKeyDecryptor {
 
         macro_rules! decrypt_with {
             ($digest:ty, $mgf:ty) => {
-                self.key
-                    .decrypt_blinded(
-                        &mut UnwrapErr(SysRng),
-                        Oaep::<$digest, $mgf>::new_with_mgf_hash_and_label(label),
-                        wrapped,
-                    )
+                Oaep::<$digest, $mgf>::new_with_mgf_hash_and_label(label)
+                    .decrypt(Some(&mut SysRng), &self.key, wrapped)
                     .map_err(rsa_error)
             };
         }
@@ -271,7 +273,10 @@ impl PrivateKeyDecryptor {
 }
 
 fn rsa_error(error: rsa::Error) -> XmlEncError {
-    XmlEncError::Rsa(error.to_string())
+    match error {
+        rsa::Error::Rng => XmlEncError::Rng("RSA-OAEP blinding failed".into()),
+        error => XmlEncError::Rsa(error.to_string()),
+    }
 }
 
 fn invalid_kek_size(algorithm: KeyWrapAlgorithm, actual: usize) -> XmlEncError {

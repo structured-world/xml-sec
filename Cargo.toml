@@ -64,7 +64,7 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:subtle",
     "dep:x509-parser",
 ]
-xmlenc = [             # XML Encryption decryption
+xmlenc = [             # XML Encryption (encrypt + decrypt)
     "dep:aes",
     "dep:aes-gcm",
     "dep:aes-kw",
