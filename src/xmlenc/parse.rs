@@ -136,13 +136,12 @@ fn parse_encrypted_key(node: Node<'_, '_>) -> Result<EncryptedKey, XmlEncError> 
 fn parse_carried_key_name(node: Node<'_, '_>) -> Result<String, XmlEncError> {
     require_element(node, XMLENC_NS, "CarriedKeyName")?;
     let value = simple_text(node, "CarriedKeyName")?;
-    let value = value.trim();
     if value.is_empty() {
         return Err(XmlEncError::InvalidStructure(
             "CarriedKeyName is empty".into(),
         ));
     }
-    Ok(value.to_owned())
+    Ok(value)
 }
 
 fn parse_key_name_hint(node: Node<'_, '_>) -> Result<Option<String>, XmlEncError> {
@@ -163,11 +162,10 @@ fn parse_key_name_hint(node: Node<'_, '_>) -> Result<Option<String>, XmlEncError
 
 fn parse_key_name(node: Node<'_, '_>) -> Result<String, XmlEncError> {
     let value = simple_text(node, "KeyName")?;
-    let value = value.trim();
     if value.is_empty() {
         return Err(XmlEncError::InvalidStructure("KeyName is empty".into()));
     }
-    Ok(value.to_owned())
+    Ok(value)
 }
 
 fn parse_reference_list(node: Node<'_, '_>) -> Result<ReferenceList, XmlEncError> {
