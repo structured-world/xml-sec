@@ -521,6 +521,24 @@ mod tests {
     }
 
     #[test]
+    fn retains_supported_key_candidates_alongside_unsupported_agreement() {
+        // Multi-recipient KeyInfo may advertise an unsupported agreement method
+        // before a key candidate that the configured resolver can actually use.
+        let xml = format!(
+            r#"<xenc:EncryptedData xmlns:xenc="{XMLENC_NS}" xmlns:ds="{XMLDSIG_NS}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/><ds:KeyInfo><xenc:AgreementMethod Algorithm="http://www.w3.org/2001/04/xmlenc#dh"/><ds:KeyName>content-key</ds:KeyName><xenc:EncryptedKey Recipient="alice"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes128"/><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>"#
+        );
+
+        let parsed = parse_encrypted_data(&xml)
+            .expect("a supported key candidate must take precedence over agreement fallback");
+        assert_eq!(parsed.key_name.as_deref(), Some("content-key"));
+        assert_eq!(parsed.encrypted_keys.len(), 1);
+        assert_eq!(
+            parsed.encrypted_keys[0].recipient.as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[test]
     fn rejects_missing_algorithm_and_duplicate_oaep_parameters() {
         // Algorithm selection and OAEP parameter cardinality are security-sensitive,
         // so malformed declarations must not fall back to implicit behavior.
