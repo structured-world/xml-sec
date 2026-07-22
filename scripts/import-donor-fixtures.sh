@@ -95,7 +95,14 @@ for relative_path in "${fixture_paths[@]}"; do
     fi
     replace_target "$staging" "$target"
   else
-    mkdir -p "$(dirname "$target")"
-    install -m 0644 "$source" "$target"
+    target_parent="$(dirname "$target")"
+    target_name="$(basename "$target")"
+    mkdir -p "$target_parent"
+    staging="$(mktemp "$target_parent/.${target_name}.import.XXXXXX")"
+    if ! install -m 0644 "$source" "$staging"; then
+      rm -f "$staging"
+      exit 1
+    fi
+    replace_target "$staging" "$target"
   fi
 done
