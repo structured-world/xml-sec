@@ -27,8 +27,12 @@ for relative_path in "${fixture_paths[@]}"; do
       exit 1
       ;;
   esac
-  if [[ -z "$donor_path" || "/$donor_path/" == *"/../"* ]]; then
-    printf 'fixture path must not be empty or contain ..: %s\n' "$relative_path" >&2
+  if [[ -z "$donor_path"
+    || "$donor_path" == /*
+    || "$donor_path" == *//*
+    || "/$donor_path/" == *"/./"*
+    || "/$donor_path/" == *"/../"* ]]; then
+    printf 'fixture path contains an empty, current, or parent component: %s\n' "$relative_path" >&2
     exit 1
   fi
   target="$fixture_root/$relative_path"
