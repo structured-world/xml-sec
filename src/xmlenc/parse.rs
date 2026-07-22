@@ -57,6 +57,7 @@ fn parse_key_info(node: Node<'_, '_>) -> Result<ParsedKeyInfo, XmlEncError> {
     require_element(node, XMLDSIG_NS, "KeyInfo")?;
     let mut key_name = None;
     let mut encrypted_keys = Vec::new();
+    let mut unsupported_agreement = None;
     for child in node.children().filter(Node::is_element) {
         if child.has_tag_name((XMLDSIG_NS, "KeyName")) {
             if key_name.is_some() {
@@ -67,7 +68,23 @@ fn parse_key_info(node: Node<'_, '_>) -> Result<ParsedKeyInfo, XmlEncError> {
             key_name = Some(parse_key_name(child)?);
         } else if child.has_tag_name((XMLENC_NS, "EncryptedKey")) {
             encrypted_keys.push(parse_encrypted_key(child)?);
+        } else if child.has_tag_name((XMLENC_NS, "AgreementMethod")) {
+            // Agreement methods require a separate key-derivation trust boundary.
+            // Keep the URI as a fallback error while allowing another advertised
+            // key candidate to be selected by the caller's resolver.
+            let algorithm = child
+                .attribute("Algorithm")
+                .ok_or(XmlEncError::MissingRequired(
+                    "AgreementMethod Algorithm attribute",
+                ))?;
+            unsupported_agreement.get_or_insert_with(|| algorithm.to_owned());
         }
+    }
+    if key_name.is_none()
+        && encrypted_keys.is_empty()
+        && let Some(algorithm) = unsupported_agreement
+    {
+        return Err(XmlEncError::UnsupportedAlgorithm(algorithm));
     }
     Ok(ParsedKeyInfo {
         key_name,
@@ -486,6 +503,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["alice", "bob"]
         );
+    }
+
+    /// Verifies that a lone unsupported agreement reports its algorithm URI.
+    #[test]
+    fn rejects_unsupported_key_agreement_explicitly() {
+        // AgreementMethod is outside the supported secure profile. Reporting its
+        // URI avoids misclassifying a present but unsupported key as missing.
+        let xml = format!(
+            r#"<xenc:EncryptedData xmlns:xenc="{XMLENC_NS}" xmlns:ds="{XMLDSIG_NS}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/><ds:KeyInfo><xenc:AgreementMethod Algorithm="http://www.w3.org/2001/04/xmlenc#dh"/></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>"#
+        );
+        assert!(matches!(
+            parse_encrypted_data(&xml),
+            Err(XmlEncError::UnsupportedAlgorithm(uri))
+                if uri == "http://www.w3.org/2001/04/xmlenc#dh"
+        ));
+
+        let missing_algorithm =
+            xml.replace(" Algorithm=\"http://www.w3.org/2001/04/xmlenc#dh\"", "");
+        assert!(matches!(
+            parse_encrypted_data(&missing_algorithm),
+            Err(XmlEncError::MissingRequired(
+                "AgreementMethod Algorithm attribute"
+            ))
+        ));
+    }
+
+    /// Verifies that unsupported agreement metadata does not hide usable keys.
+    #[test]
+    fn retains_supported_key_candidates_alongside_unsupported_agreement() {
+        // Multi-recipient KeyInfo may advertise an unsupported agreement method
+        // before a key candidate that the configured resolver can actually use.
+        let xml = format!(
+            r#"<xenc:EncryptedData xmlns:xenc="{XMLENC_NS}" xmlns:ds="{XMLDSIG_NS}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/><ds:KeyInfo><xenc:AgreementMethod Algorithm="http://www.w3.org/2001/04/xmlenc#dh"/><ds:KeyName>content-key</ds:KeyName><xenc:EncryptedKey Recipient="alice"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes128"/><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>"#
+        );
+
+        let parsed = parse_encrypted_data(&xml)
+            .expect("a supported key candidate must take precedence over agreement fallback");
+        assert_eq!(parsed.key_name.as_deref(), Some("content-key"));
+        assert_eq!(parsed.encrypted_keys.len(), 1);
+        assert_eq!(parsed.encrypted_keys[0].recipient.as_deref(), Some("alice"));
     }
 
     #[test]

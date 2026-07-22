@@ -5,6 +5,10 @@ on network access or a local xmlsec1 checkout. They were imported from the
 `xmlsec_1_3_12` tag of
 [lsh123/xmlsec](https://github.com/lsh123/xmlsec/tree/xmlsec_1_3_12/tests).
 
+Imported donor artifacts are kept byte-for-byte, including upstream wording
+and spelling. Repository-specific clarifications belong in this wrapper rather
+than in the corpus files whose provenance the tests are intended to preserve.
+
 All private keys in this directory are public test material from that corpus.
 They must never be used outside tests.
 
@@ -42,15 +46,24 @@ Decrypted XML is compared with donor plaintext after canonicalization because
 xmlsec1 encrypts parsed XML rather than preserving declaration and empty-tag
 serialization.
 
+### `01-phaos-xmlenc-3`
+
+The complete independent Phaos XML Encryption corpus, including its public test
+keys and templates. Five vectors are inside the crate's secure profile and must
+decrypt end-to-end: AES-128/256-CBC with RSA-OAEP-SHA1 and AES-128/256 Key Wrap.
+All remaining ciphertexts are exhaustively classified as fail-closed because
+they use Triple-DES, RSA-PKCS#1 v1.5 encryption, AES-192, unsupported key-wrap
+algorithms, Diffie-Hellman agreement, or deliberately malformed metadata.
+
 ## Importing Vectors
 
 Point the repository helper at an xmlsec1 1.3.12 test checkout and pass paths
-under the destination corpus:
+under the destination corpus. A directory argument imports its complete tree:
 
 ```sh
 XMLSEC_DONOR_ROOT=/path/to/xmlsec/tests \
   scripts/import-donor-fixtures.sh \
-  xmlenc/aleksey-xmlenc-01/enc-aes128gcm-keyname.xml
+  xmlenc/01-phaos-xmlenc-3
 ```
 
 Every imported positive vector must be exercised through the full public

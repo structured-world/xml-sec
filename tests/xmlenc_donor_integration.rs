@@ -18,14 +18,15 @@ use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePrivateKey};
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize, canonicalize_xml};
 use xml_sec::xmlenc::{
     DecryptedContent, DocumentDecryptionOptions, KekDecryptor, PrivateKeyDecryptor,
-    SymmetricKeyDecryptor, XmlEncError, decrypt, decrypt_data, decrypt_document_with_options,
-    parse_encrypted_data,
+    SymmetricKeyDecryptor, XmlEncError, decrypt, decrypt_data, decrypt_document,
+    decrypt_document_with_options, parse_encrypted_data,
 };
 
 const VECTOR_DIR: &str = "tests/fixtures/xmlenc/aleksey-xmlenc-01";
 const NIST_DIR: &str = "tests/fixtures/xmlenc/nist-aesgcm";
 const INTEROP_DIR: &str = "tests/fixtures/xmlenc/xmlenc11-interop-2012";
 const MERLIN_DIR: &str = "tests/fixtures/xmlenc/merlin-xmlenc-five";
+const PHAOS_DIR: &str = "tests/fixtures/xmlenc/01-phaos-xmlenc-3";
 const KEY_INVENTORY: &str = "tests/fixtures/keys/keys.xml";
 
 #[test]
@@ -390,4 +391,203 @@ fn wrapped_key_xml(wrapped_key: &[u8], ciphertext: &[u8]) -> String {
         STANDARD.encode(wrapped_key),
         STANDARD.encode(ciphertext)
     )
+}
+
+/// Loads the Phaos RSA transport key from the tracked donor corpus.
+fn read_phaos_private_key() -> RsaPrivateKey {
+    let der = std::fs::read(format!("{PHAOS_DIR}/rsa-priv-key.der"))
+        .expect("tracked Phaos RSA key must be readable");
+    RsaPrivateKey::from_pkcs1_der(&der).expect("Phaos RSA key must be PKCS#1 DER")
+}
+
+/// Canonicalizes donor XML so serialization differences do not mask semantics.
+fn canonicalize_fixture_document(xml: &[u8]) -> Vec<u8> {
+    canonicalize_xml(xml, &C14nAlgorithm::new(C14nMode::Inclusive1_0, false))
+        .expect("Phaos fixture must be canonicalizable XML")
+}
+
+/// Decrypts one Phaos vector and compares its canonical document to donor data.
+fn assert_phaos_document(name: &str, resolver: &dyn xml_sec::xmlenc::DecryptionKeyResolver) {
+    let encrypted = std::fs::read_to_string(format!("{PHAOS_DIR}/{name}.xml"))
+        .expect("tracked Phaos ciphertext must be readable");
+    let expected = std::fs::read(format!("{PHAOS_DIR}/{name}.data"))
+        .expect("tracked Phaos plaintext must be readable");
+    let decrypted = decrypt_document(&encrypted, Some("ED"), resolver)
+        .unwrap_or_else(|error| panic!("{name} must decrypt: {error}"));
+    assert_eq!(
+        canonicalize_fixture_document(decrypted.as_bytes()),
+        canonicalize_fixture_document(&expected),
+        "{name}"
+    );
+}
+
+/// Exercises every Phaos vector supported by the crate's secure profile.
+#[test]
+fn decrypts_supported_phaos_rsa_oaep_and_aes_kw_vectors() {
+    // These Phaos-produced documents independently exercise RSA-OAEP and both
+    // RFC 3394 KEK sizes through Element and Content document replacement.
+    let private_key = read_phaos_private_key();
+    for name in [
+        "enc-element-aes128-kt-rsa_oaep_sha1",
+        "enc-text-aes256-kt-rsa_oaep_sha1",
+    ] {
+        assert_phaos_document(name, &PrivateKeyDecryptor::new(private_key.clone()));
+    }
+
+    let keys = read_aes_keys(Path::new(&format!("{PHAOS_DIR}/keys.xml")));
+    for (name, key_name) in [
+        ("enc-element-aes128-kw-aes128", "my-aes128-key"),
+        ("enc-element-aes128-kw-aes256", "my-aes256-key"),
+        ("enc-element-aes256-kw-aes256", "my-aes256-key"),
+    ] {
+        let kek = keys.get(key_name).expect("Phaos KEK must exist");
+        assert_phaos_document(name, &KekDecryptor::new(kek.clone()));
+    }
+}
+
+/// Asserts that a donor vector fails at its explicitly classified algorithm URI.
+fn assert_unsupported(
+    name: &str,
+    expected_uri: &str,
+    resolver: &dyn xml_sec::xmlenc::DecryptionKeyResolver,
+) {
+    let xml = std::fs::read_to_string(format!("{PHAOS_DIR}/{name}.xml"))
+        .expect("tracked Phaos vector must be readable");
+    let result = decrypt_document(&xml, Some("ED"), resolver);
+    assert!(
+        matches!(&result, Err(XmlEncError::UnsupportedAlgorithm(uri)) if uri == expected_uri),
+        "{name} must reject {expected_uri}, got {result:?}"
+    );
+}
+
+/// Counts encrypted Phaos vectors while excluding key and plaintext documents.
+fn phaos_vector_count() -> usize {
+    std::fs::read_dir(PHAOS_DIR)
+        .expect("Phaos fixture directory must be readable")
+        .map(|entry| {
+            entry
+                .expect("Phaos directory entry must be readable")
+                .path()
+        })
+        .filter(|path| {
+            path.extension().is_some_and(|extension| extension == "xml")
+                && path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with("enc-") || name.starts_with("bad-")
+                })
+        })
+        .count()
+}
+
+/// Proves that every encrypted Phaos vector has an explicit support classification.
+#[test]
+fn classifies_complete_phaos_decryption_corpus() {
+    // Every Phaos ciphertext is classified. Legacy algorithms remain visible
+    // interoperability boundaries rather than being silently skipped or enabled.
+    const TRIPLEDES: &str = "http://www.w3.org/2001/04/xmlenc#tripledes-cbc";
+    const AES192: &str = "http://www.w3.org/2001/04/xmlenc#aes192-cbc";
+    const KW_TRIPLEDES: &str = "http://www.w3.org/2001/04/xmlenc#kw-tripledes";
+    const KW_AES192: &str = "http://www.w3.org/2001/04/xmlenc#kw-aes192";
+    const RSA_1_5: &str = "http://www.w3.org/2001/04/xmlenc#rsa-1_5";
+    const DH: &str = "http://www.w3.org/2001/04/xmlenc#dh";
+
+    let direct = SymmetricKeyDecryptor::new([0_u8; 16]);
+    let mut classified = 5;
+    for name in [
+        "enc-content-3des-kw-aes192",
+        "enc-element-3des-kt-rsa1_5",
+        "enc-element-3des-kt-rsa_oaep_sha1",
+        "enc-element-3des-kt-rsa_oaep_sha256",
+        "enc-element-3des-kt-rsa_oaep_sha512",
+        "enc-element-3des-kw-3des",
+        "enc-text-3des-kw-aes256",
+    ] {
+        assert_unsupported(name, TRIPLEDES, &direct);
+        classified += 1;
+    }
+    for name in [
+        "enc-content-aes192-kw-aes256",
+        "enc-element-aes192-kt-rsa_oaep_sha1",
+        "enc-element-aes192-kw-aes192",
+        "enc-text-aes192-kt-rsa1_5",
+    ] {
+        assert_unsupported(name, AES192, &direct);
+        classified += 1;
+    }
+
+    let kek = KekDecryptor::new([0_u8; 32]);
+    for name in [
+        "bad-alg-enc-element-aes128-kw-3des",
+        "enc-content-aes128-kw-3des",
+    ] {
+        assert_unsupported(name, KW_TRIPLEDES, &kek);
+        classified += 1;
+    }
+    assert_unsupported("enc-text-aes128-kw-aes192", KW_AES192, &kek);
+    classified += 1;
+
+    let private_key = PrivateKeyDecryptor::new(read_phaos_private_key());
+    for name in [
+        "enc-content-aes256-kt-rsa1_5",
+        "enc-element-aes128-kt-rsa1_5",
+    ] {
+        assert_unsupported(name, RSA_1_5, &private_key);
+        classified += 1;
+    }
+    for name in [
+        "enc-element-3des-ka-dh",
+        "enc-element-aes128-ka-dh",
+        "enc-element-aes192-ka-dh",
+        "enc-element-aes256-ka-dh",
+    ] {
+        assert_unsupported(name, DH, &direct);
+        classified += 1;
+    }
+
+    assert_eq!(classified, 25);
+    assert_eq!(classified, phaos_vector_count());
+}
+
+/// Verifies recipient-key mismatch and AES-KW integrity failure paths.
+#[test]
+fn rejects_phaos_wrong_rsa_key_and_tampered_wrapped_key() {
+    // Independent negative paths prove OAEP does not accept another recipient's
+    // key and RFC 3394 integrity is checked before donor content decryption.
+    let rsa_xml = std::fs::read_to_string(format!(
+        "{PHAOS_DIR}/enc-element-aes128-kt-rsa_oaep_sha1.xml"
+    ))
+    .expect("tracked Phaos RSA vector must be readable");
+    let wrong_pem = std::fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-key.pem")
+        .expect("tracked unrelated RSA key must be readable");
+    let wrong_key = RsaPrivateKey::from_pkcs8_pem(&wrong_pem)
+        .expect("tracked unrelated RSA key must be PKCS#8 PEM");
+    let wrong_key_result =
+        decrypt_document(&rsa_xml, Some("ED"), &PrivateKeyDecryptor::new(wrong_key));
+    assert!(
+        matches!(&wrong_key_result, Err(XmlEncError::Rsa(_))),
+        "wrong RSA key must fail OAEP decryption, got {wrong_key_result:?}"
+    );
+
+    let mut wrapped_xml = std::fs::read(format!("{PHAOS_DIR}/enc-element-aes128-kw-aes128.xml"))
+        .expect("tracked Phaos AES-KW vector must be readable");
+    let marker = b"<CipherValue>";
+    let start = wrapped_xml
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("Phaos EncryptedKey must contain CipherValue")
+        + marker.len();
+    let encoded = wrapped_xml[start..]
+        .iter_mut()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .expect("wrapped key must contain base64 data");
+    *encoded = if *encoded == b'A' { b'B' } else { b'A' };
+    let wrapped_xml = String::from_utf8(wrapped_xml).expect("Phaos XML must remain UTF-8");
+    let keys = read_aes_keys(Path::new(&format!("{PHAOS_DIR}/keys.xml")));
+    let kek = keys
+        .get("my-aes128-key")
+        .expect("Phaos AES-128 KEK must exist");
+    assert!(matches!(
+        decrypt_document(&wrapped_xml, Some("ED"), &KekDecryptor::new(kek.clone())),
+        Err(XmlEncError::KeyWrapIntegrity)
+    ));
 }
