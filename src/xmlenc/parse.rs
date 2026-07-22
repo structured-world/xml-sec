@@ -57,6 +57,7 @@ fn parse_key_info(node: Node<'_, '_>) -> Result<ParsedKeyInfo, XmlEncError> {
     require_element(node, XMLDSIG_NS, "KeyInfo")?;
     let mut key_name = None;
     let mut encrypted_keys = Vec::new();
+    let mut unsupported_agreement = None;
     for child in node.children().filter(Node::is_element) {
         if child.has_tag_name((XMLDSIG_NS, "KeyName")) {
             if key_name.is_some() {
@@ -69,14 +70,21 @@ fn parse_key_info(node: Node<'_, '_>) -> Result<ParsedKeyInfo, XmlEncError> {
             encrypted_keys.push(parse_encrypted_key(child)?);
         } else if child.has_tag_name((XMLENC_NS, "AgreementMethod")) {
             // Agreement methods require a separate key-derivation trust boundary.
-            // Fail on the declared URI instead of treating the present key as absent.
+            // Keep the URI as a fallback error while allowing another advertised
+            // key candidate to be selected by the caller's resolver.
             let algorithm = child
                 .attribute("Algorithm")
                 .ok_or(XmlEncError::MissingRequired(
                     "AgreementMethod Algorithm attribute",
                 ))?;
-            return Err(XmlEncError::UnsupportedAlgorithm(algorithm.to_owned()));
+            unsupported_agreement.get_or_insert_with(|| algorithm.to_owned());
         }
+    }
+    if key_name.is_none()
+        && encrypted_keys.is_empty()
+        && let Some(algorithm) = unsupported_agreement
+    {
+        return Err(XmlEncError::UnsupportedAlgorithm(algorithm));
     }
     Ok(ParsedKeyInfo {
         key_name,
