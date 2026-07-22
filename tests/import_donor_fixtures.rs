@@ -77,6 +77,40 @@ fn directory_import_removes_files_deleted_by_the_donor() {
     );
 }
 
+/// Verifies that a trailing separator does not alter the imported directory layout.
+#[test]
+fn directory_import_normalizes_a_trailing_separator() {
+    // Shell callers commonly append a slash to directory arguments. The donor
+    // prefix still has to be stripped before each file is placed in staging.
+    let root = TestDirectory::new();
+    let scripts = root.path().join("scripts");
+    let donor = root.path().join("donor/corpus");
+    let target = root.path().join("tests/fixtures/xmlenc/corpus");
+    std::fs::create_dir_all(&scripts).expect("scripts directory must be creatable");
+    std::fs::create_dir_all(&donor).expect("donor directory must be creatable");
+    std::fs::copy(
+        "scripts/import-donor-fixtures.sh",
+        scripts.join("import-donor-fixtures.sh"),
+    )
+    .expect("import script must be copied into the isolated repository");
+    std::fs::write(donor.join("current.xml"), "<current/>")
+        .expect("donor fixture must be writable");
+
+    let status = Command::new("bash")
+        .arg(scripts.join("import-donor-fixtures.sh"))
+        .arg("xmlenc/corpus/")
+        .env("XMLSEC_DONOR_ROOT", root.path().join("donor"))
+        .status()
+        .expect("fixture import script must run");
+
+    assert!(status.success(), "fixture import must succeed");
+    assert_eq!(
+        std::fs::read_to_string(target.join("current.xml"))
+            .expect("fixture must retain its donor-relative path"),
+        "<current/>"
+    );
+}
+
 /// Verifies that parent traversal cannot mutate an adjacent fixture tree.
 #[test]
 fn directory_import_rejects_paths_that_escape_the_fixture_root() {
