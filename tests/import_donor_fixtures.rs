@@ -201,3 +201,44 @@ fn directory_import_failures_preserve_the_existing_snapshot() {
         );
     }
 }
+
+#[test]
+fn file_import_replaces_an_existing_directory() {
+    // A donor path may change type between upstream revisions. Importing a
+    // regular file must replace the previous directory snapshot, not copy the
+    // file beneath that stale directory.
+    let root = TestDirectory::new();
+    let scripts = root.path().join("scripts");
+    let donor = root.path().join("donor/corpus");
+    let target = root.path().join("tests/fixtures/xmlenc/corpus");
+    std::fs::create_dir_all(&scripts).expect("scripts directory must be creatable");
+    std::fs::create_dir_all(&target).expect("fixture directory must be creatable");
+    std::fs::create_dir_all(donor.parent().expect("donor file must have a parent"))
+        .expect("donor parent directory must be creatable");
+    std::fs::copy(
+        "scripts/import-donor-fixtures.sh",
+        scripts.join("import-donor-fixtures.sh"),
+    )
+    .expect("import script must be copied into the isolated repository");
+    std::fs::write(&donor, "current fixture").expect("donor fixture must be writable");
+    std::fs::write(target.join("obsolete.xml"), "<obsolete/>")
+        .expect("stale fixture must be writable");
+
+    let status = Command::new("bash")
+        .arg(scripts.join("import-donor-fixtures.sh"))
+        .arg("xmlenc/corpus")
+        .env("XMLSEC_DONOR_ROOT", root.path().join("donor"))
+        .status()
+        .expect("fixture import script must run");
+
+    assert!(status.success(), "file import must succeed");
+    assert!(target.is_file(), "the target must become a regular file");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("imported fixture must be readable"),
+        "current fixture"
+    );
+    assert!(
+        !target.join("obsolete.xml").exists(),
+        "the previous directory contents must not survive"
+    );
+}
