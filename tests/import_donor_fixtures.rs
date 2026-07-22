@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Integration coverage for the donor fixture import workflow.
 
 use std::path::{Path, PathBuf};
