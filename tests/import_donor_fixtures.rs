@@ -104,3 +104,40 @@ fn directory_import_rejects_paths_that_escape_the_fixture_root() {
         "rejected paths must not mutate files outside their corpus"
     );
 }
+
+#[test]
+fn directory_import_rejects_fixture_root_aliases() {
+    // Empty and current-directory components can normalize to the corpus root;
+    // no user-supplied path may authorize replacing that whole directory.
+    for fixture_path in ["xmlenc/.", "xmlenc//", "xmlenc/./"] {
+        let root = TestDirectory::new();
+        let scripts = root.path().join("scripts");
+        let donor = root.path().join("donor");
+        let target = root.path().join("tests/fixtures/xmlenc");
+        std::fs::create_dir_all(&scripts).expect("scripts directory must be creatable");
+        std::fs::create_dir_all(&donor).expect("donor directory must be creatable");
+        std::fs::create_dir_all(&target).expect("fixture directory must be creatable");
+        std::fs::copy(
+            "scripts/import-donor-fixtures.sh",
+            scripts.join("import-donor-fixtures.sh"),
+        )
+        .expect("import script must be copied into the isolated repository");
+        std::fs::write(donor.join("replacement.xml"), "<replacement/>")
+            .expect("donor fixture must be writable");
+        std::fs::write(target.join("sentinel.xml"), "<sentinel/>")
+            .expect("sentinel fixture must be writable");
+
+        let status = Command::new("bash")
+            .arg(scripts.join("import-donor-fixtures.sh"))
+            .arg(fixture_path)
+            .env("XMLSEC_DONOR_ROOT", &donor)
+            .status()
+            .expect("fixture import script must run");
+
+        assert!(!status.success(), "{fixture_path} must be rejected");
+        assert!(
+            target.join("sentinel.xml").exists(),
+            "rejected alias {fixture_path} must not replace the corpus root"
+        );
+    }
+}
