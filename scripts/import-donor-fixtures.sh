@@ -49,6 +49,10 @@ if (( ${#fixture_paths[@]} == 0 )); then
 fi
 
 for relative_path in "${fixture_paths[@]}"; do
+  # Normalize directory notation before deriving source and target prefixes.
+  while [[ "$relative_path" == */ ]]; do
+    relative_path="${relative_path%/}"
+  done
   case "$relative_path" in
     xmldsig/*) donor_path="${relative_path#xmldsig/}" ;;
     xmlenc/*) donor_path="${relative_path#xmlenc/}" ;;
