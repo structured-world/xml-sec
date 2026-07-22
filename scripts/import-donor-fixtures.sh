@@ -5,6 +5,36 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 donor_root="${XMLSEC_DONOR_ROOT:-$repo_root/donors/xmlsec/tests}"
 fixture_root="$repo_root/tests/fixtures"
 
+replace_target() {
+  local replacement="$1"
+  local target="$2"
+  local target_parent target_name backup=""
+  target_parent="$(dirname "$target")"
+  target_name="$(basename "$target")"
+
+  if [[ -e "$target" || -L "$target" ]]; then
+    backup="$(mktemp -d "$target_parent/.${target_name}.backup.XXXXXX")"
+    rm -rf "$backup"
+    if ! mv "$target" "$backup"; then
+      rm -rf "$replacement"
+      return 1
+    fi
+  fi
+
+  if mv "$replacement" "$target"; then
+    if [[ -n "$backup" ]]; then
+      rm -rf "$backup"
+    fi
+    return 0
+  fi
+
+  rm -rf "$replacement"
+  if [[ -n "$backup" ]] && ! mv "$backup" "$target"; then
+    printf 'failed to restore fixture target after replacement failure: %s\n' "$target" >&2
+  fi
+  return 1
+}
+
 fixture_paths=("$@")
 if (( ${#fixture_paths[@]} == 0 )); then
   fixture_paths=(
@@ -38,16 +68,32 @@ for relative_path in "${fixture_paths[@]}"; do
   target="$fixture_root/$relative_path"
   source="$donor_root/$donor_path"
   if [[ -d "$source" ]]; then
-    # A directory argument represents a complete donor snapshot. Recreate the
-    # destination so upstream deletions cannot leave stale tracked fixtures.
-    rm -rf "$target"
-    mkdir -p "$target"
+    # Build the complete snapshot before replacing the last known-good target.
+    target_parent="$(dirname "$target")"
+    target_name="$(basename "$target")"
+    mkdir -p "$target_parent"
+    staging="$(mktemp -d "$target_parent/.${target_name}.import.XXXXXX")"
+    manifest="$(mktemp "$target_parent/.${target_name}.files.XXXXXX")"
+    if ! find "$source" -type f -print0 > "$manifest"; then
+      rm -rf "$staging" "$manifest"
+      exit 1
+    fi
+    copy_failed=false
     while IFS= read -r -d '' donor_file; do
       suffix="${donor_file#"$source/"}"
-      target_file="$target/$suffix"
-      mkdir -p "$(dirname "$target_file")"
-      install -m 0644 "$donor_file" "$target_file"
-    done < <(find "$source" -type f -print0)
+      target_file="$staging/$suffix"
+      if ! mkdir -p "$(dirname "$target_file")" \
+        || ! install -m 0644 "$donor_file" "$target_file"; then
+        copy_failed=true
+        break
+      fi
+    done < "$manifest"
+    rm -f "$manifest"
+    if [[ "$copy_failed" == true ]]; then
+      rm -rf "$staging"
+      exit 1
+    fi
+    replace_target "$staging" "$target"
   else
     mkdir -p "$(dirname "$target")"
     install -m 0644 "$source" "$target"
