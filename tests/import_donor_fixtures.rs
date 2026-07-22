@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use std::os::unix::fs::PermissionsExt;
+
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {
@@ -138,6 +140,66 @@ fn directory_import_rejects_fixture_root_aliases() {
         assert!(
             target.join("sentinel.xml").exists(),
             "rejected alias {fixture_path} must not replace the corpus root"
+        );
+    }
+}
+
+#[test]
+fn directory_import_failures_preserve_the_existing_snapshot() {
+    // Enumeration and copy failures must happen entirely in staging. The last
+    // known-good fixture tree remains authoritative until a full import exists.
+    for failing_tool in ["find", "install"] {
+        let root = TestDirectory::new();
+        let scripts = root.path().join("scripts");
+        let donor = root.path().join("donor/corpus");
+        let target = root.path().join("tests/fixtures/xmlenc/corpus");
+        let tools = root.path().join("tools");
+        for directory in [&scripts, &donor, &target, &tools] {
+            std::fs::create_dir_all(directory).expect("test directory must be creatable");
+        }
+        std::fs::copy(
+            "scripts/import-donor-fixtures.sh",
+            scripts.join("import-donor-fixtures.sh"),
+        )
+        .expect("import script must be copied into the isolated repository");
+        std::fs::write(donor.join("current.xml"), "<current/>")
+            .expect("donor fixture must be writable");
+        std::fs::write(target.join("sentinel.xml"), "<sentinel/>")
+            .expect("sentinel fixture must be writable");
+
+        let fake_tool = tools.join(failing_tool);
+        std::fs::write(&fake_tool, "#!/bin/sh\nexit 23\n")
+            .expect("failing tool must be writable");
+        let mut permissions = std::fs::metadata(&fake_tool)
+            .expect("failing tool metadata must be readable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_tool, permissions)
+            .expect("failing tool must be executable");
+        let inherited_path = std::env::var_os("PATH").expect("test process must have PATH");
+        let path = std::env::join_paths(
+            std::iter::once(tools.clone()).chain(std::env::split_paths(&inherited_path)),
+        )
+        .expect("test PATH must be joinable");
+
+        let status = Command::new("bash")
+            .arg(scripts.join("import-donor-fixtures.sh"))
+            .arg("xmlenc/corpus")
+            .env("XMLSEC_DONOR_ROOT", root.path().join("donor"))
+            .env("PATH", path)
+            .status()
+            .expect("fixture import script must run");
+
+        assert!(!status.success(), "{failing_tool} failure must propagate");
+        assert_eq!(
+            std::fs::read_to_string(target.join("sentinel.xml"))
+                .expect("existing snapshot must survive a failed import"),
+            "<sentinel/>",
+            "{failing_tool} failure replaced the existing snapshot"
+        );
+        assert!(
+            !target.join("current.xml").exists(),
+            "failed import must not expose a partial replacement"
         );
     }
 }
