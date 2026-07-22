@@ -168,14 +168,12 @@ fn directory_import_failures_preserve_the_existing_snapshot() {
             .expect("sentinel fixture must be writable");
 
         let fake_tool = tools.join(failing_tool);
-        std::fs::write(&fake_tool, "#!/bin/sh\nexit 23\n")
-            .expect("failing tool must be writable");
+        std::fs::write(&fake_tool, "#!/bin/sh\nexit 23\n").expect("failing tool must be writable");
         let mut permissions = std::fs::metadata(&fake_tool)
             .expect("failing tool metadata must be readable")
             .permissions();
         permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake_tool, permissions)
-            .expect("failing tool must be executable");
+        std::fs::set_permissions(&fake_tool, permissions).expect("failing tool must be executable");
         let inherited_path = std::env::var_os("PATH").expect("test process must have PATH");
         let path = std::env::join_paths(
             std::iter::once(tools.clone()).chain(std::env::split_paths(&inherited_path)),
