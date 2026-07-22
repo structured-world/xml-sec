@@ -540,10 +540,7 @@ mod tests {
             .expect("a supported key candidate must take precedence over agreement fallback");
         assert_eq!(parsed.key_name.as_deref(), Some("content-key"));
         assert_eq!(parsed.encrypted_keys.len(), 1);
-        assert_eq!(
-            parsed.encrypted_keys[0].recipient.as_deref(),
-            Some("alice")
-        );
+        assert_eq!(parsed.encrypted_keys[0].recipient.as_deref(), Some("alice"));
     }
 
     #[test]
