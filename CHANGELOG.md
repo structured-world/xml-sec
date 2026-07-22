@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/structured-world/xml-sec/compare/v0.1.9...v0.1.10) - 2026-07-22
+
+### Added
+
+- *(xmlenc)* add encryption pipeline
+
+### Documentation
+
+- *(tests)* document donor workflow contracts
+- *(fixtures)* preserve donor artifacts verbatim
+- *(xmlenc)* clarify fallible OAEP RNG
+
+### Fixed
+
+- *(fixtures)* normalize directory import paths
+- *(fixtures)* replace directory targets with files
+- *(fixtures)* stage donor snapshots atomically
+- *(fixtures)* reject corpus root aliases
+- *(xmlenc)* defer unsupported key agreement
+- *(fixtures)* synchronize donor directories
+- *(xmlenc)* validate metadata characters
+- *(xmlenc)* align element fragment validation
+- *(xmlenc)* bound documents before parsing
+- *(xmlenc)* reject empty key names
+- *(xmlenc)* bound XML before parsing
+- *(build)* gate encryption example
+
+### Refactored
+
+- *(xmlenc)* clarify element validation
+
 ## [0.1.9](https://github.com/structured-world/xml-sec/compare/v0.1.8...v0.1.9) - 2026-07-21
 
 ### Added
