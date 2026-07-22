@@ -393,17 +393,20 @@ fn wrapped_key_xml(wrapped_key: &[u8], ciphertext: &[u8]) -> String {
     )
 }
 
+/// Loads the Phaos RSA transport key from the tracked donor corpus.
 fn read_phaos_private_key() -> RsaPrivateKey {
     let der = std::fs::read(format!("{PHAOS_DIR}/rsa-priv-key.der"))
         .expect("tracked Phaos RSA key must be readable");
     RsaPrivateKey::from_pkcs1_der(&der).expect("Phaos RSA key must be PKCS#1 DER")
 }
 
+/// Canonicalizes donor XML so serialization differences do not mask semantics.
 fn canonicalize_fixture_document(xml: &[u8]) -> Vec<u8> {
     canonicalize_xml(xml, &C14nAlgorithm::new(C14nMode::Inclusive1_0, false))
         .expect("Phaos fixture must be canonicalizable XML")
 }
 
+/// Decrypts one Phaos vector and compares its canonical document to donor data.
 fn assert_phaos_document(name: &str, resolver: &dyn xml_sec::xmlenc::DecryptionKeyResolver) {
     let encrypted = std::fs::read_to_string(format!("{PHAOS_DIR}/{name}.xml"))
         .expect("tracked Phaos ciphertext must be readable");
@@ -418,6 +421,7 @@ fn assert_phaos_document(name: &str, resolver: &dyn xml_sec::xmlenc::DecryptionK
     );
 }
 
+/// Exercises every Phaos vector supported by the crate's secure profile.
 #[test]
 fn decrypts_supported_phaos_rsa_oaep_and_aes_kw_vectors() {
     // These Phaos-produced documents independently exercise RSA-OAEP and both
@@ -441,6 +445,7 @@ fn decrypts_supported_phaos_rsa_oaep_and_aes_kw_vectors() {
     }
 }
 
+/// Asserts that a donor vector fails at its explicitly classified algorithm URI.
 fn assert_unsupported(
     name: &str,
     expected_uri: &str,
@@ -455,6 +460,7 @@ fn assert_unsupported(
     );
 }
 
+/// Counts encrypted Phaos vectors while excluding key and plaintext documents.
 fn phaos_vector_count() -> usize {
     std::fs::read_dir(PHAOS_DIR)
         .expect("Phaos fixture directory must be readable")
@@ -473,6 +479,7 @@ fn phaos_vector_count() -> usize {
         .count()
 }
 
+/// Proves that every encrypted Phaos vector has an explicit support classification.
 #[test]
 fn classifies_complete_phaos_decryption_corpus() {
     // Every Phaos ciphertext is classified. Legacy algorithms remain visible
@@ -541,6 +548,7 @@ fn classifies_complete_phaos_decryption_corpus() {
     assert_eq!(classified, phaos_vector_count());
 }
 
+/// Verifies recipient-key mismatch and AES-KW integrity failure paths.
 #[test]
 fn rejects_phaos_wrong_rsa_key_and_tampered_wrapped_key() {
     // Independent negative paths prove OAEP does not accept another recipient's

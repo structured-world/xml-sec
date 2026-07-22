@@ -5,9 +5,11 @@ use std::process::Command;
 
 use std::os::unix::fs::PermissionsExt;
 
+/// Isolated repository-shaped directory removed after each importer test.
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {
+    /// Creates a process-unique temporary directory for one test scenario.
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
             "xml-sec-fixture-import-{}-{}",
@@ -21,17 +23,20 @@ impl TestDirectory {
         Self(path)
     }
 
+    /// Returns the temporary repository root.
     fn path(&self) -> &Path {
         &self.0
     }
 }
 
 impl Drop for TestDirectory {
+    /// Removes every donor, fixture, and fake tool created by the scenario.
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.0).expect("temporary test directory must be removable");
     }
 }
 
+/// Verifies that directory imports are snapshots rather than stale overlays.
 #[test]
 fn directory_import_removes_files_deleted_by_the_donor() {
     // A complete-directory import is a reproducible snapshot, not an overlay:
@@ -72,6 +77,7 @@ fn directory_import_removes_files_deleted_by_the_donor() {
     );
 }
 
+/// Verifies that parent traversal cannot mutate an adjacent fixture tree.
 #[test]
 fn directory_import_rejects_paths_that_escape_the_fixture_root() {
     // Directory synchronization removes its destination before copying. Reject
@@ -107,6 +113,7 @@ fn directory_import_rejects_paths_that_escape_the_fixture_root() {
     );
 }
 
+/// Verifies that normalized aliases cannot authorize replacing a corpus root.
 #[test]
 fn directory_import_rejects_fixture_root_aliases() {
     // Empty and current-directory components can normalize to the corpus root;
@@ -144,6 +151,7 @@ fn directory_import_rejects_fixture_root_aliases() {
     }
 }
 
+/// Verifies that enumeration and copy failures preserve the last good snapshot.
 #[test]
 fn directory_import_failures_preserve_the_existing_snapshot() {
     // Enumeration and copy failures must happen entirely in staging. The last
@@ -202,6 +210,7 @@ fn directory_import_failures_preserve_the_existing_snapshot() {
     }
 }
 
+/// Verifies that an upstream directory-to-file transition removes stale children.
 #[test]
 fn file_import_replaces_an_existing_directory() {
     // A donor path may change type between upstream revisions. Importing a

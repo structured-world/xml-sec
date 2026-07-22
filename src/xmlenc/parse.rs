@@ -505,6 +505,7 @@ mod tests {
         );
     }
 
+    /// Verifies that a lone unsupported agreement reports its algorithm URI.
     #[test]
     fn rejects_unsupported_key_agreement_explicitly() {
         // AgreementMethod is outside the supported secure profile. Reporting its
@@ -528,6 +529,7 @@ mod tests {
         ));
     }
 
+    /// Verifies that unsupported agreement metadata does not hide usable keys.
     #[test]
     fn retains_supported_key_candidates_alongside_unsupported_agreement() {
         // Multi-recipient KeyInfo may advertise an unsupported agreement method
