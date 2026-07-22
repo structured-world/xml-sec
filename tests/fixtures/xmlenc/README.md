@@ -5,6 +5,10 @@ on network access or a local xmlsec1 checkout. They were imported from the
 `xmlsec_1_3_12` tag of
 [lsh123/xmlsec](https://github.com/lsh123/xmlsec/tree/xmlsec_1_3_12/tests).
 
+Imported donor artifacts are kept byte-for-byte, including upstream wording
+and spelling. Repository-specific clarifications belong in this wrapper rather
+than in the corpus files whose provenance the tests are intended to preserve.
+
 All private keys in this directory are public test material from that corpus.
 They must never be used outside tests.
 
