@@ -26,7 +26,7 @@ mod escape;
 mod ns_common;
 pub(crate) mod ns_exclusive;
 pub(crate) mod ns_inclusive;
-mod prefix;
+pub(crate) mod prefix;
 pub(crate) mod serialize;
 mod xml_base;
 
@@ -36,7 +36,7 @@ use roxmltree::{Document, Node};
 
 use ns_exclusive::ExclusiveNsRenderer;
 use ns_inclusive::InclusiveNsRenderer;
-use serialize::{C14nConfig, serialize_canonical};
+use serialize::{C14nConfig, serialize_canonical_visible};
 
 /// C14N algorithm mode (without the comments flag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +158,48 @@ pub enum C14nError {
     Io(#[from] std::io::Error),
 }
 
+/// Visibility contract for canonicalizing a precise XPath node-set.
+///
+/// XPath can select attributes and namespace nodes independently from their
+/// owner element. The public closure API predates that requirement and treats
+/// both categories as visible whenever their owner is visible; XMLDSig uses
+/// this richer crate-private contract for standards-compliant subsets.
+pub(crate) trait NodeVisibility {
+    fn contains_node(&self, node: Node<'_, '_>) -> bool;
+
+    fn contains_attribute(
+        &self,
+        owner: Node<'_, '_>,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> bool;
+
+    fn contains_namespace(&self, owner: Node<'_, '_>, prefix: &str, uri: &str) -> bool;
+}
+
+struct ClosureVisibility<'a> {
+    predicate: &'a dyn Fn(Node<'_, '_>) -> bool,
+}
+
+impl NodeVisibility for ClosureVisibility<'_> {
+    fn contains_node(&self, node: Node<'_, '_>) -> bool {
+        (self.predicate)(node)
+    }
+
+    fn contains_attribute(
+        &self,
+        owner: Node<'_, '_>,
+        _namespace: Option<&str>,
+        _local_name: &str,
+    ) -> bool {
+        (self.predicate)(owner)
+    }
+
+    fn contains_namespace(&self, owner: Node<'_, '_>, _prefix: &str, _uri: &str) -> bool {
+        (self.predicate)(owner)
+    }
+}
+
 /// Canonicalize an XML document or document subset.
 ///
 /// - `doc`: parsed roxmltree document (read-only DOM).
@@ -171,6 +213,23 @@ pub fn canonicalize(
     algo: &C14nAlgorithm,
     output: &mut Vec<u8>,
 ) -> Result<(), C14nError> {
+    let visibility = node_set.map(|predicate| ClosureVisibility { predicate });
+    canonicalize_with_visibility(
+        doc,
+        visibility
+            .as_ref()
+            .map(|visibility| visibility as &dyn NodeVisibility),
+        algo,
+        output,
+    )
+}
+
+pub(crate) fn canonicalize_with_visibility(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    algo: &C14nAlgorithm,
+    output: &mut Vec<u8>,
+) -> Result<(), C14nError> {
     // inherit_xml_attrs: Inclusive C14N inherits xml:* attrs from ancestors
     // per §2.4. Exclusive C14N explicitly omits this per Exc-C14N §3.
     // fixup_xml_base: C14N 1.1 resolves relative xml:base URIs via RFC 3986.
@@ -181,7 +240,14 @@ pub fn canonicalize(
                 inherit_xml_attrs: true,
                 fixup_xml_base: false,
             };
-            serialize_canonical(doc, node_set, algo.with_comments, &renderer, config, output)
+            serialize_canonical_visible(
+                doc,
+                visibility,
+                algo.with_comments,
+                &renderer,
+                config,
+                output,
+            )
         }
         C14nMode::Inclusive1_1 => {
             let renderer = InclusiveNsRenderer;
@@ -189,7 +255,14 @@ pub fn canonicalize(
                 inherit_xml_attrs: true,
                 fixup_xml_base: true,
             };
-            serialize_canonical(doc, node_set, algo.with_comments, &renderer, config, output)
+            serialize_canonical_visible(
+                doc,
+                visibility,
+                algo.with_comments,
+                &renderer,
+                config,
+                output,
+            )
         }
         C14nMode::Exclusive1_0 => {
             let renderer = ExclusiveNsRenderer::new(&algo.inclusive_prefixes);
@@ -197,7 +270,14 @@ pub fn canonicalize(
                 inherit_xml_attrs: false,
                 fixup_xml_base: false,
             };
-            serialize_canonical(doc, node_set, algo.with_comments, &renderer, config, output)
+            serialize_canonical_visible(
+                doc,
+                visibility,
+                algo.with_comments,
+                &renderer,
+                config,
+                output,
+            )
         }
     }
 }

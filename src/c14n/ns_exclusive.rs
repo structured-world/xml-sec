@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use roxmltree::Node;
 
+use super::NodeVisibility;
 use super::ns_common::collect_ns_declarations;
 use super::prefix::{attribute_prefix, element_prefix};
 use super::serialize::NsRenderer;
@@ -31,13 +32,65 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
         &self,
         node: Node<'n, '_>,
         parent_rendered: &HashMap<String, String>,
+        visibility: Option<&dyn NodeVisibility>,
     ) -> (Vec<(String, String)>, HashMap<String, String>) {
-        let utilized = visibly_utilized_prefixes(node);
+        let utilized = visibly_utilized_prefixes(node, visibility);
         // Exclusive mode: only visibly-utilized prefixes and forced prefixes
         // from InclusiveNamespaces PrefixList are candidates.
-        collect_ns_declarations(node, parent_rendered, |prefix, _| {
-            utilized.contains(prefix) || self.inclusive_prefixes.contains(prefix)
-        })
+        // Missing namespace nodes suppress a declaration but do not erase a
+        // binding physically rendered by an output ancestor.
+        let (mut declarations, mut rendered) = collect_ns_declarations(
+            node,
+            parent_rendered,
+            visibility,
+            |prefix| self.inclusive_prefixes.contains(prefix),
+            |prefix, _| utilized.contains(prefix) || self.inclusive_prefixes.contains(prefix),
+        );
+
+        if let (Some(visibility), Some(parent)) = (visibility, node.parent())
+            && parent.is_element()
+        {
+            for namespace in node.namespaces() {
+                let prefix = namespace.name().unwrap_or("");
+                let uri = namespace.uri();
+                let selected_here = visibility.contains_namespace(node, prefix, uri);
+                let selected_on_parent = visibility.contains_namespace(parent, prefix, uri);
+                let declaration_suppressed = parent_rendered.get(prefix).map(String::as_str)
+                    == Some(uri)
+                    && !declarations
+                        .iter()
+                        .any(|(declared_prefix, _)| declared_prefix == prefix);
+                let discontinuity_key = format!("\0exclusive-discontinuity:{prefix}");
+                let was_discontinuous = parent_rendered.contains_key(&discontinuity_key);
+                if selected_here && declaration_suppressed {
+                    match (was_discontinuous, selected_on_parent) {
+                        (true, false) => {
+                            declarations.push((prefix.to_owned(), uri.to_owned()));
+                            declarations.sort_by(|left, right| left.0.cmp(&right.0));
+                            rendered.remove(&discontinuity_key);
+                        }
+                        (true, true) => {
+                            rendered.remove(&discontinuity_key);
+                        }
+                        (false, false) => {
+                            // Preserve the physical URI binding while marking
+                            // the first namespace-node discontinuity. A second
+                            // discontinuity must redeclare the prefix.
+                            rendered.insert(discontinuity_key, String::new());
+                        }
+                        (false, true) => {}
+                    }
+                } else if selected_here {
+                    rendered.remove(&discontinuity_key);
+                }
+            }
+        }
+
+        (declarations, rendered)
+    }
+
+    fn renders_orphan_namespace(&self, prefix: &str) -> bool {
+        self.inclusive_prefixes.contains(prefix)
     }
 }
 
@@ -49,7 +102,10 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
 ///
 /// Uses lexical prefixes extracted from source XML byte positions,
 /// avoiding ambiguity when multiple prefixes bind the same namespace URI.
-fn visibly_utilized_prefixes<'a>(node: Node<'a, '_>) -> HashSet<&'a str> {
+fn visibly_utilized_prefixes<'a>(
+    node: Node<'a, '_>,
+    visibility: Option<&dyn NodeVisibility>,
+) -> HashSet<&'a str> {
     let mut utilized = HashSet::new();
 
     // Element's own lexical prefix from source XML.
@@ -66,6 +122,11 @@ fn visibly_utilized_prefixes<'a>(node: Node<'a, '_>) -> HashSet<&'a str> {
 
     // Attribute lexical prefixes from source XML.
     for attr in node.attributes() {
+        if visibility
+            .is_some_and(|set| !set.contains_attribute(node, attr.namespace(), attr.name()))
+        {
+            continue;
+        }
         let attr_prefix = attribute_prefix(node, &attr);
         if !attr_prefix.is_empty() {
             utilized.insert(attr_prefix);

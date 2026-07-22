@@ -10,8 +10,8 @@
 //! to strip comments). Therefore `assert_c14n_matches_golden` defaults to
 //! `with_comments: true` to match xmllint behavior.
 //!
-//! XPath-subset vectors (merlin c14n-0..27) are skipped — require XPath
-//! evaluator (P4-008). Only full-document canonicalization is tested here.
+//! XPath-subset vectors (Merlin c14n-0..27) exercise the complete XMLDSig
+//! XPath transform and canonicalization path.
 //!
 //! Subtree tests for exc-c14n-one use SHA-1 digest comparison against
 //! DigestValues embedded in the signed XML (validates subtree C14N
@@ -22,6 +22,10 @@ use std::fs;
 
 use sha1::{Digest, Sha1};
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize, canonicalize_xml};
+use xml_sec::xmldsig::uri::UriReferenceResolver;
+use xml_sec::xmldsig::{
+    DsigStatus, ReferenceSet, find_signature_node, parse_reference, process_reference,
+};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -281,12 +285,88 @@ fn exc_c14n_subtree_with_comments_and_prefix_list() {
     );
 }
 
-// ─── XPath subset vectors — explicitly skipped ──────────────────────────────
-//
-// merlin-c14n-three/c14n-0.txt through c14n-27.txt are all XPath-subset
-// canonicalization results. Without an XPath 1.0 evaluator (planned for
-// P4-008), we cannot generate the node sets needed to test against these
-// golden files. They remain in tests/fixtures/ for when P4-008 is
-// implemented.
-//
-// See also: arch/ROADMAP.md gap G002.
+#[test]
+fn merlin_xpath_subset_and_signed_info_match_all_28_golden_outputs() {
+    // Every reference carries a different XPath predicate and C14N parameter
+    // combination. Comparing exact octets catches node-kind, namespace, and
+    // inherited-attribute errors that digest-only checks cannot localize.
+    let xml = fixture("merlin-c14n-three/signature.xml");
+    let document = roxmltree::Document::parse(&xml).expect("Merlin signature must parse");
+    let signature = find_signature_node(&document).expect("Merlin Signature element");
+    let signed_info_node = signature
+        .children()
+        .find(|node| node.tag_name().name() == "SignedInfo")
+        .expect("Merlin SignedInfo element");
+    let references = signed_info_node
+        .children()
+        .filter(|node| node.tag_name().name() == "Reference")
+        .enumerate()
+        .map(|(index, reference_node)| {
+            parse_reference(reference_node)
+                .unwrap_or_else(|error| panic!("Merlin Reference {index} must parse: {error}"))
+        })
+        .collect::<Vec<_>>();
+    let resolver = UriReferenceResolver::new(&document);
+    assert_eq!(references.len(), 27);
+    let mut failures = Vec::new();
+    for (index, reference) in references.iter().enumerate() {
+        let result = process_reference(
+            reference,
+            &resolver,
+            signature,
+            ReferenceSet::SignedInfo,
+            index,
+            true,
+        )
+        .unwrap_or_else(|error| panic!("Merlin reference {index} must execute: {error}"));
+        let expected = fixture_bytes(&format!("merlin-c14n-three/c14n-{}.txt", index));
+        let actual = result
+            .pre_digest_data
+            .as_deref()
+            .expect("pre-digest capture was requested");
+        if actual != expected {
+            let offset = actual
+                .iter()
+                .zip(&expected)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or(actual.len().min(expected.len()));
+            let start = offset.saturating_sub(80);
+            let actual_end = (offset + 160).min(actual.len());
+            let expected_end = (offset + 160).min(expected.len());
+            failures.push(format!(
+                "reference {index} at offset {offset}\nactual: {:?}\nexpected: {:?}",
+                String::from_utf8_lossy(&actual[start..actual_end]),
+                String::from_utf8_lossy(&expected[start..expected_end]),
+            ));
+            continue;
+        }
+        assert_eq!(
+            result.status,
+            DsigStatus::Valid,
+            "embedded digest mismatch for Merlin reference {}",
+            index
+        );
+    }
+
+    // The final Merlin output is canonicalized SignedInfo rather than another
+    // Reference. It validates namespace and xml:lang inheritance from the
+    // omitted ancestors after all 27 XPath subset outputs have passed.
+    let predicate = subtree_predicate(signed_info_node);
+    let mut signed_info_output = Vec::new();
+    canonicalize(
+        &document,
+        Some(&predicate),
+        &C14nAlgorithm::new(C14nMode::Inclusive1_0, false),
+        &mut signed_info_output,
+    )
+    .expect("Merlin SignedInfo must canonicalize");
+    assert_eq!(
+        signed_info_output,
+        fixture_bytes("merlin-c14n-three/c14n-27.txt")
+    );
+    assert!(
+        failures.is_empty(),
+        "Merlin canonical byte mismatches:\n{}",
+        failures.join("\n\n")
+    );
+}

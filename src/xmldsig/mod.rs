@@ -6,7 +6,8 @@
 //!
 //! - URI dereference: same-document references (`""`, `#id`, `#xpointer(/)`, `#xpointer(id('...'))`)
 //! - ID attribute resolution with configurable attribute names
-//! - Node set types for the transform pipeline
+//! - Exact element, attribute, and namespace node sets for transform processing
+//! - Enveloped, canonicalization, Base64, XPath 1.0, and XPath Filter 2.0 transforms
 //!
 //! ## Signing and verification
 //!
@@ -63,13 +64,14 @@ pub mod uri;
 pub mod verify;
 pub(crate) mod whitespace;
 pub mod x509;
+mod xpath;
 
 pub use builder::{ReferenceBuilder, SignatureBuilder, SignatureBuilderError};
 pub use digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 pub use keys::{DefaultKeyResolver, KeyResolutionError, KeyResolverConfig, VerificationKey};
 pub use parse::{
     KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, SignatureAlgorithm, SignedInfo,
-    X509DataInfo, find_signature_node, parse_key_info, parse_signed_info,
+    X509DataInfo, find_signature_node, parse_key_info, parse_reference, parse_signed_info,
 };
 pub use sign::{
     ComputedReferenceDigest, EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriteError,
@@ -82,8 +84,9 @@ pub use signature::{
     verify_rsa_signature_pem, verify_rsa_signature_spki,
 };
 pub use transforms::{
-    DEFAULT_IMPLICIT_C14N_URI, ENVELOPED_SIGNATURE_URI, Transform, XPATH_TRANSFORM_URI,
-    execute_transforms, parse_transforms,
+    BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, ENVELOPED_SIGNATURE_URI, Transform,
+    XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI, XPathExpression, XPathFilter,
+    XPathFilterOperation, execute_transforms, parse_transforms,
 };
 pub use types::{NodeSet, TransformData, TransformError};
 pub use verify::{

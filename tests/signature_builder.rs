@@ -1,7 +1,7 @@
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::xmldsig::{
     DigestAlgorithm, ReferenceBuilder, SignatureAlgorithm, SignatureBuilder, SignatureBuilderError,
-    Transform, parse_transforms,
+    Transform, XPathExpression, XPathFilter, XPathFilterOperation, parse_transforms,
 };
 
 const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
@@ -164,6 +164,62 @@ fn serializes_xpath_and_exclusive_prefix_list() {
         .find(|node| node.tag_name().name() == "InclusiveNamespaces")
         .expect("InclusiveNamespaces child");
     assert_eq!(inclusive.attribute("PrefixList"), Some("#default ds saml"));
+}
+
+#[test]
+fn serializes_and_reparses_general_xpath_filter2_parameters() {
+    // Builder output must preserve expression order, operations, escaping,
+    // and prefix bindings because all four affect the resulting node set.
+    let filters = vec![
+        XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("//doc:Record[@active = 'yes']")
+                .with_namespace("doc", "urn:documents"),
+        ),
+        XPathFilter::new(
+            XPathFilterOperation::Subtract,
+            XPathExpression::new("//doc:Secret").with_namespace("doc", "urn:documents"),
+        ),
+    ];
+    let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .transform(Transform::XPathFilter2(filters)),
+        )
+        .build_template()
+        .expect("valid XPath Filter 2.0 template");
+    let document = roxmltree::Document::parse(&xml).expect("builder must emit valid XML");
+    let transforms = document
+        .descendants()
+        .find(|node| node.has_tag_name((DSIG_NS, "Transforms")))
+        .expect("Transforms element");
+    let parsed = parse_transforms(transforms).expect("serialized filters must parse");
+    let [Transform::XPathFilter2(parsed_filters)] = parsed.as_slice() else {
+        panic!("expected XPath Filter 2.0 transform");
+    };
+
+    assert_eq!(parsed_filters.len(), 2);
+    assert_eq!(
+        parsed_filters[0].operation(),
+        XPathFilterOperation::Intersect
+    );
+    assert_eq!(
+        parsed_filters[0].xpath().expression(),
+        "//doc:Record[@active = 'yes']"
+    );
+    assert_eq!(
+        parsed_filters[0]
+            .xpath()
+            .namespaces()
+            .get("doc")
+            .map(String::as_str),
+        Some("urn:documents")
+    );
+    assert_eq!(
+        parsed_filters[1].operation(),
+        XPathFilterOperation::Subtract
+    );
 }
 
 #[test]

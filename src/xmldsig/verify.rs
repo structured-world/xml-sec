@@ -23,7 +23,8 @@ use super::signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
 };
 use super::transforms::{
-    DEFAULT_IMPLICIT_C14N_URI, Transform, XPATH_TRANSFORM_URI, execute_transforms,
+    BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, Transform, XPATH_TRANSFORM_URI,
+    execute_transforms,
 };
 use super::uri::{UriReferenceResolver, parse_xpointer_id_fragment};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_text};
@@ -975,11 +976,10 @@ fn enforce_reference_policies(
                 }
             }
 
-            let has_explicit_c14n = reference
-                .transforms
-                .iter()
-                .any(|transform| matches!(transform, Transform::C14n(_)));
-            if !has_explicit_c14n && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI) {
+            let produces_binary = reference.transforms.last().is_some_and(|transform| {
+                matches!(transform, Transform::C14n(_) | Transform::Base64Decode)
+            });
+            if !produces_binary && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI) {
                 return Err(SignatureVerificationPipelineError::DisallowedTransform {
                     algorithm: DEFAULT_IMPLICIT_C14N_URI.to_owned(),
                 });
@@ -992,8 +992,10 @@ fn enforce_reference_policies(
 fn transform_uri(transform: &Transform) -> &'static str {
     match transform {
         Transform::Enveloped => super::transforms::ENVELOPED_SIGNATURE_URI,
-        Transform::XpathExcludeAllSignatures => XPATH_TRANSFORM_URI,
+        Transform::XpathExcludeAllSignatures | Transform::XPath(_) => XPATH_TRANSFORM_URI,
+        Transform::XPathFilter2(_) => super::transforms::XPATH_FILTER2_TRANSFORM_URI,
         Transform::C14n(algo) => algo.uri(),
+        Transform::Base64Decode => BASE64_TRANSFORM_URI,
     }
 }
 

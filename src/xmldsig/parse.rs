@@ -373,7 +373,9 @@ pub fn parse_signed_info(signed_info_node: Node) -> Result<SignedInfo, ParseErro
 /// Parse a single `<ds:Reference>` element.
 ///
 /// Structure: `<Transforms>?` → `<DigestMethod>` → `<DigestValue>`
-pub(crate) fn parse_reference(reference_node: Node) -> Result<Reference, ParseError> {
+pub fn parse_reference(reference_node: Node) -> Result<Reference, ParseError> {
+    verify_ds_element(reference_node, "Reference")?;
+    ensure_no_non_whitespace_text(reference_node, "Reference")?;
     let uri = reference_node.attribute("URI").map(String::from);
     let id = reference_node.attribute("Id").map(String::from);
     let ref_type = reference_node.attribute("Type").map(String::from);

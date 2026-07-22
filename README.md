@@ -37,7 +37,7 @@ Every SAML, SOAP, and WS-Security implementation depends on libxmlsec1 — a C l
 
 Currently implemented (core paths):
 - C14N 1.0, C14N 1.1, and Exclusive C14N
-- XMLDSig parsing, same-document URI dereference, transform chains, and digest verification
+- XMLDSig parsing, same-document URI dereference, enveloped/C14N/Base64/XPath 1.0/XPath Filter 2.0 transform chains, and digest verification
 - XMLDSig full verify pipeline (`SignedInfo` canonicalization + `SignatureValue` verification)
 - XMLDSig template signing pipeline (`DigestValue` fill + `SignedInfo` canonicalization + `SignatureValue` fill), including enveloped SAML Response templates
 - XMLDSig signing KeyInfo writer for embedded X.509 certificates

@@ -11,6 +11,8 @@
 
 use roxmltree::Node;
 
+use super::NodeVisibility;
+
 /// The XML namespace URI.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -34,7 +36,7 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 /// `xml:base` attribute.
 pub(crate) fn compute_effective_xml_base(
     start: Node<'_, '_>,
-    node_set: Option<&dyn Fn(Node) -> bool>,
+    visibility: Option<&dyn NodeVisibility>,
 ) -> Option<String> {
     let mut bases: Vec<&str> = Vec::new();
     let mut current = Some(start);
@@ -44,8 +46,8 @@ pub(crate) fn compute_effective_xml_base(
             // xml:base in the canonical output. However, we still collect
             // its xml:base value as the resolution seed, so that the
             // omitted chain below resolves against an absolute base.
-            if let Some(pred) = node_set
-                && pred(n)
+            if let Some(set) = visibility
+                && set.contains_node(n)
             {
                 if let Some(base) = xml_base_value(n) {
                     bases.push(base);

@@ -31,6 +31,8 @@ p521 = { version = "0.14", features = ["ecdsa"], optional = true }
 signature = { version = "3", optional = true }
 subtle = { version = "2", optional = true }
 getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
+sxd-document-no-unsafe = { version = "0.4.1", default-features = false, features = ["no-unsafe"], optional = true }
+sxd-xpath-no-unsafe = { version = "0.5.1", default-features = false, features = ["no-unsafe"], optional = true }
 aes = { version = "0.9.1", optional = true }
 aes-gcm = { version = "0.11.0", optional = true }
 aes-kw = { version = "0.3.1", optional = true }
@@ -66,6 +68,8 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:sha2",
     "dep:signature",
     "dep:subtle",
+    "dep:sxd-document-no-unsafe",
+    "dep:sxd-xpath-no-unsafe",
     "dep:x509-parser",
 ]
 xmlenc = [             # XML Encryption (encrypt + decrypt)
