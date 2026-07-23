@@ -158,7 +158,13 @@ impl<'d> Mirror<'d> {
         let mut result = NodeSet::empty(source);
         for node in selected.document_order() {
             match node {
-                nodeset::Node::Root(_) => result.insert_node(source.root()),
+                nodeset::Node::Root(_) => {
+                    if expand_subtrees {
+                        result.insert_subtree(source.root());
+                    } else {
+                        result.insert_node(source.root());
+                    }
+                }
                 nodeset::Node::Element(element) => {
                     if let Some(source_node) = self.source_node(source, self.elements.get(&element))
                     {
@@ -562,6 +568,21 @@ mod tests {
             canonicalize(&result),
             r#"<keep a="1"><child>yes</child></keep>"#
         );
+    }
+
+    #[test]
+    fn filter2_expands_document_root_to_the_whole_document() {
+        // Filter 2.0 defines a selected root as the root plus every node that
+        // has it as an ancestor, so intersecting with `/` is an identity.
+        let doc = Document::parse("<root><child>covered</child></root>").unwrap();
+        let input = NodeSet::entire_document_without_comments(&doc);
+        let filters = [XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("/"),
+        )];
+        let result = apply_xpath_filter2(input, &filters).unwrap();
+
+        assert_eq!(canonicalize(&result), "<root><child>covered</child></root>");
     }
 
     #[test]
