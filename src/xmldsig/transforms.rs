@@ -920,6 +920,22 @@ mod tests {
         assert!(result.into_binary().unwrap().is_empty());
     }
 
+    #[test]
+    fn pipeline_rejects_unbounded_programmatic_transform_chain() {
+        // The public executor is a trust boundary too: callers can bypass XML
+        // parsing and must not be able to create an arbitrarily deep recursion.
+        let doc = Document::parse("<root/>").unwrap();
+        let transforms = vec![Transform::Base64Decode; 65];
+
+        let result = execute_transforms(
+            doc.root_element(),
+            TransformData::Binary(Vec::new()),
+            &transforms,
+        );
+
+        assert!(result.is_err());
+    }
+
     // ── Pipeline execution ───────────────────────────────────────────
 
     #[test]
@@ -1044,6 +1060,20 @@ mod tests {
         assert_eq!(chain.len(), 2);
         assert!(matches!(chain[0], Transform::Enveloped));
         assert!(matches!(chain[1], Transform::C14n(_)));
+    }
+
+    #[test]
+    fn parse_transforms_rejects_unbounded_chain() {
+        // Signed XML is untrusted input; reject excess transforms before
+        // constructing a chain that would consume one stack frame per entry.
+        let entries = format!(
+            r#"<Transform Algorithm="{BASE64_TRANSFORM_URI}"/>"#
+        )
+        .repeat(65);
+        let xml = format!(r#"<Transforms xmlns="{XMLDSIG_NS}">{entries}</Transforms>"#);
+        let doc = Document::parse(&xml).unwrap();
+
+        assert!(parse_transforms(doc.root_element()).is_err());
     }
 
     #[test]
