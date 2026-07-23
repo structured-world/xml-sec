@@ -223,6 +223,23 @@ fn serializes_and_reparses_general_xpath_filter2_parameters() {
 }
 
 #[test]
+fn rejects_xpath_binding_that_shadows_signature_prefix() {
+    // Rebinding the prefix used for ds:XPath changes the element namespace and
+    // produces a template that neither the strict parser nor a signer can use.
+    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::XPath(
+                XPathExpression::new("//ds:item").with_namespace("ds", "urn:payload"),
+            )),
+        )
+        .build_template()
+        .expect_err("XPath namespace bindings must not shadow the signature prefix");
+
+    assert!(error.to_string().contains("ds"));
+}
+
+#[test]
 fn accepts_unicode_xml_namespace_prefixes() {
     // XML 1.0 NCNames permit Unicode letters; prefix validation must not be ASCII-only.
     let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
