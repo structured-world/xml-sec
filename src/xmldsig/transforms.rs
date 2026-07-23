@@ -44,6 +44,11 @@ pub const XPATH_FILTER2_TRANSFORM_URI: &str = "http://www.w3.org/2002/06/xmldsig
 /// The implicit default canonicalization URI applied when no explicit C14N
 /// transform is present in a `<Reference>`.
 pub const DEFAULT_IMPLICIT_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
+/// Maximum transforms accepted for one reference.
+///
+/// Execution retains one stack frame when a binary-to-node-set adapter parses
+/// temporary XML, so bounding the chain also bounds stack and retained input.
+pub const MAX_TRANSFORMS_PER_REFERENCE: usize = 64;
 /// xmlsec1 donor vectors use this XPath expression as a compatibility form of
 /// enveloped-signature exclusion.
 const ENVELOPED_SIGNATURE_XPATH_EXPR: &str = "not(ancestor-or-self::dsig:Signature)";
@@ -382,7 +387,17 @@ pub fn execute_transforms_with_options<'a>(
     transforms: &[Transform],
     options: TransformOptions,
 ) -> Result<Vec<u8>, TransformError> {
+    ensure_transform_count(transforms.len())?;
     execute_transform_chain(signature_node, initial_data, transforms, options)
+}
+
+fn ensure_transform_count(count: usize) -> Result<(), TransformError> {
+    if count > MAX_TRANSFORMS_PER_REFERENCE {
+        return Err(TransformError::TooManyTransforms {
+            max: MAX_TRANSFORMS_PER_REFERENCE,
+        });
+    }
+    Ok(())
 }
 
 fn execute_transform_chain<'s, 'd>(
@@ -466,6 +481,7 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
         if !child.is_element() {
             continue;
         }
+        ensure_transform_count(chain.len() + 1)?;
 
         // Only <ds:Transform> children are allowed; fail closed on any other element.
         let tag = child.tag_name();
@@ -933,7 +949,12 @@ mod tests {
             &transforms,
         );
 
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(TransformError::TooManyTransforms {
+                max: MAX_TRANSFORMS_PER_REFERENCE
+            })
+        ));
     }
 
     // ── Pipeline execution ───────────────────────────────────────────
@@ -1073,7 +1094,12 @@ mod tests {
         let xml = format!(r#"<Transforms xmlns="{XMLDSIG_NS}">{entries}</Transforms>"#);
         let doc = Document::parse(&xml).unwrap();
 
-        assert!(parse_transforms(doc.root_element()).is_err());
+        assert!(matches!(
+            parse_transforms(doc.root_element()),
+            Err(TransformError::TooManyTransforms {
+                max: MAX_TRANSFORMS_PER_REFERENCE
+            })
+        ));
     }
 
     #[test]

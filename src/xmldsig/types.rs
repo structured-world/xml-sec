@@ -321,6 +321,13 @@ pub enum TransformError {
     #[error("unsupported transform: {0}")]
     UnsupportedTransform(String),
 
+    /// A reference declared more transforms than the implementation permits.
+    #[error("transform chain exceeds maximum length of {max}")]
+    TooManyTransforms {
+        /// Maximum accepted transforms in one reference.
+        max: usize,
+    },
+
     /// Canonicalization error during transform.
     #[error("C14N error: {0}")]
     C14n(#[from] crate::c14n::C14nError),
