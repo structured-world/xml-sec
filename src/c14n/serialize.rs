@@ -138,9 +138,8 @@ fn serialize_children(
                     // Before root element: emit \n separator if there was output before
                     // (e.g., a preceding comment/PI). Note: when node_set excludes the
                     // root element but includes preceding comments, those comments won't
-                    // get a trailing \n — this is acceptable because document subsets
-                    // that exclude the root element are only used with XPath transforms,
-                    // which are not yet implemented.
+                    // get a trailing \n. XPath document subsets may intentionally produce
+                    // canonical octet streams that are not well-formed XML documents.
                     if is_doc_root && !output.is_empty() {
                         output.push(b'\n');
                     }
@@ -154,8 +153,11 @@ fn serialize_children(
                         output,
                     );
                 } else {
-                    // Attribute and namespace nodes can remain selected even
-                    // when their owner element is absent from an XPath subset.
+                    // Canonical XML 1.0 section 2.3 requires processing an
+                    // excluded element's namespace and attribute axes before
+                    // its selected children. Their standalone bytes are
+                    // therefore intentional; canonical subset output need not
+                    // be a well-formed XML document.
                     serialize_orphan_axis_nodes(
                         child,
                         visibility,
