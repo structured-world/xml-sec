@@ -18,6 +18,8 @@ use super::transforms::{
 use super::types::{NodeSet, TransformError};
 use crate::c14n::prefix::{attribute_prefix, element_prefix};
 
+const ALL_XPATH_NODES: &str = "//. | //@* | //namespace::*";
+
 /// SXD's tokenizer rejects otherwise valid whitespace between a function QName
 /// and `(`. Normalize only that token boundary, preserving quoted literals and
 /// all whitespace that can affect string values or operator tokenization.
@@ -386,18 +388,36 @@ fn evaluate_expression<'a>(
     context.set_function("id", IdFunction);
     context.set_function("lang", LangFunction);
 
-    let source = if wrap_as_filter {
-        format!(
-            "(//. | //@* | //namespace::*)[boolean({})]",
-            expression.expression()
-        )
-    } else {
-        expression.expression().to_owned()
-    };
-    let source = normalize_function_spacing(&source);
+    let source = normalize_function_spacing(expression.expression());
     let xpath = Factory::new()
         .build(&source)
         .map_err(|error| TransformError::XPath(error.to_string()))?;
+
+    if wrap_as_filter {
+        // XMLDSig evaluates the expression independently for every input node;
+        // XPath::evaluate establishes position=1 and size=1 for each call.
+        let all_nodes_xpath = Factory::new()
+            .build(ALL_XPATH_NODES)
+            .map_err(|error| TransformError::XPath(error.to_string()))?;
+        let all_nodes = all_nodes_xpath
+            .evaluate(&context, target.root())
+            .map_err(|error| TransformError::XPath(error.to_string()))?;
+        let Value::Nodeset(all_nodes) = all_nodes else {
+            unreachable!("the fixed all-nodes XPath expression returns a node-set");
+        };
+        let mut selected = nodeset::Nodeset::new();
+        for node in all_nodes.document_order() {
+            let include = xpath
+                .evaluate(&context, node.clone())
+                .map_err(|error| TransformError::XPath(error.to_string()))?
+                .into_boolean();
+            if include {
+                selected.add(node);
+            }
+        }
+        return Ok(mirror.project(document, selected, false));
+    }
+
     let value = xpath
         .evaluate(&context, target.root())
         .map_err(|error| TransformError::XPath(error.to_string()))?;
@@ -504,6 +524,23 @@ mod tests {
         let output = canonicalize(&result);
         assert!(output.contains(r#"xmlns:keep="urn:keep""#));
         assert!(!output.contains(r#"xmlns:drop="urn:drop""#));
+    }
+
+    #[test]
+    fn xpath_filter_evaluates_position_and_size_per_input_node() {
+        // XMLDSig visits every input node independently with both context
+        // position and context size set to one.
+        let doc = Document::parse("<root><first/><second/></root>").unwrap();
+        let input = NodeSet::entire_document_without_comments(&doc);
+        let result = apply_xpath_filter(
+            input,
+            &XPathExpression::new("position() = 1 and last() = 1"),
+        )
+        .unwrap();
+
+        assert!(result.contains(doc.root_element()));
+        assert!(result.contains(doc.root_element().first_element_child().unwrap()));
+        assert!(result.contains(doc.root_element().last_element_child().unwrap()));
     }
 
     #[test]
