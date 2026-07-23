@@ -39,6 +39,22 @@ fn fixture_bytes(path: &str) -> Vec<u8> {
     fs::read(&full).unwrap_or_else(|e| panic!("cannot read fixture {full}: {e}"))
 }
 
+fn canonical_mismatch(label: &str, actual: &[u8], expected: &[u8]) -> String {
+    let offset = actual
+        .iter()
+        .zip(expected)
+        .position(|(actual, expected)| actual != expected)
+        .unwrap_or(actual.len().min(expected.len()));
+    let start = offset.saturating_sub(80);
+    let actual_end = (offset + 160).min(actual.len());
+    let expected_end = (offset + 160).min(expected.len());
+    format!(
+        "{label} at offset {offset}\nactual: {:?}\nexpected: {:?}",
+        String::from_utf8_lossy(&actual[start..actual_end]),
+        String::from_utf8_lossy(&expected[start..expected_end]),
+    )
+}
+
 fn sha1_base64(data: &[u8]) -> String {
     base64_encode(&Sha1::digest(data))
 }
@@ -325,18 +341,10 @@ fn merlin_xpath_subset_and_signed_info_match_all_28_golden_outputs() {
             .as_deref()
             .expect("pre-digest capture was requested");
         if actual != expected {
-            let offset = actual
-                .iter()
-                .zip(&expected)
-                .position(|(actual, expected)| actual != expected)
-                .unwrap_or(actual.len().min(expected.len()));
-            let start = offset.saturating_sub(80);
-            let actual_end = (offset + 160).min(actual.len());
-            let expected_end = (offset + 160).min(expected.len());
-            failures.push(format!(
-                "reference {index} at offset {offset}\nactual: {:?}\nexpected: {:?}",
-                String::from_utf8_lossy(&actual[start..actual_end]),
-                String::from_utf8_lossy(&expected[start..expected_end]),
+            failures.push(canonical_mismatch(
+                &format!("reference {index}"),
+                actual,
+                &expected,
             ));
             continue;
         }
@@ -360,10 +368,14 @@ fn merlin_xpath_subset_and_signed_info_match_all_28_golden_outputs() {
         &mut signed_info_output,
     )
     .expect("Merlin SignedInfo must canonicalize");
-    assert_eq!(
-        signed_info_output,
-        fixture_bytes("merlin-c14n-three/c14n-27.txt")
-    );
+    let expected_signed_info = fixture_bytes("merlin-c14n-three/c14n-27.txt");
+    if signed_info_output != expected_signed_info {
+        failures.push(canonical_mismatch(
+            "SignedInfo",
+            &signed_info_output,
+            &expected_signed_info,
+        ));
+    }
     assert!(
         failures.is_empty(),
         "Merlin canonical byte mismatches:\n{}",
