@@ -241,7 +241,6 @@ impl<'a> VerifyContext<'a> {
     /// The default follows XMLDSig and returns the `<XPath>` parameter.
     /// Use [`XPathHereSemantics::XmlSecLegacy`] only for documents known to
     /// have been generated with libxmlsec1's `<Transform>` interpretation.
-    #[must_use]
     pub fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
         self.transform_options = self.transform_options.xpath_here_semantics(semantics);
         self

@@ -352,12 +352,13 @@ mod tests {
     fn document_without_comments_preserves_comment_policy() {
         // Empty-URI dereferencing strips comment nodes and must not retain a
         // stale flag merely because comments were seen while materializing.
-        let document = Document::parse("<root><!-- excluded --><child/></root>").unwrap();
+        let document = Document::parse("<root><!-- excluded --><child/></root>")
+            .expect("fixed comment fixture must parse");
         let nodes = NodeSet::entire_document_without_comments(&document);
         let comment = document
             .descendants()
             .find(|node| node.is_comment())
-            .unwrap();
+            .expect("fixed fixture contains one comment");
 
         assert!(!nodes.contains(comment));
         assert!(!nodes.with_comments());
