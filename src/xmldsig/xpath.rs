@@ -700,6 +700,15 @@ mod tests {
     }
 
     #[test]
+    fn function_spacing_normalization_preserves_word_operators() {
+        // XPath word operators require a token boundary. Treating their
+        // following parenthesis like a function call changes valid syntax.
+        let source = "true() and (false()) or (6 div (2) = 3 and 7 mod (4) = 3)";
+
+        assert_eq!(normalize_function_spacing(source), source);
+    }
+
+    #[test]
     fn xpath_here_function_uses_xpath_element() {
         // XMLDSig defines here() as the parent of the text node that directly
         // bears the expression, which is the XPath parameter element.
