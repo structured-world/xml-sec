@@ -1082,10 +1082,7 @@ mod tests {
     fn parse_transforms_rejects_unbounded_chain() {
         // Signed XML is untrusted input; reject excess transforms before
         // constructing a chain that would consume one stack frame per entry.
-        let entries = format!(
-            r#"<Transform Algorithm="{BASE64_TRANSFORM_URI}"/>"#
-        )
-        .repeat(65);
+        let entries = format!(r#"<Transform Algorithm="{BASE64_TRANSFORM_URI}"/>"#).repeat(65);
         let xml = format!(r#"<Transforms xmlns="{XMLDSIG_NS}">{entries}</Transforms>"#);
         let doc = Document::parse(&xml).unwrap();
 

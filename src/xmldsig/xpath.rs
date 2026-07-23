@@ -50,16 +50,11 @@ pub(super) fn normalize_function_spacing(source: &str) -> String {
                 .next_back()
                 .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'));
             let previous_name = output
-                .rsplit(|ch: char| {
-                    !(ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
-                })
+                .rsplit(|ch: char| !(ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':')))
                 .next()
                 .unwrap_or_default();
             let previous_is_word_operator = matches!(previous_name, "and" | "or" | "div" | "mod");
-            if previous_is_name
-                && !previous_is_word_operator
-                && chars.get(index) == Some(&'(')
-            {
+            if previous_is_name && !previous_is_word_operator && chars.get(index) == Some(&'(') {
                 continue;
             }
             output.extend(chars[whitespace_start..index].iter());
