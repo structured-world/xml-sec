@@ -49,7 +49,17 @@ pub(super) fn normalize_function_spacing(source: &str) -> String {
                 .chars()
                 .next_back()
                 .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'));
-            if previous_is_name && chars.get(index) == Some(&'(') {
+            let previous_name = output
+                .rsplit(|ch: char| {
+                    !(ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+                })
+                .next()
+                .unwrap_or_default();
+            let previous_is_word_operator = matches!(previous_name, "and" | "or" | "div" | "mod");
+            if previous_is_name
+                && !previous_is_word_operator
+                && chars.get(index) == Some(&'(')
+            {
                 continue;
             }
             output.extend(chars[whitespace_start..index].iter());
