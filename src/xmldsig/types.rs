@@ -333,6 +333,11 @@ pub enum TransformError {
     #[error("XPath transform error: {0}")]
     XPath(String),
 
+    /// XML octets could not be parsed while adapting binary transform output
+    /// to the node-set required by a subsequent transform.
+    #[error("XML transform input parse error: {0}")]
+    XmlParse(String),
+
     /// The Signature node passed to the enveloped transform belongs to a
     /// different `Document` than the input `NodeSet`.
     #[error("enveloped-signature transform: invalid Signature node for this document")]

@@ -237,12 +237,12 @@ pub(crate) fn apply_transform<'a>(
     )
 }
 
-pub(super) fn apply_transform_with_options<'a>(
-    signature_node: Node<'a, 'a>,
+pub(super) fn apply_transform_with_options<'s, 'd>(
+    signature_node: Node<'s, 's>,
     transform: &Transform,
-    input: TransformData<'a>,
+    input: TransformData<'d>,
     options: TransformOptions,
-) -> Result<TransformData<'a>, TransformError> {
+) -> Result<TransformData<'d>, TransformError> {
     match transform {
         Transform::Enveloped => {
             let mut nodes = input.into_node_set()?;
@@ -276,18 +276,22 @@ pub(super) fn apply_transform_with_options<'a>(
         }
         Transform::XPath(xpath) => {
             let nodes = input.into_node_set()?;
+            let here_is_same_document = std::ptr::eq(signature_node.document(), nodes.document());
             Ok(TransformData::NodeSet(apply_xpath_filter_with_semantics(
                 nodes,
                 xpath,
                 options.here_semantics(),
+                here_is_same_document,
             )?))
         }
         Transform::XPathFilter2(filters) => {
             let nodes = input.into_node_set()?;
+            let here_is_same_document = std::ptr::eq(signature_node.document(), nodes.document());
             Ok(TransformData::NodeSet(apply_xpath_filter2_with_semantics(
                 nodes,
                 filters,
                 options.here_semantics(),
+                here_is_same_document,
             )?))
         }
         Transform::C14n(algo) => {
@@ -378,12 +382,47 @@ pub fn execute_transforms_with_options<'a>(
     transforms: &[Transform],
     options: TransformOptions,
 ) -> Result<Vec<u8>, TransformError> {
-    let mut data = initial_data;
+    execute_transform_chain(signature_node, initial_data, transforms, options)
+}
 
-    for transform in transforms {
-        data = apply_transform_with_options(signature_node, transform, data, options)?;
+fn execute_transform_chain<'s, 'd>(
+    signature_node: Node<'s, 's>,
+    data: TransformData<'d>,
+    transforms: &[Transform],
+    options: TransformOptions,
+) -> Result<Vec<u8>, TransformError> {
+    let Some((transform, remaining)) = transforms.split_first() else {
+        return finalize_transform_data(data);
+    };
+
+    if transform_requires_node_set(transform)
+        && let TransformData::Binary(bytes) = data
+    {
+        // The parsed document must outlive every remaining node-set transform.
+        // Recursive execution keeps all borrows scoped to this stack frame and
+        // returns only owned digest bytes.
+        let xml = std::str::from_utf8(&bytes)
+            .map_err(|error| TransformError::XmlParse(error.to_string()))?;
+        let document = roxmltree::Document::parse(xml)
+            .map_err(|error| TransformError::XmlParse(error.to_string()))?;
+        let nodes = super::types::NodeSet::entire_document_with_comments(&document);
+        return execute_transform_chain(
+            signature_node,
+            TransformData::NodeSet(nodes),
+            transforms,
+            options,
+        );
     }
 
+    let data = apply_transform_with_options(signature_node, transform, data, options)?;
+    execute_transform_chain(signature_node, data, remaining, options)
+}
+
+fn transform_requires_node_set(transform: &Transform) -> bool {
+    !matches!(transform, Transform::Base64Decode)
+}
+
+fn finalize_transform_data(data: TransformData<'_>) -> Result<Vec<u8>, TransformError> {
     // Final coercion: if the result is still a NodeSet, canonicalize with
     // default inclusive C14N 1.0 per XMLDSig spec §4.3.3.2.
     match data {

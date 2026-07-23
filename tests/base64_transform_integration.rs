@@ -6,13 +6,20 @@ use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::xmldsig::{
     BASE64_TRANSFORM_URI, DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus,
     FailureReason, ReferenceBuilder, ReferenceProcessingError, RsaSigningKey, SignContext,
-    SignatureAlgorithm, SignatureBuilder, Transform, TransformError, VerifyContext,
-    X509CertificateKeyInfoWriter,
+    SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError, Transform,
+    TransformError, VerifyContext, X509CertificateKeyInfoWriter, XPathExpression, XPathFilter,
+    XPathFilterOperation,
 };
 
 const ENCODED_XML: &str = r#"<root>
     <Encoded ID="payload">ZXh0<!-- split --><Chunk>ZXJuYWwg</Chunk><?ignored data?>dmVyaWZpZXIgY29udHJhY3Q=</Encoded>
 </root>"#;
+const DECODED_XML_BASE64: &str =
+    "PHBheWxvYWQ+PGtlZXA+Y292ZXJlZDwva2VlcD48ZHJvcD5tdXRhYmxlPC9kcm9wPjwvcGF5bG9hZD4=";
+const DECODED_EXCLUDED_TAMPER_BASE64: &str =
+    "PHBheWxvYWQ+PGtlZXA+Y292ZXJlZDwva2VlcD48ZHJvcD5jaGFuZ2VkPC9kcm9wPjwvcGF5bG9hZD4=";
+const DECODED_INCLUDED_TAMPER_BASE64: &str =
+    "PHBheWxvYWQ+PGtlZXA+dGFtcGVyZWQ8L2tlZXA+PGRyb3A+bXV0YWJsZTwvZHJvcD48L3BheWxvYWQ+";
 
 fn exclusive_c14n() -> C14nAlgorithm {
     C14nAlgorithm::new(C14nMode::Exclusive1_0, false)
@@ -113,5 +120,129 @@ fn malformed_base64_reference_fails_before_digest_comparison() {
         DsigError::Reference(ReferenceProcessingError::Transform(TransformError::Base64(
             _
         )))
+    ));
+}
+
+#[test]
+fn decoded_xml_is_adapted_to_a_node_set_for_xpath() {
+    // XMLDSig converts XML octets to a comment-preserving node-set before a
+    // subsequent XPath transform; excluded decoded content remains mutable.
+    let document = format!(r#"<root><Encoded ID="payload">{DECODED_XML_BASE64}</Encoded></root>"#);
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::Base64Decode)
+                .transform(Transform::XPath(XPathExpression::new(
+                    "not(self::drop or ancestor::drop)",
+                ))),
+        )
+        .key_info(true);
+    let (key, key_info) = signing_material();
+    let signed = SignContext::new(&key)
+        .key_info_writer(&key_info)
+        .sign_with_builder(&document, &builder)
+        .expect("Base64-to-XPath transform chain must sign");
+    let resolver = DefaultKeyResolver::default();
+
+    let verified = VerifyContext::new()
+        .key_resolver(&resolver)
+        .verify(&signed)
+        .expect("Base64-to-XPath signature must verify");
+    assert_eq!(verified.status, DsigStatus::Valid);
+
+    let excluded = signed.replacen(DECODED_XML_BASE64, DECODED_EXCLUDED_TAMPER_BASE64, 1);
+    let excluded_result = VerifyContext::new()
+        .key_resolver(&resolver)
+        .verify(&excluded)
+        .expect("excluded decoded XML tampering remains processable");
+    assert_eq!(excluded_result.status, DsigStatus::Valid);
+
+    let included = signed.replacen(DECODED_XML_BASE64, DECODED_INCLUDED_TAMPER_BASE64, 1);
+    let included_result = VerifyContext::new()
+        .key_resolver(&resolver)
+        .verify(&included)
+        .expect("included decoded XML tampering remains processable");
+    assert_eq!(
+        included_result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+    );
+}
+
+#[test]
+fn decoded_xml_is_adapted_for_xpath_filter2() {
+    // Filter 2.0 has the same node-set input contract as the original XPath
+    // transform and must receive a fully parsed decoded document subtree.
+    let document = format!(r#"<root><Encoded ID="payload">{DECODED_XML_BASE64}</Encoded></root>"#);
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::Base64Decode)
+                .transform(Transform::XPathFilter2(vec![XPathFilter::new(
+                    XPathFilterOperation::Intersect,
+                    XPathExpression::new("/payload/keep"),
+                )])),
+        )
+        .key_info(true);
+    let (key, key_info) = signing_material();
+    let signed = SignContext::new(&key)
+        .key_info_writer(&key_info)
+        .sign_with_builder(&document, &builder)
+        .expect("Base64-to-Filter2 transform chain must sign");
+    let resolver = DefaultKeyResolver::default();
+    let result = VerifyContext::new()
+        .key_resolver(&resolver)
+        .verify(&signed)
+        .expect("Base64-to-Filter2 signature must verify");
+
+    assert_eq!(result.status, DsigStatus::Valid);
+}
+
+#[test]
+fn binary_to_node_set_adapter_rejects_malformed_xml() {
+    // Base64 decodes successfully to `<payload>`, but the node-set adapter must
+    // reject the unclosed XML before XPath or digest comparison.
+    let document = r#"<root><Encoded ID="payload">PHBheWxvYWQ+</Encoded></root>"#;
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::Base64Decode)
+                .transform(Transform::XPath(XPathExpression::new("true()"))),
+        );
+    let (key, _) = signing_material();
+    let error = SignContext::new(&key)
+        .sign_with_builder(document, &builder)
+        .expect_err("malformed decoded XML must fail closed");
+
+    assert!(matches!(
+        error,
+        SigningError::Digest(SigningDigestError::Transform(TransformError::XmlParse(_)))
+    ));
+}
+
+#[test]
+fn decoded_xml_rejects_here_from_the_signature_document() {
+    // XMLDSig forbids here() when the expression-bearing parameter and the
+    // evaluated XML are different documents; NodeId collisions must not pass.
+    let document = format!(r#"<root><Encoded ID="payload">{DECODED_XML_BASE64}</Encoded></root>"#);
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::Base64Decode)
+                .transform(Transform::XPath(XPathExpression::new(
+                    "count(. | here()) = 1",
+                ))),
+        );
+    let (key, _) = signing_material();
+    let error = SignContext::new(&key)
+        .sign_with_builder(&document, &builder)
+        .expect_err("cross-document here() must fail closed");
+
+    assert!(matches!(
+        error,
+        SigningError::Digest(SigningDigestError::Transform(TransformError::XPath(_)))
     ));
 }

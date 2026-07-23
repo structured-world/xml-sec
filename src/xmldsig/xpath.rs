@@ -370,6 +370,7 @@ fn evaluate_expression<'a>(
     expression: &XPathExpression,
     wrap_as_filter: bool,
     here_semantics: XPathHereSemantics,
+    here_is_same_document: bool,
 ) -> Result<NodeSet<'a>, TransformError> {
     if expression.expression().is_empty()
         || expression.expression().len() > MAX_XPATH_EXPRESSION_BYTES
@@ -388,7 +389,9 @@ fn evaluate_expression<'a>(
     context.set_function(
         "here",
         HereFunction {
-            path: here_path(document, expression.here_node(here_semantics)),
+            path: here_is_same_document
+                .then(|| here_path(document, expression.here_node(here_semantics)))
+                .flatten(),
         },
     );
     context.set_function("id", IdFunction);
@@ -440,15 +443,22 @@ pub(super) fn apply_xpath_filter<'a>(
     input: NodeSet<'a>,
     expression: &XPathExpression,
 ) -> Result<NodeSet<'a>, TransformError> {
-    apply_xpath_filter_with_semantics(input, expression, XPathHereSemantics::default())
+    apply_xpath_filter_with_semantics(input, expression, XPathHereSemantics::default(), true)
 }
 
 pub(super) fn apply_xpath_filter_with_semantics<'a>(
     mut input: NodeSet<'a>,
     expression: &XPathExpression,
     here_semantics: XPathHereSemantics,
+    here_is_same_document: bool,
 ) -> Result<NodeSet<'a>, TransformError> {
-    let selected = evaluate_expression(input.document(), expression, true, here_semantics)?;
+    let selected = evaluate_expression(
+        input.document(),
+        expression,
+        true,
+        here_semantics,
+        here_is_same_document,
+    )?;
     input.intersect_with(&selected);
     Ok(input)
 }
@@ -458,13 +468,14 @@ pub(super) fn apply_xpath_filter2<'a>(
     input: NodeSet<'a>,
     filters: &[XPathFilter],
 ) -> Result<NodeSet<'a>, TransformError> {
-    apply_xpath_filter2_with_semantics(input, filters, XPathHereSemantics::default())
+    apply_xpath_filter2_with_semantics(input, filters, XPathHereSemantics::default(), true)
 }
 
 pub(super) fn apply_xpath_filter2_with_semantics<'a>(
     input: NodeSet<'a>,
     filters: &[XPathFilter],
     here_semantics: XPathHereSemantics,
+    here_is_same_document: bool,
 ) -> Result<NodeSet<'a>, TransformError> {
     if filters.is_empty() || filters.len() > MAX_XPATH_FILTERS {
         return Err(TransformError::XPath(format!(
@@ -473,8 +484,13 @@ pub(super) fn apply_xpath_filter2_with_semantics<'a>(
     }
     let mut result = NodeSet::entire_document(input.document());
     for filter in filters {
-        let selected =
-            evaluate_expression(input.document(), filter.xpath(), false, here_semantics)?;
+        let selected = evaluate_expression(
+            input.document(),
+            filter.xpath(),
+            false,
+            here_semantics,
+            here_is_same_document,
+        )?;
         match filter.operation() {
             XPathFilterOperation::Intersect => result.intersect_with(&selected),
             XPathFilterOperation::Subtract => result.subtract(&selected),
