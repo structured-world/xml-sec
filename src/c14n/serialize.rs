@@ -514,12 +514,20 @@ fn collect_inherited_xml_attrs<'a>(
     // Canonical XML treats this element as an apex even if a more distant
     // ancestor is also in the output. Search the complete source ancestry.
     let mut inherited = Vec::new();
+    let mut xml_base_boundary_reached = false;
     let mut ancestor = node.parent();
     while let Some(anc) = ancestor {
         if anc.is_element() {
+            // C14N 1.1 resolves xml:base only across the contiguous omitted
+            // chain. An included ancestor already renders its own base, but
+            // remains the resolution seed for bases on omitted descendants.
+            xml_base_boundary_reached |= include_xml_id && set.contains_node(anc);
             for attr in anc.attributes() {
                 if attr.namespace() == Some(XML_NS) {
                     let local = attr.name();
+                    if local == "base" && xml_base_boundary_reached {
+                        continue;
+                    }
                     // Skip empty xml:base="" — per RFC 3986 an empty reference
                     // resolves to the current base, so it's a no-op.
                     if local == "base" && attr.value().is_empty() {
