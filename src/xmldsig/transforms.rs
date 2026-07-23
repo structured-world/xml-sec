@@ -26,7 +26,7 @@ use roxmltree::Node;
 
 use super::parse::XMLDSIG_NS;
 use super::types::{TransformData, TransformError};
-use super::whitespace::is_xml_whitespace_only;
+use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 use super::xpath::{
     apply_xpath_filter_with_semantics, apply_xpath_filter2_with_semantics,
     normalize_function_spacing,
@@ -337,20 +337,15 @@ fn append_normalized_base64(
     encoded: &[u8],
     normalized: &mut Vec<u8>,
 ) -> Result<(), TransformError> {
-    for &byte in encoded {
-        if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
-            continue;
-        }
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=') {
-            normalized.push(byte);
-        } else {
-            return Err(TransformError::Base64(format!(
-                "invalid byte 0x{byte:02X} in encoded input"
-            )));
-        }
-    }
-
-    Ok(())
+    normalize_xml_base64_bytes(encoded, normalized, |byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
+    })
+    .map_err(|err| {
+        TransformError::Base64(format!(
+            "invalid byte 0x{:02X} in encoded input",
+            err.invalid_byte
+        ))
+    })
 }
 
 fn decode_base64_transform(normalized: Vec<u8>) -> Result<Vec<u8>, TransformError> {

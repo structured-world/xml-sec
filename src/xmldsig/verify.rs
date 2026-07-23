@@ -27,7 +27,7 @@ use super::transforms::{
     XPATH_TRANSFORM_URI, XPathHereSemantics, execute_transforms_with_options,
 };
 use super::uri::{UriReferenceResolver, parse_xpointer_id_fragment};
-use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_text};
+use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
@@ -1192,7 +1192,7 @@ fn decode_signature_value(
         });
     }
 
-    let mut normalized = String::new();
+    let mut normalized = Vec::new();
     let mut raw_text_len = 0usize;
     for child in signature_value_node
         .children()
@@ -1209,7 +1209,7 @@ fn decode_signature_value(
 fn push_normalized_signature_text(
     text: &str,
     raw_text_len: &mut usize,
-    normalized: &mut String,
+    normalized: &mut Vec<u8>,
 ) -> Result<(), SignatureVerificationPipelineError> {
     if raw_text_len.saturating_add(text.len()) > MAX_SIGNATURE_VALUE_TEXT_LEN {
         return Err(SignatureVerificationPipelineError::InvalidStructure {
@@ -1218,7 +1218,7 @@ fn push_normalized_signature_text(
     }
     *raw_text_len = raw_text_len.saturating_add(text.len());
 
-    normalize_xml_base64_text(text, normalized).map_err(|err| {
+    normalize_xml_base64_bytes(text.as_bytes(), normalized, |_| true).map_err(|err| {
         SignatureVerificationPipelineError::SignatureValueBase64(base64::DecodeError::InvalidByte(
             err.normalized_offset,
             err.invalid_byte,
@@ -2140,7 +2140,7 @@ mod tests {
 
     #[test]
     fn push_normalized_signature_text_rejects_form_feed() {
-        let mut normalized = String::new();
+        let mut normalized = Vec::new();
         let mut raw_text_len = 0usize;
         let err =
             push_normalized_signature_text("ab\u{000C}cd", &mut raw_text_len, &mut normalized)
@@ -2155,7 +2155,7 @@ mod tests {
 
     #[test]
     fn push_normalized_signature_text_enforces_byte_limit_for_multibyte_chars() {
-        let mut normalized = "A".repeat(MAX_SIGNATURE_VALUE_LEN - 1);
+        let mut normalized = vec![b'A'; MAX_SIGNATURE_VALUE_LEN - 1];
         let mut raw_text_len = normalized.len();
         let err = push_normalized_signature_text("é", &mut raw_text_len, &mut normalized)
             .expect_err("multibyte characters must not bypass byte-size limit");

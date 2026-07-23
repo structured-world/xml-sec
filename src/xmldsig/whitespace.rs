@@ -23,6 +23,31 @@ pub(crate) struct XmlBase64LengthError {
     pub max_len: usize,
 }
 
+/// Append base64 bytes after removing XML whitespace.
+///
+/// `accept` controls caller-specific alphabet validation. Non-XML ASCII
+/// whitespace is always rejected so every XMLDSig base64 path follows XML's
+/// four-character whitespace definition rather than Rust's broader one.
+pub(crate) fn normalize_xml_base64_bytes(
+    bytes: &[u8],
+    normalized: &mut Vec<u8>,
+    accept: impl Fn(u8) -> bool,
+) -> Result<(), XmlBase64NormalizeError> {
+    for &byte in bytes {
+        if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+            continue;
+        }
+        if byte.is_ascii_whitespace() || !accept(byte) {
+            return Err(XmlBase64NormalizeError {
+                invalid_byte: byte,
+                normalized_offset: normalized.len(),
+            });
+        }
+        normalized.push(byte);
+    }
+    Ok(())
+}
+
 /// Normalize base64 text by stripping XML whitespace and rejecting other ASCII whitespace.
 pub(crate) fn normalize_xml_base64_text(
     text: &str,
@@ -83,7 +108,7 @@ impl From<XmlBase64NormalizeError> for XmlBase64NormalizeLimitedError {
 #[cfg(test)]
 mod tests {
     use super::{
-        XmlBase64NormalizeLimitedError, normalize_xml_base64_text,
+        XmlBase64NormalizeLimitedError, normalize_xml_base64_bytes, normalize_xml_base64_text,
         normalize_xml_base64_text_with_limit,
     };
 
@@ -106,5 +131,20 @@ mod tests {
             .expect("XML whitespace must be stripped from base64 text");
 
         assert_eq!(normalized, "ABC");
+    }
+
+    #[test]
+    fn byte_normalization_applies_caller_alphabet_policy() {
+        // The shared XML whitespace pass must report the same normalized
+        // offset whether rejection comes from whitespace or caller policy.
+        let mut normalized = Vec::new();
+        let err = normalize_xml_base64_bytes(b" A\tB!", &mut normalized, |byte| {
+            byte.is_ascii_alphanumeric()
+        })
+        .expect_err("caller must be able to reject a non-alphabet byte");
+
+        assert_eq!(normalized, b"AB");
+        assert_eq!(err.invalid_byte, b'!');
+        assert_eq!(err.normalized_offset, 2);
     }
 }
