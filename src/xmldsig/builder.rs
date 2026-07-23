@@ -22,6 +22,9 @@ pub enum SignatureBuilderError {
     /// A namespace prefix was not a supported XML NCName.
     #[error("invalid XML namespace prefix: {0}")]
     InvalidNamespacePrefix(String),
+    /// An XPath binding would rebind the prefix used by XMLDSig elements.
+    #[error("XPath namespace binding conflicts with XMLDSig prefix: {0}")]
+    NamespacePrefixConflict(String),
     /// An XMLDSig Id attribute was not a valid XML NCName.
     #[error("invalid {element} Id: {value}")]
     InvalidId {
@@ -209,21 +212,26 @@ impl SignatureBuilder {
         if self.references.is_empty() {
             return Err(SignatureBuilderError::MissingReference);
         }
-        for prefix in self.references.iter().flat_map(|reference| {
+        for (prefix, uri) in self.references.iter().flat_map(|reference| {
             reference
                 .transforms
                 .iter()
                 .flat_map(|transform| match transform {
-                    Transform::XPath(xpath) => xpath.namespaces().keys().collect::<Vec<_>>(),
+                    Transform::XPath(xpath) => xpath.namespaces().iter().collect::<Vec<_>>(),
                     Transform::XPathFilter2(filters) => filters
                         .iter()
-                        .flat_map(|filter| filter.xpath().namespaces().keys())
+                        .flat_map(|filter| filter.xpath().namespaces().iter())
                         .collect(),
                     _ => Vec::new(),
                 })
         }) {
             if prefix == "xmlns" || (prefix != "xml" && !is_namespace_prefix(prefix)) {
                 return Err(SignatureBuilderError::InvalidNamespacePrefix(
+                    prefix.clone(),
+                ));
+            }
+            if self.ns_prefix.as_ref() == Some(prefix) && uri != XMLDSIG_NS {
+                return Err(SignatureBuilderError::NamespacePrefixConflict(
                     prefix.clone(),
                 ));
             }
