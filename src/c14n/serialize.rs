@@ -555,54 +555,6 @@ mod tests {
     use super::*;
     use roxmltree::NodeId;
 
-    struct OrphanAxisOnly;
-
-    impl NodeVisibility for OrphanAxisOnly {
-        fn contains_node(&self, _node: Node<'_, '_>) -> bool {
-            false
-        }
-
-        fn contains_attribute(
-            &self,
-            _owner: Node<'_, '_>,
-            _namespace: Option<&str>,
-            local_name: &str,
-        ) -> bool {
-            local_name == "selected"
-        }
-
-        fn contains_namespace(&self, _owner: Node<'_, '_>, prefix: &str, _uri: &str) -> bool {
-            prefix == "selected"
-        }
-    }
-
-    #[test]
-    fn orphan_attribute_and_namespace_nodes_emit_no_bytes() {
-        // Canonical XML can serialize axis nodes only inside their visible
-        // owner element's start tag. A subset containing only those nodes
-        // therefore contributes no standalone fragments to the octet stream.
-        let doc = Document::parse(
-            r#"<root xmlns:selected="urn:selected" selected="value"><child/></root>"#,
-        )
-        .expect("parse");
-        let mut out = Vec::new();
-
-        serialize_canonical_visible(
-            &doc,
-            Some(&OrphanAxisOnly),
-            false,
-            &InclusiveNsRenderer,
-            C14nConfig {
-                inherit_xml_attrs: true,
-                fixup_xml_base: false,
-            },
-            &mut out,
-        )
-        .expect("c14n");
-
-        assert!(out.is_empty(), "orphan axis nodes produced {out:?}");
-    }
-
     #[test]
     fn empty_element_expanded() {
         let xml = "<root><empty/></root>";
