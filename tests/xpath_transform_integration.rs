@@ -140,6 +140,47 @@ fn filter2_transform_is_enforced_by_the_allowlist() {
 }
 
 #[test]
+fn filter2_union_restores_a_subtree_to_the_signed_set() {
+    // Union runs after intersect/subtract and must make Outside cryptographically
+    // covered even though it was absent from the initial intersection.
+    let filters = vec![
+        XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("/root/Signed"),
+        ),
+        XPathFilter::new(
+            XPathFilterOperation::Subtract,
+            XPathExpression::new("/root/Signed/Excluded"),
+        ),
+        XPathFilter::new(
+            XPathFilterOperation::Union,
+            XPathExpression::new("/root/Outside"),
+        ),
+    ];
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("")
+                .transform(Transform::XPathFilter2(filters)),
+        )
+        .key_info(true);
+    let (key, key_info) = signing_material();
+    let signed = SignContext::new(&key)
+        .key_info_writer(&key_info)
+        .sign_with_builder(DOCUMENT, &builder)
+        .expect("Filter 2.0 Union document must sign");
+
+    let verified = verify(&signed).expect("generated Union signature must verify");
+    assert_eq!(verified.status, DsigStatus::Valid);
+    let tampered = signed.replacen("also mutable", "union tampered", 1);
+    let tampered_result = verify(&tampered).expect("Union tampering remains processable");
+    assert_eq!(
+        tampered_result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+    );
+}
+
+#[test]
 fn here_semantics_are_explicit_across_signing_and_verification() {
     // The identity expression selects XPath under the specification and
     // Transform under libxmlsec1, proving the policy reaches both pipelines.
