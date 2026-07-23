@@ -23,8 +23,8 @@ use super::signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
 };
 use super::transforms::{
-    BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, Transform, XPATH_TRANSFORM_URI,
-    execute_transforms,
+    BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, Transform, TransformOptions,
+    XPATH_TRANSFORM_URI, XPathHereSemantics, execute_transforms_with_options,
 };
 use super::uri::{UriReferenceResolver, parse_xpointer_id_fragment};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_text};
@@ -139,6 +139,7 @@ pub struct VerifyContext<'a> {
     allowed_uri_types: UriTypeSet,
     allowed_transforms: Option<HashSet<String>>,
     store_pre_digest: bool,
+    transform_options: TransformOptions,
 }
 
 impl<'a> VerifyContext<'a> {
@@ -158,6 +159,7 @@ impl<'a> VerifyContext<'a> {
             allowed_uri_types: UriTypeSet::default(),
             allowed_transforms: None,
             store_pre_digest: false,
+            transform_options: TransformOptions::default(),
         }
     }
 
@@ -231,6 +233,17 @@ impl<'a> VerifyContext<'a> {
     /// Store pre-digest buffers for diagnostics.
     pub fn store_pre_digest(mut self, enabled: bool) -> Self {
         self.store_pre_digest = enabled;
+        self
+    }
+
+    /// Select the node returned by XPath's `here()` extension function.
+    ///
+    /// The default follows XMLDSig and returns the `<XPath>` parameter.
+    /// Use [`XPathHereSemantics::XmlSecLegacy`] only for documents known to
+    /// have been generated with libxmlsec1's `<Transform>` interpretation.
+    #[must_use]
+    pub fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
+        self.transform_options = self.transform_options.xpath_here_semantics(semantics);
         self
     }
 
@@ -373,6 +386,26 @@ pub fn process_reference(
     reference_index: usize,
     store_pre_digest: bool,
 ) -> Result<ReferenceResult, ReferenceProcessingError> {
+    process_reference_with_options(
+        reference,
+        resolver,
+        signature_node,
+        reference_set,
+        reference_index,
+        store_pre_digest,
+        TransformOptions::default(),
+    )
+}
+
+fn process_reference_with_options(
+    reference: &Reference,
+    resolver: &UriReferenceResolver<'_>,
+    signature_node: Node<'_, '_>,
+    reference_set: ReferenceSet,
+    reference_index: usize,
+    store_pre_digest: bool,
+    transform_options: TransformOptions,
+) -> Result<ReferenceResult, ReferenceProcessingError> {
     // 1. Dereference URI. Omitted URI is distinct from URI="" in XMLDSig and
     // must be rejected until caller-provided external object resolution exists.
     let uri = reference
@@ -384,8 +417,13 @@ pub fn process_reference(
         .map_err(ReferenceProcessingError::UriDereference)?;
 
     // 2. Apply transform chain
-    let pre_digest_bytes = execute_transforms(signature_node, initial_data, &reference.transforms)
-        .map_err(ReferenceProcessingError::Transform)?;
+    let pre_digest_bytes = execute_transforms_with_options(
+        signature_node,
+        initial_data,
+        &reference.transforms,
+        transform_options,
+    )
+    .map_err(ReferenceProcessingError::Transform)?;
 
     // 3. Compute digest
     let computed_digest = compute_digest(reference.digest_method, &pre_digest_bytes);
@@ -430,16 +468,33 @@ pub fn process_all_references(
     signature_node: Node<'_, '_>,
     store_pre_digest: bool,
 ) -> Result<ReferencesResult, ReferenceProcessingError> {
+    process_all_references_with_options(
+        references,
+        resolver,
+        signature_node,
+        store_pre_digest,
+        TransformOptions::default(),
+    )
+}
+
+fn process_all_references_with_options(
+    references: &[Reference],
+    resolver: &UriReferenceResolver<'_>,
+    signature_node: Node<'_, '_>,
+    store_pre_digest: bool,
+    transform_options: TransformOptions,
+) -> Result<ReferencesResult, ReferenceProcessingError> {
     let mut results = Vec::with_capacity(references.len());
 
     for (i, reference) in references.iter().enumerate() {
-        let result = process_reference(
+        let result = process_reference_with_options(
             reference,
             resolver,
             signature_node,
             ReferenceSet::SignedInfo,
             i,
             store_pre_digest,
+            transform_options,
         )?;
         let failed = matches!(result.status, DsigStatus::Invalid(_));
         results.push(result);
@@ -674,11 +729,12 @@ fn verify_signature_with_context(
     )?;
 
     let resolver = UriReferenceResolver::new(&doc);
-    let references = process_all_references(
+    let references = process_all_references_with_options(
         &signed_info.references,
         &resolver,
         signature_node,
         ctx.store_pre_digest,
+        ctx.transform_options,
     )?;
 
     let manifest_references = if ctx.process_manifests {
@@ -801,13 +857,14 @@ fn process_manifest_references(
             }
         }
 
-        match process_reference(
+        match process_reference_with_options(
             reference,
             resolver,
             signature_node,
             ReferenceSet::Manifest,
             index,
             ctx.store_pre_digest,
+            ctx.transform_options,
         ) {
             Ok(result) => results.push(result),
             Err(_) => results.push(manifest_reference_invalid_result(

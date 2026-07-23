@@ -251,7 +251,6 @@ impl<'a> NodeSet<'a> {
 
     fn collect_document(doc: &'a Document<'a>, with_comments: bool) -> Self {
         let mut set = Self::empty(doc);
-        set.with_comments = with_comments;
         set.insert_subtree(doc.root());
         if !with_comments {
             set.nodes.retain(|key| match key {
@@ -259,6 +258,7 @@ impl<'a> NodeSet<'a> {
                 _ => true,
             });
         }
+        set.with_comments = with_comments;
         set
     }
 
@@ -337,4 +337,24 @@ pub enum TransformError {
     /// different `Document` than the input `NodeSet`.
     #[error("enveloped-signature transform: invalid Signature node for this document")]
     CrossDocumentSignatureNode,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn document_without_comments_preserves_comment_policy() {
+        // Empty-URI dereferencing strips comment nodes and must not retain a
+        // stale flag merely because comments were seen while materializing.
+        let document = Document::parse("<root><!-- excluded --><child/></root>").unwrap();
+        let nodes = NodeSet::entire_document_without_comments(&document);
+        let comment = document
+            .descendants()
+            .find(|node| node.is_comment())
+            .unwrap();
+
+        assert!(!nodes.contains(comment));
+        assert!(!nodes.with_comments());
+    }
 }

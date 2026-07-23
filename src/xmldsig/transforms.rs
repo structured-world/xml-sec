@@ -27,7 +27,10 @@ use roxmltree::Node;
 use super::parse::XMLDSIG_NS;
 use super::types::{TransformData, TransformError};
 use super::whitespace::is_xml_whitespace_only;
-use super::xpath::{apply_xpath_filter, apply_xpath_filter2, normalize_function_spacing};
+use super::xpath::{
+    apply_xpath_filter_with_semantics, apply_xpath_filter2_with_semantics,
+    normalize_function_spacing,
+};
 use crate::c14n::{self, C14nAlgorithm};
 
 /// The algorithm URI for the enveloped signature transform.
@@ -50,12 +53,51 @@ pub(super) const MAX_XPATH_FILTERS: usize = 64;
 /// Namespace URI for Exclusive C14N `<InclusiveNamespaces>` elements.
 const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 
+/// Node returned by the XMLDSig XPath `here()` extension function.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum XPathHereSemantics {
+    /// Follow XMLDSig: return the `<XPath>` parameter element that contains
+    /// the expression text.
+    #[default]
+    Specification,
+    /// Match libxmlsec1, which returns the owning `<Transform>` element.
+    ///
+    /// This mode is opt-in because the two interpretations can select
+    /// different data for the same signed XML document.
+    XmlSecLegacy,
+}
+
+/// Options controlling execution of an XMLDSig transform chain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransformOptions {
+    xpath_here_semantics: XPathHereSemantics,
+}
+
+impl TransformOptions {
+    /// Select the node returned by the XPath `here()` extension function.
+    #[must_use]
+    pub fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
+        self.xpath_here_semantics = semantics;
+        self
+    }
+
+    pub(crate) fn here_semantics(self) -> XPathHereSemantics {
+        self.xpath_here_semantics
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct XPathHereNodes {
+    xpath: roxmltree::NodeId,
+    transform: roxmltree::NodeId,
+}
+
 /// An XPath 1.0 expression and the namespace bindings in scope where it was declared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XPathExpression {
     expression: String,
     namespaces: BTreeMap<String, String>,
-    here_node: Option<roxmltree::NodeId>,
+    here_nodes: Option<XPathHereNodes>,
 }
 
 impl XPathExpression {
@@ -64,7 +106,7 @@ impl XPathExpression {
         Self {
             expression: expression.into(),
             namespaces: BTreeMap::new(),
-            here_node: None,
+            here_nodes: None,
         }
     }
 
@@ -84,8 +126,11 @@ impl XPathExpression {
         &self.namespaces
     }
 
-    pub(crate) fn here_node(&self) -> Option<roxmltree::NodeId> {
-        self.here_node
+    pub(crate) fn here_node(&self, semantics: XPathHereSemantics) -> Option<roxmltree::NodeId> {
+        self.here_nodes.map(|nodes| match semantics {
+            XPathHereSemantics::Specification => nodes.xpath,
+            XPathHereSemantics::XmlSecLegacy => nodes.transform,
+        })
     }
 }
 
@@ -178,10 +223,25 @@ pub enum Transform {
 /// to know which signature subtree to exclude. The node must belong to the
 /// same document as the `NodeSet` in `input`; a cross-document mismatch
 /// returns [`TransformError::CrossDocumentSignatureNode`].
+#[cfg(test)]
 pub(crate) fn apply_transform<'a>(
     signature_node: Node<'a, 'a>,
     transform: &Transform,
     input: TransformData<'a>,
+) -> Result<TransformData<'a>, TransformError> {
+    apply_transform_with_options(
+        signature_node,
+        transform,
+        input,
+        TransformOptions::default(),
+    )
+}
+
+pub(super) fn apply_transform_with_options<'a>(
+    signature_node: Node<'a, 'a>,
+    transform: &Transform,
+    input: TransformData<'a>,
+    options: TransformOptions,
 ) -> Result<TransformData<'a>, TransformError> {
     match transform {
         Transform::Enveloped => {
@@ -216,11 +276,19 @@ pub(crate) fn apply_transform<'a>(
         }
         Transform::XPath(xpath) => {
             let nodes = input.into_node_set()?;
-            Ok(TransformData::NodeSet(apply_xpath_filter(nodes, xpath)?))
+            Ok(TransformData::NodeSet(apply_xpath_filter_with_semantics(
+                nodes,
+                xpath,
+                options.here_semantics(),
+            )?))
         }
         Transform::XPathFilter2(filters) => {
             let nodes = input.into_node_set()?;
-            Ok(TransformData::NodeSet(apply_xpath_filter2(nodes, filters)?))
+            Ok(TransformData::NodeSet(apply_xpath_filter2_with_semantics(
+                nodes,
+                filters,
+                options.here_semantics(),
+            )?))
         }
         Transform::C14n(algo) => {
             let nodes = input.into_node_set()?;
@@ -295,10 +363,25 @@ pub fn execute_transforms<'a>(
     initial_data: TransformData<'a>,
     transforms: &[Transform],
 ) -> Result<Vec<u8>, TransformError> {
+    execute_transforms_with_options(
+        signature_node,
+        initial_data,
+        transforms,
+        TransformOptions::default(),
+    )
+}
+
+/// Execute a transform chain with explicit compatibility options.
+pub fn execute_transforms_with_options<'a>(
+    signature_node: Node<'a, 'a>,
+    initial_data: TransformData<'a>,
+    transforms: &[Transform],
+    options: TransformOptions,
+) -> Result<Vec<u8>, TransformError> {
     let mut data = initial_data;
 
     for transform in transforms {
-        data = apply_transform(signature_node, transform, data)?;
+        data = apply_transform_with_options(signature_node, transform, data, options)?;
     }
 
     // Final coercion: if the result is still a NodeSet, canonicalize with
@@ -503,7 +586,7 @@ fn parse_xpath_filter2_transform(transform_node: Node) -> Result<Transform, Tran
 
 fn parse_xpath_expression(
     xpath_node: Node,
-    here_node: roxmltree::NodeId,
+    transform_node: roxmltree::NodeId,
 ) -> Result<XPathExpression, TransformError> {
     let mut source = String::new();
     for child in xpath_node.children() {
@@ -533,7 +616,10 @@ fn parse_xpath_expression(
     let mut xpath = XPathExpression {
         expression: source.to_owned(),
         namespaces: BTreeMap::new(),
-        here_node: Some(here_node),
+        here_nodes: Some(XPathHereNodes {
+            xpath: xpath_node.id(),
+            transform: transform_node,
+        }),
     };
     for namespace in xpath_node.namespaces() {
         if let Some(prefix) = namespace.name() {

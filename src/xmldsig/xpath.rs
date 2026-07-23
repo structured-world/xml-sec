@@ -13,7 +13,7 @@ use sxd_xpath_no_unsafe::{Context, Factory, Value, function, nodeset};
 
 use super::transforms::{
     MAX_XPATH_EXPRESSION_BYTES, MAX_XPATH_FILTERS, XPathExpression, XPathFilter,
-    XPathFilterOperation,
+    XPathFilterOperation, XPathHereSemantics,
 };
 use super::types::{NodeSet, TransformError};
 use crate::c14n::prefix::{attribute_prefix, element_prefix};
@@ -218,9 +218,9 @@ impl<'d> Mirror<'d> {
     }
 }
 
-/// xmlsec1 binds XML Signature's `here()` function to the `<Transform>` node
-/// that owns the XPath parameters. A child-index path is owned by the function
-/// because SXD requires registered functions to be `'static`.
+/// Resolves XML Signature's `here()` function to the node selected by the
+/// caller's standards/compatibility policy. A child-index path is owned by the
+/// function because SXD requires registered functions to be `'static`.
 struct HereFunction {
     path: Option<Vec<usize>>,
 }
@@ -361,6 +361,7 @@ fn evaluate_expression<'a>(
     document: &'a Document<'a>,
     expression: &XPathExpression,
     wrap_as_filter: bool,
+    here_semantics: XPathHereSemantics,
 ) -> Result<NodeSet<'a>, TransformError> {
     if expression.expression().is_empty()
         || expression.expression().len() > MAX_XPATH_EXPRESSION_BYTES
@@ -379,7 +380,7 @@ fn evaluate_expression<'a>(
     context.set_function(
         "here",
         HereFunction {
-            path: here_path(document, expression.here_node()),
+            path: here_path(document, expression.here_node(here_semantics)),
         },
     );
     context.set_function("id", IdFunction);
@@ -408,18 +409,36 @@ fn evaluate_expression<'a>(
     Ok(mirror.project(document, selected, !wrap_as_filter))
 }
 
+#[cfg(test)]
 pub(super) fn apply_xpath_filter<'a>(
-    mut input: NodeSet<'a>,
+    input: NodeSet<'a>,
     expression: &XPathExpression,
 ) -> Result<NodeSet<'a>, TransformError> {
-    let selected = evaluate_expression(input.document(), expression, true)?;
+    apply_xpath_filter_with_semantics(input, expression, XPathHereSemantics::default())
+}
+
+pub(super) fn apply_xpath_filter_with_semantics<'a>(
+    mut input: NodeSet<'a>,
+    expression: &XPathExpression,
+    here_semantics: XPathHereSemantics,
+) -> Result<NodeSet<'a>, TransformError> {
+    let selected = evaluate_expression(input.document(), expression, true, here_semantics)?;
     input.intersect_with(&selected);
     Ok(input)
 }
 
+#[cfg(test)]
 pub(super) fn apply_xpath_filter2<'a>(
     input: NodeSet<'a>,
     filters: &[XPathFilter],
+) -> Result<NodeSet<'a>, TransformError> {
+    apply_xpath_filter2_with_semantics(input, filters, XPathHereSemantics::default())
+}
+
+pub(super) fn apply_xpath_filter2_with_semantics<'a>(
+    input: NodeSet<'a>,
+    filters: &[XPathFilter],
+    here_semantics: XPathHereSemantics,
 ) -> Result<NodeSet<'a>, TransformError> {
     if filters.is_empty() || filters.len() > MAX_XPATH_FILTERS {
         return Err(TransformError::XPath(format!(
@@ -428,7 +447,8 @@ pub(super) fn apply_xpath_filter2<'a>(
     }
     let mut result = NodeSet::entire_document(input.document());
     for filter in filters {
-        let selected = evaluate_expression(input.document(), filter.xpath(), false)?;
+        let selected =
+            evaluate_expression(input.document(), filter.xpath(), false, here_semantics)?;
         match filter.operation() {
             XPathFilterOperation::Intersect => result.intersect_with(&selected),
             XPathFilterOperation::Subtract => result.subtract(&selected),
@@ -606,10 +626,10 @@ mod tests {
     }
 
     #[test]
-    fn xpath_here_function_uses_transform_element() {
-        // xmlsec1 and the XMLDSig processing model bind here() to the owning
-        // Transform element, not the XPath child or current predicate node.
-        let xml = r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><data/><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>ancestor-or-self::ds:Transform = here()</ds:XPath></ds:Transform></root>"#;
+    fn xpath_here_function_uses_xpath_element() {
+        // XMLDSig defines here() as the parent of the text node that directly
+        // bears the expression, which is the XPath parameter element.
+        let xml = r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><data/><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>count(. | here()) = 1</ds:XPath></ds:Transform></root>"#;
         let doc = Document::parse(xml).unwrap();
         let transform_node = doc
             .descendants()
@@ -623,10 +643,38 @@ mod tests {
                 .into_node_set()
                 .unwrap();
 
+        let xpath_node = doc
+            .descendants()
+            .find(|node| node.has_tag_name((super::super::parse::XMLDSIG_NS, "XPath")))
+            .unwrap();
+        assert!(result.contains(xpath_node));
+        assert!(!result.contains(doc.root_element()));
+    }
+
+    #[test]
+    fn xpath_here_function_supports_xmlsec_legacy_transform_element() {
+        // libxmlsec1 binds here() to Transform rather than the XPath parameter;
+        // compatibility must be explicit because this changes the selected set.
+        let xml = r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><data/><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>count(. | here()) = 1</ds:XPath></ds:Transform></root>"#;
+        let doc = Document::parse(xml).unwrap();
         let transform_node = doc
             .descendants()
             .find(|node| node.has_tag_name((super::super::parse::XMLDSIG_NS, "Transform")))
             .unwrap();
+        let transform = super::super::transforms::parse_xpath_transform(transform_node).unwrap();
+        let input = TransformData::NodeSet(NodeSet::entire_document_with_comments(&doc));
+        let options = super::super::transforms::TransformOptions::default()
+            .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy);
+        let result = super::super::transforms::apply_transform_with_options(
+            doc.root_element(),
+            &transform,
+            input,
+            options,
+        )
+        .unwrap()
+        .into_node_set()
+        .unwrap();
+
         assert!(result.contains(transform_node));
         assert!(!result.contains(doc.root_element()));
     }

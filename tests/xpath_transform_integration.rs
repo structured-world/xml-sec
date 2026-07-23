@@ -7,8 +7,8 @@ use xml_sec::xmldsig::{
     DEFAULT_IMPLICIT_C14N_URI, DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus,
     FailureReason, ParseError, ReferenceBuilder, ReferenceProcessingError, RsaSigningKey,
     SignContext, SignatureAlgorithm, SignatureBuilder, Transform, TransformError, VerifyContext,
-    X509CertificateKeyInfoWriter, XPATH_FILTER2_TRANSFORM_URI, XPathExpression, XPathFilter,
-    XPathFilterOperation,
+    X509CertificateKeyInfoWriter, XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI,
+    XPathExpression, XPathFilter, XPathFilterOperation, XPathHereSemantics,
 };
 
 const DOCUMENT: &str = r#"<root>
@@ -136,5 +136,62 @@ fn filter2_transform_is_enforced_by_the_allowlist() {
 
     assert!(
         matches!(error, DsigError::DisallowedTransform { algorithm } if algorithm == XPATH_FILTER2_TRANSFORM_URI)
+    );
+}
+
+#[test]
+fn here_semantics_are_explicit_across_signing_and_verification() {
+    // The identity expression selects XPath under the specification and
+    // Transform under libxmlsec1, proving the policy reaches both pipelines.
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("")
+                .transform(Transform::XPath(XPathExpression::new(
+                    "count(. | here()) = 1",
+                ))),
+        )
+        .key_info(true);
+    let (key, key_info) = signing_material();
+    let resolver = DefaultKeyResolver::default();
+
+    let standard = SignContext::new(&key)
+        .key_info_writer(&key_info)
+        .sign_with_builder(DOCUMENT, &builder)
+        .expect("standards-mode XPath document must sign");
+    let standard_result = VerifyContext::new()
+        .key_resolver(&resolver)
+        .allowed_transforms([XPATH_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI])
+        .verify(&standard)
+        .expect("standards-mode signature must be processable");
+    assert_eq!(standard_result.status, DsigStatus::Valid);
+    let wrong_legacy_result = VerifyContext::new()
+        .key_resolver(&resolver)
+        .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy)
+        .verify(&standard)
+        .expect("legacy-mode verification must reach digest comparison");
+    assert_eq!(
+        wrong_legacy_result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+    );
+
+    let legacy = SignContext::new(&key)
+        .key_info_writer(&key_info)
+        .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy)
+        .sign_with_builder(DOCUMENT, &builder)
+        .expect("xmlsec-legacy XPath document must sign");
+    let legacy_result = VerifyContext::new()
+        .key_resolver(&resolver)
+        .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy)
+        .verify(&legacy)
+        .expect("xmlsec-legacy signature must be processable");
+    assert_eq!(legacy_result.status, DsigStatus::Valid);
+    let wrong_standard_result = VerifyContext::new()
+        .key_resolver(&resolver)
+        .verify(&legacy)
+        .expect("standards-mode verification must reach digest comparison");
+    assert_eq!(
+        wrong_standard_result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
     );
 }
