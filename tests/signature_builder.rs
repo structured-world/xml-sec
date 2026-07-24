@@ -260,6 +260,28 @@ fn rejects_xpath_binding_that_redefines_xml_prefix() {
 }
 
 #[test]
+fn rejects_xpath_binding_that_aliases_xml_namespace() {
+    // The XML namespace is reserved for the `xml` prefix; declaring an alias
+    // would produce a document that violates the namespace constraints.
+    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::XPath(
+                XPathExpression::new("//alias:item").with_namespace(
+                    "alias",
+                    "http://www.w3.org/XML/1998/namespace",
+                ),
+            )),
+        )
+        .build_template()
+        .expect_err("the XML namespace cannot be assigned to another prefix");
+
+    assert!(matches!(
+        error,
+        SignatureBuilderError::InvalidNamespacePrefix(prefix) if prefix == "alias"
+    ));
+}
+
+#[test]
 fn accepts_unicode_xml_namespace_prefixes() {
     // XML 1.0 NCNames permit Unicode letters; prefix validation must not be ASCII-only.
     let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
