@@ -124,6 +124,10 @@ impl<'d> Mirror<'d> {
                 parents.insert(source_node.id(), element);
                 mirror.elements.insert(element, source_node.id());
             } else if source_node.is_text() {
+                // roxmltree, like XPath's data model, does not expose
+                // whitespace outside the document element as a root child.
+                // Every source text node therefore has an element parent and
+                // retains the same child index in the SXD mirror.
                 if let Some(parent) = target_parent {
                     let text = target.create_text(source_node.text().unwrap_or_default());
                     parent.append_child(text);
@@ -718,6 +722,33 @@ mod tests {
         // XMLDSig defines here() as the parent of the text node that directly
         // bears the expression, which is the XPath parameter element.
         let xml = r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><data/><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>count(. | here()) = 1</ds:XPath></ds:Transform></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let transform_node = doc
+            .descendants()
+            .find(|node| node.has_tag_name((super::super::parse::XMLDSIG_NS, "Transform")))
+            .unwrap();
+        let transform = super::super::transforms::parse_xpath_transform(transform_node).unwrap();
+        let input = TransformData::NodeSet(NodeSet::entire_document_with_comments(&doc));
+        let result =
+            super::super::transforms::apply_transform(doc.root_element(), &transform, input)
+                .unwrap()
+                .into_node_set()
+                .unwrap();
+
+        let xpath_node = doc
+            .descendants()
+            .find(|node| node.has_tag_name((super::super::parse::XMLDSIG_NS, "XPath")))
+            .unwrap();
+        assert!(result.contains(xpath_node));
+        assert!(!result.contains(doc.root_element()));
+    }
+
+    #[test]
+    fn xpath_here_function_ignores_document_level_whitespace() {
+        // XPath's root node does not expose whitespace outside the document
+        // element, so it must not shift the child-index path used by here().
+        let xml = r#"
+<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><data/><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>count(. | here()) = 1</ds:XPath></ds:Transform></root>"#;
         let doc = Document::parse(xml).unwrap();
         let transform_node = doc
             .descendants()
