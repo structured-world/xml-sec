@@ -308,10 +308,9 @@ impl function::Function for IdFunction {
             for attribute in element.attributes() {
                 let stored_name = attribute.name();
                 let name = sxd_document_no_unsafe::as_qname!(stored_name);
-                let recognized = (name.namespace_uri().is_none()
-                    && matches!(name.local_part(), "Id" | "ID" | "id"))
-                    || (name.local_part() == "id"
-                        && name.namespace_uri() == Some("http://www.w3.org/XML/1998/namespace"));
+                // Match the URI resolver's local-name policy: WS-Security's
+                // namespaced wsu:Id and XML's xml:id are ID attributes too.
+                let recognized = matches!(name.local_part(), "Id" | "ID" | "id");
                 let value = sxd_document_no_unsafe::as_str!(attribute.value());
                 if !recognized
                     || !identifiers.iter().any(|identifier| *identifier == value)
@@ -690,11 +689,8 @@ mod tests {
             XPathFilterOperation::Intersect,
             XPathExpression::new("id('target')"),
         )];
-        let result = apply_xpath_filter2(
-            NodeSet::entire_document_with_comments(&doc),
-            &filters,
-        )
-        .unwrap();
+        let result =
+            apply_xpath_filter2(NodeSet::entire_document_with_comments(&doc), &filters).unwrap();
 
         assert_eq!(
             canonicalize(&result),
