@@ -240,6 +240,26 @@ fn rejects_xpath_binding_that_shadows_signature_prefix() {
 }
 
 #[test]
+fn rejects_xpath_binding_that_redefines_xml_prefix() {
+    // XML Namespaces permanently binds `xml` to the XML namespace. Accepting
+    // another URI would change the XPath context when serialization omits the
+    // reserved declaration.
+    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::XPath(
+                XPathExpression::new("//xml:item").with_namespace("xml", "urn:not-xml"),
+            )),
+        )
+        .build_template()
+        .expect_err("the xml prefix cannot be rebound to another namespace");
+
+    assert!(matches!(
+        error,
+        SignatureBuilderError::InvalidNamespacePrefix(prefix) if prefix == "xml"
+    ));
+}
+
+#[test]
 fn accepts_unicode_xml_namespace_prefixes() {
     // XML 1.0 NCNames permit Unicode letters; prefix validation must not be ASCII-only.
     let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
