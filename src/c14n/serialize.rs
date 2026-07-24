@@ -781,6 +781,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn document_level_pi_keeps_separator_when_root_is_omitted() {
+        // Document-level separators depend on source-document position, not
+        // on whether the document element itself belongs to the node-set.
+        let xml = "<?pi data?><root><child>text</child></root>";
+        let doc = Document::parse(xml).expect("parse");
+        let pi = doc
+            .root()
+            .children()
+            .find(|node| node.node_type() == NodeType::PI)
+            .expect("document PI");
+        let child = doc.root_element().first_element_child().unwrap();
+        let mut ids = subtree_ids(child);
+        ids.insert(pi.id());
+        let pred = subset_predicate(ids);
+
+        let mut out = Vec::new();
+        serialize_canonical(
+            &doc,
+            Some(&pred),
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .expect("c14n");
+
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "<?pi data?>\n<child>text</child>"
+        );
+    }
+
     // ── xml:* attribute inheritance tests (G001) ──────────────────────
 
     /// Helper: build a predicate that includes only nodes in `ids`.
