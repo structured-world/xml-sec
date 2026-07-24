@@ -1265,6 +1265,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_transforms_bounds_raw_xpath_parameter_text() {
+        // Trimming must not let an untrusted parameter force allocation of an
+        // otherwise bounded expression-sized buffer.
+        let padding = " ".repeat(MAX_XPATH_EXPRESSION_BYTES);
+        let xml = format!(
+            r#"<Transforms xmlns="{XMLDSIG_NS}"><Transform Algorithm="{XPATH_TRANSFORM_URI}"><XPath>{padding}true()</XPath></Transform></Transforms>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let error = parse_transforms(doc.root_element())
+            .expect_err("raw XPath parameter text must obey the expression bound");
+
+        assert!(matches!(error, TransformError::XPath(_)));
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
     fn parse_transforms_rejects_xpath_in_wrong_namespace() {
         let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">
             <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
