@@ -5,7 +5,7 @@
 //! bidirectional node map so the result can be projected back onto the
 //! original document without serializing and reparsing signed input.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 use roxmltree::{Document, NodeId};
 use sxd_document_no_unsafe::{Package, QName, dom};
@@ -296,7 +296,8 @@ impl function::Function for IdFunction {
             .iter()
             .flat_map(|value| value.split_ascii_whitespace())
             .collect::<Vec<_>>();
-        let mut result = nodeset::Nodeset::new();
+        let mut matched = HashMap::new();
+        let mut ambiguous = HashSet::new();
         let mut stack = vec![nodeset::Node::Root(context.node.document().root())];
 
         while let Some(node) = stack.pop() {
@@ -304,21 +305,41 @@ impl function::Function for IdFunction {
             let Some(element) = node.element() else {
                 continue;
             };
-            let matches_id = element.attributes().into_iter().any(|attribute| {
+            for attribute in element.attributes() {
                 let stored_name = attribute.name();
                 let name = sxd_document_no_unsafe::as_qname!(stored_name);
                 let recognized = (name.namespace_uri().is_none()
                     && matches!(name.local_part(), "Id" | "ID" | "id"))
                     || (name.local_part() == "id"
                         && name.namespace_uri() == Some("http://www.w3.org/XML/1998/namespace"));
-                recognized
-                    && identifiers.iter().any(|identifier| {
-                        *identifier == sxd_document_no_unsafe::as_str!(attribute.value())
-                    })
-            });
-            if matches_id {
-                result.add(element);
+                let value = sxd_document_no_unsafe::as_str!(attribute.value());
+                if !recognized
+                    || !identifiers.iter().any(|identifier| *identifier == value)
+                    || ambiguous.contains(value)
+                {
+                    continue;
+                }
+                match matched.entry(value.to_owned()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(element);
+                    }
+                    Entry::Occupied(entry) if *entry.get() == element => {}
+                    Entry::Occupied(entry) => {
+                        entry.remove();
+                        ambiguous.insert(value.to_owned());
+                    }
+                }
             }
+        }
+
+        if !ambiguous.is_empty() {
+            return Err(function::Error::Other {
+                what: "id() matched a duplicate identifier".into(),
+            });
+        }
+        let mut result = nodeset::Nodeset::new();
+        for element in matched.into_values() {
+            result.add(element);
         }
         Ok(Value::Nodeset(result))
     }
@@ -683,21 +704,17 @@ mod tests {
         // Ambiguous IDs must fail closed instead of selecting every matching
         // element, which could let a verifier and application bind different
         // content to the same identifier.
-        let doc = Document::parse(
-            r#"<root><first Id="duplicate"/><second Id="duplicate"/></root>"#,
-        )
-        .unwrap();
+        let doc =
+            Document::parse(r#"<root><first Id="duplicate"/><second Id="duplicate"/></root>"#)
+                .unwrap();
         let filters = [XPathFilter::new(
             XPathFilterOperation::Intersect,
             XPathExpression::new("id('duplicate')"),
         )];
 
-        let error = apply_xpath_filter2(
-            NodeSet::entire_document_with_comments(&doc),
-            &filters,
-        )
-        .err()
-        .expect("duplicate IDs must make XPath evaluation fail closed");
+        let error = apply_xpath_filter2(NodeSet::entire_document_with_comments(&doc), &filters)
+            .err()
+            .expect("duplicate IDs must make XPath evaluation fail closed");
 
         assert!(matches!(error, TransformError::XPath(_)));
     }
