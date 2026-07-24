@@ -1109,6 +1109,45 @@ mod tests {
     }
 
     #[test]
+    fn c14n11_apex_base_uses_only_contiguous_omitted_ancestors() {
+        // The included a already establishes u/ in the canonical output. The
+        // apex c must fix up only the omitted b base plus its own base, or u/
+        // would be applied twice when the canonical subset is interpreted.
+        let xml = r#"<a xml:base="u/"><b xml:base="v/"><c xml:base="x">text</c></b></a>"#;
+        let doc = Document::parse(xml).unwrap();
+        let a = doc.root_element();
+        let b = a.first_element_child().unwrap();
+        let c = b.first_element_child().unwrap();
+
+        let mut ids = HashSet::new();
+        ids.insert(a.id());
+        ids.insert(c.id());
+        for child in c.children() {
+            ids.insert(child.id());
+        }
+        let pred = subset_predicate(ids);
+
+        let mut out = Vec::new();
+        serialize_canonical(
+            &doc,
+            Some(&pred),
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: true,
+            },
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"<a xml:base="u/"><c xml:base="v/x">text</c></a>"#
+        );
+    }
+
+    #[test]
     fn no_inheritance_in_full_document() {
         // Full document (no node_set) — xml:lang stays on root only.
         let xml = r#"<root xml:lang="en"><child>text</child></root>"#;
