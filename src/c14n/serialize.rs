@@ -134,14 +134,6 @@ fn serialize_children(
         match child.node_type() {
             NodeType::Element => {
                 if in_set {
-                    // Before root element: emit \n separator if there was output before
-                    // (e.g., a preceding comment/PI). Note: when node_set excludes the
-                    // root element but includes preceding comments, those comments won't
-                    // get a trailing \n. XPath document subsets may intentionally produce
-                    // canonical octet streams that are not well-formed XML documents.
-                    if is_doc_root && !output.is_empty() {
-                        output.push(b'\n');
-                    }
                     serialize_element(
                         child,
                         visibility,
@@ -187,22 +179,23 @@ fn serialize_children(
             }
             NodeType::Comment => {
                 if with_comments && in_set {
-                    if is_doc_root {
-                        write_doc_level_separator(&child, output);
-                    }
+                    let follows_document_element =
+                        is_doc_root && has_preceding_element_sibling(&child);
+                    write_doc_level_prefix(is_doc_root, follows_document_element, output);
                     output.extend_from_slice(b"<!--");
                     if let Some(text) = child.text() {
                         // C14N spec: \r in comments must be escaped to &#xD;
                         escape_cr(text, output);
                     }
                     output.extend_from_slice(b"-->");
+                    write_doc_level_suffix(is_doc_root, follows_document_element, output);
                 }
             }
             NodeType::PI => {
                 if in_set && let Some(pi) = child.pi() {
-                    if is_doc_root {
-                        write_doc_level_separator(&child, output);
-                    }
+                    let follows_document_element =
+                        is_doc_root && has_preceding_element_sibling(&child);
+                    write_doc_level_prefix(is_doc_root, follows_document_element, output);
                     output.extend_from_slice(b"<?");
                     output.extend_from_slice(pi.target.as_bytes());
                     if let Some(value) = pi.value {
@@ -211,6 +204,7 @@ fn serialize_children(
                         escape_cr(value, output);
                     }
                     output.extend_from_slice(b"?>");
+                    write_doc_level_suffix(is_doc_root, follows_document_element, output);
                 }
             }
             NodeType::Root => {
@@ -423,26 +417,24 @@ fn serialize_element(
     output.push(b'>');
 }
 
-/// Write `\n` separator for document-level nodes.
-///
-/// C14N spec: document-level comments and PIs get `\n` between them and the
-/// root element. Specifically:
-/// - Before root element: comment/PI followed by `\n`
-/// - After root element: `\n` followed by comment/PI
-///
-/// This function emits `\n` either before or after the node, depending on
-/// whether the root element has already been emitted.
-///
-/// Limitation: when `node_set` excludes the root element, the `\n` logic may
-/// be incorrect for preceding comments/PIs. This only affects XPath-selected
-/// subsets that exclude the root — not relevant for SAML enveloped signatures.
-fn write_doc_level_separator(node: &Node, output: &mut Vec<u8>) {
-    let root_elem_seen = has_preceding_element_sibling(node);
-    if root_elem_seen {
-        // After root element: \n before this node.
+/// Emit the separator preceding a document-level comment or PI.
+fn write_doc_level_prefix(
+    is_doc_root: bool,
+    follows_document_element: bool,
+    output: &mut Vec<u8>,
+) {
+    if is_doc_root && follows_document_element {
         output.push(b'\n');
-    } else if !output.is_empty() {
-        // Before root element but not first output: \n after previous node.
+    }
+}
+
+/// Emit the separator following a document-level comment or PI.
+fn write_doc_level_suffix(
+    is_doc_root: bool,
+    follows_document_element: bool,
+    output: &mut Vec<u8>,
+) {
+    if is_doc_root && !follows_document_element {
         output.push(b'\n');
     }
 }
