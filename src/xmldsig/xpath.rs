@@ -98,6 +98,8 @@ impl<'d> Mirror<'d> {
                 );
                 let element = target.create_element(name);
 
+                // SXD's namespaces_in_scope() always injects the predefined
+                // xml binding, even when no prefix was registered explicitly.
                 for namespace in source_node.namespaces() {
                     match namespace.name() {
                         Some(prefix) => element.register_prefix(prefix, namespace.uri()),
