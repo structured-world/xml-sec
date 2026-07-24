@@ -312,10 +312,7 @@ impl function::Function for IdFunction {
                 // namespaced wsu:Id and XML's xml:id are ID attributes too.
                 let recognized = matches!(name.local_part(), "Id" | "ID" | "id");
                 let value = sxd_document_no_unsafe::as_str!(attribute.value());
-                if !recognized
-                    || !identifiers.iter().any(|identifier| *identifier == value)
-                    || ambiguous.contains(value)
-                {
+                if !recognized || !identifiers.contains(&value) || ambiguous.contains(value) {
                     continue;
                 }
                 match matched.entry(value.to_owned()) {
