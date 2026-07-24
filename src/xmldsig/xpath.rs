@@ -679,6 +679,30 @@ mod tests {
     }
 
     #[test]
+    fn xpath_id_function_selects_namespaced_id_by_local_name() {
+        // Same-document URI resolution and XPath id() must agree on common
+        // WS-Security identifiers even when the Id attribute is namespaced.
+        let doc = Document::parse(
+            r#"<root xmlns:wsu="urn:ws-security"><item wsu:Id="target">yes</item><item>no</item></root>"#,
+        )
+        .unwrap();
+        let filters = [XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("id('target')"),
+        )];
+        let result = apply_xpath_filter2(
+            NodeSet::entire_document_with_comments(&doc),
+            &filters,
+        )
+        .unwrap();
+
+        assert_eq!(
+            canonicalize(&result),
+            r#"<item xmlns:wsu="urn:ws-security" wsu:Id="target">yes</item>"#
+        );
+    }
+
+    #[test]
     fn xpath_id_function_unions_identifiers_from_node_set_argument() {
         // XPath 1.0 expands every string-value in a node-set argument to id(),
         // rather than coercing only its first node to a string.
