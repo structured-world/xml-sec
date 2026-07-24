@@ -641,7 +641,17 @@ fn parse_xpath_expression(
     let mut source = String::new();
     for child in xpath_node.children() {
         if child.is_text() {
-            source.push_str(child.text().unwrap_or_default());
+            let text = child.text().unwrap_or_default();
+            if source
+                .len()
+                .checked_add(text.len())
+                .is_none_or(|length| length > MAX_XPATH_EXPRESSION_BYTES)
+            {
+                return Err(TransformError::XPath(format!(
+                    "XPath expression exceeds {MAX_XPATH_EXPRESSION_BYTES} bytes"
+                )));
+            }
+            source.push_str(text);
         } else if child.is_element() {
             return Err(TransformError::XPath(
                 "XPath expressions must contain text only".into(),
@@ -653,11 +663,6 @@ fn parse_xpath_expression(
         return Err(TransformError::XPath(
             "XPath expression must not be empty".into(),
         ));
-    }
-    if source.len() > MAX_XPATH_EXPRESSION_BYTES {
-        return Err(TransformError::XPath(format!(
-            "XPath expression exceeds {MAX_XPATH_EXPRESSION_BYTES} bytes"
-        )));
     }
     sxd_xpath_no_unsafe::Factory::new()
         .build(&normalize_function_spacing(source))
