@@ -2,7 +2,7 @@
 //!
 //! Implements:
 //! - [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) (inclusive)
-//! - [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) (inclusive; xml:id propagation and xml:base fixup)
+//! - [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) (inclusive; xml:id non-inheritance and xml:base fixup)
 //! - [Exclusive XML Canonicalization 1.0](https://www.w3.org/TR/xml-exc-c14n/) (exclusive)
 //!
 //! # Example
@@ -43,7 +43,7 @@ use serialize::{C14nConfig, serialize_canonical_visible};
 pub enum C14nMode {
     /// Inclusive C14N 1.0 — all in-scope namespaces rendered.
     Inclusive1_0,
-    /// Inclusive C14N 1.1 — like 1.0 with xml:id propagation and xml:base fixup.
+    /// Inclusive C14N 1.1 — like 1.0 with xml:id non-inheritance and xml:base fixup.
     Inclusive1_1,
     /// Exclusive C14N 1.0 — only visibly-utilized namespaces rendered.
     Exclusive1_0,

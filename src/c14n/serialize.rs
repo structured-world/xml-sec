@@ -17,18 +17,17 @@ use super::{C14nError, NodeVisibility};
 
 /// The XML namespace URI.
 ///
-/// In C14N document subsets (W3C C14N §2.4), inheritable attributes in
-/// this namespace are propagated from ancestors outside the node set:
-/// - C14N 1.0 / Exclusive 1.0: `xml:lang`, `xml:space`, `xml:base`
-/// - C14N 1.1: adds `xml:id` to the above set
+/// In inclusive C14N document subsets, `xml:lang` and `xml:space` are simple
+/// inheritable attributes. `xml:base` is inherited in C14N 1.0 and receives
+/// dedicated fixup in C14N 1.1; `xml:id` is never inherited in C14N 1.1.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
-/// Check whether an xml:* attribute name is inheritable in the current mode.
+/// Check whether an xml:* attribute participates in subset inheritance.
 ///
-/// Per C14N 1.0 §2.4: `xml:lang`, `xml:space`, `xml:base` are inherited.
-/// Per C14N 1.1: `xml:id` is also inherited (xml:id propagation).
-fn is_inheritable_xml_attr(local_name: &str, include_xml_id: bool) -> bool {
-    matches!(local_name, "lang" | "space" | "base") || (include_xml_id && local_name == "id")
+/// `xml:id` is deliberately absent: C14N 1.1 §2.4 states that it is not a
+/// simple inheritable attribute and performs no propagation for it.
+fn is_inheritable_xml_attr(local_name: &str) -> bool {
+    matches!(local_name, "lang" | "space" | "base")
 }
 
 /// Configuration flags for C14N serialization that vary by mode.
@@ -66,8 +65,8 @@ pub(crate) trait NsRenderer {
 /// - `with_comments`: whether to preserve comment nodes
 /// - `ns_renderer`: namespace rendering strategy
 /// - `inherit_xml_attrs`: if `true` (Inclusive C14N), inherit `xml:lang`,
-///   `xml:space`, `xml:base` (and `xml:id` for 1.1) from ancestors outside
-///   the node set per C14N §2.4. If `false` (Exclusive C14N), skip this
+///   `xml:space`, and process `xml:base` from ancestors outside the node set
+///   per C14N §2.4. If `false` (Exclusive C14N), skip this
 ///   search — per Exc-C14N §3, ancestor xml:* import is explicitly omitted.
 /// - `fixup_xml_base`: if `true` (C14N 1.1), resolve `xml:base` relative
 ///   URIs in document subsets via RFC 3986. Only meaningful when
@@ -321,12 +320,7 @@ fn serialize_element(
     // For C14N 1.1 (fixup_xml_base=true): xml:base values are additionally
     // resolved to effective URIs per RFC 3986.
     let inherited_xml = if config.inherit_xml_attrs {
-        // xml:id is only inheritable in C14N 1.1. Both xml:id propagation
-        // and xml:base fixup are C14N 1.1 features, so fixup_xml_base
-        // serves as the "is C14N 1.1" indicator. If these ever need to be
-        // independent, add a separate field to C14nConfig.
-        let include_xml_id = config.fixup_xml_base;
-        collect_inherited_xml_attrs(node, visibility, include_xml_id)
+        collect_inherited_xml_attrs(node, visibility, config.fixup_xml_base)
     } else {
         Vec::new()
     };
@@ -468,19 +462,19 @@ fn has_preceding_element_sibling(node: &Node) -> bool {
 /// Collect inheritable `xml:*` attributes from ancestors for document subsets.
 ///
 /// Per [W3C C14N 1.0 §2.4](https://www.w3.org/TR/xml-c14n/#ProcessingModel):
-/// when an element is in the node set but its parent is NOT, `xml:lang`,
-/// `xml:space`, and `xml:base` from ancestor elements must be emitted on
-/// the element to preserve inherited semantics.
+/// when an element is in the node set but its parent is NOT, `xml:lang` and
+/// `xml:space` are inherited from the nearest ancestor declarations whether
+/// or not those attribute nodes are themselves in the node set. `xml:base`
+/// follows the version-specific inheritance/fixup rules.
 ///
-/// The `include_xml_id` flag (true for C14N 1.1) additionally inherits
-/// `xml:id`. Other `xml:*` attributes are never inherited.
+/// `xml:id` and other `xml:*` attributes are never inherited in C14N 1.1.
 ///
 /// Returns `(local_name, value)` pairs. Closer ancestors take precedence.
 /// Attributes already present on the element itself are excluded.
 fn collect_inherited_xml_attrs<'a>(
     node: Node<'a, '_>,
     visibility: Option<&dyn NodeVisibility>,
-    include_xml_id: bool,
+    fixup_xml_base: bool,
 ) -> Vec<(&'a str, &'a str)> {
     let set = match visibility {
         Some(p) => p,
@@ -502,7 +496,7 @@ fn collect_inherited_xml_attrs<'a>(
     for attr in node.attributes() {
         if attr.namespace() == Some(XML_NS) {
             let local = attr.name();
-            if is_inheritable_xml_attr(local, include_xml_id) {
+            if is_inheritable_xml_attr(local) {
                 seen.insert(local);
             }
         }
@@ -521,7 +515,7 @@ fn collect_inherited_xml_attrs<'a>(
             // C14N 1.1 resolves xml:base only across the contiguous omitted
             // chain. An included ancestor already renders its own base, but
             // remains the resolution seed for bases on omitted descendants.
-            xml_base_boundary_reached |= include_xml_id && set.contains_node(anc);
+            xml_base_boundary_reached |= fixup_xml_base && set.contains_node(anc);
             for attr in anc.attributes() {
                 if attr.namespace() == Some(XML_NS) {
                     let local = attr.name();
@@ -533,7 +527,11 @@ fn collect_inherited_xml_attrs<'a>(
                     if local == "base" && attr.value().is_empty() {
                         continue;
                     }
-                    if is_inheritable_xml_attr(local, include_xml_id) && seen.insert(local) {
+                    // C14N 1.1 §2.4 examines simple inheritable attributes
+                    // whether or not their attribute nodes are in the input
+                    // node-set. Filtering here would change inherited XML
+                    // semantics at an apex element.
+                    if is_inheritable_xml_attr(local) && seen.insert(local) {
                         inherited.push((attr.name(), attr.value()));
                     }
                 }
