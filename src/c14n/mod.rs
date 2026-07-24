@@ -391,8 +391,9 @@ mod tests {
     }
 
     #[test]
-    fn c14n_1_1_xml_id_inherited_in_subset() {
-        // C14N 1.1 propagates xml:id to document subsets, just like xml:lang.
+    fn c14n_1_1_xml_id_is_not_inherited_in_subset() {
+        // C14N 1.1 explicitly excludes xml:id from simple inheritable
+        // attributes, so omitting its owner must also omit the attribute.
         use roxmltree::Document;
         use std::collections::HashSet;
 
@@ -416,10 +417,9 @@ mod tests {
         canonicalize(&doc, Some(&pred), &algo, &mut out).expect("c14n 1.1 subset");
         let result = String::from_utf8(out).expect("utf8");
 
-        // xml:id="r1" should be inherited from root onto child
         assert!(
-            result.contains(r#"xml:id="r1""#),
-            "xml:id should be inherited in C14N 1.1 subset; got: {result}"
+            !result.contains(r#"xml:id="r1""#),
+            "xml:id must not be inherited in C14N 1.1 subset; got: {result}"
         );
     }
 }
