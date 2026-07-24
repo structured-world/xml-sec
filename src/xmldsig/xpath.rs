@@ -802,6 +802,28 @@ mod tests {
     }
 
     #[test]
+    fn parsed_xpath_uses_implicit_xml_namespace_binding() {
+        // Namespaces in XML binds `xml` without requiring an xmlns:xml
+        // declaration, so parsed signatures must expose it to XPath too.
+        let xml = r#"<root xml:id="target" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>self::*[@xml:id='target']</ds:XPath></ds:Transform></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let transform_node = doc
+            .descendants()
+            .find(|node| node.has_tag_name((super::super::parse::XMLDSIG_NS, "Transform")))
+            .unwrap();
+        let transform = super::super::transforms::parse_xpath_transform(transform_node).unwrap();
+        let input = TransformData::NodeSet(NodeSet::entire_document_with_comments(&doc));
+
+        let result =
+            super::super::transforms::apply_transform(doc.root_element(), &transform, input)
+                .unwrap()
+                .into_node_set()
+                .unwrap();
+
+        assert!(result.contains(doc.root_element()));
+    }
+
+    #[test]
     fn xpath_here_function_ignores_document_level_whitespace() {
         // XPath's root node does not expose whitespace outside the document
         // element, so it must not shift the child-index path used by here().
