@@ -418,22 +418,14 @@ fn serialize_element(
 }
 
 /// Emit the separator preceding a document-level comment or PI.
-fn write_doc_level_prefix(
-    is_doc_root: bool,
-    follows_document_element: bool,
-    output: &mut Vec<u8>,
-) {
+fn write_doc_level_prefix(is_doc_root: bool, follows_document_element: bool, output: &mut Vec<u8>) {
     if is_doc_root && follows_document_element {
         output.push(b'\n');
     }
 }
 
 /// Emit the separator following a document-level comment or PI.
-fn write_doc_level_suffix(
-    is_doc_root: bool,
-    follows_document_element: bool,
-    output: &mut Vec<u8>,
-) {
+fn write_doc_level_suffix(is_doc_root: bool, follows_document_element: bool, output: &mut Vec<u8>) {
     if is_doc_root && !follows_document_element {
         output.push(b'\n');
     }

@@ -266,10 +266,8 @@ fn rejects_xpath_binding_that_aliases_xml_namespace() {
     let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
         .add_reference(
             ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::XPath(
-                XPathExpression::new("//alias:item").with_namespace(
-                    "alias",
-                    "http://www.w3.org/XML/1998/namespace",
-                ),
+                XPathExpression::new("//alias:item")
+                    .with_namespace("alias", "http://www.w3.org/XML/1998/namespace"),
             )),
         )
         .build_template()
