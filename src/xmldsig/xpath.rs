@@ -19,6 +19,8 @@ use super::types::{NodeSet, TransformError};
 use crate::c14n::prefix::{attribute_prefix, element_prefix};
 
 const ALL_XPATH_NODES: &str = "//. | //@* | //namespace::*";
+/// Namespace URI permanently bound to the reserved `xml` prefix.
+const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
 /// SXD's tokenizer rejects otherwise valid whitespace between a function QName
 /// and `(`. Normalize only that token boundary, preserving quoted literals and
@@ -412,6 +414,10 @@ fn evaluate_expression<'a>(
     for (prefix, uri) in expression.namespaces() {
         context.set_namespace(prefix, uri);
     }
+    // The XML namespace binding is implicit and roxmltree therefore does not
+    // expose it through element namespace declarations. Enforce it at the
+    // evaluation boundary for both parsed and programmatic expressions.
+    context.set_namespace("xml", XML_NS);
     context.set_function(
         "here",
         HereFunction {
