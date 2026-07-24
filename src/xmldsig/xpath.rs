@@ -679,6 +679,30 @@ mod tests {
     }
 
     #[test]
+    fn xpath_id_function_rejects_duplicate_identifiers() {
+        // Ambiguous IDs must fail closed instead of selecting every matching
+        // element, which could let a verifier and application bind different
+        // content to the same identifier.
+        let doc = Document::parse(
+            r#"<root><first Id="duplicate"/><second Id="duplicate"/></root>"#,
+        )
+        .unwrap();
+        let filters = [XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("id('duplicate')"),
+        )];
+
+        let error = apply_xpath_filter2(
+            NodeSet::entire_document_with_comments(&doc),
+            &filters,
+        )
+        .err()
+        .expect("duplicate IDs must make XPath evaluation fail closed");
+
+        assert!(matches!(error, TransformError::XPath(_)));
+    }
+
+    #[test]
     fn xpath_lang_function_uses_nearest_xml_lang_ancestor() {
         // lang() is case-insensitive, accepts a language subtag suffix, and
         // stops at the nearest xml:lang declaration.
