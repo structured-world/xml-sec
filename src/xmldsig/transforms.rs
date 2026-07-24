@@ -1270,6 +1270,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_xpath_transform_ignores_comments_and_processing_instructions() {
+        // Comments and PIs are not transform parameters and may surround the
+        // required XPath element in an otherwise valid signature.
+        let xml = format!(
+            r#"<Transforms xmlns="{XMLDSIG_NS}"><Transform Algorithm="{XPATH_TRANSFORM_URI}"><!-- before --><?probe value?><XPath>true()</XPath><!-- after --><?done?></Transform></Transforms>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let transforms = parse_transforms(doc.root_element()).unwrap();
+
+        assert!(matches!(transforms.as_slice(), [Transform::XPath(_)]));
+    }
+
+    #[test]
+    fn parse_filter2_transform_ignores_comments_and_processing_instructions() {
+        // Filter 2.0 has the same XML comment/PI treatment while retaining its
+        // stricter element and attribute grammar.
+        let xml = format!(
+            r#"<Transforms xmlns="{XMLDSIG_NS}"><Transform Algorithm="{XPATH_FILTER2_TRANSFORM_URI}"><!-- before --><?probe value?><XPath xmlns="{XPATH_FILTER2_TRANSFORM_URI}" Filter="intersect">/root</XPath><!-- after --><?done?></Transform></Transforms>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let transforms = parse_transforms(doc.root_element()).unwrap();
+
+        assert!(matches!(
+            transforms.as_slice(),
+            [Transform::XPathFilter2(filters)] if filters.len() == 1
+        ));
+    }
+
+    #[test]
     fn parse_transforms_bounds_raw_xpath_parameter_text() {
         // Trimming must not let an untrusted parameter force allocation of an
         // otherwise bounded expression-sized buffer.
