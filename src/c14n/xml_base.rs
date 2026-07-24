@@ -11,6 +11,8 @@
 
 use roxmltree::Node;
 
+use super::NodeVisibility;
+
 /// The XML namespace URI.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -20,36 +22,30 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 /// Walks from `start` up the ancestor chain, collecting `xml:base` values
 /// from each element. If a `node_set` is provided, the walk stops at the
 /// nearest ancestor that is included in the node set, since that ancestor
-/// will render its own `xml:base` in the canonical output. The function still
-/// uses that included ancestor's `xml:base` (if any) as the resolution seed,
-/// so that the omitted portion of the chain resolves against the correct
-/// effective base. Resolves from the topmost collected base to the closest.
+/// renders its own `xml:base` in the canonical output. Only the contiguous
+/// chain of omitted ancestors is collected, then resolved from the topmost
+/// collected base to the closest.
 ///
 /// The resulting reference is absolute only if some ancestor `xml:base`
 /// (or the effective base at that point) is absolute; otherwise it may be
 /// a relative reference.
 ///
-/// Returns `None` if neither the omitted ancestor chain nor the nearest
-/// included ancestor (when `node_set` is provided) has a non-empty
+/// Returns `None` if the considered ancestor chain has no non-empty
 /// `xml:base` attribute.
 pub(crate) fn compute_effective_xml_base(
     start: Node<'_, '_>,
-    node_set: Option<&dyn Fn(Node) -> bool>,
+    visibility: Option<&dyn NodeVisibility>,
 ) -> Option<String> {
     let mut bases: Vec<&str> = Vec::new();
     let mut current = Some(start);
     while let Some(n) = current {
         if n.is_element() {
-            // Stop at the nearest included ancestor — it renders its own
-            // xml:base in the canonical output. However, we still collect
-            // its xml:base value as the resolution seed, so that the
-            // omitted chain below resolves against an absolute base.
-            if let Some(pred) = node_set
-                && pred(n)
+            // An included ancestor already establishes its base in the
+            // canonical output, so including it in the fixup would apply it
+            // a second time when the output is interpreted.
+            if let Some(set) = visibility
+                && set.contains_node(n)
             {
-                if let Some(base) = xml_base_value(n) {
-                    bases.push(base);
-                }
                 break;
             }
             if let Some(base) = xml_base_value(n) {

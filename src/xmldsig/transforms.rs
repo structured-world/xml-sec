@@ -15,27 +15,174 @@
 //! | Enveloped signature | NodeSet → NodeSet | P0 (SAML) |
 //! | Inclusive C14N 1.0/1.1 | NodeSet → Binary | P0 |
 //! | Exclusive C14N 1.0 | NodeSet → Binary | P0 |
-//! | Base64 decode | Binary → Binary | P1 (future) |
+//! | Base64 decode | NodeSet/Binary → Binary | P1 |
+//! | XPath 1.0 | NodeSet → NodeSet | P1 |
+//! | XPath Filter 2.0 | NodeSet → NodeSet | P1 |
 
+use std::collections::BTreeMap;
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use roxmltree::Node;
 
 use super::parse::XMLDSIG_NS;
 use super::types::{TransformData, TransformError};
+use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
+use super::xpath::{
+    apply_xpath_filter_with_semantics, apply_xpath_filter2_with_semantics,
+    normalize_function_spacing,
+};
 use crate::c14n::{self, C14nAlgorithm};
 
 /// The algorithm URI for the enveloped signature transform.
 pub const ENVELOPED_SIGNATURE_URI: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
+/// The algorithm URI for the Base64 decode transform.
+pub const BASE64_TRANSFORM_URI: &str = "http://www.w3.org/2000/09/xmldsig#base64";
 /// The algorithm URI for the XPath 1.0 transform.
 pub const XPATH_TRANSFORM_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+/// The algorithm URI for the XPath Filter 2.0 transform.
+pub const XPATH_FILTER2_TRANSFORM_URI: &str = "http://www.w3.org/2002/06/xmldsig-filter2";
 /// The implicit default canonicalization URI applied when no explicit C14N
 /// transform is present in a `<Reference>`.
 pub const DEFAULT_IMPLICIT_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
+/// Maximum transforms accepted for one reference.
+///
+/// Execution retains one stack frame when a binary-to-node-set adapter parses
+/// temporary XML, so bounding the chain also bounds stack and retained input.
+pub const MAX_TRANSFORMS_PER_REFERENCE: usize = 64;
 /// xmlsec1 donor vectors use this XPath expression as a compatibility form of
 /// enveloped-signature exclusion.
 const ENVELOPED_SIGNATURE_XPATH_EXPR: &str = "not(ancestor-or-self::dsig:Signature)";
+pub(super) const MAX_XPATH_EXPRESSION_BYTES: usize = 16 * 1024;
+pub(super) const MAX_XPATH_FILTERS: usize = 64;
 
 /// Namespace URI for Exclusive C14N `<InclusiveNamespaces>` elements.
 const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+
+/// Node returned by the XMLDSig XPath `here()` extension function.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum XPathHereSemantics {
+    /// Follow XMLDSig: return the `<XPath>` parameter element that contains
+    /// the expression text.
+    #[default]
+    Specification,
+    /// Match libxmlsec1, which returns the owning `<Transform>` element.
+    ///
+    /// This mode is opt-in because the two interpretations can select
+    /// different data for the same signed XML document.
+    XmlSecLegacy,
+}
+
+/// Options controlling execution of an XMLDSig transform chain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransformOptions {
+    xpath_here_semantics: XPathHereSemantics,
+}
+
+impl TransformOptions {
+    /// Select the node returned by the XPath `here()` extension function.
+    #[must_use]
+    pub fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
+        self.xpath_here_semantics = semantics;
+        self
+    }
+
+    pub(crate) fn here_semantics(self) -> XPathHereSemantics {
+        self.xpath_here_semantics
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct XPathHereNodes {
+    xpath: roxmltree::NodeId,
+    transform: roxmltree::NodeId,
+}
+
+/// An XPath 1.0 expression and the namespace bindings in scope where it was declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XPathExpression {
+    expression: String,
+    namespaces: BTreeMap<String, String>,
+    here_nodes: Option<XPathHereNodes>,
+}
+
+impl XPathExpression {
+    /// Create an expression for signature-template generation.
+    pub fn new(expression: impl Into<String>) -> Self {
+        Self {
+            expression: expression.into(),
+            namespaces: BTreeMap::new(),
+            here_nodes: None,
+        }
+    }
+
+    /// Bind a prefix used by this XPath expression.
+    pub fn with_namespace(mut self, prefix: impl Into<String>, uri: impl Into<String>) -> Self {
+        self.namespaces.insert(prefix.into(), uri.into());
+        self
+    }
+
+    /// XPath source text.
+    pub fn expression(&self) -> &str {
+        &self.expression
+    }
+
+    /// Namespace prefix bindings used during evaluation.
+    pub fn namespaces(&self) -> &BTreeMap<String, String> {
+        &self.namespaces
+    }
+
+    pub(crate) fn here_node(&self, semantics: XPathHereSemantics) -> Option<roxmltree::NodeId> {
+        self.here_nodes.map(|nodes| match semantics {
+            XPathHereSemantics::Specification => nodes.xpath,
+            XPathHereSemantics::XmlSecLegacy => nodes.transform,
+        })
+    }
+}
+
+/// Set operation applied by one XPath Filter 2.0 step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XPathFilterOperation {
+    /// Keep only nodes in the selected subtrees.
+    Intersect,
+    /// Remove nodes in the selected subtrees.
+    Subtract,
+    /// Add nodes in the selected subtrees.
+    Union,
+}
+
+impl XPathFilterOperation {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Intersect => "intersect",
+            Self::Subtract => "subtract",
+            Self::Union => "union",
+        }
+    }
+}
+
+/// One expression and set operation in an XPath Filter 2.0 transform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XPathFilter {
+    operation: XPathFilterOperation,
+    xpath: XPathExpression,
+}
+
+impl XPathFilter {
+    /// Create a Filter 2.0 step.
+    pub fn new(operation: XPathFilterOperation, xpath: XPathExpression) -> Self {
+        Self { operation, xpath }
+    }
+
+    /// Operation applied to the subtree-expanded expression result.
+    pub fn operation(&self) -> XPathFilterOperation {
+        self.operation
+    }
+
+    /// XPath expression evaluated by this step.
+    pub fn xpath(&self) -> &XPathExpression {
+        &self.xpath
+    }
+}
 
 /// A single transform in the pipeline.
 #[derive(Debug, Clone)]
@@ -53,10 +200,25 @@ pub enum Transform {
     /// current document, not only the containing signature.
     XpathExcludeAllSignatures,
 
+    /// General XMLDSig XPath 1.0 node filter.
+    XPath(XPathExpression),
+
+    /// XPath Filter 2.0 ordered subtree set operations.
+    XPathFilter2(Vec<XPathFilter>),
+
     /// XML Canonicalization (any supported variant).
     ///
     /// Input: `NodeSet` → Output: `Binary`
     C14n(C14nAlgorithm),
+
+    /// Decode base64 text into the octets consumed by the next transform or digest.
+    ///
+    /// Node-set input is converted by concatenating included text nodes in
+    /// document order, as required by XMLDSig section 6.6.2. Binary input is
+    /// decoded directly.
+    ///
+    /// Input: `NodeSet` or `Binary` → Output: `Binary`
+    Base64Decode,
 }
 
 /// Apply a single transform to the pipeline data.
@@ -66,11 +228,26 @@ pub enum Transform {
 /// to know which signature subtree to exclude. The node must belong to the
 /// same document as the `NodeSet` in `input`; a cross-document mismatch
 /// returns [`TransformError::CrossDocumentSignatureNode`].
+#[cfg(test)]
 pub(crate) fn apply_transform<'a>(
     signature_node: Node<'a, 'a>,
     transform: &Transform,
     input: TransformData<'a>,
 ) -> Result<TransformData<'a>, TransformError> {
+    apply_transform_with_options(
+        signature_node,
+        transform,
+        input,
+        TransformOptions::default(),
+    )
+}
+
+pub(super) fn apply_transform_with_options<'s, 'd>(
+    signature_node: Node<'s, 's>,
+    transform: &Transform,
+    input: TransformData<'d>,
+    options: TransformOptions,
+) -> Result<TransformData<'d>, TransformError> {
     match transform {
         Transform::Enveloped => {
             let mut nodes = input.into_node_set()?;
@@ -102,14 +279,79 @@ pub(crate) fn apply_transform<'a>(
 
             Ok(TransformData::NodeSet(nodes))
         }
+        Transform::XPath(xpath) => {
+            let nodes = input.into_node_set()?;
+            let here_is_same_document = std::ptr::eq(signature_node.document(), nodes.document());
+            Ok(TransformData::NodeSet(apply_xpath_filter_with_semantics(
+                nodes,
+                xpath,
+                options.here_semantics(),
+                here_is_same_document,
+            )?))
+        }
+        Transform::XPathFilter2(filters) => {
+            let nodes = input.into_node_set()?;
+            let here_is_same_document = std::ptr::eq(signature_node.document(), nodes.document());
+            Ok(TransformData::NodeSet(apply_xpath_filter2_with_semantics(
+                nodes,
+                filters,
+                options.here_semantics(),
+                here_is_same_document,
+            )?))
+        }
         Transform::C14n(algo) => {
             let nodes = input.into_node_set()?;
             let mut output = Vec::new();
-            let predicate = |node: Node| nodes.contains(node);
-            c14n::canonicalize(nodes.document(), Some(&predicate), algo, &mut output)?;
+            c14n::canonicalize_with_visibility(nodes.document(), Some(&nodes), algo, &mut output)?;
             Ok(TransformData::Binary(output))
         }
+        Transform::Base64Decode => {
+            let mut normalized = Vec::new();
+            match input {
+                TransformData::Binary(bytes) => {
+                    normalized.reserve(bytes.len());
+                    append_normalized_base64(&bytes, &mut normalized)?;
+                }
+                TransformData::NodeSet(nodes) => {
+                    for node in nodes.document().descendants() {
+                        if nodes.contains(node) && node.is_text() {
+                            append_normalized_base64(
+                                node.text().unwrap_or_default().as_bytes(),
+                                &mut normalized,
+                            )?;
+                        }
+                    }
+                }
+            }
+            Ok(TransformData::Binary(decode_base64_transform(normalized)?))
+        }
     }
+}
+
+/// Decode the RFC 2045 alphabet accepted by xmlsec1's Base64 transform.
+///
+/// XML whitespace is insignificant in XMLDSig Base64 data. Other bytes are
+/// rejected rather than ignored so malformed signed content cannot acquire
+/// multiple textual representations with different application meaning.
+fn append_normalized_base64(
+    encoded: &[u8],
+    normalized: &mut Vec<u8>,
+) -> Result<(), TransformError> {
+    normalize_xml_base64_bytes(encoded, normalized, |byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
+    })
+    .map_err(|err| {
+        TransformError::Base64(format!(
+            "invalid byte 0x{:02X} in encoded input",
+            err.invalid_byte
+        ))
+    })
+}
+
+fn decode_base64_transform(normalized: Vec<u8>) -> Result<Vec<u8>, TransformError> {
+    STANDARD
+        .decode(normalized)
+        .map_err(|error| TransformError::Base64(error.to_string()))
 }
 
 /// Execute a chain of transforms for a single `<Reference>`.
@@ -125,12 +367,72 @@ pub fn execute_transforms<'a>(
     initial_data: TransformData<'a>,
     transforms: &[Transform],
 ) -> Result<Vec<u8>, TransformError> {
-    let mut data = initial_data;
+    execute_transforms_with_options(
+        signature_node,
+        initial_data,
+        transforms,
+        TransformOptions::default(),
+    )
+}
 
-    for transform in transforms {
-        data = apply_transform(signature_node, transform, data)?;
+/// Execute a transform chain with explicit compatibility options.
+pub fn execute_transforms_with_options<'a>(
+    signature_node: Node<'a, 'a>,
+    initial_data: TransformData<'a>,
+    transforms: &[Transform],
+    options: TransformOptions,
+) -> Result<Vec<u8>, TransformError> {
+    ensure_transform_count(transforms.len())?;
+    execute_transform_chain(signature_node, initial_data, transforms, options)
+}
+
+fn ensure_transform_count(count: usize) -> Result<(), TransformError> {
+    if count > MAX_TRANSFORMS_PER_REFERENCE {
+        return Err(TransformError::TooManyTransforms {
+            max: MAX_TRANSFORMS_PER_REFERENCE,
+        });
+    }
+    Ok(())
+}
+
+fn execute_transform_chain<'s, 'd>(
+    signature_node: Node<'s, 's>,
+    data: TransformData<'d>,
+    transforms: &[Transform],
+    options: TransformOptions,
+) -> Result<Vec<u8>, TransformError> {
+    let Some((transform, remaining)) = transforms.split_first() else {
+        return finalize_transform_data(data);
+    };
+
+    if transform_requires_node_set(transform)
+        && let TransformData::Binary(bytes) = data
+    {
+        // The parsed document must outlive every remaining node-set transform.
+        // Recursive execution keeps all borrows scoped to this stack frame and
+        // returns only owned digest bytes.
+        let xml = std::str::from_utf8(&bytes)
+            .map_err(|error| TransformError::XmlParse(error.to_string()))?;
+        let document = roxmltree::Document::parse(xml)
+            .map_err(|error| TransformError::XmlParse(error.to_string()))?;
+        let nodes = super::types::NodeSet::entire_document_with_comments(&document);
+        return execute_transform_chain(
+            signature_node,
+            TransformData::NodeSet(nodes),
+            transforms,
+            options,
+        );
     }
 
+    let data = apply_transform_with_options(signature_node, transform, data, options)?;
+    execute_transform_chain(signature_node, data, remaining, options)
+}
+
+fn transform_requires_node_set(transform: &Transform) -> bool {
+    !matches!(transform, Transform::Base64Decode)
+}
+
+fn finalize_transform_data(data: TransformData<'_>) -> Result<Vec<u8>, TransformError> {
     // Final coercion: if the result is still a NodeSet, canonicalize with
     // default inclusive C14N 1.0 per XMLDSig spec §4.3.3.2.
     match data {
@@ -140,8 +442,7 @@ pub fn execute_transforms<'a>(
             let algo = C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI)
                 .expect("default C14N algorithm URI must be supported by C14nAlgorithm::from_uri");
             let mut output = Vec::new();
-            let predicate = |node: Node| nodes.contains(node);
-            c14n::canonicalize(nodes.document(), Some(&predicate), &algo, &mut output)?;
+            c14n::canonicalize_with_visibility(nodes.document(), Some(&nodes), &algo, &mut output)?;
             Ok(output)
         }
     }
@@ -175,6 +476,7 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
         if !child.is_element() {
             continue;
         }
+        ensure_transform_count(chain.len() + 1)?;
 
         // Only <ds:Transform> children are allowed; fail closed on any other element.
         let tag = child.tag_name();
@@ -192,8 +494,13 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
 
         let transform = if uri == ENVELOPED_SIGNATURE_URI {
             Transform::Enveloped
+        } else if uri == BASE64_TRANSFORM_URI {
+            validate_empty_transform(child, "Base64")?;
+            Transform::Base64Decode
         } else if uri == XPATH_TRANSFORM_URI {
-            parse_xpath_compat_transform(child)?
+            parse_xpath_transform(child)?
+        } else if uri == XPATH_FILTER2_TRANSFORM_URI {
+            parse_xpath_filter2_transform(child)?
         } else if let Some(mut algo) = C14nAlgorithm::from_uri(uri) {
             // For exclusive C14N, check for InclusiveNamespaces child
             if algo.mode() == c14n::C14nMode::Exclusive1_0
@@ -211,57 +518,178 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
     Ok(chain)
 }
 
-/// Parse the narrow XPath compatibility case we currently support.
-///
-/// We do not implement general XPath evaluation here. The only accepted form is
-/// the xmlsec1 donor-vector expression that excludes all `ds:Signature`
-/// subtrees from the current node-set.
-fn parse_xpath_compat_transform(transform_node: Node) -> Result<Transform, TransformError> {
+/// Validate transforms whose XML syntax does not define parameter content.
+fn validate_empty_transform(
+    transform_node: Node,
+    transform_name: &'static str,
+) -> Result<(), TransformError> {
+    for child in transform_node.children() {
+        if child.is_element()
+            || (child.is_text()
+                && child
+                    .text()
+                    .is_some_and(|text| !is_xml_whitespace_only(text)))
+        {
+            return Err(TransformError::UnsupportedTransform(format!(
+                "{transform_name} transform must not contain parameters"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn parse_xpath_transform(transform_node: Node) -> Result<Transform, TransformError> {
     let mut xpath_node = None;
 
-    for child in transform_node.children().filter(|node| node.is_element()) {
+    for child in transform_node.children() {
+        if child.is_text() && child.text().is_some_and(is_xml_whitespace_only) {
+            continue;
+        }
+        if child.is_comment() || child.is_pi() {
+            continue;
+        }
+        if !child.is_element() {
+            return Err(TransformError::XPath(
+                "XPath transform contains non-whitespace parameter content".into(),
+            ));
+        }
         let tag = child.tag_name();
         if tag.name() == "XPath" && tag.namespace() == Some(XMLDSIG_NS) {
             if xpath_node.is_some() {
-                return Err(TransformError::UnsupportedTransform(
+                return Err(TransformError::XPath(
                     "XPath transform must contain exactly one XMLDSig <XPath> child element".into(),
                 ));
             }
             xpath_node = Some(child);
         } else {
-            return Err(TransformError::UnsupportedTransform(
+            return Err(TransformError::XPath(
                 "XPath transform allows only a single XMLDSig <XPath> child element".into(),
             ));
         }
     }
 
     let xpath_node = xpath_node.ok_or_else(|| {
-        TransformError::UnsupportedTransform(
+        TransformError::XPath(
             "XPath transform requires a single XMLDSig <XPath> child element".into(),
         )
     })?;
-
-    let expr = xpath_node
-        .text()
-        .map(|text| text.trim().to_string())
-        .unwrap_or_default();
-
-    if expr == ENVELOPED_SIGNATURE_XPATH_EXPR {
-        let dsig_ns = xpath_node.lookup_namespace_uri(Some("dsig"));
-        if dsig_ns == Some(XMLDSIG_NS) {
-            Ok(Transform::XpathExcludeAllSignatures)
-        } else {
-            Err(TransformError::UnsupportedTransform(
-                "XPath compatibility form requires the `dsig` prefix to be bound to the XMLDSig namespace"
-                    .into(),
-            ))
-        }
-    } else {
-        Err(TransformError::UnsupportedTransform(
-            "unsupported XPath expression in compatibility transform; only `not(ancestor-or-self::dsig:Signature)` is supported"
-                .into(),
-        ))
+    if xpath_node.attributes().len() != 0 {
+        return Err(TransformError::XPath(
+            "XMLDSig <XPath> does not allow attributes".into(),
+        ));
     }
+    let xpath = parse_xpath_expression(xpath_node, transform_node.id())?;
+
+    if xpath.expression() == ENVELOPED_SIGNATURE_XPATH_EXPR
+        && xpath.namespaces().get("dsig").map(String::as_str) == Some(XMLDSIG_NS)
+    {
+        Ok(Transform::XpathExcludeAllSignatures)
+    } else {
+        Ok(Transform::XPath(xpath))
+    }
+}
+
+fn parse_xpath_filter2_transform(transform_node: Node) -> Result<Transform, TransformError> {
+    let mut filters = Vec::new();
+    for child in transform_node.children() {
+        if child.is_text() && child.text().is_some_and(is_xml_whitespace_only) {
+            continue;
+        }
+        if child.is_comment() || child.is_pi() {
+            continue;
+        }
+        if !child.is_element()
+            || child.tag_name().name() != "XPath"
+            || child.tag_name().namespace() != Some(XPATH_FILTER2_TRANSFORM_URI)
+        {
+            return Err(TransformError::XPath(
+                "XPath Filter 2.0 allows only filter-namespace <XPath> children".into(),
+            ));
+        }
+        if filters.len() == MAX_XPATH_FILTERS {
+            return Err(TransformError::XPath(format!(
+                "XPath Filter 2.0 exceeds the maximum of {MAX_XPATH_FILTERS} expressions"
+            )));
+        }
+        if child.attributes().len() != 1 || child.attribute("Filter").is_none() {
+            return Err(TransformError::XPath(
+                "XPath Filter 2.0 <XPath> requires only the unqualified Filter attribute".into(),
+            ));
+        }
+        let operation = match child.attribute("Filter") {
+            Some("intersect") => XPathFilterOperation::Intersect,
+            Some("subtract") => XPathFilterOperation::Subtract,
+            Some("union") => XPathFilterOperation::Union,
+            Some(value) => {
+                return Err(TransformError::XPath(format!(
+                    "unsupported XPath Filter 2.0 operation: {value}"
+                )));
+            }
+            None => unreachable!("Filter presence was checked above"),
+        };
+        filters.push(XPathFilter::new(
+            operation,
+            parse_xpath_expression(child, transform_node.id())?,
+        ));
+    }
+    if filters.is_empty() {
+        return Err(TransformError::XPath(
+            "XPath Filter 2.0 requires at least one expression".into(),
+        ));
+    }
+    Ok(Transform::XPathFilter2(filters))
+}
+
+fn parse_xpath_expression(
+    xpath_node: Node,
+    transform_node: roxmltree::NodeId,
+) -> Result<XPathExpression, TransformError> {
+    let mut source = String::new();
+    for child in xpath_node.children() {
+        if child.is_text() {
+            let text = child.text().unwrap_or_default();
+            if source
+                .len()
+                .checked_add(text.len())
+                .is_none_or(|length| length > MAX_XPATH_EXPRESSION_BYTES)
+            {
+                return Err(TransformError::XPath(format!(
+                    "XPath expression exceeds {MAX_XPATH_EXPRESSION_BYTES} bytes"
+                )));
+            }
+            source.push_str(text);
+        } else if child.is_element() {
+            return Err(TransformError::XPath(
+                "XPath expressions must contain text only".into(),
+            ));
+        }
+    }
+    let source = source.trim();
+    if source.is_empty() {
+        return Err(TransformError::XPath(
+            "XPath expression must not be empty".into(),
+        ));
+    }
+    sxd_xpath_no_unsafe::Factory::new()
+        .build(&normalize_function_spacing(source))
+        .map_err(|error| TransformError::XPath(error.to_string()))?;
+
+    let mut xpath = XPathExpression {
+        expression: source.to_owned(),
+        namespaces: BTreeMap::new(),
+        here_nodes: Some(XPathHereNodes {
+            xpath: xpath_node.id(),
+            transform: transform_node,
+        }),
+    };
+    for namespace in xpath_node.namespaces() {
+        if let Some(prefix) = namespace.name() {
+            xpath
+                .namespaces
+                .insert(prefix.to_owned(), namespace.uri().to_owned());
+        }
+    }
+    Ok(xpath)
 }
 
 /// Parse the `PrefixList` attribute from an `<ec:InclusiveNamespaces>` child
@@ -434,6 +862,107 @@ mod tests {
         ));
     }
 
+    // ── Base64 transform ────────────────────────────────────────────
+
+    #[test]
+    fn base64_transform_decodes_binary_with_xml_whitespace() {
+        // XML line wrapping is insignificant to the standard transform.
+        let doc = Document::parse("<root/>").unwrap();
+        let input = TransformData::Binary(b" SGV\tsbG8=\r\n".to_vec());
+
+        let result = apply_transform(doc.root_element(), &Transform::Base64Decode, input).unwrap();
+
+        assert_eq!(result.into_binary().unwrap(), b"Hello");
+    }
+
+    #[test]
+    fn base64_transform_concatenates_only_selected_text_nodes_in_document_order() {
+        // Tags, comments, and processing instructions must not enter the
+        // encoded octet stream; descendant text remains in document order.
+        let xml = r#"<root><Data ID="payload">SGV<!-- split --><Part>sb</Part><?pi ignored?>G8=</Data></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let data = doc
+            .descendants()
+            .find(|node| node.attribute("ID") == Some("payload"))
+            .unwrap();
+        let input = TransformData::NodeSet(NodeSet::subtree(data));
+
+        let result = apply_transform(data, &Transform::Base64Decode, input).unwrap();
+
+        assert_eq!(result.into_binary().unwrap(), b"Hello");
+    }
+
+    #[test]
+    fn base64_transform_omits_text_excluded_from_the_node_set() {
+        // A prior node-set transform can remove a subtree. Its text must not
+        // be resurrected while converting the remaining node set to octets.
+        let xml = "<root>SGV<Excluded>QUJD</Excluded>sbG8=</root>";
+        let doc = Document::parse(xml).unwrap();
+        let excluded = doc
+            .descendants()
+            .find(|node| node.has_tag_name("Excluded"))
+            .unwrap();
+        let mut nodes = NodeSet::subtree(doc.root_element());
+        nodes.exclude_subtree(excluded);
+
+        let result = apply_transform(
+            doc.root_element(),
+            &Transform::Base64Decode,
+            TransformData::NodeSet(nodes),
+        )
+        .unwrap();
+
+        assert_eq!(result.into_binary().unwrap(), b"Hello");
+    }
+
+    #[test]
+    fn base64_transform_rejects_invalid_alphabet_and_padding() {
+        let doc = Document::parse("<root/>").unwrap();
+
+        for encoded in [b"SGVs!bG8=".as_slice(), b"SGVsbG8===".as_slice()] {
+            let result = apply_transform(
+                doc.root_element(),
+                &Transform::Base64Decode,
+                TransformData::Binary(encoded.to_vec()),
+            );
+            assert!(matches!(result, Err(TransformError::Base64(_))));
+        }
+    }
+
+    #[test]
+    fn base64_transform_accepts_empty_input() {
+        let doc = Document::parse("<root/>").unwrap();
+        let result = apply_transform(
+            doc.root_element(),
+            &Transform::Base64Decode,
+            TransformData::Binary(Vec::new()),
+        )
+        .unwrap();
+
+        assert!(result.into_binary().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pipeline_rejects_unbounded_programmatic_transform_chain() {
+        // The public executor is a trust boundary too: callers can bypass XML
+        // parsing and must not be able to create an arbitrarily deep recursion.
+        let doc = Document::parse("<root/>").unwrap();
+        let transforms = vec![Transform::Base64Decode; 65];
+
+        let result = execute_transforms(
+            doc.root_element(),
+            TransformData::Binary(Vec::new()),
+            &transforms,
+        );
+
+        assert!(matches!(
+            result,
+            Err(TransformError::TooManyTransforms {
+                max: MAX_TRANSFORMS_PER_REFERENCE
+            })
+        ));
+    }
+
     // ── Pipeline execution ───────────────────────────────────────────
 
     #[test]
@@ -561,6 +1090,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_transforms_rejects_unbounded_chain() {
+        // Signed XML is untrusted input; reject excess transforms before
+        // constructing a chain that would consume one stack frame per entry.
+        let entries = format!(r#"<Transform Algorithm="{BASE64_TRANSFORM_URI}"/>"#).repeat(65);
+        let xml = format!(r#"<Transforms xmlns="{XMLDSIG_NS}">{entries}</Transforms>"#);
+        let doc = Document::parse(&xml).unwrap();
+
+        assert!(matches!(
+            parse_transforms(doc.root_element()),
+            Err(TransformError::TooManyTransforms {
+                max: MAX_TRANSFORMS_PER_REFERENCE
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_transforms_accepts_parameterless_base64() {
+        let xml = format!(
+            r#"<Transforms xmlns="{XMLDSIG_NS}"><Transform Algorithm="{BASE64_TRANSFORM_URI}">
+            </Transform></Transforms>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let chain = parse_transforms(doc.root_element()).unwrap();
+
+        assert_eq!(chain.len(), 1);
+        assert!(matches!(chain[0], Transform::Base64Decode));
+    }
+
+    #[test]
+    fn parse_transforms_rejects_base64_parameters() {
+        for parameter in ["<Parameter/>", "unexpected", "\u{00A0}"] {
+            let xml = format!(
+                r#"<Transforms xmlns="{XMLDSIG_NS}"><Transform Algorithm="{BASE64_TRANSFORM_URI}">{parameter}</Transform></Transforms>"#
+            );
+            let doc = Document::parse(&xml).unwrap();
+
+            let result = parse_transforms(doc.root_element());
+
+            assert!(matches!(
+                result,
+                Err(TransformError::UnsupportedTransform(_))
+            ));
+        }
+    }
+
+    #[test]
     fn parse_transforms_with_inclusive_prefixes() {
         let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#"
                                 xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#">
@@ -685,7 +1261,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_transforms_rejects_other_xpath_expressions() {
+    fn parse_transforms_accepts_general_xpath_expressions() {
+        // XPath 1.0 is no longer restricted to the historical enveloped-
+        // signature compatibility expression.
         let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">
             <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
                 <XPath>self::node()</XPath>
@@ -693,12 +1271,56 @@ mod tests {
         </Transforms>"#;
         let doc = Document::parse(xml).unwrap();
 
-        let result = parse_transforms(doc.root_element());
-        assert!(result.is_err());
+        let result = parse_transforms(doc.root_element()).unwrap();
+        assert!(matches!(result.as_slice(), [Transform::XPath(_)]));
+    }
+
+    #[test]
+    fn parse_xpath_transform_ignores_comments_and_processing_instructions() {
+        // Comments and PIs are not transform parameters and may surround the
+        // required XPath element in an otherwise valid signature.
+        let xml = format!(
+            r#"<Transforms xmlns="{XMLDSIG_NS}"><Transform Algorithm="{XPATH_TRANSFORM_URI}"><!-- before --><?probe value?><XPath>true()</XPath><!-- after --><?done?></Transform></Transforms>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let transforms = parse_transforms(doc.root_element()).unwrap();
+
+        assert!(matches!(transforms.as_slice(), [Transform::XPath(_)]));
+    }
+
+    #[test]
+    fn parse_filter2_transform_ignores_comments_and_processing_instructions() {
+        // Filter 2.0 has the same XML comment/PI treatment while retaining its
+        // stricter element and attribute grammar.
+        let xml = format!(
+            r#"<Transforms xmlns="{XMLDSIG_NS}"><Transform Algorithm="{XPATH_FILTER2_TRANSFORM_URI}"><!-- before --><?probe value?><XPath xmlns="{XPATH_FILTER2_TRANSFORM_URI}" Filter="intersect">/root</XPath><!-- after --><?done?></Transform></Transforms>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let transforms = parse_transforms(doc.root_element()).unwrap();
+
         assert!(matches!(
-            result.unwrap_err(),
-            TransformError::UnsupportedTransform(_)
+            transforms.as_slice(),
+            [Transform::XPathFilter2(filters)] if filters.len() == 1
         ));
+    }
+
+    #[test]
+    fn parse_transforms_bounds_raw_xpath_parameter_text() {
+        // Trimming must not let an untrusted parameter force allocation of an
+        // otherwise bounded expression-sized buffer.
+        let padding = " ".repeat(MAX_XPATH_EXPRESSION_BYTES);
+        let xml = format!(
+            r#"<Transforms xmlns="{XMLDSIG_NS}"><Transform Algorithm="{XPATH_TRANSFORM_URI}"><XPath>{padding}true()</XPath></Transform></Transforms>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let error = parse_transforms(doc.root_element())
+            .expect_err("raw XPath parameter text must obey the expression bound");
+
+        assert!(matches!(error, TransformError::XPath(_)));
+        assert!(error.to_string().contains("exceeds"));
     }
 
     #[test]
@@ -714,14 +1336,14 @@ mod tests {
 
         let result = parse_transforms(doc.root_element());
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            TransformError::UnsupportedTransform(_)
-        ));
+        assert!(matches!(result.unwrap_err(), TransformError::XPath(_)));
     }
 
     #[test]
-    fn parse_transforms_rejects_xpath_with_wrong_dsig_prefix_binding() {
+    fn parse_transforms_preserves_nonstandard_prefix_bindings() {
+        // A prefix URI is expression data. Binding `dsig` to another namespace
+        // is valid XPath and must select that namespace rather than being
+        // rewritten to XMLDSig by the parser.
         let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">
             <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
                 <XPath xmlns:dsig="http://example.com/not-xmldsig">
@@ -731,12 +1353,14 @@ mod tests {
         </Transforms>"#;
         let doc = Document::parse(xml).unwrap();
 
-        let result = parse_transforms(doc.root_element());
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            TransformError::UnsupportedTransform(_)
-        ));
+        let result = parse_transforms(doc.root_element()).unwrap();
+        let [Transform::XPath(xpath)] = result.as_slice() else {
+            panic!("expected general XPath transform");
+        };
+        assert_eq!(
+            xpath.namespaces().get("dsig").map(String::as_str),
+            Some("http://example.com/not-xmldsig")
+        );
     }
 
     #[test]
@@ -751,10 +1375,7 @@ mod tests {
         let doc = Document::parse(xml).unwrap();
 
         let result = parse_transforms(doc.root_element());
-        assert!(matches!(
-            result.unwrap_err(),
-            TransformError::UnsupportedTransform(_)
-        ));
+        assert!(matches!(result.unwrap_err(), TransformError::XPath(_)));
     }
 
     #[test]
@@ -773,10 +1394,7 @@ mod tests {
 
         let result = parse_transforms(doc.root_element());
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            TransformError::UnsupportedTransform(_)
-        ));
+        assert!(matches!(result.unwrap_err(), TransformError::XPath(_)));
     }
 
     #[test]
@@ -793,10 +1411,43 @@ mod tests {
 
         let result = parse_transforms(doc.root_element());
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            TransformError::UnsupportedTransform(_)
-        ));
+        assert!(matches!(result.unwrap_err(), TransformError::XPath(_)));
+    }
+
+    #[test]
+    fn parse_transforms_rejects_malformed_xpath_filter2_parameters() {
+        // Filter 2.0 has a deliberately narrow parameter grammar. Rejecting
+        // malformed variants prevents an unsupported parameter from being
+        // silently ignored while computing security-sensitive digest input.
+        for parameter in [
+            r#"<XPath xmlns="http://www.w3.org/2002/06/xmldsig-filter2">//Data</XPath>"#,
+            r#"<XPath xmlns="http://www.w3.org/2002/06/xmldsig-filter2" Filter="exclude">//Data</XPath>"#,
+            r#"<XPath xmlns="urn:wrong" Filter="intersect">//Data</XPath>"#,
+            r#"<XPath xmlns="http://www.w3.org/2002/06/xmldsig-filter2" Filter="intersect" Extra="value">//Data</XPath>"#,
+        ] {
+            let xml = format!(
+                r#"<Transforms xmlns="{XMLDSIG_NS}"><Transform Algorithm="{XPATH_FILTER2_TRANSFORM_URI}">{parameter}</Transform></Transforms>"#
+            );
+            let doc = Document::parse(&xml).unwrap();
+
+            let result = parse_transforms(doc.root_element());
+
+            assert!(matches!(result, Err(TransformError::XPath(_))));
+        }
+    }
+
+    #[test]
+    fn parse_transforms_rejects_empty_xpath_filter2_sequence() {
+        // A no-op empty filter list is not a valid Filter 2.0 transform and
+        // must not be accepted as though the transform were absent.
+        let xml = format!(
+            r#"<Transforms xmlns="{XMLDSIG_NS}"><Transform Algorithm="{XPATH_FILTER2_TRANSFORM_URI}"/></Transforms>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let result = parse_transforms(doc.root_element());
+
+        assert!(matches!(result, Err(TransformError::XPath(_))));
     }
 
     #[test]

@@ -8,10 +8,12 @@ use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use crate::c14n::{C14nAlgorithm, C14nMode};
 
 use super::{
-    DigestAlgorithm, ENVELOPED_SIGNATURE_URI, SignatureAlgorithm, Transform, XPATH_TRANSFORM_URI,
+    BASE64_TRANSFORM_URI, DigestAlgorithm, ENVELOPED_SIGNATURE_URI, SignatureAlgorithm, Transform,
+    XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI, XPathExpression,
 };
 
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const EXCLUSIVE_C14N_NS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 const XPATH_EXCLUDE_ALL_SIGNATURES: &str = "not(ancestor-or-self::dsig:Signature)";
 
@@ -21,6 +23,9 @@ pub enum SignatureBuilderError {
     /// A namespace prefix was not a supported XML NCName.
     #[error("invalid XML namespace prefix: {0}")]
     InvalidNamespacePrefix(String),
+    /// An XPath binding would rebind the prefix used by XMLDSig elements.
+    #[error("XPath namespace binding conflicts with XMLDSig prefix: {0}")]
+    NamespacePrefixConflict(String),
     /// An XMLDSig Id attribute was not a valid XML NCName.
     #[error("invalid {element} Id: {value}")]
     InvalidId {
@@ -208,6 +213,35 @@ impl SignatureBuilder {
         if self.references.is_empty() {
             return Err(SignatureBuilderError::MissingReference);
         }
+        for (prefix, uri) in self.references.iter().flat_map(|reference| {
+            reference
+                .transforms
+                .iter()
+                .flat_map(|transform| match transform {
+                    Transform::XPath(xpath) => xpath.namespaces().iter().collect::<Vec<_>>(),
+                    Transform::XPathFilter2(filters) => filters
+                        .iter()
+                        .flat_map(|filter| filter.xpath().namespaces().iter())
+                        .collect(),
+                    _ => Vec::new(),
+                })
+        }) {
+            // Namespaces in XML reserves both sides of this binding: `xml`
+            // can name only XML_NS, and XML_NS can use only `xml`.
+            if prefix == "xmlns"
+                || (prefix == "xml") != (uri == XML_NS)
+                || (prefix != "xml" && !is_namespace_prefix(prefix))
+            {
+                return Err(SignatureBuilderError::InvalidNamespacePrefix(
+                    prefix.clone(),
+                ));
+            }
+            if self.ns_prefix.as_ref() == Some(prefix) && uri != XMLDSIG_NS {
+                return Err(SignatureBuilderError::NamespacePrefixConflict(
+                    prefix.clone(),
+                ));
+            }
+        }
         if !self.sign_method.signing_allowed() {
             return Err(SignatureBuilderError::SigningAlgorithmDisabled(
                 self.sign_method.uri(),
@@ -291,6 +325,35 @@ fn write_transform<W: Write>(
             writer.write_event(Event::End(BytesEnd::new(name)))?;
             Ok(())
         }
+        Transform::XPath(xpath) => {
+            let transform_name = qualified_name(prefix, "Transform");
+            let mut transform_element = BytesStart::new(&transform_name);
+            transform_element.push_attribute(("Algorithm", XPATH_TRANSFORM_URI));
+            writer.write_event(Event::Start(transform_element))?;
+            write_xpath_expression(writer, prefix, "XPath", None, xpath)?;
+            writer.write_event(Event::End(BytesEnd::new(transform_name)))?;
+            Ok(())
+        }
+        Transform::XPathFilter2(filters) => {
+            let transform_name = qualified_name(prefix, "Transform");
+            let mut transform_element = BytesStart::new(&transform_name);
+            transform_element.push_attribute(("Algorithm", XPATH_FILTER2_TRANSFORM_URI));
+            writer.write_event(Event::Start(transform_element))?;
+            for filter in filters {
+                write_xpath_expression(
+                    writer,
+                    None,
+                    "XPath",
+                    Some(filter.operation().as_str()),
+                    filter.xpath(),
+                )?;
+            }
+            writer.write_event(Event::End(BytesEnd::new(transform_name)))?;
+            Ok(())
+        }
+        Transform::Base64Decode => {
+            write_algorithm(writer, prefix, "Transform", BASE64_TRANSFORM_URI)
+        }
         Transform::C14n(algorithm) if algorithm.inclusive_prefixes().is_empty() => {
             write_algorithm(writer, prefix, "Transform", algorithm.uri())
         }
@@ -321,6 +384,36 @@ fn write_transform<W: Write>(
             Ok(())
         }
     }
+}
+
+fn write_xpath_expression<W: Write>(
+    writer: &mut Writer<W>,
+    prefix: Option<&str>,
+    local_name: &str,
+    filter: Option<&str>,
+    xpath: &XPathExpression,
+) -> Result<(), std::io::Error> {
+    let name = qualified_name(prefix, local_name);
+    let mut element = BytesStart::new(&name);
+    let namespace_attributes = xpath
+        .namespaces()
+        .iter()
+        .filter(|(namespace_prefix, _)| namespace_prefix.as_str() != "xml")
+        .map(|(namespace_prefix, uri)| (format!("xmlns:{namespace_prefix}"), uri))
+        .collect::<Vec<_>>();
+    if prefix.is_none() && filter.is_some() {
+        element.push_attribute(("xmlns", XPATH_FILTER2_TRANSFORM_URI));
+    }
+    if let Some(filter) = filter {
+        element.push_attribute(("Filter", filter));
+    }
+    for (attribute, uri) in &namespace_attributes {
+        element.push_attribute((attribute.as_str(), uri.as_str()));
+    }
+    writer.write_event(Event::Start(element))?;
+    writer.write_event(Event::Text(BytesText::new(xpath.expression())))?;
+    writer.write_event(Event::End(BytesEnd::new(name)))?;
+    Ok(())
 }
 
 fn write_algorithm<W: Write>(

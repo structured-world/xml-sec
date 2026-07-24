@@ -9,6 +9,8 @@ use std::collections::HashSet;
 
 use roxmltree::{Document, Node, NodeId};
 
+use crate::c14n::NodeVisibility;
+
 // roxmltree 0.21 uses `Node<'a, 'input: 'a>`. We tie both lifetimes together
 // with a single `'a` by requiring `'input = 'a` at every use site (`Node<'a, 'a>`).
 // This is safe because our NodeSet borrows the Document which owns the input.
@@ -59,22 +61,34 @@ impl<'a> TransformData<'a> {
 
 /// A set of nodes from a roxmltree document.
 ///
-/// Represents "which nodes are included" for canonicalization and transforms.
-/// Two modes:
-/// - **Whole document**: `included` is `None`, meaning all nodes are in the set
-///   (minus any in `excluded`).
-/// - **Subset**: `included` is `Some(ids)`, meaning only those node IDs are in
-///   the set (minus any in `excluded`).
+/// Represents the exact XPath nodes included for canonicalization and transforms.
+///
+/// Attributes and namespace bindings are first-class XPath nodes even though
+/// roxmltree exposes them through their owner element. Materializing them here
+/// lets XPath filters independently include or remove those nodes as required
+/// by canonical XML document-subset processing.
 pub struct NodeSet<'a> {
     /// Reference to the parsed document.
     doc: &'a Document<'a>,
-    /// If `None`, all nodes are included. If `Some`, only these nodes.
-    included: Option<HashSet<NodeId>>,
-    /// Nodes explicitly excluded (e.g., `<Signature>` subtree for enveloped transform).
-    excluded: HashSet<NodeId>,
+    nodes: HashSet<XmlNodeKey>,
     /// Whether comment nodes are included. For empty URI dereference (whole
     /// document), comments are excluded per XMLDSig spec.
     with_comments: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum XmlNodeKey {
+    Tree(NodeId),
+    Attribute {
+        owner: NodeId,
+        namespace: Option<String>,
+        local_name: String,
+    },
+    Namespace {
+        owner: NodeId,
+        prefix: String,
+        uri: String,
+    },
 }
 
 impl<'a> NodeSet<'a> {
@@ -83,43 +97,28 @@ impl<'a> NodeSet<'a> {
     /// Per XMLDSig §4.3.3.2: "An empty URI [...] is a reference to the document
     /// [...] and the comment nodes are not included."
     pub fn entire_document_without_comments(doc: &'a Document<'a>) -> Self {
-        Self {
-            doc,
-            included: None,
-            excluded: HashSet::new(),
-            with_comments: false,
-        }
+        Self::collect_document(doc, false)
     }
 
     /// Create a node set representing the entire document with comments.
     ///
     /// Used for `#xpointer(/)` which, unlike empty URI, includes comment nodes.
     pub fn entire_document_with_comments(doc: &'a Document<'a>) -> Self {
-        Self {
-            doc,
-            included: None,
-            excluded: HashSet::new(),
-            with_comments: true,
-        }
+        Self::collect_document(doc, true)
     }
 
     /// Create a node set rooted at `element`, containing that element and all
     /// of its descendant nodes (elements, text, and, for this constructor,
     /// comment nodes).
     ///
-    /// Note: in `roxmltree`, attributes and namespaces are not separate nodes
-    /// and therefore are not tracked individually in this `NodeSet`. During
-    /// canonicalization, any attributes and namespace declarations belonging to
-    /// the included elements are serialized as part of those elements.
     pub fn subtree(element: Node<'a, 'a>) -> Self {
-        let mut ids = HashSet::new();
-        collect_subtree_ids(element, &mut ids);
-        Self {
+        let mut set = Self {
             doc: element.document(),
-            included: Some(ids),
-            excluded: HashSet::new(),
+            nodes: HashSet::new(),
             with_comments: true,
-        }
+        };
+        set.insert_subtree(element);
+        set
     }
 
     /// Reference to the underlying document.
@@ -139,23 +138,7 @@ impl<'a> NodeSet<'a> {
             return false;
         }
 
-        let id = node.id();
-
-        // Check exclusion first
-        if self.excluded.contains(&id) {
-            return false;
-        }
-
-        // Filter comments if not included
-        if !self.with_comments && node.is_comment() {
-            return false;
-        }
-
-        // Check inclusion
-        match &self.included {
-            None => true,
-            Some(ids) => ids.contains(&id),
-        }
+        self.nodes.contains(&XmlNodeKey::Tree(node.id()))
     }
 
     /// Exclude a node and all its descendants from this set.
@@ -166,40 +149,154 @@ impl<'a> NodeSet<'a> {
         if !std::ptr::eq(node.document() as *const _, self.doc as *const _) {
             return;
         }
-        collect_subtree_ids(node, &mut self.excluded);
+        let mut removed = Self {
+            doc: self.doc,
+            nodes: HashSet::new(),
+            with_comments: true,
+        };
+        removed.insert_subtree(node);
+        self.nodes.retain(|key| !removed.nodes.contains(key));
     }
 
     /// Whether comments are included in this node set.
     pub fn with_comments(&self) -> bool {
         self.with_comments
     }
-}
 
-/// Collect a node and all its descendants into a set of `NodeId`s.
-///
-/// Uses an explicit stack instead of recursion to avoid stack overflow
-/// on deeply nested XML (attacker-controlled input in SAML contexts).
-fn collect_subtree_ids(node: Node<'_, '_>, ids: &mut HashSet<NodeId>) {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        ids.insert(current.id());
-        for child in current.children() {
-            stack.push(child);
+    pub(crate) fn empty(doc: &'a Document<'a>) -> Self {
+        Self {
+            doc,
+            nodes: HashSet::new(),
+            with_comments: false,
         }
     }
-    // In roxmltree, attributes and namespaces are not nodes and do not
-    // appear in `children()` traversal; they're accessed via
-    // node.attributes(). We therefore track the NodeIds of all descendant
-    // nodes reachable via `children()` (elements, text, comments,
-    // processing instructions, etc.). During C14N, the serializer checks
-    // whether an element is in the node set and then serializes all of
-    // that element's attributes/namespaces as part of the element, so
-    // separate attribute/namespace identifiers are unnecessary.
+
+    pub(crate) fn entire_document(doc: &'a Document<'a>) -> Self {
+        Self::collect_document(doc, true)
+    }
+
+    pub(crate) fn insert_node(&mut self, node: Node<'_, '_>) {
+        if self.owns(node) {
+            self.with_comments |= node.is_comment();
+            self.nodes.insert(XmlNodeKey::Tree(node.id()));
+        }
+    }
+
+    pub(crate) fn insert_attribute(
+        &mut self,
+        owner: Node<'_, '_>,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) {
+        if self.owns(owner) {
+            self.nodes.insert(XmlNodeKey::Attribute {
+                owner: owner.id(),
+                namespace: namespace.map(str::to_owned),
+                local_name: local_name.to_owned(),
+            });
+        }
+    }
+
+    pub(crate) fn insert_namespace(&mut self, owner: Node<'_, '_>, prefix: &str, uri: &str) {
+        if self.owns(owner) {
+            self.nodes.insert(XmlNodeKey::Namespace {
+                owner: owner.id(),
+                prefix: prefix.to_owned(),
+                uri: uri.to_owned(),
+            });
+        }
+    }
+
+    pub(crate) fn insert_subtree(&mut self, root: Node<'_, '_>) {
+        if !self.owns(root) {
+            return;
+        }
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            self.insert_node(node);
+            if node.is_element() {
+                for attribute in node.attributes() {
+                    self.insert_attribute(node, attribute.namespace(), attribute.name());
+                }
+                for namespace in node.namespaces() {
+                    self.insert_namespace(node, namespace.name().unwrap_or(""), namespace.uri());
+                }
+            }
+            stack.extend(node.children());
+        }
+    }
+
+    pub(crate) fn intersect_with(&mut self, other: &Self) {
+        if !std::ptr::eq(self.doc as *const _, other.doc as *const _) {
+            self.nodes.clear();
+            self.with_comments = false;
+            return;
+        }
+        self.nodes.retain(|key| other.nodes.contains(key));
+        self.with_comments &= other.with_comments;
+    }
+
+    pub(crate) fn subtract(&mut self, other: &Self) {
+        if std::ptr::eq(self.doc as *const _, other.doc as *const _) {
+            self.nodes.retain(|key| !other.nodes.contains(key));
+        }
+    }
+
+    pub(crate) fn union_with(&mut self, other: &Self) {
+        if std::ptr::eq(self.doc as *const _, other.doc as *const _) {
+            self.nodes.extend(other.nodes.iter().cloned());
+            self.with_comments |= other.with_comments;
+        }
+    }
+
+    fn collect_document(doc: &'a Document<'a>, with_comments: bool) -> Self {
+        let mut set = Self::empty(doc);
+        set.insert_subtree(doc.root());
+        if !with_comments {
+            set.nodes.retain(|key| match key {
+                XmlNodeKey::Tree(id) => !doc.get_node(*id).is_some_and(|node| node.is_comment()),
+                _ => true,
+            });
+        }
+        set.with_comments = with_comments;
+        set
+    }
+
+    fn owns(&self, node: Node<'_, '_>) -> bool {
+        std::ptr::eq(node.document() as *const _, self.doc as *const _)
+    }
+}
+
+impl NodeVisibility for NodeSet<'_> {
+    fn contains_node(&self, node: Node<'_, '_>) -> bool {
+        self.contains(node)
+    }
+
+    fn contains_attribute(
+        &self,
+        owner: Node<'_, '_>,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> bool {
+        self.owns(owner)
+            && self.nodes.contains(&XmlNodeKey::Attribute {
+                owner: owner.id(),
+                namespace: namespace.map(str::to_owned),
+                local_name: local_name.to_owned(),
+            })
+    }
+
+    fn contains_namespace(&self, owner: Node<'_, '_>, prefix: &str, uri: &str) -> bool {
+        self.owns(owner)
+            && self.nodes.contains(&XmlNodeKey::Namespace {
+                owner: owner.id(),
+                prefix: prefix.to_owned(),
+                uri: uri.to_owned(),
+            })
+    }
 }
 
 /// Errors during transform processing.
-///
-/// New variants may be added as more transforms are implemented (Base64, XPath).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransformError {
@@ -224,12 +321,53 @@ pub enum TransformError {
     #[error("unsupported transform: {0}")]
     UnsupportedTransform(String),
 
+    /// A reference declared more transforms than the implementation permits.
+    #[error("transform chain exceeds maximum length of {max}")]
+    TooManyTransforms {
+        /// Maximum accepted transforms in one reference.
+        max: usize,
+    },
+
     /// Canonicalization error during transform.
     #[error("C14N error: {0}")]
     C14n(#[from] crate::c14n::C14nError),
+
+    /// Base64 decoding failed during the standard XMLDSig Base64 transform.
+    #[error("base64 transform decode error: {0}")]
+    Base64(String),
+
+    /// XPath parsing or evaluation failed.
+    #[error("XPath transform error: {0}")]
+    XPath(String),
+
+    /// XML octets could not be parsed while adapting binary transform output
+    /// to the node-set required by a subsequent transform.
+    #[error("XML transform input parse error: {0}")]
+    XmlParse(String),
 
     /// The Signature node passed to the enveloped transform belongs to a
     /// different `Document` than the input `NodeSet`.
     #[error("enveloped-signature transform: invalid Signature node for this document")]
     CrossDocumentSignatureNode,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn document_without_comments_preserves_comment_policy() {
+        // Empty-URI dereferencing strips comment nodes and must not retain a
+        // stale flag merely because comments were seen while materializing.
+        let document = Document::parse("<root><!-- excluded --><child/></root>")
+            .expect("fixed comment fixture must parse");
+        let nodes = NodeSet::entire_document_without_comments(&document);
+        let comment = document
+            .descendants()
+            .find(|node| node.is_comment())
+            .expect("fixed fixture contains one comment");
+
+        assert!(!nodes.contains(comment));
+        assert!(!nodes.with_comments());
+    }
 }

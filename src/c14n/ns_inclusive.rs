@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use roxmltree::Node;
 
+use super::NodeVisibility;
 use super::ns_common::collect_ns_declarations;
 use super::serialize::NsRenderer;
 
@@ -24,9 +25,14 @@ impl NsRenderer for InclusiveNsRenderer {
         &self,
         node: Node<'a, '_>,
         parent_rendered: &HashMap<String, String>,
+        visibility: Option<&dyn NodeVisibility>,
     ) -> (Vec<(String, String)>, HashMap<String, String>) {
         // Inclusive mode: all in-scope namespace bindings are candidates.
-        collect_ns_declarations(node, parent_rendered, |_, _| true)
+        collect_ns_declarations(node, parent_rendered, visibility, |_| true, |_, _| true)
+    }
+
+    fn renders_orphan_namespace(&self, _prefix: &str) -> bool {
+        true
     }
 }
 

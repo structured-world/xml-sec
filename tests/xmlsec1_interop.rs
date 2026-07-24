@@ -10,7 +10,8 @@ use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, DsigStatus, EcdsaP256SigningKey, EcdsaP384SigningKey,
     FailureReason, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
-    SignatureBuilder, SigningKey, Transform, VerifyContext,
+    SignatureBuilder, SigningKey, Transform, VerifyContext, XPathExpression, XPathFilter,
+    XPathFilterOperation,
 };
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -52,6 +53,47 @@ fn signing_builder(algorithm: SignatureAlgorithm, digest: DigestAlgorithm) -> Si
             .uri("#payload")
             .transform(Transform::Enveloped)
             .transform(Transform::C14n(exclusive_c14n())),
+    )
+}
+
+fn base64_signing_builder() -> SignatureBuilder {
+    SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::Base64Decode),
+        )
+        .key_info(true)
+}
+
+fn xpath_filter2_signing_builder() -> SignatureBuilder {
+    SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("")
+                .transform(Transform::XPathFilter2(vec![
+                    XPathFilter::new(
+                        XPathFilterOperation::Intersect,
+                        XPathExpression::new("/root/Payload"),
+                    ),
+                    XPathFilter::new(
+                        XPathFilterOperation::Subtract,
+                        XPathExpression::new("/root/Payload/Excluded"),
+                    ),
+                ])),
+        )
+        .key_info(true)
+}
+
+fn xpath_filter2_payload_xml() -> &'static str {
+    "<root><Payload><Included>external verifier contract</Included><Excluded>mutable</Excluded></Payload><Outside>not signed</Outside></root>"
+}
+
+fn encoded_payload_xml(id_attribute: &str) -> String {
+    format!(
+        "<root><Encoded {id_attribute}=\"payload\">ZXh0<!-- split --><Chunk>ZXJuYWwg</Chunk>dmVyaWZpZXIgY29udHJhY3Q=</Encoded></root>"
     )
 }
 
@@ -197,6 +239,126 @@ fn xmlsec1_verifies_rsa_sha256_signature_from_xml_sec() {
     );
 
     assert_xmlsec1_accepts(&signed, "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+}
+
+#[test]
+fn xmlsec1_verifies_base64_reference_signature_from_xml_sec() {
+    // The donor implementation must derive the same decoded octets from a
+    // node set containing nested elements and comments.
+    if !xmlsec1_is_available() {
+        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        return;
+    }
+
+    let key = RsaSigningKey::from_pkcs8_pem(
+        &fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-key.pem")
+            .expect("RSA private-key fixture must load"),
+    )
+    .expect("RSA private-key fixture must parse");
+    let signed = SignContext::new(&key)
+        .sign_with_builder(&encoded_payload_xml("ID"), &base64_signing_builder())
+        .expect("xml-sec must sign the Base64-transformed reference");
+
+    assert_xmlsec1_accepts(&signed, "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+}
+
+#[test]
+fn xml_sec_verifies_base64_reference_signature_from_xmlsec1() {
+    // Reciprocal generation proves our parser and text-node conversion accept
+    // the transform representation emitted and digested by xmlsec1.
+    if !xmlsec1_is_available() {
+        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        return;
+    }
+
+    let template = base64_signing_builder()
+        .build_template()
+        .expect("Base64 interop template must build");
+    let xml =
+        xml_sec::xmldsig::mutation::append_signature_to_root(&encoded_payload_xml("Id"), &template)
+            .expect("Base64 interop signature template must append")
+            .replace(
+                "<ds:KeyInfo/>",
+                "<ds:KeyInfo><ds:KeyName>TestKeyName-rsa-2048</ds:KeyName></ds:KeyInfo>",
+            );
+    let template_file = TemporaryXmlFile::write("xmlsec1-base64-template", &xml);
+    let signed = sign_with_xmlsec1(
+        &template_file.path,
+        "TestKeyName-rsa-2048",
+        Path::new("tests/fixtures/keys/rsa/rsa-2048-key.pem"),
+        Path::new("tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+    );
+    let public_key = fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem")
+        .expect("RSA public-key fixture must load");
+
+    let verified = xml_sec::xmldsig::verify_signature_with_pem_key(&signed, &public_key, true)
+        .expect("xml-sec must process xmlsec1 Base64 signature");
+
+    assert_eq!(verified.status, DsigStatus::Valid);
+    assert_eq!(
+        verified.signed_info_references[0]
+            .pre_digest_data
+            .as_deref(),
+        Some(b"external verifier contract".as_slice())
+    );
+}
+
+#[test]
+fn xmlsec1_verifies_xpath_filter2_signature_from_xml_sec() {
+    // xmlsec1 must derive the same subtree set after ordered intersect and
+    // subtract operations and accept our resulting RSA signature.
+    if !xmlsec1_is_available() {
+        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        return;
+    }
+    let key = RsaSigningKey::from_pkcs8_pem(
+        &fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-key.pem")
+            .expect("RSA private-key fixture must load"),
+    )
+    .expect("RSA private-key fixture must parse");
+    let signed = SignContext::new(&key)
+        .sign_with_builder(
+            xpath_filter2_payload_xml(),
+            &xpath_filter2_signing_builder(),
+        )
+        .expect("xml-sec must sign the Filter 2.0 reference");
+
+    assert_xmlsec1_accepts(&signed, "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+}
+
+#[test]
+fn xml_sec_verifies_xpath_filter2_signature_from_xmlsec1() {
+    // Reciprocal signing proves the parser and evaluator accept Filter 2.0 XML
+    // and digest octets produced independently by xmlsec1.
+    if !xmlsec1_is_available() {
+        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        return;
+    }
+    let template = xpath_filter2_signing_builder()
+        .build_template()
+        .expect("Filter 2.0 interop template must build");
+    let xml = xml_sec::xmldsig::mutation::append_signature_to_root(
+        xpath_filter2_payload_xml(),
+        &template,
+    )
+    .expect("Filter 2.0 template must append")
+    .replace(
+        "<ds:KeyInfo/>",
+        "<ds:KeyInfo><ds:KeyName>TestKeyName-rsa-2048</ds:KeyName></ds:KeyInfo>",
+    );
+    let template_file = TemporaryXmlFile::write("xmlsec1-filter2-template", &xml);
+    let signed = sign_with_xmlsec1(
+        &template_file.path,
+        "TestKeyName-rsa-2048",
+        Path::new("tests/fixtures/keys/rsa/rsa-2048-key.pem"),
+        Path::new("tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+    );
+    let public_key = fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem")
+        .expect("RSA public-key fixture must load");
+
+    let verified = xml_sec::xmldsig::verify_signature_with_pem_key(&signed, &public_key, true)
+        .expect("xml-sec must process xmlsec1 Filter 2.0 signature");
+    assert_eq!(verified.status, DsigStatus::Valid);
 }
 
 #[test]

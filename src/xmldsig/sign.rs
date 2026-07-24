@@ -29,7 +29,10 @@ use super::mutation::{
     fill_signed_info_digest_values,
 };
 use super::parse::{SignatureAlgorithm, XMLDSIG_NS, parse_signed_info};
-use super::transforms::{Transform, execute_transforms, parse_transforms};
+use super::transforms::{
+    Transform, TransformOptions, XPathHereSemantics, execute_transforms_with_options,
+    parse_transforms,
+};
 use super::types::TransformError;
 use super::uri::UriReferenceResolver;
 
@@ -466,6 +469,7 @@ impl SigningKey for EcdsaP384SigningKey {
 pub struct SignContext<'a> {
     signing_key: &'a dyn SigningKey,
     key_info_writer: Option<&'a dyn KeyInfoWriter>,
+    transform_options: TransformOptions,
 }
 
 impl<'a> SignContext<'a> {
@@ -474,6 +478,7 @@ impl<'a> SignContext<'a> {
         Self {
             signing_key,
             key_info_writer: None,
+            transform_options: TransformOptions::default(),
         }
     }
 
@@ -484,6 +489,17 @@ impl<'a> SignContext<'a> {
         self
     }
 
+    /// Select the node returned by XPath's `here()` extension function.
+    ///
+    /// The default follows XMLDSig and returns the `<XPath>` parameter.
+    /// [`XPathHereSemantics::XmlSecLegacy`] is available only for producing
+    /// signatures compatible with libxmlsec1's `<Transform>` interpretation.
+    #[must_use]
+    pub fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
+        self.transform_options = self.transform_options.xpath_here_semantics(semantics);
+        self
+    }
+
     /// Sign XML that already contains a `<Signature>` template.
     ///
     /// The template must include empty `<DigestValue>` and `<SignatureValue>`
@@ -491,7 +507,7 @@ impl<'a> SignContext<'a> {
     /// canonicalizes `<SignedInfo>`, signs those canonical bytes, and fills the
     /// base64 `<SignatureValue>`.
     pub fn sign_template(&self, xml: &str) -> Result<String, SigningError> {
-        let with_digests = fill_reference_digest_values(xml)?;
+        let with_digests = fill_reference_digest_values_with_options(xml, self.transform_options)?;
         let (algorithm, canonical_signed_info) = canonicalize_signed_info(&with_digests)?;
         let signature_value = self.signing_key.sign(algorithm, &canonical_signed_info)?;
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature_value);
@@ -532,6 +548,13 @@ struct SigningReference {
 pub fn compute_reference_digest_values(
     xml: &str,
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
+    compute_reference_digest_values_with_options(xml, TransformOptions::default())
+}
+
+fn compute_reference_digest_values_with_options(
+    xml: &str,
+    transform_options: TransformOptions,
+) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
     let doc = Document::parse(xml)?;
     let signature = find_signing_signature_node(&doc)?;
     let signed_info = find_required_child(signature, "SignedInfo")?;
@@ -543,7 +566,12 @@ pub fn compute_reference_digest_values(
         .enumerate()
         .map(|(index, reference)| {
             let initial_data = resolver.dereference(&reference.uri)?;
-            let pre_digest = execute_transforms(signature, initial_data, &reference.transforms)?;
+            let pre_digest = execute_transforms_with_options(
+                signature,
+                initial_data,
+                &reference.transforms,
+                transform_options,
+            )?;
             let digest = compute_digest(reference.digest_method, &pre_digest);
             let digest_value = base64::engine::general_purpose::STANDARD.encode(digest);
             Ok(ComputedReferenceDigest {
@@ -563,7 +591,14 @@ pub fn compute_reference_digest_values(
 /// and writes the base64 digest into the matching `<DigestValue>` in document
 /// order.
 pub fn fill_reference_digest_values(xml: &str) -> Result<String, SigningDigestError> {
-    let digest_values = compute_reference_digest_values(xml)?
+    fill_reference_digest_values_with_options(xml, TransformOptions::default())
+}
+
+fn fill_reference_digest_values_with_options(
+    xml: &str,
+    transform_options: TransformOptions,
+) -> Result<String, SigningDigestError> {
+    let digest_values = compute_reference_digest_values_with_options(xml, transform_options)?
         .into_iter()
         .map(|digest| digest.digest_value);
     Ok(fill_signed_info_digest_values(xml, digest_values)?)
