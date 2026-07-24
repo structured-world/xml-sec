@@ -545,6 +545,9 @@ pub(super) fn parse_xpath_transform(transform_node: Node) -> Result<Transform, T
         if child.is_text() && child.text().is_some_and(is_xml_whitespace_only) {
             continue;
         }
+        if child.is_comment() || child.is_pi() {
+            continue;
+        }
         if !child.is_element() {
             return Err(TransformError::XPath(
                 "XPath transform contains non-whitespace parameter content".into(),
@@ -590,6 +593,9 @@ fn parse_xpath_filter2_transform(transform_node: Node) -> Result<Transform, Tran
     let mut filters = Vec::new();
     for child in transform_node.children() {
         if child.is_text() && child.text().is_some_and(is_xml_whitespace_only) {
+            continue;
+        }
+        if child.is_comment() || child.is_pi() {
             continue;
         }
         if !child.is_element()
