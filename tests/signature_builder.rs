@@ -314,9 +314,7 @@ fn rejects_xpath_bindings_with_invalid_namespace_uris() {
     // bound to an XPath prefix in either XMLDSig XPath parameter form.
     let transforms = [
         Transform::XPath(XPathExpression::new("//doc:item").with_namespace("doc", "")),
-        Transform::XPath(
-            XPathExpression::new("//doc:item").with_namespace("doc", XMLNS_NS),
-        ),
+        Transform::XPath(XPathExpression::new("//doc:item").with_namespace("doc", XMLNS_NS)),
         Transform::XPathFilter2(vec![XPathFilter::new(
             XPathFilterOperation::Intersect,
             XPathExpression::new("//doc:item").with_namespace("doc", ""),

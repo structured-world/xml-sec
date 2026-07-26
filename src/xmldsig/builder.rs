@@ -14,6 +14,7 @@ use super::{
 
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 const EXCLUSIVE_C14N_NS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 const XPATH_EXCLUDE_ALL_SIGNATURES: &str = "not(ancestor-or-self::dsig:Signature)";
 
@@ -238,9 +239,11 @@ impl SignatureBuilder {
                     })
             })
         {
-            // Namespaces in XML reserves both sides of this binding: `xml`
-            // can name only XML_NS, and XML_NS can use only `xml`.
-            if prefix == "xmlns"
+            // Namespaces in XML reserves the declaration namespace and both
+            // sides of the `xml` binding; prefixed declarations cannot be empty.
+            if uri.is_empty()
+                || uri == XMLNS_NS
+                || prefix == "xmlns"
                 || (prefix == "xml") != (uri == XML_NS)
                 || (prefix != "xml" && !is_namespace_prefix(prefix))
             {
