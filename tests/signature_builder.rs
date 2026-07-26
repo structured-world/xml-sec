@@ -223,6 +223,36 @@ fn serializes_and_reparses_general_xpath_filter2_parameters() {
 }
 
 #[test]
+fn allows_filter2_binding_that_matches_signature_prefix() {
+    // Filter2 XPath parameters use the Filter2 namespace as their default
+    // namespace, so a local `ds` binding cannot rebind XMLDSig elements.
+    let filters = vec![XPathFilter::new(
+        XPathFilterOperation::Intersect,
+        XPathExpression::new("//ds:Record").with_namespace("ds", "urn:documents"),
+    )];
+    let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .transform(Transform::XPathFilter2(filters)),
+        )
+        .build_template()
+        .expect("Filter2-local bindings must not conflict with the signature prefix");
+    let document = roxmltree::Document::parse(&xml).expect("builder must emit valid XML");
+    let xpath = document
+        .descendants()
+        .find(|node| {
+            node.has_tag_name((
+                "http://www.w3.org/2002/06/xmldsig-filter2",
+                "XPath",
+            ))
+        })
+        .expect("Filter2 XPath child");
+
+    assert_eq!(xpath.lookup_namespace_uri(Some("ds")), Some("urn:documents"));
+}
+
+#[test]
 fn rejects_xpath_binding_that_shadows_signature_prefix() {
     // Rebinding the prefix used for ds:XPath changes the element namespace and
     // produces a template that neither the strict parser nor a signer can use.
