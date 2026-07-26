@@ -5,6 +5,7 @@ use xml_sec::xmldsig::{
 };
 
 const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
 fn exclusive_c14n() -> C14nAlgorithm {
     C14nAlgorithm::new(C14nMode::Exclusive1_0, false)
@@ -305,6 +306,37 @@ fn rejects_xpath_binding_that_aliases_xml_namespace() {
         error,
         SignatureBuilderError::InvalidNamespacePrefix(prefix) if prefix == "alias"
     ));
+}
+
+#[test]
+fn rejects_xpath_bindings_with_invalid_namespace_uris() {
+    // Empty namespace names and the namespace-declaration namespace cannot be
+    // bound to an XPath prefix in either XMLDSig XPath parameter form.
+    let transforms = [
+        Transform::XPath(XPathExpression::new("//doc:item").with_namespace("doc", "")),
+        Transform::XPath(
+            XPathExpression::new("//doc:item").with_namespace("doc", XMLNS_NS),
+        ),
+        Transform::XPathFilter2(vec![XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("//doc:item").with_namespace("doc", ""),
+        )]),
+        Transform::XPathFilter2(vec![XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("//doc:item").with_namespace("doc", XMLNS_NS),
+        )]),
+    ];
+
+    for transform in transforms {
+        let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(transform))
+            .build_template()
+            .expect_err("invalid namespace URI must be rejected before serialization");
+        assert!(matches!(
+            error,
+            SignatureBuilderError::InvalidNamespacePrefix(prefix) if prefix == "doc"
+        ));
+    }
 }
 
 #[test]
