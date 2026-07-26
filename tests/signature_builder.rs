@@ -241,15 +241,13 @@ fn allows_filter2_binding_that_matches_signature_prefix() {
     let document = roxmltree::Document::parse(&xml).expect("builder must emit valid XML");
     let xpath = document
         .descendants()
-        .find(|node| {
-            node.has_tag_name((
-                "http://www.w3.org/2002/06/xmldsig-filter2",
-                "XPath",
-            ))
-        })
+        .find(|node| node.has_tag_name(("http://www.w3.org/2002/06/xmldsig-filter2", "XPath")))
         .expect("Filter2 XPath child");
 
-    assert_eq!(xpath.lookup_namespace_uri(Some("ds")), Some("urn:documents"));
+    assert_eq!(
+        xpath.lookup_namespace_uri(Some("ds")),
+        Some("urn:documents")
+    );
 }
 
 #[test]

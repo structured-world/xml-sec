@@ -213,19 +213,31 @@ impl SignatureBuilder {
         if self.references.is_empty() {
             return Err(SignatureBuilderError::MissingReference);
         }
-        for (prefix, uri) in self.references.iter().flat_map(|reference| {
-            reference
-                .transforms
-                .iter()
-                .flat_map(|transform| match transform {
-                    Transform::XPath(xpath) => xpath.namespaces().iter().collect::<Vec<_>>(),
-                    Transform::XPathFilter2(filters) => filters
-                        .iter()
-                        .flat_map(|filter| filter.xpath().namespaces().iter())
-                        .collect(),
-                    _ => Vec::new(),
-                })
-        }) {
+        for (prefix, uri, shares_signature_namespace) in
+            self.references.iter().flat_map(|reference| {
+                reference
+                    .transforms
+                    .iter()
+                    .flat_map(|transform| match transform {
+                        Transform::XPath(xpath) => xpath
+                            .namespaces()
+                            .iter()
+                            .map(|(prefix, uri)| (prefix, uri, true))
+                            .collect::<Vec<_>>(),
+                        Transform::XPathFilter2(filters) => filters
+                            .iter()
+                            .flat_map(|filter| {
+                                filter
+                                    .xpath()
+                                    .namespaces()
+                                    .iter()
+                                    .map(|(prefix, uri)| (prefix, uri, false))
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+            })
+        {
             // Namespaces in XML reserves both sides of this binding: `xml`
             // can name only XML_NS, and XML_NS can use only `xml`.
             if prefix == "xmlns"
@@ -236,7 +248,12 @@ impl SignatureBuilder {
                     prefix.clone(),
                 ));
             }
-            if self.ns_prefix.as_ref() == Some(prefix) && uri != XMLDSIG_NS {
+            // Ordinary XPath parameters share the Signature namespace prefix,
+            // while Filter2 parameters are unprefixed in their own namespace.
+            if shares_signature_namespace
+                && self.ns_prefix.as_ref() == Some(prefix)
+                && uri != XMLDSIG_NS
+            {
                 return Err(SignatureBuilderError::NamespacePrefixConflict(
                     prefix.clone(),
                 ));
