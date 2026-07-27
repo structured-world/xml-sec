@@ -627,6 +627,27 @@ mod tests {
     }
 
     #[test]
+    fn xpath_filter_rejects_excessive_cumulative_evaluation_work() {
+        // This document stays below the per-node call-count cap, but repeated
+        // evaluation over its full context would still exceed the aggregate
+        // work budget. The check must therefore be independent of node count.
+        let xml = format!("<root>{}</root>", "<item/>".repeat(1_300));
+        let doc = Document::parse(&xml).unwrap();
+        let error = apply_xpath_filter(
+            NodeSet::entire_document_without_comments(&doc).unwrap(),
+            &XPathExpression::new("true()"),
+        )
+        .err()
+        .expect("excessive cumulative XPath evaluation work must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cumulative evaluation work")
+        );
+    }
+
+    #[test]
     fn filter2_expands_selected_elements_to_subtrees() {
         // Filter 2.0 selection of an element includes all descendants,
         // attributes, and in-scope namespace nodes before set operations.
