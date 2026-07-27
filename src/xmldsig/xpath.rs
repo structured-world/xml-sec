@@ -19,6 +19,8 @@ use super::types::{NodeSet, TransformError};
 use crate::c14n::prefix::{attribute_prefix, element_prefix};
 
 const ALL_XPATH_NODES: &str = "//. | //@* | //namespace::*";
+/// Bound ordinary XMLDSig XPath's per-node evaluation loop before user XPath runs.
+const MAX_XPATH_PER_NODE_EVALUATIONS: usize = 1_024;
 /// Namespace URI permanently bound to the reserved `xml` prefix.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -448,8 +450,14 @@ fn evaluate_expression<'a>(
         let Value::Nodeset(all_nodes) = all_nodes else {
             unreachable!("the fixed all-nodes XPath expression returns a node-set");
         };
+        let ordered_nodes = all_nodes.document_order();
+        if ordered_nodes.len() > MAX_XPATH_PER_NODE_EVALUATIONS {
+            return Err(TransformError::XPath(format!(
+                "XPath transform input exceeds {MAX_XPATH_PER_NODE_EVALUATIONS} per-node evaluations"
+            )));
+        }
         let mut selected = nodeset::Nodeset::new();
-        for node in all_nodes.document_order() {
+        for node in ordered_nodes {
             let include = xpath
                 .evaluate(&context, node.clone())
                 .map_err(|error| TransformError::XPath(error.to_string()))?
