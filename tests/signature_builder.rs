@@ -151,6 +151,37 @@ fn rejects_transform_chains_that_execution_cannot_accept() {
 }
 
 #[test]
+fn rejects_xpath_sources_that_parsing_cannot_accept() {
+    // Programmatic XPath and Filter 2.0 parameters must pass the same source
+    // contract as serialized parameters parsed back during signing.
+    let invalid_transforms = [
+        ("empty", Transform::XPath(XPathExpression::new(""))),
+        ("malformed", Transform::XPath(XPathExpression::new("("))),
+        (
+            "oversized",
+            Transform::XPath(XPathExpression::new("x".repeat(16 * 1024 + 1))),
+        ),
+        (
+            "filter2 malformed",
+            Transform::XPathFilter2(vec![XPathFilter::new(
+                XPathFilterOperation::Intersect,
+                XPathExpression::new("("),
+            )]),
+        ),
+    ];
+
+    for (case, transform) in invalid_transforms {
+        let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .add_reference(
+                ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(transform),
+            )
+            .build_template()
+            .expect_err("builder must reject an unusable XPath source");
+        assert!(error.to_string().contains("XPath"), "case: {case}");
+    }
+}
+
+#[test]
 fn serializes_xpath_and_exclusive_prefix_list() {
     // Complex transforms retain the child content required by their specifications.
     let c14n = exclusive_c14n().with_prefix_list("saml #default ds");
