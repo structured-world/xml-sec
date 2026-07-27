@@ -16,6 +16,7 @@ use super::transforms::{
     XPathFilterOperation, XPathHereSemantics,
 };
 use super::types::{NodeSet, TransformError};
+use crate::c14n::NodeVisibility;
 use crate::c14n::prefix::{attribute_prefix, element_prefix};
 
 const ALL_XPATH_NODES: &str = "//. | //@* | //namespace::*";
@@ -285,6 +286,46 @@ impl<'d> Mirror<'d> {
     ) -> Option<roxmltree::Node<'a, 'a>> {
         id.and_then(|id| source.get_node(*id))
     }
+
+    fn input_contains<'a>(
+        &self,
+        source: &'a Document<'a>,
+        input: &NodeSet<'a>,
+        node: &nodeset::Node<'d>,
+    ) -> bool {
+        match node {
+            nodeset::Node::Root(_) => input.contains(source.root()),
+            nodeset::Node::Element(element) => self
+                .source_node(source, self.elements.get(element))
+                .is_some_and(|node| input.contains(node)),
+            nodeset::Node::Attribute(attribute) => {
+                let Some(parent) = attribute.parent() else {
+                    return false;
+                };
+                let Some(source_parent) = self.source_node(source, self.elements.get(&parent))
+                else {
+                    return false;
+                };
+                let stored_name = attribute.name();
+                let name = sxd_document_no_unsafe::as_qname!(stored_name);
+                input.contains_attribute(source_parent, name.namespace_uri(), name.local_part())
+            }
+            nodeset::Node::Text(text) => self
+                .source_node(source, self.texts.get(text))
+                .is_some_and(|node| input.contains(node)),
+            nodeset::Node::Comment(comment) => self
+                .source_node(source, self.comments.get(comment))
+                .is_some_and(|node| input.contains(node)),
+            nodeset::Node::Namespace(namespace) => self
+                .source_node(source, self.elements.get(&namespace.parent()))
+                .is_some_and(|owner| {
+                    input.contains_namespace(owner, namespace.prefix(), namespace.uri())
+                }),
+            nodeset::Node::ProcessingInstruction(pi) => self
+                .source_node(source, self.processing_instructions.get(pi))
+                .is_some_and(|node| input.contains(node)),
+        }
+    }
 }
 
 /// Resolves XML Signature's `here()` function to the node selected by the
@@ -444,12 +485,13 @@ fn here_path(document: &Document<'_>, here_node: Option<NodeId>) -> Option<Vec<u
 }
 
 fn evaluate_expression<'a>(
-    document: &'a Document<'a>,
+    input: &NodeSet<'a>,
     expression: &XPathExpression,
     wrap_as_filter: bool,
     here_semantics: XPathHereSemantics,
     here_is_same_document: bool,
 ) -> Result<NodeSet<'a>, TransformError> {
+    let document = input.document();
     let package = Package::new();
     let target = package.as_document();
     let mirror = Mirror::build(document, target);
@@ -486,13 +528,18 @@ fn evaluate_expression<'a>(
         let Value::Nodeset(all_nodes) = all_nodes else {
             unreachable!("the fixed all-nodes XPath expression returns a node-set");
         };
-        let ordered_nodes = all_nodes.document_order();
+        let all_ordered_nodes = all_nodes.document_order();
+        let document_size = all_ordered_nodes.len();
+        let ordered_nodes = all_ordered_nodes
+            .into_iter()
+            .filter(|node| mirror.input_contains(document, input, node))
+            .collect::<Vec<_>>();
         if ordered_nodes.len() > MAX_XPATH_PER_NODE_EVALUATIONS {
             return Err(TransformError::XPath(format!(
                 "XPath transform input exceeds {MAX_XPATH_PER_NODE_EVALUATIONS} per-node evaluations"
             )));
         }
-        let work_per_evaluation = ordered_nodes.len();
+        let work_per_evaluation = document_size;
         let mut cumulative_work = 0_usize;
         let mut selected = nodeset::Nodeset::new();
         for node in ordered_nodes {
@@ -549,7 +596,7 @@ pub(super) fn apply_xpath_filter_with_semantics<'a>(
     here_is_same_document: bool,
 ) -> Result<NodeSet<'a>, TransformError> {
     let selected = evaluate_expression(
-        input.document(),
+        &input,
         expression,
         true,
         here_semantics,
@@ -581,7 +628,7 @@ pub(super) fn apply_xpath_filter2_with_semantics<'a>(
     let mut result = NodeSet::try_entire_document(input.document())?;
     for filter in filters {
         let selected = evaluate_expression(
-            input.document(),
+            &input,
             filter.xpath(),
             false,
             here_semantics,
@@ -706,7 +753,7 @@ mod tests {
         // This document stays below the per-node call-count cap, but repeated
         // evaluation over its full context would still exceed the aggregate
         // work budget. The check must therefore be independent of node count.
-        let xml = format!("<root>{}</root>", "<item/>".repeat(1_300));
+        let xml = format!("<root>{}</root>", "<item/>".repeat(2_400));
         let doc = Document::parse(&xml).unwrap();
         let error = apply_xpath_filter(
             NodeSet::entire_document_without_comments(&doc).unwrap(),
