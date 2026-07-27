@@ -1361,6 +1361,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_transforms_bounds_cumulative_xpath_namespace_storage() {
+        // In-scope bindings are copied into every Filter 2.0 expression, so a
+        // chain-level budget must reject their multiplicative amplification.
+        let declarations = (0..32)
+            .map(|index| {
+                format!(
+                    "xmlns:n{index}=\"urn:namespace:{index}:{}\"",
+                    "x".repeat(64)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let filters = (0..MAX_XPATH_FILTERS)
+            .map(|_| {
+                format!(
+                    r#"<XPath xmlns="{XPATH_FILTER2_TRANSFORM_URI}" Filter="intersect">true()</XPath>"#
+                )
+            })
+            .collect::<String>();
+        let xml = format!(
+            r#"<Transforms xmlns="{XMLDSIG_NS}" {declarations}><Transform Algorithm="{XPATH_FILTER2_TRANSFORM_URI}">{filters}</Transform></Transforms>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let error = parse_transforms(doc.root_element())
+            .expect_err("cumulative XPath namespace storage must be bounded");
+
+        assert!(error.to_string().contains("namespace binding budget"));
+    }
+
+    #[test]
     fn parse_transforms_rejects_xpath_in_wrong_namespace() {
         let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">
             <Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
