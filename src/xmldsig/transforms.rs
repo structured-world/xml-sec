@@ -415,7 +415,7 @@ fn execute_transform_chain<'s, 'd>(
         let xml = decode_xml_octets(&bytes)?;
         let document = roxmltree::Document::parse(&xml)
             .map_err(|error| TransformError::XmlParse(error.to_string()))?;
-        let nodes = super::types::NodeSet::entire_document_with_comments(&document);
+        let nodes = super::types::NodeSet::try_entire_document_with_comments(&document)?;
         return execute_transform_chain(
             signature_node,
             TransformData::NodeSet(nodes),

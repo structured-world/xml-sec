@@ -9,6 +9,8 @@ use std::collections::HashSet;
 
 use roxmltree::{Document, Node, NodeId};
 
+const MAX_NODE_SET_ENTRIES: usize = 65_536;
+
 use crate::c14n::NodeVisibility;
 
 // roxmltree 0.21 uses `Node<'a, 'input: 'a>`. We tie both lifetimes together
@@ -171,8 +173,27 @@ impl<'a> NodeSet<'a> {
         }
     }
 
-    pub(crate) fn entire_document(doc: &'a Document<'a>) -> Self {
-        Self::collect_document(doc, true)
+    pub(crate) fn try_entire_document_without_comments(
+        doc: &'a Document<'a>,
+    ) -> Result<Self, TransformError> {
+        Self::ensure_subtree_materialization_fits(doc.root())?;
+        Ok(Self::collect_document(doc, false))
+    }
+
+    pub(crate) fn try_entire_document_with_comments(
+        doc: &'a Document<'a>,
+    ) -> Result<Self, TransformError> {
+        Self::ensure_subtree_materialization_fits(doc.root())?;
+        Ok(Self::collect_document(doc, true))
+    }
+
+    pub(crate) fn try_entire_document(doc: &'a Document<'a>) -> Result<Self, TransformError> {
+        Self::try_entire_document_with_comments(doc)
+    }
+
+    pub(crate) fn try_subtree(element: Node<'a, 'a>) -> Result<Self, TransformError> {
+        Self::ensure_subtree_materialization_fits(element)?;
+        Ok(Self::subtree(element))
     }
 
     pub(crate) fn insert_node(&mut self, node: Node<'_, '_>) {
@@ -262,6 +283,41 @@ impl<'a> NodeSet<'a> {
         set
     }
 
+    fn ensure_subtree_materialization_fits(root: Node<'_, '_>) -> Result<(), TransformError> {
+        let mut entries = 0_usize;
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            let projected = 1_usize
+                .checked_add(
+                    node.is_element()
+                        .then(|| node.attributes().len())
+                        .unwrap_or(0),
+                )
+                .and_then(|count| {
+                    count.checked_add(
+                        node.is_element()
+                            .then(|| node.namespaces().len())
+                            .unwrap_or(0),
+                    )
+                })
+                .ok_or(TransformError::NodeSetTooLarge {
+                    max: MAX_NODE_SET_ENTRIES,
+                })?;
+            entries = entries
+                .checked_add(projected)
+                .ok_or(TransformError::NodeSetTooLarge {
+                    max: MAX_NODE_SET_ENTRIES,
+                })?;
+            if entries > MAX_NODE_SET_ENTRIES {
+                return Err(TransformError::NodeSetTooLarge {
+                    max: MAX_NODE_SET_ENTRIES,
+                });
+            }
+            stack.extend(node.children());
+        }
+        Ok(())
+    }
+
     fn owns(&self, node: Node<'_, '_>) -> bool {
         std::ptr::eq(node.document() as *const _, self.doc as *const _)
     }
@@ -325,6 +381,13 @@ pub enum TransformError {
     #[error("transform chain exceeds maximum length of {max}")]
     TooManyTransforms {
         /// Maximum accepted transforms in one reference.
+        max: usize,
+    },
+
+    /// Exact XPath node projection would exceed the materialization budget.
+    #[error("node-set materialization exceeds maximum of {max} entries")]
+    NodeSetTooLarge {
+        /// Maximum tree, attribute, and namespace entries accepted.
         max: usize,
     },
 

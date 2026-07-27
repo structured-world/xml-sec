@@ -137,7 +137,7 @@ impl<'a> UriReferenceResolver<'a> {
             // XMLDSig §4.3.3.2: "the reference is to the document [...],
             // and the comment nodes are not included"
             Ok(TransformData::NodeSet(
-                NodeSet::entire_document_without_comments(self.doc),
+                NodeSet::try_entire_document_without_comments(self.doc)?,
             ))
         } else if let Some(fragment) = uri.strip_prefix('#') {
             // Note: we intentionally do NOT percent-decode the fragment.
@@ -167,7 +167,7 @@ impl<'a> UriReferenceResolver<'a> {
             // Per XMLDSig §4.3.3.3: "the XPointer expression [...] includes
             // comment nodes"
             Ok(TransformData::NodeSet(
-                NodeSet::entire_document_with_comments(self.doc),
+                NodeSet::try_entire_document_with_comments(self.doc)?,
             ))
         } else if let Some(id) = parse_xpointer_id_fragment(fragment) {
             // xpointer(id('foo')) → same as bare-name #foo
@@ -188,7 +188,7 @@ impl<'a> UriReferenceResolver<'a> {
     /// Look up an element by its ID attribute value and return a subtree node set.
     fn resolve_id(&self, id: &str) -> Result<TransformData<'a>, TransformError> {
         match self.id_map.get(id) {
-            Some(&element) => Ok(TransformData::NodeSet(NodeSet::subtree(element))),
+            Some(&element) => Ok(TransformData::NodeSet(NodeSet::try_subtree(element)?)),
             None => Err(TransformError::ElementNotFound(id.to_string())),
         }
     }

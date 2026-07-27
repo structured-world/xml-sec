@@ -524,7 +524,7 @@ pub(super) fn apply_xpath_filter2_with_semantics<'a>(
             "XPath Filter 2.0 requires between 1 and {MAX_XPATH_FILTERS} expressions"
         )));
     }
-    let mut result = NodeSet::entire_document(input.document());
+    let mut result = NodeSet::try_entire_document(input.document())?;
     for filter in filters {
         let selected = evaluate_expression(
             input.document(),
@@ -922,7 +922,7 @@ mod tests {
             XPathFilterOperation::Intersect,
             XPathExpression::new("true()"),
         )];
-        let error = apply_xpath_filter2(NodeSet::entire_document(&doc), &filters)
+        let error = apply_xpath_filter2(NodeSet::try_entire_document(&doc).unwrap(), &filters)
             .err()
             .unwrap();
 
@@ -935,7 +935,7 @@ mod tests {
         // fail closed rather than inheriting application state.
         let doc = Document::parse("<root/>").unwrap();
         let error = apply_xpath_filter(
-            NodeSet::entire_document(&doc),
+            NodeSet::try_entire_document(&doc).unwrap(),
             &XPathExpression::new("$external"),
         )
         .err()
@@ -949,7 +949,7 @@ mod tests {
         // A parameterless Filter 2.0 transform is malformed and must not act
         // as an accidental identity transform.
         let doc = Document::parse("<root/>").unwrap();
-        let error = apply_xpath_filter2(NodeSet::entire_document(&doc), &[])
+        let error = apply_xpath_filter2(NodeSet::try_entire_document(&doc).unwrap(), &[])
             .err()
             .unwrap();
 
