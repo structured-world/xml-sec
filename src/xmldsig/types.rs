@@ -287,22 +287,16 @@ impl<'a> NodeSet<'a> {
         let mut entries = 0_usize;
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            let projected = 1_usize
-                .checked_add(
-                    node.is_element()
-                        .then(|| node.attributes().len())
-                        .unwrap_or(0),
-                )
-                .and_then(|count| {
-                    count.checked_add(
-                        node.is_element()
-                            .then(|| node.namespaces().len())
-                            .unwrap_or(0),
-                    )
-                })
-                .ok_or(TransformError::NodeSetTooLarge {
-                    max: MAX_NODE_SET_ENTRIES,
-                })?;
+            let projected = if node.is_element() {
+                1_usize
+                    .checked_add(node.attributes().len())
+                    .and_then(|count| count.checked_add(node.namespaces().len()))
+            } else {
+                Some(1)
+            }
+            .ok_or(TransformError::NodeSetTooLarge {
+                max: MAX_NODE_SET_ENTRIES,
+            })?;
             entries = entries
                 .checked_add(projected)
                 .ok_or(TransformError::NodeSetTooLarge {
