@@ -1,9 +1,9 @@
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::xmldsig::transforms::MAX_TRANSFORMS_PER_REFERENCE;
 use xml_sec::xmldsig::{
     DigestAlgorithm, ReferenceBuilder, SignatureAlgorithm, SignatureBuilder, SignatureBuilderError,
     Transform, XPathExpression, XPathFilter, XPathFilterOperation, parse_transforms,
 };
-use xml_sec::xmldsig::transforms::MAX_TRANSFORMS_PER_REFERENCE;
 
 const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
@@ -172,9 +172,7 @@ fn rejects_xpath_sources_that_parsing_cannot_accept() {
 
     for (case, transform) in invalid_transforms {
         let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
-            .add_reference(
-                ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(transform),
-            )
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(transform))
             .build_template()
             .expect_err("builder must reject an unusable XPath source");
         assert!(error.to_string().contains("XPath"), "case: {case}");

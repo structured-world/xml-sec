@@ -29,8 +29,7 @@ use super::parse::XMLDSIG_NS;
 use super::types::{TransformData, TransformError};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 use super::xpath::{
-    apply_xpath_filter_with_semantics, apply_xpath_filter2_with_semantics,
-    normalize_function_spacing,
+    apply_xpath_filter_with_semantics, apply_xpath_filter2_with_semantics, compile_xpath,
 };
 use crate::c14n::{self, C14nAlgorithm};
 
@@ -708,9 +707,7 @@ fn parse_xpath_expression(
             "XPath expression must not be empty".into(),
         ));
     }
-    sxd_xpath_no_unsafe::Factory::new()
-        .build(&normalize_function_spacing(source))
-        .map_err(|error| TransformError::XPath(error.to_string()))?;
+    compile_xpath(source).map_err(TransformError::XPath)?;
 
     let mut xpath = XPathExpression {
         expression: source.to_owned(),

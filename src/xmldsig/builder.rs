@@ -8,6 +8,7 @@ use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use crate::c14n::{C14nAlgorithm, C14nMode};
 
 use super::transforms::{MAX_TRANSFORMS_PER_REFERENCE, MAX_XPATH_FILTERS};
+use super::xpath::compile_xpath;
 use super::{
     BASE64_TRANSFORM_URI, DigestAlgorithm, ENVELOPED_SIGNATURE_URI, SignatureAlgorithm, Transform,
     XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI, XPathExpression,
@@ -55,6 +56,9 @@ pub enum SignatureBuilderError {
         /// Maximum expression count accepted by parsing and execution.
         max: usize,
     },
+    /// An XPath parameter cannot be parsed or exceeds its resource bounds.
+    #[error("invalid XPath expression: {0}")]
+    InvalidXPath(String),
     /// SHA-1 algorithms are available for verification but not new signatures.
     #[error("algorithm is not allowed for signing: {0}")]
     SigningAlgorithmDisabled(&'static str),
@@ -238,21 +242,26 @@ impl SignatureBuilder {
                     max: MAX_TRANSFORMS_PER_REFERENCE,
                 });
             }
-        }
-        for filters in self
-            .references
-            .iter()
-            .flat_map(|reference| reference.transforms.iter())
-            .filter_map(|transform| match transform {
-                Transform::XPathFilter2(filters) => Some(filters),
-                _ => None,
-            })
-        {
-            if filters.is_empty() || filters.len() > MAX_XPATH_FILTERS {
-                return Err(SignatureBuilderError::InvalidXPathFilterCount {
-                    count: filters.len(),
-                    max: MAX_XPATH_FILTERS,
-                });
+            for transform in &reference.transforms {
+                match transform {
+                    Transform::XPath(xpath) => {
+                        compile_xpath(xpath.expression())
+                            .map_err(SignatureBuilderError::InvalidXPath)?;
+                    }
+                    Transform::XPathFilter2(filters) => {
+                        if filters.is_empty() || filters.len() > MAX_XPATH_FILTERS {
+                            return Err(SignatureBuilderError::InvalidXPathFilterCount {
+                                count: filters.len(),
+                                max: MAX_XPATH_FILTERS,
+                            });
+                        }
+                        for filter in filters {
+                            compile_xpath(filter.xpath().expression())
+                                .map_err(SignatureBuilderError::InvalidXPath)?;
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         for (prefix, uri, shares_signature_namespace) in

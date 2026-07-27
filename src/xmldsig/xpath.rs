@@ -74,20 +74,20 @@ pub(super) fn normalize_function_spacing(source: &str) -> String {
     output
 }
 
-fn compile_xpath(source: &str) -> Result<sxd_xpath_no_unsafe::XPath, TransformError> {
+pub(super) fn compile_xpath(source: &str) -> Result<sxd_xpath_no_unsafe::XPath, String> {
     if source.is_empty() || source.len() > MAX_XPATH_EXPRESSION_BYTES {
-        return Err(TransformError::XPath(format!(
+        return Err(format!(
             "XPath expression length must be between 1 and {MAX_XPATH_EXPRESSION_BYTES} bytes"
-        )));
+        ));
     }
     if xpath_expression_complexity(source) > MAX_XPATH_EXPRESSION_COMPLEXITY {
-        return Err(TransformError::XPath(format!(
+        return Err(format!(
             "XPath expression complexity exceeds {MAX_XPATH_EXPRESSION_COMPLEXITY} tokens"
-        )));
+        ));
     }
     Factory::new()
         .build(&normalize_function_spacing(source))
-        .map_err(|error| TransformError::XPath(error.to_string()))
+        .map_err(|error| error.to_string())
 }
 
 fn xpath_expression_complexity(source: &str) -> usize {
@@ -472,7 +472,7 @@ fn evaluate_expression<'a>(
     context.set_function("id", IdFunction);
     context.set_function("lang", LangFunction);
 
-    let xpath = compile_xpath(expression.expression())?;
+    let xpath = compile_xpath(expression.expression()).map_err(TransformError::XPath)?;
 
     if wrap_as_filter {
         // XMLDSig evaluates the expression independently for every input node;
