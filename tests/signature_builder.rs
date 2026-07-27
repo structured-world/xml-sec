@@ -252,6 +252,32 @@ fn allows_filter2_binding_that_matches_signature_prefix() {
 }
 
 #[test]
+fn rejects_invalid_filter2_expression_counts() {
+    // Builder output is reparsed by signing, so it must enforce the same
+    // non-empty, bounded Filter2 sequence accepted by the transform parser.
+    let oversized = (0..65)
+        .map(|_| {
+            XPathFilter::new(
+                XPathFilterOperation::Intersect,
+                XPathExpression::new("/root"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for filters in [Vec::new(), oversized] {
+        let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .add_reference(
+                ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                    .transform(Transform::XPathFilter2(filters)),
+            )
+            .build_template()
+            .expect_err("invalid Filter2 cardinality must fail at the builder boundary");
+
+        assert!(error.to_string().contains("between 1 and 64"));
+    }
+}
+
+#[test]
 fn rejects_xpath_binding_that_shadows_signature_prefix() {
     // Rebinding the prefix used for ds:XPath changes the element namespace and
     // produces a template that neither the strict parser nor a signer can use.
