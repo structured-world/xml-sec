@@ -21,6 +21,8 @@ use crate::c14n::prefix::{attribute_prefix, element_prefix};
 const ALL_XPATH_NODES: &str = "//. | //@* | //namespace::*";
 /// Bound ordinary XMLDSig XPath's per-node evaluation loop before user XPath runs.
 const MAX_XPATH_PER_NODE_EVALUATIONS: usize = 4_096;
+/// Bound repeated XPath evaluation work, measured as context nodes times calls.
+const MAX_XPATH_CUMULATIVE_EVALUATION_WORK: usize = 6_000_000;
 /// Namespace URI permanently bound to the reserved `xml` prefix.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -456,8 +458,26 @@ fn evaluate_expression<'a>(
                 "XPath transform input exceeds {MAX_XPATH_PER_NODE_EVALUATIONS} per-node evaluations"
             )));
         }
+        let work_per_evaluation = ordered_nodes.len();
+        let mut cumulative_work = 0_usize;
         let mut selected = nodeset::Nodeset::new();
         for node in ordered_nodes {
+            // A user expression may scan the entire document on every call.
+            // Charge that worst-case cost before execution so a failure never
+            // occurs after performing work beyond the aggregate budget.
+            cumulative_work = cumulative_work
+                .checked_add(work_per_evaluation)
+                .ok_or_else(|| {
+                    TransformError::XPath(
+                        "XPath transform exceeds cumulative evaluation work budget".into(),
+                    )
+                })?;
+            if cumulative_work > MAX_XPATH_CUMULATIVE_EVALUATION_WORK {
+                return Err(TransformError::XPath(format!(
+                    "XPath transform exceeds cumulative evaluation work budget of \
+                     {MAX_XPATH_CUMULATIVE_EVALUATION_WORK} node-evaluations"
+                )));
+            }
             let include = xpath
                 .evaluate(&context, node.clone())
                 .map_err(|error| TransformError::XPath(error.to_string()))?
@@ -640,11 +660,7 @@ mod tests {
         .err()
         .expect("excessive cumulative XPath evaluation work must fail closed");
 
-        assert!(
-            error
-                .to_string()
-                .contains("cumulative evaluation work")
-        );
+        assert!(error.to_string().contains("cumulative evaluation work"));
     }
 
     #[test]
