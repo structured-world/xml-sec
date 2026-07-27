@@ -155,8 +155,9 @@ fn enveloped_inclusive_c14n_1_1() {
     let doc = roxmltree::Document::parse(xml).unwrap();
     let sig_node = find_element(&doc, "Signature");
 
-    let initial =
-        xml_sec::xmldsig::TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc));
+    let initial = xml_sec::xmldsig::TransformData::NodeSet(
+        NodeSet::entire_document_without_comments(&doc).unwrap(),
+    );
     let transforms = vec![
         Transform::Enveloped,
         Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_1, false)),
@@ -287,8 +288,9 @@ fn enveloped_only_falls_back_to_default_c14n() {
     let doc = roxmltree::Document::parse(xml).unwrap();
     let sig_node = find_element(&doc, "Signature");
 
-    let initial =
-        xml_sec::xmldsig::TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc));
+    let initial = xml_sec::xmldsig::TransformData::NodeSet(
+        NodeSet::entire_document_without_comments(&doc).unwrap(),
+    );
     let transforms = vec![Transform::Enveloped];
 
     let result = execute_transforms(sig_node, initial, &transforms).unwrap();
@@ -438,8 +440,9 @@ fn enveloped_signature_only_child() {
     let doc = roxmltree::Document::parse(xml).unwrap();
     let sig_node = find_element(&doc, "Signature");
 
-    let initial =
-        xml_sec::xmldsig::TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc));
+    let initial = xml_sec::xmldsig::TransformData::NodeSet(
+        NodeSet::entire_document_without_comments(&doc).unwrap(),
+    );
     let transforms = vec![
         Transform::Enveloped,
         Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),
@@ -465,8 +468,9 @@ fn enveloped_preserves_surrounding_whitespace() {
     let doc = roxmltree::Document::parse(xml).unwrap();
     let sig_node = find_element(&doc, "Signature");
 
-    let initial =
-        xml_sec::xmldsig::TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc));
+    let initial = xml_sec::xmldsig::TransformData::NodeSet(
+        NodeSet::entire_document_without_comments(&doc).unwrap(),
+    );
     let transforms = vec![
         Transform::Enveloped,
         Transform::C14n(C14nAlgorithm::new(C14nMode::Inclusive1_0, false)),

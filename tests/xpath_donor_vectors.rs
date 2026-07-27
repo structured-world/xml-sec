@@ -19,7 +19,10 @@ fn merlin_filter2_sign_spec_produces_exact_canonical_octets() {
     let transforms = parse_transforms(transforms_node).expect("Merlin transforms must parse");
     let output = execute_transforms(
         document.root_element(),
-        TransformData::NodeSet(NodeSet::entire_document_without_comments(&document)),
+        TransformData::NodeSet(
+            NodeSet::entire_document_without_comments(&document)
+                .expect("donor fixture must fit the node-set materialization budget"),
+        ),
         &transforms,
     )
     .expect("Merlin Filter 2.0 operations must execute");

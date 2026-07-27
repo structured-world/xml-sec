@@ -568,7 +568,7 @@ mod tests {
         // The element remains visible while one attribute is removed from its
         // canonical form; expanding every selected element would regress this.
         let doc = Document::parse(r#"<root keep="yes" drop="no">text</root>"#).unwrap();
-        let input = NodeSet::entire_document_with_comments(&doc);
+        let input = NodeSet::entire_document_with_comments(&doc).unwrap();
         let result = apply_xpath_filter(input, &XPathExpression::new("name() != 'drop'")).unwrap();
 
         assert_eq!(canonicalize(&result), r#"<root keep="yes">text</root>"#);
@@ -582,7 +582,7 @@ mod tests {
             r#"<root xmlns:keep="urn:keep" xmlns:drop="urn:drop" keep:value="1"/>"#,
         )
         .unwrap();
-        let input = NodeSet::entire_document_with_comments(&doc);
+        let input = NodeSet::entire_document_with_comments(&doc).unwrap();
         let result = apply_xpath_filter(input, &XPathExpression::new("name() != 'drop'")).unwrap();
 
         let output = canonicalize(&result);
@@ -595,7 +595,7 @@ mod tests {
         // XMLDSig visits every input node independently with both context
         // position and context size set to one.
         let doc = Document::parse("<root><first/><second/></root>").unwrap();
-        let input = NodeSet::entire_document_without_comments(&doc);
+        let input = NodeSet::entire_document_without_comments(&doc).unwrap();
         let result = apply_xpath_filter(
             input,
             &XPathExpression::new("position() = 1 and last() = 1"),
@@ -617,7 +617,7 @@ mod tests {
         );
         let doc = Document::parse(&xml).unwrap();
         let error = apply_xpath_filter(
-            NodeSet::entire_document_without_comments(&doc),
+            NodeSet::entire_document_without_comments(&doc).unwrap(),
             &XPathExpression::new("count(//*) >= 0"),
         )
         .err()
@@ -634,7 +634,7 @@ mod tests {
             r#"<root><keep a="1"><child>yes</child></keep><outside>no</outside></root>"#,
         )
         .unwrap();
-        let input = NodeSet::entire_document_with_comments(&doc);
+        let input = NodeSet::entire_document_with_comments(&doc).unwrap();
         let filters = [XPathFilter::new(
             XPathFilterOperation::Intersect,
             XPathExpression::new("/root/keep"),
@@ -652,7 +652,7 @@ mod tests {
         // Filter 2.0 defines a selected root as the root plus every node that
         // has it as an ancestor, so intersecting with `/` is an identity.
         let doc = Document::parse("<root><child>covered</child></root>").unwrap();
-        let input = NodeSet::entire_document_without_comments(&doc);
+        let input = NodeSet::entire_document_without_comments(&doc).unwrap();
         let filters = [XPathFilter::new(
             XPathFilterOperation::Intersect,
             XPathExpression::new("/"),
@@ -670,7 +670,7 @@ mod tests {
             r#"<root><scope><keep/><drop><restore/></drop></scope><other/></root>"#,
         )
         .unwrap();
-        let input = NodeSet::entire_document_with_comments(&doc);
+        let input = NodeSet::entire_document_with_comments(&doc).unwrap();
         let filters = [
             XPathFilter::new(
                 XPathFilterOperation::Intersect,
@@ -699,7 +699,7 @@ mod tests {
         // even without a validating DTD declaring the attribute type ID.
         let doc =
             Document::parse(r#"<root><item Id="target">yes</item><item>no</item></root>"#).unwrap();
-        let input = NodeSet::entire_document_with_comments(&doc);
+        let input = NodeSet::entire_document_with_comments(&doc).unwrap();
         let filters = [XPathFilter::new(
             XPathFilterOperation::Intersect,
             XPathExpression::new("id('target')"),
@@ -721,8 +721,11 @@ mod tests {
             XPathFilterOperation::Intersect,
             XPathExpression::new("id('target')"),
         )];
-        let result =
-            apply_xpath_filter2(NodeSet::entire_document_with_comments(&doc), &filters).unwrap();
+        let result = apply_xpath_filter2(
+            NodeSet::entire_document_with_comments(&doc).unwrap(),
+            &filters,
+        )
+        .unwrap();
 
         assert_eq!(
             canonicalize(&result),
@@ -742,8 +745,11 @@ mod tests {
             XPathFilterOperation::Intersect,
             XPathExpression::new("id(/root/ids/id)"),
         )];
-        let result =
-            apply_xpath_filter2(NodeSet::entire_document_with_comments(&doc), &filters).unwrap();
+        let result = apply_xpath_filter2(
+            NodeSet::entire_document_with_comments(&doc).unwrap(),
+            &filters,
+        )
+        .unwrap();
 
         assert_eq!(
             canonicalize(&result),
@@ -764,9 +770,12 @@ mod tests {
             XPathExpression::new("id('duplicate')"),
         )];
 
-        let error = apply_xpath_filter2(NodeSet::entire_document_with_comments(&doc), &filters)
-            .err()
-            .expect("duplicate IDs must make XPath evaluation fail closed");
+        let error = apply_xpath_filter2(
+            NodeSet::entire_document_with_comments(&doc).unwrap(),
+            &filters,
+        )
+        .err()
+        .expect("duplicate IDs must make XPath evaluation fail closed");
 
         assert!(matches!(error, TransformError::XPath(_)));
     }
@@ -780,7 +789,7 @@ mod tests {
         )
         .unwrap();
         let result = apply_xpath_filter(
-            NodeSet::entire_document_with_comments(&doc),
+            NodeSet::entire_document_with_comments(&doc).unwrap(),
             &XPathExpression::new("lang('EN')"),
         )
         .unwrap();
@@ -821,7 +830,7 @@ mod tests {
             .find(|node| node.has_tag_name((super::super::parse::XMLDSIG_NS, "Transform")))
             .unwrap();
         let transform = super::super::transforms::parse_xpath_transform(transform_node).unwrap();
-        let input = TransformData::NodeSet(NodeSet::entire_document_with_comments(&doc));
+        let input = TransformData::NodeSet(NodeSet::entire_document_with_comments(&doc).unwrap());
         let result =
             super::super::transforms::apply_transform(doc.root_element(), &transform, input)
                 .unwrap()
@@ -847,7 +856,7 @@ mod tests {
             .find(|node| node.has_tag_name((super::super::parse::XMLDSIG_NS, "Transform")))
             .unwrap();
         let transform = super::super::transforms::parse_xpath_transform(transform_node).unwrap();
-        let input = TransformData::NodeSet(NodeSet::entire_document_with_comments(&doc));
+        let input = TransformData::NodeSet(NodeSet::entire_document_with_comments(&doc).unwrap());
 
         let result =
             super::super::transforms::apply_transform(doc.root_element(), &transform, input)
@@ -870,7 +879,7 @@ mod tests {
             .find(|node| node.has_tag_name((super::super::parse::XMLDSIG_NS, "Transform")))
             .unwrap();
         let transform = super::super::transforms::parse_xpath_transform(transform_node).unwrap();
-        let input = TransformData::NodeSet(NodeSet::entire_document_with_comments(&doc));
+        let input = TransformData::NodeSet(NodeSet::entire_document_with_comments(&doc).unwrap());
         let result =
             super::super::transforms::apply_transform(doc.root_element(), &transform, input)
                 .unwrap()
@@ -896,7 +905,7 @@ mod tests {
             .find(|node| node.has_tag_name((super::super::parse::XMLDSIG_NS, "Transform")))
             .unwrap();
         let transform = super::super::transforms::parse_xpath_transform(transform_node).unwrap();
-        let input = TransformData::NodeSet(NodeSet::entire_document_with_comments(&doc));
+        let input = TransformData::NodeSet(NodeSet::entire_document_with_comments(&doc).unwrap());
         let options = super::super::transforms::TransformOptions::default()
             .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy);
         let result = super::super::transforms::apply_transform_with_options(

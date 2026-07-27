@@ -85,7 +85,11 @@ fn empty_uri_rejects_quadratic_namespace_materialization() {
         Err(error) => error,
         Ok(_) => panic!("public constructors must enforce the materialization budget"),
     };
-    assert!(direct_error.to_string().contains("node-set materialization"));
+    assert!(
+        direct_error
+            .to_string()
+            .contains("node-set materialization")
+    );
 }
 
 // ─── #id: subtree by ID ─────────────────────────────────────────────────────

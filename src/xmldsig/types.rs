@@ -98,29 +98,46 @@ impl<'a> NodeSet<'a> {
     ///
     /// Per XMLDSig §4.3.3.2: "An empty URI [...] is a reference to the document
     /// [...] and the comment nodes are not included."
-    pub fn entire_document_without_comments(doc: &'a Document<'a>) -> Self {
-        Self::collect_document(doc, false)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransformError::NodeSetTooLarge`] when projecting the document's
+    /// tree, attribute, and namespace nodes would exceed the materialization budget.
+    pub fn entire_document_without_comments(doc: &'a Document<'a>) -> Result<Self, TransformError> {
+        Self::ensure_subtree_materialization_fits(doc.root())?;
+        Ok(Self::collect_document(doc, false))
     }
 
     /// Create a node set representing the entire document with comments.
     ///
     /// Used for `#xpointer(/)` which, unlike empty URI, includes comment nodes.
-    pub fn entire_document_with_comments(doc: &'a Document<'a>) -> Self {
-        Self::collect_document(doc, true)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransformError::NodeSetTooLarge`] when projecting the document's
+    /// tree, attribute, and namespace nodes would exceed the materialization budget.
+    pub fn entire_document_with_comments(doc: &'a Document<'a>) -> Result<Self, TransformError> {
+        Self::ensure_subtree_materialization_fits(doc.root())?;
+        Ok(Self::collect_document(doc, true))
     }
 
     /// Create a node set rooted at `element`, containing that element and all
     /// of its descendant nodes (elements, text, and, for this constructor,
     /// comment nodes).
     ///
-    pub fn subtree(element: Node<'a, 'a>) -> Self {
+    /// # Errors
+    ///
+    /// Returns [`TransformError::NodeSetTooLarge`] when projecting the subtree's
+    /// tree, attribute, and namespace nodes would exceed the materialization budget.
+    pub fn subtree(element: Node<'a, 'a>) -> Result<Self, TransformError> {
+        Self::ensure_subtree_materialization_fits(element)?;
         let mut set = Self {
             doc: element.document(),
             nodes: HashSet::new(),
             with_comments: true,
         };
         set.insert_subtree(element);
-        set
+        Ok(set)
     }
 
     /// Reference to the underlying document.
@@ -173,27 +190,8 @@ impl<'a> NodeSet<'a> {
         }
     }
 
-    pub(crate) fn try_entire_document_without_comments(
-        doc: &'a Document<'a>,
-    ) -> Result<Self, TransformError> {
-        Self::ensure_subtree_materialization_fits(doc.root())?;
-        Ok(Self::collect_document(doc, false))
-    }
-
-    pub(crate) fn try_entire_document_with_comments(
-        doc: &'a Document<'a>,
-    ) -> Result<Self, TransformError> {
-        Self::ensure_subtree_materialization_fits(doc.root())?;
-        Ok(Self::collect_document(doc, true))
-    }
-
     pub(crate) fn try_entire_document(doc: &'a Document<'a>) -> Result<Self, TransformError> {
-        Self::try_entire_document_with_comments(doc)
-    }
-
-    pub(crate) fn try_subtree(element: Node<'a, 'a>) -> Result<Self, TransformError> {
-        Self::ensure_subtree_materialization_fits(element)?;
-        Ok(Self::subtree(element))
+        Self::entire_document_with_comments(doc)
     }
 
     pub(crate) fn insert_node(&mut self, node: Node<'_, '_>) {
@@ -418,7 +416,7 @@ mod tests {
         // stale flag merely because comments were seen while materializing.
         let document = Document::parse("<root><!-- excluded --><child/></root>")
             .expect("fixed comment fixture must parse");
-        let nodes = NodeSet::entire_document_without_comments(&document);
+        let nodes = NodeSet::entire_document_without_comments(&document).unwrap();
         let comment = document
             .descendants()
             .find(|node| node.is_comment())

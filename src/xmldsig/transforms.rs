@@ -415,7 +415,7 @@ fn execute_transform_chain<'s, 'd>(
         let xml = decode_xml_octets(&bytes)?;
         let document = roxmltree::Document::parse(&xml)
             .map_err(|error| TransformError::XmlParse(error.to_string()))?;
-        let nodes = super::types::NodeSet::try_entire_document_with_comments(&document)?;
+        let nodes = super::types::NodeSet::entire_document_with_comments(&document)?;
         return execute_transform_chain(
             signature_node,
             TransformData::NodeSet(nodes),
@@ -793,7 +793,7 @@ mod tests {
             .unwrap();
 
         // Start with entire document without comments (empty URI)
-        let node_set = NodeSet::entire_document_without_comments(&doc);
+        let node_set = NodeSet::entire_document_without_comments(&doc).unwrap();
         let data = TransformData::NodeSet(node_set);
 
         // Apply enveloped transform
@@ -849,7 +849,7 @@ mod tests {
         let doc2 = Document::parse(xml).unwrap();
 
         // NodeSet from doc1, Signature node from doc2
-        let node_set = NodeSet::entire_document_without_comments(&doc1);
+        let node_set = NodeSet::entire_document_without_comments(&doc1).unwrap();
         let input = TransformData::NodeSet(node_set);
         let sig_from_doc2 = doc2
             .descendants()
@@ -870,7 +870,7 @@ mod tests {
         let xml = r#"<root b="2" a="1"><child/></root>"#;
         let doc = Document::parse(xml).unwrap();
 
-        let node_set = NodeSet::entire_document_without_comments(&doc);
+        let node_set = NodeSet::entire_document_without_comments(&doc).unwrap();
         let data = TransformData::NodeSet(node_set);
 
         let algo =
@@ -923,7 +923,7 @@ mod tests {
             .descendants()
             .find(|node| node.attribute("ID") == Some("payload"))
             .unwrap();
-        let input = TransformData::NodeSet(NodeSet::subtree(data));
+        let input = TransformData::NodeSet(NodeSet::subtree(data).unwrap());
 
         let result = apply_transform(data, &Transform::Base64Decode, input).unwrap();
 
@@ -940,7 +940,7 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name("Excluded"))
             .unwrap();
-        let mut nodes = NodeSet::subtree(doc.root_element());
+        let mut nodes = NodeSet::subtree(doc.root_element()).unwrap();
         nodes.exclude_subtree(excluded);
 
         let result = apply_transform(
@@ -1020,7 +1020,8 @@ mod tests {
             .find(|n| n.is_element() && n.tag_name().name() == "Signature")
             .unwrap();
 
-        let initial = TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc));
+        let initial =
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc).unwrap());
         let transforms = vec![
             Transform::Enveloped,
             Transform::C14n(
@@ -1044,7 +1045,8 @@ mod tests {
         let xml = r#"<root b="2" a="1"><child/></root>"#;
         let doc = Document::parse(xml).unwrap();
 
-        let initial = TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc));
+        let initial =
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc).unwrap());
         let result = execute_transforms(doc.root_element(), initial, &[]).unwrap();
 
         let output = String::from_utf8(result).unwrap();
@@ -1087,7 +1089,7 @@ mod tests {
             .find(|n| n.is_element() && n.attribute("Id") == Some("sig-target"))
             .unwrap();
 
-        let node_set = NodeSet::entire_document_without_comments(&doc);
+        let node_set = NodeSet::entire_document_without_comments(&doc).unwrap();
         let data = TransformData::NodeSet(node_set);
 
         let result = apply_transform(sig_node, &Transform::Enveloped, data).unwrap();
@@ -1514,7 +1516,7 @@ mod tests {
 
         let enveloped = execute_transforms(
             sig_node,
-            TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc)),
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc).unwrap()),
             &[
                 Transform::Enveloped,
                 Transform::C14n(C14nAlgorithm::new(
@@ -1526,7 +1528,7 @@ mod tests {
         .unwrap();
         let xpath_compat = execute_transforms(
             sig_node,
-            TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc)),
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc).unwrap()),
             &[
                 Transform::XpathExcludeAllSignatures,
                 Transform::C14n(C14nAlgorithm::new(
@@ -1607,7 +1609,8 @@ mod tests {
         assert_eq!(transforms.len(), 2);
 
         // Execute the pipeline with empty URI (entire document)
-        let initial = TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc));
+        let initial =
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&doc).unwrap());
         let result = execute_transforms(sig_node, initial, &transforms).unwrap();
 
         let output = String::from_utf8(result).unwrap();
