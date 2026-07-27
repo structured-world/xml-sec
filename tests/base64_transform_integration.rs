@@ -2,6 +2,7 @@
 
 use std::fs;
 
+use base64::Engine;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::xmldsig::{
     BASE64_TRANSFORM_URI, DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus,
@@ -197,6 +198,49 @@ fn decoded_xml_is_adapted_for_xpath_filter2() {
         .expect("Base64-to-Filter2 signature must verify");
 
     assert_eq!(result.status, DsigStatus::Valid);
+}
+
+#[test]
+fn decoded_utf16_xml_is_adapted_to_a_node_set() {
+    // XML processors must accept both UTF-16 byte orders when a BOM identifies
+    // the encoding; the binary adapter must decode before handing text to roxmltree.
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><payload><keep>covered</keep></payload>";
+    let code_units = xml.encode_utf16().collect::<Vec<_>>();
+    let encoded_inputs = [
+        std::iter::once(0xff)
+            .chain(std::iter::once(0xfe))
+            .chain(code_units.iter().flat_map(|unit| unit.to_le_bytes()))
+            .collect::<Vec<_>>(),
+        std::iter::once(0xfe)
+            .chain(std::iter::once(0xff))
+            .chain(code_units.iter().flat_map(|unit| unit.to_be_bytes()))
+            .collect::<Vec<_>>(),
+    ];
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::Base64Decode)
+                .transform(Transform::XPath(XPathExpression::new("true()"))),
+        )
+        .key_info(true);
+    let (key, key_info) = signing_material();
+    let resolver = DefaultKeyResolver::default();
+
+    for bytes in encoded_inputs {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let document = format!(r#"<root><Encoded ID="payload">{encoded}</Encoded></root>"#);
+        let signed = SignContext::new(&key)
+            .key_info_writer(&key_info)
+            .sign_with_builder(&document, &builder)
+            .expect("BOM-marked UTF-16 XML must enter the XPath node-set pipeline");
+        let verified = VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&signed)
+            .expect("UTF-16 transform chain must verify");
+
+        assert_eq!(verified.status, DsigStatus::Valid);
+    }
 }
 
 #[test]
