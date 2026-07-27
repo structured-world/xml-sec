@@ -93,6 +93,15 @@ enum XmlNodeKey {
     },
 }
 
+impl XmlNodeKey {
+    fn owner_id(&self) -> NodeId {
+        match self {
+            Self::Tree(id) => *id,
+            Self::Attribute { owner, .. } | Self::Namespace { owner, .. } => *owner,
+        }
+    }
+}
+
 impl<'a> NodeSet<'a> {
     /// Create a node set representing the entire document without comments.
     ///
@@ -168,13 +177,15 @@ impl<'a> NodeSet<'a> {
         if !std::ptr::eq(node.document() as *const _, self.doc as *const _) {
             return;
         }
-        let mut removed = Self {
-            doc: self.doc,
-            nodes: HashSet::new(),
-            with_comments: true,
-        };
-        removed.insert_subtree(node);
-        self.nodes.retain(|key| !removed.nodes.contains(key));
+        let document = self.doc;
+        // Inspect only keys already admitted to this bounded set. Building the
+        // excluded subtree would let an unrelated large Signature/Object tree
+        // allocate a second, unbounded set before verification.
+        self.nodes.retain(|key| {
+            document.get_node(key.owner_id()).is_none_or(|candidate| {
+                candidate != node && !candidate.ancestors().any(|ancestor| ancestor == node)
+            })
+        });
     }
 
     /// Whether comments are included in this node set.
@@ -425,5 +436,40 @@ mod tests {
 
         assert!(!nodes.contains(comment));
         assert!(!nodes.with_comments());
+    }
+
+    #[test]
+    fn excluding_disjoint_oversized_subtree_only_scans_input_keys() {
+        // The excluded Signature subtree is intentionally larger than the
+        // constructor budget; a small referenced subtree must remain unchanged
+        // without attempting to materialize the irrelevant Signature content.
+        let xml = format!(
+            "<root><target Id=\"selected\"><child/></target><Signature>{}</Signature></root>",
+            "<Object/>".repeat(MAX_NODE_SET_ENTRIES + 1)
+        );
+        let document = Document::parse(&xml).expect("fixed oversized fixture must parse");
+        let target = document
+            .descendants()
+            .find(|node| node.attribute("Id") == Some("selected"))
+            .expect("fixed fixture contains the selected subtree");
+        let signature = document
+            .descendants()
+            .find(|node| node.has_tag_name("Signature"))
+            .expect("fixed fixture contains the excluded Signature subtree");
+        let mut nodes = NodeSet::subtree(target)
+            .expect("small selected subtree must fit the materialization budget");
+        let entries_before = nodes.nodes.len();
+
+        nodes.exclude_subtree(signature);
+
+        assert_eq!(nodes.nodes.len(), entries_before);
+        assert!(nodes.contains(target));
+        assert!(
+            nodes.contains(
+                target
+                    .first_element_child()
+                    .expect("fixed target subtree contains a child")
+            )
+        );
     }
 }
