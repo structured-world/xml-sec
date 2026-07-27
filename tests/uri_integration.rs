@@ -73,10 +73,10 @@ fn empty_uri_rejects_quadratic_namespace_materialization() {
         .collect::<String>();
     let xml = format!("<root{namespaces}>{}</root>", "<item/>".repeat(257));
     let document = roxmltree::Document::parse(&xml).expect("generated XML must parse");
-    let error = UriReferenceResolver::new(&document)
-        .dereference("")
-        .err()
-        .expect("oversized namespace projection must fail before materialization");
+    let error = match UriReferenceResolver::new(&document).dereference("") {
+        Err(error) => error,
+        Ok(_) => panic!("oversized namespace projection must fail before materialization"),
+    };
 
     assert!(error.to_string().contains("node-set materialization"));
 }
