@@ -664,6 +664,23 @@ mod tests {
     }
 
     #[test]
+    fn xpath_filter_rejects_excessive_expression_complexity() {
+        // A short document does not consume the context budget, but repeating
+        // a document-scanning subexpression can still multiply evaluator work.
+        let repeated_scan = "count(//*) >= 0 and ".repeat(300);
+        let expression = XPathExpression::new(format!("{repeated_scan}true()"));
+        let doc = Document::parse("<root><item/></root>").unwrap();
+        let error = apply_xpath_filter(
+            NodeSet::entire_document_without_comments(&doc).unwrap(),
+            &expression,
+        )
+        .err()
+        .expect("excessive XPath expression complexity must fail closed");
+
+        assert!(error.to_string().contains("complexity"));
+    }
+
+    #[test]
     fn filter2_expands_selected_elements_to_subtrees() {
         // Filter 2.0 selection of an element includes all descendants,
         // attributes, and in-scope namespace nodes before set operations.
