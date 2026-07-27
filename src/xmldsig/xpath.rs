@@ -23,6 +23,8 @@ const ALL_XPATH_NODES: &str = "//. | //@* | //namespace::*";
 const MAX_XPATH_PER_NODE_EVALUATIONS: usize = 4_096;
 /// Bound repeated XPath evaluation work, measured as context nodes times calls.
 const MAX_XPATH_CUMULATIVE_EVALUATION_WORK: usize = 6_000_000;
+/// Bound operators, names, literals, and path punctuation in one expression.
+const MAX_XPATH_EXPRESSION_COMPLEXITY: usize = 256;
 /// Namespace URI permanently bound to the reserved `xml` prefix.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -70,6 +72,48 @@ pub(super) fn normalize_function_spacing(source: &str) -> String {
         index += 1;
     }
     output
+}
+
+fn compile_xpath(source: &str) -> Result<sxd_xpath_no_unsafe::XPath, TransformError> {
+    if source.is_empty() || source.len() > MAX_XPATH_EXPRESSION_BYTES {
+        return Err(TransformError::XPath(format!(
+            "XPath expression length must be between 1 and {MAX_XPATH_EXPRESSION_BYTES} bytes"
+        )));
+    }
+    if xpath_expression_complexity(source) > MAX_XPATH_EXPRESSION_COMPLEXITY {
+        return Err(TransformError::XPath(format!(
+            "XPath expression complexity exceeds {MAX_XPATH_EXPRESSION_COMPLEXITY} tokens"
+        )));
+    }
+    Factory::new()
+        .build(&normalize_function_spacing(source))
+        .map_err(|error| TransformError::XPath(error.to_string()))
+}
+
+fn xpath_expression_complexity(source: &str) -> usize {
+    let mut chars = source.chars().peekable();
+    let mut tokens = 0_usize;
+    while let Some(character) = chars.next() {
+        if character.is_whitespace() {
+            continue;
+        }
+        tokens = tokens.saturating_add(1);
+        if matches!(character, '\'' | '"') {
+            for literal_character in chars.by_ref() {
+                if literal_character == character {
+                    break;
+                }
+            }
+        } else if character.is_alphanumeric() || matches!(character, '_' | ':' | '-' | '.') {
+            while chars
+                .peek()
+                .is_some_and(|next| next.is_alphanumeric() || matches!(next, '_' | ':' | '-' | '.'))
+            {
+                chars.next();
+            }
+        }
+    }
+    tokens
 }
 
 struct Mirror<'d> {
@@ -406,13 +450,6 @@ fn evaluate_expression<'a>(
     here_semantics: XPathHereSemantics,
     here_is_same_document: bool,
 ) -> Result<NodeSet<'a>, TransformError> {
-    if expression.expression().is_empty()
-        || expression.expression().len() > MAX_XPATH_EXPRESSION_BYTES
-    {
-        return Err(TransformError::XPath(format!(
-            "XPath expression length must be between 1 and {MAX_XPATH_EXPRESSION_BYTES} bytes"
-        )));
-    }
     let package = Package::new();
     let target = package.as_document();
     let mirror = Mirror::build(document, target);
@@ -435,10 +472,7 @@ fn evaluate_expression<'a>(
     context.set_function("id", IdFunction);
     context.set_function("lang", LangFunction);
 
-    let source = normalize_function_spacing(expression.expression());
-    let xpath = Factory::new()
-        .build(&source)
-        .map_err(|error| TransformError::XPath(error.to_string()))?;
+    let xpath = compile_xpath(expression.expression())?;
 
     if wrap_as_filter {
         // XMLDSig evaluates the expression independently for every input node;
