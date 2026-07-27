@@ -7,7 +7,7 @@ use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 
 use crate::c14n::{C14nAlgorithm, C14nMode};
 
-use super::transforms::MAX_XPATH_FILTERS;
+use super::transforms::{MAX_TRANSFORMS_PER_REFERENCE, MAX_XPATH_FILTERS};
 use super::{
     BASE64_TRANSFORM_URI, DigestAlgorithm, ENVELOPED_SIGNATURE_URI, SignatureAlgorithm, Transform,
     XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI, XPathExpression,
@@ -39,6 +39,14 @@ pub enum SignatureBuilderError {
     /// XMLDSig requires at least one reference in SignedInfo.
     #[error("a signature template requires at least one Reference")]
     MissingReference,
+    /// A reference exceeded the transform-chain limit shared with execution.
+    #[error("transform chain contains {count} transforms; maximum is {max}")]
+    TooManyTransforms {
+        /// Number of transforms supplied by the caller.
+        count: usize,
+        /// Maximum transforms accepted by parsing and execution.
+        max: usize,
+    },
     /// XPath Filter 2.0 requires a non-empty, bounded expression sequence.
     #[error("XPath Filter 2.0 requires between 1 and {max} expressions, got {count}")]
     InvalidXPathFilterCount {
@@ -222,6 +230,14 @@ impl SignatureBuilder {
         }
         if self.references.is_empty() {
             return Err(SignatureBuilderError::MissingReference);
+        }
+        for reference in &self.references {
+            if reference.transforms.len() > MAX_TRANSFORMS_PER_REFERENCE {
+                return Err(SignatureBuilderError::TooManyTransforms {
+                    count: reference.transforms.len(),
+                    max: MAX_TRANSFORMS_PER_REFERENCE,
+                });
+            }
         }
         for filters in self
             .references
