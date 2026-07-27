@@ -7,6 +7,7 @@ use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 
 use crate::c14n::{C14nAlgorithm, C14nMode};
 
+use super::transforms::MAX_XPATH_FILTERS;
 use super::{
     BASE64_TRANSFORM_URI, DigestAlgorithm, ENVELOPED_SIGNATURE_URI, SignatureAlgorithm, Transform,
     XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI, XPathExpression,
@@ -38,6 +39,14 @@ pub enum SignatureBuilderError {
     /// XMLDSig requires at least one reference in SignedInfo.
     #[error("a signature template requires at least one Reference")]
     MissingReference,
+    /// XPath Filter 2.0 requires a non-empty, bounded expression sequence.
+    #[error("XPath Filter 2.0 requires between 1 and {max} expressions, got {count}")]
+    InvalidXPathFilterCount {
+        /// Number of expressions supplied by the caller.
+        count: usize,
+        /// Maximum expression count accepted by parsing and execution.
+        max: usize,
+    },
     /// SHA-1 algorithms are available for verification but not new signatures.
     #[error("algorithm is not allowed for signing: {0}")]
     SigningAlgorithmDisabled(&'static str),
@@ -213,6 +222,22 @@ impl SignatureBuilder {
         }
         if self.references.is_empty() {
             return Err(SignatureBuilderError::MissingReference);
+        }
+        for filters in self
+            .references
+            .iter()
+            .flat_map(|reference| reference.transforms.iter())
+            .filter_map(|transform| match transform {
+                Transform::XPathFilter2(filters) => Some(filters),
+                _ => None,
+            })
+        {
+            if filters.is_empty() || filters.len() > MAX_XPATH_FILTERS {
+                return Err(SignatureBuilderError::InvalidXPathFilterCount {
+                    count: filters.len(),
+                    max: MAX_XPATH_FILTERS,
+                });
+            }
         }
         for (prefix, uri, shares_signature_namespace) in
             self.references.iter().flat_map(|reference| {
