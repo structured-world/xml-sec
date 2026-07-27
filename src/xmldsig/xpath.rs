@@ -20,7 +20,7 @@ use crate::c14n::prefix::{attribute_prefix, element_prefix};
 
 const ALL_XPATH_NODES: &str = "//. | //@* | //namespace::*";
 /// Bound ordinary XMLDSig XPath's per-node evaluation loop before user XPath runs.
-const MAX_XPATH_PER_NODE_EVALUATIONS: usize = 1_024;
+const MAX_XPATH_PER_NODE_EVALUATIONS: usize = 4_096;
 /// Namespace URI permanently bound to the reserved `xml` prefix.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -611,7 +611,10 @@ mod tests {
     fn xpath_filter_rejects_oversized_per_node_evaluation() {
         // XMLDSig re-evaluates ordinary XPath for every node, so allowing an
         // expression that scans a larger document would permit quadratic work.
-        let xml = format!("<root>{}</root>", "<item/>".repeat(1_025));
+        let xml = format!(
+            "<root>{}</root>",
+            "<item/>".repeat(MAX_XPATH_PER_NODE_EVALUATIONS + 1)
+        );
         let doc = Document::parse(&xml).unwrap();
         let error = apply_xpath_filter(
             NodeSet::entire_document_without_comments(&doc),
