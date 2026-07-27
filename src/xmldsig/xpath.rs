@@ -681,6 +681,27 @@ mod tests {
     }
 
     #[test]
+    fn xpath_filter_caps_only_input_node_set_contexts() {
+        // Same-document references may select a small ID subtree inside a much
+        // larger document. Nodes outside that input are not XPath contexts.
+        let xml = format!(
+            "<root><target Id=\"selected\"><child/></target>{}</root>",
+            "<outside/>".repeat(MAX_XPATH_PER_NODE_EVALUATIONS + 1)
+        );
+        let doc = Document::parse(&xml).unwrap();
+        let target = doc
+            .descendants()
+            .find(|node| node.attribute("Id") == Some("selected"))
+            .unwrap();
+        let input = NodeSet::subtree(target).unwrap();
+        let result = apply_xpath_filter(input, &XPathExpression::new("true()"))
+            .expect("small input subtree must not inherit the document context count");
+
+        assert!(result.contains(target));
+        assert!(result.contains(target.first_element_child().unwrap()));
+    }
+
+    #[test]
     fn xpath_filter_rejects_excessive_cumulative_evaluation_work() {
         // This document stays below the per-node call-count cap, but repeated
         // evaluation over its full context would still exceed the aggregate
