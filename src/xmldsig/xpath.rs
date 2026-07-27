@@ -600,6 +600,22 @@ mod tests {
     }
 
     #[test]
+    fn xpath_filter_rejects_oversized_per_node_evaluation() {
+        // XMLDSig re-evaluates ordinary XPath for every node, so allowing an
+        // expression that scans a larger document would permit quadratic work.
+        let xml = format!("<root>{}</root>", "<item/>".repeat(1_025));
+        let doc = Document::parse(&xml).unwrap();
+        let error = apply_xpath_filter(
+            NodeSet::entire_document_without_comments(&doc),
+            &XPathExpression::new("count(//*) >= 0"),
+        )
+        .err()
+        .expect("oversized per-node XPath evaluation must fail before execution");
+
+        assert!(matches!(error, TransformError::XPath(_)));
+    }
+
+    #[test]
     fn filter2_expands_selected_elements_to_subtrees() {
         // Filter 2.0 selection of an element includes all descendants,
         // attributes, and in-scope namespace nodes before set operations.
