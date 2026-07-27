@@ -54,6 +54,8 @@ pub const MAX_TRANSFORMS_PER_REFERENCE: usize = 64;
 const ENVELOPED_SIGNATURE_XPATH_EXPR: &str = "not(ancestor-or-self::dsig:Signature)";
 pub(super) const MAX_XPATH_EXPRESSION_BYTES: usize = 16 * 1024;
 pub(super) const MAX_XPATH_FILTERS: usize = 64;
+const MAX_XPATH_NAMESPACE_BINDINGS: usize = 1_024;
+const MAX_XPATH_NAMESPACE_BYTES: usize = 64 * 1024;
 
 /// Namespace URI for Exclusive C14N `<InclusiveNamespaces>` elements.
 const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
@@ -508,6 +510,7 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
     }
 
     let mut chain = Vec::new();
+    let mut xpath_namespace_budget = XPathNamespaceBudget::default();
 
     for child in transforms_node.children() {
         if !child.is_element() {
@@ -535,9 +538,9 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
             validate_empty_transform(child, "Base64")?;
             Transform::Base64Decode
         } else if uri == XPATH_TRANSFORM_URI {
-            parse_xpath_transform(child)?
+            parse_xpath_transform_with_budget(child, &mut xpath_namespace_budget)?
         } else if uri == XPATH_FILTER2_TRANSFORM_URI {
-            parse_xpath_filter2_transform(child)?
+            parse_xpath_filter2_transform(child, &mut xpath_namespace_budget)?
         } else if let Some(mut algo) = C14nAlgorithm::from_uri(uri) {
             // For exclusive C14N, check for InclusiveNamespaces child
             if algo.mode() == c14n::C14nMode::Exclusive1_0
@@ -575,7 +578,15 @@ fn validate_empty_transform(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn parse_xpath_transform(transform_node: Node) -> Result<Transform, TransformError> {
+    parse_xpath_transform_with_budget(transform_node, &mut XPathNamespaceBudget::default())
+}
+
+fn parse_xpath_transform_with_budget(
+    transform_node: Node,
+    namespace_budget: &mut XPathNamespaceBudget,
+) -> Result<Transform, TransformError> {
     let mut xpath_node = None;
 
     for child in transform_node.children() {
@@ -615,7 +626,7 @@ pub(super) fn parse_xpath_transform(transform_node: Node) -> Result<Transform, T
             "XMLDSig <XPath> does not allow attributes".into(),
         ));
     }
-    let xpath = parse_xpath_expression(xpath_node, transform_node.id())?;
+    let xpath = parse_xpath_expression(xpath_node, transform_node.id(), namespace_budget)?;
 
     if xpath.expression() == ENVELOPED_SIGNATURE_XPATH_EXPR
         && xpath.namespaces().get("dsig").map(String::as_str) == Some(XMLDSIG_NS)
@@ -626,7 +637,10 @@ pub(super) fn parse_xpath_transform(transform_node: Node) -> Result<Transform, T
     }
 }
 
-fn parse_xpath_filter2_transform(transform_node: Node) -> Result<Transform, TransformError> {
+fn parse_xpath_filter2_transform(
+    transform_node: Node,
+    namespace_budget: &mut XPathNamespaceBudget,
+) -> Result<Transform, TransformError> {
     let mut filters = Vec::new();
     for child in transform_node.children() {
         if child.is_text() && child.text().is_some_and(is_xml_whitespace_only) {
@@ -666,7 +680,7 @@ fn parse_xpath_filter2_transform(transform_node: Node) -> Result<Transform, Tran
         };
         filters.push(XPathFilter::new(
             operation,
-            parse_xpath_expression(child, transform_node.id())?,
+            parse_xpath_expression(child, transform_node.id(), namespace_budget)?,
         ));
     }
     if filters.is_empty() {
@@ -680,6 +694,7 @@ fn parse_xpath_filter2_transform(transform_node: Node) -> Result<Transform, Tran
 fn parse_xpath_expression(
     xpath_node: Node,
     transform_node: roxmltree::NodeId,
+    namespace_budget: &mut XPathNamespaceBudget,
 ) -> Result<XPathExpression, TransformError> {
     let mut source = String::new();
     for child in xpath_node.children() {
@@ -719,12 +734,41 @@ fn parse_xpath_expression(
     };
     for namespace in xpath_node.namespaces() {
         if let Some(prefix) = namespace.name() {
+            namespace_budget.charge(prefix, namespace.uri())?;
             xpath
                 .namespaces
                 .insert(prefix.to_owned(), namespace.uri().to_owned());
         }
     }
     Ok(xpath)
+}
+
+#[derive(Default)]
+struct XPathNamespaceBudget {
+    bindings: usize,
+    bytes: usize,
+}
+
+impl XPathNamespaceBudget {
+    fn charge(&mut self, prefix: &str, uri: &str) -> Result<(), TransformError> {
+        self.bindings = self.bindings.checked_add(1).ok_or_else(Self::error)?;
+        self.bytes = self
+            .bytes
+            .checked_add(prefix.len())
+            .and_then(|bytes| bytes.checked_add(uri.len()))
+            .ok_or_else(Self::error)?;
+        if self.bindings > MAX_XPATH_NAMESPACE_BINDINGS || self.bytes > MAX_XPATH_NAMESPACE_BYTES {
+            return Err(Self::error());
+        }
+        Ok(())
+    }
+
+    fn error() -> TransformError {
+        TransformError::XPath(format!(
+            "XPath namespace binding budget exceeds {MAX_XPATH_NAMESPACE_BINDINGS} entries or \
+             {MAX_XPATH_NAMESPACE_BYTES} bytes per transform chain"
+        ))
+    }
 }
 
 /// Parse the `PrefixList` attribute from an `<ec:InclusiveNamespaces>` child
