@@ -64,6 +64,23 @@ fn empty_uri_with_namespaces() {
     );
 }
 
+#[test]
+fn empty_uri_rejects_quadratic_namespace_materialization() {
+    // In-scope namespace nodes are projected for every owner element. Bound the
+    // N-declarations-by-N-elements product before allocating the backing set.
+    let namespaces = (0..257)
+        .map(|index| format!(r#" xmlns:n{index}="urn:{index}""#))
+        .collect::<String>();
+    let xml = format!("<root{namespaces}>{}</root>", "<item/>".repeat(257));
+    let document = roxmltree::Document::parse(&xml).expect("generated XML must parse");
+    let error = UriReferenceResolver::new(&document)
+        .dereference("")
+        .err()
+        .expect("oversized namespace projection must fail before materialization");
+
+    assert!(error.to_string().contains("node-set materialization"));
+}
+
 // ─── #id: subtree by ID ─────────────────────────────────────────────────────
 
 #[test]
