@@ -3,6 +3,7 @@ use xml_sec::xmldsig::{
     DigestAlgorithm, ReferenceBuilder, SignatureAlgorithm, SignatureBuilder, SignatureBuilderError,
     Transform, XPathExpression, XPathFilter, XPathFilterOperation, parse_transforms,
 };
+use xml_sec::xmldsig::transforms::MAX_TRANSFORMS_PER_REFERENCE;
 
 const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
@@ -131,6 +132,22 @@ fn rejects_incomplete_or_unsafe_signing_templates() {
         sha1_digest,
         SignatureBuilderError::SigningAlgorithmDisabled(_)
     ));
+}
+
+#[test]
+fn rejects_transform_chains_that_execution_cannot_accept() {
+    // A builder-produced template must remain parseable and executable by the
+    // same crate instead of deferring an oversized chain failure until signing.
+    let mut reference = ReferenceBuilder::new(DigestAlgorithm::Sha256);
+    for _ in 0..=MAX_TRANSFORMS_PER_REFERENCE {
+        reference = reference.transform(Transform::Enveloped);
+    }
+    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(reference)
+        .build_template()
+        .expect_err("builder must reject an oversized transform chain");
+
+    assert!(error.to_string().contains("transform chain"));
 }
 
 #[test]
