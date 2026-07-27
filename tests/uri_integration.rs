@@ -4,6 +4,7 @@
 //! a predicate for C14N, produces the correct canonical output.
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
+use xml_sec::xmldsig::NodeSet;
 use xml_sec::xmldsig::uri::UriReferenceResolver;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -79,6 +80,12 @@ fn empty_uri_rejects_quadratic_namespace_materialization() {
     };
 
     assert!(error.to_string().contains("node-set materialization"));
+
+    let direct_error = match NodeSet::entire_document_without_comments(&document) {
+        Err(error) => error,
+        Ok(_) => panic!("public constructors must enforce the materialization budget"),
+    };
+    assert!(direct_error.to_string().contains("node-set materialization"));
 }
 
 // ─── #id: subtree by ID ─────────────────────────────────────────────────────
