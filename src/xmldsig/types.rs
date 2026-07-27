@@ -416,7 +416,8 @@ mod tests {
         // stale flag merely because comments were seen while materializing.
         let document = Document::parse("<root><!-- excluded --><child/></root>")
             .expect("fixed comment fixture must parse");
-        let nodes = NodeSet::entire_document_without_comments(&document).unwrap();
+        let nodes = NodeSet::entire_document_without_comments(&document)
+            .expect("fixed fixture must fit the node-set materialization budget");
         let comment = document
             .descendants()
             .find(|node| node.is_comment())
