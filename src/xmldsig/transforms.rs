@@ -29,7 +29,8 @@ use super::parse::XMLDSIG_NS;
 use super::types::{TransformData, TransformError};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 use super::xpath::{
-    apply_xpath_filter_with_semantics, apply_xpath_filter2_with_semantics, compile_xpath,
+    XPathDocumentRelation, XPathWorkBudget, apply_xpath_filter_with_semantics,
+    apply_xpath_filter2_with_semantics, compile_xpath,
 };
 use crate::c14n::{self, C14nAlgorithm};
 
@@ -78,6 +79,20 @@ pub enum XPathHereSemantics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransformOptions {
     xpath_here_semantics: XPathHereSemantics,
+}
+
+#[derive(Default)]
+pub(crate) struct TransformExecutionBudget {
+    xpath: XPathWorkBudget,
+}
+
+#[cfg(test)]
+impl TransformExecutionBudget {
+    pub(crate) fn with_xpath_limit(limit: usize) -> Self {
+        Self {
+            xpath: XPathWorkBudget::with_limit(limit),
+        }
+    }
 }
 
 impl TransformOptions {
@@ -236,11 +251,13 @@ pub(crate) fn apply_transform<'a>(
     transform: &Transform,
     input: TransformData<'a>,
 ) -> Result<TransformData<'a>, TransformError> {
+    let budget = TransformExecutionBudget::default();
     apply_transform_with_options(
         signature_node,
         transform,
         input,
         TransformOptions::default(),
+        &budget,
     )
 }
 
@@ -249,6 +266,7 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
     transform: &Transform,
     input: TransformData<'d>,
     options: TransformOptions,
+    budget: &TransformExecutionBudget,
 ) -> Result<TransformData<'d>, TransformError> {
     match transform {
         Transform::Enveloped => {
@@ -283,22 +301,26 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
         }
         Transform::XPath(xpath) => {
             let nodes = input.into_node_set()?;
-            let here_is_same_document = std::ptr::eq(signature_node.document(), nodes.document());
+            let document_relation =
+                XPathDocumentRelation::between(signature_node.document(), nodes.document());
             Ok(TransformData::NodeSet(apply_xpath_filter_with_semantics(
                 nodes,
                 xpath,
                 options.here_semantics(),
-                here_is_same_document,
+                document_relation,
+                &budget.xpath,
             )?))
         }
         Transform::XPathFilter2(filters) => {
             let nodes = input.into_node_set()?;
-            let here_is_same_document = std::ptr::eq(signature_node.document(), nodes.document());
+            let document_relation =
+                XPathDocumentRelation::between(signature_node.document(), nodes.document());
             Ok(TransformData::NodeSet(apply_xpath_filter2_with_semantics(
                 nodes,
                 filters,
                 options.here_semantics(),
-                here_is_same_document,
+                document_relation,
+                &budget.xpath,
             )?))
         }
         Transform::C14n(algo) => {
@@ -384,8 +406,25 @@ pub fn execute_transforms_with_options<'a>(
     transforms: &[Transform],
     options: TransformOptions,
 ) -> Result<Vec<u8>, TransformError> {
+    let budget = TransformExecutionBudget::default();
+    execute_transforms_with_options_and_budget(
+        signature_node,
+        initial_data,
+        transforms,
+        options,
+        &budget,
+    )
+}
+
+pub(crate) fn execute_transforms_with_options_and_budget<'a>(
+    signature_node: Node<'a, 'a>,
+    initial_data: TransformData<'a>,
+    transforms: &[Transform],
+    options: TransformOptions,
+    budget: &TransformExecutionBudget,
+) -> Result<Vec<u8>, TransformError> {
     ensure_transform_count(transforms.len())?;
-    execute_transform_chain(signature_node, initial_data, transforms, options)
+    execute_transform_chain(signature_node, initial_data, transforms, options, budget)
 }
 
 fn ensure_transform_count(count: usize) -> Result<(), TransformError> {
@@ -402,6 +441,7 @@ fn execute_transform_chain<'s, 'd>(
     data: TransformData<'d>,
     transforms: &[Transform],
     options: TransformOptions,
+    budget: &TransformExecutionBudget,
 ) -> Result<Vec<u8>, TransformError> {
     let Some((transform, remaining)) = transforms.split_first() else {
         return finalize_transform_data(data);
@@ -422,11 +462,12 @@ fn execute_transform_chain<'s, 'd>(
             TransformData::NodeSet(nodes),
             transforms,
             options,
+            budget,
         );
     }
 
-    let data = apply_transform_with_options(signature_node, transform, data, options)?;
-    execute_transform_chain(signature_node, data, remaining, options)
+    let data = apply_transform_with_options(signature_node, transform, data, options, budget)?;
+    execute_transform_chain(signature_node, data, remaining, options, budget)
 }
 
 fn decode_xml_octets(bytes: &[u8]) -> Result<Cow<'_, str>, TransformError> {
@@ -769,6 +810,30 @@ impl XPathNamespaceBudget {
              {MAX_XPATH_NAMESPACE_BYTES} bytes per transform chain"
         ))
     }
+}
+
+pub(crate) fn validate_xpath_namespace_budget(
+    transforms: &[Transform],
+) -> Result<(), TransformError> {
+    let mut budget = XPathNamespaceBudget::default();
+    for transform in transforms {
+        match transform {
+            Transform::XPath(xpath) => {
+                for (prefix, uri) in xpath.namespaces() {
+                    budget.charge(prefix, uri)?;
+                }
+            }
+            Transform::XPathFilter2(filters) => {
+                for filter in filters {
+                    for (prefix, uri) in filter.xpath().namespaces() {
+                        budget.charge(prefix, uri)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Parse the `PrefixList` attribute from an `<ec:InclusiveNamespaces>` child

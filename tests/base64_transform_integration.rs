@@ -285,8 +285,12 @@ fn decoded_xml_rejects_here_from_the_signature_document() {
         .sign_with_builder(&document, &builder)
         .expect_err("cross-document here() must fail closed");
 
-    assert!(matches!(
-        error,
-        SigningError::Digest(SigningDigestError::Transform(TransformError::XPath(_)))
-    ));
+    let SigningError::Digest(SigningDigestError::Transform(TransformError::XPath(message))) = error
+    else {
+        panic!("expected cross-document XPath error");
+    };
+    assert!(
+        message.contains("same XML document"),
+        "error must state the normative cross-document here() requirement: {message}"
+    );
 }

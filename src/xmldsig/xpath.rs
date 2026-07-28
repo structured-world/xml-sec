@@ -5,7 +5,9 @@
 //! bidirectional node map so the result can be projected back onto the
 //! original document without serializing and reparsing signed input.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::rc::Rc;
 
 use roxmltree::{Document, NodeId};
 use sxd_document_no_unsafe::{Package, QName, dom};
@@ -28,6 +30,47 @@ const MAX_XPATH_CUMULATIVE_EVALUATION_WORK: usize = 6_000_000;
 const MAX_XPATH_EXPRESSION_COMPLEXITY: usize = 256;
 /// Namespace URI permanently bound to the reserved `xml` prefix.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+
+#[derive(Clone)]
+pub(super) struct XPathWorkBudget {
+    remaining: Rc<Cell<usize>>,
+}
+
+impl Default for XPathWorkBudget {
+    fn default() -> Self {
+        Self {
+            remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
+        }
+    }
+}
+
+impl XPathWorkBudget {
+    #[cfg(test)]
+    pub(super) fn with_limit(limit: usize) -> Self {
+        Self {
+            remaining: Rc::new(Cell::new(limit)),
+        }
+    }
+
+    fn charge(&self, work: usize) -> Result<(), TransformError> {
+        let remaining = self.remaining.get();
+        let Some(next) = remaining.checked_sub(work) else {
+            self.remaining.set(0);
+            return Err(TransformError::XPath(format!(
+                "XPath transform exceeds signature-wide cumulative evaluation work budget of \
+                 {MAX_XPATH_CUMULATIVE_EVALUATION_WORK} node-evaluations"
+            )));
+        };
+        self.remaining.set(next);
+        Ok(())
+    }
+
+    fn charge_function(&self, work: usize) -> Result<(), function::Error> {
+        self.charge(work).map_err(|error| function::Error::Other {
+            what: error.to_string(),
+        })
+    }
+}
 
 /// SXD's tokenizer rejects otherwise valid whitespace between a function QName
 /// and `(`. Normalize only that token boundary, preserving quoted literals and
@@ -332,7 +375,13 @@ impl<'d> Mirror<'d> {
 /// caller's standards/compatibility policy. A child-index path is owned by the
 /// function because SXD requires registered functions to be `'static`.
 struct HereFunction {
-    path: Option<Vec<usize>>,
+    context: HereContext,
+}
+
+enum HereContext {
+    Path(Vec<usize>),
+    CrossDocument,
+    MissingParameterNode,
 }
 
 impl function::Function for HereFunction {
@@ -342,10 +391,21 @@ impl function::Function for HereFunction {
         args: Vec<Value<'d>>,
     ) -> Result<Value<'d>, function::Error> {
         function::Args(args).exactly(0)?;
-        let Some(path) = &self.path else {
-            return Err(function::Error::Other {
-                what: "here() is unavailable for an expression not parsed from XML".into(),
-            });
+        let path = match &self.context {
+            HereContext::Path(path) => path,
+            // XMLDSig XPath and Filter 2.0 require an error when the parameter
+            // carrying the expression belongs to another XML document.
+            HereContext::CrossDocument => {
+                return Err(function::Error::Other {
+                    what: "here() parameter and evaluation context must appear in the same XML document"
+                        .into(),
+                });
+            }
+            HereContext::MissingParameterNode => {
+                return Err(function::Error::Other {
+                    what: "here() requires an XPath expression parsed from an XML parameter".into(),
+                });
+            }
         };
         let mut node = nodeset::Node::Root(context.node.document().root());
         for &index in path {
@@ -366,7 +426,10 @@ impl function::Function for HereFunction {
 /// SXD omits XPath's DTD-aware `id()` function. XMLDSig commonly identifies
 /// elements through `Id`, `ID`, `id`, or `xml:id`, matching this crate's same-
 /// document URI resolver rather than requiring a validating DTD parser.
-struct IdFunction;
+struct IdFunction {
+    work_budget: XPathWorkBudget,
+    document_scan_cost: usize,
+}
 
 impl function::Function for IdFunction {
     fn evaluate<'c, 'd>(
@@ -388,10 +451,14 @@ impl function::Function for IdFunction {
         let identifiers = values
             .iter()
             .flat_map(|value| value.split_ascii_whitespace())
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
         let mut matched = HashMap::new();
         let mut ambiguous = HashSet::new();
         let mut stack = vec![nodeset::Node::Root(context.node.document().root())];
+
+        // The custom id() implementation performs its own full-document scan in
+        // addition to the XPath engine's work, so it must consume the same meter.
+        self.work_budget.charge_function(self.document_scan_cost)?;
 
         while let Some(node) = stack.pop() {
             stack.extend(node.children());
@@ -484,14 +551,35 @@ fn here_path(document: &Document<'_>, here_node: Option<NodeId>) -> Option<Vec<u
     Some(path)
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum XPathDocumentRelation {
+    SameDocument,
+    CrossDocument,
+}
+
+impl XPathDocumentRelation {
+    pub(super) fn between(left: &Document<'_>, right: &Document<'_>) -> Self {
+        if std::ptr::eq(left, right) {
+            Self::SameDocument
+        } else {
+            Self::CrossDocument
+        }
+    }
+}
+
 fn evaluate_expression<'a>(
     input: &NodeSet<'a>,
     expression: &XPathExpression,
     wrap_as_filter: bool,
     here_semantics: XPathHereSemantics,
-    here_is_same_document: bool,
+    document_relation: XPathDocumentRelation,
+    work_budget: &XPathWorkBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
     let document = input.document();
+    let document_size = NodeSet::ensure_subtree_materialization_fits(document.root())?;
+    // Mirroring duplicates the complete source document and builds lookup maps;
+    // charge it before allocating the secondary DOM.
+    work_budget.charge(document_size)?;
     let package = Package::new();
     let target = package.as_document();
     let mirror = Mirror::build(document, target);
@@ -506,12 +594,22 @@ fn evaluate_expression<'a>(
     context.set_function(
         "here",
         HereFunction {
-            path: here_is_same_document
-                .then(|| here_path(document, expression.here_node(here_semantics)))
-                .flatten(),
+            context: match document_relation {
+                XPathDocumentRelation::CrossDocument => HereContext::CrossDocument,
+                XPathDocumentRelation::SameDocument => {
+                    here_path(document, expression.here_node(here_semantics))
+                        .map_or(HereContext::MissingParameterNode, HereContext::Path)
+                }
+            },
         },
     );
-    context.set_function("id", IdFunction);
+    context.set_function(
+        "id",
+        IdFunction {
+            work_budget: work_budget.clone(),
+            document_scan_cost: document_size,
+        },
+    );
     context.set_function("lang", LangFunction);
 
     let xpath = compile_xpath(expression.expression()).map_err(TransformError::XPath)?;
@@ -522,6 +620,7 @@ fn evaluate_expression<'a>(
         let all_nodes_xpath = Factory::new()
             .build(ALL_XPATH_NODES)
             .map_err(|error| TransformError::XPath(error.to_string()))?;
+        work_budget.charge(document_size)?;
         let all_nodes = all_nodes_xpath
             .evaluate(&context, target.root())
             .map_err(|error| TransformError::XPath(error.to_string()))?;
@@ -529,7 +628,6 @@ fn evaluate_expression<'a>(
             unreachable!("the fixed all-nodes XPath expression returns a node-set");
         };
         let all_ordered_nodes = all_nodes.document_order();
-        let document_size = all_ordered_nodes.len();
         let ordered_nodes = all_ordered_nodes
             .into_iter()
             .filter(|node| mirror.input_contains(document, input, node))
@@ -539,26 +637,12 @@ fn evaluate_expression<'a>(
                 "XPath transform input exceeds {MAX_XPATH_PER_NODE_EVALUATIONS} per-node evaluations"
             )));
         }
-        let work_per_evaluation = document_size;
-        let mut cumulative_work = 0_usize;
         let mut selected = nodeset::Nodeset::new();
         for node in ordered_nodes {
             // A user expression may scan the entire document on every call.
             // Charge that worst-case cost before execution so a failure never
             // occurs after performing work beyond the aggregate budget.
-            cumulative_work = cumulative_work
-                .checked_add(work_per_evaluation)
-                .ok_or_else(|| {
-                    TransformError::XPath(
-                        "XPath transform exceeds cumulative evaluation work budget".into(),
-                    )
-                })?;
-            if cumulative_work > MAX_XPATH_CUMULATIVE_EVALUATION_WORK {
-                return Err(TransformError::XPath(format!(
-                    "XPath transform exceeds cumulative evaluation work budget of \
-                     {MAX_XPATH_CUMULATIVE_EVALUATION_WORK} node-evaluations"
-                )));
-            }
+            work_budget.charge(document_size)?;
             let include = xpath
                 .evaluate(&context, node.clone())
                 .map_err(|error| TransformError::XPath(error.to_string()))?
@@ -570,6 +654,7 @@ fn evaluate_expression<'a>(
         return Ok(mirror.project(document, selected, false));
     }
 
+    work_budget.charge(document_size)?;
     let value = xpath
         .evaluate(&context, target.root())
         .map_err(|error| TransformError::XPath(error.to_string()))?;
@@ -586,21 +671,29 @@ pub(super) fn apply_xpath_filter<'a>(
     input: NodeSet<'a>,
     expression: &XPathExpression,
 ) -> Result<NodeSet<'a>, TransformError> {
-    apply_xpath_filter_with_semantics(input, expression, XPathHereSemantics::default(), true)
+    apply_xpath_filter_with_semantics(
+        input,
+        expression,
+        XPathHereSemantics::default(),
+        XPathDocumentRelation::SameDocument,
+        &XPathWorkBudget::default(),
+    )
 }
 
 pub(super) fn apply_xpath_filter_with_semantics<'a>(
     mut input: NodeSet<'a>,
     expression: &XPathExpression,
     here_semantics: XPathHereSemantics,
-    here_is_same_document: bool,
+    document_relation: XPathDocumentRelation,
+    work_budget: &XPathWorkBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
     let selected = evaluate_expression(
         &input,
         expression,
         true,
         here_semantics,
-        here_is_same_document,
+        document_relation,
+        work_budget,
     )?;
     input.intersect_with(&selected);
     Ok(input)
@@ -611,14 +704,21 @@ pub(super) fn apply_xpath_filter2<'a>(
     input: NodeSet<'a>,
     filters: &[XPathFilter],
 ) -> Result<NodeSet<'a>, TransformError> {
-    apply_xpath_filter2_with_semantics(input, filters, XPathHereSemantics::default(), true)
+    apply_xpath_filter2_with_semantics(
+        input,
+        filters,
+        XPathHereSemantics::default(),
+        XPathDocumentRelation::SameDocument,
+        &XPathWorkBudget::default(),
+    )
 }
 
 pub(super) fn apply_xpath_filter2_with_semantics<'a>(
     input: NodeSet<'a>,
     filters: &[XPathFilter],
     here_semantics: XPathHereSemantics,
-    here_is_same_document: bool,
+    document_relation: XPathDocumentRelation,
+    work_budget: &XPathWorkBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
     if filters.is_empty() || filters.len() > MAX_XPATH_FILTERS {
         return Err(TransformError::XPath(format!(
@@ -632,7 +732,8 @@ pub(super) fn apply_xpath_filter2_with_semantics<'a>(
             filter.xpath(),
             false,
             here_semantics,
-            here_is_same_document,
+            document_relation,
+            work_budget,
         )?;
         match filter.operation() {
             XPathFilterOperation::Intersect => result.intersect_with(&selected),
@@ -749,11 +850,35 @@ mod tests {
     }
 
     #[test]
+    fn xpath_rejects_oversized_source_before_building_mirror() {
+        // A small same-document reference must not permit XPath to duplicate an
+        // unrelated source document that exceeds the node-set materialization cap.
+        let xml = format!(
+            "<root><target Id=\"selected\"><child/></target>{}</root>",
+            "<outside/>".repeat(65_537)
+        );
+        let document = Document::parse(&xml).expect("fixed oversized fixture must parse");
+        let target = document
+            .descendants()
+            .find(|node| node.attribute("Id") == Some("selected"))
+            .expect("fixed fixture contains selected subtree");
+
+        let error = apply_xpath_filter(
+            NodeSet::subtree(target).expect("selected subtree fits the node-set budget"),
+            &XPathExpression::new("true()"),
+        )
+        .err()
+        .expect("XPath must reject the source before allocating an oversized mirror");
+
+        assert!(matches!(error, TransformError::NodeSetTooLarge { .. }));
+    }
+
+    #[test]
     fn xpath_filter_rejects_excessive_cumulative_evaluation_work() {
         // This document stays below the per-node call-count cap, but repeated
         // evaluation over its full context would still exceed the aggregate
         // work budget. The check must therefore be independent of node count.
-        let xml = format!("<root>{}</root>", "<item/>".repeat(2_400));
+        let xml = format!("<root>{}</root>", "<item/>".repeat(2_500));
         let doc = Document::parse(&xml).unwrap();
         let error = apply_xpath_filter(
             NodeSet::entire_document_without_comments(&doc).unwrap(),
@@ -763,6 +888,29 @@ mod tests {
         .expect("excessive cumulative XPath evaluation work must fail closed");
 
         assert!(error.to_string().contains("cumulative evaluation work"));
+    }
+
+    #[test]
+    fn xpath_id_scans_consume_the_shared_work_budget() {
+        // Each custom id() call scans the mirrored document in addition to the
+        // XPath engine's own traversal and must therefore consume shared work.
+        let document = Document::parse("<root><item Id=\"selected\"/></root>").unwrap();
+        let input = NodeSet::entire_document_without_comments(&document).unwrap();
+        let budget = XPathWorkBudget::with_limit(15);
+        let error = apply_xpath_filter2_with_semantics(
+            input,
+            &[XPathFilter::new(
+                XPathFilterOperation::Intersect,
+                XPathExpression::new("id('selected') | id('selected')"),
+            )],
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &budget,
+        )
+        .err()
+        .expect("repeated id() scans must exhaust the shared XPath budget");
+
+        assert!(error.to_string().contains("signature-wide"));
     }
 
     #[test]
@@ -1064,11 +1212,13 @@ mod tests {
         let input = TransformData::NodeSet(NodeSet::entire_document_with_comments(&doc).unwrap());
         let options = super::super::transforms::TransformOptions::default()
             .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy);
+        let budget = super::super::transforms::TransformExecutionBudget::default();
         let result = super::super::transforms::apply_transform_with_options(
             doc.root_element(),
             &transform,
             input,
             options,
+            &budget,
         )
         .unwrap()
         .into_node_set()

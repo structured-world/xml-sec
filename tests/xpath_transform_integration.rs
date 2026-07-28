@@ -6,9 +6,9 @@ use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::xmldsig::{
     DEFAULT_IMPLICIT_C14N_URI, DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus,
     FailureReason, ParseError, ReferenceBuilder, ReferenceProcessingError, RsaSigningKey,
-    SignContext, SignatureAlgorithm, SignatureBuilder, Transform, TransformError, VerifyContext,
-    X509CertificateKeyInfoWriter, XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI,
-    XPathExpression, XPathFilter, XPathFilterOperation, XPathHereSemantics,
+    SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError, Transform,
+    TransformError, VerifyContext, X509CertificateKeyInfoWriter, XPATH_FILTER2_TRANSFORM_URI,
+    XPATH_TRANSFORM_URI, XPathExpression, XPathFilter, XPathFilterOperation, XPathHereSemantics,
 };
 
 const DOCUMENT: &str = r#"<root>
@@ -235,4 +235,31 @@ fn here_semantics_are_explicit_across_signing_and_verification() {
         wrong_standard_result.status,
         DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
     );
+}
+
+#[test]
+fn signing_shares_xpath_work_across_references() {
+    // Each Reference is below the per-transform limit, but resetting the meter
+    // between References would allow aggregate work to grow with signature size.
+    let document = format!("<root>{}</root>", "<item/>".repeat(1_000));
+    let mut builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256);
+    for _ in 0..6 {
+        builder = builder.add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("")
+                .transform(Transform::XPath(XPathExpression::new("true()"))),
+        );
+    }
+    let (key, key_info) = signing_material();
+
+    let error = SignContext::new(&key)
+        .key_info_writer(&key_info)
+        .sign_with_builder(&document, &builder)
+        .expect_err("aggregate XPath work must fail before signing");
+
+    assert!(matches!(
+        error,
+        SigningError::Digest(SigningDigestError::Transform(TransformError::XPath(message)))
+            if message.contains("signature-wide")
+    ));
 }

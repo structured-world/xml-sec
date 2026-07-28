@@ -7,7 +7,10 @@ use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 
 use crate::c14n::{C14nAlgorithm, C14nMode};
 
-use super::transforms::{MAX_TRANSFORMS_PER_REFERENCE, MAX_XPATH_FILTERS};
+use super::parse::MAX_REFERENCES_PER_SIGNATURE;
+use super::transforms::{
+    MAX_TRANSFORMS_PER_REFERENCE, MAX_XPATH_FILTERS, validate_xpath_namespace_budget,
+};
 use super::xpath::compile_xpath;
 use super::{
     BASE64_TRANSFORM_URI, DigestAlgorithm, ENVELOPED_SIGNATURE_URI, SignatureAlgorithm, Transform,
@@ -40,6 +43,14 @@ pub enum SignatureBuilderError {
     /// XMLDSig requires at least one reference in SignedInfo.
     #[error("a signature template requires at least one Reference")]
     MissingReference,
+    /// A template declared more references than signing and verification accept.
+    #[error("signature template contains {count} references; maximum is {max}")]
+    TooManyReferences {
+        /// Number of references supplied by the caller.
+        count: usize,
+        /// Maximum references accepted for one signature.
+        max: usize,
+    },
     /// A reference exceeded the transform-chain limit shared with execution.
     #[error("transform chain contains {count} transforms; maximum is {max}")]
     TooManyTransforms {
@@ -235,6 +246,12 @@ impl SignatureBuilder {
         if self.references.is_empty() {
             return Err(SignatureBuilderError::MissingReference);
         }
+        if self.references.len() > MAX_REFERENCES_PER_SIGNATURE {
+            return Err(SignatureBuilderError::TooManyReferences {
+                count: self.references.len(),
+                max: MAX_REFERENCES_PER_SIGNATURE,
+            });
+        }
         for reference in &self.references {
             if reference.transforms.len() > MAX_TRANSFORMS_PER_REFERENCE {
                 return Err(SignatureBuilderError::TooManyTransforms {
@@ -263,6 +280,8 @@ impl SignatureBuilder {
                     _ => {}
                 }
             }
+            validate_xpath_namespace_budget(&reference.transforms)
+                .map_err(|error| SignatureBuilderError::InvalidXPath(error.to_string()))?;
         }
         for (prefix, uri, shares_signature_namespace) in
             self.references.iter().flat_map(|reference| {

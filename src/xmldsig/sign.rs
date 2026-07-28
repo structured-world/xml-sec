@@ -28,10 +28,12 @@ use super::mutation::{
     XmlMutationError, append_signature_to_root, fill_key_info, fill_signature_value,
     fill_signed_info_digest_values,
 };
-use super::parse::{SignatureAlgorithm, XMLDSIG_NS, parse_signed_info};
+use super::parse::{
+    MAX_REFERENCES_PER_SIGNATURE, SignatureAlgorithm, XMLDSIG_NS, parse_signed_info,
+};
 use super::transforms::{
-    Transform, TransformOptions, XPathHereSemantics, execute_transforms_with_options,
-    parse_transforms,
+    Transform, TransformExecutionBudget, TransformOptions, XPathHereSemantics,
+    execute_transforms_with_options_and_budget, parse_transforms,
 };
 use super::types::TransformError;
 use super::uri::UriReferenceResolver;
@@ -560,17 +562,19 @@ fn compute_reference_digest_values_with_options(
     let signed_info = find_required_child(signature, "SignedInfo")?;
     let references = parse_signing_references(signed_info)?;
     let resolver = UriReferenceResolver::new(&doc);
+    let execution_budget = TransformExecutionBudget::default();
 
     references
         .into_iter()
         .enumerate()
         .map(|(index, reference)| {
             let initial_data = resolver.dereference(&reference.uri)?;
-            let pre_digest = execute_transforms_with_options(
+            let pre_digest = execute_transforms_with_options_and_budget(
                 signature,
                 initial_data,
                 &reference.transforms,
                 transform_options,
+                &execution_budget,
             )?;
             let digest = compute_digest(reference.digest_method, &pre_digest);
             let digest_value = base64::engine::general_purpose::STANDARD.encode(digest);
@@ -670,6 +674,11 @@ fn parse_signing_references(
 
     let mut references = Vec::new();
     for child in children {
+        if references.len() == MAX_REFERENCES_PER_SIGNATURE {
+            return Err(SigningDigestError::InvalidStructure(format!(
+                "SignedInfo contains more than {MAX_REFERENCES_PER_SIGNATURE} Reference elements"
+            )));
+        }
         verify_ds_element(child, "Reference")?;
         references.push(parse_signing_reference(child)?);
     }

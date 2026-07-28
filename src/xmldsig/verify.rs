@@ -17,14 +17,17 @@ use std::collections::HashSet;
 use crate::c14n::canonicalize;
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
-use super::parse::{KeyInfo, ParseError, Reference, SignatureAlgorithm, XMLDSIG_NS};
+use super::parse::{
+    KeyInfo, MAX_REFERENCES_PER_SIGNATURE, ParseError, Reference, SignatureAlgorithm, XMLDSIG_NS,
+};
 use super::parse::{parse_key_info, parse_reference, parse_signed_info};
 use super::signature::{
     SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
 };
 use super::transforms::{
-    BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, Transform, TransformOptions,
-    XPATH_TRANSFORM_URI, XPathHereSemantics, execute_transforms_with_options,
+    BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget,
+    TransformOptions, XPATH_TRANSFORM_URI, XPathHereSemantics,
+    execute_transforms_with_options_and_budget,
 };
 use super::uri::{UriReferenceResolver, parse_xpointer_id_fragment};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
@@ -385,15 +388,26 @@ pub fn process_reference(
     reference_index: usize,
     store_pre_digest: bool,
 ) -> Result<ReferenceResult, ReferenceProcessingError> {
+    let execution_budget = TransformExecutionBudget::default();
+    let execution = ReferenceExecutionContext {
+        store_pre_digest,
+        transform_options: TransformOptions::default(),
+        transform_budget: &execution_budget,
+    };
     process_reference_with_options(
         reference,
         resolver,
         signature_node,
         reference_set,
         reference_index,
-        store_pre_digest,
-        TransformOptions::default(),
+        &execution,
     )
+}
+
+struct ReferenceExecutionContext<'a> {
+    store_pre_digest: bool,
+    transform_options: TransformOptions,
+    transform_budget: &'a TransformExecutionBudget,
 }
 
 fn process_reference_with_options(
@@ -402,8 +416,7 @@ fn process_reference_with_options(
     signature_node: Node<'_, '_>,
     reference_set: ReferenceSet,
     reference_index: usize,
-    store_pre_digest: bool,
-    transform_options: TransformOptions,
+    execution: &ReferenceExecutionContext<'_>,
 ) -> Result<ReferenceResult, ReferenceProcessingError> {
     // 1. Dereference URI. Omitted URI is distinct from URI="" in XMLDSig and
     // must be rejected until caller-provided external object resolution exists.
@@ -416,11 +429,12 @@ fn process_reference_with_options(
         .map_err(ReferenceProcessingError::UriDereference)?;
 
     // 2. Apply transform chain
-    let pre_digest_bytes = execute_transforms_with_options(
+    let pre_digest_bytes = execute_transforms_with_options_and_budget(
         signature_node,
         initial_data,
         &reference.transforms,
-        transform_options,
+        execution.transform_options,
+        execution.transform_budget,
     )
     .map_err(ReferenceProcessingError::Transform)?;
 
@@ -442,7 +456,7 @@ fn process_reference_with_options(
         uri: uri.to_owned(),
         digest_algorithm: reference.digest_method,
         status,
-        pre_digest_data: if store_pre_digest {
+        pre_digest_data: if execution.store_pre_digest {
             Some(pre_digest_bytes)
         } else {
             None
@@ -467,21 +481,20 @@ pub fn process_all_references(
     signature_node: Node<'_, '_>,
     store_pre_digest: bool,
 ) -> Result<ReferencesResult, ReferenceProcessingError> {
-    process_all_references_with_options(
-        references,
-        resolver,
-        signature_node,
+    let execution_budget = TransformExecutionBudget::default();
+    let execution = ReferenceExecutionContext {
         store_pre_digest,
-        TransformOptions::default(),
-    )
+        transform_options: TransformOptions::default(),
+        transform_budget: &execution_budget,
+    };
+    process_all_references_with_options(references, resolver, signature_node, &execution)
 }
 
 fn process_all_references_with_options(
     references: &[Reference],
     resolver: &UriReferenceResolver<'_>,
     signature_node: Node<'_, '_>,
-    store_pre_digest: bool,
-    transform_options: TransformOptions,
+    execution: &ReferenceExecutionContext<'_>,
 ) -> Result<ReferencesResult, ReferenceProcessingError> {
     let mut results = Vec::with_capacity(references.len());
 
@@ -492,8 +505,7 @@ fn process_all_references_with_options(
             signature_node,
             ReferenceSet::SignedInfo,
             i,
-            store_pre_digest,
-            transform_options,
+            execution,
         )?;
         let failed = matches!(result.status, DsigStatus::Invalid(_));
         results.push(result);
@@ -728,18 +740,29 @@ fn verify_signature_with_context(
     )?;
 
     let resolver = UriReferenceResolver::new(&doc);
+    let execution_budget = TransformExecutionBudget::default();
+    let execution = ReferenceExecutionContext {
+        store_pre_digest: ctx.store_pre_digest,
+        transform_options: ctx.transform_options,
+        transform_budget: &execution_budget,
+    };
     let references = process_all_references_with_options(
         &signed_info.references,
         &resolver,
         signature_node,
-        ctx.store_pre_digest,
-        ctx.transform_options,
+        &execution,
     )?;
 
     let manifest_references = if ctx.process_manifests {
         let signed_info_reference_nodes =
             collect_signed_info_reference_nodes(&signed_info.references, &resolver);
-        process_manifest_references(signature_node, &resolver, ctx, &signed_info_reference_nodes)?
+        process_manifest_references(
+            signature_node,
+            &resolver,
+            ctx,
+            &signed_info_reference_nodes,
+            &execution,
+        )?
     } else {
         Vec::new()
     };
@@ -809,6 +832,7 @@ fn process_manifest_references(
     resolver: &UriReferenceResolver<'_>,
     ctx: &VerifyContext<'_>,
     signed_info_reference_nodes: &HashSet<NodeId>,
+    execution: &ReferenceExecutionContext<'_>,
 ) -> Result<Vec<ReferenceResult>, SignatureVerificationPipelineError> {
     let manifest_references =
         parse_manifest_references(signature_node, signed_info_reference_nodes)?;
@@ -862,8 +886,7 @@ fn process_manifest_references(
             signature_node,
             ReferenceSet::Manifest,
             index,
-            ctx.store_pre_digest,
-            ctx.transform_options,
+            execution,
         ) {
             Ok(result) => results.push(result),
             Err(_) => results.push(manifest_reference_invalid_result(
@@ -940,6 +963,11 @@ fn parse_manifest_references(
                 {
                     return Err(SignatureVerificationPipelineError::InvalidStructure {
                         reason: "Manifest must contain only ds:Reference element children",
+                    });
+                }
+                if references.len() == MAX_REFERENCES_PER_SIGNATURE {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "signed Manifests exceed the per-signature Reference limit",
                     });
                 }
                 references.push(
@@ -2430,6 +2458,48 @@ mod tests {
         assert!(result.all_valid());
         assert_eq!(result.results.len(), 2);
         assert!(result.first_failure.is_none());
+    }
+
+    #[test]
+    fn reference_processing_shares_xpath_work_across_references() {
+        // A signature-wide meter must not reset when processing the next
+        // Reference, even though each transform chain is independently valid.
+        let document = Document::parse("<root/>").unwrap();
+        let resolver = UriReferenceResolver::new(&document);
+        let transform = Transform::XPath(super::super::transforms::XPathExpression::new("true()"));
+        let initial_data = resolver.dereference("").unwrap();
+        let pre_digest = crate::xmldsig::execute_transforms(
+            document.root_element(),
+            initial_data,
+            std::slice::from_ref(&transform),
+        )
+        .unwrap();
+        let digest = compute_digest(DigestAlgorithm::Sha256, &pre_digest);
+        let references = vec![
+            make_reference(
+                "",
+                vec![transform.clone()],
+                DigestAlgorithm::Sha256,
+                digest.clone(),
+            ),
+            make_reference("", vec![transform], DigestAlgorithm::Sha256, digest),
+        ];
+        let budget = TransformExecutionBudget::with_xpath_limit(12);
+        let execution = ReferenceExecutionContext {
+            store_pre_digest: false,
+            transform_options: TransformOptions::default(),
+            transform_budget: &budget,
+        };
+
+        let error = process_all_references_with_options(
+            &references,
+            &resolver,
+            document.root_element(),
+            &execution,
+        )
+        .expect_err("the second Reference must consume the first Reference's XPath work");
+
+        assert!(error.to_string().contains("signature-wide"));
     }
 
     #[test]

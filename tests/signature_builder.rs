@@ -135,6 +135,27 @@ fn rejects_incomplete_or_unsafe_signing_templates() {
 }
 
 #[test]
+fn rejects_too_many_references_before_serialization() {
+    // Builder output must obey the same cardinality bound as strict parsing and
+    // execution instead of producing a template that signing later rejects.
+    let mut builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256);
+    for index in 0..65 {
+        builder = builder.add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(format!("#item-{index}")),
+        );
+    }
+
+    let error = builder
+        .build_template()
+        .expect_err("the builder must reject the 65th Reference");
+
+    assert!(matches!(
+        error,
+        SignatureBuilderError::TooManyReferences { count: 65, max: 64 }
+    ));
+}
+
+#[test]
 fn rejects_transform_chains_that_execution_cannot_accept() {
     // A builder-produced template must remain parseable and executable by the
     // same crate instead of deferring an oversized chain failure until signing.
@@ -177,6 +198,26 @@ fn rejects_xpath_sources_that_parsing_cannot_accept() {
             .expect_err("builder must reject an unusable XPath source");
         assert!(error.to_string().contains("XPath"), "case: {case}");
     }
+}
+
+#[test]
+fn rejects_xpath_namespace_budget_before_serialization() {
+    // Parsing enforces one aggregate namespace budget per Reference. The builder
+    // must reject the same input rather than emit a template that signing reparses.
+    let mut expression = XPathExpression::new("true()");
+    for index in 0..=1_024 {
+        expression = expression.with_namespace(format!("p{index}"), "urn:test");
+    }
+
+    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::XPath(expression)),
+        )
+        .build_template()
+        .expect_err("builder must enforce the parser's aggregate namespace budget");
+
+    assert!(matches!(error, SignatureBuilderError::InvalidXPath(_)));
+    assert!(error.to_string().contains("namespace binding budget"));
 }
 
 #[test]

@@ -292,7 +292,9 @@ impl<'a> NodeSet<'a> {
         set
     }
 
-    fn ensure_subtree_materialization_fits(root: Node<'_, '_>) -> Result<(), TransformError> {
+    pub(crate) fn ensure_subtree_materialization_fits(
+        root: Node<'_, '_>,
+    ) -> Result<usize, TransformError> {
         let mut entries = 0_usize;
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
@@ -318,7 +320,7 @@ impl<'a> NodeSet<'a> {
             }
             stack.extend(node.children());
         }
-        Ok(())
+        Ok(entries)
     }
 
     fn owns(&self, node: Node<'_, '_>) -> bool {

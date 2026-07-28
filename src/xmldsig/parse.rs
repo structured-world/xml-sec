@@ -51,6 +51,7 @@ const MAX_X509_SERIAL_NUMBER_TEXT_LEN: usize = 4096;
 const MAX_X509_DATA_ENTRY_COUNT: usize = 64;
 const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
 const MAX_X509_CHAIN_DEPTH: usize = 9;
+pub(crate) const MAX_REFERENCES_PER_SIGNATURE: usize = 64;
 
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -272,6 +273,13 @@ pub enum ParseError {
     #[error("invalid structure: {0}")]
     InvalidStructure(String),
 
+    /// `<SignedInfo>` declared more references than one signature may process.
+    #[error("SignedInfo contains more than {max} Reference elements")]
+    TooManyReferences {
+        /// Maximum references accepted for one signature.
+        max: usize,
+    },
+
     /// Unsupported algorithm URI.
     #[error("unsupported algorithm: {uri}")]
     UnsupportedAlgorithm {
@@ -355,6 +363,11 @@ pub fn parse_signed_info(signed_info_node: Node) -> Result<SignedInfo, ParseErro
     let mut references = Vec::new();
     for child in children {
         verify_ds_element(child, "Reference")?;
+        if references.len() == MAX_REFERENCES_PER_SIGNATURE {
+            return Err(ParseError::TooManyReferences {
+                max: MAX_REFERENCES_PER_SIGNATURE,
+            });
+        }
         references.push(parse_reference(child)?);
     }
     if references.is_empty() {
@@ -2787,6 +2800,40 @@ BA== </Modulus>
         assert_eq!(si.references[0].digest_method, DigestAlgorithm::Sha256);
         assert_eq!(si.references[1].uri.as_deref(), Some("#b"));
         assert_eq!(si.references[1].digest_method, DigestAlgorithm::Sha1);
+    }
+
+    #[test]
+    fn parse_signed_info_rejects_too_many_references() {
+        // Reference processing shares signature-wide resource budgets, so the
+        // parser must bound cardinality before retaining attacker-controlled entries.
+        let references = (0..=MAX_REFERENCES_PER_SIGNATURE)
+            .map(|index| {
+                format!(
+                    r##"<Reference URI="#item-{index}">
+                        <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                        <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>
+                    </Reference>"##
+                )
+            })
+            .collect::<String>();
+        let xml = format!(
+            r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+                <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+                {references}
+            </SignedInfo>"#
+        );
+        let document = Document::parse(&xml).expect("fixed oversized fixture must parse");
+
+        let error = parse_signed_info(document.root_element())
+            .expect_err("the parser must reject the 65th Reference");
+
+        assert!(matches!(
+            error,
+            ParseError::TooManyReferences {
+                max: MAX_REFERENCES_PER_SIGNATURE
+            }
+        ));
     }
 
     #[test]
