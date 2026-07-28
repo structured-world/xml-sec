@@ -309,6 +309,28 @@ fn rejects_reference_without_uri() {
 }
 
 #[test]
+fn validates_reference_elements_before_reporting_the_cardinality_limit() {
+    // A foreign child after 64 valid References is a structural violation, not
+    // a 65th Reference, and must retain the precise fail-closed error contract.
+    let references = (0..64)
+        .map(|_| {
+            r#"<Reference URI=""><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference>"#
+        })
+        .collect::<String>();
+    let xml = format!(
+        r#"<root><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>{references}<NotAReference/></SignedInfo><SignatureValue/></Signature></root>"#
+    );
+
+    let error = compute_reference_digest_values(&xml)
+        .expect_err("foreign SignedInfo child must fail structural validation");
+
+    assert!(
+        matches!(error, SigningDigestError::InvalidStructure(ref message) if message.contains("Reference"))
+    );
+    assert!(!error.to_string().contains("more than 64"));
+}
+
+#[test]
 fn rejects_sha1_digest_for_signing_template() {
     // SHA-1 remains verify-only. This manually crafted template bypasses the
     // builder, so the digest pass must enforce the same policy before signing.

@@ -674,12 +674,12 @@ fn parse_signing_references(
 
     let mut references = Vec::new();
     for child in children {
+        verify_ds_element(child, "Reference")?;
         if references.len() == MAX_REFERENCES_PER_SIGNATURE {
             return Err(SigningDigestError::InvalidStructure(format!(
                 "SignedInfo contains more than {MAX_REFERENCES_PER_SIGNATURE} Reference elements"
             )));
         }
-        verify_ds_element(child, "Reference")?;
         references.push(parse_signing_reference(child)?);
     }
     if references.is_empty() {
