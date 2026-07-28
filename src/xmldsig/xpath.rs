@@ -23,7 +23,13 @@ use crate::c14n::prefix::{attribute_prefix, element_prefix};
 
 const ALL_XPATH_NODES: &str = "//. | //@* | //namespace::*";
 /// Bound ordinary XMLDSig XPath's per-node evaluation loop before user XPath runs.
-const MAX_XPATH_PER_NODE_EVALUATIONS: usize = 4_096;
+/// Absolute ceiling for context-node evaluations in an ordinary XPath filter.
+///
+/// The signature-wide work budget is intentionally stricter for larger source
+/// documents: an arbitrary expression can traverse the complete mirrored DOM
+/// for every context node, and the XPath engine exposes no interrupt or step
+/// counter that could safely distinguish a cheap expression from an expensive one.
+const MAX_XPATH_CONTEXT_EVALUATIONS: usize = 4_096;
 /// Bound repeated XPath evaluation work, measured as context nodes times calls.
 const MAX_XPATH_CUMULATIVE_EVALUATION_WORK: usize = 6_000_000;
 /// Bound operators, names, literals, and path punctuation in one expression.
@@ -632,9 +638,9 @@ fn evaluate_expression<'a>(
             .into_iter()
             .filter(|node| mirror.input_contains(document, input, node))
             .collect::<Vec<_>>();
-        if ordered_nodes.len() > MAX_XPATH_PER_NODE_EVALUATIONS {
+        if ordered_nodes.len() > MAX_XPATH_CONTEXT_EVALUATIONS {
             return Err(TransformError::XPath(format!(
-                "XPath transform input exceeds {MAX_XPATH_PER_NODE_EVALUATIONS} per-node evaluations"
+                "XPath transform input exceeds {MAX_XPATH_CONTEXT_EVALUATIONS} per-node evaluations"
             )));
         }
         let mut selected = nodeset::Nodeset::new();
@@ -815,7 +821,7 @@ mod tests {
         // expression that scans a larger document would permit quadratic work.
         let xml = format!(
             "<root>{}</root>",
-            "<item/>".repeat(MAX_XPATH_PER_NODE_EVALUATIONS + 1)
+            "<item/>".repeat(MAX_XPATH_CONTEXT_EVALUATIONS + 1)
         );
         let doc = Document::parse(&xml).unwrap();
         let error = apply_xpath_filter(
@@ -834,7 +840,7 @@ mod tests {
         // larger document. Nodes outside that input are not XPath contexts.
         let xml = format!(
             "<root><target Id=\"selected\"><child/></target>{}</root>",
-            "<outside/>".repeat(MAX_XPATH_PER_NODE_EVALUATIONS + 1)
+            "<outside/>".repeat(MAX_XPATH_CONTEXT_EVALUATIONS + 1)
         );
         let doc = Document::parse(&xml).unwrap();
         let target = doc
