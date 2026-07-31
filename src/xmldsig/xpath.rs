@@ -34,6 +34,8 @@ const MAX_XPATH_CONTEXT_EVALUATIONS: usize = 4_096;
 const MAX_XPATH_CUMULATIVE_EVALUATION_WORK: usize = 6_000_000;
 /// Bound operators, names, literals, and path punctuation in one expression.
 const MAX_XPATH_EXPRESSION_COMPLEXITY: usize = 256;
+/// Bound strings copied into SXD before evaluating untrusted XPath.
+const MAX_XPATH_MIRROR_STRING_BYTES: usize = 8 * 1024 * 1024;
 /// Namespace URI permanently bound to the reserved `xml` prefix.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -253,6 +255,65 @@ struct Mirror<'d> {
 }
 
 impl<'d> Mirror<'d> {
+    /// Measures exactly the source strings passed to SXD by [`Self::build`].
+    ///
+    /// Keep this traversal structurally aligned with `build`: unlike the
+    /// node-set budget, it includes character data and attribute values, and
+    /// charges repeated namespace registrations separately.
+    fn projected_string_bytes(source: &Document<'_>) -> Result<usize, TransformError> {
+        let mut projected_bytes = 0_usize;
+        for node in source.descendants().filter(|node| !node.is_root()) {
+            if node.is_element() {
+                projected_bytes = charge_xpath_mirror_bytes(
+                    projected_bytes,
+                    node.tag_name().namespace().map_or(0, str::len),
+                )?;
+                projected_bytes =
+                    charge_xpath_mirror_bytes(projected_bytes, node.tag_name().name().len())?;
+
+                for namespace in node.namespaces() {
+                    projected_bytes = charge_xpath_mirror_bytes(
+                        projected_bytes,
+                        namespace.name().map_or(0, str::len),
+                    )?;
+                    projected_bytes =
+                        charge_xpath_mirror_bytes(projected_bytes, namespace.uri().len())?;
+                    if namespace.name().is_none() {
+                        // Mirror::build stores the default URI both as SXD's
+                        // default namespace and as the empty-prefix axis entry.
+                        projected_bytes =
+                            charge_xpath_mirror_bytes(projected_bytes, namespace.uri().len())?;
+                    }
+                }
+
+                projected_bytes =
+                    charge_xpath_mirror_bytes(projected_bytes, element_prefix(node).len())?;
+                for attribute in node.attributes() {
+                    projected_bytes = charge_xpath_mirror_bytes(
+                        projected_bytes,
+                        attribute.namespace().map_or(0, str::len),
+                    )?;
+                    projected_bytes =
+                        charge_xpath_mirror_bytes(projected_bytes, attribute.name().len())?;
+                    projected_bytes =
+                        charge_xpath_mirror_bytes(projected_bytes, attribute.value().len())?;
+                    projected_bytes = charge_xpath_mirror_bytes(
+                        projected_bytes,
+                        attribute_prefix(node, &attribute).len(),
+                    )?;
+                }
+            } else if node.is_text() || node.is_comment() {
+                projected_bytes =
+                    charge_xpath_mirror_bytes(projected_bytes, node.text().map_or(0, str::len))?;
+            } else if let Some(pi) = node.pi() {
+                projected_bytes = charge_xpath_mirror_bytes(projected_bytes, pi.target.len())?;
+                projected_bytes =
+                    charge_xpath_mirror_bytes(projected_bytes, pi.value.map_or(0, str::len))?;
+            }
+        }
+        Ok(projected_bytes)
+    }
+
     fn build(source: &Document<'_>, target: dom::Document<'d>) -> Self {
         let mut mirror = Self {
             elements: HashMap::new(),
@@ -454,6 +515,20 @@ impl<'d> Mirror<'d> {
                 .is_some_and(|node| input.contains(node)),
         }
     }
+}
+
+fn charge_xpath_mirror_bytes(current: usize, additional: usize) -> Result<usize, TransformError> {
+    let total = current
+        .checked_add(additional)
+        .ok_or(TransformError::XPathMirrorTooLarge {
+            max_bytes: MAX_XPATH_MIRROR_STRING_BYTES,
+        })?;
+    if total > MAX_XPATH_MIRROR_STRING_BYTES {
+        return Err(TransformError::XPathMirrorTooLarge {
+            max_bytes: MAX_XPATH_MIRROR_STRING_BYTES,
+        });
+    }
+    Ok(total)
 }
 
 /// Resolves XML Signature's `here()` function to the node selected by the
@@ -662,8 +737,10 @@ fn evaluate_expression<'a>(
 ) -> Result<NodeSet<'a>, TransformError> {
     let document = input.document();
     let document_size = NodeSet::ensure_subtree_materialization_fits(document.root())?;
-    // Mirroring duplicates the complete source document and builds lookup maps;
-    // charge it before allocating the secondary DOM.
+    // The node-set preflight bounds map cardinality and inherited namespace
+    // amplification. This separate preflight accounts for every string copied
+    // by Mirror::build before allocating the secondary DOM.
+    Mirror::projected_string_bytes(document)?;
     work_budget.charge(document_size)?;
     let package = Package::new();
     let target = package.as_document();
@@ -956,6 +1033,51 @@ mod tests {
         .expect("XPath must reject the source before allocating an oversized mirror");
 
         assert!(matches!(error, TransformError::NodeSetTooLarge { .. }));
+    }
+
+    #[test]
+    fn xpath_rejects_oversized_source_values_before_building_mirror() {
+        // A same-document ID reference can select only a tiny subtree while
+        // XPath still mirrors the complete source. Both text and attribute
+        // values must be rejected before SXD copies their untrusted bytes.
+        let oversized_value = "x".repeat(8 * 1024 * 1024 + 1);
+        let fixtures = [
+            format!("<root><target Id=\"selected\"/><outside>{oversized_value}</outside></root>"),
+            format!("<root><target Id=\"selected\"/><outside value=\"{oversized_value}\"/></root>"),
+        ];
+
+        for xml in fixtures {
+            let document = Document::parse(&xml).expect("fixed oversized fixture must parse");
+            let target = document
+                .descendants()
+                .find(|node| node.attribute("Id") == Some("selected"))
+                .expect("fixed fixture contains the selected subtree");
+
+            let error = apply_xpath_filter(
+                NodeSet::subtree(target).expect("selected subtree fits the node-set budget"),
+                &XPathExpression::new("true()"),
+            )
+            .err()
+            .expect("XPath must reject source values before building the mirror");
+
+            assert!(matches!(error, TransformError::XPathMirrorTooLarge { .. }));
+        }
+    }
+
+    #[test]
+    fn xpath_mirror_projection_counts_every_copied_string() {
+        // This fixture exercises every string-bearing SXD constructor and
+        // mutator used by Mirror::build. The default namespace is counted
+        // twice because SXD stores both its default URI and namespace-axis
+        // registration.
+        let document = Document::parse(
+            r#"<p:root xmlns:p="urn:p" xmlns="urn:d" p:a="value">text<!--comment--><?pi data?></p:root>"#,
+        )
+        .expect("fixed mirror projection fixture must parse");
+
+        let projected_bytes = Mirror::projected_string_bytes(&document)
+            .expect("complete fixed fixture fits the mirror string budget");
+        assert_eq!(projected_bytes, 55);
     }
 
     #[test]

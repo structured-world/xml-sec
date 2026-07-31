@@ -448,6 +448,13 @@ pub enum TransformError {
         max_bytes: usize,
     },
 
+    /// Strings copied into the temporary XPath document would exceed its budget.
+    #[error("XPath mirror exceeds maximum of {max_bytes} copied string bytes")]
+    XPathMirrorTooLarge {
+        /// Maximum string bytes copied into one temporary SXD document.
+        max_bytes: usize,
+    },
+
     /// Canonicalization error during transform.
     #[error("C14N error: {0}")]
     C14n(#[from] crate::c14n::C14nError),
