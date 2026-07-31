@@ -30,7 +30,7 @@ const ALL_XPATH_NODES: &str = "//. | //@* | //namespace::*";
 /// for every context node, and the XPath engine exposes no interrupt or step
 /// counter that could safely distinguish a cheap expression from an expensive one.
 const MAX_XPATH_CONTEXT_EVALUATIONS: usize = 4_096;
-/// Bound repeated XPath evaluation work, measured as context nodes times calls.
+/// Bound conservative XPath evaluator node visits across one signature.
 const MAX_XPATH_CUMULATIVE_EVALUATION_WORK: usize = 6_000_000;
 /// Bound operators, names, literals, and path punctuation in one expression.
 const MAX_XPATH_EXPRESSION_COMPLEXITY: usize = 256;
@@ -164,6 +164,85 @@ fn xpath_expression_complexity(source: &str) -> usize {
         }
     }
     tokens
+}
+
+/// Estimate one XPath evaluation before entering SXD's non-interruptible engine.
+///
+/// One top-level traversal is covered by the baseline document-size charge. A
+/// traversal inside a predicate can run once per node selected by every enclosing
+/// predicate, so its worst-case cost gains one document-size factor per level.
+/// Saturation deliberately turns arithmetic overflow into a budget rejection.
+fn xpath_evaluation_work(source: &str, document_size: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut work = document_size;
+    let mut predicate_depth = 0_usize;
+    let mut quote = None;
+    let mut index = 0_usize;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if matches!(byte, b'\'' | b'"') {
+            if quote == Some(byte) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(byte);
+            }
+            index += 1;
+            continue;
+        }
+        if quote.is_some() {
+            index += 1;
+            continue;
+        }
+
+        match byte {
+            b'[' => predicate_depth = predicate_depth.saturating_add(1),
+            b']' => predicate_depth = predicate_depth.saturating_sub(1),
+            b'/' if predicate_depth > 0 => {
+                work = work.saturating_add(nested_traversal_work(document_size, predicate_depth));
+                if bytes.get(index + 1) == Some(&b'/') {
+                    index += 1;
+                }
+            }
+            b':' if predicate_depth > 0 && bytes.get(index + 1) == Some(&b':') => {
+                let mut axis_start = index;
+                while axis_start > 0 && is_xpath_name_byte(bytes[axis_start - 1]) {
+                    axis_start -= 1;
+                }
+                if is_document_scanning_axis(&source[axis_start..index]) {
+                    work =
+                        work.saturating_add(nested_traversal_work(document_size, predicate_depth));
+                }
+                index += 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    work
+}
+
+fn nested_traversal_work(document_size: usize, predicate_depth: usize) -> usize {
+    (0..=predicate_depth).fold(1_usize, |work, _| work.saturating_mul(document_size))
+}
+
+fn is_xpath_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn is_document_scanning_axis(axis: &str) -> bool {
+    matches!(
+        axis,
+        "ancestor"
+            | "ancestor-or-self"
+            | "descendant"
+            | "descendant-or-self"
+            | "following"
+            | "following-sibling"
+            | "preceding"
+            | "preceding-sibling"
+    )
 }
 
 struct Mirror<'d> {
@@ -619,6 +698,7 @@ fn evaluate_expression<'a>(
     context.set_function("lang", LangFunction);
 
     let xpath = compile_xpath(expression.expression()).map_err(TransformError::XPath)?;
+    let evaluation_work = xpath_evaluation_work(expression.expression(), document_size);
 
     if wrap_as_filter {
         // XMLDSig evaluates the expression independently for every input node;
@@ -645,10 +725,9 @@ fn evaluate_expression<'a>(
         }
         let mut selected = nodeset::Nodeset::new();
         for node in ordered_nodes {
-            // A user expression may scan the entire document on every call.
-            // Charge that worst-case cost before execution so a failure never
-            // occurs after performing work beyond the aggregate budget.
-            work_budget.charge(document_size)?;
+            // SXD exposes no interrupt hook. Charge nested predicate scans
+            // before execution so they cannot hide cubic work inside one call.
+            work_budget.charge(evaluation_work)?;
             let include = xpath
                 .evaluate(&context, node.clone())
                 .map_err(|error| TransformError::XPath(error.to_string()))?
@@ -660,7 +739,7 @@ fn evaluate_expression<'a>(
         return Ok(mirror.project(document, selected, false));
     }
 
-    work_budget.charge(document_size)?;
+    work_budget.charge(evaluation_work)?;
     let value = xpath
         .evaluate(&context, target.root())
         .map_err(|error| TransformError::XPath(error.to_string()))?;
@@ -894,6 +973,40 @@ mod tests {
         .expect("excessive cumulative XPath evaluation work must fail closed");
 
         assert!(error.to_string().contains("cumulative evaluation work"));
+    }
+
+    #[test]
+    fn xpath_filter_charges_nested_document_scans() {
+        // A nested descendant scan runs once for every node visited by the
+        // outer scan, and ordinary XMLDSig XPath repeats that work for every
+        // input context node. Flat document-size accounting misses this cubic
+        // case even though the expression and document are both small.
+        let xml = format!("<root>{}</root>", "<item/>".repeat(20));
+        let document = Document::parse(&xml).unwrap();
+        let budget = XPathWorkBudget::with_limit(1_000);
+        let error = apply_xpath_filter_with_semantics(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &XPathExpression::new("//*[count(//*) > 0]"),
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &budget,
+        )
+        .err()
+        .expect("nested document scans must exhaust the shared XPath budget");
+
+        assert!(error.to_string().contains("cumulative evaluation work"));
+    }
+
+    #[test]
+    fn xpath_work_profile_tracks_nested_paths_but_ignores_literals() {
+        // The preflight meter must recognize both abbreviated paths and named
+        // axes without treating XPath punctuation inside quoted data as work.
+        assert_eq!(xpath_evaluation_work("//*[count(//*) > 0]", 10), 110);
+        assert_eq!(xpath_evaluation_work("//*[ancestor::*]", 10), 110);
+        assert_eq!(
+            xpath_evaluation_work("//*[contains(., '//ancestor::*')]", 10),
+            10
+        );
     }
 
     #[test]

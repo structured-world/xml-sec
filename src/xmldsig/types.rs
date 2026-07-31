@@ -6,10 +6,12 @@
 //! P1-015), and reference processing (P1-018).
 
 use std::collections::HashSet;
+use std::ops::RangeInclusive;
 
 use roxmltree::{Document, Node, NodeId};
 
 const MAX_NODE_SET_ENTRIES: usize = 65_536;
+const MAX_NODE_SET_OWNED_STRING_BYTES: usize = 8 * 1024 * 1024;
 
 use crate::c14n::NodeVisibility;
 
@@ -110,8 +112,9 @@ impl<'a> NodeSet<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`TransformError::NodeSetTooLarge`] when projecting the document's
-    /// tree, attribute, and namespace nodes would exceed the materialization budget.
+    /// Returns [`TransformError::NodeSetTooLarge`] or
+    /// [`TransformError::NodeSetStringsTooLarge`] when projecting the document's
+    /// tree, attribute, namespace, or owned string data would exceed its budget.
     pub fn entire_document_without_comments(doc: &'a Document<'a>) -> Result<Self, TransformError> {
         Self::ensure_subtree_materialization_fits(doc.root())?;
         Ok(Self::collect_document(doc, false))
@@ -123,8 +126,9 @@ impl<'a> NodeSet<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`TransformError::NodeSetTooLarge`] when projecting the document's
-    /// tree, attribute, and namespace nodes would exceed the materialization budget.
+    /// Returns [`TransformError::NodeSetTooLarge`] or
+    /// [`TransformError::NodeSetStringsTooLarge`] when projecting the document's
+    /// tree, attribute, namespace, or owned string data would exceed its budget.
     pub fn entire_document_with_comments(doc: &'a Document<'a>) -> Result<Self, TransformError> {
         Self::ensure_subtree_materialization_fits(doc.root())?;
         Ok(Self::collect_document(doc, true))
@@ -136,8 +140,9 @@ impl<'a> NodeSet<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`TransformError::NodeSetTooLarge`] when projecting the subtree's
-    /// tree, attribute, and namespace nodes would exceed the materialization budget.
+    /// Returns [`TransformError::NodeSetTooLarge`] or
+    /// [`TransformError::NodeSetStringsTooLarge`] when projecting the subtree's
+    /// tree, attribute, namespace, or owned string data would exceed its budget.
     pub fn subtree(element: Node<'a, 'a>) -> Result<Self, TransformError> {
         Self::ensure_subtree_materialization_fits(element)?;
         let mut set = Self {
@@ -177,15 +182,13 @@ impl<'a> NodeSet<'a> {
         if !std::ptr::eq(node.document() as *const _, self.doc as *const _) {
             return;
         }
-        let document = self.doc;
-        // Inspect only keys already admitted to this bounded set. Building the
-        // excluded subtree would let an unrelated large Signature/Object tree
-        // allocate a second, unbounded set before verification.
-        self.nodes.retain(|key| {
-            document.get_node(key.owner_id()).is_none_or(|candidate| {
-                candidate != node && !candidate.ancestors().any(|ancestor| ancestor == node)
-            })
-        });
+        let excluded_ids = subtree_node_id_range(node);
+        // roxmltree NodeIds index a document-order Vec, and descendants() is a
+        // contiguous slice of that Vec. Attribute and namespace keys carry the
+        // owner NodeId, so one range check excludes every XPath node kind without
+        // either walking ancestors per key or materializing the excluded subtree.
+        self.nodes
+            .retain(|key| !excluded_ids.contains(&key.owner_id().get()));
     }
 
     /// Whether comments are included in this node set.
@@ -296,9 +299,26 @@ impl<'a> NodeSet<'a> {
         root: Node<'_, '_>,
     ) -> Result<usize, TransformError> {
         let mut entries = 0_usize;
+        let mut owned_string_bytes = 0_usize;
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             let projected = if node.is_element() {
+                for attribute in node.attributes() {
+                    owned_string_bytes = charge_node_set_string_bytes(
+                        owned_string_bytes,
+                        attribute.namespace().map_or(0, str::len),
+                    )?;
+                    owned_string_bytes =
+                        charge_node_set_string_bytes(owned_string_bytes, attribute.name().len())?;
+                }
+                for namespace in node.namespaces() {
+                    owned_string_bytes = charge_node_set_string_bytes(
+                        owned_string_bytes,
+                        namespace.name().map_or(0, str::len),
+                    )?;
+                    owned_string_bytes =
+                        charge_node_set_string_bytes(owned_string_bytes, namespace.uri().len())?;
+                }
                 1_usize
                     .checked_add(node.attributes().len())
                     .and_then(|count| count.checked_add(node.namespaces().len()))
@@ -326,6 +346,31 @@ impl<'a> NodeSet<'a> {
     fn owns(&self, node: Node<'_, '_>) -> bool {
         std::ptr::eq(node.document() as *const _, self.doc as *const _)
     }
+}
+
+fn charge_node_set_string_bytes(
+    current: usize,
+    additional: usize,
+) -> Result<usize, TransformError> {
+    let total = current
+        .checked_add(additional)
+        .ok_or(TransformError::NodeSetStringsTooLarge {
+            max_bytes: MAX_NODE_SET_OWNED_STRING_BYTES,
+        })?;
+    if total > MAX_NODE_SET_OWNED_STRING_BYTES {
+        return Err(TransformError::NodeSetStringsTooLarge {
+            max_bytes: MAX_NODE_SET_OWNED_STRING_BYTES,
+        });
+    }
+    Ok(total)
+}
+
+fn subtree_node_id_range(node: Node<'_, '_>) -> RangeInclusive<u32> {
+    let last_id = node
+        .descendants()
+        .next_back()
+        .map_or(node.id(), |descendant| descendant.id());
+    node.id().get()..=last_id.get()
 }
 
 impl NodeVisibility for NodeSet<'_> {
@@ -394,6 +439,13 @@ pub enum TransformError {
     NodeSetTooLarge {
         /// Maximum tree, attribute, and namespace entries accepted.
         max: usize,
+    },
+
+    /// Owned names and namespace bindings would exceed the byte budget.
+    #[error("node-set materialization exceeds maximum of {max_bytes} owned string bytes")]
+    NodeSetStringsTooLarge {
+        /// Maximum string bytes cloned into one exact XPath node projection.
+        max_bytes: usize,
     },
 
     /// Canonicalization error during transform.
@@ -473,5 +525,70 @@ mod tests {
                     .expect("fixed target subtree contains a child")
             )
         );
+    }
+
+    #[test]
+    fn materialization_rejects_inherited_namespace_byte_amplification() {
+        // One declaration is cheap in the source XML, but XPath exposes the
+        // inherited binding on every descendant. Materializing owned namespace
+        // keys must reject the amplified bytes before cloning those strings.
+        let namespace_uri = "x".repeat(8_192);
+        let xml = format!(
+            "<root xmlns:amplified=\"{namespace_uri}\">{}</root>",
+            "<child/>".repeat(1_025)
+        );
+        let document = Document::parse(&xml).expect("fixed namespace fixture must parse");
+
+        let error = NodeSet::entire_document_without_comments(&document)
+            .err()
+            .expect("amplified namespace bytes must exceed the materialization budget");
+
+        assert!(matches!(
+            error,
+            TransformError::NodeSetStringsTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn subtree_node_id_range_contains_only_the_selected_subtree() {
+        // roxmltree stores a subtree in one contiguous document-order span.
+        // The exclusion fast path relies on that span including attributes and
+        // namespaces through their owner element, but no adjacent siblings.
+        let document = Document::parse(
+            "<root><before/><excluded xmlns:gone=\"urn:gone\" a=\"1\"><child/></excluded><after/></root>",
+        )
+        .expect("fixed subtree range fixture must parse");
+        let excluded = document
+            .descendants()
+            .find(|node| node.has_tag_name("excluded"))
+            .expect("fixed fixture contains the excluded subtree");
+        let range = subtree_node_id_range(excluded);
+        let before = document
+            .descendants()
+            .find(|node| node.has_tag_name("before"))
+            .expect("fixed fixture contains the preceding sibling");
+        let child = excluded
+            .first_element_child()
+            .expect("fixed fixture contains an excluded child");
+        let after = document
+            .descendants()
+            .find(|node| node.has_tag_name("after"))
+            .expect("fixed fixture contains the following sibling");
+
+        assert!(!range.contains(&before.id().get()));
+        assert!(range.contains(&excluded.id().get()));
+        assert!(range.contains(&child.id().get()));
+        assert!(!range.contains(&after.id().get()));
+
+        let mut nodes = NodeSet::entire_document_with_comments(&document)
+            .expect("fixed fixture must fit the node-set materialization budget");
+        nodes.exclude_subtree(excluded);
+
+        assert!(nodes.contains(before));
+        assert!(!nodes.contains(excluded));
+        assert!(!nodes.contains(child));
+        assert!(!nodes.contains_attribute(excluded, None, "a"));
+        assert!(!nodes.contains_namespace(excluded, "gone", "urn:gone"));
+        assert!(nodes.contains(after));
     }
 }
