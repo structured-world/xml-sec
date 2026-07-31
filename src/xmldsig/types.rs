@@ -474,6 +474,7 @@ pub enum TransformError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::c14n::{C14nAlgorithm, C14nMode, canonicalize_with_visibility};
 
     #[test]
     fn document_without_comments_preserves_comment_policy() {
@@ -590,5 +591,47 @@ mod tests {
         assert!(!nodes.contains_attribute(excluded, None, "a"));
         assert!(!nodes.contains_namespace(excluded, "gone", "urn:gone"));
         assert!(nodes.contains(after));
+    }
+
+    #[test]
+    fn excluding_subtree_removes_trailing_text_and_comments_from_canonical_output() {
+        // Pretty-printed Signature elements can end in text or comments rather
+        // than an element. The contiguous owner-ID range must exclude those tail
+        // nodes while preserving text and elements surrounding the subtree.
+        let document = Document::parse(
+            "<root><before/>keep-before<excluded><child/>drop-text<!--drop-comment--></excluded>keep-after<after/></root>",
+        )
+        .expect("fixed trailing-node fixture must parse");
+        let excluded = document
+            .descendants()
+            .find(|node| node.has_tag_name("excluded"))
+            .expect("fixed fixture contains the excluded subtree");
+        let trailing_text = excluded
+            .children()
+            .find(|node| node.is_text())
+            .expect("fixed fixture contains trailing text");
+        let trailing_comment = excluded
+            .children()
+            .find(|node| node.is_comment())
+            .expect("fixed fixture contains a trailing comment");
+        let mut nodes = NodeSet::entire_document_with_comments(&document)
+            .expect("fixed fixture must fit the node-set materialization budget");
+
+        nodes.exclude_subtree(excluded);
+
+        assert!(!nodes.contains(trailing_text));
+        assert!(!nodes.contains(trailing_comment));
+        let mut output = Vec::new();
+        canonicalize_with_visibility(
+            &document,
+            Some(&nodes),
+            &C14nAlgorithm::new(C14nMode::Inclusive1_0, true),
+            &mut output,
+        )
+        .expect("the retained node set must canonicalize");
+        assert_eq!(
+            output,
+            b"<root><before></before>keep-beforekeep-after<after></after></root>"
+        );
     }
 }
