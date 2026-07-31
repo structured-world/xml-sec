@@ -1064,6 +1064,51 @@ mod tests {
         }
     }
 
+    fn built_mirror_string_bytes(mirror: &Mirror<'_>) -> usize {
+        let mut bytes = 0_usize;
+        for element in mirror.elements.keys() {
+            let stored_name = element.name();
+            let name = stored_name.get();
+            bytes += name.namespace_uri().map_or(0, str::len) + name.local_part().len();
+            bytes += element.preferred_prefix().map_or(0, |prefix| prefix.len());
+            bytes += element
+                .default_namespace_uri()
+                .map_or(0, |namespace| namespace.len());
+            bytes += element
+                .namespaces_in_scope()
+                .into_iter()
+                .filter(|namespace| !(namespace.prefix() == "xml" && namespace.uri() == XML_NS))
+                .map(|namespace| namespace.prefix().len() + namespace.uri().len())
+                .sum::<usize>();
+
+            for attribute in element.attributes() {
+                let stored_name = attribute.name();
+                let name = stored_name.get();
+                bytes += name.namespace_uri().map_or(0, str::len) + name.local_part().len();
+                bytes += attribute.value().len();
+                bytes += attribute
+                    .preferred_prefix()
+                    .map_or(0, |prefix| prefix.len());
+            }
+        }
+        bytes += mirror
+            .texts
+            .keys()
+            .map(|text| text.text().len())
+            .sum::<usize>();
+        bytes += mirror
+            .comments
+            .keys()
+            .map(|comment| comment.text().len())
+            .sum::<usize>();
+        bytes += mirror
+            .processing_instructions
+            .keys()
+            .map(|pi| pi.target().len() + pi.value().map_or(0, |value| value.len()))
+            .sum::<usize>();
+        bytes
+    }
+
     #[test]
     fn xpath_mirror_projection_counts_every_copied_string() {
         // This fixture exercises every string-bearing SXD constructor and
@@ -1077,7 +1122,11 @@ mod tests {
 
         let projected_bytes = Mirror::projected_string_bytes(&document)
             .expect("complete fixed fixture fits the mirror string budget");
+        let package = Package::new();
+        let mirror = Mirror::build(&document, package.as_document());
+
         assert_eq!(projected_bytes, 55);
+        assert_eq!(projected_bytes, built_mirror_string_bytes(&mirror));
     }
 
     #[test]
