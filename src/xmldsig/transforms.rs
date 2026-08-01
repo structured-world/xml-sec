@@ -57,6 +57,8 @@ pub(super) const MAX_XPATH_EXPRESSION_BYTES: usize = 16 * 1024;
 pub(super) const MAX_XPATH_FILTERS: usize = 64;
 const MAX_XPATH_NAMESPACE_BINDINGS: usize = 1_024;
 const MAX_XPATH_NAMESPACE_BYTES: usize = 64 * 1024;
+const MAX_BASE64_TRANSFORM_INPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BASE64_TRANSFORM_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Namespace URI for Exclusive C14N `<InclusiveNamespaces>` elements.
 const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
@@ -1184,6 +1186,32 @@ mod tests {
         .unwrap();
 
         assert!(result.into_binary().unwrap().is_empty());
+    }
+
+    #[test]
+    fn base64_transform_rejects_oversized_raw_binary_before_normalization() {
+        // XML whitespace does not reach the normalized buffer, but scanning an
+        // unbounded whitespace-only reference is still attacker-controlled work.
+        let doc = Document::parse("<root/>").unwrap();
+        let input = TransformData::Binary(vec![b' '; MAX_BASE64_TRANSFORM_INPUT_BYTES + 1]);
+
+        let result = apply_transform(doc.root_element(), &Transform::Base64Decode, input);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn base64_transform_rejects_node_set_that_decodes_past_output_budget() {
+        // The output limit must be checked before the decoder allocates a
+        // second buffer beside the normalized encoded text.
+        let encoded_len = MAX_BASE64_TRANSFORM_OUTPUT_BYTES.div_ceil(3) * 4 + 4;
+        let xml = format!("<root>{}</root>", "A".repeat(encoded_len));
+        let doc = Document::parse(&xml).unwrap();
+        let input = TransformData::NodeSet(NodeSet::subtree(doc.root_element()).unwrap());
+
+        let result = apply_transform(doc.root_element(), &Transform::Base64Decode, input);
+
+        assert!(result.is_err());
     }
 
     #[test]
