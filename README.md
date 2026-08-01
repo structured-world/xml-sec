@@ -6,7 +6,7 @@
 [![MSRV](https://img.shields.io/badge/rustc-1.92%2B-blue.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/crates/l/xml-sec.svg)](https://github.com/structured-world/xml-sec/blob/main/LICENSE)
 
-Pure Rust XML Security library. Drop-in replacement for libxmlsec1.
+Pure Rust implementation of core XML Security workflows covered by libxmlsec1.
 
 **No C dependencies. No cmake. No system libraries. Just `cargo add xml-sec`.**
 
@@ -23,7 +23,7 @@ Pure Rust XML Security library. Drop-in replacement for libxmlsec1.
 
 ## Why?
 
-Every SAML, SOAP, and WS-Security implementation depends on libxmlsec1 — a C library that:
+Many SAML, SOAP, and WS-Security implementations depend on libxmlsec1, a C library that:
 - Requires cmake + libxml2 + OpenSSL/NSS/GnuTLS to build
 - Breaks on Alpine/musl static linking
 - Has decades of CVEs in XML parsing and signature validation
@@ -51,104 +51,45 @@ Currently implemented (core paths):
   Element/Content document replacement
 
 Still in progress:
-- Broader XMLDSig and XMLEnc donor/CLI interop coverage
+- XMLDSig DSA, HMAC, and RSA-PSS signature algorithms
+- Complete XMLDSig and XMLEnc conformance-suite classification
+- Production hardening, fuzzing, benchmarks, and API stabilization
 
 ## XMLDSig Usage
 
-`examples/sign.rs` builds an enveloped RSA-SHA256 signature with an embedded
-X.509 certificate. `examples/verify.rs` verifies a document through
-`DefaultKeyResolver` using that embedded certificate:
+`examples/sign.rs` builds an enveloped RSA-SHA256 signature and `examples/verify.rs`
+verifies it through the embedded X.509 certificate:
 
 ```sh
 cargo run --example sign --all-features > signed.xml
 cargo run --example verify --all-features -- signed.xml
 ```
 
-For production verification, configure `KeyResolverConfig` with explicit trust
-anchors when certificate-chain validation is required. A `Valid` status means
-the cryptographic and reference checks succeeded; `Invalid(reason)` means the
-document was processed successfully but did not validate.
-
-Malformed XMLDSig structure, unsupported algorithms, disallowed reference
-URIs, and inconsistent `KeyInfo` metadata are processing errors rather than
-validity statuses. Treat both `Invalid(reason)` and an API error as a rejected
-document; never continue an authentication flow after either outcome.
+See [XML Digital Signatures](docs/xmldsig.md) for supported algorithms, transform
+semantics, key-resolution policy, and validation failure handling.
 
 ## XMLEnc Usage
 
-Enable the `xmlenc` feature. `EncryptedDataBuilder` can encrypt opaque bytes,
-one XML element, an XML content fragment, or a selected element in a complete
-document. This direct-key example creates a complete `EncryptedData` fragment
-and verifies it through the reciprocal decrypt path:
+Enable the `xmlenc` feature. `EncryptedDataBuilder` supports direct symmetric keys,
+RSA-OAEP recipients, AES Key Wrap recipients, and Element/Content document replacement:
 
 ```rust
-use xml_sec::xmlenc::{
-    DataEncryptionAlgorithm, DecryptedContent, EncryptedDataBuilder,
-    SymmetricKeyDecryptor, decrypt,
-};
+use xml_sec::xmlenc::{DataEncryptionAlgorithm, EncryptedDataBuilder};
 
 # fn example() -> Result<(), Box<dyn std::error::Error>> {
 let key = [0x42_u8; 16];
-let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+let encrypted_data = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
     .direct_key(key)
     .direct_key_name("application-content-key")
     .encrypt_xml("<secret>value</secret>")?;
 
-assert_eq!(
-    decrypt(
-        &encrypted.encrypted_data_xml,
-        &SymmetricKeyDecryptor::new(key),
-    )?,
-    DecryptedContent::Xml("<secret>value</secret>".into()),
-);
+assert!(encrypted_data.encrypted_data_xml.contains("EncryptedData"));
 # Ok(())
 # }
 ```
 
-For recipient transport, add one or more `EncryptionRecipient::rsa_oaep`
-entries with recipient public keys, or use `recipient_aes_kw` with a shared
-KEK. A fresh content key is generated from the operating-system RNG and wrapped
-once per recipient. XMLEnc 1.1 RSA-OAEP defaults to SHA-256/MGF1-SHA-256;
-legacy SHA-1 OAEP must be selected explicitly.
-
-`encrypt_document` selects the root or an element by `Id`, `ID`, or `id`, then
-replaces either the complete element or only its child content according to
-`EncryptedDataType`. The caller retains ownership of the resulting XML string.
-See `examples/encrypt.rs` for RSA-OAEP document encryption.
-
-To decrypt either a standalone XML fragment or an `EncryptedData` value parsed
-once and retained by the caller:
-
-```rust
-use xml_sec::xmlenc::{
-    DecryptedContent, SymmetricKeyDecryptor, decrypt_data, parse_encrypted_data,
-};
-
-# fn example(encrypted_xml: &str) -> Result<(), Box<dyn std::error::Error>> {
-let encrypted = parse_encrypted_data(encrypted_xml)?;
-let resolver = SymmetricKeyDecryptor::new([0_u8; 16]);
-let plaintext = decrypt_data(&encrypted, &resolver)?;
-
-match plaintext {
-    DecryptedContent::Xml(xml) => println!("{xml}"),
-    DecryptedContent::Bytes(bytes) => println!("{} plaintext bytes", bytes.len()),
-}
-# Ok(())
-# }
-```
-
-`PrivateKeyDecryptor` unwraps embedded RSA-OAEP `EncryptedKey` values and
-`KekDecryptor` unwraps AES-KW values. RSA PKCS#1 v1.5 transport, CipherReference,
-and unauthenticated external resource loading are rejected; only inline
-`CipherValue` is accepted. Encryption inputs and recipient counts are bounded
-before allocation.
-
-Use `decrypt_document` to replace one typed `EncryptedData` in a caller-owned
-XML string. Pass its `Id` when the document contains multiple encrypted
-regions. DTD parsing remains disabled by default; legacy documents that need
-an internal DTD can opt in through `decrypt_document_with_options` and
-`DocumentDecryptionOptions`. That API never installs an external entity
-resolver.
+See [XML Encryption](docs/xmlenc.md) for reciprocal decryption, recipient transport,
+document replacement, input bounds, and parser security policy.
 
 Current toolchain target: latest stable Rust.
 Current MSRV: Rust 1.92.
@@ -157,11 +98,11 @@ Current MSRV: Rust 1.92.
 
 | Spec | Status |
 |------|--------|
-| [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) | Partially implemented |
-| [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) | Partially implemented |
-| [Exclusive C14N](https://www.w3.org/TR/xml-exc-c14n/) | Partially implemented |
-| [XMLDSig](https://www.w3.org/TR/xmldsig-core1/) | Partially implemented |
-| [XMLEnc](https://www.w3.org/TR/xmlenc-core1/) | AES-CBC/GCM encryption and decryption subset implemented |
+| [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) | Implemented; full-document and document-subset vectors |
+| [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) | Implemented; `xml:id` and `xml:base` subset rules |
+| [Exclusive C14N](https://www.w3.org/TR/xml-exc-c14n/) | Implemented; `InclusiveNamespaces PrefixList` support |
+| [XMLDSig](https://www.w3.org/TR/xmldsig-core1/) | Core sign/verify pipelines implemented; additional algorithms and conformance coverage in progress |
+| [XMLEnc](https://www.w3.org/TR/xmlenc-core1/) | Core AES-CBC/GCM encrypt/decrypt with RSA-OAEP and AES-KW implemented; broader conformance coverage in progress |
 
 ## License
 
