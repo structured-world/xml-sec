@@ -20,6 +20,7 @@
 //! | XPath Filter 2.0 | NodeSet → NodeSet | P1 |
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -86,6 +87,31 @@ pub struct TransformOptions {
 #[derive(Default)]
 pub(crate) struct TransformExecutionBudget {
     xpath: XPathWorkBudget,
+    base64: Base64WorkBudget,
+}
+
+struct Base64WorkBudget {
+    remaining: Cell<usize>,
+}
+
+impl Default for Base64WorkBudget {
+    fn default() -> Self {
+        Self {
+            remaining: Cell::new(MAX_BASE64_TRANSFORM_INPUT_BYTES),
+        }
+    }
+}
+
+impl Base64WorkBudget {
+    fn charge(&self, bytes: usize) -> Result<(), TransformError> {
+        let Some(remaining) = self.remaining.get().checked_sub(bytes) else {
+            return Err(TransformError::Base64InputTooLarge {
+                max_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES,
+            });
+        };
+        self.remaining.set(remaining);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -93,6 +119,7 @@ impl TransformExecutionBudget {
     pub(crate) fn with_xpath_limit(limit: usize) -> Self {
         Self {
             xpath: XPathWorkBudget::with_limit(limit),
+            base64: Base64WorkBudget::default(),
         }
     }
 }
@@ -333,10 +360,9 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
         }
         Transform::Base64Decode => {
             let mut normalized = Vec::new();
-            let mut input_bytes = 0_usize;
             match input {
                 TransformData::Binary(bytes) => {
-                    append_normalized_base64(&bytes, &mut normalized, &mut input_bytes)?;
+                    append_normalized_base64(&bytes, &mut normalized, &budget.base64)?;
                 }
                 TransformData::NodeSet(nodes) => {
                     for node in nodes.document().descendants() {
@@ -344,7 +370,7 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
                             append_normalized_base64(
                                 node.text().unwrap_or_default().as_bytes(),
                                 &mut normalized,
-                                &mut input_bytes,
+                                &budget.base64,
                             )?;
                         }
                     }
@@ -363,20 +389,15 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
 fn append_normalized_base64(
     encoded: &[u8],
     normalized: &mut Vec<u8>,
-    input_bytes: &mut usize,
+    budget: &Base64WorkBudget,
 ) -> Result<(), TransformError> {
-    *input_bytes = input_bytes
-        .checked_add(encoded.len())
-        .filter(|length| *length <= MAX_BASE64_TRANSFORM_INPUT_BYTES)
-        .ok_or(TransformError::Base64InputTooLarge {
-            max_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES,
-        })?;
+    budget.charge(encoded.len())?;
 
     let additional = encoded
         .iter()
         .filter(|byte| is_rfc2045_base64_byte(**byte))
         .count();
-    normalized.reserve_exact(additional);
+    normalized.reserve(additional);
     normalized.extend(
         encoded
             .iter()
