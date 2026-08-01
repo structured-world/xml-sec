@@ -6,7 +6,7 @@
 [![MSRV](https://img.shields.io/badge/rustc-1.92%2B-blue.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/crates/l/xml-sec.svg)](https://github.com/structured-world/xml-sec/blob/main/LICENSE)
 
-Pure Rust implementation of core XML Security workflows covered by libxmlsec1.
+XML Security in pure Rust, built to replace libxmlsec1.
 
 **No C dependencies. No cmake. No system libraries. Just `cargo add xml-sec`.**
 
@@ -23,13 +23,12 @@ Pure Rust implementation of core XML Security workflows covered by libxmlsec1.
 
 ## Why?
 
-Many SAML, SOAP, and WS-Security implementations depend on libxmlsec1, a C library that:
-- Requires cmake + libxml2 + OpenSSL/NSS/GnuTLS to build
-- Breaks on Alpine/musl static linking
-- Has decades of CVEs in XML parsing and signature validation
-- Cannot cross-compile easily
+libxmlsec1 is the established XML Security implementation, but its native dependency stack adds
+libxml2, a crypto backend, platform packages, and cross-compilation work to every deployment.
 
-`xml-sec` is a ground-up Rust rewrite using `roxmltree` for parsing, `quick-xml` for writing, RustCrypto for RSA/ECDSA/SHA, and `x509-parser` for certificates. Single `cargo build`, works everywhere Rust works.
+`xml-sec` rebuilds that functionality on memory-safe Rust foundations: `roxmltree` for parsing,
+`quick-xml` for writing, RustCrypto for cryptography, and `x509-parser` for certificates. One
+Cargo dependency, no system XML or crypto libraries.
 
 ## Status
 
