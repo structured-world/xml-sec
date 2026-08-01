@@ -1517,6 +1517,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_transforms_rejects_non_xpath_boundary_whitespace() {
+        // XPath 1.0 S excludes NBSP, so parser-level trimming must not turn
+        // this malformed signed expression into a conforming `true()` call.
+        let xml = format!(
+            r#"<Transforms xmlns="{XMLDSIG_NS}"><Transform Algorithm="{XPATH_TRANSFORM_URI}"><XPath> true()</XPath></Transform></Transforms>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let result = parse_transforms(doc.root_element());
+
+        assert!(matches!(result, Err(TransformError::XPath(_))));
+    }
+
+    #[test]
     fn parse_transforms_with_inclusive_prefixes() {
         let xml = r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#"
                                 xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#">
