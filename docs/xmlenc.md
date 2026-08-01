@@ -73,4 +73,3 @@ Use `decrypt_document` to replace one typed `EncryptedData` in a complete XML st
 default; legacy documents that need an internal DTD can opt in through
 `decrypt_document_with_options` and `DocumentDecryptionOptions`. That API never installs an
 external entity resolver.
-

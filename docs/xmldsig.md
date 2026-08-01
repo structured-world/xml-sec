@@ -41,4 +41,3 @@ Implemented algorithms include RSA PKCS#1 v1.5 with SHA-1/SHA-256/SHA-384/SHA-51
 verification, SHA-256/SHA-384/SHA-512 for signing, and ECDSA P-256/SHA-256 and P-384/SHA-384.
 DSA, HMAC signatures, RSA-PSS, and unauthenticated external reference loading are not currently
 supported.
-
