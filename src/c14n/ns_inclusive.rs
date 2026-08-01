@@ -31,7 +31,7 @@ impl NsRenderer for InclusiveNsRenderer {
         collect_ns_declarations(node, parent_rendered, visibility, |_| true, |_, _| true)
     }
 
-    fn renders_orphan_namespace(&self, _prefix: &str) -> bool {
+    fn renders_selected_namespace_of_omitted_element(&self, _prefix: &str) -> bool {
         true
     }
 }

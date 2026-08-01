@@ -54,7 +54,7 @@ pub(crate) trait NsRenderer {
         visibility: Option<&dyn NodeVisibility>,
     ) -> (Vec<(String, String)>, HashMap<String, String>);
 
-    fn renders_orphan_namespace(&self, prefix: &str) -> bool;
+    fn renders_selected_namespace_of_omitted_element(&self, prefix: &str) -> bool;
 }
 
 /// Canonicalize a document (or subset) to the output buffer.
@@ -154,12 +154,10 @@ fn serialize_children(
                         output,
                     );
                 } else {
-                    // Canonical XML 1.0 section 2.3 requires processing an
-                    // excluded element's namespace and attribute axes before
-                    // its selected children. Their standalone bytes are
-                    // therefore intentional; canonical subset output need not
-                    // be a well-formed XML document.
-                    serialize_orphan_axis_nodes(
+                    // Canonical XML §2.3 processes the selected namespace and
+                    // attribute axes even when their owning element is omitted.
+                    // Only the owner's start/end tags are suppressed.
+                    serialize_selected_axes_of_omitted_element(
                         child,
                         visibility,
                         ns_renderer,
@@ -226,7 +224,7 @@ fn serialize_children(
     }
 }
 
-fn serialize_orphan_axis_nodes(
+fn serialize_selected_axes_of_omitted_element(
     owner: Node,
     visibility: Option<&dyn NodeVisibility>,
     ns_renderer: &dyn NsRenderer,
@@ -242,7 +240,7 @@ fn serialize_orphan_axis_nodes(
         .filter_map(|namespace| {
             let prefix = namespace.name().unwrap_or("");
             (prefix != "xml"
-                && ns_renderer.renders_orphan_namespace(prefix)
+                && ns_renderer.renders_selected_namespace_of_omitted_element(prefix)
                 && visibility.contains_namespace(owner, prefix, namespace.uri())
                 && parent_rendered.get(prefix).map(String::as_str) != Some(namespace.uri()))
             .then_some((prefix, namespace.uri()))
@@ -818,6 +816,57 @@ mod tests {
             String::from_utf8(out).expect("utf8"),
             "<?pi data?>\n<child>text</child>"
         );
+    }
+
+    struct SelectedAxesOnly {
+        owner: NodeId,
+    }
+
+    impl NodeVisibility for SelectedAxesOnly {
+        fn contains_node(&self, _node: Node<'_, '_>) -> bool {
+            false
+        }
+
+        fn contains_attribute(
+            &self,
+            owner: Node<'_, '_>,
+            namespace: Option<&str>,
+            local_name: &str,
+        ) -> bool {
+            owner.id() == self.owner && namespace.is_none() && local_name == "a"
+        }
+
+        fn contains_namespace(&self, owner: Node<'_, '_>, prefix: &str, uri: &str) -> bool {
+            owner.id() == self.owner && prefix == "p" && uri == "urn:p"
+        }
+    }
+
+    #[test]
+    fn omitted_element_still_processes_its_selected_axes() {
+        // C14N §2.3 suppresses only the omitted element's tags. Namespace and
+        // attribute nodes independently selected into the node-set still emit.
+        let document = Document::parse(r#"<root xmlns:p="urn:p" a="1"><child/></root>"#)
+            .expect("fixed selected-axis fixture must parse");
+        let visibility = SelectedAxesOnly {
+            owner: document.root_element().id(),
+        };
+        let mut output = Vec::new();
+
+        serialize_canonical_visible_with_position(
+            &document,
+            Some(&visibility),
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            None,
+            &mut output,
+        )
+        .expect("selected axes must canonicalize");
+
+        assert_eq!(output, br#" xmlns:p="urn:p" a="1""#);
     }
 
     // ── xml:* attribute inheritance tests (G001) ──────────────────────

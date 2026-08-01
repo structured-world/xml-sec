@@ -89,7 +89,7 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
         (declarations, rendered)
     }
 
-    fn renders_orphan_namespace(&self, prefix: &str) -> bool {
+    fn renders_selected_namespace_of_omitted_element(&self, prefix: &str) -> bool {
         self.inclusive_prefixes.contains(prefix)
     }
 }
