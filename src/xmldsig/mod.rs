@@ -50,6 +50,7 @@
 //! # Ok(())
 //! # }
 //! ```
+#![doc = include_str!("../../docs/xmldsig.md")]
 
 pub mod builder;
 pub mod digest;

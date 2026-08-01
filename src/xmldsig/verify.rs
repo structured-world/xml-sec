@@ -6,7 +6,7 @@
 //!
 //! This module wires together:
 //! - [`UriReferenceResolver`] for URI dereference
-//! - [`execute_transforms`] for the transform pipeline
+//! - [`super::transforms::execute_transforms`] for the transform pipeline
 //! - [`compute_digest`] + [`constant_time_eq`] for digest computation and comparison
 //! - [`verify_signature_with_pem_key`] for full pipeline validation (`SignedInfo` + `SignatureValue`)
 

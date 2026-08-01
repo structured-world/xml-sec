@@ -16,9 +16,9 @@ cargo run --example verify --all-features -- signed.xml
 ```
 
 The signing and verification contexts share the same reference-transform implementation.
-`XPathHereSemantics::Standard` follows the XMLDSig `<XPath>` contract; callers interoperating
-with legacy libxmlsec1 `here()` behavior can explicitly select
-`XPathHereSemantics::XmlSecLegacy` on both contexts.
+[`XPathHereSemantics::Specification`] follows the XMLDSig `<XPath>` contract; callers
+interoperating with legacy libxmlsec1 `here()` behavior can explicitly select
+[`XPathHereSemantics::XmlSecLegacy`] on both contexts.
 
 ## Verification Policy
 
