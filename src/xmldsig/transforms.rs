@@ -1197,17 +1197,25 @@ mod tests {
     }
 
     #[test]
-    fn base64_transform_rejects_invalid_alphabet_and_padding() {
+    fn base64_transform_ignores_rfc2045_non_alphabet_bytes() {
         let doc = Document::parse("<root/>").unwrap();
+        let input = TransformData::Binary(b"SGVs!\xFFbG8=".to_vec());
 
-        for encoded in [b"SGVs!bG8=".as_slice(), b"SGVsbG8===".as_slice()] {
-            let result = apply_transform(
-                doc.root_element(),
-                &Transform::Base64Decode,
-                TransformData::Binary(encoded.to_vec()),
-            );
-            assert!(matches!(result, Err(TransformError::Base64(_))));
-        }
+        let result = apply_transform(doc.root_element(), &Transform::Base64Decode, input).unwrap();
+
+        assert_eq!(result.into_binary().unwrap(), b"Hello");
+    }
+
+    #[test]
+    fn base64_transform_rejects_invalid_padding() {
+        let doc = Document::parse("<root/>").unwrap();
+        let result = apply_transform(
+            doc.root_element(),
+            &Transform::Base64Decode,
+            TransformData::Binary(b"SGVsbG8===".to_vec()),
+        );
+
+        assert!(matches!(result, Err(TransformError::Base64(_))));
     }
 
     #[test]
