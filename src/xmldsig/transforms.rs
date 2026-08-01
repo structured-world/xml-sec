@@ -1146,6 +1146,40 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_c14n_then_enveloped_remaps_the_exact_signature() {
+        // Reparsing canonical octets creates a new Document. The adapter must
+        // preserve which Signature owns this transform rather than removing an
+        // arbitrary signature or rejecting the new node set as cross-document.
+        let xml = r#"<root>
+            <Signature xmlns="http://www.w3.org/2000/09/xmldsig#" Id="other"/>
+            <data>hello</data>
+            <Signature xmlns="http://www.w3.org/2000/09/xmldsig#" Id="owner"/>
+        </root>"#;
+        let document = Document::parse(xml).unwrap();
+        let signature = document
+            .descendants()
+            .find(|node| node.attribute("Id") == Some("owner"))
+            .unwrap();
+        let initial = TransformData::NodeSet(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+        );
+        let transforms = vec![
+            Transform::C14n(
+                C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315")
+                    .unwrap(),
+            ),
+            Transform::Enveloped,
+        ];
+
+        let output = execute_transforms(signature, initial, &transforms).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("Id=\"other\""));
+        assert!(!output.contains("Id=\"owner\""));
+        assert!(output.contains("<data>hello</data>"));
+    }
+
+    #[test]
     fn pipeline_no_transforms_applies_default_c14n() {
         // No explicit transforms → pipeline falls back to inclusive C14N 1.0
         let xml = r#"<root b="2" a="1"><child/></root>"#;
