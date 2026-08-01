@@ -27,7 +27,9 @@ use roxmltree::Node;
 
 use super::parse::XMLDSIG_NS;
 use super::types::{TransformData, TransformError};
-use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
+use super::whitespace::{
+    XmlBase64NormalizeLimitedError, is_xml_whitespace_only, normalize_xml_base64_bytes_with_limit,
+};
 use super::xpath::{
     XPathDocumentRelation, XPathWorkBudget, apply_xpath_filter_with_semantics,
     apply_xpath_filter2_with_semantics, compile_xpath,
@@ -333,10 +335,10 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
         }
         Transform::Base64Decode => {
             let mut normalized = Vec::new();
+            let mut input_bytes = 0_usize;
             match input {
                 TransformData::Binary(bytes) => {
-                    normalized.reserve(bytes.len());
-                    append_normalized_base64(&bytes, &mut normalized)?;
+                    append_normalized_base64(&bytes, &mut normalized, &mut input_bytes)?;
                 }
                 TransformData::NodeSet(nodes) => {
                     for node in nodes.document().descendants() {
@@ -344,12 +346,13 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
                             append_normalized_base64(
                                 node.text().unwrap_or_default().as_bytes(),
                                 &mut normalized,
+                                &mut input_bytes,
                             )?;
                         }
                     }
                 }
             }
-            Ok(TransformData::Binary(decode_base64_transform(normalized)?))
+            Ok(TransformData::Binary(decode_base64_transform(&normalized)?))
         }
     }
 }
@@ -362,22 +365,51 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
 fn append_normalized_base64(
     encoded: &[u8],
     normalized: &mut Vec<u8>,
+    input_bytes: &mut usize,
 ) -> Result<(), TransformError> {
-    normalize_xml_base64_bytes(encoded, normalized, |byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
-    })
-    .map_err(|err| {
-        TransformError::Base64(format!(
+    *input_bytes = input_bytes
+        .checked_add(encoded.len())
+        .filter(|length| *length <= MAX_BASE64_TRANSFORM_INPUT_BYTES)
+        .ok_or(TransformError::Base64InputTooLarge {
+            max_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES,
+        })?;
+
+    normalize_xml_base64_bytes_with_limit(
+        encoded,
+        normalized,
+        MAX_BASE64_TRANSFORM_INPUT_BYTES,
+        |byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='),
+    )
+    .map_err(|err| match err {
+        XmlBase64NormalizeLimitedError::InvalidWhitespace(err) => TransformError::Base64(format!(
             "invalid byte 0x{:02X} in encoded input",
             err.invalid_byte
-        ))
+        )),
+        XmlBase64NormalizeLimitedError::TooLong(_) => TransformError::Base64InputTooLarge {
+            max_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES,
+        },
     })
 }
 
-fn decode_base64_transform(normalized: Vec<u8>) -> Result<Vec<u8>, TransformError> {
-    STANDARD
-        .decode(normalized)
-        .map_err(|error| TransformError::Base64(error.to_string()))
+fn decode_base64_transform(normalized: &[u8]) -> Result<Vec<u8>, TransformError> {
+    let padding = normalized
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'=')
+        .count();
+    let decoded_len = base64::decoded_len_estimate(normalized.len()).saturating_sub(padding);
+    if decoded_len > MAX_BASE64_TRANSFORM_OUTPUT_BYTES {
+        return Err(TransformError::Base64OutputTooLarge {
+            max_bytes: MAX_BASE64_TRANSFORM_OUTPUT_BYTES,
+        });
+    }
+
+    let mut decoded = vec![0_u8; decoded_len];
+    let written = STANDARD
+        .decode_slice(normalized, &mut decoded)
+        .map_err(|error| TransformError::Base64(error.to_string()))?;
+    decoded.truncate(written);
+    Ok(decoded)
 }
 
 /// Execute a chain of transforms for a single `<Reference>`.
@@ -1197,7 +1229,12 @@ mod tests {
 
         let result = apply_transform(doc.root_element(), &Transform::Base64Decode, input);
 
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(TransformError::Base64InputTooLarge {
+                max_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES
+            })
+        ));
     }
 
     #[test]
@@ -1211,7 +1248,12 @@ mod tests {
 
         let result = apply_transform(doc.root_element(), &Transform::Base64Decode, input);
 
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(TransformError::Base64OutputTooLarge {
+                max_bytes: MAX_BASE64_TRANSFORM_OUTPUT_BYTES
+            })
+        ));
     }
 
     #[test]

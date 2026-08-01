@@ -33,6 +33,27 @@ pub(crate) fn normalize_xml_base64_bytes(
     normalized: &mut Vec<u8>,
     accept: impl Fn(u8) -> bool,
 ) -> Result<(), XmlBase64NormalizeError> {
+    normalize_xml_base64_bytes_with_limit(bytes, normalized, usize::MAX, accept).map_err(|err| {
+        match err {
+            XmlBase64NormalizeLimitedError::InvalidWhitespace(err) => err,
+            XmlBase64NormalizeLimitedError::TooLong(_) => {
+                unreachable!("allocated byte slices cannot exceed usize::MAX together")
+            }
+        }
+    })
+}
+
+/// Append normalized base64 bytes without growing beyond `max_len`.
+///
+/// The first pass validates and counts bytes so the allocation happens only
+/// after the complete chunk is known to fit.
+pub(crate) fn normalize_xml_base64_bytes_with_limit(
+    bytes: &[u8],
+    normalized: &mut Vec<u8>,
+    max_len: usize,
+    accept: impl Fn(u8) -> bool,
+) -> Result<(), XmlBase64NormalizeLimitedError> {
+    let mut additional = 0_usize;
     for &byte in bytes {
         if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
             continue;
@@ -40,10 +61,28 @@ pub(crate) fn normalize_xml_base64_bytes(
         if byte.is_ascii_whitespace() || !accept(byte) {
             return Err(XmlBase64NormalizeError {
                 invalid_byte: byte,
-                normalized_offset: normalized.len(),
-            });
+                normalized_offset: normalized.len() + additional,
+            }
+            .into());
         }
-        normalized.push(byte);
+        additional += 1;
+    }
+
+    if normalized
+        .len()
+        .checked_add(additional)
+        .is_none_or(|length| length > max_len)
+    {
+        return Err(XmlBase64NormalizeLimitedError::TooLong(
+            XmlBase64LengthError { max_len },
+        ));
+    }
+
+    normalized.reserve_exact(additional);
+    for &byte in bytes {
+        if !matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+            normalized.push(byte);
+        }
     }
     Ok(())
 }
@@ -108,9 +147,23 @@ impl From<XmlBase64NormalizeError> for XmlBase64NormalizeLimitedError {
 #[cfg(test)]
 mod tests {
     use super::{
-        XmlBase64NormalizeLimitedError, normalize_xml_base64_bytes, normalize_xml_base64_text,
+        XmlBase64NormalizeLimitedError, normalize_xml_base64_bytes,
+        normalize_xml_base64_bytes_with_limit, normalize_xml_base64_text,
         normalize_xml_base64_text_with_limit,
     };
+
+    #[test]
+    fn bounded_byte_normalization_rejects_before_growth() {
+        let mut normalized = Vec::from(*b"ABCD");
+        let capacity = normalized.capacity();
+
+        let err = normalize_xml_base64_bytes_with_limit(b" E", &mut normalized, 4, |_| true)
+            .expect_err("bounded normalization must reject before allocating or appending");
+
+        assert!(matches!(err, XmlBase64NormalizeLimitedError::TooLong(_)));
+        assert_eq!(normalized, b"ABCD");
+        assert_eq!(normalized.capacity(), capacity);
+    }
 
     #[test]
     fn bounded_base64_normalization_rejects_before_growth() {

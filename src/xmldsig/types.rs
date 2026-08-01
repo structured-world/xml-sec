@@ -463,6 +463,20 @@ pub enum TransformError {
     #[error("base64 transform decode error: {0}")]
     Base64(String),
 
+    /// Raw Base64 transform input exceeded its scan and allocation budget.
+    #[error("base64 transform input exceeds maximum of {max_bytes} bytes")]
+    Base64InputTooLarge {
+        /// Maximum raw input bytes accepted by one Base64 transform.
+        max_bytes: usize,
+    },
+
+    /// Decoded Base64 transform output exceeded its allocation budget.
+    #[error("base64 transform output exceeds maximum of {max_bytes} bytes")]
+    Base64OutputTooLarge {
+        /// Maximum decoded output bytes produced by one Base64 transform.
+        max_bytes: usize,
+    },
+
     /// XPath parsing or evaluation failed.
     #[error("XPath transform error: {0}")]
     XPath(String),
