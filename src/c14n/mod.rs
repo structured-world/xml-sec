@@ -436,4 +436,30 @@ mod tests {
             "xml:id must not be inherited in C14N 1.1 subset; got: {result}"
         );
     }
+
+    #[test]
+    fn c14n_1_0_xml_id_is_inherited_in_subset() {
+        // C14N 1.0 predates the C14N 1.1 xml:id exception, so xml:id follows
+        // the general xml:* apex inheritance rule in a document subset.
+        use roxmltree::Document;
+        use std::collections::HashSet;
+
+        let xml = r#"<root xml:id="r1"><child>text</child></root>"#;
+        let doc = Document::parse(xml).expect("parse");
+        let child = doc.root_element().first_element_child().expect("child");
+        let ids = child
+            .descendants()
+            .map(|node| node.id())
+            .collect::<HashSet<_>>();
+        let pred = move |node: roxmltree::Node| ids.contains(&node.id());
+
+        let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
+        let mut out = Vec::new();
+        canonicalize(&doc, Some(&pred), &algo, &mut out).expect("c14n 1.0 subset");
+
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            r#"<child xml:id="r1">text</child>"#
+        );
+    }
 }
