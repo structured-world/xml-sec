@@ -459,12 +459,10 @@ pub enum TransformError {
     #[error("C14N error: {0}")]
     C14n(#[from] crate::c14n::C14nError),
 
-    /// Recursive node-set adaptation would retain too much canonical output.
-    #[error(
-        "cumulative canonical output retained for node-set adaptation exceeds maximum of {max_bytes} bytes"
-    )]
-    C14nRetentionTooLarge {
-        /// Maximum canonical bytes retained by one Reference transform chain.
+    /// Explicit canonicalization produced too much output in one execution.
+    #[error("cumulative canonical output exceeds signature-wide maximum of {max_bytes} bytes")]
+    C14nOutputTooLarge {
+        /// Maximum canonical bytes produced across one signature execution.
         max_bytes: usize,
     },
 
