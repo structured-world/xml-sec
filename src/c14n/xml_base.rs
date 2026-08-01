@@ -21,10 +21,10 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 ///
 /// Walks from `start` up the ancestor chain, collecting `xml:base` values
 /// from each element. If a `node_set` is provided, the walk stops at the
-/// nearest ancestor that is included in the node set, since that ancestor
-/// renders its own `xml:base` in the canonical output. Only the contiguous
-/// chain of omitted ancestors is collected, then resolved from the topmost
-/// collected base to the closest.
+/// nearest included ancestor whose base context is preserved in the canonical
+/// output. An included ancestor with an excluded `xml:base` attribute is not a
+/// boundary: its hidden base still contributes to descendants' effective base.
+/// The collected bases are resolved from the topmost to the closest.
 ///
 /// The resulting reference is absolute only if some ancestor `xml:base`
 /// (or the effective base at that point) is absolute; otherwise it may be
@@ -40,15 +40,17 @@ pub(crate) fn compute_effective_xml_base(
     let mut current = Some(start);
     while let Some(n) = current {
         if n.is_element() {
-            // An included ancestor already establishes its base in the
-            // canonical output, so including it in the fixup would apply it
-            // a second time when the output is interpreted.
+            let base = xml_base_value(n);
             if let Some(set) = visibility
                 && set.contains_node(n)
+                && (base.is_none() || set.contains_attribute(n, Some(XML_NS), "base"))
             {
+                // The selected ancestor preserves its inherited context when
+                // it has no base of its own, or establishes a visible base in
+                // the output. Applying either context again would be wrong.
                 break;
             }
-            if let Some(base) = xml_base_value(n) {
+            if let Some(base) = base {
                 bases.push(base);
             }
         }
