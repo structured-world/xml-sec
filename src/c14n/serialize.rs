@@ -181,9 +181,11 @@ fn serialize_children(
                         output,
                     );
                 } else {
-                    // Canonical XML §2.3 processes the selected namespace and
-                    // attribute axes even when their owning element is omitted.
-                    // Only the owner's start/end tags are suppressed.
+                    // Canonical XML §2.3 processes selected namespace and
+                    // attribute axes even when their owner is omitted; only
+                    // the owner's tags are suppressed. The canonical form is
+                    // an octet stream and esoteric node-sets need not serialize
+                    // as well-balanced XML (see Exclusive C14N §5.2).
                     serialize_selected_axes_of_omitted_element(
                         child,
                         visibility,

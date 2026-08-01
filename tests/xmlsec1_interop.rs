@@ -91,6 +91,31 @@ fn xpath_filter2_payload_xml() -> &'static str {
     "<root><Payload><Included>external verifier contract</Included><Excluded>mutable</Excluded></Payload><Outside>not signed</Outside></root>"
 }
 
+fn omitted_owner_axes_signing_builder() -> SignatureBuilder {
+    let selected_axes = XPathExpression::new(
+        "/root/Omitted/@a | /root/Omitted/namespace::p",
+    )
+    .with_namespace("p", "urn:p");
+    SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("")
+                .transform(Transform::XPathFilter2(vec![XPathFilter::new(
+                    XPathFilterOperation::Intersect,
+                    selected_axes,
+                )]))
+                .transform(Transform::C14n(
+                    exclusive_c14n().with_prefix_list("p"),
+                )),
+        )
+        .key_info(true)
+}
+
+fn omitted_owner_axes_payload_xml() -> &'static str {
+    r#"<root xmlns:p="urn:p"><Omitted a="1"/></root>"#
+}
+
 fn encoded_payload_xml(id_attribute: &str) -> String {
     format!(
         "<root><Encoded {id_attribute}=\"payload\">ZXh0<!-- split --><Chunk>ZXJuYWwg</Chunk>dmVyaWZpZXIgY29udHJhY3Q=</Encoded></root>"
@@ -358,6 +383,65 @@ fn xml_sec_verifies_xpath_filter2_signature_from_xmlsec1() {
 
     let verified = xml_sec::xmldsig::verify_signature_with_pem_key(&signed, &public_key, true)
         .expect("xml-sec must process xmlsec1 Filter 2.0 signature");
+    assert_eq!(verified.status, DsigStatus::Valid);
+}
+
+#[test]
+fn xmlsec1_verifies_selected_axes_without_their_owner_from_xml_sec() {
+    // Canonical XML serializes selected attribute and namespace nodes even
+    // when their owner element is absent, producing valid digest octets that
+    // are intentionally not a well-balanced XML fragment.
+    if !xmlsec1_is_available() {
+        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        return;
+    }
+    let key = RsaSigningKey::from_pkcs8_pem(
+        &fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-key.pem")
+            .expect("RSA private-key fixture must load"),
+    )
+    .expect("RSA private-key fixture must parse");
+    let signed = SignContext::new(&key)
+        .sign_with_builder(
+            omitted_owner_axes_payload_xml(),
+            &omitted_owner_axes_signing_builder(),
+        )
+        .expect("xml-sec must sign selected axes without their owner");
+
+    assert_xmlsec1_accepts(&signed, "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+}
+
+#[test]
+fn xml_sec_verifies_selected_axes_without_their_owner_from_xmlsec1() {
+    // Reciprocal signing proves xmlsec1 independently canonicalizes the same
+    // esoteric node-set to the octets consumed by xml-sec.
+    if !xmlsec1_is_available() {
+        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        return;
+    }
+    let template = omitted_owner_axes_signing_builder()
+        .build_template()
+        .expect("selected-axis interop template must build");
+    let xml = xml_sec::xmldsig::mutation::append_signature_to_root(
+        omitted_owner_axes_payload_xml(),
+        &template,
+    )
+    .expect("selected-axis interop template must append")
+    .replace(
+        "<ds:KeyInfo/>",
+        "<ds:KeyInfo><ds:KeyName>TestKeyName-rsa-2048</ds:KeyName></ds:KeyInfo>",
+    );
+    let template_file = TemporaryXmlFile::write("xmlsec1-selected-axes-template", &xml);
+    let signed = sign_with_xmlsec1(
+        &template_file.path,
+        "TestKeyName-rsa-2048",
+        Path::new("tests/fixtures/keys/rsa/rsa-2048-key.pem"),
+        Path::new("tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+    );
+    let public_key = fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem")
+        .expect("RSA public-key fixture must load");
+
+    let verified = xml_sec::xmldsig::verify_signature_with_pem_key(&signed, &public_key, true)
+        .expect("xml-sec must process xmlsec1 selected-axis signature");
     assert_eq!(verified.status, DsigStatus::Valid);
 }
 
