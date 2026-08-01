@@ -1380,6 +1380,36 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_enveloped_ignores_signature_absent_after_base64_adaptation() {
+        // A binary-producing transform may replace the source document rather
+        // than serialize it. The enveloped transform must not carry the source
+        // Signature identity into that unrelated decoded document.
+        let source = Document::parse(
+            r#"<root><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"/></root>"#,
+        )
+        .unwrap();
+        let signature = source
+            .descendants()
+            .find(|node| node.tag_name().name() == "Signature")
+            .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"<payload>ok</payload>");
+        let transforms = vec![
+            Transform::Base64Decode,
+            Transform::XPath(XPathExpression::new("true()")),
+            Transform::Enveloped,
+        ];
+
+        let output = execute_transforms(
+            signature,
+            TransformData::Binary(encoded.into()),
+            &transforms,
+        )
+        .unwrap();
+
+        assert_eq!(output, b"<payload>ok</payload>");
+    }
+
+    #[test]
     fn pipeline_no_transforms_applies_default_c14n() {
         // No explicit transforms → pipeline falls back to inclusive C14N 1.0
         let xml = r#"<root b="2" a="1"><child/></root>"#;
