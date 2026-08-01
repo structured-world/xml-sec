@@ -1355,6 +1355,28 @@ mod tests {
     // ── Pipeline execution ───────────────────────────────────────────
 
     #[test]
+    fn pipeline_rejects_cumulative_c14n_output_retention() {
+        // Every C14N result is individually moderate, but adapting it back to a
+        // node set keeps prior buffers alive until recursive execution unwinds.
+        // The chain must reject cumulative retention rather than multiplying
+        // memory use by the transform-count limit.
+        let xml = format!("<root>{}</root>", "x".repeat(512 * 1024));
+        let document = Document::parse(&xml).unwrap();
+        let algorithm =
+            C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315").unwrap();
+        let transforms = vec![Transform::C14n(algorithm); 40];
+
+        let result = execute_transforms(
+            document.root_element(),
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&document).unwrap()),
+            &transforms,
+        );
+
+        let error = result.expect_err("cumulative retained C14N output must be bounded");
+        assert!(error.to_string().contains("cumulative canonical output"));
+    }
+
+    #[test]
     fn pipeline_enveloped_then_c14n() {
         // Standard SAML transform chain: enveloped-signature → exc-c14n
         let xml = r#"<root xmlns:ns="http://example.com" b="2" a="1">
