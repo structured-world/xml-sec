@@ -33,13 +33,8 @@ pub(crate) fn normalize_xml_base64_bytes(
     normalized: &mut Vec<u8>,
     accept: impl Fn(u8) -> bool,
 ) -> Result<(), XmlBase64NormalizeError> {
-    normalize_xml_base64_bytes_with_limit(bytes, normalized, usize::MAX, accept).map_err(|err| {
-        match err {
-            XmlBase64NormalizeLimitedError::InvalidWhitespace(err) => err,
-            XmlBase64NormalizeLimitedError::TooLong(_) => {
-                unreachable!("allocated byte slices cannot exceed usize::MAX together")
-            }
-        }
+    visit_xml_base64_bytes(bytes, normalized.len(), &accept, |byte| {
+        normalized.push(byte);
     })
 }
 
@@ -54,19 +49,7 @@ pub(crate) fn normalize_xml_base64_bytes_with_limit(
     accept: impl Fn(u8) -> bool,
 ) -> Result<(), XmlBase64NormalizeLimitedError> {
     let mut additional = 0_usize;
-    for &byte in bytes {
-        if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
-            continue;
-        }
-        if byte.is_ascii_whitespace() || !accept(byte) {
-            return Err(XmlBase64NormalizeError {
-                invalid_byte: byte,
-                normalized_offset: normalized.len() + additional,
-            }
-            .into());
-        }
-        additional += 1;
-    }
+    visit_xml_base64_bytes(bytes, normalized.len(), &accept, |_| additional += 1)?;
 
     if normalized
         .len()
@@ -83,6 +66,29 @@ pub(crate) fn normalize_xml_base64_bytes_with_limit(
         if !matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
             normalized.push(byte);
         }
+    }
+    Ok(())
+}
+
+fn visit_xml_base64_bytes(
+    bytes: &[u8],
+    initial_offset: usize,
+    accept: &impl Fn(u8) -> bool,
+    mut visit: impl FnMut(u8),
+) -> Result<(), XmlBase64NormalizeError> {
+    let mut accepted = 0_usize;
+    for &byte in bytes {
+        if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+            continue;
+        }
+        if byte.is_ascii_whitespace() || !accept(byte) {
+            return Err(XmlBase64NormalizeError {
+                invalid_byte: byte,
+                normalized_offset: initial_offset + accepted,
+            });
+        }
+        visit(byte);
+        accepted += 1;
     }
     Ok(())
 }
