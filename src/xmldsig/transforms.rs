@@ -1429,6 +1429,41 @@ mod tests {
     }
 
     #[test]
+    fn execution_budget_bounds_c14n_output_across_references() {
+        // Each Reference remains below the per-chain retained-output ceiling,
+        // but signing and verification share one execution budget. Repeating
+        // the same C14N work across References must not reset that meter.
+        let xml = format!("<root>{}</root>", "x".repeat(512 * 1024));
+        let document = Document::parse(&xml).unwrap();
+        let algorithm =
+            C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315").unwrap();
+        let transforms = vec![Transform::C14n(algorithm); 20];
+        let execution_budget = TransformExecutionBudget::default();
+        let input = || {
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&document).unwrap())
+        };
+
+        execute_transforms_with_options_and_budget(
+            document.root_element(),
+            input(),
+            &transforms,
+            TransformOptions::default(),
+            &execution_budget,
+        )
+        .expect("the first Reference must fit the cumulative C14N output budget");
+        let result = execute_transforms_with_options_and_budget(
+            document.root_element(),
+            input(),
+            &transforms,
+            TransformOptions::default(),
+            &execution_budget,
+        );
+
+        let error = result.expect_err("the second Reference must exhaust the shared C14N budget");
+        assert!(error.to_string().contains("cumulative canonical output"));
+    }
+
+    #[test]
     fn pipeline_enveloped_then_c14n() {
         // Standard SAML transform chain: enveloped-signature → exc-c14n
         let xml = r#"<root xmlns:ns="http://example.com" b="2" a="1">
