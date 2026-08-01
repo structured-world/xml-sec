@@ -66,13 +66,16 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
                         .iter()
                         .any(|(declared_prefix, _)| declared_prefix == prefix);
                 let utilizer_key = nearest_utilizer_key(prefix);
-                let nearest_utilizer_selected_same_namespace = parent_rendered
+                let nearest_utilizer_omitted_namespace = parent_rendered
                     .get(&utilizer_key)
-                    .is_some_and(|selected_uri| selected_uri == uri);
+                    .is_some_and(|selected_uri| selected_uri == MISSING_NAMESPACE_NODE);
+                let uses_exclusive_rendering =
+                    utilized.contains(prefix) && !self.inclusive_prefixes.contains(prefix);
 
-                if selected_here
+                if uses_exclusive_rendering
+                    && selected_here
                     && declaration_suppressed
-                    && !nearest_utilizer_selected_same_namespace
+                    && nearest_utilizer_omitted_namespace
                 {
                     declarations.push((prefix.to_owned(), uri.to_owned()));
                     declarations.sort_by(|left, right| left.0.cmp(&right.0));
@@ -81,7 +84,7 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
                 // Exclusive C14N section 3 compares a namespace node with the
                 // nearest output ancestor that visibly utilized its prefix,
                 // not merely with the physically effective output binding.
-                if utilized.contains(prefix) {
+                if uses_exclusive_rendering {
                     rendered.insert(
                         utilizer_key,
                         if selected_here {
