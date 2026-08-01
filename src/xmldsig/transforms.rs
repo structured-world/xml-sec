@@ -23,7 +23,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use roxmltree::{Document, Node};
+use roxmltree::Node;
 
 use super::parse::XMLDSIG_NS;
 use super::types::{TransformData, TransformError};
@@ -424,7 +424,15 @@ pub(crate) fn execute_transforms_with_options_and_budget<'a>(
     budget: &TransformExecutionBudget,
 ) -> Result<Vec<u8>, TransformError> {
     ensure_transform_count(transforms.len())?;
-    execute_transform_chain(signature_node, initial_data, transforms, options, budget)
+    execute_transform_chain(
+        signature_node,
+        Some(signature_node),
+        initial_data,
+        transforms,
+        options,
+        budget,
+        None,
+    )
 }
 
 fn ensure_transform_count(count: usize) -> Result<(), TransformError> {
@@ -436,12 +444,14 @@ fn ensure_transform_count(count: usize) -> Result<(), TransformError> {
     Ok(())
 }
 
-fn execute_transform_chain<'s, 'd>(
-    signature_node: Node<'s, 's>,
+fn execute_transform_chain<'s, 'e, 'd>(
+    source_signature: Node<'s, 's>,
+    enveloped_signature: Option<Node<'e, 'e>>,
     data: TransformData<'d>,
     transforms: &[Transform],
     options: TransformOptions,
     budget: &TransformExecutionBudget,
+    canonical_signature_position: Option<Option<usize>>,
 ) -> Result<Vec<u8>, TransformError> {
     let Some((transform, remaining)) = transforms.split_first() else {
         return finalize_transform_data(data);
@@ -457,52 +467,107 @@ fn execute_transform_chain<'s, 'd>(
         let document = roxmltree::Document::parse(&xml)
             .map_err(|error| TransformError::XmlParse(error.to_string()))?;
         let nodes = super::types::NodeSet::entire_document_with_comments(&document)?;
+        return match canonical_signature_position {
+            Some(Some(position)) => {
+                let remapped = document
+                    .descendants()
+                    .find(|node| node.is_element() && node.range().start == position)
+                    .filter(|node| {
+                        enveloped_signature
+                            .is_some_and(|source| node.tag_name() == source.tag_name())
+                    })
+                    .ok_or(TransformError::CrossDocumentSignatureNode)?;
+                execute_transform_chain(
+                    source_signature,
+                    Some(remapped),
+                    TransformData::NodeSet(nodes),
+                    transforms,
+                    options,
+                    budget,
+                    None,
+                )
+            }
+            Some(None) => execute_transform_chain(
+                source_signature,
+                None,
+                TransformData::NodeSet(nodes),
+                transforms,
+                options,
+                budget,
+                None,
+            ),
+            None => execute_transform_chain(
+                source_signature,
+                enveloped_signature,
+                TransformData::NodeSet(nodes),
+                transforms,
+                options,
+                budget,
+                None,
+            ),
+        };
+    }
+
+    if let Transform::C14n(algo) = transform
+        && let TransformData::NodeSet(nodes) = &data
+    {
+        let tracked_element = enveloped_signature
+            .filter(|signature| std::ptr::eq(signature.document(), nodes.document()))
+            .filter(|signature| nodes.contains(*signature))
+            .map(|signature| signature.id());
+        let mut output = Vec::new();
+        let position = c14n::canonicalize_with_visibility_and_position(
+            nodes.document(),
+            Some(nodes),
+            algo,
+            tracked_element,
+            &mut output,
+        )?;
         return execute_transform_chain(
-            signature_node,
-            TransformData::NodeSet(nodes),
-            transforms,
+            source_signature,
+            enveloped_signature,
+            TransformData::Binary(output),
+            remaining,
             options,
             budget,
+            Some(position),
         );
     }
 
-    if matches!(transform, Transform::Enveloped)
-        && let TransformData::NodeSet(nodes) = &data
-        && !std::ptr::eq(signature_node.document(), nodes.document())
-    {
-        let remapped_signature = remap_element(signature_node, nodes.document())
-            .ok_or(TransformError::CrossDocumentSignatureNode)?;
-        let data =
-            apply_transform_with_options(remapped_signature, transform, data, options, budget)?;
-        return execute_transform_chain(remapped_signature, data, remaining, options, budget);
+    if matches!(transform, Transform::Enveloped) {
+        let Some(signature) = enveloped_signature else {
+            return execute_transform_chain(
+                source_signature,
+                None,
+                data,
+                remaining,
+                options,
+                budget,
+                None,
+            );
+        };
+        let data = apply_transform_with_options(signature, transform, data, options, budget)?;
+        return execute_transform_chain(
+            source_signature,
+            Some(signature),
+            data,
+            remaining,
+            options,
+            budget,
+            None,
+        );
     }
 
-    let data = apply_transform_with_options(signature_node, transform, data, options, budget)?;
-    execute_transform_chain(signature_node, data, remaining, options, budget)
-}
-
-fn remap_element<'a>(source: Node<'_, '_>, document: &'a Document<'a>) -> Option<Node<'a, 'a>> {
-    if !source.is_element() {
-        return None;
-    }
-
-    let mut path = Vec::new();
-    let mut current = source;
-    while let Some(parent) = current.parent() {
-        let index = parent
-            .children()
-            .filter(Node::is_element)
-            .position(|child| child == current)?;
-        path.push(index);
-        current = parent;
-    }
-
-    let mut remapped = document.root();
-    for index in path.into_iter().rev() {
-        remapped = remapped.children().filter(Node::is_element).nth(index)?;
-    }
-
-    (remapped.tag_name() == source.tag_name()).then_some(remapped)
+    let data = apply_transform_with_options(source_signature, transform, data, options, budget)?;
+    execute_transform_chain(
+        source_signature,
+        enveloped_signature,
+        data,
+        remaining,
+        options,
+        budget,
+        None,
+    )
 }
 
 fn decode_xml_octets(bytes: &[u8]) -> Result<Cow<'_, str>, TransformError> {

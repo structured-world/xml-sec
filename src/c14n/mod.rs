@@ -32,11 +32,11 @@ mod xml_base;
 
 use std::collections::HashSet;
 
-use roxmltree::{Document, Node};
+use roxmltree::{Document, Node, NodeId};
 
 use ns_exclusive::ExclusiveNsRenderer;
 use ns_inclusive::InclusiveNsRenderer;
-use serialize::{C14nConfig, serialize_canonical_visible};
+use serialize::{C14nConfig, serialize_canonical_visible_with_position};
 
 /// C14N algorithm mode (without the comments flag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +230,17 @@ pub(crate) fn canonicalize_with_visibility(
     algo: &C14nAlgorithm,
     output: &mut Vec<u8>,
 ) -> Result<(), C14nError> {
+    canonicalize_with_visibility_and_position(doc, visibility, algo, None, output)?;
+    Ok(())
+}
+
+pub(crate) fn canonicalize_with_visibility_and_position(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    algo: &C14nAlgorithm,
+    tracked_element: Option<NodeId>,
+    output: &mut Vec<u8>,
+) -> Result<Option<usize>, C14nError> {
     // inherit_xml_attrs: Inclusive C14N inherits xml:* attrs from ancestors
     // per §2.4. Exclusive C14N explicitly omits this per Exc-C14N §3.
     // fixup_xml_base: C14N 1.1 resolves relative xml:base URIs via RFC 3986.
@@ -240,12 +251,13 @@ pub(crate) fn canonicalize_with_visibility(
                 inherit_xml_attrs: true,
                 fixup_xml_base: false,
             };
-            serialize_canonical_visible(
+            serialize_canonical_visible_with_position(
                 doc,
                 visibility,
                 algo.with_comments,
                 &renderer,
                 config,
+                tracked_element,
                 output,
             )
         }
@@ -255,12 +267,13 @@ pub(crate) fn canonicalize_with_visibility(
                 inherit_xml_attrs: true,
                 fixup_xml_base: true,
             };
-            serialize_canonical_visible(
+            serialize_canonical_visible_with_position(
                 doc,
                 visibility,
                 algo.with_comments,
                 &renderer,
                 config,
+                tracked_element,
                 output,
             )
         }
@@ -270,12 +283,13 @@ pub(crate) fn canonicalize_with_visibility(
                 inherit_xml_attrs: false,
                 fixup_xml_base: false,
             };
-            serialize_canonical_visible(
+            serialize_canonical_visible_with_position(
                 doc,
                 visibility,
                 algo.with_comments,
                 &renderer,
                 config,
+                tracked_element,
                 output,
             )
         }

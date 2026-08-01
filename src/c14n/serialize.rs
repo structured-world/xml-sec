@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use roxmltree::{Document, Node, NodeType};
+use roxmltree::{Document, Node, NodeId, NodeType};
 
 #[cfg(test)]
 use super::ClosureVisibility;
@@ -82,7 +82,7 @@ pub(crate) fn serialize_canonical(
     output: &mut Vec<u8>,
 ) -> Result<(), C14nError> {
     let visibility = node_set.map(|predicate| ClosureVisibility { predicate });
-    serialize_canonical_visible(
+    serialize_canonical_visible_with_position(
         doc,
         visibility
             .as_ref()
@@ -90,19 +90,23 @@ pub(crate) fn serialize_canonical(
         with_comments,
         ns_renderer,
         config,
+        None,
         output,
-    )
+    )?;
+    Ok(())
 }
 
-pub(crate) fn serialize_canonical_visible(
+pub(crate) fn serialize_canonical_visible_with_position(
     doc: &Document,
     visibility: Option<&dyn NodeVisibility>,
     with_comments: bool,
     ns_renderer: &dyn NsRenderer,
     config: C14nConfig,
+    tracked_element: Option<NodeId>,
     output: &mut Vec<u8>,
-) -> Result<(), C14nError> {
+) -> Result<Option<usize>, C14nError> {
     let root = doc.root();
+    let mut tracked_position = None;
     serialize_children(
         root,
         visibility,
@@ -110,9 +114,11 @@ pub(crate) fn serialize_canonical_visible(
         ns_renderer,
         config,
         &HashMap::new(),
+        tracked_element,
+        &mut tracked_position,
         output,
     );
-    Ok(())
+    Ok(tracked_position)
 }
 
 /// Serialize children of a node in document order.
@@ -123,6 +129,8 @@ fn serialize_children(
     ns_renderer: &dyn NsRenderer,
     config: C14nConfig,
     parent_rendered: &HashMap<String, String>,
+    tracked_element: Option<NodeId>,
+    tracked_position: &mut Option<usize>,
     output: &mut Vec<u8>,
 ) {
     let is_doc_root = parent.node_type() == NodeType::Root;
@@ -141,6 +149,8 @@ fn serialize_children(
                         ns_renderer,
                         config,
                         parent_rendered,
+                        tracked_element,
+                        tracked_position,
                         output,
                     );
                 } else {
@@ -164,6 +174,8 @@ fn serialize_children(
                         ns_renderer,
                         config,
                         parent_rendered,
+                        tracked_element,
+                        tracked_position,
                         output,
                     );
                 }
@@ -281,11 +293,16 @@ fn serialize_element(
     ns_renderer: &dyn NsRenderer,
     config: C14nConfig,
     parent_rendered: &HashMap<String, String>,
+    tracked_element: Option<NodeId>,
+    tracked_position: &mut Option<usize>,
     output: &mut Vec<u8>,
 ) {
     let (ns_decls, rendered) = ns_renderer.render_namespaces(node, parent_rendered, visibility);
 
     // Start tag: <prefix:localname
+    if tracked_element == Some(node.id()) {
+        *tracked_position = Some(output.len());
+    }
     output.push(b'<');
     write_qualified_name(node, output);
 
@@ -408,6 +425,8 @@ fn serialize_element(
         ns_renderer,
         config,
         &rendered,
+        tracked_element,
+        tracked_position,
         output,
     );
 
