@@ -1256,6 +1256,72 @@ mod tests {
         );
     }
 
+    struct HiddenXmlBaseVisibility {
+        included: HashSet<NodeId>,
+        hidden_base_owner: NodeId,
+    }
+
+    impl NodeVisibility for HiddenXmlBaseVisibility {
+        fn contains_node(&self, node: Node<'_, '_>) -> bool {
+            self.included.contains(&node.id())
+        }
+
+        fn contains_attribute(
+            &self,
+            owner: Node<'_, '_>,
+            namespace: Option<&str>,
+            local_name: &str,
+        ) -> bool {
+            self.included.contains(&owner.id())
+                && !(owner.id() == self.hidden_base_owner
+                    && namespace == Some(XML_NS)
+                    && local_name == "base")
+        }
+
+        fn contains_namespace(&self, owner: Node<'_, '_>, _prefix: &str, _uri: &str) -> bool {
+            self.included.contains(&owner.id())
+        }
+    }
+
+    #[test]
+    fn c14n11_fixup_crosses_selected_owner_of_hidden_xml_base() {
+        // b remains in the output but its xml:base attribute node does not.
+        // The omitted c therefore requires d to materialize b's hidden base;
+        // stopping at b would change d's effective URI in the canonical form.
+        let xml = r#"<a xml:base="http://ex/"><b xml:base="hidden/"><c><d xml:base="leaf">text</d></c></b></a>"#;
+        let doc = Document::parse(xml).unwrap();
+        let a = doc.root_element();
+        let b = a.first_element_child().unwrap();
+        let c = b.first_element_child().unwrap();
+        let d = c.first_element_child().unwrap();
+        let mut included = HashSet::from([a.id(), b.id(), d.id()]);
+        included.extend(d.children().map(|node| node.id()));
+        let visibility = HiddenXmlBaseVisibility {
+            included,
+            hidden_base_owner: b.id(),
+        };
+        let mut out = Vec::new();
+
+        serialize_canonical_visible_with_position(
+            &doc,
+            Some(&visibility),
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: true,
+            },
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"<a xml:base="http://ex/"><b><d xml:base="hidden/leaf">text</d></b></a>"#
+        );
+    }
+
     #[test]
     fn no_inheritance_in_full_document() {
         // Full document (no node_set) — xml:lang stays on root only.
