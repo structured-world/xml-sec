@@ -1414,6 +1414,25 @@ mod tests {
     }
 
     #[test]
+    fn function_spacing_normalization_uses_xpath_whitespace() {
+        // XPath 1.0 S contains only space, tab, CR, and LF. Rust's broader
+        // Unicode whitespace class must not turn malformed source into a
+        // conforming function call that another XPath implementation rejects.
+        for whitespace in [' ', '\t', '\r', '\n'] {
+            let source = format!("true{whitespace}()");
+            assert_eq!(normalize_function_spacing(&source), "true()");
+            assert!(compile_xpath(&source).is_ok());
+        }
+
+        let non_xpath_whitespace = "true\u{00a0}()";
+        assert_eq!(
+            normalize_function_spacing(non_xpath_whitespace),
+            non_xpath_whitespace
+        );
+        assert!(compile_xpath(non_xpath_whitespace).is_err());
+    }
+
+    #[test]
     fn xpath_here_function_uses_xpath_element() {
         // XMLDSig defines here() as the parent of the text node that directly
         // bears the expression, which is the XPath parameter element.
