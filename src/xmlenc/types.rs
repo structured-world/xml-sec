@@ -288,7 +288,11 @@ impl fmt::Debug for EncryptionRecipient {
 }
 
 impl EncryptionRecipient {
-    /// Create an RSA-OAEP recipient with secure XMLEnc 1.1 defaults.
+    /// Create an RSA-OAEP recipient using SHA-256 and MGF1-SHA-256.
+    ///
+    /// XMLEnc 1.1 assigns SHA-1 and MGF1-SHA-1 when these parameters are
+    /// omitted. Serialized keys therefore include both algorithm values
+    /// explicitly instead of relying on the specification's legacy defaults.
     pub fn rsa_oaep(public_key: RsaPublicKey) -> Self {
         Self::RsaOaep {
             public_key,

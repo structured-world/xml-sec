@@ -35,8 +35,10 @@ fn example() -> Result<(), Box<dyn std::error::Error>> {
 
 For recipient transport, add one or more `EncryptionRecipient::rsa_oaep` entries with recipient
 public keys, or use `recipient_aes_kw` with a shared KEK. A fresh content key is generated from
-the operating-system RNG and wrapped once per recipient. XMLEnc 1.1 RSA-OAEP defaults to
-SHA-256/MGF1-SHA-256; legacy SHA-1 OAEP must be selected explicitly.
+the operating-system RNG and wrapped once per recipient. The crate's secure RSA-OAEP default is
+SHA-256/MGF1-SHA-256. XMLEnc 1.1 itself defaults omitted parameters to SHA-1/MGF1-SHA-1, so
+`xml-sec` always emits explicit `ds:DigestMethod` and `xenc11:MGF` values rather than relying on
+those implicit legacy defaults. SHA-1 OAEP remains available only through explicit parameters.
 
 `encrypt_document` selects the root or an element by `Id`, `ID`, or `id`, then replaces either
 the complete element or only its child content according to `EncryptedDataType`. See

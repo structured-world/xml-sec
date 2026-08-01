@@ -578,3 +578,25 @@ fn generated_metadata_is_xml_escaped_and_legacy_mgf_is_restricted() {
         Err(XmlEncError::InvalidEncryptionConfig(_))
     ));
 }
+
+#[test]
+fn default_rsa_oaep_recipient_emits_explicit_secure_parameters() {
+    // XMLEnc 1.1 falls back to SHA-1 when these children are absent, so the
+    // crate's SHA-256 defaults must remain explicit in the generated XML.
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .add_recipient(EncryptionRecipient::rsa_oaep(public_key(RSA_2048_PUBLIC)))
+        .encrypt_binary(b"explicit OAEP defaults")
+        .expect("default RSA-OAEP recipient must encrypt");
+    let parsed = parse_encrypted_data(&encrypted.encrypted_data_xml)
+        .expect("generated EncryptedData must parse");
+    let method = &parsed.encrypted_keys[0].encryption_method;
+
+    assert_eq!(
+        method.oaep_digest.as_deref(),
+        Some("http://www.w3.org/2001/04/xmlenc#sha256")
+    );
+    assert_eq!(
+        method.mgf_algorithm.as_deref(),
+        Some("http://www.w3.org/2009/xmlenc11#mgf1sha256")
+    );
+}
