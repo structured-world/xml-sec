@@ -12,6 +12,12 @@ use super::ns_common::collect_ns_declarations;
 use super::prefix::{attribute_prefix, element_prefix};
 use super::serialize::NsRenderer;
 
+const MISSING_NAMESPACE_NODE: &str = "\0";
+
+fn nearest_utilizer_key(prefix: &str) -> String {
+    format!("\0exclusive-nearest-utilizer:{prefix}")
+}
+
 /// Exclusive C14N namespace renderer.
 ///
 /// Only emits namespace declarations for prefixes that are visibly utilized
@@ -54,34 +60,36 @@ impl NsRenderer for ExclusiveNsRenderer<'_> {
                 let prefix = namespace.name().unwrap_or("");
                 let uri = namespace.uri();
                 let selected_here = visibility.contains_namespace(node, prefix, uri);
-                let selected_on_parent = visibility.contains_namespace(parent, prefix, uri);
                 let declaration_suppressed = parent_rendered.get(prefix).map(String::as_str)
                     == Some(uri)
                     && !declarations
                         .iter()
                         .any(|(declared_prefix, _)| declared_prefix == prefix);
-                let discontinuity_key = format!("\0exclusive-discontinuity:{prefix}");
-                let was_discontinuous = parent_rendered.contains_key(&discontinuity_key);
-                if selected_here && declaration_suppressed {
-                    match (was_discontinuous, selected_on_parent) {
-                        (true, false) => {
-                            declarations.push((prefix.to_owned(), uri.to_owned()));
-                            declarations.sort_by(|left, right| left.0.cmp(&right.0));
-                            rendered.remove(&discontinuity_key);
-                        }
-                        (true, true) => {
-                            rendered.remove(&discontinuity_key);
-                        }
-                        (false, false) => {
-                            // Preserve the physical URI binding while marking
-                            // the first namespace-node discontinuity. A second
-                            // discontinuity must redeclare the prefix.
-                            rendered.insert(discontinuity_key, String::new());
-                        }
-                        (false, true) => {}
-                    }
-                } else if selected_here {
-                    rendered.remove(&discontinuity_key);
+                let utilizer_key = nearest_utilizer_key(prefix);
+                let nearest_utilizer_selected_same_namespace = parent_rendered
+                    .get(&utilizer_key)
+                    .is_some_and(|selected_uri| selected_uri == uri);
+
+                if selected_here
+                    && declaration_suppressed
+                    && !nearest_utilizer_selected_same_namespace
+                {
+                    declarations.push((prefix.to_owned(), uri.to_owned()));
+                    declarations.sort_by(|left, right| left.0.cmp(&right.0));
+                }
+
+                // Exclusive C14N section 3 compares a namespace node with the
+                // nearest output ancestor that visibly utilized its prefix,
+                // not merely with the physically effective output binding.
+                if utilized.contains(prefix) {
+                    rendered.insert(
+                        utilizer_key,
+                        if selected_here {
+                            uri.to_owned()
+                        } else {
+                            MISSING_NAMESPACE_NODE.to_owned()
+                        },
+                    );
                 }
             }
         }
@@ -139,10 +147,33 @@ fn visibly_utilized_prefixes<'a>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::super::serialize::{C14nConfig, serialize_canonical};
+    use super::super::serialize::{
+        C14nConfig, serialize_canonical, serialize_canonical_visible_with_position,
+    };
     use super::*;
     use roxmltree::Document;
     use std::collections::HashSet;
+
+    struct NamespaceGapVisibility;
+
+    impl NodeVisibility for NamespaceGapVisibility {
+        fn contains_node(&self, _node: Node<'_, '_>) -> bool {
+            true
+        }
+
+        fn contains_attribute(
+            &self,
+            _owner: Node<'_, '_>,
+            _namespace: Option<&str>,
+            _local_name: &str,
+        ) -> bool {
+            true
+        }
+
+        fn contains_namespace(&self, owner: Node<'_, '_>, prefix: &str, _uri: &str) -> bool {
+            prefix != "p" || owner.tag_name().name() != "gap"
+        }
+    }
 
     fn exc_c14n(xml: &str, prefix_list: &HashSet<String>) -> String {
         let doc = Document::parse(xml).expect("parse");
@@ -215,6 +246,36 @@ mod tests {
         assert!(
             result.contains(r#"<child xmlns="">"#),
             "xmlns=\"\" must be emitted for undeclaration. Got: {result}"
+        );
+    }
+
+    #[test]
+    fn redeclares_prefix_after_one_namespace_node_discontinuity() {
+        // Exclusive C14N section 3 compares against the nearest output
+        // ancestor that visibly utilizes the prefix. Because `gap` omits its
+        // p namespace node, `leaf` must redeclare p at the first discontinuity.
+        let xml = r#"<p:root xmlns:p="urn:p"><p:gap><p:leaf/></p:gap></p:root>"#;
+        let doc = Document::parse(xml).expect("parse");
+        let prefix_list = HashSet::new();
+        let renderer = ExclusiveNsRenderer::new(&prefix_list);
+        let mut out = Vec::new();
+        serialize_canonical_visible_with_position(
+            &doc,
+            Some(&NamespaceGapVisibility),
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: false,
+                fixup_xml_base: false,
+            },
+            None,
+            &mut out,
+        )
+        .expect("c14n");
+
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            r#"<p:root xmlns:p="urn:p"><p:gap><p:leaf xmlns:p="urn:p"></p:leaf></p:gap></p:root>"#
         );
     }
 }
