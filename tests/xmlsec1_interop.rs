@@ -92,10 +92,8 @@ fn xpath_filter2_payload_xml() -> &'static str {
 }
 
 fn omitted_owner_axes_signing_builder() -> SignatureBuilder {
-    let selected_axes = XPathExpression::new(
-        "/root/Omitted/@a | /root/Omitted/namespace::p",
-    )
-    .with_namespace("p", "urn:p");
+    let selected_axes = XPathExpression::new("/root/Omitted/@a | /root/Omitted/namespace::p")
+        .with_namespace("p", "urn:p");
     SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
         .ns_prefix("ds")
         .add_reference(
@@ -105,9 +103,7 @@ fn omitted_owner_axes_signing_builder() -> SignatureBuilder {
                     XPathFilterOperation::Intersect,
                     selected_axes,
                 )]))
-                .transform(Transform::C14n(
-                    exclusive_c14n().with_prefix_list("p"),
-                )),
+                .transform(Transform::C14n(exclusive_c14n().with_prefix_list("p"))),
         )
         .key_info(true)
 }
