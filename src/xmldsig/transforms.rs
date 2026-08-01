@@ -1267,6 +1267,50 @@ mod tests {
     }
 
     #[test]
+    fn base64_transform_handles_highly_fragmented_node_set_input() {
+        // Comments can split an untrusted payload into thousands of tiny text
+        // nodes. Normalization must retain linear allocation behavior while
+        // preserving document-order concatenation.
+        let expected = vec![0x42_u8; 3 * 1_024];
+        let encoded = STANDARD.encode(&expected);
+        let mut xml = String::from("<root>");
+        for byte in encoded.bytes() {
+            xml.push(char::from(byte));
+            xml.push_str("<!-- split -->");
+        }
+        xml.push_str("</root>");
+        let doc = Document::parse(&xml).unwrap();
+        let input = TransformData::NodeSet(NodeSet::subtree(doc.root_element()).unwrap());
+
+        let result = apply_transform(doc.root_element(), &Transform::Base64Decode, input).unwrap();
+
+        assert_eq!(result.into_binary().unwrap(), expected);
+    }
+
+    #[test]
+    fn pipeline_rejects_cumulative_base64_input_past_budget() {
+        // Each transform is individually under 16 MiB, but charging only the
+        // current input permits one reference chain to exceed the total bound.
+        let doc = Document::parse("<root/>").unwrap();
+        let inner = vec![b'A'; MAX_BASE64_TRANSFORM_OUTPUT_BYTES];
+        let outer = STANDARD.encode(&inner);
+        let transforms = [Transform::Base64Decode, Transform::Base64Decode];
+
+        let result = execute_transforms(
+            doc.root_element(),
+            TransformData::Binary(outer.into_bytes()),
+            &transforms,
+        );
+
+        assert!(matches!(
+            result,
+            Err(TransformError::Base64InputTooLarge {
+                max_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES
+            })
+        ));
+    }
+
+    #[test]
     fn pipeline_rejects_unbounded_programmatic_transform_chain() {
         // The public executor is a trust boundary too: callers can bypass XML
         // parsing and must not be able to create an arbitrarily deep recursion.
