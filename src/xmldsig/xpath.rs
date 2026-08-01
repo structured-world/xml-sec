@@ -83,6 +83,11 @@ impl XPathWorkBudget {
 /// SXD's tokenizer rejects otherwise valid whitespace between a function QName
 /// and `(`. Normalize only that token boundary, preserving quoted literals and
 /// all whitespace that can affect string values or operator tokenization.
+fn is_xpath_whitespace(character: char) -> bool {
+    // XPath 1.0 production S delegates to XML's four ASCII whitespace chars.
+    matches!(character, ' ' | '\t' | '\r' | '\n')
+}
+
 pub(super) fn normalize_function_spacing(source: &str) -> String {
     let chars = source.chars().collect::<Vec<_>>();
     let mut output = String::with_capacity(source.len());
@@ -100,9 +105,9 @@ pub(super) fn normalize_function_spacing(source: &str) -> String {
             index += 1;
             continue;
         }
-        if quote.is_none() && character.is_whitespace() {
+        if quote.is_none() && is_xpath_whitespace(character) {
             let whitespace_start = index;
-            while index < chars.len() && chars[index].is_whitespace() {
+            while index < chars.len() && is_xpath_whitespace(chars[index]) {
                 index += 1;
             }
             let previous_is_name = output
@@ -146,7 +151,7 @@ fn xpath_expression_complexity(source: &str) -> usize {
     let mut chars = source.chars().peekable();
     let mut tokens = 0_usize;
     while let Some(character) = chars.next() {
-        if character.is_whitespace() {
+        if is_xpath_whitespace(character) {
             continue;
         }
         tokens = tokens.saturating_add(1);
