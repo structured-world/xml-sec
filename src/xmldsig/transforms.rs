@@ -49,7 +49,8 @@ pub const DEFAULT_IMPLICIT_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c
 /// Maximum transforms accepted for one reference.
 ///
 /// Execution retains one stack frame when a binary-to-node-set adapter parses
-/// temporary XML, so bounding the chain also bounds stack and retained input.
+/// temporary XML, so this bounds recursion depth. Canonical buffers retained by
+/// those frames have a separate cumulative byte budget below.
 pub const MAX_TRANSFORMS_PER_REFERENCE: usize = 64;
 /// xmlsec1 donor vectors use this XPath expression as a compatibility form of
 /// enveloped-signature exclusion.
@@ -60,6 +61,7 @@ const MAX_XPATH_NAMESPACE_BINDINGS: usize = 1_024;
 const MAX_XPATH_NAMESPACE_BYTES: usize = 64 * 1024;
 const MAX_BASE64_TRANSFORM_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BASE64_TRANSFORM_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RETAINED_C14N_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Namespace URI for Exclusive C14N `<InclusiveNamespaces>` elements.
 const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
@@ -92,6 +94,30 @@ pub(crate) struct TransformExecutionBudget {
 
 struct Base64WorkBudget {
     remaining: Cell<usize>,
+}
+
+struct RetainedC14nOutputBudget {
+    remaining: Cell<usize>,
+}
+
+impl Default for RetainedC14nOutputBudget {
+    fn default() -> Self {
+        Self {
+            remaining: Cell::new(MAX_RETAINED_C14N_OUTPUT_BYTES),
+        }
+    }
+}
+
+impl RetainedC14nOutputBudget {
+    fn charge(&self, bytes: usize) -> Result<(), TransformError> {
+        let Some(remaining) = self.remaining.get().checked_sub(bytes) else {
+            return Err(TransformError::C14nRetentionTooLarge {
+                max_bytes: MAX_RETAINED_C14N_OUTPUT_BYTES,
+            });
+        };
+        self.remaining.set(remaining);
+        Ok(())
+    }
 }
 
 impl Default for Base64WorkBudget {
@@ -478,6 +504,7 @@ pub(crate) fn execute_transforms_with_options_and_budget<'a>(
     budget: &TransformExecutionBudget,
 ) -> Result<Vec<u8>, TransformError> {
     ensure_transform_count(transforms.len())?;
+    let retained_c14n_output = RetainedC14nOutputBudget::default();
     execute_transform_chain(
         signature_node,
         Some(signature_node),
@@ -485,6 +512,7 @@ pub(crate) fn execute_transforms_with_options_and_budget<'a>(
         transforms,
         options,
         budget,
+        &retained_c14n_output,
         None,
     )
 }
@@ -505,6 +533,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
     transforms: &[Transform],
     options: TransformOptions,
     budget: &TransformExecutionBudget,
+    retained_c14n_output: &RetainedC14nOutputBudget,
     canonical_signature_position: Option<Option<usize>>,
 ) -> Result<Vec<u8>, TransformError> {
     let Some((transform, remaining)) = transforms.split_first() else {
@@ -516,7 +545,9 @@ fn execute_transform_chain<'s, 'e, 'd>(
     {
         // The parsed document must outlive every remaining node-set transform.
         // Recursive execution keeps all borrows scoped to this stack frame and
-        // returns only owned digest bytes.
+        // returns only owned digest bytes. Each C14N buffer retained by these
+        // frames is charged before adaptation, preventing transform depth from
+        // multiplying an attacker-controlled document allocation.
         let xml = decode_xml_octets(&bytes)?;
         let document = roxmltree::Document::parse(&xml)
             .map_err(|error| TransformError::XmlParse(error.to_string()))?;
@@ -538,6 +569,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                     transforms,
                     options,
                     budget,
+                    retained_c14n_output,
                     None,
                 )
             }
@@ -548,6 +580,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 transforms,
                 options,
                 budget,
+                retained_c14n_output,
                 None,
             ),
             None => execute_transform_chain(
@@ -560,6 +593,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 transforms,
                 options,
                 budget,
+                retained_c14n_output,
                 None,
             ),
         };
@@ -580,6 +614,9 @@ fn execute_transform_chain<'s, 'e, 'd>(
             tracked_element,
             &mut output,
         )?;
+        if remaining.first().is_some_and(transform_requires_node_set) {
+            retained_c14n_output.charge(output.len())?;
+        }
         return execute_transform_chain(
             source_signature,
             enveloped_signature,
@@ -587,6 +624,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
             remaining,
             options,
             budget,
+            retained_c14n_output,
             Some(position),
         );
     }
@@ -600,6 +638,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 remaining,
                 options,
                 budget,
+                retained_c14n_output,
                 None,
             );
         };
@@ -611,6 +650,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
             remaining,
             options,
             budget,
+            retained_c14n_output,
             None,
         );
     }
@@ -623,6 +663,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
         remaining,
         options,
         budget,
+        retained_c14n_output,
         None,
     )
 }
@@ -1372,8 +1413,12 @@ mod tests {
             &transforms,
         );
 
-        let error = result.expect_err("cumulative retained C14N output must be bounded");
-        assert!(error.to_string().contains("cumulative canonical output"));
+        assert!(matches!(
+            result,
+            Err(TransformError::C14nRetentionTooLarge {
+                max_bytes: MAX_RETAINED_C14N_OUTPUT_BYTES
+            })
+        ));
     }
 
     #[test]

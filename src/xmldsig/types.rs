@@ -459,6 +459,15 @@ pub enum TransformError {
     #[error("C14N error: {0}")]
     C14n(#[from] crate::c14n::C14nError),
 
+    /// Recursive node-set adaptation would retain too much canonical output.
+    #[error(
+        "cumulative canonical output retained for node-set adaptation exceeds maximum of {max_bytes} bytes"
+    )]
+    C14nRetentionTooLarge {
+        /// Maximum canonical bytes retained by one Reference transform chain.
+        max_bytes: usize,
+    },
+
     /// Base64 decoding failed during the standard XMLDSig Base64 transform.
     #[error("base64 transform decode error: {0}")]
     Base64(String),
