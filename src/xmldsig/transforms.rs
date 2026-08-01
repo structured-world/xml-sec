@@ -532,7 +532,10 @@ fn execute_transform_chain<'s, 'e, 'd>(
             ),
             None => execute_transform_chain(
                 source_signature,
-                enveloped_signature,
+                // Binary input not produced by tracked canonicalization is a
+                // different document. Keep source_signature for XPath here()
+                // semantics, but do not apply its identity to Enveloped.
+                None,
                 TransformData::NodeSet(nodes),
                 transforms,
                 options,
