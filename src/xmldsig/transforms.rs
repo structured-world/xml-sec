@@ -100,6 +100,20 @@ struct RetainedC14nOutputBudget {
     remaining: Cell<usize>,
 }
 
+struct TransformChainBudget<'a> {
+    execution: &'a TransformExecutionBudget,
+    retained_c14n_output: RetainedC14nOutputBudget,
+}
+
+impl<'a> TransformChainBudget<'a> {
+    fn new(execution: &'a TransformExecutionBudget) -> Self {
+        Self {
+            execution,
+            retained_c14n_output: RetainedC14nOutputBudget::default(),
+        }
+    }
+}
+
 impl Default for RetainedC14nOutputBudget {
     fn default() -> Self {
         Self {
@@ -504,15 +518,14 @@ pub(crate) fn execute_transforms_with_options_and_budget<'a>(
     budget: &TransformExecutionBudget,
 ) -> Result<Vec<u8>, TransformError> {
     ensure_transform_count(transforms.len())?;
-    let retained_c14n_output = RetainedC14nOutputBudget::default();
+    let budget = TransformChainBudget::new(budget);
     execute_transform_chain(
         signature_node,
         Some(signature_node),
         initial_data,
         transforms,
         options,
-        budget,
-        &retained_c14n_output,
+        &budget,
         None,
     )
 }
@@ -532,8 +545,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
     data: TransformData<'d>,
     transforms: &[Transform],
     options: TransformOptions,
-    budget: &TransformExecutionBudget,
-    retained_c14n_output: &RetainedC14nOutputBudget,
+    budget: &TransformChainBudget<'_>,
     canonical_signature_position: Option<Option<usize>>,
 ) -> Result<Vec<u8>, TransformError> {
     let Some((transform, remaining)) = transforms.split_first() else {
@@ -569,7 +581,6 @@ fn execute_transform_chain<'s, 'e, 'd>(
                     transforms,
                     options,
                     budget,
-                    retained_c14n_output,
                     None,
                 )
             }
@@ -580,7 +591,6 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 transforms,
                 options,
                 budget,
-                retained_c14n_output,
                 None,
             ),
             None => execute_transform_chain(
@@ -593,7 +603,6 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 transforms,
                 options,
                 budget,
-                retained_c14n_output,
                 None,
             ),
         };
@@ -615,7 +624,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
             &mut output,
         )?;
         if remaining.first().is_some_and(transform_requires_node_set) {
-            retained_c14n_output.charge(output.len())?;
+            budget.retained_c14n_output.charge(output.len())?;
         }
         return execute_transform_chain(
             source_signature,
@@ -624,7 +633,6 @@ fn execute_transform_chain<'s, 'e, 'd>(
             remaining,
             options,
             budget,
-            retained_c14n_output,
             Some(position),
         );
     }
@@ -638,11 +646,11 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 remaining,
                 options,
                 budget,
-                retained_c14n_output,
                 None,
             );
         };
-        let data = apply_transform_with_options(signature, transform, data, options, budget)?;
+        let data =
+            apply_transform_with_options(signature, transform, data, options, budget.execution)?;
         return execute_transform_chain(
             source_signature,
             Some(signature),
@@ -650,12 +658,12 @@ fn execute_transform_chain<'s, 'e, 'd>(
             remaining,
             options,
             budget,
-            retained_c14n_output,
             None,
         );
     }
 
-    let data = apply_transform_with_options(source_signature, transform, data, options, budget)?;
+    let data =
+        apply_transform_with_options(source_signature, transform, data, options, budget.execution)?;
     execute_transform_chain(
         source_signature,
         enveloped_signature,
@@ -663,7 +671,6 @@ fn execute_transform_chain<'s, 'e, 'd>(
         remaining,
         options,
         budget,
-        retained_c14n_output,
         None,
     )
 }
