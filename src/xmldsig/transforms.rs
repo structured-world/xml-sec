@@ -27,9 +27,7 @@ use roxmltree::Node;
 
 use super::parse::XMLDSIG_NS;
 use super::types::{TransformData, TransformError};
-use super::whitespace::{
-    XmlBase64NormalizeLimitedError, is_xml_whitespace_only, normalize_xml_base64_bytes_with_limit,
-};
+use super::whitespace::is_xml_whitespace_only;
 use super::xpath::{
     XPathDocumentRelation, XPathWorkBudget, apply_xpath_filter_with_semantics,
     apply_xpath_filter2_with_semantics, compile_xpath, is_xpath_whitespace,
@@ -357,11 +355,11 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
     }
 }
 
-/// Decode the RFC 2045 alphabet accepted by xmlsec1's Base64 transform.
+/// Retain the RFC 2045 alphabet consumed by the XMLDSig Base64 transform.
 ///
-/// XML whitespace is insignificant in XMLDSig Base64 data. Other bytes are
-/// rejected rather than ignored so malformed signed content cannot acquire
-/// multiple textual representations with different application meaning.
+/// RFC 2045 section 6.8 requires decoders to ignore every byte outside the
+/// alphabet. The raw-input budget is charged before filtering so ignored data
+/// cannot be used to force unbounded scanning or allocation.
 fn append_normalized_base64(
     encoded: &[u8],
     normalized: &mut Vec<u8>,
@@ -374,21 +372,22 @@ fn append_normalized_base64(
             max_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES,
         })?;
 
-    normalize_xml_base64_bytes_with_limit(
-        encoded,
-        normalized,
-        MAX_BASE64_TRANSFORM_INPUT_BYTES,
-        |byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='),
-    )
-    .map_err(|err| match err {
-        XmlBase64NormalizeLimitedError::InvalidWhitespace(err) => TransformError::Base64(format!(
-            "invalid byte 0x{:02X} in encoded input",
-            err.invalid_byte
-        )),
-        XmlBase64NormalizeLimitedError::TooLong(_) => TransformError::Base64InputTooLarge {
-            max_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES,
-        },
-    })
+    let additional = encoded
+        .iter()
+        .filter(|byte| is_rfc2045_base64_byte(**byte))
+        .count();
+    normalized.reserve_exact(additional);
+    normalized.extend(
+        encoded
+            .iter()
+            .copied()
+            .filter(|byte| is_rfc2045_base64_byte(*byte)),
+    );
+    Ok(())
+}
+
+fn is_rfc2045_base64_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
 }
 
 fn decode_base64_transform(normalized: &[u8]) -> Result<Vec<u8>, TransformError> {
