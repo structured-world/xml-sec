@@ -23,7 +23,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use roxmltree::Node;
+use roxmltree::{Document, Node};
 
 use super::parse::XMLDSIG_NS;
 use super::types::{TransformData, TransformError};
@@ -466,8 +466,43 @@ fn execute_transform_chain<'s, 'd>(
         );
     }
 
+    if matches!(transform, Transform::Enveloped)
+        && let TransformData::NodeSet(nodes) = &data
+        && !std::ptr::eq(signature_node.document(), nodes.document())
+    {
+        let remapped_signature = remap_element(signature_node, nodes.document())
+            .ok_or(TransformError::CrossDocumentSignatureNode)?;
+        let data =
+            apply_transform_with_options(remapped_signature, transform, data, options, budget)?;
+        return execute_transform_chain(remapped_signature, data, remaining, options, budget);
+    }
+
     let data = apply_transform_with_options(signature_node, transform, data, options, budget)?;
     execute_transform_chain(signature_node, data, remaining, options, budget)
+}
+
+fn remap_element<'a>(source: Node<'_, '_>, document: &'a Document<'a>) -> Option<Node<'a, 'a>> {
+    if !source.is_element() {
+        return None;
+    }
+
+    let mut path = Vec::new();
+    let mut current = source;
+    while let Some(parent) = current.parent() {
+        let index = parent
+            .children()
+            .filter(Node::is_element)
+            .position(|child| child == current)?;
+        path.push(index);
+        current = parent;
+    }
+
+    let mut remapped = document.root();
+    for index in path.into_iter().rev() {
+        remapped = remapped.children().filter(Node::is_element).nth(index)?;
+    }
+
+    (remapped.tag_name() == source.tag_name()).then_some(remapped)
 }
 
 fn decode_xml_octets(bytes: &[u8]) -> Result<Cow<'_, str>, TransformError> {
@@ -1160,13 +1195,11 @@ mod tests {
             .descendants()
             .find(|node| node.attribute("Id") == Some("owner"))
             .unwrap();
-        let initial = TransformData::NodeSet(
-            NodeSet::entire_document_without_comments(&document).unwrap(),
-        );
+        let initial =
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&document).unwrap());
         let transforms = vec![
             Transform::C14n(
-                C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315")
-                    .unwrap(),
+                C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315").unwrap(),
             ),
             Transform::Enveloped,
         ];
