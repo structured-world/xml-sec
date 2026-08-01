@@ -83,7 +83,7 @@ impl XPathWorkBudget {
 /// SXD's tokenizer rejects otherwise valid whitespace between a function QName
 /// and `(`. Normalize only that token boundary, preserving quoted literals and
 /// all whitespace that can affect string values or operator tokenization.
-fn is_xpath_whitespace(character: char) -> bool {
+pub(super) fn is_xpath_whitespace(character: char) -> bool {
     // XPath 1.0 production S delegates to XML's four ASCII whitespace chars.
     matches!(character, ' ' | '\t' | '\r' | '\n')
 }

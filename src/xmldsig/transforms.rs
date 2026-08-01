@@ -32,7 +32,7 @@ use super::whitespace::{
 };
 use super::xpath::{
     XPathDocumentRelation, XPathWorkBudget, apply_xpath_filter_with_semantics,
-    apply_xpath_filter2_with_semantics, compile_xpath,
+    apply_xpath_filter2_with_semantics, compile_xpath, is_xpath_whitespace,
 };
 use crate::c14n::{self, C14nAlgorithm};
 
@@ -891,7 +891,7 @@ fn parse_xpath_expression(
             ));
         }
     }
-    let source = source.trim();
+    let source = source.trim_matches(is_xpath_whitespace);
     if source.is_empty() {
         return Err(TransformError::XPath(
             "XPath expression must not be empty".into(),
