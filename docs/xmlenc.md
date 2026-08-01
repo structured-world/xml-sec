@@ -15,21 +15,22 @@ use xml_sec::xmlenc::{
     SymmetricKeyDecryptor, decrypt,
 };
 
-# fn example() -> Result<(), Box<dyn std::error::Error>> {
-let key = [0x42_u8; 16];
-let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
-    .direct_key(key)
-    .direct_key_name("application-content-key")
-    .encrypt_xml("<secret>value</secret>")?;
+fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let key = [0x42_u8; 16];
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(key)
+        .direct_key_name("application-content-key")
+        .encrypt_xml("<secret>value</secret>")?;
 
-assert_eq!(
-    decrypt(
-        &encrypted.encrypted_data_xml,
-        &SymmetricKeyDecryptor::new(key),
-    )?,
-    DecryptedContent::Xml("<secret>value</secret>".into()),
-);
-# Ok(())
+    assert_eq!(
+        decrypt(
+            &encrypted.encrypted_data_xml,
+            &SymmetricKeyDecryptor::new(key),
+        )?,
+        DecryptedContent::Xml("<secret>value</secret>".into()),
+    );
+    Ok(())
+}
 ```
 
 For recipient transport, add one or more `EncryptionRecipient::rsa_oaep` entries with recipient
@@ -51,16 +52,17 @@ use xml_sec::xmlenc::{
     DecryptedContent, SymmetricKeyDecryptor, decrypt_data, parse_encrypted_data,
 };
 
-# fn example(encrypted_xml: &str) -> Result<(), Box<dyn std::error::Error>> {
-let encrypted = parse_encrypted_data(encrypted_xml)?;
-let resolver = SymmetricKeyDecryptor::new([0_u8; 16]);
-let plaintext = decrypt_data(&encrypted, &resolver)?;
+fn example(encrypted_xml: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let encrypted = parse_encrypted_data(encrypted_xml)?;
+    let resolver = SymmetricKeyDecryptor::new([0_u8; 16]);
+    let plaintext = decrypt_data(&encrypted, &resolver)?;
 
-match plaintext {
-    DecryptedContent::Xml(xml) => println!("{xml}"),
-    DecryptedContent::Bytes(bytes) => println!("{} plaintext bytes", bytes.len()),
+    match plaintext {
+        DecryptedContent::Xml(xml) => println!("{xml}"),
+        DecryptedContent::Bytes(bytes) => println!("{} plaintext bytes", bytes.len()),
+    }
+    Ok(())
 }
-# Ok(())
 ```
 
 `PrivateKeyDecryptor` unwraps embedded RSA-OAEP `EncryptedKey` values and `KekDecryptor`

@@ -75,16 +75,16 @@ RSA-OAEP recipients, AES Key Wrap recipients, and Element/Content document repla
 ```rust
 use xml_sec::xmlenc::{DataEncryptionAlgorithm, EncryptedDataBuilder};
 
-# fn example() -> Result<(), Box<dyn std::error::Error>> {
-let key = [0x42_u8; 16];
-let encrypted_data = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
-    .direct_key(key)
-    .direct_key_name("application-content-key")
-    .encrypt_xml("<secret>value</secret>")?;
+fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let key = [0x42_u8; 16];
+    let encrypted_data = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(key)
+        .direct_key_name("application-content-key")
+        .encrypt_xml("<secret>value</secret>")?;
 
-assert!(encrypted_data.encrypted_data_xml.contains("EncryptedData"));
-# Ok(())
-# }
+    assert!(encrypted_data.encrypted_data_xml.contains("EncryptedData"));
+    Ok(())
+}
 ```
 
 See [XML Encryption](docs/xmlenc.md) for reciprocal decryption, recipient transport,

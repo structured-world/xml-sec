@@ -10,6 +10,7 @@
 //!
 //! External `CipherReference` resources, RSA PKCS#1 v1.5 key transport, and
 //! unauthenticated legacy ciphers are intentionally outside this profile.
+#![doc = include_str!("../../docs/xmlenc.md")]
 
 use roxmltree::Node;
 
