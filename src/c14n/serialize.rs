@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
 
 use roxmltree::{Document, Node, NodeId, NodeType};
 
@@ -21,6 +22,34 @@ use super::{C14nError, NodeVisibility};
 /// inheritable attributes. `xml:base` is inherited in C14N 1.0 and receives
 /// dedicated fixup in C14N 1.1; `xml:id` is never inherited in C14N 1.1.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+
+struct CanonicalOutput<'a> {
+    bytes: &'a mut Vec<u8>,
+    tracked_element: Option<NodeId>,
+    tracked_position: Option<usize>,
+}
+
+impl Deref for CanonicalOutput<'_> {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        self.bytes
+    }
+}
+
+impl DerefMut for CanonicalOutput<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.bytes
+    }
+}
+
+impl CanonicalOutput<'_> {
+    fn track(&mut self, node: Node<'_, '_>) {
+        if self.tracked_element == Some(node.id()) {
+            self.tracked_position = Some(self.bytes.len());
+        }
+    }
+}
 
 /// Check whether an xml:* attribute participates in subset inheritance.
 ///
@@ -106,7 +135,11 @@ pub(crate) fn serialize_canonical_visible_with_position(
     output: &mut Vec<u8>,
 ) -> Result<Option<usize>, C14nError> {
     let root = doc.root();
-    let mut tracked_position = None;
+    let mut output = CanonicalOutput {
+        bytes: output,
+        tracked_element,
+        tracked_position: None,
+    };
     serialize_children(
         root,
         visibility,
@@ -114,11 +147,9 @@ pub(crate) fn serialize_canonical_visible_with_position(
         ns_renderer,
         config,
         &HashMap::new(),
-        tracked_element,
-        &mut tracked_position,
-        output,
+        &mut output,
     );
-    Ok(tracked_position)
+    Ok(output.tracked_position)
 }
 
 /// Serialize children of a node in document order.
@@ -129,9 +160,7 @@ fn serialize_children(
     ns_renderer: &dyn NsRenderer,
     config: C14nConfig,
     parent_rendered: &HashMap<String, String>,
-    tracked_element: Option<NodeId>,
-    tracked_position: &mut Option<usize>,
-    output: &mut Vec<u8>,
+    output: &mut CanonicalOutput<'_>,
 ) {
     let is_doc_root = parent.node_type() == NodeType::Root;
 
@@ -149,8 +178,6 @@ fn serialize_children(
                         ns_renderer,
                         config,
                         parent_rendered,
-                        tracked_element,
-                        tracked_position,
                         output,
                     );
                 } else {
@@ -172,8 +199,6 @@ fn serialize_children(
                         ns_renderer,
                         config,
                         parent_rendered,
-                        tracked_element,
-                        tracked_position,
                         output,
                     );
                 }
@@ -291,16 +316,12 @@ fn serialize_element(
     ns_renderer: &dyn NsRenderer,
     config: C14nConfig,
     parent_rendered: &HashMap<String, String>,
-    tracked_element: Option<NodeId>,
-    tracked_position: &mut Option<usize>,
-    output: &mut Vec<u8>,
+    output: &mut CanonicalOutput<'_>,
 ) {
     let (ns_decls, rendered) = ns_renderer.render_namespaces(node, parent_rendered, visibility);
 
     // Start tag: <prefix:localname
-    if tracked_element == Some(node.id()) {
-        *tracked_position = Some(output.len());
-    }
+    output.track(node);
     output.push(b'<');
     write_qualified_name(node, output);
 
@@ -423,8 +444,6 @@ fn serialize_element(
         ns_renderer,
         config,
         &rendered,
-        tracked_element,
-        tracked_position,
         output,
     );
 
