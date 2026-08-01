@@ -1213,6 +1213,38 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_remaps_signature_after_xpath_removes_an_earlier_sibling() {
+        // The identity of the owning Signature must survive canonicalization;
+        // its source-tree sibling index is not stable after XPath filtering.
+        let xml = r#"<root>
+            <Signature xmlns="http://www.w3.org/2000/09/xmldsig#" Id="other"/>
+            <discard/>
+            <Signature xmlns="http://www.w3.org/2000/09/xmldsig#" Id="owner"/>
+        </root>"#;
+        let document = Document::parse(xml).unwrap();
+        let signature = document
+            .descendants()
+            .find(|node| node.attribute("Id") == Some("owner"))
+            .unwrap();
+        let initial =
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&document).unwrap());
+        let transforms = vec![
+            Transform::XPath(XPathExpression::new("not(self::discard)")),
+            Transform::C14n(
+                C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315").unwrap(),
+            ),
+            Transform::Enveloped,
+        ];
+
+        let output = execute_transforms(signature, initial, &transforms).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("Id=\"other\""));
+        assert!(!output.contains("Id=\"owner\""));
+        assert!(!output.contains("discard"));
+    }
+
+    #[test]
     fn pipeline_no_transforms_applies_default_c14n() {
         // No explicit transforms → pipeline falls back to inclusive C14N 1.0
         let xml = r#"<root b="2" a="1"><child/></root>"#;
