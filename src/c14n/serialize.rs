@@ -53,10 +53,10 @@ impl CanonicalOutput<'_> {
 
 /// Check whether an xml:* attribute participates in subset inheritance.
 ///
-/// `xml:id` is deliberately absent: C14N 1.1 §2.4 states that it is not a
-/// simple inheritable attribute and performs no propagation for it.
-fn is_inheritable_xml_attr(local_name: &str) -> bool {
-    matches!(local_name, "lang" | "space" | "base")
+/// C14N 1.0 applies the general rule to `xml:id`; C14N 1.1 §2.4 explicitly
+/// removes it from the simple inheritable attributes.
+fn is_inheritable_xml_attr(local_name: &str, inherit_xml_id: bool) -> bool {
+    matches!(local_name, "lang" | "space" | "base") || (inherit_xml_id && local_name == "id")
 }
 
 /// Configuration flags for C14N serialization that vary by mode.
@@ -512,13 +512,17 @@ fn collect_inherited_xml_attrs<'a>(
         return Vec::new();
     }
 
+    // C14N 1.1 is the only inclusive mode with xml:base fixup, and it is also
+    // the version that removes xml:id from subset inheritance.
+    let inherit_xml_id = !fixup_xml_base;
+
     // Collect inheritable xml:* attr names already on this element (own attrs
     // take precedence). Non-inheritable xml:* attrs are ignored.
     let mut seen: HashSet<&str> = HashSet::new();
     for attr in node.attributes() {
         if attr.namespace() == Some(XML_NS) {
             let local = attr.name();
-            if is_inheritable_xml_attr(local) {
+            if is_inheritable_xml_attr(local, inherit_xml_id) {
                 seen.insert(local);
             }
         }
@@ -553,7 +557,7 @@ fn collect_inherited_xml_attrs<'a>(
                     // whether or not their attribute nodes are in the input
                     // node-set. Filtering here would change inherited XML
                     // semantics at an apex element.
-                    if is_inheritable_xml_attr(local) && seen.insert(local) {
+                    if is_inheritable_xml_attr(local, inherit_xml_id) && seen.insert(local) {
                         inherited.push((attr.name(), attr.value()));
                     }
                 }
