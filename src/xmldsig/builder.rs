@@ -266,8 +266,7 @@ impl SignatureBuilder {
             for transform in &reference.transforms {
                 match transform {
                     Transform::XPath(xpath) => {
-                        compile_xpath(xpath.expression())
-                            .map_err(SignatureBuilderError::InvalidXPath)?;
+                        validate_xpath_source(xpath.expression())?;
                     }
                     Transform::XPathFilter2(filters) => {
                         if filters.is_empty() || filters.len() > MAX_XPATH_FILTERS {
@@ -277,8 +276,7 @@ impl SignatureBuilder {
                             });
                         }
                         for filter in filters {
-                            compile_xpath(filter.xpath().expression())
-                                .map_err(SignatureBuilderError::InvalidXPath)?;
+                            validate_xpath_source(filter.xpath().expression())?;
                         }
                     }
                     _ => {}
@@ -361,6 +359,19 @@ impl SignatureBuilder {
         }
         Ok(())
     }
+}
+
+fn validate_xpath_source(source: &str) -> Result<(), SignatureBuilderError> {
+    if let Some(character) = source
+        .chars()
+        .find(|character| !is_xml_1_0_character(*character))
+    {
+        return Err(SignatureBuilderError::InvalidXPath(format!(
+            "XPath expression contains a character forbidden by XML 1.0: {character:?}"
+        )));
+    }
+    compile_xpath(source).map_err(SignatureBuilderError::InvalidXPath)?;
+    Ok(())
 }
 
 fn write_reference<W: Write>(
