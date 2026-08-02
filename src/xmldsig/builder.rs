@@ -6,6 +6,7 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 
 use crate::c14n::{C14nAlgorithm, C14nMode};
+use crate::xml::is_xml_1_0_character;
 
 use super::parse::MAX_REFERENCES_PER_SIGNATURE;
 use super::transforms::{
@@ -29,6 +30,9 @@ pub enum SignatureBuilderError {
     /// A namespace prefix was not a supported XML NCName.
     #[error("invalid XML namespace prefix: {0}")]
     InvalidNamespacePrefix(String),
+    /// A namespace URI could not be represented in an XML 1.0 declaration.
+    #[error("XML namespace URI contains a character forbidden by XML 1.0: {0:?}")]
+    InvalidNamespaceUri(String),
     /// An XPath binding would rebind the prefix used by XMLDSig elements.
     #[error("XPath namespace binding conflicts with XMLDSig prefix: {0}")]
     NamespacePrefixConflict(String),
@@ -310,9 +314,10 @@ impl SignatureBuilder {
         {
             // Namespaces in XML reserves the declaration namespace and both
             // sides of the `xml` binding; prefixed declarations cannot be empty.
-            if uri.is_empty()
-                || uri == XMLNS_NS
-                || prefix == "xmlns"
+            if uri.is_empty() || uri == XMLNS_NS || !uri.chars().all(is_xml_1_0_character) {
+                return Err(SignatureBuilderError::InvalidNamespaceUri(uri.clone()));
+            }
+            if prefix == "xmlns"
                 || (prefix == "xml") != (uri == XML_NS)
                 || (prefix != "xml" && !is_namespace_prefix(prefix))
             {

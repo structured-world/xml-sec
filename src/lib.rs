@@ -32,6 +32,7 @@
 
 pub mod c14n;
 pub mod error;
+mod xml;
 
 #[cfg(feature = "xmldsig")]
 pub mod xmldsig;

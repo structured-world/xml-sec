@@ -23,6 +23,8 @@ use rsa::{Oaep, RsaPublicKey, traits::PaddingScheme};
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
 
+use crate::xml::is_xml_1_0_character;
+
 use super::types::{
     MAX_ENCRYPTION_DOCUMENT_LEN, MAX_ENCRYPTION_METADATA_LEN, MAX_ENCRYPTION_PLAINTEXT_LEN,
     MAX_ENCRYPTION_RECIPIENTS, XMLDSIG_NS, XMLENC_NS, XMLENC11_NS,
@@ -264,20 +266,6 @@ fn validate_metadata(field: &'static str, value: Option<&str>) -> Result<(), Xml
         )));
     }
     validate_metadata_len(field, value.map_or(0, str::len))
-}
-
-fn is_xml_1_0_character(character: char) -> bool {
-    // XML 1.0 Fifth Edition, production [2]. Rust `char` cannot represent the
-    // surrogate range between D7FF and E000, but the split keeps that exclusion explicit.
-    matches!(
-        character,
-        '\u{9}'
-            | '\u{A}'
-            | '\u{D}'
-            | '\u{20}'..='\u{D7FF}'
-            | '\u{E000}'..='\u{FFFD}'
-            | '\u{10000}'..='\u{10FFFF}'
-    )
 }
 
 fn validate_key_name(field: &'static str, value: Option<&str>) -> Result<(), XmlEncError> {
