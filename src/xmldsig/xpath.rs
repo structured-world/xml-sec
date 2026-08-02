@@ -1152,6 +1152,26 @@ mod tests {
     }
 
     #[test]
+    fn xpath_filter2_rejects_cumulative_mirror_bytes() {
+        // Each expression may mirror less than the per-document byte ceiling,
+        // but repeated filters must not multiply signature-wide copying.
+        let xml = format!("<root value=\"{}\"/>", "x".repeat(5 * 1024 * 1024));
+        let document = Document::parse(&xml).unwrap();
+        let input = NodeSet::entire_document_without_comments(&document).unwrap();
+        let filters = [
+            XPathFilter::new(XPathFilterOperation::Intersect, XPathExpression::new(".")),
+            XPathFilter::new(XPathFilterOperation::Intersect, XPathExpression::new(".")),
+        ];
+
+        let error = match apply_xpath_filter2(input, &filters) {
+            Ok(_) => panic!("repeated SXD mirrors must exhaust the cumulative byte budget"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, TransformError::XPathMirrorTooLarge { .. }));
+    }
+
+    #[test]
     fn xpath_filter_charges_nested_document_scans() {
         // A nested descendant scan runs once for every node visited by the
         // outer scan, and ordinary XMLDSig XPath repeats that work for every

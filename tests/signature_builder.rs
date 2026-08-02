@@ -339,6 +339,22 @@ fn allows_filter2_binding_that_matches_signature_prefix() {
 }
 
 #[test]
+fn rejects_xml_forbidden_characters_in_xpath_namespace_uris() {
+    // XML escaping cannot legalize control characters forbidden by XML 1.0;
+    // a successful builder result must therefore always remain parseable.
+    for uri in ["urn:invalid:\0", "urn:invalid:\u{1}"] {
+        let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(
+                Transform::XPath(XPathExpression::new("//doc:item").with_namespace("doc", uri)),
+            ))
+            .build_template()
+            .expect_err("XML-forbidden namespace URI characters must fail at the builder");
+
+        assert!(error.to_string().contains("forbidden by XML 1.0"));
+    }
+}
+
+#[test]
 fn rejects_invalid_filter2_expression_counts() {
     // Builder output is reparsed by signing, so it must enforce the same
     // non-empty, bounded Filter2 sequence accepted by the transform parser.
