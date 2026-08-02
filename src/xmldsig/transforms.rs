@@ -543,7 +543,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
     canonical_signature_position: Option<Option<usize>>,
 ) -> Result<Vec<u8>, TransformError> {
     let Some((transform, remaining)) = transforms.split_first() else {
-        return finalize_transform_data(data);
+        return finalize_transform_data(data, &budget.c14n);
     };
 
     if transform_requires_node_set(transform)
@@ -707,7 +707,10 @@ fn transform_requires_node_set(transform: &Transform) -> bool {
     !matches!(transform, Transform::Base64Decode)
 }
 
-fn finalize_transform_data(data: TransformData<'_>) -> Result<Vec<u8>, TransformError> {
+fn finalize_transform_data(
+    data: TransformData<'_>,
+    c14n_budget: &C14nOutputBudget,
+) -> Result<Vec<u8>, TransformError> {
     // Final coercion: if the result is still a NodeSet, canonicalize with
     // default inclusive C14N 1.0 per XMLDSig spec §4.3.3.2.
     match data {
@@ -718,6 +721,7 @@ fn finalize_transform_data(data: TransformData<'_>) -> Result<Vec<u8>, Transform
                 .expect("default C14N algorithm URI must be supported by C14nAlgorithm::from_uri");
             let mut output = Vec::new();
             c14n::canonicalize_with_visibility(nodes.document(), Some(&nodes), &algo, &mut output)?;
+            c14n_budget.charge(output.len())?;
             Ok(output)
         }
     }
