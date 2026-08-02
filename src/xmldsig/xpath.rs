@@ -1282,6 +1282,26 @@ mod tests {
     }
 
     #[test]
+    fn xpath_filter_rejects_excessive_cumulative_string_work() {
+        // A non-interruptible XPath string function can rescan a large text node
+        // for every context node even when the document's node count is small.
+        let xml = format!(
+            "<root><blob>{}</blob>{}</root>",
+            "x".repeat(1024 * 1024),
+            "<item/>".repeat(70)
+        );
+        let document = Document::parse(&xml).unwrap();
+        let error = apply_xpath_filter(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &XPathExpression::new("contains(string(/root/blob), 'missing')"),
+        )
+        .err()
+        .expect("repeated XPath string scans must exhaust the shared work budget");
+
+        assert!(error.to_string().contains("string-processing work"));
+    }
+
+    #[test]
     fn xpath_filter2_rejects_cumulative_mirror_bytes() {
         // Each expression may mirror less than the per-document byte ceiling,
         // but repeated filters must not multiply signature-wide copying.
