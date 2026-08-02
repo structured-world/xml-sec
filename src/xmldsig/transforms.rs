@@ -185,8 +185,15 @@ struct XPathDocumentIdentity([u8; 32]);
 
 impl XPathDocumentIdentity {
     fn from_document(document: &Document<'_>) -> Self {
+        #[cfg(test)]
+        XPATH_DOCUMENT_IDENTITY_COMPUTATIONS.with(|count| count.set(count.get() + 1));
         Self(Sha256::digest(document.input_text().as_bytes()).into())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static XPATH_DOCUMENT_IDENTITY_COMPUTATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// An XPath 1.0 expression and the namespace bindings in scope where it was declared.
@@ -2289,6 +2296,37 @@ mod tests {
 
         assert!(
             matches!(error, TransformError::XPath(ref message) if message.contains("same XML document"))
+        );
+    }
+
+    #[test]
+    fn transform_chain_computes_document_identity_once() {
+        // Parsed here() provenance needs a content hash, but every XPath step
+        // over the same live document must reuse it rather than rehashing XML.
+        let document = Document::parse(
+            r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:Signature><ds:SignedInfo><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>count(. | here()) = 1 or true()</ds:XPath></ds:Transform><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>count(. | here()) = 1 or true()</ds:XPath></ds:Transform></ds:Transforms></ds:Reference></ds:SignedInfo></ds:Signature></root>"#,
+        )
+        .unwrap();
+        let transforms_node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "Transforms")))
+            .unwrap();
+        let transforms = parse_transforms(transforms_node).unwrap();
+        let signature = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
+            .unwrap();
+        let initial = NodeSet::entire_document_without_comments(&document)
+            .map(TransformData::NodeSet)
+            .unwrap();
+
+        XPATH_DOCUMENT_IDENTITY_COMPUTATIONS.with(|count| count.set(0));
+        execute_transforms(signature, initial, &transforms).unwrap();
+        let computations = XPATH_DOCUMENT_IDENTITY_COMPUTATIONS.with(Cell::get);
+
+        assert_eq!(
+            computations, 1,
+            "one live document must be hashed once per chain"
         );
     }
 
