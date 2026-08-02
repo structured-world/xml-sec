@@ -190,14 +190,18 @@ fn xpath_expression_complexity(source: &str) -> usize {
 
 /// Estimate one XPath evaluation before entering SXD's non-interruptible engine.
 ///
-/// One top-level traversal is covered by the baseline document-size charge. A
-/// traversal inside a predicate can run once per node selected by every enclosing
-/// predicate, so its worst-case cost gains one document-size factor per level.
-/// Saturation deliberately turns arithmetic overflow into a budget rejection.
+/// One top-level traversal is covered by the baseline document-size charge.
+/// Composed scanning steps gain one document-size factor, while independent
+/// expression branches add their traversal costs. Predicate scans inherit the
+/// enclosing path depth and gain another factor per predicate level. Saturation
+/// deliberately turns arithmetic overflow into a budget rejection.
 fn xpath_evaluation_work(source: &str, document_size: usize) -> usize {
     let bytes = source.as_bytes();
     let mut work = document_size;
     let mut predicate_depth = 0_usize;
+    let mut top_level_path_scans = 0_usize;
+    let mut saw_top_level_scan = false;
+    let mut predicate_path_scans = Vec::new();
     let mut quote = None;
     let mut index = 0_usize;
 
@@ -216,27 +220,58 @@ fn xpath_evaluation_work(source: &str, document_size: usize) -> usize {
             index += 1;
             continue;
         }
+        if let Some(operator_len) = xpath_word_operator_len(bytes, index) {
+            reset_xpath_path_scan_depth(
+                predicate_depth,
+                &mut top_level_path_scans,
+                &mut predicate_path_scans,
+            );
+            index = index.saturating_add(operator_len);
+            continue;
+        }
 
         match byte {
-            b'[' => predicate_depth = predicate_depth.saturating_add(1),
-            b']' => predicate_depth = predicate_depth.saturating_sub(1),
-            b'/' if predicate_depth > 0 => {
-                work = work.saturating_add(nested_traversal_work(document_size, predicate_depth));
-                if bytes.get(index + 1) == Some(&b'/') {
-                    index += 1;
-                }
+            b'[' => {
+                predicate_depth = predicate_depth.saturating_add(1);
+                predicate_path_scans.push(0);
             }
-            b':' if predicate_depth > 0 && bytes.get(index + 1) == Some(&b':') => {
+            b']' => {
+                predicate_depth = predicate_depth.saturating_sub(1);
+                predicate_path_scans.pop();
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                charge_xpath_document_scan(
+                    &mut work,
+                    document_size,
+                    predicate_depth,
+                    &mut top_level_path_scans,
+                    &mut saw_top_level_scan,
+                    &mut predicate_path_scans,
+                );
+                index += 1;
+            }
+            b':' if bytes.get(index + 1) == Some(&b':') => {
                 let mut axis_start = index;
                 while axis_start > 0 && is_xpath_name_byte(bytes[axis_start - 1]) {
                     axis_start -= 1;
                 }
                 if is_document_scanning_axis(&source[axis_start..index]) {
-                    work =
-                        work.saturating_add(nested_traversal_work(document_size, predicate_depth));
+                    charge_xpath_document_scan(
+                        &mut work,
+                        document_size,
+                        predicate_depth,
+                        &mut top_level_path_scans,
+                        &mut saw_top_level_scan,
+                        &mut predicate_path_scans,
+                    );
                 }
                 index += 1;
             }
+            b'|' | b',' | b'+' | b'=' | b'<' | b'>' => reset_xpath_path_scan_depth(
+                predicate_depth,
+                &mut top_level_path_scans,
+                &mut predicate_path_scans,
+            ),
             _ => {}
         }
         index += 1;
@@ -245,12 +280,78 @@ fn xpath_evaluation_work(source: &str, document_size: usize) -> usize {
     work
 }
 
-fn nested_traversal_work(document_size: usize, predicate_depth: usize) -> usize {
-    (0..=predicate_depth).fold(1_usize, |work, _| work.saturating_mul(document_size))
+fn charge_xpath_document_scan(
+    work: &mut usize,
+    document_size: usize,
+    predicate_depth: usize,
+    top_level_path_scans: &mut usize,
+    saw_top_level_scan: &mut bool,
+    predicate_path_scans: &mut [usize],
+) {
+    if predicate_depth == 0 {
+        if *top_level_path_scans == 0 {
+            if *saw_top_level_scan {
+                *work = work.saturating_add(document_size);
+            }
+            *top_level_path_scans = 1;
+            *saw_top_level_scan = true;
+        } else {
+            *top_level_path_scans = top_level_path_scans.saturating_add(1);
+            *work = work.saturating_add(document_traversal_work(
+                document_size,
+                *top_level_path_scans,
+            ));
+        }
+        return;
+    }
+
+    let Some(predicate_scans) = predicate_path_scans.get_mut(predicate_depth - 1) else {
+        *work = usize::MAX;
+        return;
+    };
+    let exponent = (*top_level_path_scans)
+        .max(1)
+        .saturating_add(predicate_depth)
+        .saturating_add(*predicate_scans);
+    *work = work.saturating_add(document_traversal_work(document_size, exponent));
+    *predicate_scans = predicate_scans.saturating_add(1);
+}
+
+fn reset_xpath_path_scan_depth(
+    predicate_depth: usize,
+    top_level_path_scans: &mut usize,
+    predicate_path_scans: &mut [usize],
+) {
+    if predicate_depth == 0 {
+        *top_level_path_scans = 0;
+    } else if let Some(predicate_scans) = predicate_path_scans.get_mut(predicate_depth - 1) {
+        *predicate_scans = 0;
+    }
+}
+
+fn document_traversal_work(document_size: usize, exponent: usize) -> usize {
+    (0..exponent).fold(1_usize, |work, _| work.saturating_mul(document_size))
+}
+
+fn xpath_word_operator_len(source: &[u8], index: usize) -> Option<usize> {
+    [b"and".as_slice(), b"or", b"div", b"mod"]
+        .into_iter()
+        .find(|operator| {
+            source[index..].starts_with(operator)
+                && (index == 0 || !is_xpath_identifier_byte(source[index - 1]))
+                && source
+                    .get(index + operator.len())
+                    .is_none_or(|byte| !is_xpath_identifier_byte(*byte))
+        })
+        .map(<[u8]>::len)
 }
 
 fn is_xpath_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn is_xpath_identifier_byte(byte: u8) -> bool {
+    byte >= 0x80 || byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
 }
 
 fn is_document_scanning_axis(axis: &str) -> bool {
@@ -1250,7 +1351,10 @@ mod tests {
         assert_eq!(xpath_evaluation_work("//*[count(//*) > 0]", 10), 110);
         assert_eq!(xpath_evaluation_work("//*[ancestor::*]", 10), 110);
         assert_eq!(xpath_evaluation_work("//a | //b", 10), 20);
+        assert_eq!(xpath_evaluation_work("//a and //b", 10), 20);
+        assert_eq!(xpath_evaluation_work("//brand/descendant::*", 10), 110);
         assert_eq!(xpath_evaluation_work("//*/descendant::*", 10), 110);
+        assert_eq!(xpath_evaluation_work("//*[.//*/descendant::*]", 10), 1_110);
         assert_eq!(
             xpath_evaluation_work("//*[contains(., '//ancestor::*')]", 10),
             10
