@@ -2223,6 +2223,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parsed_xpath_rejects_node_id_collision_from_another_document() {
+        // NodeId is only a document-local index. Reusing a parsed transform
+        // against another document must not let the same numeric id redirect
+        // here() to an unrelated node in that document.
+        let source = Document::parse(
+            r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>count(. | here()) = 1</ds:XPath></ds:Transform></ds:Transforms></root>"#,
+        )
+        .unwrap();
+        let transforms_node = source
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "Transforms")))
+            .unwrap();
+        let transforms = parse_transforms(transforms_node).unwrap();
+
+        let target = Document::parse("<root><container><parameter><unrelated/></parameter></container></root>")
+            .unwrap();
+        let error = execute_transforms(
+            target.root_element(),
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&target).unwrap()),
+            &transforms,
+        )
+        .expect_err("parsed here() provenance must reject another XML document");
+
+        assert!(matches!(error, TransformError::XPath(ref message) if message.contains("same XML document")));
+    }
+
     // ── Integration: SAML-like full pipeline ─────────────────────────
 
     #[test]
