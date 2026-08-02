@@ -382,6 +382,30 @@ fn rejects_xml_forbidden_characters_in_xpath_namespace_uris() {
 }
 
 #[test]
+fn rejects_xml_forbidden_characters_in_xpath_expressions() {
+    // XPath grammar accepts string literals that XML 1.0 cannot serialize. The
+    // builder must reject both parameter forms rather than return an XML string
+    // that the signing pipeline cannot parse again.
+    let expression = "contains(., '\u{B}')";
+    let transforms = [
+        Transform::XPath(XPathExpression::new(expression)),
+        Transform::XPathFilter2(vec![XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new(expression),
+        )]),
+    ];
+
+    for transform in transforms {
+        let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(transform))
+            .build_template()
+            .expect_err("XML-forbidden XPath characters must fail at the builder boundary");
+
+        assert!(error.to_string().contains("forbidden by XML 1.0"));
+    }
+}
+
+#[test]
 fn rejects_invalid_filter2_expression_counts() {
     // Builder output is reparsed by signing, so it must enforce the same
     // non-empty, bounded Filter2 sequence accepted by the transform parser.
