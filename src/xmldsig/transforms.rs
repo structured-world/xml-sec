@@ -24,7 +24,8 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use roxmltree::Node;
+use roxmltree::{Document, Node};
+use sha2::{Digest as _, Sha256};
 
 use super::parse::XMLDSIG_NS;
 use super::types::{TransformData, TransformError};
@@ -176,6 +177,16 @@ impl TransformOptions {
 struct XPathHereNodes {
     xpath: roxmltree::NodeId,
     transform: roxmltree::NodeId,
+    document: XPathDocumentIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct XPathDocumentIdentity([u8; 32]);
+
+impl XPathDocumentIdentity {
+    fn from_document(document: &Document<'_>) -> Self {
+        Self(Sha256::digest(document.input_text().as_bytes()).into())
+    }
 }
 
 /// An XPath 1.0 expression and the namespace bindings in scope where it was declared.
@@ -217,6 +228,11 @@ impl XPathExpression {
             XPathHereSemantics::Specification => nodes.xpath,
             XPathHereSemantics::XmlSecLegacy => nodes.transform,
         })
+    }
+
+    fn matches_parsed_document(&self, document: XPathDocumentIdentity) -> bool {
+        self.here_nodes
+            .is_none_or(|nodes| nodes.document == document)
     }
 }
 
@@ -365,8 +381,16 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
         }
         Transform::XPath(xpath) => {
             let nodes = input.into_node_set()?;
-            let document_relation =
-                XPathDocumentRelation::between(signature_node.document(), nodes.document());
+            let input_document = XPathDocumentIdentity::from_document(nodes.document());
+            let document_relation = if matches!(
+                XPathDocumentRelation::between(signature_node.document(), nodes.document()),
+                XPathDocumentRelation::CrossDocument
+            ) || !xpath.matches_parsed_document(input_document)
+            {
+                XPathDocumentRelation::CrossDocument
+            } else {
+                XPathDocumentRelation::SameDocument
+            };
             Ok(TransformData::NodeSet(apply_xpath_filter_with_semantics(
                 nodes,
                 xpath,
@@ -377,8 +401,18 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
         }
         Transform::XPathFilter2(filters) => {
             let nodes = input.into_node_set()?;
-            let document_relation =
-                XPathDocumentRelation::between(signature_node.document(), nodes.document());
+            let input_document = XPathDocumentIdentity::from_document(nodes.document());
+            let document_relation = if matches!(
+                XPathDocumentRelation::between(signature_node.document(), nodes.document()),
+                XPathDocumentRelation::CrossDocument
+            ) || filters
+                .iter()
+                .any(|filter| !filter.xpath().matches_parsed_document(input_document))
+            {
+                XPathDocumentRelation::CrossDocument
+            } else {
+                XPathDocumentRelation::SameDocument
+            };
             Ok(TransformData::NodeSet(apply_xpath_filter2_with_semantics(
                 nodes,
                 filters,
@@ -970,6 +1004,10 @@ fn parse_xpath_expression(
         here_nodes: Some(XPathHereNodes {
             xpath: xpath_node.id(),
             transform: transform_node,
+            // NodeId is only meaningful within one roxmltree Document. Keep an
+            // owned content identity so parsed transforms cannot outlive the
+            // source and later alias unrelated nodes carrying the same indices.
+            document: XPathDocumentIdentity::from_document(xpath_node.document()),
         }),
     };
     for namespace in xpath_node.namespaces() {
