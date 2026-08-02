@@ -135,6 +135,25 @@ fn rejects_incomplete_or_unsafe_signing_templates() {
 }
 
 #[test]
+fn rejects_reserved_signature_namespace_prefixes() {
+    // XML Namespaces reserves both spellings independently of whether a parser
+    // happens to accept the resulting declaration syntax. Neither may be bound
+    // to the XMLDSig namespace by the public template builder.
+    for prefix in ["xml", "xmlns"] {
+        let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .ns_prefix(prefix)
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256))
+            .build_template()
+            .expect_err("reserved namespace prefixes must fail before serialization");
+
+        assert!(matches!(
+            error,
+            SignatureBuilderError::InvalidNamespacePrefix(value) if value == prefix
+        ));
+    }
+}
+
+#[test]
 fn rejects_too_many_references_before_serialization() {
     // Builder output must obey the same cardinality bound as strict parsing and
     // execution instead of producing a template that signing later rejects.
