@@ -196,6 +196,32 @@ thread_local! {
     static XPATH_DOCUMENT_IDENTITY_COMPUTATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
+#[derive(Default)]
+struct TransformChainState {
+    xpath_document_identity: Cell<Option<XPathDocumentIdentity>>,
+}
+
+impl TransformChainState {
+    fn xpath_document_identity(&self, document: &Document<'_>) -> XPathDocumentIdentity {
+        if let Some(identity) = self.xpath_document_identity.get() {
+            return identity;
+        }
+        let identity = XPathDocumentIdentity::from_document(document);
+        self.xpath_document_identity.set(Some(identity));
+        identity
+    }
+
+    fn document_reparsed(&self) {
+        self.xpath_document_identity.set(None);
+    }
+}
+
+struct TransformExecutionContext<'a> {
+    options: TransformOptions,
+    budget: &'a TransformExecutionBudget,
+    state: &'a TransformChainState,
+}
+
 /// An XPath 1.0 expression and the namespace bindings in scope where it was declared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XPathExpression {
@@ -237,9 +263,8 @@ impl XPathExpression {
         })
     }
 
-    fn matches_parsed_document(&self, document: XPathDocumentIdentity) -> bool {
-        self.here_nodes
-            .is_none_or(|nodes| nodes.document == document)
+    fn parsed_document_identity(&self) -> Option<XPathDocumentIdentity> {
+        self.here_nodes.map(|nodes| nodes.document)
     }
 }
 
@@ -339,21 +364,43 @@ pub(crate) fn apply_transform<'a>(
     input: TransformData<'a>,
 ) -> Result<TransformData<'a>, TransformError> {
     let budget = TransformExecutionBudget::default();
-    apply_transform_with_options(
+    let state = TransformChainState::default();
+    apply_transform_with_options_and_state(
         signature_node,
         transform,
         input,
         TransformOptions::default(),
         &budget,
+        &state,
     )
 }
 
+#[cfg(test)]
 pub(super) fn apply_transform_with_options<'s, 'd>(
     signature_node: Node<'s, 's>,
     transform: &Transform,
     input: TransformData<'d>,
     options: TransformOptions,
     budget: &TransformExecutionBudget,
+) -> Result<TransformData<'d>, TransformError> {
+    let state = TransformChainState::default();
+    apply_transform_with_options_and_state(
+        signature_node,
+        transform,
+        input,
+        options,
+        budget,
+        &state,
+    )
+}
+
+fn apply_transform_with_options_and_state<'s, 'd>(
+    signature_node: Node<'s, 's>,
+    transform: &Transform,
+    input: TransformData<'d>,
+    options: TransformOptions,
+    budget: &TransformExecutionBudget,
+    state: &TransformChainState,
 ) -> Result<TransformData<'d>, TransformError> {
     match transform {
         Transform::Enveloped => {
@@ -388,16 +435,12 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
         }
         Transform::XPath(xpath) => {
             let nodes = input.into_node_set()?;
-            let input_document = XPathDocumentIdentity::from_document(nodes.document());
-            let document_relation = if matches!(
-                XPathDocumentRelation::between(signature_node.document(), nodes.document()),
-                XPathDocumentRelation::CrossDocument
-            ) || !xpath.matches_parsed_document(input_document)
-            {
-                XPathDocumentRelation::CrossDocument
-            } else {
-                XPathDocumentRelation::SameDocument
-            };
+            let document_relation = xpath_document_relation(
+                signature_node.document(),
+                nodes.document(),
+                std::iter::once(xpath),
+                state,
+            );
             Ok(TransformData::NodeSet(apply_xpath_filter_with_semantics(
                 nodes,
                 xpath,
@@ -408,18 +451,12 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
         }
         Transform::XPathFilter2(filters) => {
             let nodes = input.into_node_set()?;
-            let input_document = XPathDocumentIdentity::from_document(nodes.document());
-            let document_relation = if matches!(
-                XPathDocumentRelation::between(signature_node.document(), nodes.document()),
-                XPathDocumentRelation::CrossDocument
-            ) || filters
-                .iter()
-                .any(|filter| !filter.xpath().matches_parsed_document(input_document))
-            {
-                XPathDocumentRelation::CrossDocument
-            } else {
-                XPathDocumentRelation::SameDocument
-            };
+            let document_relation = xpath_document_relation(
+                signature_node.document(),
+                nodes.document(),
+                filters.iter().map(XPathFilter::xpath),
+                state,
+            );
             Ok(TransformData::NodeSet(apply_xpath_filter2_with_semantics(
                 nodes,
                 filters,
@@ -454,6 +491,33 @@ pub(super) fn apply_transform_with_options<'s, 'd>(
             }
             Ok(TransformData::Binary(decode_base64_transform(&normalized)?))
         }
+    }
+}
+
+fn xpath_document_relation<'a>(
+    signature_document: &Document<'_>,
+    input_document: &Document<'_>,
+    expressions: impl IntoIterator<Item = &'a XPathExpression>,
+    state: &TransformChainState,
+) -> XPathDocumentRelation {
+    if matches!(
+        XPathDocumentRelation::between(signature_document, input_document),
+        XPathDocumentRelation::CrossDocument
+    ) {
+        return XPathDocumentRelation::CrossDocument;
+    }
+
+    let mut parsed_identities = expressions
+        .into_iter()
+        .filter_map(XPathExpression::parsed_document_identity);
+    let Some(first) = parsed_identities.next() else {
+        return XPathDocumentRelation::SameDocument;
+    };
+    let input_identity = state.xpath_document_identity(input_document);
+    if first == input_identity && parsed_identities.all(|identity| identity == input_identity) {
+        XPathDocumentRelation::SameDocument
+    } else {
+        XPathDocumentRelation::CrossDocument
     }
 }
 
@@ -554,14 +618,19 @@ pub(crate) fn execute_transforms_with_options_and_budget<'a>(
     budget: &TransformExecutionBudget,
 ) -> Result<Vec<u8>, TransformError> {
     ensure_transform_count(transforms.len())?;
+    let state = TransformChainState::default();
+    let context = TransformExecutionContext {
+        options,
+        budget,
+        state: &state,
+    };
     execute_transform_chain(
         signature_node,
         Some(signature_node),
         initial_data,
         transforms,
-        options,
-        budget,
         None,
+        &context,
     )
 }
 
@@ -579,12 +648,11 @@ fn execute_transform_chain<'s, 'e, 'd>(
     enveloped_signature: Option<Node<'e, 'e>>,
     data: TransformData<'d>,
     transforms: &[Transform],
-    options: TransformOptions,
-    budget: &TransformExecutionBudget,
     canonical_signature_position: Option<Option<usize>>,
+    context: &TransformExecutionContext<'_>,
 ) -> Result<Vec<u8>, TransformError> {
     let Some((transform, remaining)) = transforms.split_first() else {
-        return finalize_transform_data(data, &budget.c14n);
+        return finalize_transform_data(data, &context.budget.c14n);
     };
 
     if transform_requires_node_set(transform)
@@ -598,6 +666,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
         let xml = decode_xml_octets(&bytes)?;
         let document = roxmltree::Document::parse(&xml)
             .map_err(|error| TransformError::XmlParse(error.to_string()))?;
+        context.state.document_reparsed();
         let nodes = super::types::NodeSet::entire_document_with_comments(&document)?;
         return match canonical_signature_position {
             Some(Some(position)) => {
@@ -614,9 +683,8 @@ fn execute_transform_chain<'s, 'e, 'd>(
                     Some(remapped),
                     TransformData::NodeSet(nodes),
                     transforms,
-                    options,
-                    budget,
                     None,
+                    context,
                 )
             }
             Some(None) => execute_transform_chain(
@@ -624,9 +692,8 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 None,
                 TransformData::NodeSet(nodes),
                 transforms,
-                options,
-                budget,
                 None,
+                context,
             ),
             None => execute_transform_chain(
                 source_signature,
@@ -636,9 +703,8 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 None,
                 TransformData::NodeSet(nodes),
                 transforms,
-                options,
-                budget,
                 None,
+                context,
             ),
         };
     }
@@ -658,51 +724,54 @@ fn execute_transform_chain<'s, 'e, 'd>(
             tracked_element,
             &mut output,
         )?;
-        budget.c14n.charge(output.len())?;
+        context.budget.c14n.charge(output.len())?;
         return execute_transform_chain(
             source_signature,
             enveloped_signature,
             TransformData::Binary(output),
             remaining,
-            options,
-            budget,
             Some(position),
+            context,
         );
     }
 
     if matches!(transform, Transform::Enveloped) {
         let Some(signature) = enveloped_signature else {
-            return execute_transform_chain(
-                source_signature,
-                None,
-                data,
-                remaining,
-                options,
-                budget,
-                None,
-            );
+            return execute_transform_chain(source_signature, None, data, remaining, None, context);
         };
-        let data = apply_transform_with_options(signature, transform, data, options, budget)?;
+        let data = apply_transform_with_options_and_state(
+            signature,
+            transform,
+            data,
+            context.options,
+            context.budget,
+            context.state,
+        )?;
         return execute_transform_chain(
             source_signature,
             Some(signature),
             data,
             remaining,
-            options,
-            budget,
             None,
+            context,
         );
     }
 
-    let data = apply_transform_with_options(source_signature, transform, data, options, budget)?;
+    let data = apply_transform_with_options_and_state(
+        source_signature,
+        transform,
+        data,
+        context.options,
+        context.budget,
+        context.state,
+    )?;
     execute_transform_chain(
         source_signature,
         enveloped_signature,
         data,
         remaining,
-        options,
-        budget,
         None,
+        context,
     )
 }
 
@@ -2327,6 +2396,29 @@ mod tests {
         assert_eq!(
             computations, 1,
             "one live document must be hashed once per chain"
+        );
+    }
+
+    #[test]
+    fn template_xpath_skips_document_identity_hash() {
+        // Builder-created expressions have no document-local here() node IDs,
+        // so provenance validation must not scan and hash the input XML.
+        let document = Document::parse("<root><value/></root>").unwrap();
+        let transforms = [
+            Transform::XPath(XPathExpression::new("true()")),
+            Transform::XPath(XPathExpression::new("true()")),
+        ];
+        let initial = NodeSet::entire_document_without_comments(&document)
+            .map(TransformData::NodeSet)
+            .unwrap();
+
+        XPATH_DOCUMENT_IDENTITY_COMPUTATIONS.with(|count| count.set(0));
+        execute_transforms(document.root_element(), initial, &transforms).unwrap();
+        let computations = XPATH_DOCUMENT_IDENTITY_COMPUTATIONS.with(Cell::get);
+
+        assert_eq!(
+            computations, 0,
+            "XPath without parsed here() provenance must not hash XML"
         );
     }
 
