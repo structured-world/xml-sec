@@ -1223,11 +1223,33 @@ mod tests {
     }
 
     #[test]
+    fn xpath_filter_charges_top_level_composed_document_scans() {
+        // The descendant axis is evaluated for every node selected by the
+        // leading descendant scan. Ordinary XMLDSig XPath then repeats that
+        // quadratic evaluation for every input context node.
+        let xml = format!("<root>{}</root>", "<item/>".repeat(20));
+        let document = Document::parse(&xml).unwrap();
+        let budget = XPathWorkBudget::with_limit(1_000);
+        let error = apply_xpath_filter_with_semantics(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &XPathExpression::new("//*/descendant::*"),
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &budget,
+        )
+        .err()
+        .expect("composed top-level scans must exhaust the shared XPath budget");
+
+        assert!(error.to_string().contains("cumulative evaluation work"));
+    }
+
+    #[test]
     fn xpath_work_profile_tracks_nested_paths_but_ignores_literals() {
         // The preflight meter must recognize both abbreviated paths and named
         // axes without treating XPath punctuation inside quoted data as work.
         assert_eq!(xpath_evaluation_work("//*[count(//*) > 0]", 10), 110);
         assert_eq!(xpath_evaluation_work("//*[ancestor::*]", 10), 110);
+        assert_eq!(xpath_evaluation_work("//*/descendant::*", 10), 110);
         assert_eq!(
             xpath_evaluation_work("//*[contains(., '//ancestor::*')]", 10),
             10
