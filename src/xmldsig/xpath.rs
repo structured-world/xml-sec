@@ -1249,6 +1249,7 @@ mod tests {
         // axes without treating XPath punctuation inside quoted data as work.
         assert_eq!(xpath_evaluation_work("//*[count(//*) > 0]", 10), 110);
         assert_eq!(xpath_evaluation_work("//*[ancestor::*]", 10), 110);
+        assert_eq!(xpath_evaluation_work("//a | //b", 10), 20);
         assert_eq!(xpath_evaluation_work("//*/descendant::*", 10), 110);
         assert_eq!(
             xpath_evaluation_work("//*[contains(., '//ancestor::*')]", 10),
