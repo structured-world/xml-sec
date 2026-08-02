@@ -2276,8 +2276,10 @@ mod tests {
             .unwrap();
         let transforms = parse_transforms(transforms_node).unwrap();
 
-        let target = Document::parse("<root><container><parameter><unrelated/></parameter></container></root>")
-            .unwrap();
+        let target = Document::parse(
+            "<root><container><parameter><unrelated/></parameter></container></root>",
+        )
+        .unwrap();
         let error = execute_transforms(
             target.root_element(),
             TransformData::NodeSet(NodeSet::entire_document_without_comments(&target).unwrap()),
@@ -2285,7 +2287,9 @@ mod tests {
         )
         .expect_err("parsed here() provenance must reject another XML document");
 
-        assert!(matches!(error, TransformError::XPath(ref message) if message.contains("same XML document")));
+        assert!(
+            matches!(error, TransformError::XPath(ref message) if message.contains("same XML document"))
+        );
     }
 
     // ── Integration: SAML-like full pipeline ─────────────────────────

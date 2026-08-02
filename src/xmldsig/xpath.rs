@@ -53,9 +53,7 @@ impl Default for XPathWorkBudget {
         Self {
             remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
             mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
-            string_work_bytes_remaining: Rc::new(Cell::new(
-                MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES,
-            )),
+            string_work_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES)),
         }
     }
 }
@@ -66,9 +64,7 @@ impl XPathWorkBudget {
         Self {
             remaining: Rc::new(Cell::new(limit)),
             mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
-            string_work_bytes_remaining: Rc::new(Cell::new(
-                MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES,
-            )),
+            string_work_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES)),
         }
     }
 
