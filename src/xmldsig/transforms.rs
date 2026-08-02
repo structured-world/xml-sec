@@ -1386,6 +1386,19 @@ mod tests {
     // ── Pipeline execution ───────────────────────────────────────────
 
     #[test]
+    fn byte_budgets_remain_exhausted_after_overflow() {
+        // An overflow is a terminal state: callers must not be able to recover
+        // budget by following a rejected large charge with a smaller one.
+        let c14n = C14nOutputBudget::default();
+        assert!(c14n.charge(MAX_C14N_OUTPUT_BYTES + 1).is_err());
+        assert!(c14n.charge(1).is_err());
+
+        let base64 = Base64WorkBudget::default();
+        assert!(base64.charge(MAX_BASE64_TRANSFORM_INPUT_BYTES + 1).is_err());
+        assert!(base64.charge(1).is_err());
+    }
+
+    #[test]
     fn pipeline_rejects_cumulative_c14n_output() {
         // Every C14N result is individually moderate, but a long chain can
         // multiply canonicalization work and adapter-buffer retention. The
