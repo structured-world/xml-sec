@@ -184,7 +184,9 @@ impl<'a> VerifyContext<'a> {
     /// element children of `<ds:Object>` are processed only when the direct-child
     /// `<ds:Object>` or `<ds:Manifest>` itself is referenced from `<SignedInfo>`
     /// by an ID-based same-document fragment URI such as `#id` or
-    /// `#xpointer(id('id'))`.
+    /// `#xpointer(id('id'))`, and that reference uses only canonicalization
+    /// transforms (or implicit canonicalization). Filtering or binary transforms
+    /// do not prove that the complete Manifest structure was authenticated.
     /// Only those signed Manifest references are returned in
     /// `VerifyResult::manifest_references`.
     /// Nested `<ds:Manifest>` descendants under `<ds:Object>` are not
@@ -755,7 +757,7 @@ fn verify_signature_with_context(
 
     let manifest_references = if ctx.process_manifests {
         let signed_info_reference_nodes =
-            collect_signed_info_reference_nodes(&signed_info.references, &resolver);
+            collect_authenticated_signed_info_reference_nodes(&signed_info.references, &resolver);
         process_manifest_references(
             signature_node,
             &resolver,
@@ -980,12 +982,21 @@ fn parse_manifest_references(
     Ok(references)
 }
 
-fn collect_signed_info_reference_nodes(
+fn collect_authenticated_signed_info_reference_nodes(
     references: &[Reference],
     resolver: &UriReferenceResolver<'_>,
 ) -> HashSet<NodeId> {
     references
         .iter()
+        // URI dereference identifies the transform input, not necessarily the
+        // bytes authenticated by its digest. Only canonicalization preserves the
+        // complete XML structure needed to trust and process a Manifest.
+        .filter(|reference| {
+            reference
+                .transforms
+                .iter()
+                .all(|transform| matches!(transform, Transform::C14n(_)))
+        })
         .filter_map(|reference| reference.uri.as_deref())
         .filter_map(signed_info_reference_id_from_uri)
         .filter_map(|id| resolver.node_id_for_id(id))
@@ -1706,6 +1717,35 @@ mod tests {
             result.manifest_references[0].status,
             DsigStatus::Valid
         ));
+    }
+
+    #[test]
+    fn verify_context_ignores_manifest_excluded_from_signed_object() {
+        // A Reference URI authenticates only its post-transform bytes. Excluding
+        // the Manifest subtree must not let its independently valid digest chain
+        // masquerade as data authenticated by SignedInfo.
+        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
+            xml.replacen("URI=\"#manifest\"", "URI=\"#object-id\"", 1)
+                .replacen("<ds:Object>", "<ds:Object ID=\"object-id\">", 1)
+                .replacen("<ds:Manifest ID=\"manifest\">", "<ds:Manifest>", 1)
+                .replacen(
+                    r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+                    r#"<ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:Manifest)</ds:XPath></ds:Transform><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+                    1,
+                )
+        });
+
+        let result = VerifyContext::new()
+            .key(&AcceptingKey)
+            .process_manifests(true)
+            .verify(&xml)
+            .expect("excluded Manifest content must be ignored, not parsed");
+
+        assert!(matches!(result.status, DsigStatus::Valid));
+        assert!(
+            result.manifest_references.is_empty(),
+            "a transform-excluded Manifest is not authenticated by SignedInfo",
+        );
     }
 
     #[test]
