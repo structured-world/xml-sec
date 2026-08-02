@@ -42,12 +42,14 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 #[derive(Clone)]
 pub(super) struct XPathWorkBudget {
     remaining: Rc<Cell<usize>>,
+    mirror_bytes_remaining: Rc<Cell<usize>>,
 }
 
 impl Default for XPathWorkBudget {
     fn default() -> Self {
         Self {
             remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
+            mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
         }
     }
 }
@@ -57,6 +59,7 @@ impl XPathWorkBudget {
     pub(super) fn with_limit(limit: usize) -> Self {
         Self {
             remaining: Rc::new(Cell::new(limit)),
+            mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
         }
     }
 
@@ -77,6 +80,18 @@ impl XPathWorkBudget {
         self.charge(work).map_err(|error| function::Error::Other {
             what: error.to_string(),
         })
+    }
+
+    fn charge_mirror_bytes(&self, bytes: usize) -> Result<(), TransformError> {
+        let remaining = self.mirror_bytes_remaining.get();
+        let Some(next) = remaining.checked_sub(bytes) else {
+            self.mirror_bytes_remaining.set(0);
+            return Err(TransformError::XPathMirrorTooLarge {
+                max_bytes: MAX_XPATH_MIRROR_STRING_BYTES,
+            });
+        };
+        self.mirror_bytes_remaining.set(next);
+        Ok(())
     }
 }
 
@@ -745,7 +760,8 @@ fn evaluate_expression<'a>(
     // The node-set preflight bounds map cardinality and inherited namespace
     // amplification. This separate preflight accounts for every string copied
     // by Mirror::build before allocating the secondary DOM.
-    Mirror::projected_string_bytes(document)?;
+    let mirror_bytes = Mirror::projected_string_bytes(document)?;
+    work_budget.charge_mirror_bytes(mirror_bytes)?;
     work_budget.charge(document_size)?;
     let package = Package::new();
     let target = package.as_document();

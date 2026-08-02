@@ -448,10 +448,12 @@ pub enum TransformError {
         max_bytes: usize,
     },
 
-    /// Strings copied into the temporary XPath document would exceed its budget.
-    #[error("XPath mirror exceeds maximum of {max_bytes} copied string bytes")]
+    /// Temporary XPath documents would cumulatively copy too many strings.
+    #[error(
+        "XPath mirrors exceed signature-wide maximum of {max_bytes} cumulative copied string bytes"
+    )]
     XPathMirrorTooLarge {
-        /// Maximum string bytes copied into one temporary SXD document.
+        /// Maximum string bytes copied across one signature execution.
         max_bytes: usize,
     },
 
