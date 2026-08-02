@@ -461,7 +461,8 @@ fn rejects_xpath_bindings_with_invalid_namespace_uris() {
             .expect_err("invalid namespace URI must be rejected before serialization");
         assert!(matches!(
             error,
-            SignatureBuilderError::InvalidNamespacePrefix(prefix) if prefix == "doc"
+            SignatureBuilderError::InvalidNamespaceUri(uri)
+                if uri.is_empty() || uri == XMLNS_NS
         ));
     }
 }
