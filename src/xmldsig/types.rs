@@ -457,6 +457,15 @@ pub enum TransformError {
         max_bytes: usize,
     },
 
+    /// Non-interruptible XPath evaluations would scan too much source text.
+    #[error(
+        "XPath transform exceeds signature-wide maximum of {max_bytes} string-processing work bytes"
+    )]
+    XPathStringWorkTooLarge {
+        /// Maximum conservatively charged source-string bytes per signature.
+        max_bytes: usize,
+    },
+
     /// Canonicalization error during transform.
     #[error("C14N error: {0}")]
     C14n(#[from] crate::c14n::C14nError),

@@ -36,6 +36,8 @@ const MAX_XPATH_CUMULATIVE_EVALUATION_WORK: usize = 6_000_000;
 const MAX_XPATH_EXPRESSION_COMPLEXITY: usize = 256;
 /// Bound strings copied into SXD before evaluating untrusted XPath.
 const MAX_XPATH_MIRROR_STRING_BYTES: usize = 8 * 1024 * 1024;
+/// Bound conservative SXD string processing across one signature.
+const MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES: usize = 64 * 1024 * 1024;
 /// Namespace URI permanently bound to the reserved `xml` prefix.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -43,6 +45,7 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 pub(super) struct XPathWorkBudget {
     remaining: Rc<Cell<usize>>,
     mirror_bytes_remaining: Rc<Cell<usize>>,
+    string_work_bytes_remaining: Rc<Cell<usize>>,
 }
 
 impl Default for XPathWorkBudget {
@@ -50,6 +53,9 @@ impl Default for XPathWorkBudget {
         Self {
             remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
             mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
+            string_work_bytes_remaining: Rc::new(Cell::new(
+                MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES,
+            )),
         }
     }
 }
@@ -60,6 +66,9 @@ impl XPathWorkBudget {
         Self {
             remaining: Rc::new(Cell::new(limit)),
             mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
+            string_work_bytes_remaining: Rc::new(Cell::new(
+                MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES,
+            )),
         }
     }
 
@@ -91,6 +100,23 @@ impl XPathWorkBudget {
             });
         };
         self.mirror_bytes_remaining.set(next);
+        Ok(())
+    }
+
+    fn charge_string_work(
+        &self,
+        source_bytes: usize,
+        evaluations: usize,
+    ) -> Result<(), TransformError> {
+        let work = source_bytes.checked_mul(evaluations);
+        let remaining = self.string_work_bytes_remaining.get();
+        let Some(next) = work.and_then(|work| remaining.checked_sub(work)) else {
+            self.string_work_bytes_remaining.set(0);
+            return Err(TransformError::XPathStringWorkTooLarge {
+                max_bytes: MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES,
+            });
+        };
+        self.string_work_bytes_remaining.set(next);
         Ok(())
     }
 }
@@ -935,6 +961,11 @@ fn evaluate_expression<'a>(
                 "XPath transform input exceeds {MAX_XPATH_CONTEXT_EVALUATIONS} per-node evaluations"
             )));
         }
+        // SXD has no interrupt hook and XPath coercions can materialize or scan
+        // any mirrored string. Charge the complete source string volume for
+        // every context before entering the evaluator; syntax-based discounts
+        // would leave alternate coercion paths able to bypass this ceiling.
+        work_budget.charge_string_work(mirror_bytes, ordered_nodes.len())?;
         let mut selected = nodeset::Nodeset::new();
         for node in ordered_nodes {
             // SXD exposes no interrupt hook. Charge nested predicate scans
@@ -952,6 +983,7 @@ fn evaluate_expression<'a>(
     }
 
     work_budget.charge(evaluation_work)?;
+    work_budget.charge_string_work(mirror_bytes, 1)?;
     let value = xpath
         .evaluate(&context, target.root())
         .map_err(|error| TransformError::XPath(error.to_string()))?;
