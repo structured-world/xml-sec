@@ -1481,6 +1481,44 @@ mod tests {
     }
 
     #[test]
+    fn execution_budget_bounds_implicit_c14n_across_references() {
+        // References ending in node sets use implicit C14N 1.0. That terminal
+        // coercion must share the same signature-wide byte ceiling as explicit
+        // canonicalization transforms.
+        let xml = format!("<root>{}</root>", "x".repeat(6 * 1024 * 1024));
+        let document = Document::parse(&xml).unwrap();
+        let execution_budget = TransformExecutionBudget::default();
+        let input = || {
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&document).unwrap())
+        };
+
+        for _ in 0..2 {
+            execute_transforms_with_options_and_budget(
+                document.root_element(),
+                input(),
+                &[],
+                TransformOptions::default(),
+                &execution_budget,
+            )
+            .expect("two implicit C14N outputs must fit the shared budget");
+        }
+        let result = execute_transforms_with_options_and_budget(
+            document.root_element(),
+            input(),
+            &[],
+            TransformOptions::default(),
+            &execution_budget,
+        );
+
+        assert!(matches!(
+            result,
+            Err(TransformError::C14nOutputTooLarge {
+                max_bytes: MAX_C14N_OUTPUT_BYTES
+            })
+        ));
+    }
+
+    #[test]
     fn pipeline_enveloped_then_c14n() {
         // Standard SAML transform chain: enveloped-signature → exc-c14n
         let xml = r#"<root xmlns:ns="http://example.com" b="2" a="1">
