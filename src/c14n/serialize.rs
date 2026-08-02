@@ -1327,6 +1327,44 @@ mod tests {
     }
 
     #[test]
+    fn c14n11_inherits_hidden_base_past_selected_owner() {
+        // Unlike the fixup case above, d has no base of its own. Its inherited
+        // base must still cross selected b because b's base attribute is hidden.
+        let xml = r#"<a xml:base="http://ex/"><b xml:base="hidden/"><c><d>text</d></c></b></a>"#;
+        let doc = Document::parse(xml).unwrap();
+        let a = doc.root_element();
+        let b = a.first_element_child().unwrap();
+        let c = b.first_element_child().unwrap();
+        let d = c.first_element_child().unwrap();
+        let mut included = HashSet::from([a.id(), b.id(), d.id()]);
+        included.extend(d.children().map(|node| node.id()));
+        let visibility = HiddenXmlBaseVisibility {
+            included,
+            hidden_base_owner: b.id(),
+        };
+        let mut out = Vec::new();
+
+        serialize_canonical_visible_with_position(
+            &doc,
+            Some(&visibility),
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: true,
+            },
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"<a xml:base="http://ex/"><b><d xml:base="hidden/">text</d></b></a>"#
+        );
+    }
+
+    #[test]
     fn no_inheritance_in_full_document() {
         // Full document (no node_set) — xml:lang stays on root only.
         let xml = r#"<root xml:lang="en"><child>text</child></root>"#;
