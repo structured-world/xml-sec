@@ -37,7 +37,7 @@ const MAX_XPATH_EXPRESSION_COMPLEXITY: usize = 256;
 /// Bound strings copied into SXD before evaluating untrusted XPath.
 const MAX_XPATH_MIRROR_STRING_BYTES: usize = 8 * 1024 * 1024;
 /// Bound conservative SXD string processing across one signature.
-const MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES: usize = 64 * 1024 * 1024;
+const MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES: usize = 256 * 1024 * 1024;
 /// Namespace URI permanently bound to the reserved `xml` prefix.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -1316,7 +1316,7 @@ mod tests {
         let xml = format!(
             "<root><blob>{}</blob>{}</root>",
             "x".repeat(1024 * 1024),
-            "<item/>".repeat(70)
+            "<item/>".repeat(300)
         );
         let document = Document::parse(&xml).unwrap();
         let error = apply_xpath_filter(
