@@ -747,10 +747,15 @@ impl XPathDocumentRelation {
     }
 }
 
+enum XPathEvaluationMode {
+    XmlDsigPerNodeFilter,
+    Filter2NodeSetSelection,
+}
+
 fn evaluate_expression<'a>(
     input: &NodeSet<'a>,
     expression: &XPathExpression,
-    wrap_as_filter: bool,
+    mode: XPathEvaluationMode,
     here_semantics: XPathHereSemantics,
     document_relation: XPathDocumentRelation,
     work_budget: &XPathWorkBudget,
@@ -798,9 +803,11 @@ fn evaluate_expression<'a>(
     let xpath = compile_xpath(expression.expression()).map_err(TransformError::XPath)?;
     let evaluation_work = xpath_evaluation_work(expression.expression(), document_size);
 
-    if wrap_as_filter {
-        // XMLDSig evaluates the expression independently for every input node;
-        // XPath::evaluate establishes position=1 and size=1 for each call.
+    if matches!(mode, XPathEvaluationMode::XmlDsigPerNodeFilter) {
+        // XMLDSig 1.1 section 6.6.3 requires a fresh context for every input
+        // node with position=1 and size=1. Do not evaluate these nodes as one
+        // XPath sequence: position() and last() are normatively constant here.
+        // https://www.w3.org/TR/xmldsig-core/#sec-XPath
         let all_nodes_xpath = Factory::new()
             .build(ALL_XPATH_NODES)
             .map_err(|error| TransformError::XPath(error.to_string()))?;
@@ -846,7 +853,7 @@ fn evaluate_expression<'a>(
             "XPath Filter 2.0 expression must return a node-set".into(),
         ));
     };
-    Ok(mirror.project(document, selected, !wrap_as_filter))
+    Ok(mirror.project(document, selected, true))
 }
 
 #[cfg(test)]
@@ -873,7 +880,7 @@ pub(super) fn apply_xpath_filter_with_semantics<'a>(
     let selected = evaluate_expression(
         &input,
         expression,
-        true,
+        XPathEvaluationMode::XmlDsigPerNodeFilter,
         here_semantics,
         document_relation,
         work_budget,
@@ -913,7 +920,7 @@ pub(super) fn apply_xpath_filter2_with_semantics<'a>(
         let selected = evaluate_expression(
             &input,
             filter.xpath(),
-            false,
+            XPathEvaluationMode::Filter2NodeSetSelection,
             here_semantics,
             document_relation,
             work_budget,
@@ -976,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn xpath_filter_evaluates_position_and_size_per_input_node() {
+    fn xpath_filter_sets_position_and_size_to_one_for_each_node() {
         // XMLDSig visits every input node independently with both context
         // position and context size set to one.
         let doc = Document::parse("<root><first/><second/></root>").unwrap();
