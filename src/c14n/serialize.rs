@@ -13,7 +13,7 @@ use roxmltree::{Document, Node, NodeId, NodeType};
 use super::ClosureVisibility;
 use super::escape::{escape_attr, escape_cr, escape_text};
 use super::prefix::{attribute_prefix, element_prefix};
-use super::xml_base::{compute_effective_xml_base, resolve_uri};
+use super::xml_base::{compute_effective_xml_base, preserves_xml_base_context, resolve_uri};
 use super::{C14nError, NodeVisibility};
 
 /// The XML namespace URI.
@@ -541,7 +541,7 @@ fn collect_inherited_xml_attrs<'a>(
             // C14N 1.1 resolves xml:base only across the contiguous omitted
             // chain. An included ancestor already renders its own base, but
             // remains the resolution seed for bases on omitted descendants.
-            xml_base_boundary_reached |= fixup_xml_base && set.contains_node(anc);
+            xml_base_boundary_reached |= fixup_xml_base && preserves_xml_base_context(anc, set);
             for attr in anc.attributes() {
                 if attr.namespace() == Some(XML_NS) {
                     let local = attr.name();

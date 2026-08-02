@@ -42,8 +42,7 @@ pub(crate) fn compute_effective_xml_base(
         if n.is_element() {
             let base = xml_base_value(n);
             if let Some(set) = visibility
-                && set.contains_node(n)
-                && (base.is_none() || set.contains_attribute(n, Some(XML_NS), "base"))
+                && preserves_xml_base_context(n, set)
             {
                 // The selected ancestor preserves its inherited context when
                 // it has no base of its own, or establishes a visible base in
@@ -68,6 +67,17 @@ pub(crate) fn compute_effective_xml_base(
         effective = resolve_uri(&effective, relative);
     }
     Some(effective)
+}
+
+/// Whether a selected element preserves its source `xml:base` context in the
+/// canonical output and therefore forms a boundary for descendant fixup.
+pub(super) fn preserves_xml_base_context(
+    node: Node<'_, '_>,
+    visibility: &dyn NodeVisibility,
+) -> bool {
+    visibility.contains_node(node)
+        && (xml_base_value(node).is_none()
+            || visibility.contains_attribute(node, Some(XML_NS), "base"))
 }
 
 /// Get the `xml:base` attribute value from an element, if present.
