@@ -101,6 +101,15 @@ struct C14nOutputBudget {
     remaining: Cell<usize>,
 }
 
+fn charge_byte_budget(remaining: &Cell<usize>, bytes: usize) -> bool {
+    let Some(next) = remaining.get().checked_sub(bytes) else {
+        remaining.set(0);
+        return false;
+    };
+    remaining.set(next);
+    true
+}
+
 impl Default for C14nOutputBudget {
     fn default() -> Self {
         Self {
@@ -111,12 +120,11 @@ impl Default for C14nOutputBudget {
 
 impl C14nOutputBudget {
     fn charge(&self, bytes: usize) -> Result<(), TransformError> {
-        let Some(remaining) = self.remaining.get().checked_sub(bytes) else {
+        if !charge_byte_budget(&self.remaining, bytes) {
             return Err(TransformError::C14nOutputTooLarge {
                 max_bytes: MAX_C14N_OUTPUT_BYTES,
             });
-        };
-        self.remaining.set(remaining);
+        }
         Ok(())
     }
 }
@@ -131,12 +139,11 @@ impl Default for Base64WorkBudget {
 
 impl Base64WorkBudget {
     fn charge(&self, bytes: usize) -> Result<(), TransformError> {
-        let Some(remaining) = self.remaining.get().checked_sub(bytes) else {
+        if !charge_byte_budget(&self.remaining, bytes) {
             return Err(TransformError::Base64InputTooLarge {
                 max_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES,
             });
-        };
-        self.remaining.set(remaining);
+        }
         Ok(())
     }
 }
