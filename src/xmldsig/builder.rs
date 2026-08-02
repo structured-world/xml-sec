@@ -284,8 +284,11 @@ impl SignatureBuilder {
                     _ => {}
                 }
             }
-            validate_xpath_namespace_budget(&reference.transforms)
-                .map_err(|error| SignatureBuilderError::InvalidXPath(error.to_string()))?;
+            validate_xpath_namespace_budget(
+                &reference.transforms,
+                self.ns_prefix.as_deref().map(|prefix| (prefix, XMLDSIG_NS)),
+            )
+            .map_err(|error| SignatureBuilderError::InvalidXPath(error.to_string()))?;
         }
         for (prefix, uri, shares_signature_namespace) in
             self.references.iter().flat_map(|reference| {

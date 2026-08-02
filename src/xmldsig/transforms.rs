@@ -1009,6 +1009,7 @@ impl XPathNamespaceBudget {
 
 pub(crate) fn validate_xpath_namespace_budget(
     transforms: &[Transform],
+    inherited_namespace: Option<(&str, &str)>,
 ) -> Result<(), TransformError> {
     let mut budget = XPathNamespaceBudget::default();
     for transform in transforms {
@@ -1017,10 +1018,20 @@ pub(crate) fn validate_xpath_namespace_budget(
                 for (prefix, uri) in xpath.namespaces() {
                     budget.charge(prefix, uri)?;
                 }
+                if let Some((prefix, uri)) = inherited_namespace
+                    && !xpath.namespaces().contains_key(prefix)
+                {
+                    budget.charge(prefix, uri)?;
+                }
             }
             Transform::XPathFilter2(filters) => {
                 for filter in filters {
                     for (prefix, uri) in filter.xpath().namespaces() {
+                        budget.charge(prefix, uri)?;
+                    }
+                    if let Some((prefix, uri)) = inherited_namespace
+                        && !filter.xpath().namespaces().contains_key(prefix)
+                    {
                         budget.charge(prefix, uri)?;
                     }
                 }

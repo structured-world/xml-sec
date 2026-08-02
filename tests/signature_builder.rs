@@ -221,6 +221,33 @@ fn rejects_xpath_namespace_budget_before_serialization() {
 }
 
 #[test]
+fn rejects_inherited_signature_prefix_over_namespace_budget() {
+    // Every serialized Filter2 XPath inherits the signature prefix binding. The
+    // builder must charge those bindings before signing reparses its template.
+    let filters = (0..64)
+        .map(|_| {
+            XPathFilter::new(
+                XPathFilterOperation::Intersect,
+                XPathExpression::new("true()"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let reference = (0..17).fold(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256),
+        |reference, _| reference.transform(Transform::XPathFilter2(filters.clone())),
+    );
+
+    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        .add_reference(reference)
+        .build_template()
+        .expect_err("builder must count inherited namespace bindings on every XPath element");
+
+    assert!(matches!(error, SignatureBuilderError::InvalidXPath(_)));
+    assert!(error.to_string().contains("namespace binding budget"));
+}
+
+#[test]
 fn serializes_xpath_and_exclusive_prefix_list() {
     // Complex transforms retain the child content required by their specifications.
     let c14n = exclusive_c14n().with_prefix_list("saml #default ds");
