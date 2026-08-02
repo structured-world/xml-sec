@@ -274,6 +274,12 @@ struct Mirror<'d> {
     processing_instructions: HashMap<dom::ProcessingInstruction<'d>, NodeId>,
 }
 
+#[derive(Clone, Copy)]
+enum ProjectionMode {
+    ExactNodes,
+    ExpandToSubtrees,
+}
+
 impl<'d> Mirror<'d> {
     /// Measures exactly the source strings passed to SXD by [`Self::build`].
     ///
@@ -424,13 +430,13 @@ impl<'d> Mirror<'d> {
         &self,
         source: &'a Document<'a>,
         selected: nodeset::Nodeset<'d>,
-        expand_subtrees: bool,
+        mode: ProjectionMode,
     ) -> NodeSet<'a> {
         let mut result = NodeSet::empty(source);
         for node in selected.document_order() {
             match node {
                 nodeset::Node::Root(_) => {
-                    if expand_subtrees {
+                    if matches!(mode, ProjectionMode::ExpandToSubtrees) {
                         result.insert_subtree(source.root());
                     } else {
                         result.insert_node(source.root());
@@ -439,7 +445,7 @@ impl<'d> Mirror<'d> {
                 nodeset::Node::Element(element) => {
                     if let Some(source_node) = self.source_node(source, self.elements.get(&element))
                     {
-                        if expand_subtrees {
+                        if matches!(mode, ProjectionMode::ExpandToSubtrees) {
                             result.insert_subtree(source_node);
                         } else {
                             result.insert_node(source_node);
@@ -841,7 +847,7 @@ fn evaluate_expression<'a>(
                 selected.add(node);
             }
         }
-        return Ok(mirror.project(document, selected, false));
+        return Ok(mirror.project(document, selected, ProjectionMode::ExactNodes));
     }
 
     work_budget.charge(evaluation_work)?;
@@ -853,7 +859,7 @@ fn evaluate_expression<'a>(
             "XPath Filter 2.0 expression must return a node-set".into(),
         ));
     };
-    Ok(mirror.project(document, selected, true))
+    Ok(mirror.project(document, selected, ProjectionMode::ExpandToSubtrees))
 }
 
 #[cfg(test)]
