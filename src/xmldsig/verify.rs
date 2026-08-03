@@ -262,7 +262,9 @@ impl<'a> VerifyContext<'a> {
     /// Verify one XMLDSig signature using this context.
     ///
     /// Returns `Ok(VerifyResult)` for both valid and invalid signatures; inspect
-    /// `VerifyResult::status` for the verification outcome. `Err(...)` is
+    /// `VerifyResult::status` for the core `<SignedInfo>` and signature-value
+    /// outcome. When Manifest processing is enabled, inspect every
+    /// `VerifyResult::manifest_references` entry separately. `Err(...)` is
     /// reserved for pipeline failures.
     pub fn verify(&self, xml: &str) -> Result<VerifyResult, DsigError> {
         verify_signature_with_context(xml, self)
@@ -554,7 +556,10 @@ pub enum ReferenceProcessingError {
 #[non_exhaustive]
 #[must_use = "inspect status before accepting the document"]
 pub struct VerifyResult {
-    /// Final XMLDSig status for this signature.
+    /// Core XMLDSig status for the `<SignedInfo>` references and signature value.
+    ///
+    /// Manifest reference failures do not alter this field; inspect
+    /// [`Self::manifest_references`] before accepting Manifest-backed data.
     pub status: DsigStatus,
     /// `<Reference>` verification results from `<SignedInfo>`.
     /// On fail-fast, this includes references up to and including
@@ -564,6 +569,8 @@ pub struct VerifyResult {
     /// Populated only when `VerifyContext::process_manifests(true)` is enabled.
     /// Includes only references from signed direct-child `<ds:Object>/<ds:Manifest>`
     /// blocks that are referenced from `<SignedInfo>`.
+    /// Each entry has an independent status that does not alter [`Self::status`].
+    /// Callers must inspect every entry before accepting Manifest-backed data.
     /// Unsigned/unreferenced direct-child Manifest blocks are skipped, so an
     /// empty list does not imply that no Manifest elements existed in `verify()` input.
     pub manifest_references: Vec<ReferenceResult>,

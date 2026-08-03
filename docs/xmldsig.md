@@ -26,9 +26,16 @@ For production verification, configure `KeyResolverConfig` with explicit trust a
 certificate-chain validation is required. Embedded certificates provide key material; they do
 not become trusted merely because they appear in `<KeyInfo>`.
 
-A `Valid` status means the cryptographic signature and every processed reference succeeded.
-`Invalid(reason)` means the document was processed but failed validation, such as a reference
-digest mismatch or invalid signature value.
+`VerifyResult::status` reports core validation: `Valid` means the cryptographic signature and
+every `<SignedInfo>` reference succeeded. `Invalid(reason)` means core validation completed but
+failed, such as a `<SignedInfo>` digest mismatch or invalid signature value.
+
+When `VerifyContext::process_manifests(true)` is enabled, each authenticated Manifest reference
+has an independent status in `VerifyResult::manifest_references`. A failed Manifest reference does
+not change the core `VerifyResult::status`; callers must inspect every Manifest result before
+accepting data whose integrity depends on that Manifest. An empty Manifest result list is not proof
+that the input contained no Manifest because unsigned, unreferenced, or structurally excluded
+Manifest blocks are deliberately skipped.
 
 Malformed XMLDSig structure, unsupported algorithms, disallowed reference URIs, and
 inconsistent `KeyInfo` metadata are processing errors rather than validity statuses. Treat both
