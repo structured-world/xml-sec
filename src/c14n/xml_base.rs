@@ -21,9 +21,11 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 ///
 /// Walks from `start` up the ancestor chain, collecting `xml:base` values
 /// from each element. If a `node_set` is provided, the walk stops at the
-/// nearest included ancestor whose base context is preserved in the canonical
-/// output. An included ancestor with an excluded `xml:base` attribute is not a
-/// boundary: its hidden base still contributes to descendants' effective base.
+/// nearest included ancestor that emits its own non-empty `xml:base` in the
+/// canonical output. A selected element without such an attribute is not a
+/// boundary: inherited source context may still be absent from the output.
+/// Likewise, an included ancestor with an excluded `xml:base` attribute is not
+/// a boundary because its hidden base still contributes to descendants.
 /// The collected bases are resolved from the topmost to the closest.
 ///
 /// The resulting reference is absolute only if some ancestor `xml:base`
@@ -44,9 +46,9 @@ pub(crate) fn compute_effective_xml_base(
             if let Some(set) = visibility
                 && preserves_xml_base_context(n, set)
             {
-                // The selected ancestor preserves its inherited context when
-                // it has no base of its own, or establishes a visible base in
-                // the output. Applying either context again would be wrong.
+                // A visible non-empty base establishes the context that
+                // descendants inherit in the canonical output. Reapplying
+                // ancestors above that boundary would duplicate the context.
                 break;
             }
             if let Some(base) = base {
@@ -69,15 +71,15 @@ pub(crate) fn compute_effective_xml_base(
     Some(effective)
 }
 
-/// Whether a selected element preserves its source `xml:base` context in the
+/// Whether a selected element establishes its source `xml:base` context in the
 /// canonical output and therefore forms a boundary for descendant fixup.
 pub(super) fn preserves_xml_base_context(
     node: Node<'_, '_>,
     visibility: &dyn NodeVisibility,
 ) -> bool {
     visibility.contains_node(node)
-        && (xml_base_value(node).is_none()
-            || visibility.contains_attribute(node, Some(XML_NS), "base"))
+        && xml_base_value(node).is_some()
+        && visibility.contains_attribute(node, Some(XML_NS), "base")
 }
 
 /// Get the `xml:base` attribute value from an element, if present.

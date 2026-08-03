@@ -1466,6 +1466,45 @@ mod tests {
     }
 
     #[test]
+    fn c14n11_inherits_hidden_base_past_selected_baseless_element() {
+        // Selected b has no base of its own and cannot restore a's hidden base
+        // context. The omitted c makes d an apex, so d must materialize the
+        // source base that is otherwise absent from the canonical output.
+        let xml = r#"<a xml:base="hidden/"><b><c><d>text</d></c></b></a>"#;
+        let doc = Document::parse(xml).unwrap();
+        let a = doc.root_element();
+        let b = a.first_element_child().unwrap();
+        let c = b.first_element_child().unwrap();
+        let d = c.first_element_child().unwrap();
+        let mut included = HashSet::from([a.id(), b.id(), d.id()]);
+        included.extend(d.children().map(|node| node.id()));
+        let visibility = HiddenXmlBaseVisibility {
+            included,
+            hidden_base_owner: a.id(),
+        };
+        let mut out = Vec::new();
+
+        serialize_canonical_visible_with_position(
+            &doc,
+            Some(&visibility),
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: true,
+            },
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"<a><b><d xml:base="hidden/">text</d></b></a>"#
+        );
+    }
+
+    #[test]
     fn no_inheritance_in_full_document() {
         // Full document (no node_set) — xml:lang stays on root only.
         let xml = r#"<root xml:lang="en"><child>text</child></root>"#;
