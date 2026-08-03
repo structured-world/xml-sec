@@ -324,6 +324,16 @@ pub fn find_signature_node<'a>(doc: &'a Document<'a>) -> Option<Node<'a, 'a>> {
 /// Enforces strict child order per XMLDSig spec:
 /// `<CanonicalizationMethod>` → `<SignatureMethod>` → `<Reference>`+
 pub fn parse_signed_info(signed_info_node: Node) -> Result<SignedInfo, ParseError> {
+    parse_signed_info_with_xpath_budget(
+        signed_info_node,
+        &mut transforms::XPathSignatureParseBudget::default(),
+    )
+}
+
+pub(crate) fn parse_signed_info_with_xpath_budget(
+    signed_info_node: Node,
+    xpath_budget: &mut transforms::XPathSignatureParseBudget,
+) -> Result<SignedInfo, ParseError> {
     verify_ds_element(signed_info_node, "SignedInfo")?;
 
     let mut children = element_children(signed_info_node);
@@ -361,7 +371,6 @@ pub fn parse_signed_info(signed_info_node: Node) -> Result<SignedInfo, ParseErro
 
     // 3. One or more Reference elements
     let mut references = Vec::new();
-    let mut xpath_budget = transforms::XPathSignatureParseBudget::default();
     for child in children {
         verify_ds_element(child, "Reference")?;
         if references.len() == MAX_REFERENCES_PER_SIGNATURE {
@@ -369,7 +378,7 @@ pub fn parse_signed_info(signed_info_node: Node) -> Result<SignedInfo, ParseErro
                 max: MAX_REFERENCES_PER_SIGNATURE,
             });
         }
-        references.push(parse_reference_with_xpath_budget(child, &mut xpath_budget)?);
+        references.push(parse_reference_with_xpath_budget(child, xpath_budget)?);
     }
     if references.is_empty() {
         return Err(ParseError::MissingElement {
@@ -394,7 +403,7 @@ pub fn parse_reference(reference_node: Node) -> Result<Reference, ParseError> {
     )
 }
 
-fn parse_reference_with_xpath_budget(
+pub(crate) fn parse_reference_with_xpath_budget(
     reference_node: Node,
     xpath_budget: &mut transforms::XPathSignatureParseBudget,
 ) -> Result<Reference, ParseError> {

@@ -1194,7 +1194,7 @@ impl<'a> XPathParseState<'a> {
 }
 
 #[derive(Default)]
-/// Parser state shared by every Reference in one SignedInfo.
+/// Parser state shared by every Reference in one Signature, including Manifests.
 pub(crate) struct XPathSignatureParseBudget {
     expressions: usize,
 }
