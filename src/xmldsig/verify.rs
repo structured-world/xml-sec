@@ -1675,6 +1675,26 @@ mod tests {
         xml_with_manifest_digest.replacen(TMP_SIGNED_INFO_DIGEST, &signed_digest_b64, 1)
     }
 
+    fn replace_fixture_manifest_digest(xml: &str, replacement: &str) -> String {
+        let object_marker = "<ds:Object>";
+        let object_start = xml
+            .find(object_marker)
+            .expect("fixture should contain ds:Object")
+            + object_marker.len();
+        let open = "<ds:DigestValue>";
+        let close = "</ds:DigestValue>";
+        let value_start = xml[object_start..]
+            .find(open)
+            .map(|offset| object_start + offset + open.len())
+            .expect("Manifest should contain DigestValue");
+        let value_end = xml[value_start..]
+            .find(close)
+            .map(|offset| value_start + offset)
+            .expect("Manifest DigestValue must be closed");
+
+        format!("{}{replacement}{}", &xml[..value_start], &xml[value_end..])
+    }
+
     #[test]
     fn verify_context_processes_manifest_references_when_enabled() {
         let xml = signature_with_manifest_xml(true);
@@ -1739,16 +1759,13 @@ mod tests {
         // succeeds. Malformed nested content must not consume parsing work when
         // the cryptographic signature itself is invalid.
         let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            let (prefix, object_suffix) = xml
-                .split_once("<ds:Object>")
-                .expect("fixture should contain ds:Object");
-            let malformed = object_suffix.replacen(
-                "<ds:DigestValue>AQ==</ds:DigestValue>",
-                "<ds:DigestValue>!!!</ds:DigestValue>",
-                1,
-            );
-            format!("{prefix}<ds:Object>{malformed}")
+            replace_fixture_manifest_digest(&xml, "!!!")
         });
+        assert!(
+            xml.split_once("<ds:Object>")
+                .is_some_and(|(_, object)| object.contains("<ds:DigestValue>!!!</ds:DigestValue>")),
+            "fixture mutation must corrupt the nested Manifest DigestValue",
+        );
 
         let result = VerifyContext::new()
             .key(&RejectingKey)
@@ -2090,25 +2107,7 @@ mod tests {
         // Malformed nested DigestValue is parsed only after the enclosing
         // Manifest structure has been authenticated by SignedInfo.
         let broken_xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            let (prefix, object_suffix) = xml
-                .split_once("<ds:Object>")
-                .expect("fixture should contain ds:Object");
-            let open = "<ds:DigestValue>";
-            let close = "</ds:DigestValue>";
-            let digest_start = object_suffix
-                .find(open)
-                .expect("manifest should contain DigestValue");
-            let digest_end = object_suffix[digest_start + open.len()..]
-                .find(close)
-                .map(|offset| digest_start + open.len() + offset)
-                .expect("manifest DigestValue must be closed");
-            format!(
-                "{prefix}<ds:Object>{}{}!!!{}{}",
-                &object_suffix[..digest_start],
-                open,
-                close,
-                &object_suffix[digest_end + close.len()..],
-            )
+            replace_fixture_manifest_digest(&xml, "!!!")
         });
 
         let err = VerifyContext::new()

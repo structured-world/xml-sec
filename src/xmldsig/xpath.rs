@@ -222,29 +222,56 @@ fn xpath_expression_complexity(source: &str) -> usize {
 
 /// Count conservative full-source string passes before entering SXD.
 ///
-/// Linear XPath 1.0 built-ins, argument separators, and comparison operators
-/// each contribute one pass so repeated node-set-to-string coercions cannot hide
-/// behind one expression. Quoted literals are excluded; unknown coercion paths
-/// are covered separately by the mandatory baseline scan.
+/// Linear XPath 1.0 built-ins, numeric coercions, argument separators, and
+/// comparison operators each contribute one pass so repeated node-set-to-value
+/// conversions cannot hide behind one expression. Quoted literals are excluded;
+/// unknown coercion paths are covered separately by the mandatory baseline scan.
 fn xpath_string_scan_count(source: &str) -> usize {
     let bytes = source.as_bytes();
     let mut scans = 0_usize;
     let mut index = 0_usize;
     let mut quote = None;
+    let mut can_end_operand = false;
     while index < bytes.len() {
         let byte = bytes[index];
         if matches!(byte, b'\'' | b'"') {
             if quote == Some(byte) {
                 quote = None;
+                can_end_operand = true;
             } else if quote.is_none() {
                 quote = Some(byte);
             }
             index += 1;
             continue;
         }
-        if quote.is_some() || !(byte.is_ascii_alphabetic() || byte == b'_') {
-            if quote.is_none() && matches!(byte, b',' | b'=' | b'<' | b'>') {
-                scans = scans.saturating_add(1);
+        if quote.is_some() {
+            index += 1;
+            continue;
+        }
+        if byte.is_ascii_digit() {
+            can_end_operand = true;
+            index += 1;
+            continue;
+        }
+        if !(byte.is_ascii_alphabetic() || byte == b'_') {
+            match byte {
+                b',' | b'=' | b'<' | b'>' => {
+                    scans = scans.saturating_add(1);
+                    can_end_operand = false;
+                }
+                b'+' | b'-' => {
+                    scans = scans.saturating_add(1);
+                    can_end_operand = false;
+                }
+                b'*' if can_end_operand => {
+                    scans = scans.saturating_add(1);
+                    can_end_operand = false;
+                }
+                b'*' | b'.' | b')' | b']' => can_end_operand = true,
+                b'(' | b'[' | b'/' | b'|' | b'@' | b':' | b'!' => {
+                    can_end_operand = false;
+                }
+                _ => {}
             }
             index += 1;
             continue;
@@ -265,16 +292,25 @@ fn xpath_string_scan_count(source: &str) -> usize {
         {
             call_start += 1;
         }
-        if bytes.get(call_start) == Some(&b'(')
-            && is_xpath_string_scanning_function(&source[name_start..index])
-        {
+        let name = &source[name_start..index];
+        if name.ends_with("::") {
+            can_end_operand = false;
+        } else if bytes.get(call_start) == Some(&b'(') {
+            if is_xpath_value_scanning_function(name) {
+                scans = scans.saturating_add(1);
+            }
+            can_end_operand = false;
+        } else if can_end_operand && matches!(name, "div" | "mod") {
             scans = scans.saturating_add(1);
+            can_end_operand = false;
+        } else {
+            can_end_operand = !(can_end_operand && matches!(name, "and" | "or"));
         }
     }
     scans
 }
 
-fn is_xpath_string_scanning_function(name: &str) -> bool {
+fn is_xpath_value_scanning_function(name: &str) -> bool {
     matches!(
         name,
         "string"
@@ -287,6 +323,11 @@ fn is_xpath_string_scanning_function(name: &str) -> bool {
             | "string-length"
             | "normalize-space"
             | "translate"
+            | "number"
+            | "sum"
+            | "floor"
+            | "ceiling"
+            | "round"
     )
 }
 
@@ -1561,6 +1602,43 @@ mod tests {
     }
 
     #[test]
+    fn xpath_filter_charges_each_repeated_numeric_conversion() {
+        // SXD converts a node-set through its first node's complete string
+        // value on every number() call. Repeating that conversion must not fit
+        // inside the budget measured for one call.
+        let document = Document::parse("<root><blob> 123 </blob><item/></root>").unwrap();
+        let single_scan_budget = XPathWorkBudget::default();
+        let initial_remaining = single_scan_budget.string_work_bytes_remaining.get();
+        apply_xpath_filter_with_semantics(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &XPathExpression::new("number(/root/blob) = 123"),
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &single_scan_budget,
+        )
+        .expect("one bounded numeric conversion should fit");
+        let one_scan_work =
+            initial_remaining - single_scan_budget.string_work_bytes_remaining.get();
+        let repeated_scan_budget = XPathWorkBudget {
+            remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
+            mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
+            string_work_bytes_remaining: Rc::new(Cell::new(one_scan_work)),
+        };
+
+        let error = apply_xpath_filter_with_semantics(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &XPathExpression::new("number(/root/blob) + number(/root/blob) = 246"),
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &repeated_scan_budget,
+        )
+        .err()
+        .expect("repeated numeric conversions must exceed a one-conversion budget");
+
+        assert!(error.to_string().contains("string-processing work"));
+    }
+
+    #[test]
     fn xpath_filter_charges_each_repeated_comparison_scan() {
         // XPath 1.0 compares a node-set through each candidate node's string
         // value. Two comparisons must therefore consume two complete source scans.
@@ -1744,6 +1822,22 @@ mod tests {
             2
         );
         assert_eq!(xpath_string_scan_count("/root/blob = 'literal < > ='"), 1);
+    }
+
+    #[test]
+    fn xpath_string_profile_counts_numeric_coercion_sites() {
+        // Numeric built-ins and arithmetic call SXD's Value::number(), while
+        // wildcard name tests do not coerce strings and must remain free.
+        assert_eq!(xpath_string_scan_count("number(/root/blob)"), 1);
+        assert_eq!(xpath_string_scan_count("sum(/root/item)"), 1);
+        assert_eq!(xpath_string_scan_count("floor(number(/root/blob))"), 2);
+        assert_eq!(xpath_string_scan_count("/root/a + /root/b - /root/c"), 2);
+        assert_eq!(
+            xpath_string_scan_count("/root/a * /root/b div /root/c mod /root/d"),
+            3
+        );
+        assert_eq!(xpath_string_scan_count("-/root/a"), 1);
+        assert_eq!(xpath_string_scan_count("/root/* | child::* | //@*"), 0);
     }
 
     #[test]
