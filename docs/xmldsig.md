@@ -35,8 +35,10 @@ When `VerifyContext::process_manifests(true)` is enabled, Manifest parsing start
 then has an independent status in `VerifyResult::manifest_references`. A failed Manifest reference
 does not change the core `VerifyResult::status`; callers must inspect every Manifest result before
 accepting data whose integrity depends on that Manifest. An empty Manifest result list is not proof
-that the input contained no Manifest because core validation failures and unsigned, unreferenced,
-or structurally excluded Manifest blocks all skip Manifest processing.
+that the input contained no Manifest. `VerifyContext::process_manifests(false)` leaves the list empty
+because Manifests were not processed; core validation failures and unsigned, unreferenced, or
+structurally excluded Manifest blocks can also produce an empty list. Callers must distinguish the
+disabled state from an enabled pass with no authenticated Manifest references.
 
 Malformed XMLDSig structure, unsupported algorithms, disallowed reference URIs, and
 inconsistent `KeyInfo` metadata are processing errors rather than validity statuses. Treat both
