@@ -198,16 +198,29 @@ thread_local! {
 
 #[derive(Default)]
 struct TransformChainState {
-    xpath_document_identity: Cell<Option<XPathDocumentIdentity>>,
+    xpath_document_identity: Cell<Option<CachedXPathDocumentIdentity>>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedXPathDocumentIdentity {
+    document: *const (),
+    identity: XPathDocumentIdentity,
 }
 
 impl TransformChainState {
     fn xpath_document_identity(&self, document: &Document<'_>) -> XPathDocumentIdentity {
-        if let Some(identity) = self.xpath_document_identity.get() {
-            return identity;
+        let document_key = std::ptr::from_ref(document).cast::<()>();
+        if let Some(cached) = self.xpath_document_identity.get()
+            && cached.document == document_key
+        {
+            return cached.identity;
         }
         let identity = XPathDocumentIdentity::from_document(document);
-        self.xpath_document_identity.set(Some(identity));
+        self.xpath_document_identity
+            .set(Some(CachedXPathDocumentIdentity {
+                document: document_key,
+                identity,
+            }));
         identity
     }
 
@@ -2441,6 +2454,26 @@ mod tests {
         assert_eq!(
             computations, 1,
             "one live document must be hashed once per chain"
+        );
+    }
+
+    #[test]
+    fn transform_chain_state_keys_identity_by_document() {
+        // The cache must defend its own document association rather than rely
+        // exclusively on every caller remembering explicit invalidation.
+        let first_document = Document::parse("<first/>").unwrap();
+        let second_document = Document::parse("<second/>").unwrap();
+        let state = TransformChainState::default();
+
+        XPATH_DOCUMENT_IDENTITY_COMPUTATIONS.with(|count| count.set(0));
+        let first_identity = state.xpath_document_identity(&first_document);
+        let second_identity = state.xpath_document_identity(&second_document);
+        let computations = XPATH_DOCUMENT_IDENTITY_COMPUTATIONS.with(Cell::get);
+
+        assert_ne!(first_identity, second_identity);
+        assert_eq!(
+            computations, 2,
+            "each distinct live document must receive its own cached identity"
         );
     }
 
