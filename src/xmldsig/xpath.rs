@@ -36,8 +36,10 @@ const MAX_XPATH_CUMULATIVE_EVALUATION_WORK: usize = 6_000_000;
 const MAX_XPATH_EXPRESSION_COMPLEXITY: usize = 256;
 /// Bound strings copied into SXD before evaluating untrusted XPath.
 const MAX_XPATH_MIRROR_STRING_BYTES: usize = 8 * 1024 * 1024;
-/// Bound conservative SXD string processing across one signature.
-const MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES: usize = 256 * 1024 * 1024;
+/// Bound conservative SXD string processing across one signature. The ceiling
+/// accommodates comparison-heavy XMLDSig interoperability vectors while keeping
+/// repeated non-interruptible source scans finite.
+const MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES: usize = 512 * 1024 * 1024;
 /// Namespace URI permanently bound to the reserved `xml` prefix.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -220,10 +222,10 @@ fn xpath_expression_complexity(source: &str) -> usize {
 
 /// Count conservative full-source string passes before entering SXD.
 ///
-/// Linear XPath 1.0 built-ins contribute one pass, and each argument separator
-/// contributes another so variadic calls such as `concat()` cannot hide repeated
-/// node-set-to-string coercions. Quoted literals are excluded; unknown coercion
-/// paths are covered separately by the mandatory baseline scan.
+/// Linear XPath 1.0 built-ins, argument separators, and comparison operators
+/// each contribute one pass so repeated node-set-to-string coercions cannot hide
+/// behind one expression. Quoted literals are excluded; unknown coercion paths
+/// are covered separately by the mandatory baseline scan.
 fn xpath_string_scan_count(source: &str) -> usize {
     let bytes = source.as_bytes();
     let mut scans = 0_usize;
@@ -241,7 +243,7 @@ fn xpath_string_scan_count(source: &str) -> usize {
             continue;
         }
         if quote.is_some() || !(byte.is_ascii_alphabetic() || byte == b'_') {
-            if quote.is_none() && byte == b',' {
+            if quote.is_none() && matches!(byte, b',' | b'=' | b'<' | b'>') {
                 scans = scans.saturating_add(1);
             }
             index += 1;
@@ -295,13 +297,14 @@ fn is_xpath_string_scanning_function(name: &str) -> bool {
 /// expression branches add their traversal costs. Predicate scans inherit the
 /// enclosing path depth and gain another factor per predicate level. Saturation
 /// deliberately turns arithmetic overflow into a budget rejection.
-fn xpath_evaluation_work(source: &str, document_size: usize) -> usize {
+fn xpath_evaluation_work(source: &str, document_size: usize, mode: XPathEvaluationMode) -> usize {
     let bytes = source.as_bytes();
     let mut work = document_size;
     let mut predicate_depth = 0_usize;
     let mut top_level_path_scans = 0_usize;
     let mut saw_top_level_scan = false;
     let mut predicate_path_scans = Vec::new();
+    let mut parent_steps = 0_usize;
     let mut quote = None;
     let mut index = 0_usize;
 
@@ -350,6 +353,10 @@ fn xpath_evaluation_work(source: &str, document_size: usize) -> usize {
                 );
                 index += 1;
             }
+            b'.' if bytes.get(index + 1) == Some(&b'.') => {
+                parent_steps = parent_steps.saturating_add(1);
+                index += 1;
+            }
             b':' if bytes.get(index + 1) == Some(&b':') => {
                 let mut axis_start = index;
                 while axis_start > 0 && is_xpath_name_byte(bytes[axis_start - 1]) {
@@ -364,6 +371,8 @@ fn xpath_evaluation_work(source: &str, document_size: usize) -> usize {
                         &mut saw_top_level_scan,
                         &mut predicate_path_scans,
                     );
+                } else if &source[axis_start..index] == "parent" {
+                    parent_steps = parent_steps.saturating_add(1);
                 }
                 index += 1;
             }
@@ -376,6 +385,15 @@ fn xpath_evaluation_work(source: &str, document_size: usize) -> usize {
         }
         index += 1;
     }
+
+    // Filter2 selects from the document in one evaluation, so every parent step
+    // can run for each selected node. XMLDSig XPath evaluates once per input node;
+    // within each such evaluation one parent step remains constant work.
+    let parent_step_contexts = match mode {
+        XPathEvaluationMode::XmlDsigPerNodeFilter => 1,
+        XPathEvaluationMode::Filter2NodeSetSelection => document_size,
+    };
+    work = work.saturating_add(parent_step_contexts.saturating_mul(parent_steps));
 
     work
 }
@@ -1044,6 +1062,7 @@ impl XPathDocumentRelation {
     }
 }
 
+#[derive(Clone, Copy)]
 enum XPathEvaluationMode {
     XmlDsigPerNodeFilter,
     Filter2NodeSetSelection,
@@ -1103,7 +1122,7 @@ fn evaluate_expression<'a>(
     );
 
     let xpath = compile_xpath(expression.expression()).map_err(TransformError::XPath)?;
-    let evaluation_work = xpath_evaluation_work(expression.expression(), document_size);
+    let evaluation_work = xpath_evaluation_work(expression.expression(), document_size, mode);
     let string_scans = xpath_string_scan_count(expression.expression()).max(1);
 
     if matches!(mode, XPathEvaluationMode::XmlDsigPerNodeFilter) {
@@ -1542,6 +1561,42 @@ mod tests {
     }
 
     #[test]
+    fn xpath_filter_charges_each_repeated_comparison_scan() {
+        // XPath 1.0 compares a node-set through each candidate node's string
+        // value. Two comparisons must therefore consume two complete source scans.
+        let document = Document::parse("<root><blob>payload</blob><item/></root>").unwrap();
+        let single_scan_budget = XPathWorkBudget::default();
+        let initial_remaining = single_scan_budget.string_work_bytes_remaining.get();
+        apply_xpath_filter_with_semantics(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &XPathExpression::new("/root/blob = 'missing'"),
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &single_scan_budget,
+        )
+        .expect("one bounded comparison scan should fit");
+        let one_scan_work =
+            initial_remaining - single_scan_budget.string_work_bytes_remaining.get();
+        let repeated_scan_budget = XPathWorkBudget {
+            remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
+            mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
+            string_work_bytes_remaining: Rc::new(Cell::new(one_scan_work)),
+        };
+
+        let error = apply_xpath_filter_with_semantics(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &XPathExpression::new("/root/blob = 'missing' or /root/blob = 'absent'"),
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &repeated_scan_budget,
+        )
+        .err()
+        .expect("two comparison scans must exceed a one-scan budget");
+
+        assert!(error.to_string().contains("string-processing work"));
+    }
+
+    #[test]
     fn xpath_filter2_rejects_cumulative_mirror_bytes() {
         // Each expression may mirror less than the per-document byte ceiling,
         // but repeated filters must not multiply signature-wide copying.
@@ -1584,6 +1639,29 @@ mod tests {
     }
 
     #[test]
+    fn xpath_filter2_charges_each_parent_axis_step() {
+        // A descendant selection followed by repeated parent steps traverses
+        // those steps for every selected node inside the non-interruptible engine.
+        let xml = format!("<root><outer>{}</outer></root>", "<item/>".repeat(20));
+        let document = Document::parse(&xml).unwrap();
+        let budget = XPathWorkBudget::with_limit(70);
+        let error = apply_xpath_filter2_with_semantics(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &[XPathFilter::new(
+                XPathFilterOperation::Intersect,
+                XPathExpression::new("//*[../../..]"),
+            )],
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &budget,
+        )
+        .err()
+        .expect("repeated parent-axis steps must exhaust the shared XPath budget");
+
+        assert!(error.to_string().contains("cumulative evaluation work"));
+    }
+
+    #[test]
     fn xpath_filter_charges_top_level_composed_document_scans() {
         // The descendant axis is evaluated for every node selected by the
         // leading descendant scan. Ordinary XMLDSig XPath then repeats that
@@ -1608,15 +1686,38 @@ mod tests {
     fn xpath_work_profile_tracks_nested_paths_but_ignores_literals() {
         // The preflight meter must recognize both abbreviated paths and named
         // axes without treating XPath punctuation inside quoted data as work.
-        assert_eq!(xpath_evaluation_work("//*[count(//*) > 0]", 10), 110);
-        assert_eq!(xpath_evaluation_work("//*[ancestor::*]", 10), 110);
-        assert_eq!(xpath_evaluation_work("//a | //b", 10), 20);
-        assert_eq!(xpath_evaluation_work("//a and //b", 10), 20);
-        assert_eq!(xpath_evaluation_work("//brand/descendant::*", 10), 110);
-        assert_eq!(xpath_evaluation_work("//*/descendant::*", 10), 110);
-        assert_eq!(xpath_evaluation_work("//*[.//*/descendant::*]", 10), 1_110);
+        let filter2 = XPathEvaluationMode::Filter2NodeSetSelection;
         assert_eq!(
-            xpath_evaluation_work("//*[contains(., '//ancestor::*')]", 10),
+            xpath_evaluation_work("//*[count(//*) > 0]", 10, filter2),
+            110
+        );
+        assert_eq!(xpath_evaluation_work("//*[ancestor::*]", 10, filter2), 110);
+        assert_eq!(xpath_evaluation_work("//a | //b", 10, filter2), 20);
+        assert_eq!(xpath_evaluation_work("//a and //b", 10, filter2), 20);
+        assert_eq!(
+            xpath_evaluation_work("//brand/descendant::*", 10, filter2),
+            110
+        );
+        assert_eq!(xpath_evaluation_work("//*/descendant::*", 10, filter2), 110);
+        assert_eq!(
+            xpath_evaluation_work("//*[.//*/descendant::*]", 10, filter2),
+            1_110
+        );
+        assert_eq!(xpath_evaluation_work("//*[../../..]", 10, filter2), 40);
+        assert_eq!(
+            xpath_evaluation_work("//*[parent::*/parent::*]", 10, filter2),
+            30
+        );
+        assert_eq!(
+            xpath_evaluation_work(
+                "//*[../../..]",
+                10,
+                XPathEvaluationMode::XmlDsigPerNodeFilter,
+            ),
+            13
+        );
+        assert_eq!(
+            xpath_evaluation_work("//*[contains(., '//ancestor::*')]", 10, filter2),
             10
         );
     }
@@ -1638,6 +1739,11 @@ mod tests {
             2
         );
         assert_eq!(xpath_string_scan_count("ext:contains(/root/a, 'x')"), 1);
+        assert_eq!(
+            xpath_string_scan_count("/root/blob = 'missing' or /root/blob = 'absent'"),
+            2
+        );
+        assert_eq!(xpath_string_scan_count("/root/blob = 'literal < > ='"), 1);
     }
 
     #[test]

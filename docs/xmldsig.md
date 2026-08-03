@@ -30,12 +30,13 @@ not become trusted merely because they appear in `<KeyInfo>`.
 every `<SignedInfo>` reference succeeded. `Invalid(reason)` means core validation completed but
 failed, such as a `<SignedInfo>` digest mismatch or invalid signature value.
 
-When `VerifyContext::process_manifests(true)` is enabled, each authenticated Manifest reference
-has an independent status in `VerifyResult::manifest_references`. A failed Manifest reference does
-not change the core `VerifyResult::status`; callers must inspect every Manifest result before
+When `VerifyContext::process_manifests(true)` is enabled, Manifest parsing starts only after the
+`<SignedInfo>` references and `SignatureValue` both validate. Each authenticated Manifest reference
+then has an independent status in `VerifyResult::manifest_references`. A failed Manifest reference
+does not change the core `VerifyResult::status`; callers must inspect every Manifest result before
 accepting data whose integrity depends on that Manifest. An empty Manifest result list is not proof
-that the input contained no Manifest because unsigned, unreferenced, or structurally excluded
-Manifest blocks are deliberately skipped.
+that the input contained no Manifest because core validation failures and unsigned, unreferenced,
+or structurally excluded Manifest blocks all skip Manifest processing.
 
 Malformed XMLDSig structure, unsupported algorithms, disallowed reference URIs, and
 inconsistent `KeyInfo` metadata are processing errors rather than validity statuses. Treat both

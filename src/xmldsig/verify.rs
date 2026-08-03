@@ -201,9 +201,10 @@ impl<'a> VerifyContext<'a> {
     /// `URI="#xpointer(/)"` do not mark a specific direct-child
     /// `<ds:Object>`/`<ds:Manifest>` as signed for this option.
     ///
-    /// Manifest reference digest mismatches, policy violations, and processing
-    /// failures are reported in `VerifyResult::manifest_references` and do not
-    /// alter the final `VerifyResult::status`.
+    /// Manifests are parsed and processed only after the SignedInfo references
+    /// and SignatureValue both validate. Their digest mismatches, policy
+    /// violations, and processing failures are then reported independently in
+    /// `VerifyResult::manifest_references` and do not alter `VerifyResult::status`.
     /// Callers that enable `process_manifests(true)` must inspect
     /// `VerifyResult::manifest_references` in addition to `VerifyResult::status`
     /// when interpreting `verify()` results.
@@ -566,7 +567,8 @@ pub struct VerifyResult {
     /// the first digest mismatch only.
     pub signed_info_references: Vec<ReferenceResult>,
     /// `<Manifest>` reference results.
-    /// Populated only when `VerifyContext::process_manifests(true)` is enabled.
+    /// Populated only when `VerifyContext::process_manifests(true)` is enabled
+    /// and core signature validation succeeds.
     /// Includes only references from signed direct-child `<ds:Object>/<ds:Manifest>`
     /// blocks that are referenced from `<SignedInfo>`.
     /// Each entry has an independent status that does not alter [`Self::status`].
@@ -778,21 +780,6 @@ fn verify_signature_with_context(
         });
     }
 
-    let manifest_references = if ctx.process_manifests {
-        let signed_info_reference_nodes =
-            collect_authenticated_signed_info_reference_nodes(&signed_info.references, &resolver);
-        process_manifest_references(
-            signature_node,
-            &resolver,
-            ctx,
-            &signed_info_reference_nodes,
-            &execution,
-            &mut xpath_parse_budget,
-        )?
-    } else {
-        Vec::new()
-    };
-
     let signed_info_subtree: HashSet<_> = signed_info_node
         .descendants()
         .map(|node: Node<'_, '_>| node.id())
@@ -812,7 +799,7 @@ fn verify_signature_with_context(
         return Ok(VerifyResult {
             status: DsigStatus::Invalid(FailureReason::KeyNotFound),
             signed_info_references: references.results,
-            manifest_references,
+            manifest_references: Vec::new(),
             canonicalized_signed_info: if ctx.store_pre_digest {
                 Some(canonical_signed_info)
             } else {
@@ -827,12 +814,36 @@ fn verify_signature_with_context(
         &signature_value,
     )?;
 
+    if !signature_valid {
+        return Ok(VerifyResult {
+            status: DsigStatus::Invalid(FailureReason::SignatureMismatch),
+            signed_info_references: references.results,
+            manifest_references: Vec::new(),
+            canonicalized_signed_info: if ctx.store_pre_digest {
+                Some(canonical_signed_info)
+            } else {
+                None
+            },
+        });
+    }
+
+    let manifest_references = if ctx.process_manifests {
+        let signed_info_reference_nodes =
+            collect_authenticated_signed_info_reference_nodes(&signed_info.references, &resolver);
+        process_manifest_references(
+            signature_node,
+            &resolver,
+            ctx,
+            &signed_info_reference_nodes,
+            &execution,
+            &mut xpath_parse_budget,
+        )?
+    } else {
+        Vec::new()
+    };
+
     Ok(VerifyResult {
-        status: if signature_valid {
-            DsigStatus::Valid
-        } else {
-            DsigStatus::Invalid(FailureReason::SignatureMismatch)
-        },
+        status: DsigStatus::Valid,
         signed_info_references: references.results,
         manifest_references,
         canonicalized_signed_info: if ctx.store_pre_digest {
@@ -1329,6 +1340,7 @@ fn verify_with_algorithm(
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
     use super::*;
+    use crate::c14n::C14nAlgorithm;
     use crate::xmldsig::digest::DigestAlgorithm;
     use crate::xmldsig::parse::{Reference, parse_signed_info};
     use crate::xmldsig::transforms::Transform;
@@ -1686,7 +1698,7 @@ mod tests {
         ));
 
         let result_with_manifests = VerifyContext::new()
-            .key(&RejectingKey)
+            .key(&AcceptingKey)
             .process_manifests(true)
             .verify(&xml)
             .expect("manifest references should be processed when enabled");
@@ -1703,10 +1715,37 @@ mod tests {
             result_with_manifests.manifest_references[0].status,
             DsigStatus::Valid
         ));
+        assert!(matches!(result_with_manifests.status, DsigStatus::Valid));
+    }
+
+    #[test]
+    fn verify_context_skips_manifest_work_when_signature_value_is_invalid() {
+        // SignedInfo authenticates the Manifest bytes only after SignatureValue
+        // succeeds. Malformed nested content must not consume parsing work when
+        // the cryptographic signature itself is invalid.
+        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
+            let (prefix, object_suffix) = xml
+                .split_once("<ds:Object>")
+                .expect("fixture should contain ds:Object");
+            let malformed = object_suffix.replacen(
+                "<ds:DigestValue>AQ==</ds:DigestValue>",
+                "<ds:DigestValue>!!!</ds:DigestValue>",
+                1,
+            );
+            format!("{prefix}<ds:Object>{malformed}")
+        });
+
+        let result = VerifyContext::new()
+            .key(&RejectingKey)
+            .process_manifests(true)
+            .verify(&xml)
+            .expect("invalid SignatureValue must short-circuit Manifest parsing");
+
         assert!(matches!(
-            result_with_manifests.status,
+            result.status,
             DsigStatus::Invalid(FailureReason::SignatureMismatch)
         ));
+        assert!(result.manifest_references.is_empty());
     }
 
     #[test]
@@ -1744,7 +1783,7 @@ mod tests {
         });
 
         let error = VerifyContext::new()
-            .key(&RejectingKey)
+            .key(&AcceptingKey)
             .process_manifests(true)
             .verify(&xml)
             .expect_err("SignedInfo and Manifest References must share one XPath parse budget");
@@ -1768,7 +1807,7 @@ mod tests {
         });
 
         let result = VerifyContext::new()
-            .key(&RejectingKey)
+            .key(&AcceptingKey)
             .process_manifests(true)
             .verify(&xml)
             .expect("manifest references should be processed when SignedInfo references ds:Object");
@@ -1818,23 +1857,14 @@ mod tests {
     }
 
     #[test]
-    fn verify_context_manifest_digest_mismatch_is_non_fatal() {
+    fn verify_context_skips_manifest_digest_work_when_signature_is_invalid() {
         let xml = signature_with_manifest_xml(false);
         let result = VerifyContext::new()
             .key(&RejectingKey)
             .process_manifests(true)
             .verify(&xml)
-            .expect("manifest digest mismatches should be reported as reference status");
-        assert_eq!(result.manifest_references.len(), 1);
-        assert_eq!(
-            result.manifest_references[0].reference_set,
-            ReferenceSet::Manifest
-        );
-        assert_eq!(result.manifest_references[0].reference_index, 0);
-        assert!(matches!(
-            result.manifest_references[0].status,
-            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
-        ));
+            .expect("invalid SignatureValue must short-circuit Manifest digest work");
+        assert!(result.manifest_references.is_empty());
         assert!(matches!(
             result.status,
             DsigStatus::Invalid(FailureReason::SignatureMismatch)
@@ -1898,9 +1928,9 @@ mod tests {
     }
 
     #[test]
-    fn verify_context_records_manifest_policy_violations_without_aborting() {
-        // A policy-invalid Manifest remains authenticated by SignedInfo, so its
-        // own failure is reported independently from SignatureValue validity.
+    fn verify_context_skips_manifest_policy_work_when_signature_is_invalid() {
+        // A digest-valid SignedInfo reference does not authenticate Manifest
+        // policy inputs until SignatureValue also succeeds.
         let broken_xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
             xml.replacen("URI=\"#target\"", "URI=\"http://example.com/external\"", 1)
         });
@@ -1908,12 +1938,8 @@ mod tests {
             .key(&RejectingKey)
             .process_manifests(true)
             .verify(&broken_xml)
-            .expect("manifest policy violations should be recorded, not abort verify()");
-        assert_eq!(result.manifest_references.len(), 1);
-        assert!(matches!(
-            result.manifest_references[0].status,
-            DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
-        ));
+            .expect("invalid SignatureValue must short-circuit Manifest policy work");
+        assert!(result.manifest_references.is_empty());
         assert!(matches!(
             result.status,
             DsigStatus::Invalid(FailureReason::SignatureMismatch)
@@ -1939,9 +1965,9 @@ mod tests {
     }
 
     #[test]
-    fn verify_context_records_manifest_missing_uri_as_processing_failure() {
-        // Missing Manifest URIs are per-reference processing failures after the
-        // containing XML has passed its SignedInfo digest check.
+    fn verify_context_skips_manifest_uri_work_when_signature_is_invalid() {
+        // Missing Manifest URIs remain unauthenticated until SignatureValue
+        // succeeds, so they cannot trigger Manifest policy processing here.
         let broken_xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
             xml.replacen("<ds:Reference URI=\"#target\">", "<ds:Reference>", 1)
         });
@@ -1950,13 +1976,8 @@ mod tests {
             .key(&RejectingKey)
             .process_manifests(true)
             .verify(&broken_xml)
-            .expect("manifest missing URI should be recorded as non-fatal processing failure");
-        assert_eq!(result.manifest_references.len(), 1);
-        assert_eq!(result.manifest_references[0].uri, "<omitted>");
-        assert!(matches!(
-            result.manifest_references[0].status,
-            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
-        ));
+            .expect("invalid SignatureValue must short-circuit Manifest URI processing");
+        assert!(result.manifest_references.is_empty());
         assert!(matches!(
             result.status,
             DsigStatus::Invalid(FailureReason::SignatureMismatch)
@@ -1997,7 +2018,7 @@ mod tests {
         });
 
         let result = VerifyContext::new()
-            .key(&RejectingKey)
+            .key(&AcceptingKey)
             .process_manifests(true)
             .verify(&xml)
             .expect("nested Manifest nodes are ignored in strict mode");
@@ -2005,6 +2026,7 @@ mod tests {
             result.manifest_references.is_empty(),
             "only direct ds:Manifest children of ds:Object must be processed"
         );
+        assert!(matches!(result.status, DsigStatus::Valid));
     }
 
     #[test]
@@ -2034,7 +2056,7 @@ mod tests {
         });
 
         let err = VerifyContext::new()
-            .key(&RejectingKey)
+            .key(&AcceptingKey)
             .process_manifests(true)
             .verify(&broken_xml)
             .expect_err("invalid Manifest DigestValue must map to ParseManifestReference");
@@ -2057,7 +2079,7 @@ mod tests {
         });
 
         let err = VerifyContext::new()
-            .key(&RejectingKey)
+            .key(&AcceptingKey)
             .process_manifests(true)
             .verify(&xml)
             .expect_err("Manifest mixed content must fail verification");
@@ -2084,7 +2106,7 @@ mod tests {
         });
 
         let err = VerifyContext::new()
-            .key(&RejectingKey)
+            .key(&AcceptingKey)
             .process_manifests(true)
             .verify(&xml)
             .expect_err("empty Manifest must fail verification");
@@ -2281,6 +2303,42 @@ mod tests {
         assert!(matches!(
             err,
             SignatureVerificationPipelineError::Reference(ReferenceProcessingError::MissingUri)
+        ));
+    }
+
+    #[test]
+    fn enforce_reference_policies_checks_only_terminal_binary_output() {
+        let c14n = C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI).unwrap();
+        let allowed = HashSet::from([
+            BASE64_TRANSFORM_URI.to_owned(),
+            DEFAULT_IMPLICIT_C14N_URI.to_owned(),
+        ]);
+        let without_implicit_c14n = HashSet::from([BASE64_TRANSFORM_URI.to_owned()]);
+
+        for transforms in [
+            vec![Transform::Base64Decode, Transform::C14n(c14n)],
+            vec![Transform::Base64Decode, Transform::Base64Decode],
+        ] {
+            let reference = make_reference("", transforms, DigestAlgorithm::Sha256, vec![0; 32]);
+            enforce_reference_policies(
+                std::slice::from_ref(&reference),
+                UriTypeSet::default(),
+                Some(&allowed),
+            )
+            .expect("terminal binary output must not require implicit C14N");
+        }
+
+        let no_transforms = make_reference("", vec![], DigestAlgorithm::Sha256, vec![0; 32]);
+        let error = enforce_reference_policies(
+            std::slice::from_ref(&no_transforms),
+            UriTypeSet::default(),
+            Some(&without_implicit_c14n),
+        )
+        .expect_err("a node-set result must require allowlisted implicit C14N");
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::DisallowedTransform { ref algorithm }
+                if algorithm == DEFAULT_IMPLICIT_C14N_URI
         ));
     }
 

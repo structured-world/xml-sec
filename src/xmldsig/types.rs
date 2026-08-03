@@ -208,6 +208,10 @@ impl<'a> NodeSet<'a> {
         Self::entire_document_with_comments(doc)
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub(crate) fn insert_node(&mut self, node: Node<'_, '_>) {
         if self.owns(node) {
             self.with_comments |= node.is_comment();
@@ -446,6 +450,13 @@ pub enum TransformError {
     NodeSetStringsTooLarge {
         /// Maximum string bytes cloned into one exact XPath node projection.
         max_bytes: usize,
+    },
+
+    /// Node-set filtering would exceed the cumulative transform work budget.
+    #[error("node-set filtering exceeds signature-wide maximum of {max_entries} entry visits")]
+    NodeSetFilterWorkTooLarge {
+        /// Maximum node-set entries visited across one signature execution.
+        max_entries: usize,
     },
 
     /// Temporary XPath documents would cumulatively copy too many strings.

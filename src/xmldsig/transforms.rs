@@ -68,6 +68,8 @@ const MAX_XPATH_NAMESPACE_BYTES: usize = 64 * 1024;
 const MAX_BASE64_TRANSFORM_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BASE64_TRANSFORM_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_C14N_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+/// Bound cumulative node-set visits performed by exclusion transforms.
+const MAX_NODE_SET_FILTER_WORK: usize = 6_000_000;
 
 /// Namespace URI for Exclusive C14N `<InclusiveNamespaces>` elements.
 const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
@@ -97,6 +99,30 @@ pub(crate) struct TransformExecutionBudget {
     xpath: XPathWorkBudget,
     base64: Base64WorkBudget,
     c14n: C14nOutputBudget,
+    node_filter: NodeFilterWorkBudget,
+}
+
+struct NodeFilterWorkBudget {
+    remaining: Cell<usize>,
+}
+
+impl Default for NodeFilterWorkBudget {
+    fn default() -> Self {
+        Self {
+            remaining: Cell::new(MAX_NODE_SET_FILTER_WORK),
+        }
+    }
+}
+
+impl NodeFilterWorkBudget {
+    fn charge(&self, entries: usize) -> Result<(), TransformError> {
+        if !charge_byte_budget(&self.remaining, entries) {
+            return Err(TransformError::NodeSetFilterWorkTooLarge {
+                max_entries: MAX_NODE_SET_FILTER_WORK,
+            });
+        }
+        Ok(())
+    }
 }
 
 struct Base64WorkBudget {
@@ -165,6 +191,7 @@ impl TransformExecutionBudget {
             xpath: XPathWorkBudget::with_limit(limit),
             base64: Base64WorkBudget::default(),
             c14n: C14nOutputBudget::default(),
+            node_filter: NodeFilterWorkBudget::default(),
         }
     }
 
@@ -173,6 +200,18 @@ impl TransformExecutionBudget {
             xpath: XPathWorkBudget::default(),
             base64: Base64WorkBudget::default(),
             c14n: C14nOutputBudget {
+                remaining: Cell::new(limit),
+            },
+            node_filter: NodeFilterWorkBudget::default(),
+        }
+    }
+
+    fn with_node_filter_limit(limit: usize) -> Self {
+        Self {
+            xpath: XPathWorkBudget::default(),
+            base64: Base64WorkBudget::default(),
+            c14n: C14nOutputBudget::default(),
+            node_filter: NodeFilterWorkBudget {
                 remaining: Cell::new(limit),
             },
         }
@@ -448,6 +487,7 @@ fn apply_transform_with_options_and_state<'s, 'd>(
             if !std::ptr::eq(signature_node.document(), nodes.document()) {
                 return Err(TransformError::CrossDocumentSignatureNode);
             }
+            budget.node_filter.charge(nodes.len())?;
             nodes.exclude_subtree(signature_node);
             Ok(TransformData::NodeSet(nodes))
         }
@@ -460,6 +500,7 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                     && node.tag_name().name() == "Signature"
                     && node.tag_name().namespace() == Some(XMLDSIG_NS)
             }) {
+                budget.node_filter.charge(nodes.len())?;
                 nodes.exclude_subtree(node);
             }
 
@@ -1745,6 +1786,47 @@ mod tests {
                 max_bytes: MAX_C14N_OUTPUT_BYTES
             })
         ));
+    }
+
+    #[test]
+    fn execution_budget_bounds_repeated_node_set_exclusions() {
+        // Repeating an exclusion over a large node set must consume one shared
+        // signature budget instead of permitting references to multiply full-set scans.
+        let document =
+            Document::parse("<root><payload/><Signature><Object/></Signature></root>").unwrap();
+        let signature = document
+            .descendants()
+            .find(|node| node.has_tag_name("Signature"))
+            .unwrap();
+        let input = || NodeSet::entire_document_with_comments(&document).unwrap();
+        let entries_per_exclusion = input().len();
+        let budget = TransformExecutionBudget::with_node_filter_limit(
+            entries_per_exclusion.saturating_mul(2).saturating_sub(1),
+        );
+
+        execute_transforms_with_options_and_budget(
+            signature,
+            TransformData::NodeSet(input()),
+            &[Transform::Enveloped],
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect("the first reference exclusion must fit the shared budget");
+        let result = execute_transforms_with_options_and_budget(
+            signature,
+            TransformData::NodeSet(input()),
+            &[Transform::Enveloped],
+            TransformOptions::default(),
+            &budget,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(TransformError::NodeSetFilterWorkTooLarge { .. })
+            ),
+            "the second reference exclusion must exhaust the shared budget"
+        );
     }
 
     #[test]
