@@ -187,8 +187,9 @@ impl<'a> VerifyContext<'a> {
     /// `<ds:Object>` or `<ds:Manifest>` itself is referenced from `<SignedInfo>`
     /// by an ID-based same-document fragment URI such as `#id` or
     /// `#xpointer(id('id'))`, and that reference uses only canonicalization
-    /// transforms (or implicit canonicalization). Filtering or binary transforms
-    /// do not prove that the complete Manifest structure was authenticated.
+    /// transforms (or implicit canonicalization) and no-op enveloped-signature
+    /// transforms. Other filtering or binary transforms do not prove that the
+    /// complete Manifest structure was authenticated.
     /// Only those signed Manifest references are returned in
     /// `VerifyResult::manifest_references`.
     /// Manifest parsing begins only after every `<SignedInfo>` reference digest
@@ -1019,18 +1020,33 @@ fn collect_authenticated_signed_info_reference_nodes(
     references
         .iter()
         // URI dereference identifies the transform input, not necessarily the
-        // bytes authenticated by its digest. Only canonicalization preserves the
+        // bytes authenticated by its digest. Every transform must preserve the
         // complete XML structure needed to trust and process a Manifest.
         .filter(|reference| {
             reference
                 .transforms
                 .iter()
-                .all(|transform| matches!(transform, Transform::C14n(_)))
+                .all(transform_preserves_manifest_structure)
         })
         .filter_map(|reference| reference.uri.as_deref())
         .filter_map(signed_info_reference_id_from_uri)
         .filter_map(|id| resolver.node_id_for_id(id))
         .collect()
+}
+
+fn transform_preserves_manifest_structure(transform: &Transform) -> bool {
+    match transform {
+        Transform::C14n(_) => true,
+        // Eligible targets are a Manifest or its containing Object, both inside
+        // the owning Signature. The enveloped transform removes that Signature
+        // only when it is a descendant of the input node set, so it is a no-op
+        // for these ID-rooted subtrees and cannot remove Manifest structure.
+        Transform::Enveloped => true,
+        Transform::XpathExcludeAllSignatures
+        | Transform::XPath(_)
+        | Transform::XPathFilter2(_)
+        | Transform::Base64Decode => false,
+    }
 }
 
 fn signed_info_reference_id_from_uri(uri: &str) -> Option<&str> {
@@ -1825,6 +1841,46 @@ mod tests {
             result.manifest_references[0].status,
             DsigStatus::Valid
         ));
+    }
+
+    #[test]
+    fn verify_context_processes_manifest_after_noop_enveloped_transform() {
+        // An ID reference to either node starts below the owning Signature, so
+        // removing descendant Signature elements cannot alter the authenticated
+        // Manifest structure. Both forms must remain eligible for processing.
+        for target_object in [false, true] {
+            let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
+                let xml = xml.replacen(
+                    r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+                    r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+                    1,
+                );
+                if target_object {
+                    xml.replacen("URI=\"#manifest\"", "URI=\"#object-id\"", 1)
+                        .replacen("<ds:Object>", "<ds:Object ID=\"object-id\">", 1)
+                        .replacen("<ds:Manifest ID=\"manifest\">", "<ds:Manifest>", 1)
+                } else {
+                    xml
+                }
+            });
+
+            let result = VerifyContext::new()
+                .key(&AcceptingKey)
+                .process_manifests(true)
+                .verify(&xml)
+                .expect("a no-op enveloped transform must preserve Manifest processing");
+
+            assert!(matches!(result.status, DsigStatus::Valid));
+            assert_eq!(
+                result.manifest_references.len(),
+                1,
+                "target_object={target_object} must authenticate the Manifest",
+            );
+            assert!(matches!(
+                result.manifest_references[0].status,
+                DsigStatus::Valid
+            ));
+        }
     }
 
     #[test]
