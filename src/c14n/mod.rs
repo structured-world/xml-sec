@@ -36,7 +36,12 @@ use roxmltree::{Document, Node, NodeId};
 
 use ns_exclusive::ExclusiveNsRenderer;
 use ns_inclusive::InclusiveNsRenderer;
-use serialize::{C14nConfig, serialize_canonical_visible_with_position};
+#[cfg(any(feature = "xmldsig", test))]
+use serialize::CanonicalOutputLimitExceeded;
+use serialize::{
+    C14nConfig, CanonicalOutputOptions, serialize_canonical_visible_with_position,
+    serialize_canonical_visible_with_position_bounded,
+};
 
 /// C14N algorithm mode (without the comments flag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +163,17 @@ pub enum C14nError {
     Io(#[from] std::io::Error),
 }
 
+#[cfg(any(feature = "xmldsig", test))]
+pub(crate) fn is_output_limit_error(error: &C14nError) -> bool {
+    matches!(
+        error,
+        C14nError::Io(error)
+            if error
+                .get_ref()
+                .is_some_and(|source| source.is::<CanonicalOutputLimitExceeded>())
+    )
+}
+
 /// Visibility contract for canonicalizing a precise XPath node-set.
 ///
 /// XPath can select attributes and namespace nodes independently from their
@@ -241,6 +257,43 @@ pub(crate) fn canonicalize_with_visibility_and_position(
     tracked_element: Option<NodeId>,
     output: &mut Vec<u8>,
 ) -> Result<Option<usize>, C14nError> {
+    canonicalize_with_visibility_and_position_impl(
+        doc,
+        visibility,
+        algo,
+        tracked_element,
+        None,
+        output,
+    )
+}
+
+#[cfg(any(feature = "xmldsig", test))]
+pub(crate) fn canonicalize_with_visibility_and_position_bounded(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    algo: &C14nAlgorithm,
+    tracked_element: Option<NodeId>,
+    max_output_bytes: usize,
+    output: &mut Vec<u8>,
+) -> Result<Option<usize>, C14nError> {
+    canonicalize_with_visibility_and_position_impl(
+        doc,
+        visibility,
+        algo,
+        tracked_element,
+        Some(max_output_bytes),
+        output,
+    )
+}
+
+fn canonicalize_with_visibility_and_position_impl(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    algo: &C14nAlgorithm,
+    tracked_element: Option<NodeId>,
+    max_output_bytes: Option<usize>,
+    output: &mut Vec<u8>,
+) -> Result<Option<usize>, C14nError> {
     // inherit_xml_attrs: Inclusive C14N inherits xml:* attrs from ancestors
     // per §2.4. Exclusive C14N explicitly omits this per Exc-C14N §3.
     // fixup_xml_base: C14N 1.1 resolves relative xml:base URIs via RFC 3986.
@@ -251,13 +304,14 @@ pub(crate) fn canonicalize_with_visibility_and_position(
                 inherit_xml_attrs: true,
                 fixup_xml_base: false,
             };
-            serialize_canonical_visible_with_position(
+            serialize_canonical_visible_with_position_dispatch(
                 doc,
                 visibility,
                 algo.with_comments,
                 &renderer,
                 config,
                 tracked_element,
+                max_output_bytes,
                 output,
             )
         }
@@ -267,13 +321,14 @@ pub(crate) fn canonicalize_with_visibility_and_position(
                 inherit_xml_attrs: true,
                 fixup_xml_base: true,
             };
-            serialize_canonical_visible_with_position(
+            serialize_canonical_visible_with_position_dispatch(
                 doc,
                 visibility,
                 algo.with_comments,
                 &renderer,
                 config,
                 tracked_element,
+                max_output_bytes,
                 output,
             )
         }
@@ -283,16 +338,50 @@ pub(crate) fn canonicalize_with_visibility_and_position(
                 inherit_xml_attrs: false,
                 fixup_xml_base: false,
             };
-            serialize_canonical_visible_with_position(
+            serialize_canonical_visible_with_position_dispatch(
                 doc,
                 visibility,
                 algo.with_comments,
                 &renderer,
                 config,
                 tracked_element,
+                max_output_bytes,
                 output,
             )
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serialize_canonical_visible_with_position_dispatch(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    with_comments: bool,
+    renderer: &dyn serialize::NsRenderer,
+    config: C14nConfig,
+    tracked_element: Option<NodeId>,
+    max_output_bytes: Option<usize>,
+    output: &mut Vec<u8>,
+) -> Result<Option<usize>, C14nError> {
+    match max_output_bytes {
+        Some(max_output_bytes) => serialize_canonical_visible_with_position_bounded(
+            doc,
+            visibility,
+            with_comments,
+            renderer,
+            config,
+            CanonicalOutputOptions::bounded(tracked_element, max_output_bytes),
+            output,
+        ),
+        None => serialize_canonical_visible_with_position(
+            doc,
+            visibility,
+            with_comments,
+            renderer,
+            config,
+            tracked_element,
+            output,
+        ),
     }
 }
 
@@ -460,6 +549,34 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
             r#"<child xml:id="r1">text</child>"#
+        );
+    }
+
+    #[test]
+    fn bounded_canonicalization_stops_before_exceeding_the_limit() {
+        // XMLDSig applies a signature-wide output ceiling. The serializer must
+        // stop at that ceiling instead of allocating the complete hostile value
+        // and rejecting it only after serialization has finished.
+        let xml = format!("<root>{}</root>", "x".repeat(4_096));
+        let document = Document::parse(&xml).expect("fixed XML must parse");
+        let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
+        let mut output = Vec::new();
+
+        let error = canonicalize_with_visibility_and_position_bounded(
+            &document,
+            None,
+            &algorithm,
+            None,
+            64,
+            &mut output,
+        )
+        .expect_err("canonicalization must stop at the caller's byte ceiling");
+
+        assert!(is_output_limit_error(&error));
+        assert!(
+            output.len() <= 64,
+            "bounded output grew to {} bytes",
+            output.len()
         );
     }
 }

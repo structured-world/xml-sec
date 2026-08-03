@@ -240,6 +240,46 @@ fn rejects_xpath_namespace_budget_before_serialization() {
 }
 
 #[test]
+fn rejects_signature_wide_xpath_expression_budget() {
+    // Builder output must obey the parser's aggregate bound rather than emit a
+    // template that becomes unacceptable only when signing reparses SignedInfo.
+    let filters = (0..64)
+        .map(|_| {
+            XPathFilter::new(
+                XPathFilterOperation::Intersect,
+                XPathExpression::new("true()"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut max_reference = ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#item-0");
+    for _ in 0..64 {
+        max_reference = max_reference.transform(Transform::XPathFilter2(filters.clone()));
+    }
+    let mut builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(max_reference);
+    builder
+        .clone()
+        .build_template()
+        .expect("one maximum-shaped Reference must remain accepted");
+    builder = builder.add_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#item-1")
+            .transform(Transform::XPath(XPathExpression::new("true()"))),
+    );
+
+    let error = builder
+        .build_template()
+        .expect_err("builder must enforce the signature-wide XPath expression budget");
+
+    assert!(matches!(error, SignatureBuilderError::InvalidXPath(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("signature-wide XPath expression budget")
+    );
+}
+
+#[test]
 fn rejects_inherited_signature_prefix_over_namespace_budget() {
     // Every serialized Filter2 XPath inherits the signature prefix binding. The
     // builder must charge those bindings before signing reparses its template.

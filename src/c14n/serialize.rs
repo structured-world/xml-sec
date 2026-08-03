@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::ops::{Deref, DerefMut};
+use std::io::{self, Write};
 
 use roxmltree::{Document, Node, NodeId, NodeType};
 
@@ -16,6 +16,27 @@ use super::prefix::{attribute_prefix, element_prefix};
 use super::xml_base::{compute_effective_xml_base, preserves_xml_base_context, resolve_uri};
 use super::{C14nError, NodeVisibility};
 
+#[derive(Debug)]
+pub(super) struct CanonicalOutputLimitExceeded {
+    max_bytes: usize,
+}
+
+impl std::fmt::Display for CanonicalOutputLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "canonical output exceeds maximum of {} bytes",
+            self.max_bytes
+        )
+    }
+}
+
+impl std::error::Error for CanonicalOutputLimitExceeded {}
+
+fn output_limit_error(max_bytes: usize) -> C14nError {
+    C14nError::Io(io::Error::other(CanonicalOutputLimitExceeded { max_bytes }))
+}
+
 /// The XML namespace URI.
 ///
 /// In inclusive C14N document subsets, `xml:lang` and `xml:space` are simple
@@ -25,21 +46,28 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
 struct CanonicalOutput<'a> {
     bytes: &'a mut Vec<u8>,
+    max_len: Option<usize>,
+    limit_exceeded: bool,
     tracked_element: Option<NodeId>,
     tracked_position: Option<usize>,
 }
 
-impl Deref for CanonicalOutput<'_> {
-    type Target = Vec<u8>;
-
-    fn deref(&self) -> &Self::Target {
-        self.bytes
+impl Write for CanonicalOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next_len = self.bytes.len().checked_add(bytes.len());
+        if self
+            .max_len
+            .is_some_and(|max_len| next_len.is_none_or(|next_len| next_len > max_len))
+        {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("canonical output limit exceeded"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
     }
-}
 
-impl DerefMut for CanonicalOutput<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.bytes
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -67,6 +95,28 @@ pub(crate) struct C14nConfig {
     pub inherit_xml_attrs: bool,
     /// Resolve relative xml:base URIs via RFC 3986 (C14N 1.1 only).
     pub fixup_xml_base: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CanonicalOutputOptions {
+    tracked_element: Option<NodeId>,
+    max_output_bytes: Option<usize>,
+}
+
+impl CanonicalOutputOptions {
+    pub(crate) fn unbounded(tracked_element: Option<NodeId>) -> Self {
+        Self {
+            tracked_element,
+            max_output_bytes: None,
+        }
+    }
+
+    pub(crate) fn bounded(tracked_element: Option<NodeId>, max_output_bytes: usize) -> Self {
+        Self {
+            tracked_element,
+            max_output_bytes: Some(max_output_bytes),
+        }
+    }
 }
 
 /// Trait for namespace rendering strategies (inclusive vs exclusive).
@@ -134,13 +184,44 @@ pub(crate) fn serialize_canonical_visible_with_position(
     tracked_element: Option<NodeId>,
     output: &mut Vec<u8>,
 ) -> Result<Option<usize>, C14nError> {
+    serialize_canonical_visible_with_position_bounded(
+        doc,
+        visibility,
+        with_comments,
+        ns_renderer,
+        config,
+        CanonicalOutputOptions::unbounded(tracked_element),
+        output,
+    )
+}
+
+pub(crate) fn serialize_canonical_visible_with_position_bounded(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    with_comments: bool,
+    ns_renderer: &dyn NsRenderer,
+    config: C14nConfig,
+    options: CanonicalOutputOptions,
+    output: &mut Vec<u8>,
+) -> Result<Option<usize>, C14nError> {
     let root = doc.root();
+    let max_len = match options.max_output_bytes {
+        Some(limit) => Some(
+            output
+                .len()
+                .checked_add(limit)
+                .ok_or_else(|| output_limit_error(limit))?,
+        ),
+        None => None,
+    };
     let mut output = CanonicalOutput {
         bytes: output,
-        tracked_element,
+        max_len,
+        limit_exceeded: false,
+        tracked_element: options.tracked_element,
         tracked_position: None,
     };
-    serialize_children(
+    let result = serialize_children(
         root,
         visibility,
         with_comments,
@@ -149,6 +230,12 @@ pub(crate) fn serialize_canonical_visible_with_position(
         &HashMap::new(),
         &mut output,
     );
+    if output.limit_exceeded {
+        return Err(output_limit_error(
+            options.max_output_bytes.unwrap_or(usize::MAX),
+        ));
+    }
+    result?;
     Ok(output.tracked_position)
 }
 
@@ -161,7 +248,7 @@ fn serialize_children(
     config: C14nConfig,
     parent_rendered: &HashMap<String, String>,
     output: &mut CanonicalOutput<'_>,
-) {
+) -> Result<(), C14nError> {
     let is_doc_root = parent.node_type() == NodeType::Root;
 
     for child in parent.children() {
@@ -179,7 +266,7 @@ fn serialize_children(
                         config,
                         parent_rendered,
                         output,
-                    );
+                    )?;
                 } else {
                     // Canonical XML §2.3 processes selected namespace and
                     // attribute axes even when their owner is omitted; only
@@ -192,7 +279,7 @@ fn serialize_children(
                         ns_renderer,
                         parent_rendered,
                         output,
-                    );
+                    )?;
                     // Element not in set, but descendants might be — walk children.
                     serialize_children(
                         child,
@@ -202,7 +289,7 @@ fn serialize_children(
                         config,
                         parent_rendered,
                         output,
-                    );
+                    )?;
                 }
             }
             NodeType::Text => {
@@ -210,7 +297,7 @@ fn serialize_children(
                     // Document-level text nodes are ignored by C14N.
                     // Only text inside elements is serialized.
                     if !is_doc_root && let Some(text) = child.text() {
-                        escape_text(text, output);
+                        escape_text(text, output)?;
                     }
                 }
             }
@@ -218,30 +305,30 @@ fn serialize_children(
                 if with_comments && in_set {
                     let follows_document_element =
                         is_doc_root && has_preceding_element_sibling(&child);
-                    write_doc_level_prefix(is_doc_root, follows_document_element, output);
-                    output.extend_from_slice(b"<!--");
+                    write_doc_level_prefix(is_doc_root, follows_document_element, output)?;
+                    output.write_all(b"<!--")?;
                     if let Some(text) = child.text() {
                         // C14N spec: \r in comments must be escaped to &#xD;
-                        escape_cr(text, output);
+                        escape_cr(text, output)?;
                     }
-                    output.extend_from_slice(b"-->");
-                    write_doc_level_suffix(is_doc_root, follows_document_element, output);
+                    output.write_all(b"-->")?;
+                    write_doc_level_suffix(is_doc_root, follows_document_element, output)?;
                 }
             }
             NodeType::PI => {
                 if in_set && let Some(pi) = child.pi() {
                     let follows_document_element =
                         is_doc_root && has_preceding_element_sibling(&child);
-                    write_doc_level_prefix(is_doc_root, follows_document_element, output);
-                    output.extend_from_slice(b"<?");
-                    output.extend_from_slice(pi.target.as_bytes());
+                    write_doc_level_prefix(is_doc_root, follows_document_element, output)?;
+                    output.write_all(b"<?")?;
+                    output.write_all(pi.target.as_bytes())?;
                     if let Some(value) = pi.value {
-                        output.push(b' ');
+                        output.write_all(b" ")?;
                         // C14N spec: \r in PI content must be escaped to &#xD;
-                        escape_cr(value, output);
+                        escape_cr(value, output)?;
                     }
-                    output.extend_from_slice(b"?>");
-                    write_doc_level_suffix(is_doc_root, follows_document_element, output);
+                    output.write_all(b"?>")?;
+                    write_doc_level_suffix(is_doc_root, follows_document_element, output)?;
                 }
             }
             NodeType::Root => {
@@ -249,6 +336,7 @@ fn serialize_children(
             }
         }
     }
+    Ok(())
 }
 
 fn serialize_selected_axes_of_omitted_element(
@@ -256,10 +344,10 @@ fn serialize_selected_axes_of_omitted_element(
     visibility: Option<&dyn NodeVisibility>,
     ns_renderer: &dyn NsRenderer,
     parent_rendered: &HashMap<String, String>,
-    output: &mut Vec<u8>,
-) {
+    output: &mut CanonicalOutput<'_>,
+) -> Result<(), C14nError> {
     let Some(visibility) = visibility else {
-        return;
+        return Ok(());
     };
 
     let mut namespaces = owner
@@ -276,14 +364,14 @@ fn serialize_selected_axes_of_omitted_element(
     namespaces.sort_by_key(|(prefix, _)| *prefix);
     for (prefix, uri) in namespaces {
         if prefix.is_empty() {
-            output.extend_from_slice(b" xmlns=\"");
+            output.write_all(b" xmlns=\"")?;
         } else {
-            output.extend_from_slice(b" xmlns:");
-            output.extend_from_slice(prefix.as_bytes());
-            output.extend_from_slice(b"=\"");
+            output.write_all(b" xmlns:")?;
+            output.write_all(prefix.as_bytes())?;
+            output.write_all(b"=\"")?;
         }
-        escape_attr(uri, output);
-        output.push(b'"');
+        escape_attr(uri, output)?;
+        output.write_all(b"\"")?;
     }
 
     let mut attributes = owner
@@ -297,17 +385,18 @@ fn serialize_selected_axes_of_omitted_element(
             .cmp(&(right.namespace().unwrap_or(""), right.name()))
     });
     for attribute in attributes {
-        output.push(b' ');
+        output.write_all(b" ")?;
         let prefix = attribute_prefix(owner, &attribute);
         if !prefix.is_empty() {
-            output.extend_from_slice(prefix.as_bytes());
-            output.push(b':');
+            output.write_all(prefix.as_bytes())?;
+            output.write_all(b":")?;
         }
-        output.extend_from_slice(attribute.name().as_bytes());
-        output.extend_from_slice(b"=\"");
-        escape_attr(attribute.value(), output);
-        output.push(b'"');
+        output.write_all(attribute.name().as_bytes())?;
+        output.write_all(b"=\"")?;
+        escape_attr(attribute.value(), output)?;
+        output.write_all(b"\"")?;
     }
+    Ok(())
 }
 
 /// Serialize a single element node (start tag + children + end tag).
@@ -319,25 +408,25 @@ fn serialize_element(
     config: C14nConfig,
     parent_rendered: &HashMap<String, String>,
     output: &mut CanonicalOutput<'_>,
-) {
+) -> Result<(), C14nError> {
     let (ns_decls, rendered) = ns_renderer.render_namespaces(node, parent_rendered, visibility);
 
     // Start tag: <prefix:localname
     output.track(node);
-    output.push(b'<');
-    write_qualified_name(node, output);
+    output.write_all(b"<")?;
+    write_qualified_name(node, output)?;
 
     // Namespace declarations (already sorted by prefix).
     for (prefix, uri) in &ns_decls {
         if prefix.is_empty() {
-            output.extend_from_slice(b" xmlns=\"");
+            output.write_all(b" xmlns=\"")?;
         } else {
-            output.extend_from_slice(b" xmlns:");
-            output.extend_from_slice(prefix.as_bytes());
-            output.extend_from_slice(b"=\"");
+            output.write_all(b" xmlns:")?;
+            output.write_all(prefix.as_bytes())?;
+            output.write_all(b"=\"")?;
         }
-        escape_attr(uri, output);
-        output.push(b'"');
+        escape_attr(uri, output)?;
+        output.write_all(b"\"")?;
     }
 
     // Regular attributes, sorted by (namespace-uri, local-name).
@@ -424,19 +513,19 @@ fn serialize_element(
     all_attrs.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
 
     for (_, local_name, prefix, value) in &all_attrs {
-        output.push(b' ');
+        output.write_all(b" ")?;
         if !prefix.is_empty() {
-            output.extend_from_slice(prefix.as_bytes());
-            output.push(b':');
+            output.write_all(prefix.as_bytes())?;
+            output.write_all(b":")?;
         }
-        output.extend_from_slice(local_name.as_bytes());
-        output.extend_from_slice(b"=\"");
-        escape_attr(value, output);
-        output.push(b'"');
+        output.write_all(local_name.as_bytes())?;
+        output.write_all(b"=\"")?;
+        escape_attr(value, output)?;
+        output.write_all(b"\"")?;
     }
 
     // Always use <tag></tag> form, never self-closing.
-    output.push(b'>');
+    output.write_all(b">")?;
 
     // Children.
     serialize_children(
@@ -447,26 +536,37 @@ fn serialize_element(
         config,
         &rendered,
         output,
-    );
+    )?;
 
     // End tag.
-    output.extend_from_slice(b"</");
-    write_qualified_name(node, output);
-    output.push(b'>');
+    output.write_all(b"</")?;
+    write_qualified_name(node, output)?;
+    output.write_all(b">")?;
+    Ok(())
 }
 
 /// Emit the separator preceding a document-level comment or PI.
-fn write_doc_level_prefix(is_doc_root: bool, follows_document_element: bool, output: &mut Vec<u8>) {
+fn write_doc_level_prefix(
+    is_doc_root: bool,
+    follows_document_element: bool,
+    output: &mut CanonicalOutput<'_>,
+) -> io::Result<()> {
     if is_doc_root && follows_document_element {
-        output.push(b'\n');
+        output.write_all(b"\n")?;
     }
+    Ok(())
 }
 
 /// Emit the separator following a document-level comment or PI.
-fn write_doc_level_suffix(is_doc_root: bool, follows_document_element: bool, output: &mut Vec<u8>) {
+fn write_doc_level_suffix(
+    is_doc_root: bool,
+    follows_document_element: bool,
+    output: &mut CanonicalOutput<'_>,
+) -> io::Result<()> {
     if is_doc_root && !follows_document_element {
-        output.push(b'\n');
+        output.write_all(b"\n")?;
     }
+    Ok(())
 }
 
 /// Check if a node has a preceding sibling that is an element.
@@ -573,13 +673,14 @@ fn collect_inherited_xml_attrs<'a>(
 ///
 /// Extracts the lexical prefix from the source XML via byte-range positions,
 /// avoiding ambiguity when multiple prefixes bind the same namespace URI.
-fn write_qualified_name(node: Node, output: &mut Vec<u8>) {
+fn write_qualified_name(node: Node, output: &mut CanonicalOutput<'_>) -> io::Result<()> {
     let prefix = element_prefix(node);
     if !prefix.is_empty() {
-        output.extend_from_slice(prefix.as_bytes());
-        output.push(b':');
+        output.write_all(prefix.as_bytes())?;
+        output.write_all(b":")?;
     }
-    output.extend_from_slice(node.tag_name().name().as_bytes());
+    output.write_all(node.tag_name().name().as_bytes())?;
+    Ok(())
 }
 
 #[cfg(test)]

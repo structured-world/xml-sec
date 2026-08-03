@@ -33,7 +33,8 @@ use super::parse::{
 };
 use super::transforms::{
     Transform, TransformExecutionBudget, TransformOptions, XPathHereSemantics,
-    execute_transforms_with_options_and_budget, parse_transforms,
+    XPathSignatureParseBudget, execute_transforms_with_options_and_budget,
+    parse_transforms_with_budget,
 };
 use super::types::TransformError;
 use super::uri::UriReferenceResolver;
@@ -673,6 +674,7 @@ fn parse_signing_references(
     required_algorithm_attr(signature_method_node, "SignatureMethod")?;
 
     let mut references = Vec::new();
+    let mut xpath_budget = XPathSignatureParseBudget::default();
     for child in children {
         verify_ds_element(child, "Reference")?;
         if references.len() == MAX_REFERENCES_PER_SIGNATURE {
@@ -680,7 +682,7 @@ fn parse_signing_references(
                 "SignedInfo contains more than {MAX_REFERENCES_PER_SIGNATURE} Reference elements"
             )));
         }
-        references.push(parse_signing_reference(child)?);
+        references.push(parse_signing_reference(child, &mut xpath_budget)?);
     }
     if references.is_empty() {
         return Err(SigningDigestError::MissingElement {
@@ -692,6 +694,7 @@ fn parse_signing_references(
 
 fn parse_signing_reference(
     reference_node: Node<'_, '_>,
+    xpath_budget: &mut XPathSignatureParseBudget,
 ) -> Result<SigningReference, SigningDigestError> {
     let uri = reference_node
         .attribute("URI")
@@ -708,7 +711,7 @@ fn parse_signing_reference(
         element: "DigestMethod",
     })?;
     if next.tag_name().name() == "Transforms" && next.tag_name().namespace() == Some(XMLDSIG_NS) {
-        transforms = parse_transforms(next)?;
+        transforms = parse_transforms_with_budget(next, xpath_budget)?;
         next = children.next().ok_or(SigningDigestError::MissingElement {
             element: "DigestMethod",
         })?;

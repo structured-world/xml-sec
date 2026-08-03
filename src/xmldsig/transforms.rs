@@ -58,6 +58,11 @@ pub const MAX_TRANSFORMS_PER_REFERENCE: usize = 64;
 const ENVELOPED_SIGNATURE_XPATH_EXPR: &str = "not(ancestor-or-self::dsig:Signature)";
 pub(super) const MAX_XPATH_EXPRESSION_BYTES: usize = 16 * 1024;
 pub(super) const MAX_XPATH_FILTERS: usize = 64;
+/// Maximum XPath programs retained and compiled while parsing one SignedInfo.
+///
+/// Per-reference bounds remain necessary for transform shape, while this bound
+/// prevents their multiplication across all references in one signature.
+pub(super) const MAX_XPATH_EXPRESSIONS_PER_SIGNATURE: usize = 4_096;
 const MAX_XPATH_NAMESPACE_BINDINGS: usize = 1_024;
 const MAX_XPATH_NAMESPACE_BYTES: usize = 64 * 1024;
 const MAX_BASE64_TRANSFORM_INPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -120,6 +125,10 @@ impl Default for C14nOutputBudget {
 }
 
 impl C14nOutputBudget {
+    fn remaining(&self) -> usize {
+        self.remaining.get()
+    }
+
     fn charge(&self, bytes: usize) -> Result<(), TransformError> {
         if !charge_byte_budget(&self.remaining, bytes) {
             return Err(TransformError::C14nOutputTooLarge {
@@ -156,6 +165,16 @@ impl TransformExecutionBudget {
             xpath: XPathWorkBudget::with_limit(limit),
             base64: Base64WorkBudget::default(),
             c14n: C14nOutputBudget::default(),
+        }
+    }
+
+    fn with_c14n_limit(limit: usize) -> Self {
+        Self {
+            xpath: XPathWorkBudget::default(),
+            base64: Base64WorkBudget::default(),
+            c14n: C14nOutputBudget {
+                remaining: Cell::new(limit),
+            },
         }
     }
 }
@@ -481,7 +500,16 @@ fn apply_transform_with_options_and_state<'s, 'd>(
         Transform::C14n(algo) => {
             let nodes = input.into_node_set()?;
             let mut output = Vec::new();
-            c14n::canonicalize_with_visibility(nodes.document(), Some(&nodes), algo, &mut output)?;
+            c14n::canonicalize_with_visibility_and_position_bounded(
+                nodes.document(),
+                Some(&nodes),
+                algo,
+                None,
+                budget.c14n.remaining(),
+                &mut output,
+            )
+            .map_err(map_c14n_limit_error)?;
+            budget.c14n.charge(output.len())?;
             Ok(TransformData::Binary(output))
         }
         Transform::Base64Decode => {
@@ -730,13 +758,15 @@ fn execute_transform_chain<'s, 'e, 'd>(
             .filter(|signature| nodes.contains(*signature))
             .map(|signature| signature.id());
         let mut output = Vec::new();
-        let position = c14n::canonicalize_with_visibility_and_position(
+        let position = c14n::canonicalize_with_visibility_and_position_bounded(
             nodes.document(),
             Some(nodes),
             algo,
             tracked_element,
+            context.budget.c14n.remaining(),
             &mut output,
-        )?;
+        )
+        .map_err(map_c14n_limit_error)?;
         context.budget.c14n.charge(output.len())?;
         return execute_transform_chain(
             source_signature,
@@ -843,10 +873,28 @@ fn finalize_transform_data(
             let algo = C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI)
                 .expect("default C14N algorithm URI must be supported by C14nAlgorithm::from_uri");
             let mut output = Vec::new();
-            c14n::canonicalize_with_visibility(nodes.document(), Some(&nodes), &algo, &mut output)?;
+            c14n::canonicalize_with_visibility_and_position_bounded(
+                nodes.document(),
+                Some(&nodes),
+                &algo,
+                None,
+                c14n_budget.remaining(),
+                &mut output,
+            )
+            .map_err(map_c14n_limit_error)?;
             c14n_budget.charge(output.len())?;
             Ok(output)
         }
+    }
+}
+
+fn map_c14n_limit_error(error: c14n::C14nError) -> TransformError {
+    if c14n::is_output_limit_error(&error) {
+        TransformError::C14nOutputTooLarge {
+            max_bytes: MAX_C14N_OUTPUT_BYTES,
+        }
+    } else {
+        TransformError::C14n(error)
     }
 }
 
@@ -859,6 +907,13 @@ fn finalize_transform_data(
 /// For Exclusive C14N, also parses the optional `<InclusiveNamespaces
 /// PrefixList="...">` child element.
 pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, TransformError> {
+    parse_transforms_with_budget(transforms_node, &mut XPathSignatureParseBudget::default())
+}
+
+pub(crate) fn parse_transforms_with_budget(
+    transforms_node: Node,
+    signature_budget: &mut XPathSignatureParseBudget,
+) -> Result<Vec<Transform>, TransformError> {
     // Validate that we received a <ds:Transforms> element.
     if !transforms_node.is_element() {
         return Err(TransformError::UnsupportedTransform(
@@ -873,7 +928,7 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
     }
 
     let mut chain = Vec::new();
-    let mut xpath_state = XPathParseState::default();
+    let mut xpath_state = XPathParseState::new(signature_budget);
 
     for child in transforms_node.children() {
         if !child.is_element() {
@@ -943,7 +998,10 @@ fn validate_empty_transform(
 
 #[cfg(test)]
 pub(super) fn parse_xpath_transform(transform_node: Node) -> Result<Transform, TransformError> {
-    parse_xpath_transform_with_state(transform_node, &mut XPathParseState::default())
+    parse_xpath_transform_with_state(
+        transform_node,
+        &mut XPathParseState::new(&mut XPathSignatureParseBudget::default()),
+    )
 }
 
 fn parse_xpath_transform_with_state(
@@ -1085,6 +1143,7 @@ fn parse_xpath_expression(
             "XPath expression must not be empty".into(),
         ));
     }
+    xpath_state.signature_budget.charge()?;
     compile_xpath(source).map_err(TransformError::XPath)?;
 
     let mut xpath = XPathExpression {
@@ -1112,17 +1171,47 @@ fn parse_xpath_expression(
     Ok(xpath)
 }
 
-#[derive(Default)]
-struct XPathParseState {
+struct XPathParseState<'a> {
     namespace_budget: XPathNamespaceBudget,
     document_identity: Option<XPathDocumentIdentity>,
+    signature_budget: &'a mut XPathSignatureParseBudget,
 }
 
-impl XPathParseState {
+impl<'a> XPathParseState<'a> {
+    fn new(signature_budget: &'a mut XPathSignatureParseBudget) -> Self {
+        Self {
+            namespace_budget: XPathNamespaceBudget::default(),
+            document_identity: None,
+            signature_budget,
+        }
+    }
+
     fn document_identity(&mut self, document: &Document<'_>) -> XPathDocumentIdentity {
         *self
             .document_identity
             .get_or_insert_with(|| XPathDocumentIdentity::from_document(document))
+    }
+}
+
+#[derive(Default)]
+/// Parser state shared by every Reference in one SignedInfo.
+pub(crate) struct XPathSignatureParseBudget {
+    expressions: usize,
+}
+
+impl XPathSignatureParseBudget {
+    pub(crate) fn charge(&mut self) -> Result<(), TransformError> {
+        self.expressions = self.expressions.checked_add(1).ok_or_else(Self::error)?;
+        if self.expressions > MAX_XPATH_EXPRESSIONS_PER_SIGNATURE {
+            return Err(Self::error());
+        }
+        Ok(())
+    }
+
+    fn error() -> TransformError {
+        TransformError::XPath(format!(
+            "signature-wide XPath expression budget exceeds {MAX_XPATH_EXPRESSIONS_PER_SIGNATURE} entries"
+        ))
     }
 }
 
@@ -1586,6 +1675,37 @@ mod tests {
                 max_bytes: MAX_C14N_OUTPUT_BYTES
             })
         ));
+    }
+
+    #[test]
+    fn explicit_and_implicit_c14n_stop_at_the_execution_ceiling() {
+        // Both routes must use the bounded serializer. A post-serialization
+        // charge would return the same error but only after retaining all bytes.
+        let xml = format!("<root>{}</root>", "x".repeat(4_096));
+        let document = Document::parse(&xml).unwrap();
+        let nodes = || {
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&document).unwrap())
+        };
+        let algorithm =
+            C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315").unwrap();
+
+        for transforms in [&[][..], &[Transform::C14n(algorithm)][..]] {
+            let error = execute_transforms_with_options_and_budget(
+                document.root_element(),
+                nodes(),
+                transforms,
+                TransformOptions::default(),
+                &TransformExecutionBudget::with_c14n_limit(64),
+            )
+            .expect_err("canonicalization must stop at the execution ceiling");
+
+            assert!(matches!(
+                error,
+                TransformError::C14nOutputTooLarge {
+                    max_bytes: MAX_C14N_OUTPUT_BYTES
+                }
+            ));
+        }
     }
 
     #[test]

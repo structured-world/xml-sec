@@ -331,6 +331,34 @@ fn validates_reference_elements_before_reporting_the_cardinality_limit() {
 }
 
 #[test]
+fn signing_template_bounds_xpath_expressions_across_references() {
+    // Signing has a dedicated template parser because DigestValue may be empty.
+    // It must share the verifier/parser aggregate XPath contract rather than
+    // resetting the budget for each Reference.
+    let filters = r#"<XPath xmlns="http://www.w3.org/2002/06/xmldsig-filter2" Filter="intersect">true()</XPath>"#
+        .repeat(64);
+    let filter_transform = format!(
+        r#"<Transform Algorithm="http://www.w3.org/2002/06/xmldsig-filter2">{filters}</Transform>"#
+    );
+    let max_transforms = filter_transform.repeat(64);
+    let references = format!(
+        r##"<Reference URI="#item-0"><Transforms>{max_transforms}</Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference><Reference URI="#item-1"><Transforms><Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><XPath>true()</XPath></Transform></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference>"##
+    );
+    let xml = format!(
+        r#"<root><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>{references}</SignedInfo><SignatureValue/></Signature></root>"#
+    );
+
+    let error = compute_reference_digest_values(&xml)
+        .expect_err("signing parser must enforce the signature-wide XPath budget");
+
+    assert!(
+        error
+            .to_string()
+            .contains("signature-wide XPath expression budget")
+    );
+}
+
+#[test]
 fn rejects_sha1_digest_for_signing_template() {
     // SHA-1 remains verify-only. This manually crafted template bypasses the
     // builder, so the digest pass must enforce the same policy before signing.

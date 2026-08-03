@@ -10,7 +10,8 @@ use crate::xml::is_xml_1_0_character;
 
 use super::parse::MAX_REFERENCES_PER_SIGNATURE;
 use super::transforms::{
-    MAX_TRANSFORMS_PER_REFERENCE, MAX_XPATH_FILTERS, validate_xpath_namespace_budget,
+    MAX_TRANSFORMS_PER_REFERENCE, MAX_XPATH_FILTERS, XPathSignatureParseBudget,
+    validate_xpath_namespace_budget,
 };
 use super::xpath::compile_xpath;
 use super::{
@@ -256,6 +257,7 @@ impl SignatureBuilder {
                 max: MAX_REFERENCES_PER_SIGNATURE,
             });
         }
+        let mut xpath_signature_budget = XPathSignatureParseBudget::default();
         for reference in &self.references {
             if reference.transforms.len() > MAX_TRANSFORMS_PER_REFERENCE {
                 return Err(SignatureBuilderError::TooManyTransforms {
@@ -267,6 +269,9 @@ impl SignatureBuilder {
                 match transform {
                     Transform::XPath(xpath) => {
                         validate_xpath_source(xpath.expression())?;
+                        xpath_signature_budget.charge().map_err(|error| {
+                            SignatureBuilderError::InvalidXPath(error.to_string())
+                        })?;
                     }
                     Transform::XPathFilter2(filters) => {
                         if filters.is_empty() || filters.len() > MAX_XPATH_FILTERS {
@@ -277,6 +282,9 @@ impl SignatureBuilder {
                         }
                         for filter in filters {
                             validate_xpath_source(filter.xpath().expression())?;
+                            xpath_signature_budget.charge().map_err(|error| {
+                                SignatureBuilderError::InvalidXPath(error.to_string())
+                            })?;
                         }
                     }
                     _ => {}
