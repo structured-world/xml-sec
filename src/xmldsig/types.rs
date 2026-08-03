@@ -5,6 +5,7 @@
 //! These types are consumed by URI dereference, the transform chain (P1-014,
 //! P1-015), and reference processing (P1-018).
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
 
@@ -12,6 +13,7 @@ use roxmltree::{Document, Node, NodeId};
 
 const MAX_NODE_SET_ENTRIES: usize = 65_536;
 const MAX_NODE_SET_OWNED_STRING_BYTES: usize = 8 * 1024 * 1024;
+const MAX_NODE_SET_CUMULATIVE_OWNED_STRING_BYTES: usize = 64 * 1024 * 1024;
 
 use crate::c14n::NodeVisibility;
 
@@ -95,6 +97,42 @@ enum XmlNodeKey {
     },
 }
 
+pub(crate) struct NodeSetMaterializationBudget {
+    remaining_owned_string_bytes: Cell<usize>,
+}
+
+impl Default for NodeSetMaterializationBudget {
+    fn default() -> Self {
+        Self {
+            remaining_owned_string_bytes: Cell::new(MAX_NODE_SET_CUMULATIVE_OWNED_STRING_BYTES),
+        }
+    }
+}
+
+impl NodeSetMaterializationBudget {
+    fn charge(&self, owned_string_bytes: usize) -> Result<(), TransformError> {
+        let Some(remaining) = self
+            .remaining_owned_string_bytes
+            .get()
+            .checked_sub(owned_string_bytes)
+        else {
+            self.remaining_owned_string_bytes.set(0);
+            return Err(TransformError::NodeSetCumulativeStringsTooLarge {
+                max_bytes: MAX_NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
+            });
+        };
+        self.remaining_owned_string_bytes.set(remaining);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limit(limit: usize) -> Self {
+        Self {
+            remaining_owned_string_bytes: Cell::new(limit),
+        }
+    }
+}
+
 impl XmlNodeKey {
     fn owner_id(&self) -> NodeId {
         match self {
@@ -120,6 +158,14 @@ impl<'a> NodeSet<'a> {
         Ok(Self::collect_document(doc, false))
     }
 
+    pub(crate) fn entire_document_without_comments_with_budget(
+        doc: &'a Document<'a>,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<Self, TransformError> {
+        Self::charge_subtree_materialization(doc.root(), budget)?;
+        Ok(Self::collect_document(doc, false))
+    }
+
     /// Create a node set representing the entire document with comments.
     ///
     /// Used for `#xpointer(/)` which, unlike empty URI, includes comment nodes.
@@ -134,6 +180,14 @@ impl<'a> NodeSet<'a> {
         Ok(Self::collect_document(doc, true))
     }
 
+    pub(crate) fn entire_document_with_comments_with_budget(
+        doc: &'a Document<'a>,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<Self, TransformError> {
+        Self::charge_subtree_materialization(doc.root(), budget)?;
+        Ok(Self::collect_document(doc, true))
+    }
+
     /// Create a node set rooted at `element`, containing that element and all
     /// of its descendant nodes (elements, text, and, for this constructor,
     /// comment nodes).
@@ -145,13 +199,25 @@ impl<'a> NodeSet<'a> {
     /// tree, attribute, namespace, or owned string data would exceed its budget.
     pub fn subtree(element: Node<'a, 'a>) -> Result<Self, TransformError> {
         Self::ensure_subtree_materialization_fits(element)?;
+        Ok(Self::collect_subtree(element))
+    }
+
+    pub(crate) fn subtree_with_budget(
+        element: Node<'a, 'a>,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<Self, TransformError> {
+        Self::charge_subtree_materialization(element, budget)?;
+        Ok(Self::collect_subtree(element))
+    }
+
+    fn collect_subtree(element: Node<'a, 'a>) -> Self {
         let mut set = Self {
             doc: element.document(),
             nodes: HashSet::new(),
             with_comments: true,
         };
         set.insert_subtree(element);
-        Ok(set)
+        set
     }
 
     /// Reference to the underlying document.
@@ -204,8 +270,16 @@ impl<'a> NodeSet<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn try_entire_document(doc: &'a Document<'a>) -> Result<Self, TransformError> {
         Self::entire_document_with_comments(doc)
+    }
+
+    pub(crate) fn try_entire_document_with_budget(
+        doc: &'a Document<'a>,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<Self, TransformError> {
+        Self::entire_document_with_comments_with_budget(doc, budget)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -234,6 +308,26 @@ impl<'a> NodeSet<'a> {
         }
     }
 
+    pub(crate) fn insert_attribute_with_budget(
+        &mut self,
+        owner: Node<'_, '_>,
+        namespace: Option<&str>,
+        local_name: &str,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<(), TransformError> {
+        if self.owns(owner) {
+            let owned_string_bytes = namespace
+                .map_or(0, str::len)
+                .checked_add(local_name.len())
+                .ok_or(TransformError::NodeSetStringsTooLarge {
+                    max_bytes: MAX_NODE_SET_OWNED_STRING_BYTES,
+                })?;
+            budget.charge(owned_string_bytes)?;
+            self.insert_attribute(owner, namespace, local_name);
+        }
+        Ok(())
+    }
+
     pub(crate) fn insert_namespace(&mut self, owner: Node<'_, '_>, prefix: &str, uri: &str) {
         if self.owns(owner) {
             self.nodes.insert(XmlNodeKey::Namespace {
@@ -242,6 +336,25 @@ impl<'a> NodeSet<'a> {
                 uri: uri.to_owned(),
             });
         }
+    }
+
+    pub(crate) fn insert_namespace_with_budget(
+        &mut self,
+        owner: Node<'_, '_>,
+        prefix: &str,
+        uri: &str,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<(), TransformError> {
+        if self.owns(owner) {
+            let owned_string_bytes = prefix.len().checked_add(uri.len()).ok_or(
+                TransformError::NodeSetStringsTooLarge {
+                    max_bytes: MAX_NODE_SET_OWNED_STRING_BYTES,
+                },
+            )?;
+            budget.charge(owned_string_bytes)?;
+            self.insert_namespace(owner, prefix, uri);
+        }
+        Ok(())
     }
 
     pub(crate) fn insert_subtree(&mut self, root: Node<'_, '_>) {
@@ -279,11 +392,31 @@ impl<'a> NodeSet<'a> {
         }
     }
 
-    pub(crate) fn union_with(&mut self, other: &Self) {
+    pub(crate) fn union_with_budget(
+        &mut self,
+        other: &Self,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<(), TransformError> {
         if std::ptr::eq(self.doc as *const _, other.doc as *const _) {
-            self.nodes.extend(other.nodes.iter().cloned());
+            for key in &other.nodes {
+                if self.nodes.contains(key) {
+                    continue;
+                }
+                let owned_string_bytes = match key {
+                    XmlNodeKey::Tree(_) => 0,
+                    XmlNodeKey::Attribute {
+                        namespace,
+                        local_name,
+                        ..
+                    } => namespace.as_ref().map_or(0, String::len) + local_name.len(),
+                    XmlNodeKey::Namespace { prefix, uri, .. } => prefix.len() + uri.len(),
+                };
+                budget.charge(owned_string_bytes)?;
+                self.nodes.insert(key.clone());
+            }
             self.with_comments |= other.with_comments;
         }
+        Ok(())
     }
 
     fn collect_document(doc: &'a Document<'a>, with_comments: bool) -> Self {
@@ -302,6 +435,20 @@ impl<'a> NodeSet<'a> {
     pub(crate) fn ensure_subtree_materialization_fits(
         root: Node<'_, '_>,
     ) -> Result<usize, TransformError> {
+        Ok(Self::subtree_materialization(root)?.entries)
+    }
+
+    fn charge_subtree_materialization(
+        root: Node<'_, '_>,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<(), TransformError> {
+        let materialization = Self::subtree_materialization(root)?;
+        budget.charge(materialization.owned_string_bytes)
+    }
+
+    fn subtree_materialization(
+        root: Node<'_, '_>,
+    ) -> Result<NodeSetMaterialization, TransformError> {
         let mut entries = 0_usize;
         let mut owned_string_bytes = 0_usize;
         let mut stack = vec![root];
@@ -344,12 +491,20 @@ impl<'a> NodeSet<'a> {
             }
             stack.extend(node.children());
         }
-        Ok(entries)
+        Ok(NodeSetMaterialization {
+            entries,
+            owned_string_bytes,
+        })
     }
 
     fn owns(&self, node: Node<'_, '_>) -> bool {
         std::ptr::eq(node.document() as *const _, self.doc as *const _)
     }
+}
+
+struct NodeSetMaterialization {
+    entries: usize,
+    owned_string_bytes: usize,
 }
 
 fn charge_node_set_string_bytes(
@@ -449,6 +604,15 @@ pub enum TransformError {
     #[error("node-set materialization exceeds maximum of {max_bytes} owned string bytes")]
     NodeSetStringsTooLarge {
         /// Maximum string bytes cloned into one exact XPath node projection.
+        max_bytes: usize,
+    },
+
+    /// Repeated node-set projections would cumulatively clone too many strings.
+    #[error(
+        "node-set materialization exceeds signature-wide maximum of {max_bytes} cumulative owned string bytes"
+    )]
+    NodeSetCumulativeStringsTooLarge {
+        /// Maximum owned string bytes cloned across one signature execution.
         max_bytes: usize,
     },
 

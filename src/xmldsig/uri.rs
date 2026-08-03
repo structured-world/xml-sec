@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use roxmltree::{Document, Node, NodeId};
 
-use super::types::{NodeSet, TransformData, TransformError};
+use super::types::{NodeSet, NodeSetMaterializationBudget, TransformData, TransformError};
 
 /// Default ID attribute names to scan when building the ID index.
 ///
@@ -132,19 +132,39 @@ impl<'a> UriReferenceResolver<'a> {
     /// | `"#xpointer(id('foo'))"` | Subtree rooted at element with ID `foo` |
     /// | other | `Err(UnsupportedUri)` |
     pub fn dereference(&self, uri: &str) -> Result<TransformData<'a>, TransformError> {
+        self.dereference_with_optional_budget(uri, None)
+    }
+
+    pub(crate) fn dereference_with_budget(
+        &self,
+        uri: &str,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<TransformData<'a>, TransformError> {
+        self.dereference_with_optional_budget(uri, Some(budget))
+    }
+
+    fn dereference_with_optional_budget(
+        &self,
+        uri: &str,
+        budget: Option<&NodeSetMaterializationBudget>,
+    ) -> Result<TransformData<'a>, TransformError> {
         if uri.is_empty() {
             // Empty URI = entire document without comments
             // XMLDSig §4.3.3.2: "the reference is to the document [...],
             // and the comment nodes are not included"
-            Ok(TransformData::NodeSet(
-                NodeSet::entire_document_without_comments(self.doc)?,
-            ))
+            let nodes = match budget {
+                Some(budget) => {
+                    NodeSet::entire_document_without_comments_with_budget(self.doc, budget)?
+                }
+                None => NodeSet::entire_document_without_comments(self.doc)?,
+            };
+            Ok(TransformData::NodeSet(nodes))
         } else if let Some(fragment) = uri.strip_prefix('#') {
             // Note: we intentionally do NOT percent-decode the fragment.
             // XMLDSig ID values are XML Name tokens (no spaces/special chars),
             // and real-world SAML never uses percent-encoded fragments.
             // xmlsec1 also passes fragments through without decoding.
-            self.dereference_fragment(fragment)
+            self.dereference_fragment(fragment, budget)
         } else {
             Err(TransformError::UnsupportedUri(uri.to_string()))
         }
@@ -156,7 +176,11 @@ impl<'a> UriReferenceResolver<'a> {
     /// - `xpointer(/)` → entire document (with comments, per XPointer spec)
     /// - `xpointer(id('foo'))` → element by ID (equivalent to bare-name `#foo`)
     /// - bare name `foo` → element by ID attribute
-    fn dereference_fragment(&self, fragment: &str) -> Result<TransformData<'a>, TransformError> {
+    fn dereference_fragment(
+        &self,
+        fragment: &str,
+        budget: Option<&NodeSetMaterializationBudget>,
+    ) -> Result<TransformData<'a>, TransformError> {
         if fragment.is_empty() {
             // Bare "#" is not a valid same-document reference
             return Err(TransformError::UnsupportedUri("#".to_string()));
@@ -166,29 +190,43 @@ impl<'a> UriReferenceResolver<'a> {
             // XPointer root: entire document WITH comments (unlike empty URI).
             // Per XMLDSig §4.3.3.3: "the XPointer expression [...] includes
             // comment nodes"
-            Ok(TransformData::NodeSet(
-                NodeSet::entire_document_with_comments(self.doc)?,
-            ))
+            let nodes = match budget {
+                Some(budget) => {
+                    NodeSet::entire_document_with_comments_with_budget(self.doc, budget)?
+                }
+                None => NodeSet::entire_document_with_comments(self.doc)?,
+            };
+            Ok(TransformData::NodeSet(nodes))
         } else if let Some(id) = parse_xpointer_id_fragment(fragment) {
             // xpointer(id('foo')) → same as bare-name #foo
             // Reject empty parsed ID (e.g., xpointer(id(''))) — not a valid XML Name
             if id.is_empty() {
                 return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
             }
-            self.resolve_id(id)
+            self.resolve_id(id, budget)
         } else if fragment.starts_with("xpointer(") {
             // Any other XPointer expression is unsupported
             Err(TransformError::UnsupportedUri(format!("#{fragment}")))
         } else {
             // Bare-name fragment: #foo → element by ID
-            self.resolve_id(fragment)
+            self.resolve_id(fragment, budget)
         }
     }
 
     /// Look up an element by its ID attribute value and return a subtree node set.
-    fn resolve_id(&self, id: &str) -> Result<TransformData<'a>, TransformError> {
+    fn resolve_id(
+        &self,
+        id: &str,
+        budget: Option<&NodeSetMaterializationBudget>,
+    ) -> Result<TransformData<'a>, TransformError> {
         match self.id_map.get(id) {
-            Some(&element) => Ok(TransformData::NodeSet(NodeSet::subtree(element)?)),
+            Some(&element) => {
+                let nodes = match budget {
+                    Some(budget) => NodeSet::subtree_with_budget(element, budget)?,
+                    None => NodeSet::subtree(element)?,
+                };
+                Ok(TransformData::NodeSet(nodes))
+            }
             None => Err(TransformError::ElementNotFound(id.to_string())),
         }
     }

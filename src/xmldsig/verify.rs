@@ -434,7 +434,7 @@ fn process_reference_with_options(
         .as_deref()
         .ok_or(ReferenceProcessingError::MissingUri)?;
     let initial_data = resolver
-        .dereference(uri)
+        .dereference_with_budget(uri, execution.transform_budget.node_set_materialization())
         .map_err(ReferenceProcessingError::UriDereference)?;
 
     // 2. Apply transform chain
@@ -2744,6 +2744,42 @@ mod tests {
         .expect_err("the second Reference must consume the first Reference's XPath work");
 
         assert!(error.to_string().contains("signature-wide"));
+    }
+
+    #[test]
+    fn reference_processing_shares_node_set_materialization_across_references() {
+        // Repeated references to the same small subtree must share one owned-
+        // string budget. Otherwise a large inherited namespace can be cloned
+        // once per Reference even when canonicalization emits little output.
+        let document = Document::parse(
+            r#"<root xmlns:n="urn:0123456789"><target Id="selected">payload</target></root>"#,
+        )
+        .unwrap();
+        let resolver = UriReferenceResolver::new(&document);
+        let initial_data = resolver.dereference("#selected").unwrap();
+        let pre_digest =
+            crate::xmldsig::execute_transforms(document.root_element(), initial_data, &[]).unwrap();
+        let digest = compute_digest(DigestAlgorithm::Sha256, &pre_digest);
+        let references = vec![
+            make_reference("#selected", vec![], DigestAlgorithm::Sha256, digest.clone()),
+            make_reference("#selected", vec![], DigestAlgorithm::Sha256, digest),
+        ];
+        let budget = TransformExecutionBudget::with_node_set_materialization_limit(30);
+        let execution = ReferenceExecutionContext {
+            store_pre_digest: false,
+            transform_options: TransformOptions::default(),
+            transform_budget: &budget,
+        };
+
+        let error = process_all_references_with_options(
+            &references,
+            &resolver,
+            document.root_element(),
+            &execution,
+        )
+        .expect_err("the second Reference must consume the first Reference's materialization work");
+
+        assert!(error.to_string().contains("cumulative owned string bytes"));
     }
 
     #[test]

@@ -17,7 +17,7 @@ use super::transforms::{
     MAX_XPATH_EXPRESSION_BYTES, MAX_XPATH_FILTERS, XPathExpression, XPathFilter,
     XPathFilterOperation, XPathHereSemantics,
 };
-use super::types::{NodeSet, TransformError};
+use super::types::{NodeSet, NodeSetMaterializationBudget, TransformError};
 use crate::c14n::NodeVisibility;
 use crate::c14n::prefix::{attribute_prefix, element_prefix};
 
@@ -256,6 +256,13 @@ fn xpath_string_scan_count(source: &str) -> usize {
         if !(byte.is_ascii_alphabetic() || byte == b'_') {
             match byte {
                 b',' | b'=' | b'<' | b'>' => {
+                    // This charge matches sxd-xpath-no-unsafe 0.5.1 rather than
+                    // XPath's abstract pairwise wording: node-set equality
+                    // builds one HashSet<String> per operand and tests set
+                    // intersection, while relational comparison coerces each
+                    // operand once through Value::number(). There is no nested
+                    // node-pair loop to charge quadratically. Re-audit this
+                    // invariant before changing the pinned evaluator version.
                     scans = scans.saturating_add(1);
                     can_end_operand = false;
                 }
@@ -328,6 +335,8 @@ fn is_xpath_value_scanning_function(name: &str) -> bool {
             | "floor"
             | "ceiling"
             | "round"
+            | "id"
+            | "lang"
     )
 }
 
@@ -691,9 +700,10 @@ impl<'d> Mirror<'d> {
         source: &'a Document<'a>,
         selected: nodeset::Nodeset<'d>,
         mode: ProjectionMode,
-    ) -> NodeSet<'a> {
+        materialization_budget: &NodeSetMaterializationBudget,
+    ) -> Result<NodeSet<'a>, TransformError> {
         if matches!(mode, ProjectionMode::ExpandToSubtrees) {
-            return self.project_expanded(source, selected);
+            return self.project_expanded(source, selected, materialization_budget);
         }
 
         let mut result = NodeSet::empty(source);
@@ -718,7 +728,12 @@ impl<'d> Mirror<'d> {
                     };
                     let stored_name = attribute.name();
                     let name = sxd_document_no_unsafe::as_qname!(stored_name);
-                    result.insert_attribute(source_parent, name.namespace_uri(), name.local_part());
+                    result.insert_attribute_with_budget(
+                        source_parent,
+                        name.namespace_uri(),
+                        name.local_part(),
+                        materialization_budget,
+                    )?;
                 }
                 nodeset::Node::Text(text) => {
                     if let Some(source_node) = self.source_node(source, self.texts.get(&text)) {
@@ -735,7 +750,12 @@ impl<'d> Mirror<'d> {
                     if let Some(source_parent) =
                         self.source_node(source, self.elements.get(&namespace.parent()))
                     {
-                        result.insert_namespace(source_parent, namespace.prefix(), namespace.uri());
+                        result.insert_namespace_with_budget(
+                            source_parent,
+                            namespace.prefix(),
+                            namespace.uri(),
+                            materialization_budget,
+                        )?;
                     }
                 }
                 nodeset::Node::ProcessingInstruction(pi) => {
@@ -747,14 +767,15 @@ impl<'d> Mirror<'d> {
                 }
             }
         }
-        result
+        Ok(result)
     }
 
     fn project_expanded<'a>(
         &self,
         source: &'a Document<'a>,
         selected: nodeset::Nodeset<'d>,
-    ) -> NodeSet<'a> {
+        materialization_budget: &NodeSetMaterializationBudget,
+    ) -> Result<NodeSet<'a>, TransformError> {
         let mut result = NodeSet::empty(source);
         let mut selected_elements = HashSet::new();
         let mut root_selected = false;
@@ -780,7 +801,12 @@ impl<'d> Mirror<'d> {
                     };
                     let stored_name = attribute.name();
                     let name = sxd_document_no_unsafe::as_qname!(stored_name);
-                    result.insert_attribute(source_parent, name.namespace_uri(), name.local_part());
+                    result.insert_attribute_with_budget(
+                        source_parent,
+                        name.namespace_uri(),
+                        name.local_part(),
+                        materialization_budget,
+                    )?;
                 }
                 nodeset::Node::Text(text) => {
                     if let Some(source_node) = self.source_node(source, self.texts.get(&text)) {
@@ -797,7 +823,12 @@ impl<'d> Mirror<'d> {
                     if let Some(source_parent) =
                         self.source_node(source, self.elements.get(&namespace.parent()))
                     {
-                        result.insert_namespace(source_parent, namespace.prefix(), namespace.uri());
+                        result.insert_namespace_with_budget(
+                            source_parent,
+                            namespace.prefix(),
+                            namespace.uri(),
+                            materialization_budget,
+                        )?;
                     }
                 }
                 nodeset::Node::ProcessingInstruction(pi) => {
@@ -813,7 +844,7 @@ impl<'d> Mirror<'d> {
         // Carry one inherited-selection bit through a single source DFS. Nested
         // selected roots therefore never cause repeated descendant insertion.
         if !root_selected && selected_elements.is_empty() {
-            return result;
+            return Ok(result);
         }
         let mut stack = vec![(source.root(), root_selected)];
         while let Some((node, inherited_selection)) = stack.pop() {
@@ -824,21 +855,27 @@ impl<'d> Mirror<'d> {
                 result.insert_node(node);
                 if node.is_element() {
                     for attribute in node.attributes() {
-                        result.insert_attribute(node, attribute.namespace(), attribute.name());
+                        result.insert_attribute_with_budget(
+                            node,
+                            attribute.namespace(),
+                            attribute.name(),
+                            materialization_budget,
+                        )?;
                     }
                     for namespace in node.namespaces() {
-                        result.insert_namespace(
+                        result.insert_namespace_with_budget(
                             node,
                             namespace.name().unwrap_or(""),
                             namespace.uri(),
-                        );
+                            materialization_budget,
+                        )?;
                     }
                 }
             }
             stack.extend(node.children().rev().map(|child| (child, selected)));
         }
 
-        result
+        Ok(result)
     }
 
     fn source_node<'a>(
@@ -1116,6 +1153,7 @@ fn evaluate_expression<'a>(
     here_semantics: XPathHereSemantics,
     document_relation: XPathDocumentRelation,
     work_budget: &XPathWorkBudget,
+    materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
     let document = input.document();
     let document_size = NodeSet::ensure_subtree_materialization_fits(document.root())?;
@@ -1209,7 +1247,12 @@ fn evaluate_expression<'a>(
                 selected.add(node);
             }
         }
-        return Ok(mirror.project(document, selected, ProjectionMode::ExactNodes));
+        return mirror.project(
+            document,
+            selected,
+            ProjectionMode::ExactNodes,
+            materialization_budget,
+        );
     }
 
     work_budget.charge(evaluation_work)?;
@@ -1222,7 +1265,12 @@ fn evaluate_expression<'a>(
             "XPath Filter 2.0 expression must return a node-set".into(),
         ));
     };
-    Ok(mirror.project(document, selected, ProjectionMode::ExpandToSubtrees))
+    mirror.project(
+        document,
+        selected,
+        ProjectionMode::ExpandToSubtrees,
+        materialization_budget,
+    )
 }
 
 #[cfg(test)]
@@ -1239,12 +1287,31 @@ pub(super) fn apply_xpath_filter<'a>(
     )
 }
 
+#[cfg(test)]
 pub(super) fn apply_xpath_filter_with_semantics<'a>(
+    input: NodeSet<'a>,
+    expression: &XPathExpression,
+    here_semantics: XPathHereSemantics,
+    document_relation: XPathDocumentRelation,
+    work_budget: &XPathWorkBudget,
+) -> Result<NodeSet<'a>, TransformError> {
+    apply_xpath_filter_with_semantics_and_budget(
+        input,
+        expression,
+        here_semantics,
+        document_relation,
+        work_budget,
+        &NodeSetMaterializationBudget::default(),
+    )
+}
+
+pub(super) fn apply_xpath_filter_with_semantics_and_budget<'a>(
     mut input: NodeSet<'a>,
     expression: &XPathExpression,
     here_semantics: XPathHereSemantics,
     document_relation: XPathDocumentRelation,
     work_budget: &XPathWorkBudget,
+    materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
     let selected = evaluate_expression(
         &input,
@@ -1253,6 +1320,7 @@ pub(super) fn apply_xpath_filter_with_semantics<'a>(
         here_semantics,
         document_relation,
         work_budget,
+        materialization_budget,
     )?;
     input.intersect_with(&selected);
     Ok(input)
@@ -1272,6 +1340,7 @@ pub(super) fn apply_xpath_filter2<'a>(
     )
 }
 
+#[cfg(test)]
 pub(super) fn apply_xpath_filter2_with_semantics<'a>(
     input: NodeSet<'a>,
     filters: &[XPathFilter],
@@ -1279,12 +1348,31 @@ pub(super) fn apply_xpath_filter2_with_semantics<'a>(
     document_relation: XPathDocumentRelation,
     work_budget: &XPathWorkBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
+    apply_xpath_filter2_with_semantics_and_budget(
+        input,
+        filters,
+        here_semantics,
+        document_relation,
+        work_budget,
+        &NodeSetMaterializationBudget::default(),
+    )
+}
+
+pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a>(
+    input: NodeSet<'a>,
+    filters: &[XPathFilter],
+    here_semantics: XPathHereSemantics,
+    document_relation: XPathDocumentRelation,
+    work_budget: &XPathWorkBudget,
+    materialization_budget: &NodeSetMaterializationBudget,
+) -> Result<NodeSet<'a>, TransformError> {
     if filters.is_empty() || filters.len() > MAX_XPATH_FILTERS {
         return Err(TransformError::XPath(format!(
             "XPath Filter 2.0 requires between 1 and {MAX_XPATH_FILTERS} expressions"
         )));
     }
-    let mut result = NodeSet::try_entire_document(input.document())?;
+    let mut result =
+        NodeSet::try_entire_document_with_budget(input.document(), materialization_budget)?;
     for filter in filters {
         let selected = evaluate_expression(
             &input,
@@ -1293,11 +1381,14 @@ pub(super) fn apply_xpath_filter2_with_semantics<'a>(
             here_semantics,
             document_relation,
             work_budget,
+            materialization_budget,
         )?;
         match filter.operation() {
             XPathFilterOperation::Intersect => result.intersect_with(&selected),
             XPathFilterOperation::Subtract => result.subtract(&selected),
-            XPathFilterOperation::Union => result.union_with(&selected),
+            XPathFilterOperation::Union => {
+                result.union_with_budget(&selected, materialization_budget)?;
+            }
         }
     }
     result.intersect_with(&input);
@@ -1639,6 +1730,45 @@ mod tests {
     }
 
     #[test]
+    fn xpath_filter_charges_each_repeated_id_conversion() {
+        // The custom id() implementation converts its node-set argument to
+        // complete string values before tokenizing IDs. Repeating that
+        // conversion must not fit inside the budget measured for one call.
+        let document =
+            Document::parse("<root><ids>target</ids><item Id=\"target\"/><context/></root>")
+                .unwrap();
+        let single_scan_budget = XPathWorkBudget::default();
+        let initial_remaining = single_scan_budget.string_work_bytes_remaining.get();
+        apply_xpath_filter_with_semantics(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &XPathExpression::new("id(/root/ids)"),
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &single_scan_budget,
+        )
+        .expect("one bounded id conversion should fit");
+        let one_scan_work =
+            initial_remaining - single_scan_budget.string_work_bytes_remaining.get();
+        let repeated_scan_budget = XPathWorkBudget {
+            remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
+            mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
+            string_work_bytes_remaining: Rc::new(Cell::new(one_scan_work)),
+        };
+
+        let error = apply_xpath_filter_with_semantics(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &XPathExpression::new("id(/root/ids) or id(/root/ids)"),
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &repeated_scan_budget,
+        )
+        .err()
+        .expect("repeated id conversions must exceed a one-conversion budget");
+
+        assert!(error.to_string().contains("string-processing work"));
+    }
+
+    #[test]
     fn xpath_filter_charges_each_repeated_comparison_scan() {
         // XPath 1.0 compares a node-set through each candidate node's string
         // value. Two comparisons must therefore consume two complete source scans.
@@ -1838,6 +1968,38 @@ mod tests {
         );
         assert_eq!(xpath_string_scan_count("-/root/a"), 1);
         assert_eq!(xpath_string_scan_count("/root/* | child::* | //@*"), 0);
+    }
+
+    #[test]
+    fn xpath_string_profile_counts_custom_string_coercions() {
+        // Both registered custom functions eagerly coerce their argument to a
+        // string, while unrelated namespace-qualified extensions do not.
+        assert_eq!(xpath_string_scan_count("id(/root/ids)"), 1);
+        assert_eq!(xpath_string_scan_count("lang(/root/language)"), 1);
+        assert_eq!(xpath_string_scan_count("ext:id(/root/ids)"), 0);
+    }
+
+    #[test]
+    fn xpath_string_profile_matches_pinned_nodeset_comparison_contract() {
+        // sxd-xpath-no-unsafe 0.5.1 hashes each node-set's string values before
+        // testing equality, so one comparison is two linear operand scans, not
+        // a Cartesian product. The conservative full-source charge is one pass.
+        assert_eq!(
+            xpath_string_scan_count("/root/left/item = /root/right/item"),
+            1
+        );
+
+        let document = Document::parse(
+            "<root><left><item>a</item><item>b</item></left><right><item>c</item><item>b</item></right></root>",
+        )
+        .unwrap();
+        let result = apply_xpath_filter(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &XPathExpression::new("/root/left/item = /root/right/item"),
+        )
+        .expect("the pinned evaluator must support node-set equality");
+
+        assert!(result.contains(document.root_element()));
     }
 
     #[test]

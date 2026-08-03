@@ -569,7 +569,10 @@ fn compute_reference_digest_values_with_options(
         .into_iter()
         .enumerate()
         .map(|(index, reference)| {
-            let initial_data = resolver.dereference(&reference.uri)?;
+            let initial_data = resolver.dereference_with_budget(
+                &reference.uri,
+                execution_budget.node_set_materialization(),
+            )?;
             let pre_digest = execute_transforms_with_options_and_budget(
                 signature,
                 initial_data,

@@ -28,11 +28,11 @@ use roxmltree::{Document, Node};
 use sha2::{Digest as _, Sha256};
 
 use super::parse::XMLDSIG_NS;
-use super::types::{TransformData, TransformError};
+use super::types::{NodeSetMaterializationBudget, TransformData, TransformError};
 use super::whitespace::is_xml_whitespace_only;
 use super::xpath::{
-    XPathDocumentRelation, XPathWorkBudget, apply_xpath_filter_with_semantics,
-    apply_xpath_filter2_with_semantics, compile_xpath, is_xpath_whitespace,
+    XPathDocumentRelation, XPathWorkBudget, apply_xpath_filter_with_semantics_and_budget,
+    apply_xpath_filter2_with_semantics_and_budget, compile_xpath, is_xpath_whitespace,
 };
 use crate::c14n::{self, C14nAlgorithm};
 
@@ -100,6 +100,7 @@ pub(crate) struct TransformExecutionBudget {
     base64: Base64WorkBudget,
     c14n: C14nOutputBudget,
     node_filter: NodeFilterWorkBudget,
+    node_set_materialization: NodeSetMaterializationBudget,
 }
 
 struct NodeFilterWorkBudget {
@@ -192,6 +193,7 @@ impl TransformExecutionBudget {
             base64: Base64WorkBudget::default(),
             c14n: C14nOutputBudget::default(),
             node_filter: NodeFilterWorkBudget::default(),
+            node_set_materialization: NodeSetMaterializationBudget::default(),
         }
     }
 
@@ -203,6 +205,7 @@ impl TransformExecutionBudget {
                 remaining: Cell::new(limit),
             },
             node_filter: NodeFilterWorkBudget::default(),
+            node_set_materialization: NodeSetMaterializationBudget::default(),
         }
     }
 
@@ -214,7 +217,24 @@ impl TransformExecutionBudget {
             node_filter: NodeFilterWorkBudget {
                 remaining: Cell::new(limit),
             },
+            node_set_materialization: NodeSetMaterializationBudget::default(),
         }
+    }
+
+    pub(crate) fn with_node_set_materialization_limit(limit: usize) -> Self {
+        Self {
+            xpath: XPathWorkBudget::default(),
+            base64: Base64WorkBudget::default(),
+            c14n: C14nOutputBudget::default(),
+            node_filter: NodeFilterWorkBudget::default(),
+            node_set_materialization: NodeSetMaterializationBudget::with_limit(limit),
+        }
+    }
+}
+
+impl TransformExecutionBudget {
+    pub(crate) fn node_set_materialization(&self) -> &NodeSetMaterializationBudget {
+        &self.node_set_materialization
     }
 }
 
@@ -514,13 +534,16 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                 std::iter::once(xpath),
                 state,
             );
-            Ok(TransformData::NodeSet(apply_xpath_filter_with_semantics(
-                nodes,
-                xpath,
-                options.here_semantics(),
-                document_relation,
-                &budget.xpath,
-            )?))
+            Ok(TransformData::NodeSet(
+                apply_xpath_filter_with_semantics_and_budget(
+                    nodes,
+                    xpath,
+                    options.here_semantics(),
+                    document_relation,
+                    &budget.xpath,
+                    &budget.node_set_materialization,
+                )?,
+            ))
         }
         Transform::XPathFilter2(filters) => {
             let nodes = input.into_node_set()?;
@@ -530,13 +553,16 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                 filters.iter().map(XPathFilter::xpath),
                 state,
             );
-            Ok(TransformData::NodeSet(apply_xpath_filter2_with_semantics(
-                nodes,
-                filters,
-                options.here_semantics(),
-                document_relation,
-                &budget.xpath,
-            )?))
+            Ok(TransformData::NodeSet(
+                apply_xpath_filter2_with_semantics_and_budget(
+                    nodes,
+                    filters,
+                    options.here_semantics(),
+                    document_relation,
+                    &budget.xpath,
+                    &budget.node_set_materialization,
+                )?,
+            ))
         }
         Transform::C14n(algo) => {
             let nodes = input.into_node_set()?;
@@ -749,7 +775,10 @@ fn execute_transform_chain<'s, 'e, 'd>(
         let document = roxmltree::Document::parse(&xml)
             .map_err(|error| TransformError::XmlParse(error.to_string()))?;
         context.state.document_reparsed();
-        let nodes = super::types::NodeSet::entire_document_with_comments(&document)?;
+        let nodes = super::types::NodeSet::entire_document_with_comments_with_budget(
+            &document,
+            &context.budget.node_set_materialization,
+        )?;
         return match canonical_signature_position {
             Some(Some(position)) => {
                 let remapped = document
@@ -1715,6 +1744,54 @@ mod tests {
             Err(TransformError::C14nOutputTooLarge {
                 max_bytes: MAX_C14N_OUTPUT_BYTES
             })
+        ));
+    }
+
+    #[test]
+    fn binary_to_node_set_adapter_uses_shared_materialization_budget() {
+        // A binary transform result can be reparsed before a later node-set
+        // transform. That internal adapter must not bypass the signature-wide
+        // owned-string budget enforced by ordinary URI dereference.
+        let signature_document = Document::parse("<Signature/>").unwrap();
+        let budget = TransformExecutionBudget::with_node_set_materialization_limit(1);
+        let transforms = [Transform::XPath(XPathExpression::new("true()"))];
+
+        let error = execute_transforms_with_options_and_budget(
+            signature_document.root_element(),
+            TransformData::Binary(b"<root xmlns:n=\"urn:namespace\"/>".to_vec()),
+            &transforms,
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect_err("the binary adapter must charge cloned namespace strings");
+
+        assert!(matches!(
+            error,
+            TransformError::NodeSetCumulativeStringsTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn xpath_projection_uses_shared_materialization_budget() {
+        // XPath projects exact attribute and namespace identities back into a
+        // fresh NodeSet. Those owned keys must consume the same budget as URI
+        // dereference and binary adapters.
+        let document = Document::parse("<root attribute=\"value\"/>").unwrap();
+        let budget = TransformExecutionBudget::with_node_set_materialization_limit(1);
+        let transforms = [Transform::XPath(XPathExpression::new("true()"))];
+
+        let error = execute_transforms_with_options_and_budget(
+            document.root_element(),
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&document).unwrap()),
+            &transforms,
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect_err("XPath projection must charge cloned attribute names");
+
+        assert!(matches!(
+            error,
+            TransformError::NodeSetCumulativeStringsTooLarge { .. }
         ));
     }
 
