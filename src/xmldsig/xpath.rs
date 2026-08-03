@@ -108,8 +108,11 @@ impl XPathWorkBudget {
         &self,
         source_bytes: usize,
         evaluations: usize,
+        scans_per_evaluation: usize,
     ) -> Result<(), TransformError> {
-        let work = source_bytes.checked_mul(evaluations);
+        let work = source_bytes
+            .checked_mul(evaluations)
+            .and_then(|work| work.checked_mul(scans_per_evaluation));
         let remaining = self.string_work_bytes_remaining.get();
         let Some(next) = work.and_then(|work| remaining.checked_sub(work)) else {
             self.string_work_bytes_remaining.set(0);
@@ -213,6 +216,76 @@ fn xpath_expression_complexity(source: &str) -> usize {
         }
     }
     tokens
+}
+
+/// Count conservative full-source string passes before entering SXD.
+///
+/// Linear XPath 1.0 built-ins contribute one pass, and each argument separator
+/// contributes another so variadic calls such as `concat()` cannot hide repeated
+/// node-set-to-string coercions. Quoted literals are excluded; unknown coercion
+/// paths are covered separately by the mandatory baseline scan.
+fn xpath_string_scan_count(source: &str) -> usize {
+    let bytes = source.as_bytes();
+    let mut scans = 0_usize;
+    let mut index = 0_usize;
+    let mut quote = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if matches!(byte, b'\'' | b'"') {
+            if quote == Some(byte) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(byte);
+            }
+            index += 1;
+            continue;
+        }
+        if quote.is_some() || !(byte.is_ascii_alphabetic() || byte == b'_') {
+            if quote.is_none() && byte == b',' {
+                scans = scans.saturating_add(1);
+            }
+            index += 1;
+            continue;
+        }
+
+        let name_start = index;
+        index += 1;
+        while bytes
+            .get(index)
+            .is_some_and(|byte| is_xpath_identifier_byte(*byte))
+        {
+            index += 1;
+        }
+        let mut call_start = index;
+        while bytes
+            .get(call_start)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            call_start += 1;
+        }
+        if bytes.get(call_start) == Some(&b'(')
+            && is_xpath_string_scanning_function(&source[name_start..index])
+        {
+            scans = scans.saturating_add(1);
+        }
+    }
+    scans
+}
+
+fn is_xpath_string_scanning_function(name: &str) -> bool {
+    matches!(
+        name,
+        "string"
+            | "concat"
+            | "starts-with"
+            | "contains"
+            | "substring-before"
+            | "substring-after"
+            | "substring"
+            | "string-length"
+            | "normalize-space"
+            | "translate"
+    )
 }
 
 /// Estimate one XPath evaluation before entering SXD's non-interruptible engine.
@@ -1031,6 +1104,7 @@ fn evaluate_expression<'a>(
 
     let xpath = compile_xpath(expression.expression()).map_err(TransformError::XPath)?;
     let evaluation_work = xpath_evaluation_work(expression.expression(), document_size);
+    let string_scans = xpath_string_scan_count(expression.expression()).max(1);
 
     if matches!(mode, XPathEvaluationMode::XmlDsigPerNodeFilter) {
         // XMLDSig 1.1 section 6.6.3 requires a fresh context for every input
@@ -1061,7 +1135,7 @@ fn evaluate_expression<'a>(
         // any mirrored string. Charge the complete source string volume for
         // every context before entering the evaluator; syntax-based discounts
         // would leave alternate coercion paths able to bypass this ceiling.
-        work_budget.charge_string_work(mirror_bytes, ordered_nodes.len())?;
+        work_budget.charge_string_work(mirror_bytes, ordered_nodes.len(), string_scans)?;
         let mut selected = nodeset::Nodeset::new();
         for node in ordered_nodes {
             // SXD exposes no interrupt hook. Charge nested predicate scans
@@ -1079,7 +1153,7 @@ fn evaluate_expression<'a>(
     }
 
     work_budget.charge(evaluation_work)?;
-    work_budget.charge_string_work(mirror_bytes, 1)?;
+    work_budget.charge_string_work(mirror_bytes, 1, string_scans)?;
     let value = xpath
         .evaluate(&context, target.root())
         .map_err(|error| TransformError::XPath(error.to_string()))?;
@@ -1430,6 +1504,44 @@ mod tests {
     }
 
     #[test]
+    fn xpath_filter_charges_each_repeated_string_scan() {
+        // One full-source scan fits exactly; repeating the same linear string
+        // function in one evaluation must consume another full-source charge.
+        let document = Document::parse("<root><blob>payload</blob><item/></root>").unwrap();
+        let single_scan_budget = XPathWorkBudget::default();
+        let initial_remaining = single_scan_budget.string_work_bytes_remaining.get();
+        apply_xpath_filter_with_semantics(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &XPathExpression::new("contains(/root/blob, 'missing')"),
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &single_scan_budget,
+        )
+        .expect("one bounded string scan should fit");
+        let one_scan_work =
+            initial_remaining - single_scan_budget.string_work_bytes_remaining.get();
+        let repeated_scan_budget = XPathWorkBudget {
+            remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
+            mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
+            string_work_bytes_remaining: Rc::new(Cell::new(one_scan_work)),
+        };
+
+        let error = apply_xpath_filter_with_semantics(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &XPathExpression::new(
+                "contains(/root/blob, 'missing') or contains(/root/blob, 'absent')",
+            ),
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &repeated_scan_budget,
+        )
+        .err()
+        .expect("two string scans must exceed a one-scan budget");
+
+        assert!(error.to_string().contains("string-processing work"));
+    }
+
+    #[test]
     fn xpath_filter2_rejects_cumulative_mirror_bytes() {
         // Each expression may mirror less than the per-document byte ceiling,
         // but repeated filters must not multiply signature-wide copying.
@@ -1507,6 +1619,25 @@ mod tests {
             xpath_evaluation_work("//*[contains(., '//ancestor::*')]", 10),
             10
         );
+    }
+
+    #[test]
+    fn xpath_string_profile_counts_only_linear_builtin_calls() {
+        // Function-like text in literals and namespaced extension names does
+        // not count, while each argument boundary remains a conservative pass.
+        assert_eq!(
+            xpath_string_scan_count("contains(/root/a, 'x') or starts-with(/root/b, 'y')"),
+            4
+        );
+        assert_eq!(
+            xpath_string_scan_count("string(translate(/root/a, 'x', 'y'))"),
+            4
+        );
+        assert_eq!(
+            xpath_string_scan_count("contains ('contains(/ignored)', 'x')"),
+            2
+        );
+        assert_eq!(xpath_string_scan_count("ext:contains(/root/a, 'x')"), 1);
     }
 
     #[test]
