@@ -860,7 +860,7 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
     }
 
     let mut chain = Vec::new();
-    let mut xpath_namespace_budget = XPathNamespaceBudget::default();
+    let mut xpath_state = XPathParseState::default();
 
     for child in transforms_node.children() {
         if !child.is_element() {
@@ -888,9 +888,9 @@ pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, Transfo
             validate_empty_transform(child, "Base64")?;
             Transform::Base64Decode
         } else if uri == XPATH_TRANSFORM_URI {
-            parse_xpath_transform_with_budget(child, &mut xpath_namespace_budget)?
+            parse_xpath_transform_with_state(child, &mut xpath_state)?
         } else if uri == XPATH_FILTER2_TRANSFORM_URI {
-            parse_xpath_filter2_transform(child, &mut xpath_namespace_budget)?
+            parse_xpath_filter2_transform(child, &mut xpath_state)?
         } else if let Some(mut algo) = C14nAlgorithm::from_uri(uri) {
             // For exclusive C14N, check for InclusiveNamespaces child
             if algo.mode() == c14n::C14nMode::Exclusive1_0
@@ -930,12 +930,12 @@ fn validate_empty_transform(
 
 #[cfg(test)]
 pub(super) fn parse_xpath_transform(transform_node: Node) -> Result<Transform, TransformError> {
-    parse_xpath_transform_with_budget(transform_node, &mut XPathNamespaceBudget::default())
+    parse_xpath_transform_with_state(transform_node, &mut XPathParseState::default())
 }
 
-fn parse_xpath_transform_with_budget(
+fn parse_xpath_transform_with_state(
     transform_node: Node,
-    namespace_budget: &mut XPathNamespaceBudget,
+    xpath_state: &mut XPathParseState,
 ) -> Result<Transform, TransformError> {
     let mut xpath_node = None;
 
@@ -976,7 +976,7 @@ fn parse_xpath_transform_with_budget(
             "XMLDSig <XPath> does not allow attributes".into(),
         ));
     }
-    let xpath = parse_xpath_expression(xpath_node, transform_node.id(), namespace_budget)?;
+    let xpath = parse_xpath_expression(xpath_node, transform_node.id(), xpath_state)?;
 
     if xpath.expression() == ENVELOPED_SIGNATURE_XPATH_EXPR
         && xpath.namespaces().get("dsig").map(String::as_str) == Some(XMLDSIG_NS)
@@ -989,7 +989,7 @@ fn parse_xpath_transform_with_budget(
 
 fn parse_xpath_filter2_transform(
     transform_node: Node,
-    namespace_budget: &mut XPathNamespaceBudget,
+    xpath_state: &mut XPathParseState,
 ) -> Result<Transform, TransformError> {
     let mut filters = Vec::new();
     for child in transform_node.children() {
@@ -1030,7 +1030,7 @@ fn parse_xpath_filter2_transform(
         };
         filters.push(XPathFilter::new(
             operation,
-            parse_xpath_expression(child, transform_node.id(), namespace_budget)?,
+            parse_xpath_expression(child, transform_node.id(), xpath_state)?,
         ));
     }
     if filters.is_empty() {
@@ -1044,7 +1044,7 @@ fn parse_xpath_filter2_transform(
 fn parse_xpath_expression(
     xpath_node: Node,
     transform_node: roxmltree::NodeId,
-    namespace_budget: &mut XPathNamespaceBudget,
+    xpath_state: &mut XPathParseState,
 ) -> Result<XPathExpression, TransformError> {
     let mut source = String::new();
     for child in xpath_node.children() {
@@ -1083,18 +1083,34 @@ fn parse_xpath_expression(
             // NodeId is only meaningful within one roxmltree Document. Keep an
             // owned content identity so parsed transforms cannot outlive the
             // source and later alias unrelated nodes carrying the same indices.
-            document: XPathDocumentIdentity::from_document(xpath_node.document()),
+            document: xpath_state.document_identity(xpath_node.document()),
         }),
     };
     for namespace in xpath_node.namespaces() {
         if let Some(prefix) = namespace.name() {
-            namespace_budget.charge(prefix, namespace.uri())?;
+            xpath_state
+                .namespace_budget
+                .charge(prefix, namespace.uri())?;
             xpath
                 .namespaces
                 .insert(prefix.to_owned(), namespace.uri().to_owned());
         }
     }
     Ok(xpath)
+}
+
+#[derive(Default)]
+struct XPathParseState {
+    namespace_budget: XPathNamespaceBudget,
+    document_identity: Option<XPathDocumentIdentity>,
+}
+
+impl XPathParseState {
+    fn document_identity(&mut self, document: &Document<'_>) -> XPathDocumentIdentity {
+        *self
+            .document_identity
+            .get_or_insert_with(|| XPathDocumentIdentity::from_document(document))
+    }
 }
 
 #[derive(Default)]
@@ -2260,6 +2276,35 @@ mod tests {
         let result = parse_transforms(doc.root_element());
 
         assert!(matches!(result, Err(TransformError::XPath(_))));
+    }
+
+    #[test]
+    fn parse_transform_chain_hashes_xpath_document_once() {
+        // Every parsed XPath stores the same document provenance. A maximal
+        // Filter 2.0 list must not rescan and hash the complete XML per entry.
+        let filters = format!(
+            r#"<XPath xmlns="{XPATH_FILTER2_TRANSFORM_URI}" Filter="intersect">true()</XPath>"#
+        )
+        .repeat(MAX_XPATH_FILTERS);
+        let transform = format!(
+            r#"<Transform Algorithm="{XPATH_FILTER2_TRANSFORM_URI}">{filters}</Transform>"#
+        );
+        let xml =
+            format!(r#"<Transforms xmlns="{XMLDSIG_NS}">{transform}{transform}</Transforms>"#);
+        let document = Document::parse(&xml).unwrap();
+
+        XPATH_DOCUMENT_IDENTITY_COMPUTATIONS.with(|count| count.set(0));
+        let transforms = parse_transforms(document.root_element()).unwrap();
+        let computations = XPATH_DOCUMENT_IDENTITY_COMPUTATIONS.with(Cell::get);
+
+        assert_eq!(transforms.len(), 2);
+        assert!(transforms.iter().all(
+            |transform| matches!(transform, Transform::XPathFilter2(filters) if filters.len() == MAX_XPATH_FILTERS)
+        ));
+        assert_eq!(
+            computations, 1,
+            "one parsed transform chain must hash its source document once"
+        );
     }
 
     #[test]
