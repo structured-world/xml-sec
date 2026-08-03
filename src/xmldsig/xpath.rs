@@ -41,6 +41,11 @@ const MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES: usize = 256 * 1024 * 1024;
 /// Namespace URI permanently bound to the reserved `xml` prefix.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
+#[cfg(test)]
+thread_local! {
+    static FILTER2_PROJECTION_NODE_VISITS: Cell<usize> = const { Cell::new(0) };
+}
+
 #[derive(Clone)]
 pub(super) struct XPathWorkBudget {
     remaining: Rc<Cell<usize>>,
@@ -515,10 +520,10 @@ impl<'d> Mirror<'d> {
                 parents.insert(source_node.id(), element);
                 mirror.elements.insert(element, source_node.id());
             } else if source_node.is_text() {
-                // roxmltree, like XPath's data model, does not expose
-                // whitespace outside the document element as a root child.
-                // Every source text node therefore has an element parent and
-                // retains the same child index in the SXD mirror.
+                // roxmltree already coalesces adjacent character data across
+                // CDATA boundaries into the single text node required by the
+                // XPath 1.0 data model. It also omits whitespace outside the
+                // document element, so every mirrored text has an element parent.
                 if let Some(parent) = target_parent {
                     let text = target.create_text(source_node.text().unwrap_or_default());
                     parent.append_child(text);
@@ -555,24 +560,20 @@ impl<'d> Mirror<'d> {
         selected: nodeset::Nodeset<'d>,
         mode: ProjectionMode,
     ) -> NodeSet<'a> {
+        if matches!(mode, ProjectionMode::ExpandToSubtrees) {
+            return self.project_expanded(source, selected);
+        }
+
         let mut result = NodeSet::empty(source);
         for node in selected.document_order() {
             match node {
                 nodeset::Node::Root(_) => {
-                    if matches!(mode, ProjectionMode::ExpandToSubtrees) {
-                        result.insert_subtree(source.root());
-                    } else {
-                        result.insert_node(source.root());
-                    }
+                    result.insert_node(source.root());
                 }
                 nodeset::Node::Element(element) => {
                     if let Some(source_node) = self.source_node(source, self.elements.get(&element))
                     {
-                        if matches!(mode, ProjectionMode::ExpandToSubtrees) {
-                            result.insert_subtree(source_node);
-                        } else {
-                            result.insert_node(source_node);
-                        }
+                        result.insert_node(source_node);
                     }
                 }
                 nodeset::Node::Attribute(attribute) => {
@@ -614,6 +615,97 @@ impl<'d> Mirror<'d> {
                 }
             }
         }
+        result
+    }
+
+    fn project_expanded<'a>(
+        &self,
+        source: &'a Document<'a>,
+        selected: nodeset::Nodeset<'d>,
+    ) -> NodeSet<'a> {
+        let mut result = NodeSet::empty(source);
+        let mut selected_elements = HashSet::new();
+        let mut root_selected = false;
+
+        // Non-container XPath nodes have no descendants and are projected
+        // exactly. Element/root selections are expanded together below.
+        for node in selected.document_order() {
+            match node {
+                nodeset::Node::Root(_) => root_selected = true,
+                nodeset::Node::Element(element) => {
+                    if let Some(source_node) = self.source_node(source, self.elements.get(&element))
+                    {
+                        selected_elements.insert(source_node.id());
+                    }
+                }
+                nodeset::Node::Attribute(attribute) => {
+                    let Some(parent) = attribute.parent() else {
+                        continue;
+                    };
+                    let Some(source_parent) = self.source_node(source, self.elements.get(&parent))
+                    else {
+                        continue;
+                    };
+                    let stored_name = attribute.name();
+                    let name = sxd_document_no_unsafe::as_qname!(stored_name);
+                    result.insert_attribute(source_parent, name.namespace_uri(), name.local_part());
+                }
+                nodeset::Node::Text(text) => {
+                    if let Some(source_node) = self.source_node(source, self.texts.get(&text)) {
+                        result.insert_node(source_node);
+                    }
+                }
+                nodeset::Node::Comment(comment) => {
+                    if let Some(source_node) = self.source_node(source, self.comments.get(&comment))
+                    {
+                        result.insert_node(source_node);
+                    }
+                }
+                nodeset::Node::Namespace(namespace) => {
+                    if let Some(source_parent) =
+                        self.source_node(source, self.elements.get(&namespace.parent()))
+                    {
+                        result.insert_namespace(source_parent, namespace.prefix(), namespace.uri());
+                    }
+                }
+                nodeset::Node::ProcessingInstruction(pi) => {
+                    if let Some(source_node) =
+                        self.source_node(source, self.processing_instructions.get(&pi))
+                    {
+                        result.insert_node(source_node);
+                    }
+                }
+            }
+        }
+
+        // Carry one inherited-selection bit through a single source DFS. Nested
+        // selected roots therefore never cause repeated descendant insertion.
+        if !root_selected && selected_elements.is_empty() {
+            return result;
+        }
+        let mut stack = vec![(source.root(), root_selected)];
+        while let Some((node, inherited_selection)) = stack.pop() {
+            #[cfg(test)]
+            FILTER2_PROJECTION_NODE_VISITS.with(|visits| visits.set(visits.get() + 1));
+            let selected = inherited_selection || selected_elements.contains(&node.id());
+            if selected {
+                result.insert_node(node);
+                if node.is_element() {
+                    for attribute in node.attributes() {
+                        result.insert_attribute(node, attribute.namespace(), attribute.name());
+                    }
+                    for namespace in node.namespaces() {
+                        result.insert_namespace(
+                            node,
+                            namespace.name().unwrap_or(""),
+                            namespace.uri(),
+                        );
+                    }
+                }
+            }
+            stack.extend(node.children().rev().map(|child| (child, selected)));
+        }
+
         result
     }
 
@@ -810,7 +902,9 @@ impl function::Function for IdFunction {
     }
 }
 
-struct LangFunction;
+struct LangFunction {
+    work_budget: XPathWorkBudget,
+}
 
 impl function::Function for LangFunction {
     fn evaluate<'c, 'd>(
@@ -823,6 +917,7 @@ impl function::Function for LangFunction {
         let requested = args.pop_string()?.to_ascii_lowercase();
         let mut node = Some(context.node.clone());
         while let Some(current) = node {
+            self.work_budget.charge_function(1)?;
             if let Some(element) = current.element()
                 && let Some(language) = element.attributes().into_iter().find_map(|attribute| {
                     let stored_name = attribute.name();
@@ -927,7 +1022,12 @@ fn evaluate_expression<'a>(
             document_scan_cost: document_size,
         },
     );
-    context.set_function("lang", LangFunction);
+    context.set_function(
+        "lang",
+        LangFunction {
+            work_budget: work_budget.clone(),
+        },
+    );
 
     let xpath = compile_xpath(expression.expression()).map_err(TransformError::XPath)?;
     let evaluation_work = xpath_evaluation_work(expression.expression(), document_size);
@@ -1468,6 +1568,78 @@ mod tests {
             canonicalize(&result),
             r#"<keep a="1"><child>yes</child></keep>"#
         );
+    }
+
+    #[test]
+    fn filter2_expands_nested_selected_roots_in_one_document_walk() {
+        // A descendant selection returns every nested ancestor. Projection must
+        // not rewalk the same descendants once for every selected root.
+        let depth = 32;
+        let xml = format!("{}text{}", "<n>".repeat(depth), "</n>".repeat(depth));
+        let document = Document::parse(&xml).unwrap();
+        let input = NodeSet::entire_document_without_comments(&document).unwrap();
+        let filters = [XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("//*"),
+        )];
+
+        FILTER2_PROJECTION_NODE_VISITS.with(|visits| visits.set(0));
+        apply_xpath_filter2(input, &filters).unwrap();
+        let visits = FILTER2_PROJECTION_NODE_VISITS.with(Cell::get);
+
+        assert!(
+            visits <= document.descendants().count(),
+            "projection revisited {visits} nodes"
+        );
+    }
+
+    #[test]
+    fn filter2_lang_ancestor_walks_consume_the_shared_budget() {
+        // lang() searches ancestors for xml:lang. On a deep tree without that
+        // attribute, evaluating it for every descendant must not evade metering.
+        let depth = 32;
+        let xml = format!("{}text{}", "<n>".repeat(depth), "</n>".repeat(depth));
+        let document = Document::parse(&xml).unwrap();
+        let input = NodeSet::entire_document_without_comments(&document).unwrap();
+        let document_size = document.descendants().count();
+        let filters = [XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("//*[lang('missing')]"),
+        )];
+
+        let error = apply_xpath_filter2_with_semantics(
+            input,
+            &filters,
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &XPathWorkBudget::with_limit(document_size * 3),
+        )
+        .err()
+        .expect("ancestor walks must exhaust the shared XPath budget");
+
+        assert!(error.to_string().contains("evaluation work budget"));
+    }
+
+    #[test]
+    fn xpath_coalesces_text_split_only_by_cdata_boundaries() {
+        // XPath 1.0 exposes adjacent character data as one logical text node,
+        // while canonicalization must still retain every source fragment.
+        let document = Document::parse("<root>A<![CDATA[B]]></root>").unwrap();
+        let source_text = document
+            .descendants()
+            .filter(|node| node.is_text())
+            .collect::<Vec<_>>();
+        assert_eq!(source_text.len(), 1);
+        assert_eq!(source_text[0].text(), Some("AB"));
+        let input = NodeSet::entire_document_without_comments(&document).unwrap();
+
+        let result = apply_xpath_filter(
+            input,
+            &XPathExpression::new("not(self::text()) or . = 'AB'"),
+        )
+        .unwrap();
+
+        assert_eq!(canonicalize(&result), "<root>AB</root>");
     }
 
     #[test]
