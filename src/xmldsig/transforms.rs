@@ -253,8 +253,8 @@ impl TransformOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct XPathHereNodes {
-    xpath: roxmltree::NodeId,
-    transform: roxmltree::NodeId,
+    specification_xpath_element: roxmltree::NodeId,
+    xmlsec_legacy_transform_element: roxmltree::NodeId,
     document: XPathDocumentIdentity,
 }
 
@@ -347,10 +347,13 @@ impl XPathExpression {
         &self.namespaces
     }
 
-    pub(crate) fn here_node(&self, semantics: XPathHereSemantics) -> Option<roxmltree::NodeId> {
+    pub(crate) fn here_context_node(
+        &self,
+        semantics: XPathHereSemantics,
+    ) -> Option<roxmltree::NodeId> {
         self.here_nodes.map(|nodes| match semantics {
-            XPathHereSemantics::Specification => nodes.xpath,
-            XPathHereSemantics::XmlSecLegacy => nodes.transform,
+            XPathHereSemantics::Specification => nodes.specification_xpath_element,
+            XPathHereSemantics::XmlSecLegacy => nodes.xmlsec_legacy_transform_element,
         })
     }
 
@@ -1220,8 +1223,10 @@ fn parse_xpath_expression(
         expression: source.to_owned(),
         namespaces: BTreeMap::new(),
         here_nodes: Some(XPathHereNodes {
-            xpath: xpath_node.id(),
-            transform: transform_node,
+            // XMLDSig defines here() as the parent element of the text node
+            // bearing the expression, not as the text node itself.
+            specification_xpath_element: xpath_node.id(),
+            xmlsec_legacy_transform_element: transform_node,
             // NodeId is only meaningful within one roxmltree Document. Keep an
             // owned content identity so parsed transforms cannot outlive the
             // source and later alias unrelated nodes carrying the same indices.

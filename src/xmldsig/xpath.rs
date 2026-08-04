@@ -1180,7 +1180,7 @@ fn evaluate_expression<'a>(
             context: match document_relation {
                 XPathDocumentRelation::CrossDocument => HereContext::CrossDocument,
                 XPathDocumentRelation::SameDocument => {
-                    here_path(document, expression.here_node(here_semantics))
+                    here_path(document, expression.here_context_node(here_semantics))
                         .map_or(HereContext::MissingParameterNode, HereContext::Path)
                 }
             },
@@ -2330,7 +2330,7 @@ mod tests {
     fn xpath_here_function_uses_xpath_element() {
         // XMLDSig defines here() as the parent of the text node that directly
         // bears the expression, which is the XPath parameter element.
-        let xml = r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><data/><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>count(. | here()) = 1</ds:XPath></ds:Transform></root>"#;
+        let xml = r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><data/><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>count(. | here()) = 1 and count(here()/self::*) = 1 and count(here()/self::text()) = 0</ds:XPath></ds:Transform></root>"#;
         let doc = Document::parse(xml).unwrap();
         let transform_node = doc
             .descendants()
