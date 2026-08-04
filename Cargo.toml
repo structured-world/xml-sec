@@ -44,7 +44,7 @@ der = { version = "0.8", optional = true }
 crypto-bigint = { version = "0.7", optional = true }
 
 # Base64 encoding/decoding
-base64 = "0.22"
+base64 = "0.23"
 
 # Error handling
 thiserror = "2"
