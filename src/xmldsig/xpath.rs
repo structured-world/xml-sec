@@ -352,8 +352,10 @@ fn xpath_evaluation_work(source: &str, document_size: usize, mode: XPathEvaluati
     let mut work = document_size;
     let mut predicate_depth = 0_usize;
     let mut top_level_path_scans = 0_usize;
-    let mut saw_top_level_scan = false;
+    let mut top_level_path_started = false;
+    let mut top_level_path_branches = 0_usize;
     let mut predicate_path_scans = Vec::new();
+    let mut predicate_path_started = Vec::new();
     let mut parent_steps = 0_usize;
     let mut quote = None;
     let mut index = 0_usize;
@@ -378,6 +380,8 @@ fn xpath_evaluation_work(source: &str, document_size: usize, mode: XPathEvaluati
                 predicate_depth,
                 &mut top_level_path_scans,
                 &mut predicate_path_scans,
+                &mut top_level_path_started,
+                &mut predicate_path_started,
             );
             index = index.saturating_add(operator_len);
             continue;
@@ -387,21 +391,41 @@ fn xpath_evaluation_work(source: &str, document_size: usize, mode: XPathEvaluati
             b'[' => {
                 predicate_depth = predicate_depth.saturating_add(1);
                 predicate_path_scans.push(0);
+                predicate_path_started.push(false);
             }
             b']' => {
                 predicate_depth = predicate_depth.saturating_sub(1);
                 predicate_path_scans.pop();
+                predicate_path_started.pop();
             }
-            b'/' if bytes.get(index + 1) == Some(&b'/') => {
-                charge_xpath_document_scan(
-                    &mut work,
-                    document_size,
-                    predicate_depth,
-                    &mut top_level_path_scans,
-                    &mut saw_top_level_scan,
-                    &mut predicate_path_scans,
-                );
-                index += 1;
+            b'/' => {
+                let descendant_abbreviation = bytes.get(index + 1) == Some(&b'/');
+                let next_step_is_parent = !descendant_abbreviation
+                    && bytes.get(index + 1..index.saturating_add(3)) == Some(b"..");
+                let next_step_has_explicit_axis = !descendant_abbreviation
+                    && xpath_explicit_axis_after(bytes, index.saturating_add(1));
+                if descendant_abbreviation || (!next_step_is_parent && !next_step_has_explicit_axis)
+                {
+                    charge_xpath_path_branch(
+                        &mut work,
+                        document_size,
+                        predicate_depth,
+                        top_level_path_scans,
+                        &mut top_level_path_started,
+                        &mut top_level_path_branches,
+                        &mut predicate_path_started,
+                    );
+                }
+                if descendant_abbreviation {
+                    charge_xpath_document_scan(
+                        &mut work,
+                        document_size,
+                        predicate_depth,
+                        &mut top_level_path_scans,
+                        &mut predicate_path_scans,
+                    );
+                    index += 1;
+                }
             }
             b'.' if bytes.get(index + 1) == Some(&b'.') => {
                 parent_steps = parent_steps.saturating_add(1);
@@ -412,16 +436,27 @@ fn xpath_evaluation_work(source: &str, document_size: usize, mode: XPathEvaluati
                 while axis_start > 0 && is_xpath_name_byte(bytes[axis_start - 1]) {
                     axis_start -= 1;
                 }
-                if is_document_scanning_axis(&source[axis_start..index]) {
+                let axis = &source[axis_start..index];
+                if axis == "child" || is_document_scanning_axis(axis) {
+                    charge_xpath_path_branch(
+                        &mut work,
+                        document_size,
+                        predicate_depth,
+                        top_level_path_scans,
+                        &mut top_level_path_started,
+                        &mut top_level_path_branches,
+                        &mut predicate_path_started,
+                    );
+                }
+                if is_document_scanning_axis(axis) {
                     charge_xpath_document_scan(
                         &mut work,
                         document_size,
                         predicate_depth,
                         &mut top_level_path_scans,
-                        &mut saw_top_level_scan,
                         &mut predicate_path_scans,
                     );
-                } else if &source[axis_start..index] == "parent" {
+                } else if axis == "parent" {
                     parent_steps = parent_steps.saturating_add(1);
                 }
                 index += 1;
@@ -430,11 +465,16 @@ fn xpath_evaluation_work(source: &str, document_size: usize, mode: XPathEvaluati
                 predicate_depth,
                 &mut top_level_path_scans,
                 &mut predicate_path_scans,
+                &mut top_level_path_started,
+                &mut predicate_path_started,
             ),
             _ => {}
         }
         index += 1;
     }
+
+    work = work
+        .saturating_add(document_size.saturating_mul(top_level_path_branches.saturating_sub(1)));
 
     // Filter2 selects from the document in one evaluation, so every parent step
     // can run for each selected node. XMLDSig XPath evaluates once per input node;
@@ -448,23 +488,44 @@ fn xpath_evaluation_work(source: &str, document_size: usize, mode: XPathEvaluati
     work
 }
 
+fn charge_xpath_path_branch(
+    work: &mut usize,
+    document_size: usize,
+    predicate_depth: usize,
+    top_level_path_scans: usize,
+    top_level_path_started: &mut bool,
+    top_level_path_branches: &mut usize,
+    predicate_path_started: &mut [bool],
+) {
+    if predicate_depth == 0 {
+        if !*top_level_path_started {
+            *top_level_path_started = true;
+            *top_level_path_branches = top_level_path_branches.saturating_add(1);
+        }
+        return;
+    }
+
+    let Some(path_started) = predicate_path_started.get_mut(predicate_depth - 1) else {
+        *work = usize::MAX;
+        return;
+    };
+    if !*path_started {
+        let exponent = top_level_path_scans.max(1).saturating_add(predicate_depth);
+        *work = work.saturating_add(document_traversal_work(document_size, exponent));
+        *path_started = true;
+    }
+}
+
 fn charge_xpath_document_scan(
     work: &mut usize,
     document_size: usize,
     predicate_depth: usize,
     top_level_path_scans: &mut usize,
-    saw_top_level_scan: &mut bool,
     predicate_path_scans: &mut [usize],
 ) {
     if predicate_depth == 0 {
-        if *top_level_path_scans == 0 {
-            if *saw_top_level_scan {
-                *work = work.saturating_add(document_size);
-            }
-            *top_level_path_scans = 1;
-            *saw_top_level_scan = true;
-        } else {
-            *top_level_path_scans = top_level_path_scans.saturating_add(1);
+        *top_level_path_scans = top_level_path_scans.saturating_add(1);
+        if *top_level_path_scans > 1 {
             *work = work.saturating_add(document_traversal_work(
                 document_size,
                 *top_level_path_scans,
@@ -477,23 +538,31 @@ fn charge_xpath_document_scan(
         *work = usize::MAX;
         return;
     };
-    let exponent = (*top_level_path_scans)
-        .max(1)
-        .saturating_add(predicate_depth)
-        .saturating_add(*predicate_scans);
-    *work = work.saturating_add(document_traversal_work(document_size, exponent));
     *predicate_scans = predicate_scans.saturating_add(1);
+    if *predicate_scans > 1 {
+        let exponent = (*top_level_path_scans)
+            .max(1)
+            .saturating_add(predicate_depth)
+            .saturating_add(predicate_scans.saturating_sub(1));
+        *work = work.saturating_add(document_traversal_work(document_size, exponent));
+    }
 }
 
 fn reset_xpath_path_scan_depth(
     predicate_depth: usize,
     top_level_path_scans: &mut usize,
     predicate_path_scans: &mut [usize],
+    top_level_path_started: &mut bool,
+    predicate_path_started: &mut [bool],
 ) {
     if predicate_depth == 0 {
         *top_level_path_scans = 0;
+        *top_level_path_started = false;
     } else if let Some(predicate_scans) = predicate_path_scans.get_mut(predicate_depth - 1) {
         *predicate_scans = 0;
+        if let Some(path_started) = predicate_path_started.get_mut(predicate_depth - 1) {
+            *path_started = false;
+        }
     }
 }
 
@@ -512,6 +581,16 @@ fn xpath_word_operator_len(source: &[u8], index: usize) -> Option<usize> {
                     .is_none_or(|byte| !is_xpath_identifier_byte(*byte))
         })
         .map(<[u8]>::len)
+}
+
+fn xpath_explicit_axis_after(source: &[u8], mut index: usize) -> bool {
+    while source
+        .get(index)
+        .is_some_and(|byte| is_xpath_name_byte(*byte))
+    {
+        index = index.saturating_add(1);
+    }
+    source.get(index..index.saturating_add(2)) == Some(b"::")
 }
 
 fn is_xpath_name_byte(byte: u8) -> bool {
@@ -1891,6 +1970,30 @@ mod tests {
     }
 
     #[test]
+    fn xpath_filter_charges_repeated_child_axis_branches() {
+        // Independent child-axis union branches each rescan the same children.
+        // Counting only descendant axes lets a short expression multiply SXD
+        // work beyond the shared budget before signature verification begins.
+        let xml = format!("<root>{}</root>", "<item/>".repeat(20));
+        let document = Document::parse(&xml).unwrap();
+        let repeated_branches = std::iter::repeat_n("/root/*", 30)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let budget = XPathWorkBudget::with_limit(5_000);
+        let error = apply_xpath_filter_with_semantics(
+            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &XPathExpression::new(repeated_branches),
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &budget,
+        )
+        .err()
+        .expect("repeated child-axis branches must exhaust the shared XPath budget");
+
+        assert!(error.to_string().contains("cumulative evaluation work"));
+    }
+
+    #[test]
     fn xpath_work_profile_tracks_nested_paths_but_ignores_literals() {
         // The preflight meter must recognize both abbreviated paths and named
         // axes without treating XPath punctuation inside quoted data as work.
@@ -1902,6 +2005,13 @@ mod tests {
         assert_eq!(xpath_evaluation_work("//*[ancestor::*]", 10, filter2), 110);
         assert_eq!(xpath_evaluation_work("//a | //b", 10, filter2), 20);
         assert_eq!(xpath_evaluation_work("//a and //b", 10, filter2), 20);
+        assert_eq!(xpath_evaluation_work("/root/*", 10, filter2), 10);
+        assert_eq!(xpath_evaluation_work("/root/* | /root/*", 10, filter2), 20);
+        assert_eq!(xpath_evaluation_work("/root/* | //item", 10, filter2), 20);
+        assert_eq!(
+            xpath_evaluation_work("child::root | child::root", 10, filter2),
+            20
+        );
         assert_eq!(
             xpath_evaluation_work("//brand/descendant::*", 10, filter2),
             110
