@@ -7,6 +7,137 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/structured-world/xml-sec/compare/v0.1.9...v0.1.10) - 2026-08-04
+
+### Added
+
+- *(xmldsig)* complete transform coverage
+- *(xmlenc)* add encryption pipeline
+
+### Documentation
+
+- *(xmldsig)* clarify Manifest validity
+- *(xmldsig)* validate guide API links
+- *(xmlenc)* distinguish OAEP defaults
+- *(xmlenc)* compile guide examples
+- sharpen project positioning
+- normalize guide endings
+- actualize feature coverage
+- *(xmldsig)* clarify xpath work ceiling
+- *(xmldsig)* clarify implicit xml namespace
+- *(c14n)* explain orphan axis serialization
+- *(tests)* document donor workflow contracts
+- *(fixtures)* preserve donor artifacts verbatim
+- *(xmlenc)* clarify fallible OAEP RNG
+
+### Fixed
+
+- *(xmldsig)* meter child-axis branches
+- *(xmldsig)* bound aggregate xpath work
+- *(xmldsig)* meter numeric xpath coercions
+- *(c14n)* preserve hidden base context
+- *(xmldsig)* reject excluded manifests
+- *(xmldsig)* accept no-op manifest transform
+- *(xmldsig)* bound unauthenticated work
+- bound XML string processing
+- *(xmldsig)* bound Manifest XPath parsing
+- *(xmldsig)* bound XPath projection work
+- *(xmldsig)* enforce pipeline budgets
+- *(xmldsig)* key XPath identity cache
+- *(c14n)* retain hidden inherited base
+- *(xmldsig)* encode reserved prefix rule
+- *(xmldsig)* preserve Merlin XPath capacity
+- *(xmldsig)* retain XPath document identity
+- *(xmldsig)* validate XPath XML chars
+- *(xmldsig)* budget implicit C14N output
+- *(xmldsig)* meter XPath string work
+- *(xmldsig)* meter composed XPath scans
+- *(xmldsig)* require authenticated manifests
+- *(xmldsig)* budget inherited XPath namespaces
+- *(xmldsig)* exhaust byte budgets on overflow
+- *(build)* gate shared XML validation
+- *(xml)* reject forbidden namespace characters
+- *(xmldsig)* bound cumulative XPath mirrors
+- *(xmldsig)* share cumulative C14N budget
+- *(xmldsig)* bound retained C14N outputs
+- *(xmldsig)* bound cumulative Base64 work
+- *(c14n)* inherit xml id in C14N 1.0
+- *(xmldsig)* follow RFC 2045 Base64 decoding
+- *(xmldsig)* clear stale binary signature
+- *(c14n)* honor hidden xml base context
+- *(xmldsig)* use XPath whitespace at boundaries
+- *(xmldsig)* preserve Base64 error offsets
+- *(xmldsig)* bound Base64 transform memory
+- *(c14n)* scope namespace gap state
+- *(c14n)* redeclare namespace after gap
+- *(xmldsig)* preserve signature identity in c14n
+- *(xmldsig)* remap reparsed signature node
+- *(xmldsig)* restrict xpath whitespace
+- *(xmldsig)* bound xpath mirror storage
+- *(xmldsig)* harden xpath resource bounds
+- *(xmldsig)* preserve reference errors
+- *(xmldsig)* bound aggregate xpath work
+- *(xmldsig)* avoid excluded set materialization
+- *(xmldsig)* bound xpath namespace storage
+- *(xmldsig)* scope xpath input contexts
+- *(xmldsig)* validate builder xpath source
+- *(xmldsig)* align builder transform cap
+- *(xmldsig)* bound xpath expression work
+- *(xmldsig)* bound cumulative xpath work
+- *(xmldsig)* bound public node set builders
+- *(xmldsig)* bound node set materialization
+- *(xmldsig)* preserve donor xpath vectors
+- *(xmldsig)* validate filter2 cardinality
+- *(xmldsig)* bound per-node xpath work
+- *(xmldsig)* decode utf16 transform input
+- *(xmldsig)* reject invalid namespace uris
+- *(xmldsig)* allow filter2 local prefixes
+- *(xmldsig)* ignore xpath comments and pis
+- *(xmldsig)* bound raw xpath allocation
+- *(xmldsig)* bind implicit xml namespace
+- *(c14n)* preserve document separators
+- *(c14n)* bound xml base fixup chain
+- *(xmldsig)* enforce reserved xml binding
+- *(xmldsig)* resolve namespaced xpath ids
+- *(xmldsig)* reject ambiguous xpath ids
+- *(c14n)* stop inheriting xml id
+- *(xmldsig)* bound transform chain depth
+- *(xmldsig)* preserve xpath operator spacing
+- *(xmldsig)* reject xpath prefix shadowing
+- *(c14n)* bound xml base inheritance
+- *(xmldsig)* adapt XML octets to node sets
+- *(xmldsig)* expand Filter2 document roots
+- *(xmldsig)* evaluate XPath per input node
+- *(xmldsig)* make XPath here semantics explicit
+- *(fixtures)* normalize directory import paths
+- *(fixtures)* replace directory targets with files
+- *(fixtures)* stage donor snapshots atomically
+- *(fixtures)* reject corpus root aliases
+- *(xmlenc)* defer unsupported key agreement
+- *(fixtures)* synchronize donor directories
+- *(xmlenc)* validate metadata characters
+- *(xmlenc)* align element fragment validation
+- *(xmlenc)* bound documents before parsing
+- *(xmlenc)* reject empty key names
+- *(xmlenc)* bound XML before parsing
+- *(build)* gate encryption example
+
+### Performance
+
+- *(xmldsig)* reuse XPath parse identity
+- *(xmldsig)* cache XPath document identity
+
+### Refactored
+
+- *(xmldsig)* clarify here context
+- *(xmldsig)* name XPath projection modes
+- *(xmldsig)* name XPath context modes
+- *(xmldsig)* group transform budgets
+- *(c14n)* encapsulate serializer tracking
+- *(c14n)* clarify omitted element axes
+- *(xmldsig)* share base64 normalization
+- *(xmlenc)* clarify element validation
+
 ## [0.1.9](https://github.com/structured-world/xml-sec/compare/v0.1.8...v0.1.9) - 2026-07-21
 
 ### Added
