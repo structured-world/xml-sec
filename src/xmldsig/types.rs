@@ -202,6 +202,37 @@ impl<'a> NodeSet<'a> {
         Ok(Self::collect_subtree(element))
     }
 
+    /// Create a bare-name same-document fragment node-set, which excludes
+    /// comment nodes before any transforms are applied.
+    pub(crate) fn subtree_without_comments_with_budget(
+        element: Node<'a, 'a>,
+        budget: Option<&NodeSetMaterializationBudget>,
+    ) -> Result<Self, TransformError> {
+        match budget {
+            Some(budget) => Self::charge_subtree_materialization(element, budget)?,
+            None => {
+                Self::ensure_subtree_materialization_fits(element)?;
+            }
+        }
+        let mut set = Self {
+            doc: element.document(),
+            nodes: HashSet::new(),
+            with_comments: false,
+        };
+        for node in element.descendants().filter(|node| !node.is_comment()) {
+            set.insert_node(node);
+            if node.is_element() {
+                for attribute in node.attributes() {
+                    set.insert_attribute(node, attribute.namespace(), attribute.name());
+                }
+                for namespace in node.namespaces() {
+                    set.insert_namespace(node, namespace.name().unwrap_or(""), namespace.uri());
+                }
+            }
+        }
+        Ok(set)
+    }
+
     pub(crate) fn subtree_with_budget(
         element: Node<'a, 'a>,
         budget: &NodeSetMaterializationBudget,

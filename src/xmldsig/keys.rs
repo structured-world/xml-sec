@@ -3,13 +3,15 @@
 use std::{collections::HashMap, time::SystemTime};
 
 use crypto_bigint::BoxedUint;
-use p256::pkcs8::EncodePublicKey as P256EncodePublicKey;
+use dsa::pkcs8::{DecodePublicKey as DsaDecodePublicKey, EncodePublicKey as DsaEncodePublicKey};
+use hmac::{KeyInit, Mac};
 use x509_parser::{
     prelude::{FromDer, X509Certificate},
     public_key::PublicKey,
     x509::SubjectPublicKeyInfo,
 };
 
+use super::signature::verify_rsa_signature_spki_with_minimum;
 use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
     X509ChainOptions, X509DataInfo,
@@ -18,8 +20,75 @@ use super::{
         x509_certificate_matches_any_selector, x509_data_has_lookup_identifiers,
         x509_selector_categories_match_chain,
     },
-    verify_ecdsa_signature_spki, verify_rsa_signature_spki, verify_x509_certificate_chain,
+    verify_dsa_signature_spki, verify_ecdsa_signature_spki, verify_rsa_signature_spki,
+    verify_x509_certificate_chain,
 };
+
+/// Caller-owned HMAC-SHA1 verification key.
+#[derive(Debug, Clone)]
+pub struct HmacSha1VerificationKey {
+    secret: Vec<u8>,
+}
+
+impl HmacSha1VerificationKey {
+    /// Construct a key from non-empty secret bytes.
+    pub fn new(secret: impl Into<Vec<u8>>) -> Result<Self, KeyResolutionError> {
+        let secret = secret.into();
+        if secret.is_empty() {
+            return Err(KeyResolutionError::InvalidPublicKey);
+        }
+        Ok(Self { secret })
+    }
+}
+
+impl VerifyingKey for HmacSha1VerificationKey {
+    fn verify(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        if algorithm != SignatureAlgorithm::HmacSha1 {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        if !(10..=20).contains(&signature_value.len()) {
+            return Ok(false);
+        }
+        let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(&self.secret)
+            .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+        mac.update(signed_data);
+        let expected = mac.finalize().into_bytes();
+        Ok(
+            subtle::ConstantTimeEq::ct_eq(&expected[..signature_value.len()], signature_value)
+                .into(),
+        )
+    }
+}
+
+struct LegacyRsaSha1VerificationKey {
+    public_key_bytes: Vec<u8>,
+}
+
+impl VerifyingKey for LegacyRsaSha1VerificationKey {
+    fn verify(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        if algorithm != SignatureAlgorithm::RsaSha1 {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        verify_rsa_signature_spki_with_minimum(
+            algorithm,
+            &self.public_key_bytes,
+            signed_data,
+            signature_value,
+            1024,
+        )
+        .map_err(DsigError::Crypto)
+    }
+}
 
 /// A public verification key available to key resolvers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +114,15 @@ impl VerifyingKey for VerificationKey {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
         let result = match algorithm {
+            SignatureAlgorithm::DsaSha1 => verify_dsa_signature_spki(
+                algorithm,
+                &self.public_key_bytes,
+                signed_data,
+                signature_value,
+            ),
+            SignatureAlgorithm::HmacSha1 => {
+                return Err(KeyResolutionError::AlgorithmMismatch.into());
+            }
             SignatureAlgorithm::RsaSha1
             | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
@@ -107,6 +185,10 @@ pub struct KeyResolverConfig {
     pub named_keys: HashMap<String, VerificationKey>,
     /// Whether embedded X.509 certificate chains must terminate at a trust anchor.
     pub verify_chains: bool,
+    /// Whether embedded CRLs are authenticated and enforced during chain validation.
+    pub check_crls: bool,
+    /// Allow verify-only RSA-SHA1 keys down to 1024 bits for legacy corpora.
+    pub allow_legacy_rsa_sha1: bool,
     /// Certificate verification time override; `None` selects the system clock.
     pub verification_time: Option<SystemTime>,
     /// Maximum certificates in a validated path, including the trust anchor.
@@ -119,6 +201,8 @@ impl Default for KeyResolverConfig {
             trusted_certs: Vec::new(),
             named_keys: HashMap::new(),
             verify_chains: false,
+            check_crls: false,
+            allow_legacy_rsa_sha1: false,
             verification_time: None,
             max_chain_depth: 9,
         }
@@ -216,7 +300,7 @@ impl DefaultKeyResolver {
                 .verification_time
                 .unwrap_or_else(SystemTime::now),
             max_chain_depth: self.config.max_chain_depth,
-            check_crls: false,
+            check_crls: self.config.check_crls,
         };
         verify_x509_certificate_chain(info, &options)?;
         Ok(())
@@ -296,6 +380,12 @@ impl DefaultKeyResolver {
         algorithm: SignatureAlgorithm,
     ) -> Result<Option<VerificationKey>, KeyResolutionError> {
         let public_key_bytes = match key_value {
+            KeyValueInfo::Dsa { p, q, g, y } => {
+                if algorithm != SignatureAlgorithm::DsaSha1 {
+                    return Err(KeyResolutionError::AlgorithmMismatch);
+                }
+                dsa_key_value_to_spki_der(p, q, g, y)?
+            }
             KeyValueInfo::Rsa { modulus, exponent } => {
                 if !matches!(
                     algorithm,
@@ -369,6 +459,15 @@ impl KeyResolver for DefaultKeyResolver {
                     })
                     .transpose()?,
                 KeyInfoSource::KeyValue(key_value) => {
+                    if self.config.allow_legacy_rsa_sha1
+                        && algorithm == SignatureAlgorithm::RsaSha1
+                        && let KeyValueInfo::Rsa { modulus, exponent } = key_value
+                    {
+                        let public_key_bytes = rsa_key_value_to_spki_der(modulus, exponent)?;
+                        return Ok(Some(Box::new(LegacyRsaSha1VerificationKey {
+                            public_key_bytes,
+                        })));
+                    }
                     match Self::resolve_key_value(key_value, algorithm) {
                         Ok(resolved) => resolved,
                         Err(error) if ec_key_value_error_allows_fallback(key_value, &error) => {
@@ -378,6 +477,7 @@ impl KeyResolver for DefaultKeyResolver {
                         Err(error) => return Err(error.into()),
                     }
                 }
+                KeyInfoSource::RetrievalMethod { .. } => None,
             };
             if let Some(key) = resolved {
                 return Ok(Some(Box::new(key)));
@@ -404,6 +504,25 @@ fn rsa_key_value_to_spki_der(
     )
     .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
     key.to_public_key_der()
+        .map_err(|_| KeyResolutionError::InvalidPublicKey)
+        .map(|der| der.as_bytes().to_vec())
+}
+
+fn dsa_key_value_to_spki_der(
+    p: &[u8],
+    q: &[u8],
+    g: &[u8],
+    y: &[u8],
+) -> Result<Vec<u8>, KeyResolutionError> {
+    let components = dsa::Components::from_components(
+        BoxedUint::from_be_slice_vartime(p),
+        BoxedUint::from_be_slice_vartime(q),
+        BoxedUint::from_be_slice_vartime(g),
+    )
+    .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+    dsa::VerifyingKey::from_components(components, BoxedUint::from_be_slice_vartime(y))
+        .map_err(|_| KeyResolutionError::InvalidPublicKey)?
+        .to_public_key_der()
         .map_err(|_| KeyResolutionError::InvalidPublicKey)
         .map(|der| der.as_bytes().to_vec())
 }
@@ -459,6 +578,11 @@ fn validate_spki_algorithm(
         .and_then(|value| value.as_oid().ok())
         .map(|oid| oid.to_id_string());
     match (algorithm, parsed) {
+        (SignatureAlgorithm::DsaSha1, PublicKey::DSA(_)) => {
+            let _ = dsa::VerifyingKey::from_public_key_der(public_key_bytes)
+                .map_err(|_| KeyResolutionError::AlgorithmMismatch)?;
+            Ok(())
+        }
         (
             SignatureAlgorithm::RsaSha1
             | SignatureAlgorithm::RsaSha256
@@ -571,8 +695,27 @@ mod tests {
         assert!(config.trusted_certs.is_empty());
         assert!(config.named_keys.is_empty());
         assert!(!config.verify_chains);
+        assert!(!config.check_crls);
+        assert!(!config.allow_legacy_rsa_sha1);
         assert_eq!(config.verification_time, None);
         assert_eq!(config.max_chain_depth, 9);
+    }
+
+    #[test]
+    fn hmac_key_rejects_empty_secret_and_wrong_algorithm() {
+        // HMAC secrets are caller-owned and cannot be reused as asymmetric keys.
+        assert!(matches!(
+            HmacSha1VerificationKey::new(Vec::new()),
+            Err(KeyResolutionError::InvalidPublicKey)
+        ));
+        let key = HmacSha1VerificationKey::new(b"secret".to_vec())
+            .expect("non-empty HMAC secret must be accepted");
+        assert!(matches!(
+            key.verify(SignatureAlgorithm::RsaSha256, b"data", b"signature"),
+            Err(DsigError::KeyResolution(
+                KeyResolutionError::AlgorithmMismatch
+            ))
+        ));
     }
 
     #[test]

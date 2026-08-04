@@ -2,6 +2,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use der::Decode;
+use dsa::pkcs8::DecodePublicKey;
+use sha1::{Digest, Sha1};
+use signature::hazmat::PrehashVerifier;
+
 use x509_parser::{
     certificate::X509Certificate, extensions::ParsedExtension, prelude::FromDer,
     revocation_list::CertificateRevocationList, time::ASN1Time,
@@ -121,7 +126,7 @@ pub fn verify_x509_certificate_chain(
         && last.verify_signature(None).is_ok()
     {
         let child = parse_certificate(path_der[path_der.len() - 2])?;
-        child.issuer() == last.subject() && child.verify_signature(Some(last.public_key())).is_ok()
+        child.issuer() == last.subject() && verify_certificate_signature(&child, &last)
     } else {
         false
     };
@@ -140,9 +145,7 @@ pub fn verify_x509_certificate_chain(
     let mut first_validation_error = None;
     for (anchor_der, _) in trusted_anchors.iter().filter(|(_, cert)| {
         cert.subject() == candidate_child.issuer()
-            && candidate_child
-                .verify_signature(Some(cert.public_key()))
-                .is_ok()
+            && verify_certificate_signature(&candidate_child, cert)
     }) {
         let mut candidate_path = candidate_base.to_vec();
         candidate_path.push(anchor_der);
@@ -185,9 +188,7 @@ fn validate_path(
         let [child, issuer] = pair else {
             unreachable!()
         };
-        if child.issuer() != issuer.subject()
-            || child.verify_signature(Some(issuer.public_key())).is_err()
-        {
+        if child.issuer() != issuer.subject() || !verify_certificate_signature(child, issuer) {
             return Err(X509ChainError::InvalidSignature(position));
         }
     }
@@ -196,6 +197,29 @@ fn validate_path(
         verify_crls(&path, &info.crls, verification_time)?;
     }
     Ok(())
+}
+
+fn verify_certificate_signature(
+    certificate: &X509Certificate<'_>,
+    issuer: &X509Certificate<'_>,
+) -> bool {
+    if certificate
+        .verify_signature(Some(issuer.public_key()))
+        .is_ok()
+    {
+        return true;
+    }
+    if certificate.signature_algorithm.algorithm.to_id_string() != "1.2.840.10040.4.3" {
+        return false;
+    }
+    let Ok(key) = dsa::VerifyingKey::from_public_key_der(issuer.public_key().raw) else {
+        return false;
+    };
+    let Ok(signature) = dsa::Signature::from_der(&certificate.signature_value.data) else {
+        return false;
+    };
+    let digest = Sha1::digest(certificate.tbs_certificate.as_ref());
+    key.verify_prehash(&digest, &signature).is_ok()
 }
 
 fn validate_leaf_key_usage(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {

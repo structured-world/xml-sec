@@ -12,19 +12,22 @@
 
 use base64::Engine;
 use roxmltree::{Document, Node, NodeId};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::c14n::canonicalize;
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 use super::parse::{
-    KeyInfo, MAX_REFERENCES_PER_SIGNATURE, ParseError, Reference, SignatureAlgorithm, XMLDSIG_NS,
+    KeyInfo, MAX_REFERENCES_PER_SIGNATURE, ParseError, Reference, RetrievalMethodTransforms,
+    SignatureAlgorithm, XMLDSIG_NS,
 };
 use super::parse::{
     parse_key_info, parse_reference_with_xpath_budget, parse_signed_info_with_xpath_budget,
+    parse_x509_certificate, parse_x509_data_dispatch, reference_digest_method,
 };
 use super::signature::{
-    SignatureVerificationError, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
+    SignatureVerificationError, verify_dsa_signature_spki, verify_ecdsa_signature_pem,
+    verify_rsa_signature_pem,
 };
 use super::transforms::{
     BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget,
@@ -36,6 +39,8 @@ use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
+const MAX_EXTERNAL_RESOURCE_LEN: usize = 8 * 1024 * 1024;
+const MAX_EXTERNAL_RESOURCE_TOTAL_LEN: usize = 32 * 1024 * 1024;
 /// Cryptographic verifier used by [`VerifyContext`].
 ///
 /// This trait intentionally has no `Send + Sync` supertraits so lightweight
@@ -80,9 +85,8 @@ pub trait KeyResolver {
 
 /// Allowed URI classes for `<Reference URI="...">`.
 ///
-/// Note: `UriReferenceResolver` currently supports only same-document URIs.
-/// Allowing external URIs via this policy only disables the early policy
-/// rejection; dereference still fails until an external resolver path is added.
+/// External URIs resolve only from bytes supplied through
+/// [`VerifyContext::external_resources`]; allowing them never enables I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "pass the policy to VerifyContext::allowed_uri_types(), or store it for reuse"]
 pub struct UriTypeSet {
@@ -110,8 +114,7 @@ impl UriTypeSet {
 
     /// Allow all URI classes.
     ///
-    /// This includes external URI classes at policy level, but external
-    /// dereference is not implemented yet by the default resolver.
+    /// External URIs still require an explicit caller-owned resource map.
     pub const ALL: Self = Self {
         allow_empty: true,
         allow_same_document: true,
@@ -145,6 +148,8 @@ pub struct VerifyContext<'a> {
     allowed_transforms: Option<HashSet<String>>,
     store_pre_digest: bool,
     transform_options: TransformOptions,
+    external_resources: Option<&'a HashMap<String, Vec<u8>>>,
+    allow_internal_dtd: bool,
 }
 
 impl<'a> VerifyContext<'a> {
@@ -165,6 +170,8 @@ impl<'a> VerifyContext<'a> {
             allowed_transforms: None,
             store_pre_digest: false,
             transform_options: TransformOptions::default(),
+            external_resources: None,
+            allow_internal_dtd: false,
         }
     }
 
@@ -218,6 +225,23 @@ impl<'a> VerifyContext<'a> {
     /// Restrict allowed reference URI classes.
     pub fn allowed_uri_types(mut self, types: UriTypeSet) -> Self {
         self.allowed_uri_types = types;
+        self
+    }
+
+    /// Provide external URI payloads explicitly.
+    ///
+    /// The map is the complete external I/O boundary: verification never
+    /// performs network or filesystem access. External URIs must also be
+    /// enabled through [`UriTypeSet`].
+    pub fn external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
+        self.external_resources = Some(resources);
+        self
+    }
+
+    /// Allow bounded internal DTD declarations while keeping external entity
+    /// resolution disabled. This is off by default.
+    pub fn allow_internal_dtd(mut self, enabled: bool) -> Self {
+        self.allow_internal_dtd = enabled;
         self
     }
 
@@ -710,7 +734,14 @@ fn verify_signature_with_context(
     xml: &str,
     ctx: &VerifyContext<'_>,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
-    let doc = Document::parse(xml)?;
+    let doc = Document::parse_with_options(
+        xml,
+        roxmltree::ParsingOptions {
+            allow_dtd: ctx.allow_internal_dtd,
+            nodes_limit: 100_000,
+            entity_resolver: None,
+        },
+    )?;
     let mut signatures = doc.descendants().filter(|node| {
         node.is_element()
             && node.tag_name().name() == "Signature"
@@ -737,7 +768,7 @@ fn verify_signature_with_context(
         (None, Some(resolver)) => resolver.consumes_document_key_info(),
         (None, None) => true,
     };
-    let key_info = if should_parse_key_info {
+    let mut key_info = if should_parse_key_info {
         signature_children
             .key_info_node
             .map(parse_key_info)
@@ -756,7 +787,38 @@ fn verify_signature_with_context(
         ctx.allowed_transform_uris(),
     )?;
 
-    let resolver = UriReferenceResolver::new(&doc);
+    if let Some(resources) = ctx.external_resources {
+        let mut total = 0usize;
+        for bytes in resources.values() {
+            if bytes.len() > MAX_EXTERNAL_RESOURCE_LEN {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "external resource exceeds maximum allowed length",
+                });
+            }
+            total = total.checked_add(bytes.len()).ok_or(
+                SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "external resource total length overflow",
+                },
+            )?;
+        }
+        if total > MAX_EXTERNAL_RESOURCE_TOTAL_LEN {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "external resources exceed maximum aggregate length",
+            });
+        }
+    }
+    let resolver = match ctx.external_resources {
+        Some(resources) => UriReferenceResolver::new(&doc).with_external_resources(resources),
+        None => UriReferenceResolver::new(&doc),
+    };
+    if let Some(info) = key_info.as_mut() {
+        materialize_retrieval_methods(
+            info,
+            &resolver,
+            ctx.external_resources,
+            ctx.allowed_uri_types,
+        )?;
+    }
     let execution_budget = TransformExecutionBudget::default();
     let execution = ReferenceExecutionContext {
         store_pre_digest: ctx.store_pre_digest,
@@ -793,6 +855,14 @@ fn verify_signature_with_context(
     )?;
 
     let signature_value = decode_signature_value(signature_children.signature_value_node)?;
+    if signed_info.signature_method == SignatureAlgorithm::HmacSha1 {
+        let expected_bits = signed_info.hmac_output_length_bits.unwrap_or(160);
+        if signature_value.len() != expected_bits / 8 {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignatureValue length does not match HMACOutputLength",
+            });
+        }
+    }
     let Some(resolved_key) =
         resolve_verifying_key(ctx, key_info.as_ref(), signed_info.signature_method)?
     else {
@@ -854,6 +924,99 @@ fn verify_signature_with_context(
     })
 }
 
+fn materialize_retrieval_methods(
+    key_info: &mut KeyInfo,
+    resolver: &UriReferenceResolver<'_>,
+    external_resources: Option<&HashMap<String, Vec<u8>>>,
+    allowed_uri_types: UriTypeSet,
+) -> Result<(), SignatureVerificationPipelineError> {
+    let retrievals = key_info
+        .sources
+        .iter()
+        .filter_map(|source| match source {
+            super::parse::KeyInfoSource::RetrievalMethod {
+                uri,
+                resource_type,
+                transforms,
+            } => Some((uri.clone(), resource_type.clone(), *transforms)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (uri, resource_type, transforms) in retrievals {
+        if resource_type.as_deref() == Some("http://www.w3.org/2000/09/xmldsig#rawX509Certificate")
+        {
+            if !allowed_uri_types.allows(&uri) {
+                return Err(SignatureVerificationPipelineError::DisallowedUri { uri });
+            }
+            if transforms != RetrievalMethodTransforms::None || uri.starts_with('#') {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "raw X509 RetrievalMethod requires an untransformed external URI",
+                });
+            }
+            let certificate = external_resources
+                .and_then(|resources| resources.get(&uri))
+                .ok_or_else(|| {
+                    SignatureVerificationPipelineError::Reference(
+                        ReferenceProcessingError::Transform(super::TransformError::UnsupportedUri(
+                            uri.clone(),
+                        )),
+                    )
+                })?;
+            let parsed = parse_x509_certificate(certificate)
+                .map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
+            key_info.sources.push(super::parse::KeyInfoSource::X509Data(
+                super::parse::X509DataInfo {
+                    certificates: vec![certificate.clone()],
+                    parsed_certificates: vec![parsed],
+                    certificate_chain: vec![0],
+                    ..super::parse::X509DataInfo::default()
+                },
+            ));
+        } else if resource_type.as_deref() == Some("http://www.w3.org/2000/09/xmldsig#X509Data") {
+            if !allowed_uri_types.allows(&uri) {
+                return Err(SignatureVerificationPipelineError::DisallowedUri { uri });
+            }
+            if transforms != RetrievalMethodTransforms::X509DataAncestor {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "X509Data RetrievalMethod requires the supported XPath selection",
+                });
+            }
+            let id = uri.strip_prefix('#').ok_or(
+                SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "X509Data RetrievalMethod requires a same-document URI",
+                },
+            )?;
+            let target = resolver.node_for_id(id).ok_or(
+                SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "X509Data RetrievalMethod target is missing or ambiguous",
+                },
+            )?;
+            let mut selected = target.descendants().filter(|candidate| {
+                candidate.is_element()
+                    && candidate.tag_name().namespace() == Some(XMLDSIG_NS)
+                    && candidate.tag_name().name() == "X509Data"
+            });
+            let node =
+                selected
+                    .next()
+                    .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "X509Data RetrievalMethod selected no X509Data element",
+                    })?;
+            if selected.next().is_some() {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "X509Data RetrievalMethod selected multiple X509Data elements",
+                });
+            }
+            let data = parse_x509_data_dispatch(node)
+                .map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
+            key_info
+                .sources
+                .push(super::parse::KeyInfoSource::X509Data(data));
+        }
+    }
+    Ok(())
+}
+
 fn process_manifest_references(
     signature_node: Node<'_, '_>,
     resolver: &UriReferenceResolver<'_>,
@@ -862,16 +1025,18 @@ fn process_manifest_references(
     execution: &ReferenceExecutionContext<'_>,
     xpath_parse_budget: &mut XPathSignatureParseBudget,
 ) -> Result<Vec<ReferenceResult>, SignatureVerificationPipelineError> {
-    let manifest_references = parse_manifest_references(
+    let parsed = parse_manifest_references(
         signature_node,
         signed_info_reference_nodes,
         xpath_parse_budget,
     )?;
-    if manifest_references.is_empty() {
+    let manifest_references = parsed.references;
+    let mut results = parsed.invalid_results;
+    if manifest_references.is_empty() && results.is_empty() {
         return Ok(Vec::new());
     }
-    let mut results = Vec::with_capacity(manifest_references.len());
-    for (index, reference) in manifest_references.iter().enumerate() {
+    results.reserve(manifest_references.len());
+    for (index, reference) in &manifest_references {
         match enforce_reference_policies(
             std::slice::from_ref(reference),
             ctx.allowed_uri_types,
@@ -884,8 +1049,8 @@ fn process_manifest_references(
             ) => {
                 results.push(manifest_reference_invalid_result(
                     reference,
-                    index,
-                    FailureReason::ReferencePolicyViolation { ref_index: index },
+                    *index,
+                    FailureReason::ReferencePolicyViolation { ref_index: *index },
                 ));
                 continue;
             }
@@ -894,8 +1059,8 @@ fn process_manifest_references(
             )) => {
                 results.push(manifest_reference_invalid_result(
                     reference,
-                    index,
-                    FailureReason::ReferenceProcessingFailure { ref_index: index },
+                    *index,
+                    FailureReason::ReferenceProcessingFailure { ref_index: *index },
                 ));
                 continue;
             }
@@ -904,8 +1069,8 @@ fn process_manifest_references(
                 // record as non-fatal per-reference processing failure instead of aborting.
                 results.push(manifest_reference_invalid_result(
                     reference,
-                    index,
-                    FailureReason::ReferenceProcessingFailure { ref_index: index },
+                    *index,
+                    FailureReason::ReferenceProcessingFailure { ref_index: *index },
                 ));
                 continue;
             }
@@ -916,17 +1081,18 @@ fn process_manifest_references(
             resolver,
             signature_node,
             ReferenceSet::Manifest,
-            index,
+            *index,
             execution,
         ) {
             Ok(result) => results.push(result),
             Err(_) => results.push(manifest_reference_invalid_result(
                 reference,
-                index,
-                FailureReason::ReferenceProcessingFailure { ref_index: index },
+                *index,
+                FailureReason::ReferenceProcessingFailure { ref_index: *index },
             )),
         }
     }
+    results.sort_by_key(|result| result.reference_index);
     Ok(results)
 }
 
@@ -952,8 +1118,10 @@ fn parse_manifest_references(
     signature_node: Node<'_, '_>,
     signed_info_reference_nodes: &HashSet<NodeId>,
     xpath_parse_budget: &mut XPathSignatureParseBudget,
-) -> Result<Vec<Reference>, SignatureVerificationPipelineError> {
+) -> Result<ParsedManifestReferences, SignatureVerificationPipelineError> {
     let mut references = Vec::new();
+    let mut invalid = Vec::new();
+    let mut reference_index = 0usize;
     for object_node in signature_node.children().filter(|node| {
         node.is_element()
             && node.tag_name().namespace() == Some(XMLDSIG_NS)
@@ -1002,14 +1170,44 @@ fn parse_manifest_references(
                         reason: "signed Manifests exceed the per-signature Reference limit",
                     });
                 }
-                references.push(
-                    parse_reference_with_xpath_budget(child, xpath_parse_budget)
-                        .map_err(SignatureVerificationPipelineError::ParseManifestReference)?,
-                );
+                match parse_reference_with_xpath_budget(child, xpath_parse_budget) {
+                    Ok(reference) => references.push((reference_index, reference)),
+                    Err(ParseError::Transform(super::TransformError::UnsupportedTransform(_))) => {
+                        let digest_algorithm = reference_digest_method(child).map_err(|error| {
+                            SignatureVerificationPipelineError::ParseManifestReference(error)
+                        })?;
+                        invalid.push(ReferenceResult {
+                            reference_set: ReferenceSet::Manifest,
+                            reference_index,
+                            uri: child.attribute("URI").unwrap_or("<omitted>").to_owned(),
+                            digest_algorithm,
+                            status: DsigStatus::Invalid(
+                                FailureReason::ReferenceProcessingFailure {
+                                    ref_index: reference_index,
+                                },
+                            ),
+                            pre_digest_data: None,
+                        });
+                    }
+                    Err(error) => {
+                        return Err(SignatureVerificationPipelineError::ParseManifestReference(
+                            error,
+                        ));
+                    }
+                }
+                reference_index += 1;
             }
         }
     }
-    Ok(references)
+    Ok(ParsedManifestReferences {
+        references,
+        invalid_results: invalid,
+    })
+}
+
+struct ParsedManifestReferences {
+    references: Vec<(usize, Reference)>,
+    invalid_results: Vec<ReferenceResult>,
 }
 
 fn collect_authenticated_signed_info_reference_nodes(
@@ -1324,6 +1522,23 @@ fn verify_with_algorithm(
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationPipelineError> {
     match algorithm {
+        SignatureAlgorithm::DsaSha1 => {
+            let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
+                .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
+            if !rest.iter().all(|byte| byte.is_ascii_whitespace()) || pem.label != "PUBLIC KEY" {
+                return Err(SignatureVerificationError::InvalidKeyPem.into());
+            }
+            Ok(verify_dsa_signature_spki(
+                algorithm,
+                &pem.contents,
+                signed_data,
+                signature_value,
+            )?)
+        }
+        SignatureAlgorithm::HmacSha1 => Err(SignatureVerificationError::UnsupportedAlgorithm {
+            uri: algorithm.uri().to_string(),
+        }
+        .into()),
         SignatureAlgorithm::RsaSha1
         | SignatureAlgorithm::RsaSha256
         | SignatureAlgorithm::RsaSha384
@@ -2117,6 +2332,66 @@ mod tests {
             .expect_err("invalid Manifest DigestValue must map to ParseManifestReference");
         assert!(matches!(
             err,
+            SignatureVerificationPipelineError::ParseManifestReference(_)
+        ));
+    }
+
+    #[test]
+    fn verify_context_reports_unsupported_manifest_transform_with_declared_digest() {
+        // Unsupported optional Manifest transforms do not invalidate core
+        // SignedInfo, but their result must preserve the declared digest method.
+        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
+            let xml = xml.replacen(
+                "<ds:Reference URI=\"#target\">",
+                "<ds:Reference URI=\"#target\"><ds:Transforms><ds:Transform Algorithm=\"urn:unsupported\"/></ds:Transforms>",
+                1,
+            );
+            let xml = xml.replacen(
+                "</ds:Transforms>\n          <ds:DigestMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#sha1\"/>",
+                "</ds:Transforms>\n          <ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+                1,
+            );
+            replace_fixture_manifest_digest(&xml, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        });
+        assert!(xml.contains("urn:unsupported"));
+        assert!(xml.contains("http://www.w3.org/2001/04/xmlenc#sha256"));
+
+        let result = VerifyContext::new()
+            .key(&AcceptingKey)
+            .process_manifests(true)
+            .verify(&xml)
+            .expect("unsupported Manifest transform is a per-reference result");
+        assert_eq!(result.status, DsigStatus::Valid);
+        assert_eq!(result.manifest_references.len(), 1);
+        assert_eq!(
+            result.manifest_references[0].digest_algorithm,
+            DigestAlgorithm::Sha256
+        );
+        assert!(matches!(
+            result.manifest_references[0].status,
+            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
+        ));
+    }
+
+    #[test]
+    fn verify_context_does_not_hide_malformed_digest_behind_unsupported_transform() {
+        // A bad DigestValue remains a parse error even when its transform URI is unsupported.
+        let broken_xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
+            let xml = xml.replacen(
+                "<ds:Reference URI=\"#target\">",
+                "<ds:Reference URI=\"#target\"><ds:Transforms><ds:Transform Algorithm=\"urn:unsupported\"/></ds:Transforms>",
+                1,
+            );
+            replace_fixture_manifest_digest(&xml, "!!!")
+        });
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .process_manifests(true)
+            .verify(&broken_xml)
+            .expect_err("malformed Manifest digest must not become a validity result");
+        assert!(matches!(
+            error,
             SignatureVerificationPipelineError::ParseManifestReference(_)
         ));
     }

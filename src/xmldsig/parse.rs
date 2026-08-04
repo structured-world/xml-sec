@@ -56,6 +56,10 @@ pub(crate) const MAX_REFERENCES_PER_SIGNATURE: usize = 64;
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SignatureAlgorithm {
+    /// DSA with SHA-1. Verify-only legacy XMLDSig algorithm.
+    DsaSha1,
+    /// HMAC with SHA-1. Verify-only legacy XMLDSig algorithm.
+    HmacSha1,
     /// RSA with SHA-1. **Verify-only** — signing disabled.
     RsaSha1,
     /// RSA with SHA-256 (most common in SAML).
@@ -80,6 +84,8 @@ impl SignatureAlgorithm {
     #[must_use]
     pub fn from_uri(uri: &str) -> Option<Self> {
         match uri {
+            "http://www.w3.org/2000/09/xmldsig#dsa-sha1" => Some(Self::DsaSha1),
+            "http://www.w3.org/2000/09/xmldsig#hmac-sha1" => Some(Self::HmacSha1),
             "http://www.w3.org/2000/09/xmldsig#rsa-sha1" => Some(Self::RsaSha1),
             "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256" => Some(Self::RsaSha256),
             "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384" => Some(Self::RsaSha384),
@@ -94,6 +100,8 @@ impl SignatureAlgorithm {
     #[must_use]
     pub fn uri(self) -> &'static str {
         match self {
+            Self::DsaSha1 => "http://www.w3.org/2000/09/xmldsig#dsa-sha1",
+            Self::HmacSha1 => "http://www.w3.org/2000/09/xmldsig#hmac-sha1",
             Self::RsaSha1 => "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
             Self::RsaSha256 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
             Self::RsaSha384 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384",
@@ -106,7 +114,7 @@ impl SignatureAlgorithm {
     /// Whether this algorithm is allowed for signing (not just verification).
     #[must_use]
     pub fn signing_allowed(self) -> bool {
-        !matches!(self, Self::RsaSha1)
+        !matches!(self, Self::RsaSha1 | Self::DsaSha1 | Self::HmacSha1)
     }
 }
 
@@ -117,6 +125,8 @@ pub struct SignedInfo {
     pub c14n_method: C14nAlgorithm,
     /// Signature algorithm.
     pub signature_method: SignatureAlgorithm,
+    /// Optional byte-aligned HMAC output length in bits.
+    pub hmac_output_length_bits: Option<usize>,
     /// One or more `<Reference>` elements.
     pub references: Vec<Reference>,
 }
@@ -158,12 +168,42 @@ pub enum KeyInfoSource {
     X509Data(X509DataInfo),
     /// `dsig11:DEREncodedKeyValue` source (base64-decoded DER bytes).
     DerEncodedKeyValue(Vec<u8>),
+    /// `<RetrievalMethod>` URI and optional type URI.
+    RetrievalMethod {
+        /// Resource URI.
+        uri: String,
+        /// Declared resource type.
+        resource_type: Option<String>,
+        /// Supported transform shape declared by the retrieval method.
+        transforms: RetrievalMethodTransforms,
+    },
+}
+
+/// Transform forms accepted on `<RetrievalMethod>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RetrievalMethodTransforms {
+    /// No transform chain is present.
+    None,
+    /// Select the `ds:X509Data` ancestor-or-self node from a same-document object.
+    X509DataAncestor,
 }
 
 /// Parsed `<KeyValue>` dispatch result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeyValueInfo {
+    /// `<DSAKeyValue>` public parameters.
+    Dsa {
+        /// Prime modulus P.
+        p: Vec<u8>,
+        /// Prime divisor Q.
+        q: Vec<u8>,
+        /// Generator G.
+        g: Vec<u8>,
+        /// Public value Y.
+        y: Vec<u8>,
+    },
     /// `<RSAKeyValue>` with unsigned big-endian CryptoBinary parameters.
     Rsa {
         /// RSA modulus.
@@ -368,6 +408,7 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
         SignatureAlgorithm::from_uri(sig_uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
             uri: sig_uri.to_string(),
         })?;
+    let hmac_output_length_bits = parse_hmac_output_length(sig_method_node, signature_method)?;
 
     // 3. One or more Reference elements
     let mut references = Vec::new();
@@ -389,8 +430,42 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
     Ok(SignedInfo {
         c14n_method,
         signature_method,
+        hmac_output_length_bits,
         references,
     })
+}
+
+fn parse_hmac_output_length(
+    node: Node<'_, '_>,
+    algorithm: SignatureAlgorithm,
+) -> Result<Option<usize>, ParseError> {
+    ensure_no_non_whitespace_text(node, "SignatureMethod")?;
+    let mut children = element_children(node);
+    let Some(child) = children.next() else {
+        return Ok(None);
+    };
+    if algorithm != SignatureAlgorithm::HmacSha1
+        || child.tag_name().namespace() != Some(XMLDSIG_NS)
+        || child.tag_name().name() != "HMACOutputLength"
+        || children.next().is_some()
+    {
+        return Err(ParseError::InvalidStructure(
+            "SignatureMethod parameters do not match the selected algorithm".into(),
+        ));
+    }
+    ensure_no_element_children(child, "HMACOutputLength")?;
+    let bits = child
+        .text()
+        .unwrap_or_default()
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| ParseError::InvalidStructure("invalid HMACOutputLength".into()))?;
+    if !(80..=160).contains(&bits) || !bits.is_multiple_of(8) {
+        return Err(ParseError::InvalidStructure(
+            "HMACOutputLength must be a byte-aligned value from 80 through 160".into(),
+        ));
+    }
+    Ok(Some(bits))
 }
 
 /// Parse a single `<ds:Reference>` element.
@@ -417,12 +492,16 @@ pub(crate) fn parse_reference_with_xpath_budget(
 
     // Optional <Transforms>
     let mut transforms = Vec::new();
+    let mut transform_error = None;
     let mut next = children.next().ok_or(ParseError::MissingElement {
         element: "DigestMethod",
     })?;
 
     if next.tag_name().name() == "Transforms" && next.tag_name().namespace() == Some(XMLDSIG_NS) {
-        transforms = transforms::parse_transforms_with_budget(next, xpath_budget)?;
+        match transforms::parse_transforms_with_budget(next, xpath_budget) {
+            Ok(parsed) => transforms = parsed,
+            Err(error) => transform_error = Some(error),
+        }
         next = children.next().ok_or(ParseError::MissingElement {
             element: "DigestMethod",
         })?;
@@ -451,6 +530,13 @@ pub(crate) fn parse_reference_with_xpath_budget(
         )));
     }
 
+    // Validate the complete Reference before reporting an unsupported transform.
+    // This prevents malformed DigestMethod/DigestValue content from being
+    // downgraded to a non-fatal unsupported Manifest transform result.
+    if let Some(error) = transform_error {
+        return Err(ParseError::Transform(error));
+    }
+
     Ok(Reference {
         uri,
         id,
@@ -458,6 +544,26 @@ pub(crate) fn parse_reference_with_xpath_budget(
         transforms,
         digest_method,
         digest_value,
+    })
+}
+
+pub(crate) fn reference_digest_method(
+    reference_node: Node<'_, '_>,
+) -> Result<DigestAlgorithm, ParseError> {
+    verify_ds_element(reference_node, "Reference")?;
+    let mut children = element_children(reference_node);
+    let mut next = children.next().ok_or(ParseError::MissingElement {
+        element: "DigestMethod",
+    })?;
+    if next.tag_name().namespace() == Some(XMLDSIG_NS) && next.tag_name().name() == "Transforms" {
+        next = children.next().ok_or(ParseError::MissingElement {
+            element: "DigestMethod",
+        })?;
+    }
+    verify_ds_element(next, "DigestMethod")?;
+    let uri = required_algorithm_attr(next, "DigestMethod")?;
+    DigestAlgorithm::from_uri(uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
+        uri: uri.to_owned(),
     })
 }
 
@@ -494,6 +600,23 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
                 let x509 = parse_x509_data_dispatch(child)?;
                 sources.push(KeyInfoSource::X509Data(x509));
             }
+            (Some(XMLDSIG_NS), "RetrievalMethod") => {
+                ensure_no_non_whitespace_text(child, "RetrievalMethod")?;
+                let uri = child.attribute("URI").ok_or_else(|| {
+                    ParseError::InvalidStructure("RetrievalMethod requires URI".into())
+                })?;
+                if uri.len() > MAX_KEY_NAME_TEXT_LEN {
+                    return Err(ParseError::InvalidStructure(
+                        "RetrievalMethod URI exceeds maximum length".into(),
+                    ));
+                }
+                let transforms = parse_retrieval_method_transforms(child)?;
+                sources.push(KeyInfoSource::RetrievalMethod {
+                    uri: uri.to_string(),
+                    resource_type: child.attribute("Type").map(str::to_string),
+                    transforms,
+                });
+            }
             (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
                 ensure_no_element_children(child, "DEREncodedKeyValue")?;
                 let der = decode_der_encoded_key_value_base64(child)?;
@@ -504,6 +627,54 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
     }
 
     Ok(KeyInfo { sources })
+}
+
+fn parse_retrieval_method_transforms(
+    node: Node<'_, '_>,
+) -> Result<RetrievalMethodTransforms, ParseError> {
+    let mut children = element_children(node);
+    let Some(transforms) = children.next() else {
+        return Ok(RetrievalMethodTransforms::None);
+    };
+    if children.next().is_some()
+        || transforms.tag_name().namespace() != Some(XMLDSIG_NS)
+        || transforms.tag_name().name() != "Transforms"
+    {
+        return Err(ParseError::InvalidStructure(
+            "RetrievalMethod accepts only one optional ds:Transforms child".into(),
+        ));
+    }
+    ensure_no_non_whitespace_text(transforms, "Transforms")?;
+    let mut transform_children = element_children(transforms);
+    let transform = transform_children.next().ok_or_else(|| {
+        ParseError::InvalidStructure("RetrievalMethod Transforms must not be empty".into())
+    })?;
+    if transform_children.next().is_some()
+        || transform.tag_name().namespace() != Some(XMLDSIG_NS)
+        || transform.tag_name().name() != "Transform"
+        || transform.attribute("Algorithm") != Some(transforms::XPATH_TRANSFORM_URI)
+    {
+        return Err(ParseError::InvalidStructure(
+            "unsupported RetrievalMethod transform chain".into(),
+        ));
+    }
+    ensure_no_non_whitespace_text(transform, "Transform")?;
+    let mut parameters = element_children(transform);
+    let xpath = parameters.next().ok_or_else(|| {
+        ParseError::InvalidStructure("RetrievalMethod XPath parameter is missing".into())
+    })?;
+    if parameters.next().is_some()
+        || xpath.tag_name().namespace() != Some(XMLDSIG_NS)
+        || xpath.tag_name().name() != "XPath"
+        || xpath.text().unwrap_or_default().trim() != "ancestor-or-self::dsig:X509Data"
+        || xpath.lookup_namespace_uri(Some("dsig")) != Some(XMLDSIG_NS)
+    {
+        return Err(ParseError::InvalidStructure(
+            "unsupported RetrievalMethod XPath selection".into(),
+        ));
+    }
+    ensure_no_element_children(xpath, "XPath")?;
+    Ok(RetrievalMethodTransforms::X509DataAncestor)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -613,12 +784,37 @@ fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
         first_child.tag_name().name(),
     ) {
         (Some(XMLDSIG_NS), "RSAKeyValue") => parse_rsa_key_value(first_child),
+        (Some(XMLDSIG_NS), "DSAKeyValue") => parse_dsa_key_value(first_child),
         (Some(XMLDSIG11_NS), "ECKeyValue") => parse_ec_key_value(first_child),
         (namespace, child_name) => Ok(KeyValueInfo::Unsupported {
             namespace: namespace.map(str::to_string),
             local_name: child_name.to_string(),
         }),
     }
+}
+
+fn parse_dsa_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
+    verify_ds_element(node, "DSAKeyValue")?;
+    ensure_no_non_whitespace_text(node, "DSAKeyValue")?;
+    let mut children = element_children(node);
+    let mut next = |name| -> Result<Vec<u8>, ParseError> {
+        let child = children
+            .next()
+            .ok_or_else(|| ParseError::InvalidStructure(format!("DSAKeyValue requires {name}")))?;
+        verify_ds_element(child, name)?;
+        ensure_no_element_children(child, name)?;
+        decode_crypto_binary(child, name, MAX_RSA_MODULUS_LEN)
+    };
+    let p = next("P")?;
+    let q = next("Q")?;
+    let g = next("G")?;
+    let y = next("Y")?;
+    if children.next().is_some() {
+        return Err(ParseError::InvalidStructure(
+            "DSAKeyValue supports exactly P, Q, G, and Y".into(),
+        ));
+    }
+    Ok(KeyValueInfo::Dsa { p, q, g, y })
 }
 
 fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
@@ -792,7 +988,7 @@ fn decode_crypto_binary(
     Ok(value)
 }
 
-fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
+pub(crate) fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
     verify_ds_element(node, "X509Data")?;
     ensure_no_non_whitespace_text(node, "X509Data")?;
 
@@ -1001,7 +1197,7 @@ pub(crate) fn x509_certificate_matches_any_selector(
     let subject_match = info
         .subject_names
         .iter()
-        .any(|subject| subject.trim() == certificate.subject_dn);
+        .any(|subject| distinguished_names_equal(subject, &certificate.subject_dn));
     let mut issuer_serial_match = false;
     for (issuer, serial) in &info.issuer_serials {
         let serial_hex = x509_serial_decimal_to_hex(serial).ok_or_else(|| {
@@ -1009,8 +1205,8 @@ pub(crate) fn x509_certificate_matches_any_selector(
                 "X509Data lookup identifiers contain an invalid serial number".into(),
             )
         })?;
-        issuer_serial_match |=
-            issuer.trim() == certificate.issuer_dn && serial_hex == certificate.serial_number_hex;
+        issuer_serial_match |= distinguished_names_equal(issuer, &certificate.issuer_dn)
+            && serial_hex == certificate.serial_number_hex;
     }
     let ski_match = certificate
         .subject_key_identifier
@@ -1034,7 +1230,7 @@ pub(crate) fn x509_selector_categories_match_chain(
     let subject_match = info.subject_names.iter().all(|subject| {
         info.parsed_certificates
             .iter()
-            .any(|certificate| subject.trim() == certificate.subject_dn)
+            .any(|certificate| distinguished_names_equal(subject, &certificate.subject_dn))
     });
 
     let mut issuer_serial_match = true;
@@ -1045,7 +1241,8 @@ pub(crate) fn x509_selector_categories_match_chain(
             )
         })?;
         issuer_serial_match &= info.parsed_certificates.iter().any(|certificate| {
-            issuer.trim() == certificate.issuer_dn && serial_hex == certificate.serial_number_hex
+            distinguished_names_equal(issuer, &certificate.issuer_dn)
+                && serial_hex == certificate.serial_number_hex
         });
     }
 
@@ -1072,6 +1269,19 @@ pub(crate) fn x509_selector_categories_match_chain(
     }
 
     Ok(subject_match && issuer_serial_match && ski_match && digest_match)
+}
+
+fn distinguished_names_equal(left: &str, right: &str) -> bool {
+    fn components(name: &str) -> Vec<&str> {
+        name.trim()
+            .split(',')
+            .map(str::trim)
+            .filter(|component| !component.is_empty())
+            .collect()
+    }
+    let left = components(left);
+    let right = components(right);
+    left == right || left.iter().eq(right.iter().rev())
 }
 
 fn ensure_x509_data_entry_budget(info: &X509DataInfo) -> Result<(), ParseError> {
@@ -1550,6 +1760,8 @@ mod tests {
     #[test]
     fn signature_algorithm_uri_round_trip() {
         for algo in [
+            SignatureAlgorithm::DsaSha1,
+            SignatureAlgorithm::HmacSha1,
             SignatureAlgorithm::RsaSha1,
             SignatureAlgorithm::RsaSha256,
             SignatureAlgorithm::RsaSha384,
@@ -1566,7 +1778,9 @@ mod tests {
     }
 
     #[test]
-    fn rsa_sha1_verify_only() {
+    fn legacy_algorithms_are_verify_only() {
+        assert!(!SignatureAlgorithm::DsaSha1.signing_allowed());
+        assert!(!SignatureAlgorithm::HmacSha1.signing_allowed());
         assert!(!SignatureAlgorithm::RsaSha1.signing_allowed());
         assert!(SignatureAlgorithm::RsaSha256.signing_allowed());
         assert!(SignatureAlgorithm::EcdsaP256Sha256.signing_allowed());
@@ -1709,13 +1923,13 @@ mod tests {
     #[test]
     fn parse_rsa_key_value_preserves_wrapped_crypto_binary() {
         // CryptoBinary is unsigned big-endian data and XML whitespace is insignificant.
-        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue><RSAKeyValue>
                 <Modulus> AQID
 BA== </Modulus>
                 <Exponent> AQAB </Exponent>
             </RSAKeyValue></KeyValue>
-        </KeyInfo>"#;
+        </KeyInfo>"##;
         let doc = Document::parse(xml).unwrap();
 
         assert_eq!(
@@ -1730,11 +1944,11 @@ BA== </Modulus>
     #[test]
     fn parse_rsa_key_value_rejects_reordered_parameters() {
         // XMLDSig defines Modulus followed by Exponent; accepting reordered input is ambiguous.
-        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue><RSAKeyValue>
                 <Exponent>AQAB</Exponent><Modulus>AQID</Modulus>
             </RSAKeyValue></KeyValue>
-        </KeyInfo>"#;
+        </KeyInfo>"##;
         let doc = Document::parse(xml).unwrap();
 
         assert!(matches!(
@@ -1746,9 +1960,9 @@ BA== </Modulus>
     #[test]
     fn parse_rsa_key_value_rejects_missing_exponent() {
         // Both RSA public parameters are required to construct a usable key.
-        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue><RSAKeyValue><Modulus>AQID</Modulus></RSAKeyValue></KeyValue>
-        </KeyInfo>"#;
+        </KeyInfo>"##;
         let doc = Document::parse(xml).unwrap();
 
         assert!(matches!(
@@ -1760,11 +1974,11 @@ BA== </Modulus>
     #[test]
     fn parse_rsa_key_value_rejects_duplicate_exponent() {
         // RSAKeyValue has a closed two-child schema; duplicate parameters are invalid.
-        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue><RSAKeyValue>
                 <Modulus>AQID</Modulus><Exponent>AQAB</Exponent><Exponent>AQAB</Exponent>
             </RSAKeyValue></KeyValue>
-        </KeyInfo>"#;
+        </KeyInfo>"##;
         let doc = Document::parse(xml).unwrap();
 
         assert!(matches!(
@@ -2664,7 +2878,7 @@ BA== </Modulus>
     fn parse_key_info_keeps_unsupported_keyvalue_child_as_marker() {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue>
-                <DSAKeyValue/>
+                <FutureKeyValue/>
             </KeyValue>
         </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
@@ -2674,9 +2888,49 @@ BA== </Modulus>
             key_info.sources,
             vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
                 namespace: Some(XMLDSIG_NS.to_string()),
-                local_name: "DSAKeyValue".into(),
+                local_name: "FutureKeyValue".into(),
             })]
         );
+    }
+
+    #[test]
+    fn parse_key_info_accepts_supported_x509_retrieval_xpath() {
+        // Merlin's same-document RetrievalMethod selects only X509Data nodes.
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+          <RetrievalMethod Type="http://www.w3.org/2000/09/xmldsig#X509Data" URI="#keys">
+            <Transforms><Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+              <XPath xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">ancestor-or-self::dsig:X509Data</XPath>
+            </Transform></Transforms>
+          </RetrievalMethod>
+        </KeyInfo>"##;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [KeyInfoSource::RetrievalMethod {
+                uri,
+                resource_type: Some(resource_type),
+                transforms: RetrievalMethodTransforms::X509DataAncestor,
+            }] if uri == "#keys"
+                && resource_type == "http://www.w3.org/2000/09/xmldsig#X509Data"
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_unimplemented_retrieval_transform() {
+        // Retrieval transforms must never be silently ignored when choosing a key.
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+          <RetrievalMethod URI="#keys"><Transforms>
+            <Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/>
+          </Transforms></RetrievalMethod>
+        </KeyInfo>"##;
+        let doc = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element()),
+            Err(ParseError::InvalidStructure(_))
+        ));
     }
 
     #[test]

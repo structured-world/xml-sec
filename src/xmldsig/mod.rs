@@ -69,10 +69,14 @@ mod xpath;
 
 pub use builder::{ReferenceBuilder, SignatureBuilder, SignatureBuilderError};
 pub use digest::{DigestAlgorithm, compute_digest, constant_time_eq};
-pub use keys::{DefaultKeyResolver, KeyResolutionError, KeyResolverConfig, VerificationKey};
+pub use keys::{
+    DefaultKeyResolver, HmacSha1VerificationKey, KeyResolutionError, KeyResolverConfig,
+    VerificationKey,
+};
 pub use parse::{
-    KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, SignatureAlgorithm, SignedInfo,
-    X509DataInfo, find_signature_node, parse_key_info, parse_reference, parse_signed_info,
+    KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, RetrievalMethodTransforms,
+    SignatureAlgorithm, SignedInfo, X509DataInfo, find_signature_node, parse_key_info,
+    parse_reference, parse_signed_info,
 };
 pub use sign::{
     ComputedReferenceDigest, EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriteError,
@@ -81,8 +85,8 @@ pub use sign::{
     compute_reference_digest_values, fill_reference_digest_values,
 };
 pub use signature::{
-    SignatureVerificationError, verify_ecdsa_signature_pem, verify_ecdsa_signature_spki,
-    verify_rsa_signature_pem, verify_rsa_signature_spki,
+    SignatureVerificationError, verify_dsa_signature_spki, verify_ecdsa_signature_pem,
+    verify_ecdsa_signature_spki, verify_rsa_signature_pem, verify_rsa_signature_spki,
 };
 pub use transforms::{
     BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, ENVELOPED_SIGNATURE_URI, Transform,

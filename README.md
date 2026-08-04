@@ -43,14 +43,16 @@ Currently implemented (core paths):
 - Built-in verification-key resolution from embedded X.509/DER/`KeyValue` sources and configured `KeyName`, X.509 subject, issuer/serial, SKI, or digest selectors
 - RSA PKCS#1 v1.5 verification helpers for SHA-1 / SHA-256 / SHA-384 / SHA-512
 - ECDSA verification helpers for P-256/SHA-256 and P-384/SHA-384
+- Legacy DSA-SHA1 and HMAC-SHA1 verification, including truncated HMAC output
 - RSA PKCS#1 v1.5 and ECDSA P-256/P-384 signing from PKCS#8 private keys
 - Opt-in X.509 certificate-chain validation with explicit trust anchors, validity checks, CA constraints, and CRLs
+- Caller-supplied, bounded external references and X.509 `RetrievalMethod` resolution without implicit I/O
 - XMLEnc AES-128/256-CBC and AES-128/256-GCM encryption/decryption with direct
   keys, RSA-OAEP key transport, AES-128/256-KW, multiple recipients, and
   Element/Content document replacement
 
 Still in progress:
-- XMLDSig DSA, HMAC, and RSA-PSS signature algorithms
+- XMLDSig DSA-SHA256, broader HMAC verification/signing, and RSA-PSS algorithms
 - Complete XMLDSig and XMLEnc conformance-suite classification
 - Production hardening, fuzzing, benchmarks, and API stabilization
 
@@ -100,7 +102,7 @@ Current MSRV: Rust 1.92.
 | [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) | Implemented; full-document and document-subset vectors |
 | [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) | Implemented; `xml:id` and `xml:base` subset rules |
 | [Exclusive C14N](https://www.w3.org/TR/xml-exc-c14n/) | Implemented; `InclusiveNamespaces PrefixList` support |
-| [XMLDSig](https://www.w3.org/TR/xmldsig-core1/) | Core sign/verify pipelines implemented; additional algorithms and conformance coverage in progress |
+| [XMLDSig](https://www.w3.org/TR/xmldsig-core1/) | Core sign/verify pipelines and the complete Merlin corpus implemented; additional algorithms and conformance suites in progress |
 | [XMLEnc](https://www.w3.org/TR/xmlenc-core1/) | Core AES-CBC/GCM encrypt/decrypt with RSA-OAEP and AES-KW implemented; broader conformance coverage in progress |
 
 ## License

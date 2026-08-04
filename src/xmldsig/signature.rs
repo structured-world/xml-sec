@@ -1,8 +1,7 @@
 //! Signature verification helpers for XMLDSig.
 //!
-//! This module currently covers roadmap task P1-019 (RSA PKCS#1 v1.5) and
-//! P1-020 (ECDSA P-256/P-384) verification, plus donor P-521 interop under
-//! the XMLDSig `ecdsa-sha384` URI.
+//! This module covers RSA PKCS#1 v1.5, DSA-SHA1, and ECDSA verification,
+//! including donor P-521 interoperability under the XMLDSig `ecdsa-sha384` URI.
 //!
 //! Input public keys are accepted in SubjectPublicKeyInfo (SPKI) form because
 //! that is how the vendored PEM fixtures are stored.
@@ -135,6 +134,22 @@ pub fn verify_rsa_signature_spki(
     signed_data: &[u8],
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
+    verify_rsa_signature_spki_with_minimum(
+        algorithm,
+        public_key_spki_der,
+        signed_data,
+        signature_value,
+        2048,
+    )
+}
+
+pub(crate) fn verify_rsa_signature_spki_with_minimum(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+    minimum_modulus_bits: usize,
+) -> Result<bool, SignatureVerificationError> {
     let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
     if !rest.is_empty() {
@@ -146,7 +161,7 @@ pub fn verify_rsa_signature_spki(
 
     match public_key {
         PublicKey::RSA(rsa) => {
-            validate_rsa_public_key(&rsa, algorithm)?;
+            validate_rsa_public_key(&rsa, algorithm, minimum_modulus_bits)?;
             let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
                 .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
             let Ok(signature) = RsaPkcs1v15Signature::try_from(signature_value) else {
@@ -183,6 +198,36 @@ pub fn verify_rsa_signature_spki(
             uri: algorithm.uri().to_string(),
         }),
     }
+}
+
+/// Verify an XMLDSig DSA-SHA1 signature using a DER SPKI public key.
+///
+/// XMLDSig 1.0 encodes the signature as the fixed-width 20-byte `r` followed
+/// by the fixed-width 20-byte `s`, rather than ASN.1 DER.
+#[must_use = "discarding the verification result skips signature validation"]
+pub fn verify_dsa_signature_spki(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationError> {
+    if algorithm != SignatureAlgorithm::DsaSha1 {
+        return Err(SignatureVerificationError::UnsupportedAlgorithm {
+            uri: algorithm.uri().to_string(),
+        });
+    }
+    if signature_value.len() != 40 {
+        return Ok(false);
+    }
+    let key = dsa::VerifyingKey::from_public_key_der(public_key_spki_der)
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let signature = dsa::Signature::from_components(
+        crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[..20]),
+        crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[20..]),
+    )
+    .ok_or(SignatureVerificationError::InvalidSignatureFormat)?;
+    let digest = Sha1::digest(signed_data);
+    Ok(key.verify_prehash(&digest, &signature).is_ok())
 }
 
 /// Verify an ECDSA XMLDSig signature using DER-encoded SPKI public key bytes.
@@ -253,8 +298,9 @@ pub fn verify_ecdsa_signature_spki(
 fn validate_rsa_public_key(
     rsa: &x509_parser::public_key::RSAPublicKey<'_>,
     algorithm: SignatureAlgorithm,
+    minimum_modulus_bits: usize,
 ) -> Result<(), SignatureVerificationError> {
-    let min_modulus_bits = minimum_rsa_modulus_bits(algorithm)?;
+    minimum_rsa_modulus_bits(algorithm)?;
     let modulus_start = rsa
         .modulus
         .iter()
@@ -271,7 +317,7 @@ fn validate_rsa_public_key(
         .len()
         .checked_mul(8)
         .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-    if !(min_modulus_bits..=8192).contains(&modulus_bits) {
+    if !(minimum_modulus_bits..=8192).contains(&modulus_bits) {
         return Err(SignatureVerificationError::InvalidKeyDer);
     }
 

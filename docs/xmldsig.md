@@ -3,7 +3,8 @@
 The `xmldsig` feature provides signing and verification pipelines for same-document XML
 signatures. It supports inclusive and exclusive canonicalization, enveloped signatures,
 Base64, XPath 1.0, and XPath Filter 2.0 transforms, RSA PKCS#1 v1.5, ECDSA P-256/P-384,
-embedded X.509 certificates, and configured key resolution.
+DSA-SHA1 and HMAC-SHA1 verification, embedded X.509 certificates, and configured key
+resolution.
 
 ## Examples
 
@@ -45,9 +46,24 @@ inconsistent `KeyInfo` metadata are processing errors rather than validity statu
 `Invalid(reason)` and an API error as a rejected document; never continue an authentication flow
 after either outcome.
 
+External references are disabled by default. Callers must both allow their URI class with
+`UriTypeSet` and provide every payload through `VerifyContext::external_resources`; verification
+never performs network or filesystem I/O. Individual resources are limited to 8 MiB and the
+complete map to 32 MiB. `RetrievalMethod` currently accepts untransformed external
+`rawX509Certificate` data and the Merlin same-document `X509Data` XPath selection. Other retrieval
+transform chains fail closed instead of being ignored.
+
+Internal DTD declarations are disabled by default and require
+`VerifyContext::allow_internal_dtd(true)`. External entity resolution remains disabled. XSLT is
+intentionally not executed because transforms operate on attacker-controlled documents; an
+authenticated Manifest reference using unsupported XSLT is reported as an invalid per-reference
+result without changing core `SignedInfo` validity.
+
 ## Current Scope
 
 Implemented algorithms include RSA PKCS#1 v1.5 with SHA-1/SHA-256/SHA-384/SHA-512 for
 verification, SHA-256/SHA-384/SHA-512 for signing, and ECDSA P-256/SHA-256 and P-384/SHA-384.
-DSA, HMAC signatures, RSA-PSS, and unauthenticated external reference loading are not currently
-supported.
+DSA-SHA1 and HMAC-SHA1 (including XMLDSig's byte-aligned 80-160-bit truncation range) are
+verify-only legacy algorithms.
+DSA-SHA256, broader HMAC verification/signing, RSA-PSS, and implicit external resource loading are
+not currently supported.

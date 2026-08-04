@@ -4,12 +4,13 @@
 //! [XMLDSig §4.3.3.2](https://www.w3.org/TR/xmldsig-core1/#sec-Same-Document):
 //!
 //! - **Empty URI** (`""` or absent): the entire document, excluding comments.
-//! - **Bare-name `#id`**: the element whose ID attribute matches `id`, as a subtree.
+//! - **Bare-name `#id`**: the element whose ID attribute matches `id`, as a subtree
+//!   with comments removed by the XMLDSig same-document dereference rule.
 //! - **`#xpointer(/)`**: the entire document, including comments.
-//! - **`#xpointer(id('id'))` / `#xpointer(id("id"))`**: element by ID (equivalent to bare-name).
+//! - **`#xpointer(id('id'))` / `#xpointer(id("id"))`**: element by ID, with comments retained.
 //!
-//! External URIs (http://, file://, etc.) are not supported — only same-document
-//! references are needed for SAML signature verification.
+//! External URI bytes are resolved only from an explicit caller-owned map; this
+//! module never performs network or filesystem I/O.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -51,6 +52,7 @@ pub struct UriReferenceResolver<'a> {
     doc: &'a Document<'a>,
     /// ID → element node mapping for O(1) fragment lookups.
     id_map: HashMap<&'a str, Node<'a, 'a>>,
+    external_resources: Option<&'a HashMap<String, Vec<u8>>>,
 }
 
 impl<'a> UriReferenceResolver<'a> {
@@ -117,7 +119,19 @@ impl<'a> UriReferenceResolver<'a> {
             }
         }
 
-        Self { doc, id_map }
+        Self {
+            doc,
+            id_map,
+            external_resources: None,
+        }
+    }
+
+    /// Attach an explicit caller-owned external-resource map.
+    ///
+    /// No network or filesystem access is performed by this resolver.
+    pub fn with_external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
+        self.external_resources = Some(resources);
+        self
     }
 
     /// Dereference a URI string to a [`TransformData`].
@@ -127,9 +141,10 @@ impl<'a> UriReferenceResolver<'a> {
     /// | URI | Result |
     /// |-----|--------|
     /// | `""` (empty) | Entire document, comments excluded |
-    /// | `"#foo"` | Subtree rooted at element with ID `foo` |
+    /// | `"#foo"` | Subtree rooted at element with ID `foo`, comments excluded |
     /// | `"#xpointer(/)"` | Entire document, comments included |
-    /// | `"#xpointer(id('foo'))"` | Subtree rooted at element with ID `foo` |
+    /// | `"#xpointer(id('foo'))"` | Subtree rooted at element with ID `foo`, comments included |
+    /// | external URI in caller map | A copy of the mapped bytes |
     /// | other | `Err(UnsupportedUri)` |
     pub fn dereference(&self, uri: &str) -> Result<TransformData<'a>, TransformError> {
         self.dereference_with_optional_budget(uri, None)
@@ -166,7 +181,10 @@ impl<'a> UriReferenceResolver<'a> {
             // xmlsec1 also passes fragments through without decoding.
             self.dereference_fragment(fragment, budget)
         } else {
-            Err(TransformError::UnsupportedUri(uri.to_string()))
+            self.external_resources
+                .and_then(|resources| resources.get(uri))
+                .map(|bytes| TransformData::Binary(bytes.clone()))
+                .ok_or_else(|| TransformError::UnsupportedUri(uri.to_string()))
         }
     }
 
@@ -174,7 +192,7 @@ impl<'a> UriReferenceResolver<'a> {
     ///
     /// Handles:
     /// - `xpointer(/)` → entire document (with comments, per XPointer spec)
-    /// - `xpointer(id('foo'))` → element by ID (equivalent to bare-name `#foo`)
+    /// - `xpointer(id('foo'))` → element by ID, retaining comments
     /// - bare name `foo` → element by ID attribute
     fn dereference_fragment(
         &self,
@@ -198,18 +216,18 @@ impl<'a> UriReferenceResolver<'a> {
             };
             Ok(TransformData::NodeSet(nodes))
         } else if let Some(id) = parse_xpointer_id_fragment(fragment) {
-            // xpointer(id('foo')) → same as bare-name #foo
+            // XPointer dereference retains comments, unlike a bare-name fragment.
             // Reject empty parsed ID (e.g., xpointer(id(''))) — not a valid XML Name
             if id.is_empty() {
                 return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
             }
-            self.resolve_id(id, budget)
+            self.resolve_id(id, budget, true)
         } else if fragment.starts_with("xpointer(") {
             // Any other XPointer expression is unsupported
             Err(TransformError::UnsupportedUri(format!("#{fragment}")))
         } else {
             // Bare-name fragment: #foo → element by ID
-            self.resolve_id(fragment, budget)
+            self.resolve_id(fragment, budget, false)
         }
     }
 
@@ -218,12 +236,17 @@ impl<'a> UriReferenceResolver<'a> {
         &self,
         id: &str,
         budget: Option<&NodeSetMaterializationBudget>,
+        with_comments: bool,
     ) -> Result<TransformData<'a>, TransformError> {
         match self.id_map.get(id) {
             Some(&element) => {
-                let nodes = match budget {
-                    Some(budget) => NodeSet::subtree_with_budget(element, budget)?,
-                    None => NodeSet::subtree(element)?,
+                let nodes = if with_comments {
+                    match budget {
+                        Some(budget) => NodeSet::subtree_with_budget(element, budget)?,
+                        None => NodeSet::subtree(element)?,
+                    }
+                } else {
+                    NodeSet::subtree_without_comments_with_budget(element, budget)?
                 };
                 Ok(TransformData::NodeSet(nodes))
             }
@@ -242,6 +265,10 @@ impl<'a> UriReferenceResolver<'a> {
     /// matching the resolver behavior used by `dereference()`.
     pub(crate) fn node_id_for_id(&self, id: &str) -> Option<NodeId> {
         self.id_map.get(id).map(|node| node.id())
+    }
+
+    pub(crate) fn node_for_id(&self, id: &str) -> Option<Node<'a, 'a>> {
+        self.id_map.get(id).copied()
     }
 
     /// Get the number of registered IDs.
@@ -564,8 +591,8 @@ mod tests {
     }
 
     #[test]
-    fn subtree_includes_comments() {
-        // Subtree dereference (via #id) includes comments, unlike empty URI
+    fn bare_name_subtree_excludes_comments() {
+        // XMLDSig's bare-name same-document shortcut removes comment nodes.
         let xml = r#"<root><item ID="x"><!-- comment --><child/></item></root>"#;
         let doc = Document::parse(xml).unwrap();
         let resolver = UriReferenceResolver::new(&doc);
@@ -576,8 +603,8 @@ mod tests {
         for node in doc.descendants() {
             if node.is_comment() {
                 assert!(
-                    node_set.contains(node),
-                    "comment should be included in #id subtree"
+                    !node_set.contains(node),
+                    "comment must be excluded from #id"
                 );
             }
         }
@@ -606,7 +633,8 @@ mod tests {
 
     #[test]
     fn xpointer_id_single_quotes() {
-        let xml = r#"<root><item ID="abc">content</item></root>"#;
+        // XPointer ID dereference retains comments, unlike bare-name fragments.
+        let xml = r#"<root><item ID="abc"><!-- retained -->content</item></root>"#;
         let doc = Document::parse(xml).unwrap();
         let resolver = UriReferenceResolver::new(&doc);
 
@@ -618,6 +646,10 @@ mod tests {
             .find(|n| n.attribute("ID") == Some("abc"))
             .unwrap();
         assert!(node_set.contains(elem));
+        assert!(
+            elem.children()
+                .any(|node| node.is_comment() && node_set.contains(node))
+        );
     }
 
     #[test]
