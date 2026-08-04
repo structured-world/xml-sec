@@ -5,28 +5,86 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Write};
 
-use roxmltree::{Document, Node, NodeType};
+use roxmltree::{Document, Node, NodeId, NodeType};
 
-use super::C14nError;
+#[cfg(test)]
+use super::ClosureVisibility;
 use super::escape::{escape_attr, escape_cr, escape_text};
 use super::prefix::{attribute_prefix, element_prefix};
-use super::xml_base::{compute_effective_xml_base, resolve_uri};
+use super::xml_base::{compute_effective_xml_base, preserves_xml_base_context, resolve_uri};
+use super::{C14nError, NodeVisibility};
+
+#[derive(Debug)]
+pub(super) struct CanonicalOutputLimitExceeded {
+    max_bytes: usize,
+}
+
+impl std::fmt::Display for CanonicalOutputLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "canonical output exceeds maximum of {} bytes",
+            self.max_bytes
+        )
+    }
+}
+
+impl std::error::Error for CanonicalOutputLimitExceeded {}
+
+fn output_limit_error(max_bytes: usize) -> C14nError {
+    C14nError::Io(io::Error::other(CanonicalOutputLimitExceeded { max_bytes }))
+}
 
 /// The XML namespace URI.
 ///
-/// In C14N document subsets (W3C C14N §2.4), inheritable attributes in
-/// this namespace are propagated from ancestors outside the node set:
-/// - C14N 1.0 / Exclusive 1.0: `xml:lang`, `xml:space`, `xml:base`
-/// - C14N 1.1: adds `xml:id` to the above set
+/// In inclusive C14N document subsets, `xml:lang` and `xml:space` are simple
+/// inheritable attributes. `xml:base` is inherited in C14N 1.0 and receives
+/// dedicated fixup in C14N 1.1; `xml:id` is never inherited in C14N 1.1.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
-/// Check whether an xml:* attribute name is inheritable in the current mode.
+struct CanonicalOutput<'a> {
+    bytes: &'a mut Vec<u8>,
+    max_len: Option<usize>,
+    limit_exceeded: bool,
+    tracked_element: Option<NodeId>,
+    tracked_position: Option<usize>,
+}
+
+impl Write for CanonicalOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next_len = self.bytes.len().checked_add(bytes.len());
+        if self
+            .max_len
+            .is_some_and(|max_len| next_len.is_none_or(|next_len| next_len > max_len))
+        {
+            self.limit_exceeded = true;
+            return Err(io::Error::other("canonical output limit exceeded"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CanonicalOutput<'_> {
+    fn track(&mut self, node: Node<'_, '_>) {
+        if self.tracked_element == Some(node.id()) {
+            self.tracked_position = Some(self.bytes.len());
+        }
+    }
+}
+
+/// Check whether an xml:* attribute participates in subset inheritance.
 ///
-/// Per C14N 1.0 §2.4: `xml:lang`, `xml:space`, `xml:base` are inherited.
-/// Per C14N 1.1: `xml:id` is also inherited (xml:id propagation).
-fn is_inheritable_xml_attr(local_name: &str, include_xml_id: bool) -> bool {
-    matches!(local_name, "lang" | "space" | "base") || (include_xml_id && local_name == "id")
+/// C14N 1.0 applies the general rule to `xml:id`; C14N 1.1 §2.4 explicitly
+/// removes it from the simple inheritable attributes.
+fn is_inheritable_xml_attr(local_name: &str, inherit_xml_id: bool) -> bool {
+    matches!(local_name, "lang" | "space" | "base") || (inherit_xml_id && local_name == "id")
 }
 
 /// Configuration flags for C14N serialization that vary by mode.
@@ -37,6 +95,28 @@ pub(crate) struct C14nConfig {
     pub inherit_xml_attrs: bool,
     /// Resolve relative xml:base URIs via RFC 3986 (C14N 1.1 only).
     pub fixup_xml_base: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CanonicalOutputOptions {
+    tracked_element: Option<NodeId>,
+    max_output_bytes: Option<usize>,
+}
+
+impl CanonicalOutputOptions {
+    pub(crate) fn unbounded(tracked_element: Option<NodeId>) -> Self {
+        Self {
+            tracked_element,
+            max_output_bytes: None,
+        }
+    }
+
+    pub(crate) fn bounded(tracked_element: Option<NodeId>, max_output_bytes: usize) -> Self {
+        Self {
+            tracked_element,
+            max_output_bytes: Some(max_output_bytes),
+        }
+    }
 }
 
 /// Trait for namespace rendering strategies (inclusive vs exclusive).
@@ -50,7 +130,10 @@ pub(crate) trait NsRenderer {
         &self,
         node: Node<'a, '_>,
         parent_rendered: &HashMap<String, String>,
+        visibility: Option<&dyn NodeVisibility>,
     ) -> (Vec<(String, String)>, HashMap<String, String>);
+
+    fn renders_selected_namespace_of_omitted_element(&self, prefix: &str) -> bool;
 }
 
 /// Canonicalize a document (or subset) to the output buffer.
@@ -61,13 +144,14 @@ pub(crate) trait NsRenderer {
 /// - `with_comments`: whether to preserve comment nodes
 /// - `ns_renderer`: namespace rendering strategy
 /// - `inherit_xml_attrs`: if `true` (Inclusive C14N), inherit `xml:lang`,
-///   `xml:space`, `xml:base` (and `xml:id` for 1.1) from ancestors outside
-///   the node set per C14N §2.4. If `false` (Exclusive C14N), skip this
+///   `xml:space`, and process `xml:base` from ancestors outside the node set
+///   per C14N §2.4. If `false` (Exclusive C14N), skip this
 ///   search — per Exc-C14N §3, ancestor xml:* import is explicitly omitted.
 /// - `fixup_xml_base`: if `true` (C14N 1.1), resolve `xml:base` relative
 ///   URIs in document subsets via RFC 3986. Only meaningful when
 ///   `inherit_xml_attrs` is `true`.
 /// - `output`: destination buffer
+#[cfg(test)]
 pub(crate) fn serialize_canonical(
     doc: &Document,
     node_set: Option<&dyn Fn(Node) -> bool>,
@@ -76,67 +160,136 @@ pub(crate) fn serialize_canonical(
     config: C14nConfig,
     output: &mut Vec<u8>,
 ) -> Result<(), C14nError> {
+    let visibility = node_set.map(|predicate| ClosureVisibility { predicate });
+    serialize_canonical_visible_with_position(
+        doc,
+        visibility
+            .as_ref()
+            .map(|visibility| visibility as &dyn NodeVisibility),
+        with_comments,
+        ns_renderer,
+        config,
+        None,
+        output,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn serialize_canonical_visible_with_position(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    with_comments: bool,
+    ns_renderer: &dyn NsRenderer,
+    config: C14nConfig,
+    tracked_element: Option<NodeId>,
+    output: &mut Vec<u8>,
+) -> Result<Option<usize>, C14nError> {
+    serialize_canonical_visible_with_position_bounded(
+        doc,
+        visibility,
+        with_comments,
+        ns_renderer,
+        config,
+        CanonicalOutputOptions::unbounded(tracked_element),
+        output,
+    )
+}
+
+pub(crate) fn serialize_canonical_visible_with_position_bounded(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    with_comments: bool,
+    ns_renderer: &dyn NsRenderer,
+    config: C14nConfig,
+    options: CanonicalOutputOptions,
+    output: &mut Vec<u8>,
+) -> Result<Option<usize>, C14nError> {
     let root = doc.root();
-    serialize_children(
+    let max_len = match options.max_output_bytes {
+        Some(limit) => Some(
+            output
+                .len()
+                .checked_add(limit)
+                .ok_or_else(|| output_limit_error(limit))?,
+        ),
+        None => None,
+    };
+    let mut output = CanonicalOutput {
+        bytes: output,
+        max_len,
+        limit_exceeded: false,
+        tracked_element: options.tracked_element,
+        tracked_position: None,
+    };
+    let result = serialize_children(
         root,
-        node_set,
+        visibility,
         with_comments,
         ns_renderer,
         config,
         &HashMap::new(),
-        output,
+        &mut output,
     );
-    Ok(())
+    if output.limit_exceeded {
+        return Err(output_limit_error(
+            options.max_output_bytes.unwrap_or(usize::MAX),
+        ));
+    }
+    result?;
+    Ok(output.tracked_position)
 }
 
 /// Serialize children of a node in document order.
 fn serialize_children(
     parent: Node,
-    node_set: Option<&dyn Fn(Node) -> bool>,
+    visibility: Option<&dyn NodeVisibility>,
     with_comments: bool,
     ns_renderer: &dyn NsRenderer,
     config: C14nConfig,
     parent_rendered: &HashMap<String, String>,
-    output: &mut Vec<u8>,
-) {
+    output: &mut CanonicalOutput<'_>,
+) -> Result<(), C14nError> {
     let is_doc_root = parent.node_type() == NodeType::Root;
 
     for child in parent.children() {
         // Node-set filtering: skip nodes not in the set.
-        let in_set = node_set.is_none_or(|pred| pred(child));
+        let in_set = visibility.is_none_or(|set| set.contains_node(child));
 
         match child.node_type() {
             NodeType::Element => {
                 if in_set {
-                    // Before root element: emit \n separator if there was output before
-                    // (e.g., a preceding comment/PI). Note: when node_set excludes the
-                    // root element but includes preceding comments, those comments won't
-                    // get a trailing \n — this is acceptable because document subsets
-                    // that exclude the root element are only used with XPath transforms,
-                    // which are not yet implemented.
-                    if is_doc_root && !output.is_empty() {
-                        output.push(b'\n');
-                    }
                     serialize_element(
                         child,
-                        node_set,
+                        visibility,
                         with_comments,
                         ns_renderer,
                         config,
                         parent_rendered,
                         output,
-                    );
+                    )?;
                 } else {
+                    // Canonical XML §2.3 processes selected namespace and
+                    // attribute axes even when their owner is omitted; only
+                    // the owner's tags are suppressed. The canonical form is
+                    // an octet stream and esoteric node-sets need not serialize
+                    // as well-balanced XML (see Exclusive C14N §5.2).
+                    serialize_selected_axes_of_omitted_element(
+                        child,
+                        visibility,
+                        ns_renderer,
+                        parent_rendered,
+                        output,
+                    )?;
                     // Element not in set, but descendants might be — walk children.
                     serialize_children(
                         child,
-                        node_set,
+                        visibility,
                         with_comments,
                         ns_renderer,
                         config,
                         parent_rendered,
                         output,
-                    );
+                    )?;
                 }
             }
             NodeType::Text => {
@@ -144,36 +297,38 @@ fn serialize_children(
                     // Document-level text nodes are ignored by C14N.
                     // Only text inside elements is serialized.
                     if !is_doc_root && let Some(text) = child.text() {
-                        escape_text(text, output);
+                        escape_text(text, output)?;
                     }
                 }
             }
             NodeType::Comment => {
                 if with_comments && in_set {
-                    if is_doc_root {
-                        write_doc_level_separator(&child, output);
-                    }
-                    output.extend_from_slice(b"<!--");
+                    let follows_document_element =
+                        is_doc_root && has_preceding_element_sibling(&child);
+                    write_doc_level_prefix(is_doc_root, follows_document_element, output)?;
+                    output.write_all(b"<!--")?;
                     if let Some(text) = child.text() {
                         // C14N spec: \r in comments must be escaped to &#xD;
-                        escape_cr(text, output);
+                        escape_cr(text, output)?;
                     }
-                    output.extend_from_slice(b"-->");
+                    output.write_all(b"-->")?;
+                    write_doc_level_suffix(is_doc_root, follows_document_element, output)?;
                 }
             }
             NodeType::PI => {
                 if in_set && let Some(pi) = child.pi() {
-                    if is_doc_root {
-                        write_doc_level_separator(&child, output);
-                    }
-                    output.extend_from_slice(b"<?");
-                    output.extend_from_slice(pi.target.as_bytes());
+                    let follows_document_element =
+                        is_doc_root && has_preceding_element_sibling(&child);
+                    write_doc_level_prefix(is_doc_root, follows_document_element, output)?;
+                    output.write_all(b"<?")?;
+                    output.write_all(pi.target.as_bytes())?;
                     if let Some(value) = pi.value {
-                        output.push(b' ');
+                        output.write_all(b" ")?;
                         // C14N spec: \r in PI content must be escaped to &#xD;
-                        escape_cr(value, output);
+                        escape_cr(value, output)?;
                     }
-                    output.extend_from_slice(b"?>");
+                    output.write_all(b"?>")?;
+                    write_doc_level_suffix(is_doc_root, follows_document_element, output)?;
                 }
             }
             NodeType::Root => {
@@ -181,35 +336,97 @@ fn serialize_children(
             }
         }
     }
+    Ok(())
+}
+
+fn serialize_selected_axes_of_omitted_element(
+    owner: Node,
+    visibility: Option<&dyn NodeVisibility>,
+    ns_renderer: &dyn NsRenderer,
+    parent_rendered: &HashMap<String, String>,
+    output: &mut CanonicalOutput<'_>,
+) -> Result<(), C14nError> {
+    let Some(visibility) = visibility else {
+        return Ok(());
+    };
+
+    let mut namespaces = owner
+        .namespaces()
+        .filter_map(|namespace| {
+            let prefix = namespace.name().unwrap_or("");
+            (prefix != "xml"
+                && ns_renderer.renders_selected_namespace_of_omitted_element(prefix)
+                && visibility.contains_namespace(owner, prefix, namespace.uri())
+                && parent_rendered.get(prefix).map(String::as_str) != Some(namespace.uri()))
+            .then_some((prefix, namespace.uri()))
+        })
+        .collect::<Vec<_>>();
+    namespaces.sort_by_key(|(prefix, _)| *prefix);
+    for (prefix, uri) in namespaces {
+        if prefix.is_empty() {
+            output.write_all(b" xmlns=\"")?;
+        } else {
+            output.write_all(b" xmlns:")?;
+            output.write_all(prefix.as_bytes())?;
+            output.write_all(b"=\"")?;
+        }
+        escape_attr(uri, output)?;
+        output.write_all(b"\"")?;
+    }
+
+    let mut attributes = owner
+        .attributes()
+        .filter(|attribute| {
+            visibility.contains_attribute(owner, attribute.namespace(), attribute.name())
+        })
+        .collect::<Vec<_>>();
+    attributes.sort_by(|left, right| {
+        (left.namespace().unwrap_or(""), left.name())
+            .cmp(&(right.namespace().unwrap_or(""), right.name()))
+    });
+    for attribute in attributes {
+        output.write_all(b" ")?;
+        let prefix = attribute_prefix(owner, &attribute);
+        if !prefix.is_empty() {
+            output.write_all(prefix.as_bytes())?;
+            output.write_all(b":")?;
+        }
+        output.write_all(attribute.name().as_bytes())?;
+        output.write_all(b"=\"")?;
+        escape_attr(attribute.value(), output)?;
+        output.write_all(b"\"")?;
+    }
+    Ok(())
 }
 
 /// Serialize a single element node (start tag + children + end tag).
 fn serialize_element(
     node: Node,
-    node_set: Option<&dyn Fn(Node) -> bool>,
+    visibility: Option<&dyn NodeVisibility>,
     with_comments: bool,
     ns_renderer: &dyn NsRenderer,
     config: C14nConfig,
     parent_rendered: &HashMap<String, String>,
-    output: &mut Vec<u8>,
-) {
-    let (ns_decls, rendered) = ns_renderer.render_namespaces(node, parent_rendered);
+    output: &mut CanonicalOutput<'_>,
+) -> Result<(), C14nError> {
+    let (ns_decls, rendered) = ns_renderer.render_namespaces(node, parent_rendered, visibility);
 
     // Start tag: <prefix:localname
-    output.push(b'<');
-    write_qualified_name(node, output);
+    output.track(node);
+    output.write_all(b"<")?;
+    write_qualified_name(node, output)?;
 
     // Namespace declarations (already sorted by prefix).
     for (prefix, uri) in &ns_decls {
         if prefix.is_empty() {
-            output.extend_from_slice(b" xmlns=\"");
+            output.write_all(b" xmlns=\"")?;
         } else {
-            output.extend_from_slice(b" xmlns:");
-            output.extend_from_slice(prefix.as_bytes());
-            output.extend_from_slice(b"=\"");
+            output.write_all(b" xmlns:")?;
+            output.write_all(prefix.as_bytes())?;
+            output.write_all(b"=\"")?;
         }
-        escape_attr(uri, output);
-        output.push(b'"');
+        escape_attr(uri, output)?;
+        output.write_all(b"\"")?;
     }
 
     // Regular attributes, sorted by (namespace-uri, local-name).
@@ -224,12 +441,7 @@ fn serialize_element(
     // For C14N 1.1 (fixup_xml_base=true): xml:base values are additionally
     // resolved to effective URIs per RFC 3986.
     let inherited_xml = if config.inherit_xml_attrs {
-        // xml:id is only inheritable in C14N 1.1. Both xml:id propagation
-        // and xml:base fixup are C14N 1.1 features, so fixup_xml_base
-        // serves as the "is C14N 1.1" indicator. If these ever need to be
-        // independent, add a separate field to C14nConfig.
-        let include_xml_id = config.fixup_xml_base;
-        collect_inherited_xml_attrs(node, node_set, include_xml_id)
+        collect_inherited_xml_attrs(node, visibility, config.fixup_xml_base)
     } else {
         Vec::new()
     };
@@ -239,14 +451,16 @@ fn serialize_element(
     // - parent is not in the node set (otherwise parent renders its own base)
     // The effective base is used for both inherited xml:base values and
     // resolving the element's own xml:base against the ancestor chain.
-    let parent_not_in_set = if let Some(pred) = node_set {
-        !node.parent().is_some_and(|p| p.is_element() && pred(p))
+    let parent_not_in_set = if let Some(set) = visibility {
+        !node
+            .parent()
+            .is_some_and(|p| p.is_element() && set.contains_node(p))
     } else {
         false
     };
     let effective_parent_base = if config.fixup_xml_base && parent_not_in_set {
         node.parent()
-            .and_then(|p| compute_effective_xml_base(p, node_set))
+            .and_then(|p| compute_effective_xml_base(p, visibility))
     } else {
         None
     };
@@ -255,6 +469,11 @@ fn serialize_element(
     // Using Cow to avoid allocations when no fixup is needed.
     let mut all_attrs: Vec<(&str, &str, &str, Cow<'_, str>)> = Vec::new();
     for attr in node.attributes() {
+        if visibility
+            .is_some_and(|set| !set.contains_attribute(node, attr.namespace(), attr.name()))
+        {
+            continue;
+        }
         let value = if let Some(base) = effective_parent_base.as_deref() {
             if attr.namespace() == Some(XML_NS) && attr.name() == "base" {
                 // C14N 1.1: resolve the element's xml:base against the
@@ -294,59 +513,60 @@ fn serialize_element(
     all_attrs.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
 
     for (_, local_name, prefix, value) in &all_attrs {
-        output.push(b' ');
+        output.write_all(b" ")?;
         if !prefix.is_empty() {
-            output.extend_from_slice(prefix.as_bytes());
-            output.push(b':');
+            output.write_all(prefix.as_bytes())?;
+            output.write_all(b":")?;
         }
-        output.extend_from_slice(local_name.as_bytes());
-        output.extend_from_slice(b"=\"");
-        escape_attr(value, output);
-        output.push(b'"');
+        output.write_all(local_name.as_bytes())?;
+        output.write_all(b"=\"")?;
+        escape_attr(value, output)?;
+        output.write_all(b"\"")?;
     }
 
     // Always use <tag></tag> form, never self-closing.
-    output.push(b'>');
+    output.write_all(b">")?;
 
     // Children.
     serialize_children(
         node,
-        node_set,
+        visibility,
         with_comments,
         ns_renderer,
         config,
         &rendered,
         output,
-    );
+    )?;
 
     // End tag.
-    output.extend_from_slice(b"</");
-    write_qualified_name(node, output);
-    output.push(b'>');
+    output.write_all(b"</")?;
+    write_qualified_name(node, output)?;
+    output.write_all(b">")?;
+    Ok(())
 }
 
-/// Write `\n` separator for document-level nodes.
-///
-/// C14N spec: document-level comments and PIs get `\n` between them and the
-/// root element. Specifically:
-/// - Before root element: comment/PI followed by `\n`
-/// - After root element: `\n` followed by comment/PI
-///
-/// This function emits `\n` either before or after the node, depending on
-/// whether the root element has already been emitted.
-///
-/// Limitation: when `node_set` excludes the root element, the `\n` logic may
-/// be incorrect for preceding comments/PIs. This only affects XPath-selected
-/// subsets that exclude the root — not relevant for SAML enveloped signatures.
-fn write_doc_level_separator(node: &Node, output: &mut Vec<u8>) {
-    let root_elem_seen = has_preceding_element_sibling(node);
-    if root_elem_seen {
-        // After root element: \n before this node.
-        output.push(b'\n');
-    } else if !output.is_empty() {
-        // Before root element but not first output: \n after previous node.
-        output.push(b'\n');
+/// Emit the separator preceding a document-level comment or PI.
+fn write_doc_level_prefix(
+    is_doc_root: bool,
+    follows_document_element: bool,
+    output: &mut CanonicalOutput<'_>,
+) -> io::Result<()> {
+    if is_doc_root && follows_document_element {
+        output.write_all(b"\n")?;
     }
+    Ok(())
+}
+
+/// Emit the separator following a document-level comment or PI.
+fn write_doc_level_suffix(
+    is_doc_root: bool,
+    follows_document_element: bool,
+    output: &mut CanonicalOutput<'_>,
+) -> io::Result<()> {
+    if is_doc_root && !follows_document_element {
+        output.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 /// Check if a node has a preceding sibling that is an element.
@@ -364,21 +584,21 @@ fn has_preceding_element_sibling(node: &Node) -> bool {
 /// Collect inheritable `xml:*` attributes from ancestors for document subsets.
 ///
 /// Per [W3C C14N 1.0 §2.4](https://www.w3.org/TR/xml-c14n/#ProcessingModel):
-/// when an element is in the node set but its parent is NOT, `xml:lang`,
-/// `xml:space`, and `xml:base` from ancestor elements must be emitted on
-/// the element to preserve inherited semantics.
+/// when an element is in the node set but its parent is NOT, `xml:lang` and
+/// `xml:space` are inherited from the nearest ancestor declarations whether
+/// or not those attribute nodes are themselves in the node set. `xml:base`
+/// follows the version-specific inheritance/fixup rules.
 ///
-/// The `include_xml_id` flag (true for C14N 1.1) additionally inherits
-/// `xml:id`. Other `xml:*` attributes are never inherited.
+/// `xml:id` and other `xml:*` attributes are never inherited in C14N 1.1.
 ///
 /// Returns `(local_name, value)` pairs. Closer ancestors take precedence.
 /// Attributes already present on the element itself are excluded.
 fn collect_inherited_xml_attrs<'a>(
     node: Node<'a, '_>,
-    node_set: Option<&dyn Fn(Node) -> bool>,
-    include_xml_id: bool,
+    visibility: Option<&dyn NodeVisibility>,
+    fixup_xml_base: bool,
 ) -> Vec<(&'a str, &'a str)> {
-    let pred = match node_set {
+    let set = match visibility {
         Some(p) => p,
         None => return Vec::new(), // Full document — no inheritance needed
     };
@@ -387,10 +607,14 @@ fn collect_inherited_xml_attrs<'a>(
     // will render its own xml:* attributes, and the element inherits normally.
     if let Some(parent) = node.parent()
         && parent.is_element()
-        && pred(parent)
+        && set.contains_node(parent)
     {
         return Vec::new();
     }
+
+    // C14N 1.1 is the only inclusive mode with xml:base fixup, and it is also
+    // the version that removes xml:id from subset inheritance.
+    let inherit_xml_id = !fixup_xml_base;
 
     // Collect inheritable xml:* attr names already on this element (own attrs
     // take precedence). Non-inheritable xml:* attrs are ignored.
@@ -398,7 +622,7 @@ fn collect_inherited_xml_attrs<'a>(
     for attr in node.attributes() {
         if attr.namespace() == Some(XML_NS) {
             let local = attr.name();
-            if is_inheritable_xml_attr(local, include_xml_id) {
+            if is_inheritable_xml_attr(local, inherit_xml_id) {
                 seen.insert(local);
             }
         }
@@ -406,27 +630,34 @@ fn collect_inherited_xml_attrs<'a>(
 
     // Walk ancestor chain. Closer ancestors take precedence: once a name is
     // seen, later (more distant) ancestors with the same name are skipped.
-    // Stop at the nearest included ancestor — it renders its own xml:*
-    // attributes in the canonical output, so inheriting past it would
-    // incorrectly propagate attributes that are already visible.
+    // The direct source parent is absent from the node set at this point, so
+    // Canonical XML treats this element as an apex even if a more distant
+    // ancestor is also in the output. Search the complete source ancestry.
     let mut inherited = Vec::new();
+    let mut xml_base_boundary_reached = false;
     let mut ancestor = node.parent();
     while let Some(anc) = ancestor {
         if anc.is_element() {
-            // Stop at the nearest included ancestor (same logic as
-            // compute_effective_xml_base).
-            if pred(anc) {
-                break;
-            }
+            // C14N 1.1 resolves xml:base only across the contiguous omitted
+            // chain. An included ancestor already renders its own base, but
+            // remains the resolution seed for bases on omitted descendants.
+            xml_base_boundary_reached |= fixup_xml_base && preserves_xml_base_context(anc, set);
             for attr in anc.attributes() {
                 if attr.namespace() == Some(XML_NS) {
                     let local = attr.name();
+                    if local == "base" && xml_base_boundary_reached {
+                        continue;
+                    }
                     // Skip empty xml:base="" — per RFC 3986 an empty reference
                     // resolves to the current base, so it's a no-op.
                     if local == "base" && attr.value().is_empty() {
                         continue;
                     }
-                    if is_inheritable_xml_attr(local, include_xml_id) && seen.insert(local) {
+                    // C14N 1.1 §2.4 examines simple inheritable attributes
+                    // whether or not their attribute nodes are in the input
+                    // node-set. Filtering here would change inherited XML
+                    // semantics at an apex element.
+                    if is_inheritable_xml_attr(local, inherit_xml_id) && seen.insert(local) {
                         inherited.push((attr.name(), attr.value()));
                     }
                 }
@@ -442,13 +673,14 @@ fn collect_inherited_xml_attrs<'a>(
 ///
 /// Extracts the lexical prefix from the source XML via byte-range positions,
 /// avoiding ambiguity when multiple prefixes bind the same namespace URI.
-fn write_qualified_name(node: Node, output: &mut Vec<u8>) {
+fn write_qualified_name(node: Node, output: &mut CanonicalOutput<'_>) -> io::Result<()> {
     let prefix = element_prefix(node);
     if !prefix.is_empty() {
-        output.extend_from_slice(prefix.as_bytes());
-        output.push(b':');
+        output.write_all(prefix.as_bytes())?;
+        output.write_all(b":")?;
     }
-    output.extend_from_slice(node.tag_name().name().as_bytes());
+    output.write_all(node.tag_name().name().as_bytes())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -674,6 +906,93 @@ mod tests {
             String::from_utf8(out).expect("utf8"),
             "<?pi data?>\n<root></root>"
         );
+    }
+
+    #[test]
+    fn document_level_pi_keeps_separator_when_root_is_omitted() {
+        // Document-level separators depend on source-document position, not
+        // on whether the document element itself belongs to the node-set.
+        let xml = "<?pi data?><root><child>text</child></root>";
+        let doc = Document::parse(xml).expect("parse");
+        let pi = doc
+            .root()
+            .children()
+            .find(|node| node.node_type() == NodeType::PI)
+            .expect("document PI");
+        let child = doc.root_element().first_element_child().unwrap();
+        let mut ids = subtree_ids(child);
+        ids.insert(pi.id());
+        let pred = subset_predicate(ids);
+
+        let mut out = Vec::new();
+        serialize_canonical(
+            &doc,
+            Some(&pred),
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            &mut out,
+        )
+        .expect("c14n");
+
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "<?pi data?>\n<child>text</child>"
+        );
+    }
+
+    struct SelectedAxesOnly {
+        owner: NodeId,
+    }
+
+    impl NodeVisibility for SelectedAxesOnly {
+        fn contains_node(&self, _node: Node<'_, '_>) -> bool {
+            false
+        }
+
+        fn contains_attribute(
+            &self,
+            owner: Node<'_, '_>,
+            namespace: Option<&str>,
+            local_name: &str,
+        ) -> bool {
+            owner.id() == self.owner && namespace.is_none() && local_name == "a"
+        }
+
+        fn contains_namespace(&self, owner: Node<'_, '_>, prefix: &str, uri: &str) -> bool {
+            owner.id() == self.owner && prefix == "p" && uri == "urn:p"
+        }
+    }
+
+    #[test]
+    fn omitted_element_still_processes_its_selected_axes() {
+        // C14N §2.3 suppresses only the omitted element's tags. Namespace and
+        // attribute nodes independently selected into the node-set still emit.
+        let document = Document::parse(r#"<root xmlns:p="urn:p" a="1"><child/></root>"#)
+            .expect("fixed selected-axis fixture must parse");
+        let visibility = SelectedAxesOnly {
+            owner: document.root_element().id(),
+        };
+        let mut output = Vec::new();
+
+        serialize_canonical_visible_with_position(
+            &document,
+            Some(&visibility),
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: false,
+            },
+            None,
+            &mut output,
+        )
+        .expect("selected axes must canonicalize");
+
+        assert_eq!(output, br#" xmlns:p="urn:p" a="1""#);
     }
 
     // ── xml:* attribute inheritance tests (G001) ──────────────────────
@@ -915,10 +1234,11 @@ mod tests {
     }
 
     #[test]
-    fn no_inheritance_past_included_ancestor() {
+    fn apex_inherits_past_included_ancestor() {
         // A (in set, xml:lang="en") → B (not in set) → C (in set)
-        // C should NOT inherit xml:lang from A because A is in the set
-        // and renders its own attributes. The walk must stop at A.
+        // C is an apex because its direct parent is absent. C14N 1.0 §2.4
+        // examines its complete ancestor axis, including ancestors that are
+        // themselves in the node set, so C must materialize xml:lang.
         let xml = r#"<a xml:lang="en"><b><c>text</c></b></a>"#;
         let doc = Document::parse(xml).unwrap();
         let a = doc.root_element();
@@ -950,14 +1270,237 @@ mod tests {
         .unwrap();
         let result = String::from_utf8(out).unwrap();
 
-        // xml:lang should appear on <a> only, NOT inherited onto <c>
+        // Both elements carry xml:lang: A owns it and C materializes the
+        // inherited value because the omitted B breaks the output ancestry.
         assert!(
             result.contains(r#"<a xml:lang="en">"#),
             "a should have xml:lang; got: {result}"
         );
         assert!(
-            !result.contains(r#"<c xml:lang"#),
-            "c should NOT inherit xml:lang from a; got: {result}"
+            result.contains(r#"<c xml:lang="en">"#),
+            "apex c should inherit xml:lang from a; got: {result}"
+        );
+    }
+
+    #[test]
+    fn c14n11_apex_does_not_repeat_base_from_included_ancestor() {
+        // C14N 1.1 fixes up xml:base only across the contiguous omitted chain.
+        // Repeating a base already rendered by an included ancestor changes the
+        // canonical octets without preserving any additional URI semantics.
+        let xml = r#"<a xml:base="u/"><b><c>text</c></b></a>"#;
+        let doc = Document::parse(xml).unwrap();
+        let a = doc.root_element();
+        let b = a.first_element_child().unwrap();
+        let c = b.first_element_child().unwrap();
+
+        let mut ids = HashSet::new();
+        ids.insert(a.id());
+        ids.insert(c.id());
+        for child in c.children() {
+            ids.insert(child.id());
+        }
+        let pred = subset_predicate(ids);
+
+        let renderer = InclusiveNsRenderer;
+        let mut out = Vec::new();
+        serialize_canonical(
+            &doc,
+            Some(&pred),
+            false,
+            &renderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: true,
+            },
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"<a xml:base="u/"><c>text</c></a>"#
+        );
+    }
+
+    #[test]
+    fn c14n11_apex_base_uses_only_contiguous_omitted_ancestors() {
+        // The included a already establishes u/ in the canonical output. The
+        // apex c must fix up only the omitted b base plus its own base, or u/
+        // would be applied twice when the canonical subset is interpreted.
+        let xml = r#"<a xml:base="u/"><b xml:base="v/"><c xml:base="x">text</c></b></a>"#;
+        let doc = Document::parse(xml).unwrap();
+        let a = doc.root_element();
+        let b = a.first_element_child().unwrap();
+        let c = b.first_element_child().unwrap();
+
+        let mut ids = HashSet::new();
+        ids.insert(a.id());
+        ids.insert(c.id());
+        for child in c.children() {
+            ids.insert(child.id());
+        }
+        let pred = subset_predicate(ids);
+
+        let mut out = Vec::new();
+        serialize_canonical(
+            &doc,
+            Some(&pred),
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: true,
+            },
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"<a xml:base="u/"><c xml:base="v/x">text</c></a>"#
+        );
+    }
+
+    struct HiddenXmlBaseVisibility {
+        included: HashSet<NodeId>,
+        hidden_base_owner: NodeId,
+    }
+
+    impl NodeVisibility for HiddenXmlBaseVisibility {
+        fn contains_node(&self, node: Node<'_, '_>) -> bool {
+            self.included.contains(&node.id())
+        }
+
+        fn contains_attribute(
+            &self,
+            owner: Node<'_, '_>,
+            namespace: Option<&str>,
+            local_name: &str,
+        ) -> bool {
+            self.included.contains(&owner.id())
+                && !(owner.id() == self.hidden_base_owner
+                    && namespace == Some(XML_NS)
+                    && local_name == "base")
+        }
+
+        fn contains_namespace(&self, owner: Node<'_, '_>, _prefix: &str, _uri: &str) -> bool {
+            self.included.contains(&owner.id())
+        }
+    }
+
+    #[test]
+    fn c14n11_fixup_crosses_selected_owner_of_hidden_xml_base() {
+        // b remains in the output but its xml:base attribute node does not.
+        // The omitted c therefore requires d to materialize b's hidden base;
+        // stopping at b would change d's effective URI in the canonical form.
+        let xml = r#"<a xml:base="http://ex/"><b xml:base="hidden/"><c><d xml:base="leaf">text</d></c></b></a>"#;
+        let doc = Document::parse(xml).unwrap();
+        let a = doc.root_element();
+        let b = a.first_element_child().unwrap();
+        let c = b.first_element_child().unwrap();
+        let d = c.first_element_child().unwrap();
+        let mut included = HashSet::from([a.id(), b.id(), d.id()]);
+        included.extend(d.children().map(|node| node.id()));
+        let visibility = HiddenXmlBaseVisibility {
+            included,
+            hidden_base_owner: b.id(),
+        };
+        let mut out = Vec::new();
+
+        serialize_canonical_visible_with_position(
+            &doc,
+            Some(&visibility),
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: true,
+            },
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"<a xml:base="http://ex/"><b><d xml:base="hidden/leaf">text</d></b></a>"#
+        );
+    }
+
+    #[test]
+    fn c14n11_inherits_hidden_base_past_selected_owner() {
+        // Unlike the fixup case above, d has no base of its own. Its inherited
+        // base must still cross selected b because b's base attribute is hidden.
+        let xml = r#"<a xml:base="http://ex/"><b xml:base="hidden/"><c><d>text</d></c></b></a>"#;
+        let doc = Document::parse(xml).unwrap();
+        let a = doc.root_element();
+        let b = a.first_element_child().unwrap();
+        let c = b.first_element_child().unwrap();
+        let d = c.first_element_child().unwrap();
+        let mut included = HashSet::from([a.id(), b.id(), d.id()]);
+        included.extend(d.children().map(|node| node.id()));
+        let visibility = HiddenXmlBaseVisibility {
+            included,
+            hidden_base_owner: b.id(),
+        };
+        let mut out = Vec::new();
+
+        serialize_canonical_visible_with_position(
+            &doc,
+            Some(&visibility),
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: true,
+            },
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"<a xml:base="http://ex/"><b><d xml:base="hidden/">text</d></b></a>"#
+        );
+    }
+
+    #[test]
+    fn c14n11_inherits_hidden_base_past_selected_baseless_element() {
+        // Selected b has no base of its own and cannot restore a's hidden base
+        // context. The omitted c makes d an apex, so d must materialize the
+        // source base that is otherwise absent from the canonical output.
+        let xml = r#"<a xml:base="hidden/"><b><c><d>text</d></c></b></a>"#;
+        let doc = Document::parse(xml).unwrap();
+        let a = doc.root_element();
+        let b = a.first_element_child().unwrap();
+        let c = b.first_element_child().unwrap();
+        let d = c.first_element_child().unwrap();
+        let mut included = HashSet::from([a.id(), b.id(), d.id()]);
+        included.extend(d.children().map(|node| node.id()));
+        let visibility = HiddenXmlBaseVisibility {
+            included,
+            hidden_base_owner: a.id(),
+        };
+        let mut out = Vec::new();
+
+        serialize_canonical_visible_with_position(
+            &doc,
+            Some(&visibility),
+            false,
+            &InclusiveNsRenderer,
+            C14nConfig {
+                inherit_xml_attrs: true,
+                fixup_xml_base: true,
+            },
+            None,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"<a><b><d xml:base="hidden/">text</d></b></a>"#
         );
     }
 

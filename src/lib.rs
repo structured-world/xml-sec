@@ -32,6 +32,8 @@
 
 pub mod c14n;
 pub mod error;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+mod xml;
 
 #[cfg(feature = "xmldsig")]
 pub mod xmldsig;

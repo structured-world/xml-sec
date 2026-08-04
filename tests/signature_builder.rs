@@ -1,10 +1,12 @@
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::xmldsig::transforms::MAX_TRANSFORMS_PER_REFERENCE;
 use xml_sec::xmldsig::{
     DigestAlgorithm, ReferenceBuilder, SignatureAlgorithm, SignatureBuilder, SignatureBuilderError,
-    Transform, parse_transforms,
+    Transform, XPathExpression, XPathFilter, XPathFilterOperation, parse_transforms,
 };
 
 const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
 fn exclusive_c14n() -> C14nAlgorithm {
     C14nAlgorithm::new(C14nMode::Exclusive1_0, false)
@@ -133,6 +135,178 @@ fn rejects_incomplete_or_unsafe_signing_templates() {
 }
 
 #[test]
+fn rejects_reserved_signature_namespace_prefixes() {
+    // XML Namespaces reserves both spellings independently of whether a parser
+    // happens to accept the resulting declaration syntax. Neither may be bound
+    // to the XMLDSig namespace by the public template builder.
+    for prefix in ["xml", "xmlns"] {
+        let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .ns_prefix(prefix)
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256))
+            .build_template()
+            .expect_err("reserved namespace prefixes must fail before serialization");
+
+        assert!(matches!(
+            error,
+            SignatureBuilderError::InvalidNamespacePrefix(value) if value == prefix
+        ));
+    }
+}
+
+#[test]
+fn rejects_too_many_references_before_serialization() {
+    // Builder output must obey the same cardinality bound as strict parsing and
+    // execution instead of producing a template that signing later rejects.
+    let mut builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256);
+    for index in 0..65 {
+        builder = builder.add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(format!("#item-{index}")),
+        );
+    }
+
+    let error = builder
+        .build_template()
+        .expect_err("the builder must reject the 65th Reference");
+
+    assert!(matches!(
+        error,
+        SignatureBuilderError::TooManyReferences { count: 65, max: 64 }
+    ));
+}
+
+#[test]
+fn rejects_transform_chains_that_execution_cannot_accept() {
+    // A builder-produced template must remain parseable and executable by the
+    // same crate instead of deferring an oversized chain failure until signing.
+    let mut reference = ReferenceBuilder::new(DigestAlgorithm::Sha256);
+    for _ in 0..=MAX_TRANSFORMS_PER_REFERENCE {
+        reference = reference.transform(Transform::Enveloped);
+    }
+    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(reference)
+        .build_template()
+        .expect_err("builder must reject an oversized transform chain");
+
+    assert!(error.to_string().contains("transform chain"));
+}
+
+#[test]
+fn rejects_xpath_sources_that_parsing_cannot_accept() {
+    // Programmatic XPath and Filter 2.0 parameters must pass the same source
+    // contract as serialized parameters parsed back during signing.
+    let invalid_transforms = [
+        ("empty", Transform::XPath(XPathExpression::new(""))),
+        ("malformed", Transform::XPath(XPathExpression::new("("))),
+        (
+            "oversized",
+            Transform::XPath(XPathExpression::new("x".repeat(16 * 1024 + 1))),
+        ),
+        (
+            "filter2 malformed",
+            Transform::XPathFilter2(vec![XPathFilter::new(
+                XPathFilterOperation::Intersect,
+                XPathExpression::new("("),
+            )]),
+        ),
+    ];
+
+    for (case, transform) in invalid_transforms {
+        let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(transform))
+            .build_template()
+            .expect_err("builder must reject an unusable XPath source");
+        assert!(error.to_string().contains("XPath"), "case: {case}");
+    }
+}
+
+#[test]
+fn rejects_xpath_namespace_budget_before_serialization() {
+    // Parsing enforces one aggregate namespace budget per Reference. The builder
+    // must reject the same input rather than emit a template that signing reparses.
+    let mut expression = XPathExpression::new("true()");
+    for index in 0..=1_024 {
+        expression = expression.with_namespace(format!("p{index}"), "urn:test");
+    }
+
+    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::XPath(expression)),
+        )
+        .build_template()
+        .expect_err("builder must enforce the parser's aggregate namespace budget");
+
+    assert!(matches!(error, SignatureBuilderError::InvalidXPath(_)));
+    assert!(error.to_string().contains("namespace binding budget"));
+}
+
+#[test]
+fn rejects_signature_wide_xpath_expression_budget() {
+    // Builder output must obey the parser's aggregate bound rather than emit a
+    // template that becomes unacceptable only when signing reparses SignedInfo.
+    let filters = (0..64)
+        .map(|_| {
+            XPathFilter::new(
+                XPathFilterOperation::Intersect,
+                XPathExpression::new("true()"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut max_reference = ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#item-0");
+    for _ in 0..64 {
+        max_reference = max_reference.transform(Transform::XPathFilter2(filters.clone()));
+    }
+    let mut builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(max_reference);
+    builder
+        .clone()
+        .build_template()
+        .expect("one maximum-shaped Reference must remain accepted");
+    builder = builder.add_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#item-1")
+            .transform(Transform::XPath(XPathExpression::new("true()"))),
+    );
+
+    let error = builder
+        .build_template()
+        .expect_err("builder must enforce the signature-wide XPath expression budget");
+
+    assert!(matches!(error, SignatureBuilderError::InvalidXPath(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("signature-wide XPath expression budget")
+    );
+}
+
+#[test]
+fn rejects_inherited_signature_prefix_over_namespace_budget() {
+    // Every serialized Filter2 XPath inherits the signature prefix binding. The
+    // builder must charge those bindings before signing reparses its template.
+    let filters = (0..64)
+        .map(|_| {
+            XPathFilter::new(
+                XPathFilterOperation::Intersect,
+                XPathExpression::new("true()"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let reference = (0..17).fold(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256),
+        |reference, _| reference.transform(Transform::XPathFilter2(filters.clone())),
+    );
+
+    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        .add_reference(reference)
+        .build_template()
+        .expect_err("builder must count inherited namespace bindings on every XPath element");
+
+    assert!(matches!(error, SignatureBuilderError::InvalidXPath(_)));
+    assert!(error.to_string().contains("namespace binding budget"));
+}
+
+#[test]
 fn serializes_xpath_and_exclusive_prefix_list() {
     // Complex transforms retain the child content required by their specifications.
     let c14n = exclusive_c14n().with_prefix_list("saml #default ds");
@@ -164,6 +338,243 @@ fn serializes_xpath_and_exclusive_prefix_list() {
         .find(|node| node.tag_name().name() == "InclusiveNamespaces")
         .expect("InclusiveNamespaces child");
     assert_eq!(inclusive.attribute("PrefixList"), Some("#default ds saml"));
+}
+
+#[test]
+fn serializes_and_reparses_general_xpath_filter2_parameters() {
+    // Builder output must preserve expression order, operations, escaping,
+    // and prefix bindings because all four affect the resulting node set.
+    let filters = vec![
+        XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("//doc:Record[@active = 'yes']")
+                .with_namespace("doc", "urn:documents"),
+        ),
+        XPathFilter::new(
+            XPathFilterOperation::Subtract,
+            XPathExpression::new("//doc:Secret").with_namespace("doc", "urn:documents"),
+        ),
+    ];
+    let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .transform(Transform::XPathFilter2(filters)),
+        )
+        .build_template()
+        .expect("valid XPath Filter 2.0 template");
+    let document = roxmltree::Document::parse(&xml).expect("builder must emit valid XML");
+    let transforms = document
+        .descendants()
+        .find(|node| node.has_tag_name((DSIG_NS, "Transforms")))
+        .expect("Transforms element");
+    let parsed = parse_transforms(transforms).expect("serialized filters must parse");
+    let [Transform::XPathFilter2(parsed_filters)] = parsed.as_slice() else {
+        panic!("expected XPath Filter 2.0 transform");
+    };
+
+    assert_eq!(parsed_filters.len(), 2);
+    assert_eq!(
+        parsed_filters[0].operation(),
+        XPathFilterOperation::Intersect
+    );
+    assert_eq!(
+        parsed_filters[0].xpath().expression(),
+        "//doc:Record[@active = 'yes']"
+    );
+    assert_eq!(
+        parsed_filters[0]
+            .xpath()
+            .namespaces()
+            .get("doc")
+            .map(String::as_str),
+        Some("urn:documents")
+    );
+    assert_eq!(
+        parsed_filters[1].operation(),
+        XPathFilterOperation::Subtract
+    );
+}
+
+#[test]
+fn allows_filter2_binding_that_matches_signature_prefix() {
+    // Filter2 XPath parameters use the Filter2 namespace as their default
+    // namespace, so a local `ds` binding cannot rebind XMLDSig elements.
+    let filters = vec![XPathFilter::new(
+        XPathFilterOperation::Intersect,
+        XPathExpression::new("//ds:Record").with_namespace("ds", "urn:documents"),
+    )];
+    let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .transform(Transform::XPathFilter2(filters)),
+        )
+        .build_template()
+        .expect("Filter2-local bindings must not conflict with the signature prefix");
+    let document = roxmltree::Document::parse(&xml).expect("builder must emit valid XML");
+    let xpath = document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2002/06/xmldsig-filter2", "XPath")))
+        .expect("Filter2 XPath child");
+
+    assert_eq!(
+        xpath.lookup_namespace_uri(Some("ds")),
+        Some("urn:documents")
+    );
+}
+
+#[test]
+fn rejects_xml_forbidden_characters_in_xpath_namespace_uris() {
+    // XML escaping cannot legalize control characters forbidden by XML 1.0;
+    // a successful builder result must therefore always remain parseable.
+    for uri in ["urn:invalid:\0", "urn:invalid:\u{1}"] {
+        let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(
+                Transform::XPath(XPathExpression::new("//doc:item").with_namespace("doc", uri)),
+            ))
+            .build_template()
+            .expect_err("XML-forbidden namespace URI characters must fail at the builder");
+
+        assert!(error.to_string().contains("forbidden by XML 1.0"));
+    }
+}
+
+#[test]
+fn rejects_xml_forbidden_characters_in_xpath_expressions() {
+    // XPath grammar accepts string literals that XML 1.0 cannot serialize. The
+    // builder must reject both parameter forms rather than return an XML string
+    // that the signing pipeline cannot parse again.
+    let expression = "contains(., '\u{B}')";
+    let transforms = [
+        Transform::XPath(XPathExpression::new(expression)),
+        Transform::XPathFilter2(vec![XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new(expression),
+        )]),
+    ];
+
+    for transform in transforms {
+        let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(transform))
+            .build_template()
+            .expect_err("XML-forbidden XPath characters must fail at the builder boundary");
+
+        assert!(error.to_string().contains("forbidden by XML 1.0"));
+    }
+}
+
+#[test]
+fn rejects_invalid_filter2_expression_counts() {
+    // Builder output is reparsed by signing, so it must enforce the same
+    // non-empty, bounded Filter2 sequence accepted by the transform parser.
+    let oversized = (0..65)
+        .map(|_| {
+            XPathFilter::new(
+                XPathFilterOperation::Intersect,
+                XPathExpression::new("/root"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for filters in [Vec::new(), oversized] {
+        let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .add_reference(
+                ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                    .transform(Transform::XPathFilter2(filters)),
+            )
+            .build_template()
+            .expect_err("invalid Filter2 cardinality must fail at the builder boundary");
+
+        assert!(error.to_string().contains("between 1 and 64"));
+    }
+}
+
+#[test]
+fn rejects_xpath_binding_that_shadows_signature_prefix() {
+    // Rebinding the prefix used for ds:XPath changes the element namespace and
+    // produces a template that neither the strict parser nor a signer can use.
+    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::XPath(
+                XPathExpression::new("//ds:item").with_namespace("ds", "urn:payload"),
+            )),
+        )
+        .build_template()
+        .expect_err("XPath namespace bindings must not shadow the signature prefix");
+
+    assert!(error.to_string().contains("ds"));
+}
+
+#[test]
+fn rejects_xpath_binding_that_redefines_xml_prefix() {
+    // XML Namespaces permanently binds `xml` to the XML namespace. Accepting
+    // another URI would change the XPath context when serialization omits the
+    // reserved declaration.
+    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::XPath(
+                XPathExpression::new("//xml:item").with_namespace("xml", "urn:not-xml"),
+            )),
+        )
+        .build_template()
+        .expect_err("the xml prefix cannot be rebound to another namespace");
+
+    assert!(matches!(
+        error,
+        SignatureBuilderError::InvalidNamespacePrefix(prefix) if prefix == "xml"
+    ));
+}
+
+#[test]
+fn rejects_xpath_binding_that_aliases_xml_namespace() {
+    // The XML namespace is reserved for the `xml` prefix; declaring an alias
+    // would produce a document that violates the namespace constraints.
+    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::XPath(
+                XPathExpression::new("//alias:item")
+                    .with_namespace("alias", "http://www.w3.org/XML/1998/namespace"),
+            )),
+        )
+        .build_template()
+        .expect_err("the XML namespace cannot be assigned to another prefix");
+
+    assert!(matches!(
+        error,
+        SignatureBuilderError::InvalidNamespacePrefix(prefix) if prefix == "alias"
+    ));
+}
+
+#[test]
+fn rejects_xpath_bindings_with_invalid_namespace_uris() {
+    // Empty namespace names and the namespace-declaration namespace cannot be
+    // bound to an XPath prefix in either XMLDSig XPath parameter form.
+    let transforms = [
+        Transform::XPath(XPathExpression::new("//doc:item").with_namespace("doc", "")),
+        Transform::XPath(XPathExpression::new("//doc:item").with_namespace("doc", XMLNS_NS)),
+        Transform::XPathFilter2(vec![XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("//doc:item").with_namespace("doc", ""),
+        )]),
+        Transform::XPathFilter2(vec![XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("//doc:item").with_namespace("doc", XMLNS_NS),
+        )]),
+    ];
+
+    for transform in transforms {
+        let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(transform))
+            .build_template()
+            .expect_err("invalid namespace URI must be rejected before serialization");
+        assert!(matches!(
+            error,
+            SignatureBuilderError::InvalidNamespaceUri(uri)
+                if uri.is_empty() || uri == XMLNS_NS
+        ));
+    }
 }
 
 #[test]

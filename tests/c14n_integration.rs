@@ -392,9 +392,9 @@ fn c14n_1_1_idempotency() {
 }
 
 #[test]
-fn c14n_1_1_xml_id_inherited_in_subset() {
-    // C14N 1.1 specific: xml:id is propagated to document subsets.
-    // Root has xml:id="doc1", subset includes only child — xml:id must appear.
+fn c14n_1_1_xml_id_is_not_inherited_in_subset() {
+    // C14N 1.1 §2.4 excludes xml:id from inheritance. Root has xml:id="doc1",
+    // but a subset containing only child must not resurrect that attribute.
     let xml = r#"<root xml:id="doc1" xmlns:a="http://a"><a:child>text</a:child></root>"#;
     let doc = roxmltree::Document::parse(xml).expect("parse");
     let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
@@ -410,8 +410,8 @@ fn c14n_1_1_xml_id_inherited_in_subset() {
     let result = String::from_utf8(output).expect("utf8");
 
     assert!(
-        result.contains(r#"xml:id="doc1""#),
-        "xml:id should be inherited in C14N 1.1 subset; got: {result}"
+        !result.contains(r#"xml:id="doc1""#),
+        "xml:id must not be inherited in C14N 1.1 subset; got: {result}"
     );
     // Also verify namespace is rendered
     assert!(
@@ -421,8 +421,9 @@ fn c14n_1_1_xml_id_inherited_in_subset() {
 }
 
 #[test]
-fn c14n_1_1_xml_lang_and_id_both_inherited() {
-    // Both xml:lang and xml:id should be inherited together.
+fn c14n_1_1_inherits_xml_lang_but_not_xml_id() {
+    // Simple inheritance applies to xml:lang, but C14N 1.1 explicitly
+    // excludes xml:id from that processing.
     let xml = r#"<root xml:lang="en" xml:id="r1"><child/></root>"#;
     let doc = roxmltree::Document::parse(xml).expect("parse");
     let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
@@ -435,7 +436,7 @@ fn c14n_1_1_xml_lang_and_id_both_inherited() {
     canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
     let result = String::from_utf8(output).expect("utf8");
 
-    assert!(result.contains(r#"xml:id="r1""#), "got: {result}");
+    assert!(!result.contains(r#"xml:id="r1""#), "got: {result}");
     assert!(result.contains(r#"xml:lang="en""#), "got: {result}");
 }
 

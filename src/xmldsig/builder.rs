@@ -6,12 +6,22 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 
 use crate::c14n::{C14nAlgorithm, C14nMode};
+use crate::xml::is_xml_1_0_character;
 
+use super::parse::MAX_REFERENCES_PER_SIGNATURE;
+use super::transforms::{
+    MAX_TRANSFORMS_PER_REFERENCE, MAX_XPATH_FILTERS, XPathSignatureParseBudget,
+    validate_xpath_namespace_budget,
+};
+use super::xpath::compile_xpath;
 use super::{
-    DigestAlgorithm, ENVELOPED_SIGNATURE_URI, SignatureAlgorithm, Transform, XPATH_TRANSFORM_URI,
+    BASE64_TRANSFORM_URI, DigestAlgorithm, ENVELOPED_SIGNATURE_URI, SignatureAlgorithm, Transform,
+    XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI, XPathExpression,
 };
 
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 const EXCLUSIVE_C14N_NS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 const XPATH_EXCLUDE_ALL_SIGNATURES: &str = "not(ancestor-or-self::dsig:Signature)";
 
@@ -21,6 +31,12 @@ pub enum SignatureBuilderError {
     /// A namespace prefix was not a supported XML NCName.
     #[error("invalid XML namespace prefix: {0}")]
     InvalidNamespacePrefix(String),
+    /// A namespace URI could not be represented in an XML 1.0 declaration.
+    #[error("XML namespace URI contains a character forbidden by XML 1.0: {0:?}")]
+    InvalidNamespaceUri(String),
+    /// An XPath binding would rebind the prefix used by XMLDSig elements.
+    #[error("XPath namespace binding conflicts with XMLDSig prefix: {0}")]
+    NamespacePrefixConflict(String),
     /// An XMLDSig Id attribute was not a valid XML NCName.
     #[error("invalid {element} Id: {value}")]
     InvalidId {
@@ -32,6 +48,33 @@ pub enum SignatureBuilderError {
     /// XMLDSig requires at least one reference in SignedInfo.
     #[error("a signature template requires at least one Reference")]
     MissingReference,
+    /// A template declared more references than signing and verification accept.
+    #[error("signature template contains {count} references; maximum is {max}")]
+    TooManyReferences {
+        /// Number of references supplied by the caller.
+        count: usize,
+        /// Maximum references accepted for one signature.
+        max: usize,
+    },
+    /// A reference exceeded the transform-chain limit shared with execution.
+    #[error("transform chain contains {count} transforms; maximum is {max}")]
+    TooManyTransforms {
+        /// Number of transforms supplied by the caller.
+        count: usize,
+        /// Maximum transforms accepted by parsing and execution.
+        max: usize,
+    },
+    /// XPath Filter 2.0 requires a non-empty, bounded expression sequence.
+    #[error("XPath Filter 2.0 requires between 1 and {max} expressions, got {count}")]
+    InvalidXPathFilterCount {
+        /// Number of expressions supplied by the caller.
+        count: usize,
+        /// Maximum expression count accepted by parsing and execution.
+        max: usize,
+    },
+    /// An XPath parameter cannot be parsed or exceeds its resource bounds.
+    #[error("invalid XPath expression: {0}")]
+    InvalidXPath(String),
     /// SHA-1 algorithms are available for verification but not new signatures.
     #[error("algorithm is not allowed for signing: {0}")]
     SigningAlgorithmDisabled(&'static str),
@@ -208,6 +251,100 @@ impl SignatureBuilder {
         if self.references.is_empty() {
             return Err(SignatureBuilderError::MissingReference);
         }
+        if self.references.len() > MAX_REFERENCES_PER_SIGNATURE {
+            return Err(SignatureBuilderError::TooManyReferences {
+                count: self.references.len(),
+                max: MAX_REFERENCES_PER_SIGNATURE,
+            });
+        }
+        let mut xpath_signature_budget = XPathSignatureParseBudget::default();
+        for reference in &self.references {
+            if reference.transforms.len() > MAX_TRANSFORMS_PER_REFERENCE {
+                return Err(SignatureBuilderError::TooManyTransforms {
+                    count: reference.transforms.len(),
+                    max: MAX_TRANSFORMS_PER_REFERENCE,
+                });
+            }
+            for transform in &reference.transforms {
+                match transform {
+                    Transform::XPath(xpath) => {
+                        validate_xpath_source(xpath.expression())?;
+                        xpath_signature_budget.charge().map_err(|error| {
+                            SignatureBuilderError::InvalidXPath(error.to_string())
+                        })?;
+                    }
+                    Transform::XPathFilter2(filters) => {
+                        if filters.is_empty() || filters.len() > MAX_XPATH_FILTERS {
+                            return Err(SignatureBuilderError::InvalidXPathFilterCount {
+                                count: filters.len(),
+                                max: MAX_XPATH_FILTERS,
+                            });
+                        }
+                        for filter in filters {
+                            validate_xpath_source(filter.xpath().expression())?;
+                            xpath_signature_budget.charge().map_err(|error| {
+                                SignatureBuilderError::InvalidXPath(error.to_string())
+                            })?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            validate_xpath_namespace_budget(
+                &reference.transforms,
+                self.ns_prefix.as_deref().map(|prefix| (prefix, XMLDSIG_NS)),
+            )
+            .map_err(|error| SignatureBuilderError::InvalidXPath(error.to_string()))?;
+        }
+        for (prefix, uri, shares_signature_namespace) in
+            self.references.iter().flat_map(|reference| {
+                reference
+                    .transforms
+                    .iter()
+                    .flat_map(|transform| match transform {
+                        Transform::XPath(xpath) => xpath
+                            .namespaces()
+                            .iter()
+                            .map(|(prefix, uri)| (prefix, uri, true))
+                            .collect::<Vec<_>>(),
+                        Transform::XPathFilter2(filters) => filters
+                            .iter()
+                            .flat_map(|filter| {
+                                filter
+                                    .xpath()
+                                    .namespaces()
+                                    .iter()
+                                    .map(|(prefix, uri)| (prefix, uri, false))
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+            })
+        {
+            // Namespaces in XML reserves the declaration namespace and both
+            // sides of the `xml` binding; prefixed declarations cannot be empty.
+            if uri.is_empty() || uri == XMLNS_NS || !uri.chars().all(is_xml_1_0_character) {
+                return Err(SignatureBuilderError::InvalidNamespaceUri(uri.clone()));
+            }
+            if prefix == "xmlns"
+                || (prefix == "xml") != (uri == XML_NS)
+                || (prefix != "xml" && !is_namespace_prefix(prefix))
+            {
+                return Err(SignatureBuilderError::InvalidNamespacePrefix(
+                    prefix.clone(),
+                ));
+            }
+            // Ordinary XPath parameters share the Signature namespace prefix,
+            // while Filter2 parameters are unprefixed in their own namespace.
+            if shares_signature_namespace
+                && self.ns_prefix.as_ref() == Some(prefix)
+                && uri != XMLDSIG_NS
+            {
+                return Err(SignatureBuilderError::NamespacePrefixConflict(
+                    prefix.clone(),
+                ));
+            }
+        }
         if !self.sign_method.signing_allowed() {
             return Err(SignatureBuilderError::SigningAlgorithmDisabled(
                 self.sign_method.uri(),
@@ -230,6 +367,19 @@ impl SignatureBuilder {
         }
         Ok(())
     }
+}
+
+fn validate_xpath_source(source: &str) -> Result<(), SignatureBuilderError> {
+    if let Some(character) = source
+        .chars()
+        .find(|character| !is_xml_1_0_character(*character))
+    {
+        return Err(SignatureBuilderError::InvalidXPath(format!(
+            "XPath expression contains a character forbidden by XML 1.0: {character:?}"
+        )));
+    }
+    compile_xpath(source).map_err(SignatureBuilderError::InvalidXPath)?;
+    Ok(())
 }
 
 fn write_reference<W: Write>(
@@ -291,6 +441,35 @@ fn write_transform<W: Write>(
             writer.write_event(Event::End(BytesEnd::new(name)))?;
             Ok(())
         }
+        Transform::XPath(xpath) => {
+            let transform_name = qualified_name(prefix, "Transform");
+            let mut transform_element = BytesStart::new(&transform_name);
+            transform_element.push_attribute(("Algorithm", XPATH_TRANSFORM_URI));
+            writer.write_event(Event::Start(transform_element))?;
+            write_xpath_expression(writer, prefix, "XPath", None, xpath)?;
+            writer.write_event(Event::End(BytesEnd::new(transform_name)))?;
+            Ok(())
+        }
+        Transform::XPathFilter2(filters) => {
+            let transform_name = qualified_name(prefix, "Transform");
+            let mut transform_element = BytesStart::new(&transform_name);
+            transform_element.push_attribute(("Algorithm", XPATH_FILTER2_TRANSFORM_URI));
+            writer.write_event(Event::Start(transform_element))?;
+            for filter in filters {
+                write_xpath_expression(
+                    writer,
+                    None,
+                    "XPath",
+                    Some(filter.operation().as_str()),
+                    filter.xpath(),
+                )?;
+            }
+            writer.write_event(Event::End(BytesEnd::new(transform_name)))?;
+            Ok(())
+        }
+        Transform::Base64Decode => {
+            write_algorithm(writer, prefix, "Transform", BASE64_TRANSFORM_URI)
+        }
         Transform::C14n(algorithm) if algorithm.inclusive_prefixes().is_empty() => {
             write_algorithm(writer, prefix, "Transform", algorithm.uri())
         }
@@ -321,6 +500,36 @@ fn write_transform<W: Write>(
             Ok(())
         }
     }
+}
+
+fn write_xpath_expression<W: Write>(
+    writer: &mut Writer<W>,
+    prefix: Option<&str>,
+    local_name: &str,
+    filter: Option<&str>,
+    xpath: &XPathExpression,
+) -> Result<(), std::io::Error> {
+    let name = qualified_name(prefix, local_name);
+    let mut element = BytesStart::new(&name);
+    let namespace_attributes = xpath
+        .namespaces()
+        .iter()
+        .filter(|(namespace_prefix, _)| namespace_prefix.as_str() != "xml")
+        .map(|(namespace_prefix, uri)| (format!("xmlns:{namespace_prefix}"), uri))
+        .collect::<Vec<_>>();
+    if prefix.is_none() && filter.is_some() {
+        element.push_attribute(("xmlns", XPATH_FILTER2_TRANSFORM_URI));
+    }
+    if let Some(filter) = filter {
+        element.push_attribute(("Filter", filter));
+    }
+    for (attribute, uri) in &namespace_attributes {
+        element.push_attribute((attribute.as_str(), uri.as_str()));
+    }
+    writer.write_event(Event::Start(element))?;
+    writer.write_event(Event::Text(BytesText::new(xpath.expression())))?;
+    writer.write_event(Event::End(BytesEnd::new(name)))?;
+    Ok(())
 }
 
 fn write_algorithm<W: Write>(
@@ -386,12 +595,15 @@ fn is_ncname(value: &str) -> bool {
 }
 
 fn is_namespace_prefix(value: &str) -> bool {
-    if !is_ncname(value) {
+    // Namespaces in XML reserves these names regardless of the URI being bound.
+    // Keep the invariant explicit instead of depending on parser rejection of a
+    // synthetic declaration assembled below.
+    if matches!(value, "xml" | "xmlns") || !is_ncname(value) {
         return false;
     }
 
-    // Parsing delegates the complete Unicode XML Name grammar and reserved-prefix
-    // rules to the same parser used by the rest of the crate.
+    // Parsing delegates the complete Unicode XML Name grammar to the same parser
+    // used by the rest of the crate.
     roxmltree::Document::parse(&format!(
         "<{value}:n xmlns:{value}=\"urn:xml-sec:prefix-validation\"/>"
     ))

@@ -56,16 +56,34 @@ Currently fail-closed:
 ### `xmldsig2ed-tests`
 
 XMLDSig Second Edition errata vectors. They exercise HMAC-SHA1, external URI
-references, XPath transforms, and Canonical XML 1.1. Those facilities are not
-enabled by the default XMLDSig verification policy, so the interop inventory
-asserts that each document fails closed.
+references, XPath transforms, and Canonical XML 1.1. XPath and C14N 1.1 are
+implemented; documents that additionally require HMAC, an external resource,
+or an unsupported key source remain explicitly classified as fail-closed.
+
+### `merlin-xpath-filter2`
+
+W3C/Merlin XPath Filter 2.0 subset input used for byte-exact canonicalization.
+The fixture is derived from the upstream sign-spec vector and exercises ordered
+intersect/subtract/union processing before inclusive C14N. Reciprocal xmlsec1
+tests separately cover signing and verification interoperability.
 
 ### `phaos-xmldsig-three`
 
 Third-party negative vectors. The regression suite currently imports the
-historical RSA enveloped baseline and its bad-digest and bad-signature variants.
-All carry inconsistent X.509 selector metadata and must fail during strict
-KeyInfo parsing before the certificate becomes a verification candidate.
+historical RSA enveloped baseline, its bad-digest and bad-signature variants,
+and the matching leaf/CA certificates. The artifacts intentionally exercise
+different boundaries:
+
+- The bad-digest vector returns an exact Reference digest mismatch when a
+  caller-owned key bypasses advisory document KeyInfo.
+- The file named `bad-sig` contains a second malformed MD5 Reference and is
+  rejected as an unsupported algorithm before SignatureValue verification.
+- The baseline certificate uses a 1024-bit RSA key and expired in 2012; key
+  strength and certificate validity policy reject it independently.
+
+The upstream corpus does not contain a separately named expired-certificate
+signature. Expiry coverage therefore uses the original Phaos leaf and CA at a
+fixed modern verification time without modifying the donor artifacts.
 
 ## Test Contract
 

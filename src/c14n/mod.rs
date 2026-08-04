@@ -2,7 +2,7 @@
 //!
 //! Implements:
 //! - [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) (inclusive)
-//! - [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) (inclusive; xml:id propagation and xml:base fixup)
+//! - [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) (inclusive; xml:id non-inheritance and xml:base fixup)
 //! - [Exclusive XML Canonicalization 1.0](https://www.w3.org/TR/xml-exc-c14n/) (exclusive)
 //!
 //! # Example
@@ -26,24 +26,29 @@ mod escape;
 mod ns_common;
 pub(crate) mod ns_exclusive;
 pub(crate) mod ns_inclusive;
-mod prefix;
+pub(crate) mod prefix;
 pub(crate) mod serialize;
 mod xml_base;
 
 use std::collections::HashSet;
 
-use roxmltree::{Document, Node};
+use roxmltree::{Document, Node, NodeId};
 
 use ns_exclusive::ExclusiveNsRenderer;
 use ns_inclusive::InclusiveNsRenderer;
-use serialize::{C14nConfig, serialize_canonical};
+#[cfg(any(feature = "xmldsig", test))]
+use serialize::CanonicalOutputLimitExceeded;
+use serialize::{
+    C14nConfig, CanonicalOutputOptions, serialize_canonical_visible_with_position,
+    serialize_canonical_visible_with_position_bounded,
+};
 
 /// C14N algorithm mode (without the comments flag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C14nMode {
     /// Inclusive C14N 1.0 — all in-scope namespaces rendered.
     Inclusive1_0,
-    /// Inclusive C14N 1.1 — like 1.0 with xml:id propagation and xml:base fixup.
+    /// Inclusive C14N 1.1 — like 1.0 with xml:id non-inheritance and xml:base fixup.
     Inclusive1_1,
     /// Exclusive C14N 1.0 — only visibly-utilized namespaces rendered.
     Exclusive1_0,
@@ -158,6 +163,59 @@ pub enum C14nError {
     Io(#[from] std::io::Error),
 }
 
+#[cfg(any(feature = "xmldsig", test))]
+pub(crate) fn is_output_limit_error(error: &C14nError) -> bool {
+    matches!(
+        error,
+        C14nError::Io(error)
+            if error
+                .get_ref()
+                .is_some_and(|source| source.is::<CanonicalOutputLimitExceeded>())
+    )
+}
+
+/// Visibility contract for canonicalizing a precise XPath node-set.
+///
+/// XPath can select attributes and namespace nodes independently from their
+/// owner element. The public closure API predates that requirement and treats
+/// both categories as visible whenever their owner is visible; XMLDSig uses
+/// this richer crate-private contract for standards-compliant subsets.
+pub(crate) trait NodeVisibility {
+    fn contains_node(&self, node: Node<'_, '_>) -> bool;
+
+    fn contains_attribute(
+        &self,
+        owner: Node<'_, '_>,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> bool;
+
+    fn contains_namespace(&self, owner: Node<'_, '_>, prefix: &str, uri: &str) -> bool;
+}
+
+struct ClosureVisibility<'a> {
+    predicate: &'a dyn Fn(Node<'_, '_>) -> bool,
+}
+
+impl NodeVisibility for ClosureVisibility<'_> {
+    fn contains_node(&self, node: Node<'_, '_>) -> bool {
+        (self.predicate)(node)
+    }
+
+    fn contains_attribute(
+        &self,
+        owner: Node<'_, '_>,
+        _namespace: Option<&str>,
+        _local_name: &str,
+    ) -> bool {
+        (self.predicate)(owner)
+    }
+
+    fn contains_namespace(&self, owner: Node<'_, '_>, _prefix: &str, _uri: &str) -> bool {
+        (self.predicate)(owner)
+    }
+}
+
 /// Canonicalize an XML document or document subset.
 ///
 /// - `doc`: parsed roxmltree document (read-only DOM).
@@ -171,6 +229,71 @@ pub fn canonicalize(
     algo: &C14nAlgorithm,
     output: &mut Vec<u8>,
 ) -> Result<(), C14nError> {
+    let visibility = node_set.map(|predicate| ClosureVisibility { predicate });
+    canonicalize_with_visibility(
+        doc,
+        visibility
+            .as_ref()
+            .map(|visibility| visibility as &dyn NodeVisibility),
+        algo,
+        output,
+    )
+}
+
+pub(crate) fn canonicalize_with_visibility(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    algo: &C14nAlgorithm,
+    output: &mut Vec<u8>,
+) -> Result<(), C14nError> {
+    canonicalize_with_visibility_and_position(doc, visibility, algo, None, output)?;
+    Ok(())
+}
+
+pub(crate) fn canonicalize_with_visibility_and_position(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    algo: &C14nAlgorithm,
+    tracked_element: Option<NodeId>,
+    output: &mut Vec<u8>,
+) -> Result<Option<usize>, C14nError> {
+    canonicalize_with_visibility_and_position_impl(
+        doc,
+        visibility,
+        algo,
+        tracked_element,
+        None,
+        output,
+    )
+}
+
+#[cfg(any(feature = "xmldsig", test))]
+pub(crate) fn canonicalize_with_visibility_and_position_bounded(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    algo: &C14nAlgorithm,
+    tracked_element: Option<NodeId>,
+    max_output_bytes: usize,
+    output: &mut Vec<u8>,
+) -> Result<Option<usize>, C14nError> {
+    canonicalize_with_visibility_and_position_impl(
+        doc,
+        visibility,
+        algo,
+        tracked_element,
+        Some(max_output_bytes),
+        output,
+    )
+}
+
+fn canonicalize_with_visibility_and_position_impl(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    algo: &C14nAlgorithm,
+    tracked_element: Option<NodeId>,
+    max_output_bytes: Option<usize>,
+    output: &mut Vec<u8>,
+) -> Result<Option<usize>, C14nError> {
     // inherit_xml_attrs: Inclusive C14N inherits xml:* attrs from ancestors
     // per §2.4. Exclusive C14N explicitly omits this per Exc-C14N §3.
     // fixup_xml_base: C14N 1.1 resolves relative xml:base URIs via RFC 3986.
@@ -181,7 +304,16 @@ pub fn canonicalize(
                 inherit_xml_attrs: true,
                 fixup_xml_base: false,
             };
-            serialize_canonical(doc, node_set, algo.with_comments, &renderer, config, output)
+            serialize_canonical_visible_with_position_dispatch(
+                doc,
+                visibility,
+                algo.with_comments,
+                &renderer,
+                config,
+                tracked_element,
+                max_output_bytes,
+                output,
+            )
         }
         C14nMode::Inclusive1_1 => {
             let renderer = InclusiveNsRenderer;
@@ -189,7 +321,16 @@ pub fn canonicalize(
                 inherit_xml_attrs: true,
                 fixup_xml_base: true,
             };
-            serialize_canonical(doc, node_set, algo.with_comments, &renderer, config, output)
+            serialize_canonical_visible_with_position_dispatch(
+                doc,
+                visibility,
+                algo.with_comments,
+                &renderer,
+                config,
+                tracked_element,
+                max_output_bytes,
+                output,
+            )
         }
         C14nMode::Exclusive1_0 => {
             let renderer = ExclusiveNsRenderer::new(&algo.inclusive_prefixes);
@@ -197,8 +338,50 @@ pub fn canonicalize(
                 inherit_xml_attrs: false,
                 fixup_xml_base: false,
             };
-            serialize_canonical(doc, node_set, algo.with_comments, &renderer, config, output)
+            serialize_canonical_visible_with_position_dispatch(
+                doc,
+                visibility,
+                algo.with_comments,
+                &renderer,
+                config,
+                tracked_element,
+                max_output_bytes,
+                output,
+            )
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serialize_canonical_visible_with_position_dispatch(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    with_comments: bool,
+    renderer: &dyn serialize::NsRenderer,
+    config: C14nConfig,
+    tracked_element: Option<NodeId>,
+    max_output_bytes: Option<usize>,
+    output: &mut Vec<u8>,
+) -> Result<Option<usize>, C14nError> {
+    match max_output_bytes {
+        Some(max_output_bytes) => serialize_canonical_visible_with_position_bounded(
+            doc,
+            visibility,
+            with_comments,
+            renderer,
+            config,
+            CanonicalOutputOptions::bounded(tracked_element, max_output_bytes),
+            output,
+        ),
+        None => serialize_canonical_visible_with_position(
+            doc,
+            visibility,
+            with_comments,
+            renderer,
+            config,
+            tracked_element,
+            output,
+        ),
     }
 }
 
@@ -311,8 +494,9 @@ mod tests {
     }
 
     #[test]
-    fn c14n_1_1_xml_id_inherited_in_subset() {
-        // C14N 1.1 propagates xml:id to document subsets, just like xml:lang.
+    fn c14n_1_1_xml_id_is_not_inherited_in_subset() {
+        // C14N 1.1 explicitly excludes xml:id from simple inheritable
+        // attributes, so omitting its owner must also omit the attribute.
         use roxmltree::Document;
         use std::collections::HashSet;
 
@@ -336,10 +520,63 @@ mod tests {
         canonicalize(&doc, Some(&pred), &algo, &mut out).expect("c14n 1.1 subset");
         let result = String::from_utf8(out).expect("utf8");
 
-        // xml:id="r1" should be inherited from root onto child
         assert!(
-            result.contains(r#"xml:id="r1""#),
-            "xml:id should be inherited in C14N 1.1 subset; got: {result}"
+            !result.contains(r#"xml:id="r1""#),
+            "xml:id must not be inherited in C14N 1.1 subset; got: {result}"
+        );
+    }
+
+    #[test]
+    fn c14n_1_0_xml_id_is_inherited_in_subset() {
+        // C14N 1.0 predates the C14N 1.1 xml:id exception, so xml:id follows
+        // the general xml:* apex inheritance rule in a document subset.
+        use roxmltree::Document;
+        use std::collections::HashSet;
+
+        let xml = r#"<root xml:id="r1"><child>text</child></root>"#;
+        let doc = Document::parse(xml).expect("parse");
+        let child = doc.root_element().first_element_child().expect("child");
+        let ids = child
+            .descendants()
+            .map(|node| node.id())
+            .collect::<HashSet<_>>();
+        let pred = move |node: roxmltree::Node| ids.contains(&node.id());
+
+        let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
+        let mut out = Vec::new();
+        canonicalize(&doc, Some(&pred), &algo, &mut out).expect("c14n 1.0 subset");
+
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            r#"<child xml:id="r1">text</child>"#
+        );
+    }
+
+    #[test]
+    fn bounded_canonicalization_stops_before_exceeding_the_limit() {
+        // XMLDSig applies a signature-wide output ceiling. The serializer must
+        // stop at that ceiling instead of allocating the complete hostile value
+        // and rejecting it only after serialization has finished.
+        let xml = format!("<root>{}</root>", "x".repeat(4_096));
+        let document = Document::parse(&xml).expect("fixed XML must parse");
+        let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
+        let mut output = Vec::new();
+
+        let error = canonicalize_with_visibility_and_position_bounded(
+            &document,
+            None,
+            &algorithm,
+            None,
+            64,
+            &mut output,
+        )
+        .expect_err("canonicalization must stop at the caller's byte ceiling");
+
+        assert!(is_output_limit_error(&error));
+        assert!(
+            output.len() <= 64,
+            "bounded output grew to {} bytes",
+            output.len()
         );
     }
 }

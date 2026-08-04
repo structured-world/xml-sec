@@ -178,7 +178,7 @@ fn fixture_file_count_matches_expected() {
     let expected = [
         ("keys", 24),
         ("c14n", 41),
-        ("xmldsig", 78),
+        ("xmldsig", 81),
         ("saml", 2),
         ("xmlenc", 482),
     ];

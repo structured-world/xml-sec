@@ -11,6 +11,8 @@
 
 use roxmltree::Node;
 
+use super::NodeVisibility;
+
 /// The XML namespace URI.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -19,40 +21,37 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 ///
 /// Walks from `start` up the ancestor chain, collecting `xml:base` values
 /// from each element. If a `node_set` is provided, the walk stops at the
-/// nearest ancestor that is included in the node set, since that ancestor
-/// will render its own `xml:base` in the canonical output. The function still
-/// uses that included ancestor's `xml:base` (if any) as the resolution seed,
-/// so that the omitted portion of the chain resolves against the correct
-/// effective base. Resolves from the topmost collected base to the closest.
+/// nearest included ancestor that emits its own non-empty `xml:base` in the
+/// canonical output. A selected element without such an attribute is not a
+/// boundary: inherited source context may still be absent from the output.
+/// Likewise, an included ancestor with an excluded `xml:base` attribute is not
+/// a boundary because its hidden base still contributes to descendants.
+/// The collected bases are resolved from the topmost to the closest.
 ///
 /// The resulting reference is absolute only if some ancestor `xml:base`
 /// (or the effective base at that point) is absolute; otherwise it may be
 /// a relative reference.
 ///
-/// Returns `None` if neither the omitted ancestor chain nor the nearest
-/// included ancestor (when `node_set` is provided) has a non-empty
+/// Returns `None` if the considered ancestor chain has no non-empty
 /// `xml:base` attribute.
 pub(crate) fn compute_effective_xml_base(
     start: Node<'_, '_>,
-    node_set: Option<&dyn Fn(Node) -> bool>,
+    visibility: Option<&dyn NodeVisibility>,
 ) -> Option<String> {
     let mut bases: Vec<&str> = Vec::new();
     let mut current = Some(start);
     while let Some(n) = current {
         if n.is_element() {
-            // Stop at the nearest included ancestor — it renders its own
-            // xml:base in the canonical output. However, we still collect
-            // its xml:base value as the resolution seed, so that the
-            // omitted chain below resolves against an absolute base.
-            if let Some(pred) = node_set
-                && pred(n)
+            let base = xml_base_value(n);
+            if let Some(set) = visibility
+                && preserves_xml_base_context(n, set)
             {
-                if let Some(base) = xml_base_value(n) {
-                    bases.push(base);
-                }
+                // A visible non-empty base establishes the context that
+                // descendants inherit in the canonical output. Reapplying
+                // ancestors above that boundary would duplicate the context.
                 break;
             }
-            if let Some(base) = xml_base_value(n) {
+            if let Some(base) = base {
                 bases.push(base);
             }
         }
@@ -70,6 +69,17 @@ pub(crate) fn compute_effective_xml_base(
         effective = resolve_uri(&effective, relative);
     }
     Some(effective)
+}
+
+/// Whether a selected element establishes its source `xml:base` context in the
+/// canonical output and therefore forms a boundary for descendant fixup.
+pub(super) fn preserves_xml_base_context(
+    node: Node<'_, '_>,
+    visibility: &dyn NodeVisibility,
+) -> bool {
+    visibility.contains_node(node)
+        && xml_base_value(node).is_some()
+        && visibility.contains_attribute(node, Some(XML_NS), "base")
 }
 
 /// Get the `xml:base` attribute value from an element, if present.

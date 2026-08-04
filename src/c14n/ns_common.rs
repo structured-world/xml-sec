@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use roxmltree::Node;
 
+use super::NodeVisibility;
 use super::prefix::has_in_scope_default_namespace;
 
 /// Collect, filter, and sort namespace declarations for a single element.
@@ -35,6 +36,8 @@ use super::prefix::has_in_scope_default_namespace;
 pub(crate) fn collect_ns_declarations(
     node: Node<'_, '_>,
     parent_rendered: &HashMap<String, String>,
+    visibility: Option<&dyn NodeVisibility>,
+    reset_invisible_binding: impl Fn(&str) -> bool,
     include_prefix: impl Fn(&str, &str) -> bool,
 ) -> (Vec<(String, String)>, HashMap<String, String>) {
     let mut rendered = parent_rendered.clone();
@@ -43,6 +46,24 @@ pub(crate) fn collect_ns_declarations(
     for ns in node.namespaces() {
         let prefix = ns.name().unwrap_or(""); // None = default namespace
         let uri = ns.uri();
+
+        if visibility.is_some_and(|set| !set.contains_namespace(node, prefix, uri)) {
+            // Canonical XML subset state tracks namespace nodes present on the
+            // nearest output ancestor, not merely declarations still in XML
+            // scope. A binding excluded on this element must be eligible for
+            // redeclaration if XPath includes it again on a descendant.
+            if reset_invisible_binding(prefix) {
+                if prefix.is_empty()
+                    && parent_rendered
+                        .get("")
+                        .is_some_and(|parent_uri| !parent_uri.is_empty())
+                {
+                    decls.push((String::new(), String::new()));
+                }
+                rendered.remove(prefix);
+            }
+            continue;
+        }
 
         // The `xml` prefix namespace is never declared in canonical XML.
         if prefix == "xml" {
@@ -96,7 +117,8 @@ mod tests {
     fn collect_all(xml: &str) -> Vec<(String, String)> {
         let doc = Document::parse(xml).expect("parse");
         let root = doc.root_element();
-        let (decls, _) = collect_ns_declarations(root, &HashMap::new(), |_, _| true);
+        let (decls, _) =
+            collect_ns_declarations(root, &HashMap::new(), None, |_| false, |_, _| true);
         decls
     }
 
@@ -122,10 +144,11 @@ mod tests {
     fn redundant_suppressed() {
         let doc = Document::parse(r#"<root xmlns:a="http://a"><child/></root>"#).expect("parse");
         let root = doc.root_element();
-        let (_, rendered) = collect_ns_declarations(root, &HashMap::new(), |_, _| true);
+        let (_, rendered) =
+            collect_ns_declarations(root, &HashMap::new(), None, |_| false, |_, _| true);
 
         let child = root.first_element_child().expect("child");
-        let (decls, _) = collect_ns_declarations(child, &rendered, |_, _| true);
+        let (decls, _) = collect_ns_declarations(child, &rendered, None, |_| false, |_, _| true);
         assert!(decls.is_empty(), "child must not redeclare a:");
     }
 
@@ -144,10 +167,11 @@ mod tests {
         let doc = Document::parse(r#"<root xmlns="http://example.com"><child xmlns=""/></root>"#)
             .expect("parse");
         let root = doc.root_element();
-        let (_, rendered) = collect_ns_declarations(root, &HashMap::new(), |_, _| true);
+        let (_, rendered) =
+            collect_ns_declarations(root, &HashMap::new(), None, |_| false, |_, _| true);
 
         let child = root.first_element_child().expect("child");
-        let (decls, _) = collect_ns_declarations(child, &rendered, |_, _| true);
+        let (decls, _) = collect_ns_declarations(child, &rendered, None, |_| false, |_, _| true);
         assert!(
             decls.iter().any(|(p, u)| p.is_empty() && u.is_empty()),
             "xmlns=\"\" must be emitted to undeclare default ns"
@@ -161,7 +185,8 @@ mod tests {
                 .expect("parse");
         let root = doc.root_element();
         // Only accept prefix "b".
-        let (decls, _) = collect_ns_declarations(root, &HashMap::new(), |p, _| p == "b");
+        let (decls, _) =
+            collect_ns_declarations(root, &HashMap::new(), None, |_| false, |p, _| p == "b");
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].0, "b");
     }

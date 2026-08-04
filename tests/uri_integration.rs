@@ -4,6 +4,7 @@
 //! a predicate for C14N, produces the correct canonical output.
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
+use xml_sec::xmldsig::NodeSet;
 use xml_sec::xmldsig::uri::UriReferenceResolver;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -61,6 +62,33 @@ fn empty_uri_with_namespaces() {
     assert_eq!(
         result,
         r#"<root xmlns:a="http://a" xmlns:b="http://b"><a:child b:attr="val"></a:child></root>"#
+    );
+}
+
+#[test]
+fn empty_uri_rejects_quadratic_namespace_materialization() {
+    // In-scope namespace nodes are projected for every owner element. Bound the
+    // N-declarations-by-N-elements product before allocating the backing set.
+    let namespaces = (0..257)
+        .map(|index| format!(r#" xmlns:n{index}="urn:{index}""#))
+        .collect::<String>();
+    let xml = format!("<root{namespaces}>{}</root>", "<item/>".repeat(257));
+    let document = roxmltree::Document::parse(&xml).expect("generated XML must parse");
+    let error = match UriReferenceResolver::new(&document).dereference("") {
+        Err(error) => error,
+        Ok(_) => panic!("oversized namespace projection must fail before materialization"),
+    };
+
+    assert!(error.to_string().contains("node-set materialization"));
+
+    let direct_error = match NodeSet::entire_document_without_comments(&document) {
+        Err(error) => error,
+        Ok(_) => panic!("public constructors must enforce the materialization budget"),
+    };
+    assert!(
+        direct_error
+            .to_string()
+            .contains("node-set materialization")
     );
 }
 

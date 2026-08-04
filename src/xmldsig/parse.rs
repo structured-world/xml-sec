@@ -51,6 +51,7 @@ const MAX_X509_SERIAL_NUMBER_TEXT_LEN: usize = 4096;
 const MAX_X509_DATA_ENTRY_COUNT: usize = 64;
 const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
 const MAX_X509_CHAIN_DEPTH: usize = 9;
+pub(crate) const MAX_REFERENCES_PER_SIGNATURE: usize = 64;
 
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -272,6 +273,13 @@ pub enum ParseError {
     #[error("invalid structure: {0}")]
     InvalidStructure(String),
 
+    /// `<SignedInfo>` declared more references than one signature may process.
+    #[error("SignedInfo contains more than {max} Reference elements")]
+    TooManyReferences {
+        /// Maximum references accepted for one signature.
+        max: usize,
+    },
+
     /// Unsupported algorithm URI.
     #[error("unsupported algorithm: {uri}")]
     UnsupportedAlgorithm {
@@ -316,6 +324,16 @@ pub fn find_signature_node<'a>(doc: &'a Document<'a>) -> Option<Node<'a, 'a>> {
 /// Enforces strict child order per XMLDSig spec:
 /// `<CanonicalizationMethod>` → `<SignatureMethod>` → `<Reference>`+
 pub fn parse_signed_info(signed_info_node: Node) -> Result<SignedInfo, ParseError> {
+    parse_signed_info_with_xpath_budget(
+        signed_info_node,
+        &mut transforms::XPathSignatureParseBudget::default(),
+    )
+}
+
+pub(crate) fn parse_signed_info_with_xpath_budget(
+    signed_info_node: Node,
+    xpath_budget: &mut transforms::XPathSignatureParseBudget,
+) -> Result<SignedInfo, ParseError> {
     verify_ds_element(signed_info_node, "SignedInfo")?;
 
     let mut children = element_children(signed_info_node);
@@ -355,7 +373,12 @@ pub fn parse_signed_info(signed_info_node: Node) -> Result<SignedInfo, ParseErro
     let mut references = Vec::new();
     for child in children {
         verify_ds_element(child, "Reference")?;
-        references.push(parse_reference(child)?);
+        if references.len() == MAX_REFERENCES_PER_SIGNATURE {
+            return Err(ParseError::TooManyReferences {
+                max: MAX_REFERENCES_PER_SIGNATURE,
+            });
+        }
+        references.push(parse_reference_with_xpath_budget(child, xpath_budget)?);
     }
     if references.is_empty() {
         return Err(ParseError::MissingElement {
@@ -373,7 +396,19 @@ pub fn parse_signed_info(signed_info_node: Node) -> Result<SignedInfo, ParseErro
 /// Parse a single `<ds:Reference>` element.
 ///
 /// Structure: `<Transforms>?` → `<DigestMethod>` → `<DigestValue>`
-pub(crate) fn parse_reference(reference_node: Node) -> Result<Reference, ParseError> {
+pub fn parse_reference(reference_node: Node) -> Result<Reference, ParseError> {
+    parse_reference_with_xpath_budget(
+        reference_node,
+        &mut transforms::XPathSignatureParseBudget::default(),
+    )
+}
+
+pub(crate) fn parse_reference_with_xpath_budget(
+    reference_node: Node,
+    xpath_budget: &mut transforms::XPathSignatureParseBudget,
+) -> Result<Reference, ParseError> {
+    verify_ds_element(reference_node, "Reference")?;
+    ensure_no_non_whitespace_text(reference_node, "Reference")?;
     let uri = reference_node.attribute("URI").map(String::from);
     let id = reference_node.attribute("Id").map(String::from);
     let ref_type = reference_node.attribute("Type").map(String::from);
@@ -387,7 +422,7 @@ pub(crate) fn parse_reference(reference_node: Node) -> Result<Reference, ParseEr
     })?;
 
     if next.tag_name().name() == "Transforms" && next.tag_name().namespace() == Some(XMLDSIG_NS) {
-        transforms = transforms::parse_transforms(next)?;
+        transforms = transforms::parse_transforms_with_budget(next, xpath_budget)?;
         next = children.next().ok_or(ParseError::MissingElement {
             element: "DigestMethod",
         })?;
@@ -2785,6 +2820,89 @@ BA== </Modulus>
         assert_eq!(si.references[0].digest_method, DigestAlgorithm::Sha256);
         assert_eq!(si.references[1].uri.as_deref(), Some("#b"));
         assert_eq!(si.references[1].digest_method, DigestAlgorithm::Sha1);
+    }
+
+    #[test]
+    fn parse_signed_info_rejects_too_many_references() {
+        // Reference processing shares signature-wide resource budgets, so the
+        // parser must bound cardinality before retaining attacker-controlled entries.
+        let references = (0..=MAX_REFERENCES_PER_SIGNATURE)
+            .map(|index| {
+                format!(
+                    r##"<Reference URI="#item-{index}">
+                        <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                        <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>
+                    </Reference>"##
+                )
+            })
+            .collect::<String>();
+        let xml = format!(
+            r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+                <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+                {references}
+            </SignedInfo>"#
+        );
+        let document = Document::parse(&xml).expect("fixed oversized fixture must parse");
+
+        let error = parse_signed_info(document.root_element())
+            .expect_err("the parser must reject the 65th Reference");
+
+        assert!(matches!(
+            error,
+            ParseError::TooManyReferences {
+                max: MAX_REFERENCES_PER_SIGNATURE
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_signed_info_bounds_xpath_expressions_across_references() {
+        // Per-reference limits alone permit an attacker to retain and compile
+        // thousands of XPath programs before signature verification begins.
+        let filters = r#"<XPath xmlns="http://www.w3.org/2002/06/xmldsig-filter2" Filter="intersect">true()</XPath>"#
+            .repeat(64);
+        let filter_transform = format!(
+            r#"<Transform Algorithm="http://www.w3.org/2002/06/xmldsig-filter2">{filters}</Transform>"#
+        );
+        let reference = |index, transforms: &str| {
+            format!(
+                r##"<Reference URI="#item-{index}">
+                        <Transforms>{transforms}</Transforms>
+                        <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                        <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>
+                    </Reference>"##
+            )
+        };
+        let signed_info = |references: &str| {
+            format!(
+                r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+                <SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+                {references}
+            </SignedInfo>"#
+            )
+        };
+
+        let max_reference = reference(0, &filter_transform.repeat(64));
+        let boundary_xml = signed_info(&max_reference);
+        let boundary_document =
+            Document::parse(&boundary_xml).expect("fixed boundary fixture must parse");
+        parse_signed_info(boundary_document.root_element())
+            .expect("one maximum-shaped Reference must remain accepted");
+
+        let extra_transform = r#"<Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><XPath>true()</XPath></Transform>"#;
+        let xml = signed_info(&format!("{max_reference}{}", reference(1, extra_transform)));
+        let document = Document::parse(&xml).expect("fixed aggregate fixture must parse");
+
+        let error = parse_signed_info(document.root_element())
+            .expect_err("signature-wide XPath expression count must be bounded");
+
+        assert!(
+            error
+                .to_string()
+                .contains("signature-wide XPath expression budget")
+        );
     }
 
     #[test]
