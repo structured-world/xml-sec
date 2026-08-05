@@ -687,7 +687,7 @@ mod tests {
     fn x509_signature_with_leaf_subject() -> String {
         replace_unprefixed_key_info(
             X509_DIGEST_SIGNATURE,
-            "<KeyInfo><X509Data><X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-4096</X509SubjectName></X509Data></KeyInfo>",
+            "<KeyInfo><X509Data><X509SubjectName>CN=Test Key rsa-4096,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName></X509Data></KeyInfo>",
         )
     }
 
@@ -921,7 +921,7 @@ mod tests {
 
     #[test]
     fn selector_resolved_certificate_preserves_supplied_crls() {
-        let selector = "<KeyInfo><X509Data><X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName><X509CRL>CRL_PLACEHOLDER</X509CRL></X509Data></KeyInfo>";
+        let selector = "<KeyInfo><X509Data><X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName><X509CRL>CRL_PLACEHOLDER</X509CRL></X509Data></KeyInfo>";
         let crl = crl_der(include_str!(
             "../../tests/fixtures/keys/rsa/rsa-2048-cert-revoked-crl.pem"
         ));
@@ -963,8 +963,8 @@ mod tests {
         // Every selector form documented by KeyInfo must independently locate
         // the same configured RSA certificate without embedded key material.
         let selectors = [
-            "<X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>",
-            "<X509IssuerSerial><X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName><X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber></X509IssuerSerial>",
+            "<X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>",
+            "<X509IssuerSerial><X509IssuerName>Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName><X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber></X509IssuerSerial>",
             "<X509SKI>bcOXN/nsVl8GatRbcKrPbzIbw0Y=</X509SKI>",
         ];
         let configured_certificate = certificate_der(include_str!(
@@ -991,7 +991,7 @@ mod tests {
     fn resolves_configured_chain_selectors_across_certificates() {
         // Selector categories may identify different members of one configured
         // chain; the unique leaf remains the signing certificate.
-        let key_info = r#"<KeyInfo><X509Data><X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName><X509SKI>0X0XrEVCio75sBcl1TxymJ2IOiU=</X509SKI></X509Data></KeyInfo>"#;
+        let key_info = r#"<KeyInfo><X509Data><X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName><X509SKI>0X0XrEVCio75sBcl1TxymJ2IOiU=</X509SKI></X509Data></KeyInfo>"#;
         let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, key_info);
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             trusted_certs: vec![

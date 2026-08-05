@@ -1094,11 +1094,6 @@ fn materialize_retrieval_methods(
             if !allowed_uri_types.allows(&uri) {
                 return Err(SignatureVerificationPipelineError::DisallowedUri { uri });
             }
-            if transforms != RetrievalMethodTransforms::X509DataNodeSetFilter {
-                return Err(SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "X509Data RetrievalMethod requires the supported XPath selection",
-                });
-            }
             let id = same_document_reference_id(&uri).ok_or(
                 SignatureVerificationPipelineError::InvalidStructure {
                     reason: "X509Data RetrievalMethod requires a same-document URI",
@@ -1109,7 +1104,26 @@ fn materialize_retrieval_methods(
                     reason: "X509Data RetrievalMethod target is missing or ambiguous",
                 },
             )?;
-            let node = select_retrieved_x509_data_root(target)?;
+            let node = match transforms {
+                RetrievalMethodTransforms::None
+                    if target.has_tag_name((XMLDSIG_NS, "X509Data")) =>
+                {
+                    target
+                }
+                RetrievalMethodTransforms::None => {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "untransformed X509Data RetrievalMethod must target X509Data directly",
+                    });
+                }
+                RetrievalMethodTransforms::X509DataNodeSetFilter => {
+                    select_retrieved_x509_data_root(target)?
+                }
+                RetrievalMethodTransforms::Unsupported => {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "X509Data RetrievalMethod contains unsupported transforms",
+                    });
+                }
+            };
             let data = parse_x509_data_dispatch_with_budget(node, &mut total_binary_len)
                 .map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
             materialized.push(super::parse::KeyInfoSource::X509Data(data));
@@ -2633,6 +2647,65 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn retrieval_method_materializes_direct_untransformed_x509_data() {
+        // A typed RetrievalMethod may point directly at the XML structure it
+        // identifies; no transform is needed when X509Data is the URI root.
+        let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+          <ds:KeyInfo><ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data"/></ds:KeyInfo>
+          <ds:X509Data Id="target"><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data>
+        </root>"##;
+        let document = Document::parse(xml).unwrap();
+        let key_info_node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .unwrap();
+        let mut key_info = parse_key_info(key_info_node).unwrap();
+
+        materialize_retrieval_methods(
+            &mut key_info,
+            &UriReferenceResolver::new(&document),
+            None,
+            UriTypeSet::SAME_DOCUMENT,
+        )
+        .expect("a direct X509Data target needs no transform");
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [super::super::parse::KeyInfoSource::X509Data(info)]
+                if info.subject_names == ["CN=leaf"]
+        ));
+    }
+
+    #[test]
+    fn retrieval_method_requires_xpath_for_x509_data_below_uri_root() {
+        // Without a transform the dereferenced holder, not its descendant,
+        // is the result and therefore cannot masquerade as typed X509Data.
+        let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+          <ds:KeyInfo><ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data"/></ds:KeyInfo>
+          <holder Id="target"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder>
+        </root>"##;
+        let document = Document::parse(xml).unwrap();
+        let key_info_node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .unwrap();
+        let mut key_info = parse_key_info(key_info_node).unwrap();
+
+        let error = materialize_retrieval_methods(
+            &mut key_info,
+            &UriReferenceResolver::new(&document),
+            None,
+            UriTypeSet::SAME_DOCUMENT,
+        )
+        .expect_err("a wrapper target requires an explicit selection transform");
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "untransformed X509Data RetrievalMethod must target X509Data directly"
+            }
+        ));
     }
 
     #[test]

@@ -20,6 +20,7 @@ use roxmltree::{Document, Node};
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 use x509_parser::public_key::PublicKey;
+use x509_parser::x509::X509Name;
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 use super::transforms::{self, Transform};
@@ -1357,7 +1358,7 @@ fn distinguished_names_equal(left: &str, right: &str) -> bool {
     }
     let left = components(left);
     let right = components(right);
-    left == right || left.iter().eq(right.iter().rev())
+    left == right
 }
 
 fn ensure_x509_data_entry_budget(info: &X509DataInfo) -> Result<(), ParseError> {
@@ -1447,8 +1448,12 @@ pub(crate) fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certif
         ));
     }
 
-    let subject_dn = cert.subject().to_string();
-    let issuer_dn = cert.issuer().to_string();
+    // x509-parser displays the DER RDN sequence in storage order, while
+    // XMLDSig names follow RFC 4514 and serialize that sequence in reverse.
+    // Normalize at the certificate boundary so matching remains ordered and
+    // cannot confuse a DN with another hierarchy containing reversed RDNs.
+    let subject_dn = x509_name_to_rfc4514(cert.subject());
+    let issuer_dn = x509_name_to_rfc4514(cert.issuer());
     let serial_number = cert.tbs_certificate.raw_serial().to_vec();
     let serial_number_hex = format_x509_serial_value_hex(&serial_number);
 
@@ -1506,6 +1511,12 @@ pub(crate) fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certif
     })
 }
 
+fn x509_name_to_rfc4514(name: &X509Name<'_>) -> String {
+    let mut rdns = name.iter_rdn().cloned().collect::<Vec<_>>();
+    rdns.reverse();
+    X509Name::new(rdns, name.as_raw()).to_string()
+}
+
 fn format_x509_serial_hex(serial: &[u8]) -> String {
     serial
         .iter()
@@ -1528,6 +1539,7 @@ fn format_x509_serial_value_hex(serial: &[u8]) -> String {
 
 fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
     let serial = serial.trim();
+    let serial = serial.strip_prefix('+').unwrap_or(serial);
     if serial.is_empty()
         || serial.len() > MAX_X509_SERIAL_NUMBER_TEXT_LEN
         || !serial.bytes().all(|byte| byte.is_ascii_digit())
@@ -1551,6 +1563,9 @@ fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
     // DER INTEGER is signed, so a positive 20-octet serial must keep its high
     // bit clear. Values requiring a 21st sign-extension octet exceed RFC 5280.
     if bytes[0] & 0x80 != 0 {
+        return None;
+    }
+    if bytes.iter().all(|byte| *byte == 0) {
         return None;
     }
 
@@ -1750,6 +1765,7 @@ fn collect_text_content_bounded(
 fn collect_x509_serial_number(node: Node<'_, '_>) -> Result<String, ParseError> {
     let mut serial = String::with_capacity(MAX_X509_SERIAL_NUMBER_TEXT_LEN);
     let mut trailing_whitespace = false;
+    let mut explicit_positive = false;
 
     for byte in node
         .children()
@@ -1757,7 +1773,11 @@ fn collect_x509_serial_number(node: Node<'_, '_>) -> Result<String, ParseError> 
         .flat_map(str::bytes)
     {
         if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
-            trailing_whitespace |= !serial.is_empty();
+            trailing_whitespace |= explicit_positive || !serial.is_empty();
+            continue;
+        }
+        if byte == b'+' && serial.is_empty() && !explicit_positive && !trailing_whitespace {
+            explicit_positive = true;
             continue;
         }
         if trailing_whitespace || !byte.is_ascii_digit() {
@@ -1956,9 +1976,9 @@ mod tests {
             </KeyValue>
             <X509Data>
                 <X509Certificate>{cert_base64}</X509Certificate>
-                <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                <X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>
                 <X509IssuerSerial>
-                    <X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName>
+                    <X509IssuerName>Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName>
                     <X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber>
                 </X509IssuerSerial>
                 <X509SKI>bcOXN/nsVl8GatRbcKrPbzIbw0Y=</X509SKI>
@@ -1992,14 +2012,14 @@ mod tests {
         assert_eq!(
             x509_info.subject_names,
             vec![
-                "C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048"
+                "CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US"
                     .to_string()
             ]
         );
         assert_eq!(
             x509_info.issuer_serials,
             vec![(
-                "C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com".to_string(),
+                "Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US".to_string(),
                 "680572598617295163017172295025714171905498632019".to_string()
             )]
         );
@@ -2496,7 +2516,7 @@ BA== </Modulus>
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
                     <X509IssuerSerial>
-                        <X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName>
+                        <X509IssuerName>Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName>
                         <X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber>
                     </X509IssuerSerial>
                     <X509Certificate>{root}</X509Certificate>
@@ -2526,7 +2546,7 @@ BA== </Modulus>
         let xml = format!(
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
-                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>
                     <X509SKI>0X0XrEVCio75sBcl1TxymJ2IOiU=</X509SKI>
                     <X509Certificate>{root}</X509Certificate>
                     <X509Certificate>{intermediate}</X509Certificate>
@@ -2560,7 +2580,7 @@ BA== </Modulus>
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
                     <X509IssuerSerial>
-                        <X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName>
+                        <X509IssuerName>Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName>
                         <X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber>
                     </X509IssuerSerial>
                     <X509Certificate>{root}</X509Certificate>
@@ -2626,7 +2646,7 @@ BA== </Modulus>
         let xml = format!(
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
-                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>
                     <X509SubjectName>CN=Not In The Embedded Chain</X509SubjectName>
                     <X509Certificate>{cert}</X509Certificate>
                 </X509Data>
@@ -2648,9 +2668,9 @@ BA== </Modulus>
         let xml = format!(
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
-                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>
                     <X509IssuerSerial>
-                        <X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName>
+                        <X509IssuerName>Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName>
                         <X509SerialNumber>not-a-decimal-serial</X509SerialNumber>
                     </X509IssuerSerial>
                     <X509Certificate>{cert}</X509Certificate>
@@ -2671,7 +2691,7 @@ BA== </Modulus>
         let xml = format!(
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
-                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>
                     <X509SKI>AQIDBA==</X509SKI>
                     <X509Certificate>{cert}</X509Certificate>
                 </X509Data>
@@ -2692,7 +2712,7 @@ BA== </Modulus>
         let xml = format!(
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
-                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>
                     <X509SKI>60zMLKCfzQ3qnXAzABzRNpdgQ8Q=</X509SKI>
                     <X509Certificate>{first_cert}</X509Certificate>
                     <X509Certificate>{second_cert}</X509Certificate>
@@ -2756,10 +2776,14 @@ BA== </Modulus>
             x509_serial_decimal_to_hex("0000000000000000000000000000000000000000000000001"),
             Some("01".into())
         );
+        assert_eq!(x509_serial_decimal_to_hex("+1"), Some("01".into()));
 
         for invalid in [
             "",
-            "+1",
+            "0",
+            "000",
+            "+0",
+            "++1",
             "-1",
             "1a",
             "00000000000000000000000000000000000000000000000001",
@@ -2789,6 +2813,14 @@ BA== </Modulus>
         };
         assert_eq!(x509.issuer_serials[0].1, max_serial);
 
+        let explicit_positive = valid.replace(max_serial, "+42");
+        let doc = Document::parse(&explicit_positive).unwrap();
+        let parsed = parse_key_info(doc.root_element()).unwrap();
+        let KeyInfoSource::X509Data(x509) = &parsed.sources[0] else {
+            panic!("expected X509Data source");
+        };
+        assert_eq!(x509.issuer_serials[0].1, "42");
+
         let overflow = valid.replace(
             max_serial,
             "730750818665451459101842416358141509827966271488",
@@ -2798,6 +2830,20 @@ BA== </Modulus>
             parse_key_info(doc.root_element()),
             Err(ParseError::InvalidStructure(message))
                 if message.contains("invalid X509SerialNumber")
+        ));
+    }
+
+    #[test]
+    fn distinguished_name_matching_preserves_rdn_order() {
+        // RFC 4514 permits alternate encodings within an RDN, but reversing
+        // the RDN sequence identifies a different hierarchical name.
+        assert!(distinguished_names_equal(
+            "CN=leaf, O=example",
+            "CN=leaf,O=example"
+        ));
+        assert!(!distinguished_names_equal(
+            "CN=leaf,O=example",
+            "O=example,CN=leaf"
         ));
     }
 

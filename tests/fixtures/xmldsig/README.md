@@ -31,9 +31,9 @@ signing.
 
 ### `merlin-xmldsig-twenty-three`
 
-W3C/Merlin basic signature vectors. Some files intentionally remain outside
-the supported algorithm set, such as DSA, and are accounted for as skips or
-fail-closed cases by the donor verification suite.
+W3C/Merlin basic signature vectors. DSA-SHA1 and HMAC-SHA1 are supported for
+legacy verification, including XMLDSig's permitted HMAC truncation. Unsupported
+DSA and HMAC variants remain fail-closed.
 
 ### `xmldsig11-interop-2012`
 
@@ -50,7 +50,7 @@ Currently verified as valid:
 
 Currently fail-closed:
 
-- HMAC algorithms.
+- HMAC algorithms other than HMAC-SHA1.
 - SHA-224 digest or signature algorithms.
 - P-521 KeyValue resolution.
 - `KeyInfoReference` dereference.
@@ -61,8 +61,9 @@ Currently fail-closed:
 
 XMLDSig Second Edition errata vectors. They exercise HMAC-SHA1, external URI
 references, XPath transforms, and Canonical XML 1.1. XPath and C14N 1.1 are
-implemented; documents that additionally require HMAC, an external resource,
-or an unsupported key source remain explicitly classified as fail-closed.
+implemented; HMAC-SHA1 is supported for verification, while documents that
+require another HMAC variant, an unavailable external resource, or an
+unsupported key source remain explicitly classified as fail-closed.
 
 ### `merlin-xpath-filter2`
 

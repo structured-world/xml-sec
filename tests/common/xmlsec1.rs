@@ -9,17 +9,31 @@ pub fn command() -> Command {
 }
 
 pub fn version_supports_interop(version: &str) -> bool {
-    version
-        .split_whitespace()
-        .find_map(|token| {
-            let mut components = token.split('.');
-            Some((
-                components.next()?.parse::<u16>().ok()?,
-                components.next()?.parse::<u16>().ok()?,
-                components.next()?.parse::<u16>().ok()?,
-            ))
-        })
-        .is_some_and(|version| version >= REQUIRED_VERSION)
+    let mut tokens = version.split_whitespace();
+    if tokens.next() != Some("xmlsec1") {
+        return false;
+    }
+    let Some(version) = tokens.next() else {
+        return false;
+    };
+    let mut components = version.split('.');
+    let parsed = (
+        components
+            .next()
+            .and_then(|value| value.parse::<u16>().ok()),
+        components
+            .next()
+            .and_then(|value| value.parse::<u16>().ok()),
+        components
+            .next()
+            .and_then(|value| value.parse::<u16>().ok()),
+    );
+    match parsed {
+        (Some(major), Some(minor), Some(patch)) if components.next().is_none() => {
+            (major, minor, patch) >= REQUIRED_VERSION
+        }
+        _ => false,
+    }
 }
 
 pub fn is_available() -> bool {

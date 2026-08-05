@@ -136,6 +136,18 @@ fn xmlsec1_version_gate_requires_pinned_snapshot() {
         "xmlsec1 1.2.37 (openssl)"
     ));
     assert!(!xmlsec1::version_supports_interop("xmlsec1 unknown"));
+    for malformed in [
+        "OpenSSL 3.0.0",
+        "xmlsec1 unknown OpenSSL 3.0.0",
+        "xmlsec1 1.3",
+        "xmlsec1 1.3.13.1",
+        "prefix xmlsec1 1.3.13",
+    ] {
+        assert!(
+            !xmlsec1::version_supports_interop(malformed),
+            "malformed xmlsec1 version output {malformed:?} must fail closed"
+        );
+    }
 }
 
 fn signed_payload_xml(key: &dyn SigningKey, builder: &SignatureBuilder) -> String {
