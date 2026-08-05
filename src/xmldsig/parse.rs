@@ -194,6 +194,10 @@ pub enum RetrievalMethodTransforms {
     None,
     /// Filter a same-document node-set to one `ds:X509Data`-rooted subtree.
     X509DataNodeSetFilter,
+    /// A transform chain attached to a RetrievalMethod type this implementation
+    /// does not materialize. Resolvers may ignore this advisory key source and
+    /// continue with later `<KeyInfo>` children.
+    Unsupported,
 }
 
 /// Parsed `<KeyValue>` dispatch result.
@@ -628,10 +632,19 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
                         "RetrievalMethod URI exceeds maximum length".into(),
                     ));
                 }
-                let transforms = parse_retrieval_method_transforms(child)?;
+                let resource_type = child.attribute("Type").map(str::to_string);
+                let transforms = if resource_type.as_deref()
+                    == Some("http://www.w3.org/2000/09/xmldsig#X509Data")
+                {
+                    parse_retrieval_method_transforms(child)?
+                } else if element_children(child).next().is_some() {
+                    RetrievalMethodTransforms::Unsupported
+                } else {
+                    RetrievalMethodTransforms::None
+                };
                 sources.push(KeyInfoSource::RetrievalMethod {
                     uri: uri.to_string(),
-                    resource_type: child.attribute("Type").map(str::to_string),
+                    resource_type,
                     transforms,
                 });
             }
@@ -3211,18 +3224,25 @@ BA== </Modulus>
     }
 
     #[test]
-    fn parse_key_info_rejects_unimplemented_retrieval_transform() {
-        // Retrieval transforms must never be silently ignored when choosing a key.
+    fn parse_key_info_preserves_advisory_unsupported_retrieval_transform() {
+        // Unsupported RetrievalMethod types are advisory key sources. Their
+        // transform syntax must not hide a later source the resolver can use.
         let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
-          <RetrievalMethod URI="#keys"><Transforms>
+          <RetrievalMethod URI="#keys" Type="urn:vendor:key"><Transforms>
             <Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/>
           </Transforms></RetrievalMethod>
+          <KeyName>fallback</KeyName>
         </KeyInfo>"##;
         let doc = Document::parse(xml).unwrap();
 
+        let key_info = parse_key_info(doc.root_element())
+            .expect("unsupported advisory retrieval must not reject all KeyInfo sources");
         assert!(matches!(
-            parse_key_info(doc.root_element()),
-            Err(ParseError::InvalidStructure(_))
+            key_info.sources.as_slice(),
+            [
+                KeyInfoSource::RetrievalMethod { resource_type: Some(resource_type), .. },
+                KeyInfoSource::KeyName(name),
+            ] if resource_type == "urn:vendor:key" && name == "fallback"
         ));
     }
 

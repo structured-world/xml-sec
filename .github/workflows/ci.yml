@@ -91,5 +91,5 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --version 0.13.1 --locked
-      - run: cargo fuzz run xmldsig_verify -- -runs=256 -max_len=65536
+      - run: cargo +nightly install cargo-fuzz --version 0.13.1 --locked
+      - run: cargo +nightly fuzz run xmldsig_verify -- -runs=256 -max_len=65536

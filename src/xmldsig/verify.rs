@@ -12,9 +12,11 @@
 
 use base64::Engine;
 use roxmltree::{Document, Node, NodeId};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::c14n::canonicalize;
+use crate::hard_limits::{STORED_PRE_DIGEST_BYTE_CEILING, XML_DOCUMENT_NODE_CEILING};
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 use super::parse::{
@@ -295,6 +297,11 @@ impl<'a> VerifyContext<'a> {
     }
 
     /// Store pre-digest buffers for diagnostics.
+    ///
+    /// Retained reference buffers and canonicalized `<SignedInfo>` share a
+    /// non-configurable 32 MiB safety ceiling. Verification returns
+    /// [`ReferenceProcessingError::PreDigestDataTooLarge`] rather than retaining
+    /// more diagnostic data.
     pub fn store_pre_digest(mut self, enabled: bool) -> Self {
         self.store_pre_digest = enabled;
         self
@@ -436,7 +443,8 @@ impl ReferencesResult {
 /// - `signature_node`: The `<Signature>` element (for enveloped-signature transform).
 /// - `reference_set`: Whether this reference belongs to `<SignedInfo>` or `<Manifest>`.
 /// - `reference_index`: Zero-based index of this reference inside `reference_set`.
-/// - `store_pre_digest`: If true, store the pre-digest bytes in the result.
+/// - `store_pre_digest`: If true, store the pre-digest bytes in the result,
+///   subject to the signature-wide diagnostic retention ceiling.
 ///
 /// # Errors
 ///
@@ -452,10 +460,12 @@ pub fn process_reference(
     store_pre_digest: bool,
 ) -> Result<ReferenceResult, ReferenceProcessingError> {
     let execution_budget = TransformExecutionBudget::default();
+    let pre_digest_budget = PreDigestRetentionBudget::default();
     let execution = ReferenceExecutionContext {
         store_pre_digest,
         transform_options: TransformOptions::default(),
         transform_budget: &execution_budget,
+        pre_digest_budget: &pre_digest_budget,
     };
     process_reference_with_options(
         reference,
@@ -471,6 +481,42 @@ struct ReferenceExecutionContext<'a> {
     store_pre_digest: bool,
     transform_options: TransformOptions,
     transform_budget: &'a TransformExecutionBudget,
+    pre_digest_budget: &'a PreDigestRetentionBudget,
+}
+
+struct PreDigestRetentionBudget {
+    remaining: Cell<usize>,
+    max_bytes: usize,
+}
+
+impl Default for PreDigestRetentionBudget {
+    fn default() -> Self {
+        Self {
+            remaining: Cell::new(STORED_PRE_DIGEST_BYTE_CEILING),
+            max_bytes: STORED_PRE_DIGEST_BYTE_CEILING,
+        }
+    }
+}
+
+impl PreDigestRetentionBudget {
+    fn charge(&self, bytes: usize) -> Result<(), ReferenceProcessingError> {
+        let Some(remaining) = self.remaining.get().checked_sub(bytes) else {
+            self.remaining.set(0);
+            return Err(ReferenceProcessingError::PreDigestDataTooLarge {
+                max_bytes: self.max_bytes,
+            });
+        };
+        self.remaining.set(remaining);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn with_limit(max_bytes: usize) -> Self {
+        Self {
+            remaining: Cell::new(max_bytes),
+            max_bytes,
+        }
+    }
 }
 
 fn process_reference_with_options(
@@ -513,17 +559,20 @@ fn process_reference_with_options(
         })
     };
 
+    let pre_digest_data = if execution.store_pre_digest {
+        execution.pre_digest_budget.charge(pre_digest_bytes.len())?;
+        Some(pre_digest_bytes)
+    } else {
+        None
+    };
+
     Ok(ReferenceResult {
         reference_set,
         reference_index,
         uri: uri.to_owned(),
         digest_algorithm: reference.digest_method,
         status,
-        pre_digest_data: if execution.store_pre_digest {
-            Some(pre_digest_bytes)
-        } else {
-            None
-        },
+        pre_digest_data,
     })
 }
 
@@ -545,10 +594,12 @@ pub fn process_all_references(
     store_pre_digest: bool,
 ) -> Result<ReferencesResult, ReferenceProcessingError> {
     let execution_budget = TransformExecutionBudget::default();
+    let pre_digest_budget = PreDigestRetentionBudget::default();
     let execution = ReferenceExecutionContext {
         store_pre_digest,
         transform_options: TransformOptions::default(),
         transform_budget: &execution_budget,
+        pre_digest_budget: &pre_digest_budget,
     };
     process_all_references_with_options(references, resolver, signature_node, &execution)
 }
@@ -604,6 +655,13 @@ pub enum ReferenceProcessingError {
     /// Transform execution failed.
     #[error("transform failed: {0}")]
     Transform(#[source] super::types::TransformError),
+
+    /// Diagnostic pre-digest buffers would exceed their signature-wide cap.
+    #[error("stored pre-digest data exceeds signature-wide maximum of {max_bytes} bytes")]
+    PreDigestDataTooLarge {
+        /// Maximum bytes retained across all reference diagnostics.
+        max_bytes: usize,
+    },
 }
 
 /// End-to-end XMLDSig verification result for one `<Signature>`.
@@ -768,7 +826,7 @@ fn verify_signature_with_context(
         xml,
         roxmltree::ParsingOptions {
             allow_dtd: ctx.allow_internal_dtd,
-            nodes_limit: 100_000,
+            nodes_limit: XML_DOCUMENT_NODE_CEILING,
             entity_resolver: None,
         },
     )?;
@@ -815,7 +873,6 @@ fn verify_signature_with_context(
         &signed_info.references,
         ctx.allowed_uri_types,
         ctx.allowed_transform_uris(),
-        ctx.external_resources,
     )?;
 
     if let Some(resources) = ctx.external_resources {
@@ -851,10 +908,12 @@ fn verify_signature_with_context(
         )?;
     }
     let execution_budget = TransformExecutionBudget::default();
+    let pre_digest_budget = PreDigestRetentionBudget::default();
     let execution = ReferenceExecutionContext {
         store_pre_digest: ctx.store_pre_digest,
         transform_options: ctx.transform_options,
         transform_budget: &execution_budget,
+        pre_digest_budget: &pre_digest_budget,
     };
     let references = process_all_references_with_options(
         &signed_info.references,
@@ -884,6 +943,9 @@ fn verify_signature_with_context(
         &signed_info.c14n_method,
         &mut canonical_signed_info,
     )?;
+    if ctx.store_pre_digest {
+        pre_digest_budget.charge(canonical_signed_info.len())?;
+    }
 
     let signature_value = decode_signature_value(signature_children.signature_value_node)?;
     if signed_info.signature_method == SignatureAlgorithm::HmacSha1 {
@@ -1151,7 +1213,6 @@ fn process_manifest_references(
             std::slice::from_ref(reference),
             ctx.allowed_uri_types,
             ctx.allowed_transform_uris(),
-            ctx.external_resources,
         ) {
             Ok(()) => {}
             Err(
@@ -1390,7 +1451,6 @@ fn enforce_reference_policies(
     references: &[Reference],
     allowed_uri_types: UriTypeSet,
     allowed_transforms: Option<&HashSet<String>>,
-    external_resources: Option<&HashMap<String, Vec<u8>>>,
 ) -> Result<(), SignatureVerificationPipelineError> {
     for reference in references {
         let uri = reference
@@ -1415,13 +1475,14 @@ fn enforce_reference_policies(
                 }
             }
 
-            let dereferences_to_binary = !uri.is_empty()
-                && !uri.starts_with('#')
-                && external_resources.is_some_and(|resources| resources.contains_key(uri));
-            let produces_binary = dereferences_to_binary
-                || reference.transforms.last().is_some_and(|transform| {
-                    matches!(transform, Transform::C14n(_) | Transform::Base64Decode)
-                });
+            // External dereference has an octet-stream data type independent of
+            // whether the caller supplied the resource. Every transform then
+            // determines the next type, including implicit binary-to-node-set
+            // adapters before XML-level transforms.
+            let mut produces_binary = classify_uri(uri) == UriClass::External;
+            for transform in &reference.transforms {
+                produces_binary = matches!(transform, Transform::C14n(_) | Transform::Base64Decode);
+            }
             if !produces_binary && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI) {
                 return Err(SignatureVerificationPipelineError::DisallowedTransform {
                     algorithm: DEFAULT_IMPLICIT_C14N_URI.to_owned(),
@@ -1764,6 +1825,31 @@ mod tests {
         ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
         {
             Ok(None)
+        }
+
+        fn consumes_document_key_info(&self) -> bool {
+            true
+        }
+    }
+
+    struct FallbackKeyInfoResolver;
+
+    impl KeyResolver for FallbackKeyInfoResolver {
+        fn resolve<'a>(
+            &'a self,
+            key_info: Option<&KeyInfo>,
+            _algorithm: SignatureAlgorithm,
+        ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
+        {
+            let sources = &key_info.expect("KeyInfo must be parsed").sources;
+            assert!(matches!(
+                sources.as_slice(),
+                [
+                    super::super::parse::KeyInfoSource::RetrievalMethod { .. },
+                    super::super::parse::KeyInfoSource::KeyName(name),
+                ] if name == "fallback"
+            ));
+            Ok(Some(Box::new(AcceptingKey)))
         }
 
         fn consumes_document_key_info(&self) -> bool {
@@ -2960,6 +3046,29 @@ mod tests {
     }
 
     #[test]
+    fn verify_context_ignores_unsupported_retrieval_before_valid_key_source() {
+        // An advisory vendor RetrievalMethod cannot prevent the resolver from
+        // reaching a later supported source in document order.
+        let xml = signature_with_target_reference("AQ==").replace(
+            "</ds:SignatureValue>\n  </ds:Signature>",
+            r##"</ds:SignatureValue>
+    <ds:KeyInfo>
+      <ds:RetrievalMethod URI="#vendor" Type="urn:vendor:key">
+        <ds:Transforms><ds:Transform Algorithm="urn:vendor:transform"/></ds:Transforms>
+      </ds:RetrievalMethod>
+      <ds:KeyName>fallback</ds:KeyName>
+    </ds:KeyInfo>
+  </ds:Signature>"##,
+        );
+
+        let result = VerifyContext::new()
+            .key_resolver(&FallbackKeyInfoResolver)
+            .verify(&xml)
+            .expect("unsupported advisory retrieval must not abort key resolution");
+        assert_eq!(result.status, DsigStatus::Valid);
+    }
+
+    #[test]
     fn verify_context_preserves_signaturevalue_decode_errors_when_resolver_misses() {
         let xml = signature_with_target_reference("@@@");
 
@@ -3002,7 +3111,7 @@ mod tests {
             allow_external: false,
         };
 
-        let err = enforce_reference_policies(&references, uri_types, None, None)
+        let err = enforce_reference_policies(&references, uri_types, None)
             .expect_err("missing URI must fail before allow_empty policy is evaluated");
         assert!(matches!(
             err,
@@ -3028,7 +3137,6 @@ mod tests {
                 std::slice::from_ref(&reference),
                 UriTypeSet::default(),
                 Some(&allowed),
-                None,
             )
             .expect("terminal binary output must not require implicit C14N");
         }
@@ -3043,7 +3151,6 @@ mod tests {
             std::slice::from_ref(&terminal_base64),
             UriTypeSet::default(),
             Some(&without_implicit_c14n),
-            None,
         )
         .expect("terminal Base64 output must not require implicit C14N");
 
@@ -3052,7 +3159,6 @@ mod tests {
             std::slice::from_ref(&no_transforms),
             UriTypeSet::default(),
             Some(&without_implicit_c14n),
-            None,
         )
         .expect_err("a node-set result must require allowlisted implicit C14N");
         assert!(matches!(
@@ -3061,15 +3167,78 @@ mod tests {
                 if algorithm == DEFAULT_IMPLICIT_C14N_URI
         ));
 
-        let external_resources = HashMap::from([("urn:payload".to_owned(), b"bytes".to_vec())]);
         let detached = make_reference("urn:payload", vec![], DigestAlgorithm::Sha256, vec![0; 32]);
         enforce_reference_policies(
             std::slice::from_ref(&detached),
             UriTypeSet::ALL,
             Some(&without_implicit_c14n),
-            Some(&external_resources),
         )
         .expect("external octets without transforms must not require implicit C14N");
+
+        let external_xpath = make_reference(
+            "urn:payload",
+            vec![Transform::XPath(
+                super::super::transforms::XPathExpression::new("true()"),
+            )],
+            DigestAlgorithm::Sha256,
+            vec![0; 32],
+        );
+        let error = enforce_reference_policies(
+            std::slice::from_ref(&external_xpath),
+            UriTypeSet::ALL,
+            Some(&HashSet::from([XPATH_TRANSFORM_URI.to_owned()])),
+        )
+        .expect_err("external XML converted to a node-set must require implicit C14N");
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::DisallowedTransform { ref algorithm }
+                if algorithm == DEFAULT_IMPLICIT_C14N_URI
+        ));
+    }
+
+    #[test]
+    fn stored_pre_digest_budget_counts_repeated_external_references() {
+        // The caller map owns one bounded payload, but diagnostic retention is
+        // charged per Reference because every result owns its pre-digest bytes.
+        let document =
+            Document::parse("<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"/>")
+                .unwrap();
+        let payload = vec![b'x'; 7];
+        let digest = compute_digest(DigestAlgorithm::Sha256, &payload);
+        let references = (0..5)
+            .map(|_| {
+                make_reference(
+                    "urn:repeated",
+                    Vec::new(),
+                    DigestAlgorithm::Sha256,
+                    digest.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let resources = HashMap::from([("urn:repeated".to_owned(), payload)]);
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+        let transform_budget = TransformExecutionBudget::default();
+        let pre_digest_budget = PreDigestRetentionBudget::with_limit(32);
+        let execution = ReferenceExecutionContext {
+            store_pre_digest: true,
+            transform_options: TransformOptions::default(),
+            transform_budget: &transform_budget,
+            pre_digest_budget: &pre_digest_budget,
+        };
+
+        let error = process_all_references_with_options(
+            &references,
+            &resolver,
+            document.root_element(),
+            &execution,
+        )
+        .expect_err(
+            "retained diagnostics must not multiply one external allocation past the aggregate cap",
+        );
+        assert!(matches!(
+            error,
+            ReferenceProcessingError::PreDigestDataTooLarge { max_bytes: 32 }
+        ));
     }
 
     #[test]
@@ -3391,10 +3560,12 @@ mod tests {
             make_reference("", vec![transform], DigestAlgorithm::Sha256, digest),
         ];
         let budget = TransformExecutionBudget::with_xpath_limit(12);
+        let pre_digest_budget = PreDigestRetentionBudget::default();
         let execution = ReferenceExecutionContext {
             store_pre_digest: false,
             transform_options: TransformOptions::default(),
             transform_budget: &budget,
+            pre_digest_budget: &pre_digest_budget,
         };
 
         let error = process_all_references_with_options(
@@ -3427,10 +3598,12 @@ mod tests {
             make_reference("#selected", vec![], DigestAlgorithm::Sha256, digest),
         ];
         let budget = TransformExecutionBudget::with_node_set_materialization_limit(30);
+        let pre_digest_budget = PreDigestRetentionBudget::default();
         let execution = ReferenceExecutionContext {
             store_pre_digest: false,
             transform_options: TransformOptions::default(),
             transform_budget: &budget,
+            pre_digest_budget: &pre_digest_budget,
         };
 
         let error = process_all_references_with_options(

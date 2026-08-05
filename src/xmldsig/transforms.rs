@@ -35,6 +35,7 @@ use super::xpath::{
     apply_xpath_filter2_with_semantics_and_budget, compile_xpath, is_xpath_whitespace,
 };
 use crate::c14n::{self, C14nAlgorithm};
+use crate::hard_limits::XML_DOCUMENT_NODE_CEILING;
 
 /// The algorithm URI for the enveloped signature transform.
 pub const ENVELOPED_SIGNATURE_URI: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
@@ -775,8 +776,15 @@ fn execute_transform_chain<'s, 'e, 'd>(
         // recursion, so these retained buffers remain a bounded subset of the
         // signature-wide canonicalization work budget.
         let xml = decode_xml_octets(&bytes)?;
-        let document = roxmltree::Document::parse(&xml)
-            .map_err(|error| TransformError::XmlParse(error.to_string()))?;
+        let document = roxmltree::Document::parse_with_options(
+            &xml,
+            roxmltree::ParsingOptions {
+                allow_dtd: false,
+                nodes_limit: XML_DOCUMENT_NODE_CEILING,
+                entity_resolver: None,
+            },
+        )
+        .map_err(|error| TransformError::XmlParse(error.to_string()))?;
         context.state.document_reparsed();
         let nodes = super::types::NodeSet::entire_document_with_comments_with_budget(
             &document,
@@ -1774,6 +1782,27 @@ mod tests {
             error,
             TransformError::NodeSetCumulativeStringsTooLarge { .. }
         ));
+    }
+
+    #[test]
+    fn binary_to_node_set_adapter_bounds_external_xml_nodes_during_parse() {
+        // The parser must reject a dense external XML resource before allocating
+        // an unbounded roxmltree arena or beginning XPath materialization.
+        let signature_document = Document::parse("<Signature/>").unwrap();
+        let xml = format!(
+            "<root>{}</root>",
+            "<n/>".repeat(XML_DOCUMENT_NODE_CEILING as usize + 1),
+        );
+        let transforms = [Transform::XPath(XPathExpression::new("true()"))];
+
+        let error = execute_transforms(
+            signature_document.root_element(),
+            TransformData::Binary(xml.into_bytes()),
+            &transforms,
+        )
+        .expect_err("external XML exceeding the node ceiling must fail during parse");
+
+        assert!(matches!(error, TransformError::XmlParse(_)));
     }
 
     #[test]
