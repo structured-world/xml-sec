@@ -35,7 +35,7 @@ use super::transforms::{
     TransformOptions, XPATH_TRANSFORM_URI, XPathHereSemantics, XPathSignatureParseBudget,
     execute_transforms_with_options_and_budget,
 };
-use super::uri::{UriReferenceResolver, parse_xpointer_id_fragment};
+use super::uri::{UriReferenceResolver, same_document_reference_id};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
@@ -1037,7 +1037,7 @@ fn materialize_retrieval_methods(
                     reason: "X509Data RetrievalMethod requires the supported XPath selection",
                 });
             }
-            let id = uri.strip_prefix('#').ok_or(
+            let id = same_document_reference_id(&uri).ok_or(
                 SignatureVerificationPipelineError::InvalidStructure {
                     reason: "X509Data RetrievalMethod requires a same-document URI",
                 },
@@ -1337,7 +1337,7 @@ fn collect_authenticated_signed_info_reference_nodes(
                 .all(transform_preserves_manifest_structure)
         })
         .filter_map(|reference| reference.uri.as_deref())
-        .filter_map(signed_info_reference_id_from_uri)
+        .filter_map(same_document_reference_id)
         .filter_map(|id| resolver.node_id_for_id(id))
         .collect()
 }
@@ -1355,17 +1355,6 @@ fn transform_preserves_manifest_structure(transform: &Transform) -> bool {
         | Transform::XPathFilter2(_)
         | Transform::Base64Decode => false,
     }
-}
-
-fn signed_info_reference_id_from_uri(uri: &str) -> Option<&str> {
-    let fragment = uri.strip_prefix('#')?;
-    if fragment.is_empty() || fragment == "xpointer(/)" {
-        return None;
-    }
-    if let Some(id) = parse_xpointer_id_fragment(fragment) {
-        return (!id.is_empty()).then_some(id);
-    }
-    (!fragment.starts_with("xpointer(")).then_some(fragment)
 }
 
 enum ResolvedVerifyingKey<'a> {
@@ -2524,33 +2513,39 @@ mod tests {
 
     #[test]
     fn retrieval_method_materializes_single_x509_data_subtree() {
-        for target_xml in [
-            r#"<ds:X509Data Id="target"><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data>"#,
-            r#"<holder Id="target"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder>"#,
+        for uri in [
+            "#target",
+            "#xpointer(id('target'))",
+            "#xpointer(id(&quot;target&quot;))",
         ] {
-            let xml = format!(
-                r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo><ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath></ds:Transform></ds:Transforms></ds:RetrievalMethod></ds:KeyInfo>{target_xml}</root>"##
-            );
-            let document = Document::parse(&xml).unwrap();
-            let key_info_node = document
-                .descendants()
-                .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
-                .unwrap();
-            let mut key_info = parse_key_info(key_info_node).unwrap();
-            let resolver = UriReferenceResolver::new(&document);
+            for target_xml in [
+                r#"<ds:X509Data Id="target"><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data>"#,
+                r#"<holder Id="target"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder>"#,
+            ] {
+                let xml = format!(
+                    r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo><ds:RetrievalMethod URI="{uri}" Type="http://www.w3.org/2000/09/xmldsig#X509Data"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath></ds:Transform></ds:Transforms></ds:RetrievalMethod></ds:KeyInfo>{target_xml}</root>"#
+                );
+                let document = Document::parse(&xml).unwrap();
+                let key_info_node = document
+                    .descendants()
+                    .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+                    .unwrap();
+                let mut key_info = parse_key_info(key_info_node).unwrap();
+                let resolver = UriReferenceResolver::new(&document);
 
-            materialize_retrieval_methods(
-                &mut key_info,
-                &resolver,
-                None,
-                UriTypeSet::SAME_DOCUMENT,
-            )
-            .expect("XPath filter must produce one X509Data-rooted node-set");
-            assert!(matches!(
-                key_info.sources.as_slice(),
-                [super::super::parse::KeyInfoSource::X509Data(info)]
-                    if info.subject_names == ["CN=leaf"]
-            ));
+                materialize_retrieval_methods(
+                    &mut key_info,
+                    &resolver,
+                    None,
+                    UriTypeSet::SAME_DOCUMENT,
+                )
+                .expect("XPath filter must produce one X509Data-rooted node-set");
+                assert!(matches!(
+                    key_info.sources.as_slice(),
+                    [super::super::parse::KeyInfoSource::X509Data(info)]
+                        if info.subject_names == ["CN=leaf"]
+                ));
+            }
         }
     }
 

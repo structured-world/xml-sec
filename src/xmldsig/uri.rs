@@ -293,6 +293,21 @@ pub(crate) fn parse_xpointer_id_fragment(fragment: &str) -> Option<&str> {
     }
 }
 
+/// Extract the ID selected by a supported same-document URI.
+///
+/// This keeps secondary consumers such as KeyInfo and Manifest processing in
+/// lockstep with the resolver's bare-fragment and XPointer ID semantics.
+pub(crate) fn same_document_reference_id(uri: &str) -> Option<&str> {
+    let fragment = uri.strip_prefix('#')?;
+    if fragment.is_empty() || fragment == "xpointer(/)" {
+        return None;
+    }
+    if let Some(id) = parse_xpointer_id_fragment(fragment) {
+        return (!id.is_empty()).then_some(id);
+    }
+    (!fragment.starts_with("xpointer(")).then_some(fragment)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -721,6 +736,29 @@ mod tests {
             super::parse_xpointer_id_fragment(r#"xpointer(id("))"#),
             None
         );
+    }
+
+    #[test]
+    fn same_document_reference_id_rejects_non_id_fragments() {
+        assert_eq!(super::same_document_reference_id("#target"), Some("target"));
+        assert_eq!(
+            super::same_document_reference_id("#xpointer(id('target'))"),
+            Some("target")
+        );
+        assert_eq!(
+            super::same_document_reference_id(r#"#xpointer(id("target"))"#),
+            Some("target")
+        );
+        for uri in [
+            "",
+            "target",
+            "#",
+            "#xpointer(/)",
+            "#xpointer(id(''))",
+            "#xpointer(id(target))",
+        ] {
+            assert_eq!(super::same_document_reference_id(uri), None, "{uri}");
+        }
     }
 
     #[test]

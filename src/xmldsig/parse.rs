@@ -199,12 +199,12 @@ pub enum RetrievalMethodTransforms {
 pub enum KeyValueInfo {
     /// `<DSAKeyValue>` public parameters.
     Dsa {
-        /// Prime modulus P.
-        p: Vec<u8>,
-        /// Prime divisor Q.
-        q: Vec<u8>,
-        /// Generator G.
-        g: Vec<u8>,
+        /// Optional prime modulus P, present only together with Q.
+        p: Option<Vec<u8>>,
+        /// Optional prime divisor Q, present only together with P.
+        q: Option<Vec<u8>>,
+        /// Optional generator G.
+        g: Option<Vec<u8>>,
         /// Public value Y.
         y: Vec<u8>,
     },
@@ -823,47 +823,48 @@ fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
 fn parse_dsa_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
     verify_ds_element(node, "DSAKeyValue")?;
     ensure_no_non_whitespace_text(node, "DSAKeyValue")?;
-    let mut children = element_children(node);
-    let mut next = |name| -> Result<Vec<u8>, ParseError> {
-        let child = children
-            .next()
-            .ok_or_else(|| ParseError::InvalidStructure(format!("DSAKeyValue requires {name}")))?;
-        verify_ds_element(child, name)?;
-        ensure_no_element_children(child, name)?;
-        decode_crypto_binary(child, name, MAX_RSA_MODULUS_LEN)
-    };
-    let p = next("P")?;
-    let q = next("Q")?;
-    let g = next("G")?;
-    let y = next("Y")?;
-    let optional = children.collect::<Vec<_>>();
-    let valid_optional = match optional.as_slice() {
-        [] => true,
-        [j] => is_ds_element(*j, "J"),
-        [seed, counter] => is_ds_element(*seed, "Seed") && is_ds_element(*counter, "PgenCounter"),
-        [j, seed, counter] => {
-            is_ds_element(*j, "J")
-                && is_ds_element(*seed, "Seed")
-                && is_ds_element(*counter, "PgenCounter")
-        }
-        _ => false,
-    };
-    if !valid_optional {
+    let children = element_children(node).collect::<Vec<_>>();
+    let mut index = 0;
+    let p = take_dsa_crypto_binary(&children, &mut index, "P")?;
+    let q = take_dsa_crypto_binary(&children, &mut index, "Q")?;
+    if p.is_some() != q.is_some() {
         return Err(ParseError::InvalidStructure(
-            "DSAKeyValue optional children must be J and/or a Seed/PgenCounter pair".into(),
+            "DSAKeyValue P and Q must be present together".into(),
         ));
     }
-    for child in optional {
-        let name = match child.tag_name().name() {
-            "J" => "J",
-            "Seed" => "Seed",
-            "PgenCounter" => "PgenCounter",
-            _ => unreachable!("optional DSA child shape was validated above"),
-        };
-        ensure_no_element_children(child, name)?;
-        decode_crypto_binary(child, name, MAX_RSA_MODULUS_LEN)?;
+    let g = take_dsa_crypto_binary(&children, &mut index, "G")?;
+    let y = take_dsa_crypto_binary(&children, &mut index, "Y")?
+        .ok_or_else(|| ParseError::InvalidStructure("DSAKeyValue requires Y".into()))?;
+    let _j = take_dsa_crypto_binary(&children, &mut index, "J")?;
+    let seed = take_dsa_crypto_binary(&children, &mut index, "Seed")?;
+    let counter = take_dsa_crypto_binary(&children, &mut index, "PgenCounter")?;
+    if seed.is_some() != counter.is_some() {
+        return Err(ParseError::InvalidStructure(
+            "DSAKeyValue Seed and PgenCounter must be present together".into(),
+        ));
+    }
+    if index != children.len() {
+        return Err(ParseError::InvalidStructure(
+            "DSAKeyValue children do not match the XMLDSig schema order".into(),
+        ));
     }
     Ok(KeyValueInfo::Dsa { p, q, g, y })
+}
+
+fn take_dsa_crypto_binary(
+    children: &[Node<'_, '_>],
+    index: &mut usize,
+    name: &'static str,
+) -> Result<Option<Vec<u8>>, ParseError> {
+    let Some(&child) = children.get(*index) else {
+        return Ok(None);
+    };
+    if !is_ds_element(child, name) {
+        return Ok(None);
+    }
+    *index += 1;
+    ensure_no_element_children(child, name)?;
+    decode_crypto_binary(child, name, MAX_RSA_MODULUS_LEN).map(Some)
 }
 
 fn is_ds_element(node: Node<'_, '_>, name: &str) -> bool {
@@ -3021,19 +3022,22 @@ BA== </Modulus>
 
     #[test]
     fn parse_dsa_key_value_accepts_schema_optional_parameters_and_rejects_half_pair() {
-        let key_info = |optional: &str| {
+        let key_info = |parameters: &str| {
             format!(
                 r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyValue><DSAKeyValue>
-                <P>AQ==</P><Q>AQ==</Q><G>AQ==</G><Y>AQ==</Y>{optional}
+                {parameters}
                 </DSAKeyValue></KeyValue></KeyInfo>"#
             )
         };
-        for optional in [
-            "<J>AQ==</J>",
-            "<Seed>AQ==</Seed><PgenCounter>AQ==</PgenCounter>",
-            "<J>AQ==</J><Seed>AQ==</Seed><PgenCounter>AQ==</PgenCounter>",
+        for parameters in [
+            "<Y>AQ==</Y>",
+            "<G>AQ==</G><Y>AQ==</Y>",
+            "<P>AQ==</P><Q>AQ==</Q><Y>AQ==</Y>",
+            "<P>AQ==</P><Q>AQ==</Q><G>AQ==</G><Y>AQ==</Y><J>AQ==</J>",
+            "<Y>AQ==</Y><Seed>AQ==</Seed><PgenCounter>AQ==</PgenCounter>",
+            "<Y>AQ==</Y><J>AQ==</J><Seed>AQ==</Seed><PgenCounter>AQ==</PgenCounter>",
         ] {
-            let xml = key_info(optional);
+            let xml = key_info(parameters);
             let doc = Document::parse(&xml).unwrap();
             assert!(matches!(
                 parse_key_info(doc.root_element())
@@ -3044,12 +3048,19 @@ BA== </Modulus>
             ));
         }
 
-        let xml = key_info("<Seed>AQ==</Seed>");
-        let doc = Document::parse(&xml).unwrap();
-        assert!(matches!(
-            parse_key_info(doc.root_element()),
-            Err(ParseError::InvalidStructure(_))
-        ));
+        for invalid_parameters in [
+            "<P>AQ==</P><Y>AQ==</Y>",
+            "<Q>AQ==</Q><Y>AQ==</Y>",
+            "<Y>AQ==</Y><Seed>AQ==</Seed>",
+            "<Y>AQ==</Y><PgenCounter>AQ==</PgenCounter>",
+        ] {
+            let xml = key_info(invalid_parameters);
+            let doc = Document::parse(&xml).unwrap();
+            assert!(matches!(
+                parse_key_info(doc.root_element()),
+                Err(ParseError::InvalidStructure(_))
+            ));
+        }
     }
 
     #[test]

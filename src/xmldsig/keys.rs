@@ -1,6 +1,6 @@
 //! Configuration and key material for XMLDSig key resolution.
 
-use std::{collections::HashMap, time::SystemTime};
+use std::{collections::HashMap, fmt, time::SystemTime};
 
 use crypto_bigint::BoxedUint;
 use dsa::pkcs8::{DecodePublicKey as DsaDecodePublicKey, EncodePublicKey as DsaEncodePublicKey};
@@ -25,10 +25,19 @@ use super::{
 };
 
 /// Caller-owned HMAC-SHA1 verification key.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HmacSha1VerificationKey {
     secret: Vec<u8>,
     output_len: usize,
+}
+
+impl fmt::Debug for HmacSha1VerificationKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HmacSha1VerificationKey")
+            .field("output_length_bits", &(self.output_len * 8))
+            .finish_non_exhaustive()
+    }
 }
 
 impl HmacSha1VerificationKey {
@@ -401,6 +410,9 @@ impl DefaultKeyResolver {
                 if algorithm != SignatureAlgorithm::DsaSha1 {
                     return Err(KeyResolutionError::AlgorithmMismatch);
                 }
+                let (Some(p), Some(q), Some(g)) = (p.as_deref(), q.as_deref(), g.as_deref()) else {
+                    return Err(KeyResolutionError::InvalidPublicKey);
+                };
                 dsa_key_value_to_spki_der(p, q, g, y)?
             }
             KeyValueInfo::Rsa { modulus, exponent } => {
@@ -478,7 +490,7 @@ impl KeyResolver for DefaultKeyResolver {
                 KeyInfoSource::KeyValue(key_value) => {
                     match Self::resolve_key_value(key_value, algorithm) {
                         Ok(resolved) => resolved,
-                        Err(error) if ec_key_value_error_allows_fallback(key_value, &error) => {
+                        Err(error) if key_value_error_allows_fallback(key_value, &error) => {
                             deferred_key_value_error.get_or_insert(error);
                             None
                         }
@@ -559,13 +571,10 @@ fn ec_key_value_to_spki_der(
     }
 }
 
-fn ec_key_value_error_allows_fallback(
-    key_value: &KeyValueInfo,
-    error: &KeyResolutionError,
-) -> bool {
+fn key_value_error_allows_fallback(key_value: &KeyValueInfo, error: &KeyResolutionError) -> bool {
     matches!(
         key_value,
-        KeyValueInfo::Ec { .. } | KeyValueInfo::InvalidEcKeyValue
+        KeyValueInfo::Dsa { .. } | KeyValueInfo::Ec { .. } | KeyValueInfo::InvalidEcKeyValue
     ) && matches!(
         error,
         KeyResolutionError::InvalidPublicKey | KeyResolutionError::AlgorithmMismatch
@@ -768,6 +777,25 @@ mod tests {
                 .with_output_length_bits(79),
             Err(KeyResolutionError::InvalidHmacOutputLength)
         ));
+    }
+
+    #[test]
+    fn hmac_key_debug_redacts_secret_material() {
+        // Debug output may expose public verification parameters, never caller secrets.
+        let secret = b"unique-debug-secret-marker";
+        let key = HmacSha1VerificationKey::new(secret.to_vec())
+            .expect("the fixture HMAC secret is non-empty")
+            .with_output_length_bits(80)
+            .expect("80 bits is a valid HMAC-SHA1 output length");
+
+        let debug = format!("{key:?}");
+        assert!(
+            !debug
+                .contains(std::str::from_utf8(secret).expect("the debug marker is literal ASCII"))
+        );
+        assert!(!debug.contains(&format!("{secret:?}")));
+        assert!(debug.contains("output_length_bits"));
+        assert!(debug.contains("80"));
     }
 
     #[test]

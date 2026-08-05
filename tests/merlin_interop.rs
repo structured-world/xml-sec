@@ -403,6 +403,25 @@ fn rejects_malformed_dsa_key_value() {
 }
 
 #[test]
+fn partial_dsa_key_value_falls_back_to_later_complete_key() {
+    // XMLDSig permits Y-only DSAKeyValue sources; an unusable first source must
+    // not prevent a later complete DSAKeyValue from verifying the signature.
+    let document = xml("signature-enveloped-dsa").replacen(
+        "<KeyInfo>\n      <KeyValue>",
+        "<KeyInfo>\n      <KeyValue><DSAKeyValue><Y>AQ==</Y></DSAKeyValue></KeyValue>\n      <KeyValue>",
+        1,
+    );
+    assert!(document.contains("<DSAKeyValue><Y>AQ==</Y></DSAKeyValue>"));
+
+    assert_valid(
+        "partial DSAKeyValue fallback",
+        VerifyContext::new()
+            .key_resolver(&DefaultKeyResolver::default())
+            .verify(&document),
+    );
+}
+
+#[test]
 fn rejects_missing_ambiguous_and_weak_key_resolution() {
     // KeyName, RetrievalMethod IDs, and legacy RSA policy each fail closed.
     let resources = external_resources();
