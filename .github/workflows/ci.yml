@@ -91,5 +91,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo +nightly install cargo-fuzz --version 0.13.1 --locked
+      # cargo-fuzz 0.13.1's published lockfile pins rustix 0.36.5, which no
+      # longer compiles on current nightly. Keep the tool version pinned while
+      # allowing compatible patch-level transitive dependencies.
+      - run: cargo +nightly install cargo-fuzz --version 0.13.1
       - run: cargo +nightly fuzz run xmldsig_verify -- -runs=256 -max_len=65536
