@@ -5,10 +5,12 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[path = "common/xmlsec1.rs"]
+mod xmlsec1;
 
 use rsa::{RsaPublicKey, pkcs8::DecodePublicKey};
 use xml_sec::xmlenc::{
@@ -51,32 +53,10 @@ impl Drop for TemporaryFile {
     }
 }
 
-fn xmlsec1_version_supports_interop(version: &str) -> bool {
-    version
-        .split_whitespace()
-        .find_map(|token| {
-            let mut components = token.split('.');
-            Some((
-                components.next()?.parse::<u16>().ok()?,
-                components.next()?.parse::<u16>().ok()?,
-                components.next()?.parse::<u16>().ok()?,
-            ))
-        })
-        .is_some_and(|version| version >= (1, 3, 8))
-}
-
-fn xmlsec1_is_available() -> bool {
-    let Ok(output) = Command::new("xmlsec1").arg("--version").output() else {
-        return false;
-    };
-    output.status.success()
-        && std::str::from_utf8(&output.stdout).is_ok_and(xmlsec1_version_supports_interop)
-}
-
 fn decrypt_with_xmlsec1(encrypted_xml: &str, key_option: &str, key_path: &Path) -> Vec<u8> {
     let input = TemporaryFile::write("xmlenc-input", "xml", encrypted_xml.as_bytes());
     let output = TemporaryFile::path("xmlenc-output", "data");
-    let command_output = Command::new("xmlsec1")
+    let command_output = xmlsec1::command()
         .arg("decrypt")
         .arg("--lax-key-search")
         .arg(key_option)
@@ -98,17 +78,20 @@ fn decrypt_with_xmlsec1(encrypted_xml: &str, key_option: &str, key_path: &Path) 
 
 #[test]
 fn xmlsec1_version_gate_accepts_ci_version() {
-    assert!(!xmlsec1_version_supports_interop("xmlsec1 1.3.7 (openssl)"));
-    assert!(xmlsec1_version_supports_interop("xmlsec1 1.3.8 (openssl)"));
-    assert!(xmlsec1_version_supports_interop("xmlsec1 1.3.12 (openssl)"));
+    assert!(!xmlsec1::version_supports_interop(
+        "xmlsec1 1.3.12 (openssl)"
+    ));
+    assert!(xmlsec1::version_supports_interop(
+        "xmlsec1 1.3.13 (openssl)"
+    ));
 }
 
 #[test]
 fn xmlsec1_decrypts_direct_aes_gcm_from_xml_sec() {
     // This validates nonce/tag framing and direct KeyName XML against an
     // independent implementation rather than our reciprocal decrypt path.
-    if !xmlsec1_is_available() {
-        eprintln!("skipping XMLEnc interop: xmlsec1 >= 1.3.8 is not installed");
+    if !xmlsec1::is_available() {
+        eprintln!("skipping XMLEnc interop: xmlsec1 >= 1.3.13 is not installed");
         return;
     }
     let key = [0x4a; 16];
@@ -134,8 +117,8 @@ fn xmlsec1_decrypts_direct_aes_gcm_from_xml_sec() {
 fn xmlsec1_decrypts_rsa_oaep_wrapped_aes_cbc_from_xml_sec() {
     // This covers generated session-key transport, OAEP digest/MGF metadata,
     // nested EncryptedKey lookup, and XMLEnc CBC random-padding framing.
-    if !xmlsec1_is_available() {
-        eprintln!("skipping XMLEnc interop: xmlsec1 >= 1.3.8 is not installed");
+    if !xmlsec1::is_available() {
+        eprintln!("skipping XMLEnc interop: xmlsec1 >= 1.3.13 is not installed");
         return;
     }
     let public_key_path = Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");

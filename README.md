@@ -54,7 +54,7 @@ Currently implemented (core paths):
 Still in progress:
 - XMLDSig DSA-SHA256, broader HMAC verification/signing, and RSA-PSS algorithms
 - Complete XMLDSig and XMLEnc conformance-suite classification
-- Production hardening, fuzzing, benchmarks, and API stabilization
+- Expanded fuzz coverage, benchmarks, production hardening, and API stabilization
 
 ## XMLDSig Usage
 

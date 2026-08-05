@@ -46,7 +46,7 @@ normalize_imported_snapshot() {
     # upstream prose as project documentation.
     rm -f "$staging/Readme.txt"
 
-    # xmlsec 1.3.12's historical "-40" filenames contain an 80-bit HMAC,
+    # xmlsec 1.3.13's historical "-40" filenames contain an 80-bit HMAC,
     # matching XMLDSig 1.1's security floor. Normalize only the local names;
     # file contents remain byte-for-byte donor data.
     for extension in tmpl xml; do
@@ -68,6 +68,7 @@ fixture_paths=("$@")
 if (( ${#fixture_paths[@]} == 0 )); then
   fixture_paths=(
     "xmldsig/aleksey-xmldsig-01/enveloping-rsa-x509chain.xml"
+    "xmldsig/aleksey-xmldsig-01/enveloped-x509-digest-sha256.xml"
     "xmldsig/merlin-xmldsig-twenty-three"
     "xmldsig/external-data/xml-stylesheet-2005"
     "xmldsig/external-data/xml-stylesheet-2005.b64"

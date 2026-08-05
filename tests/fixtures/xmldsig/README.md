@@ -2,6 +2,9 @@
 
 This directory contains the XMLDSig test documents used by integration tests.
 They are checked into the repository so CI never depends on a local donor clone.
+The current compatibility oracle is the xmlsec1 1.3.13 development snapshot at
+commit `5fdd47dc35753438bdc38b6e96c1a3805c67a483`; upstream had bumped the
+version but had not published a release tag when this snapshot was pinned.
 
 ## Importing Vectors
 
@@ -23,7 +26,8 @@ fixture provenance and CI coverage difficult to audit.
 
 Core xmlsec1-generated XMLDSig vectors used by the signing and verification
 pipeline tests. They cover RSA SHA-1/SHA-256/SHA-384/SHA-512, ECDSA P-256 and
-P-384, X.509 KeyInfo, and template signing.
+P-384, SHA-256/SHA-512 X.509 digest selectors, X.509 KeyInfo, and template
+signing.
 
 ### `merlin-xmldsig-twenty-three`
 

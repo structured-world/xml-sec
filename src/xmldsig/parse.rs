@@ -51,7 +51,10 @@ pub(crate) const MAX_X509_DECODED_BINARY_LEN: usize =
     MAX_X509_BASE64_NORMALIZED_LEN.div_ceil(4) * 3;
 const MAX_X509_SUBJECT_NAME_TEXT_LEN: usize = 16_384;
 const MAX_X509_ISSUER_NAME_TEXT_LEN: usize = 16_384;
-const MAX_X509_SERIAL_NUMBER_TEXT_LEN: usize = 4096;
+// RFC 5280 permits at most 20 DER content octets for a positive certificate
+// serial number. The sign bit leaves 159 value bits, or at most 49 decimal digits.
+const MAX_X509_SERIAL_NUMBER_TEXT_LEN: usize = 49;
+const MAX_X509_SERIAL_NUMBER_BYTES: usize = 20;
 const MAX_X509_DATA_ENTRY_COUNT: usize = 64;
 pub(crate) const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
 const MAX_X509_CHAIN_DEPTH: usize = 9;
@@ -1508,12 +1511,14 @@ fn format_x509_serial_value_hex(serial: &[u8]) -> String {
 
 fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
     let serial = serial.trim();
-    let serial = serial.strip_prefix('+').unwrap_or(serial);
-    if serial.is_empty() || !serial.bytes().all(|byte| byte.is_ascii_digit()) {
+    if serial.is_empty()
+        || serial.len() > MAX_X509_SERIAL_NUMBER_TEXT_LEN
+        || !serial.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
 
-    let mut bytes = Vec::<u8>::new();
+    let mut bytes = [0_u8; MAX_X509_SERIAL_NUMBER_BYTES];
     for digit in serial.bytes().map(|byte| byte - b'0') {
         let mut carry = u16::from(digit);
         for byte in bytes.iter_mut().rev() {
@@ -1521,10 +1526,15 @@ fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
             *byte = value as u8;
             carry = value >> 8;
         }
-        while carry > 0 {
-            bytes.insert(0, carry as u8);
-            carry >>= 8;
+        if carry != 0 {
+            return None;
         }
+    }
+
+    // DER INTEGER is signed, so a positive 20-octet serial must keep its high
+    // bit clear. Values requiring a 21st sign-extension octet exceed RFC 5280.
+    if bytes[0] & 0x80 != 0 {
+        return None;
     }
 
     Some(format_x509_serial_value_hex(&bytes))
@@ -1578,12 +1588,8 @@ fn parse_x509_issuer_serial(node: Node<'_, '_>) -> Result<(String, String), Pars
 
     let serial_node = children[1];
     ensure_no_element_children(serial_node, "X509SerialNumber")?;
-    let serial_number = collect_text_content_bounded(
-        serial_node,
-        MAX_X509_SERIAL_NUMBER_TEXT_LEN,
-        "X509SerialNumber",
-    )?;
-    if issuer_name.trim().is_empty() || serial_number.trim().is_empty() {
+    let serial_number = collect_x509_serial_number(serial_node)?;
+    if issuer_name.trim().is_empty() {
         return Err(ParseError::InvalidStructure(
             "X509IssuerSerial requires non-empty X509IssuerName and X509SerialNumber".into(),
         ));
@@ -1722,6 +1728,46 @@ fn collect_text_content_bounded(
         text.push_str(chunk);
     }
     Ok(text)
+}
+
+fn collect_x509_serial_number(node: Node<'_, '_>) -> Result<String, ParseError> {
+    let mut serial = String::with_capacity(MAX_X509_SERIAL_NUMBER_TEXT_LEN);
+    let mut trailing_whitespace = false;
+
+    for byte in node
+        .children()
+        .filter_map(|child| child.is_text().then(|| child.text()).flatten())
+        .flat_map(str::bytes)
+    {
+        if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+            trailing_whitespace |= !serial.is_empty();
+            continue;
+        }
+        if trailing_whitespace || !byte.is_ascii_digit() {
+            return Err(ParseError::InvalidStructure(
+                "invalid X509SerialNumber decimal value".into(),
+            ));
+        }
+        if serial.len() == MAX_X509_SERIAL_NUMBER_TEXT_LEN {
+            return Err(ParseError::InvalidStructure(
+                "X509SerialNumber exceeds maximum allowed decimal length".into(),
+            ));
+        }
+        serial.push(char::from(byte));
+    }
+
+    if serial.is_empty() {
+        return Err(ParseError::InvalidStructure(
+            "X509IssuerSerial requires non-empty X509IssuerName and X509SerialNumber".into(),
+        ));
+    }
+    if x509_serial_decimal_to_hex(&serial).is_none() {
+        return Err(ParseError::InvalidStructure(
+            "invalid X509SerialNumber decimal value or RFC 5280 range".into(),
+        ));
+    }
+
+    Ok(serial)
 }
 
 fn ensure_no_element_children(node: Node<'_, '_>, element_name: &str) -> Result<(), ParseError> {
@@ -2579,6 +2625,8 @@ BA== </Modulus>
 
     #[test]
     fn parse_key_info_rejects_malformed_issuer_serial_even_with_matching_subject() {
+        // Lexically invalid serials must fail while parsing X509IssuerSerial,
+        // before another selector or embedded certificate can mask them.
         let cert = fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
         let xml = format!(
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
@@ -2596,7 +2644,7 @@ BA== </Modulus>
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
         assert!(
-            matches!(err, ParseError::InvalidStructure(message) if message.contains("lookup identifiers"))
+            matches!(err, ParseError::InvalidStructure(message) if message.contains("invalid X509SerialNumber"))
         );
     }
 
@@ -2679,9 +2727,67 @@ BA== </Modulus>
     }
 
     #[test]
+    fn x509_serial_decimal_parser_enforces_rfc5280_positive_range() {
+        // RFC 5280 limits positive certificate serials to 20 DER content
+        // octets, leaving 159 value bits because the high bit is the sign.
+        let max_serial = "730750818665451459101842416358141509827966271487";
+        assert_eq!(
+            x509_serial_decimal_to_hex(max_serial),
+            Some("7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF".into())
+        );
+        assert_eq!(
+            x509_serial_decimal_to_hex("0000000000000000000000000000000000000000000000001"),
+            Some("01".into())
+        );
+
+        for invalid in [
+            "",
+            "+1",
+            "-1",
+            "1a",
+            "00000000000000000000000000000000000000000000000001",
+            "730750818665451459101842416358141509827966271488",
+            "1461501637330902918203684832716283019655932542976",
+        ] {
+            assert_eq!(
+                x509_serial_decimal_to_hex(invalid),
+                None,
+                "invalid serial {invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_x509_serial_normalizes_boundary_whitespace_and_rejects_overflow() {
+        // XML Schema collapses integer whitespace before validation; the
+        // normalized value must still obey the RFC 5280 positive range.
+        let max_serial = "730750818665451459101842416358141509827966271487";
+        let valid = format!(
+            "<KeyInfo xmlns=\"{XMLDSIG_NS}\"><X509Data><X509IssuerSerial><X509IssuerName>CN=issuer</X509IssuerName><X509SerialNumber>\n {max_serial}\t</X509SerialNumber></X509IssuerSerial></X509Data></KeyInfo>"
+        );
+        let doc = Document::parse(&valid).unwrap();
+        let parsed = parse_key_info(doc.root_element()).unwrap();
+        let KeyInfoSource::X509Data(x509) = &parsed.sources[0] else {
+            panic!("expected X509Data source");
+        };
+        assert_eq!(x509.issuer_serials[0].1, max_serial);
+
+        let overflow = valid.replace(
+            max_serial,
+            "730750818665451459101842416358141509827966271488",
+        );
+        let doc = Document::parse(&overflow).unwrap();
+        assert!(matches!(
+            parse_key_info(doc.root_element()),
+            Err(ParseError::InvalidStructure(message))
+                if message.contains("invalid X509SerialNumber")
+        ));
+    }
+
+    #[test]
     fn parse_key_info_accepts_large_textual_x509_entries_within_entry_budget() {
         let issuer_name = "C".repeat(MAX_X509_ISSUER_NAME_TEXT_LEN);
-        let serial_number = "7".repeat(MAX_X509_SERIAL_NUMBER_TEXT_LEN);
+        let serial_number = "0".repeat(MAX_X509_SERIAL_NUMBER_TEXT_LEN - 1) + "1";
         let issuer_serials = (0..52)
             .map(|_| {
                 format!(

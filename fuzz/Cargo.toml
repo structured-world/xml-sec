@@ -1,0 +1,22 @@
+[package]
+name = "xml-sec-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+xml-sec = { path = "..", features = ["xmldsig"] }
+
+[[bin]]
+name = "xmldsig_verify"
+path = "fuzz_targets/xmldsig_verify.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -646,6 +646,9 @@ mod tests {
     const X509_DIGEST_SIGNATURE: &str = include_str!(
         "../../tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-x509-digest-sha512.xml"
     );
+    const X509_DIGEST_SHA256_SIGNATURE: &str = include_str!(
+        "../../tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-x509-digest-sha256.xml"
+    );
     const RSA_KEY_VALUE_SIGNATURE: &str = include_str!(
         "../../tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml"
     );
@@ -838,12 +841,14 @@ mod tests {
             ],
             ..KeyResolverConfig::default()
         });
-        let result = super::super::VerifyContext::new()
-            .key_resolver(&resolver)
-            .verify(X509_DIGEST_SIGNATURE)
-            .expect("X509Digest should resolve a configured certificate");
+        for signature in [X509_DIGEST_SHA256_SIGNATURE, X509_DIGEST_SIGNATURE] {
+            let result = super::super::VerifyContext::new()
+                .key_resolver(&resolver)
+                .verify(signature)
+                .expect("X509Digest should resolve a configured certificate");
 
-        assert_eq!(result.status, super::super::DsigStatus::Valid);
+            assert_eq!(result.status, super::super::DsigStatus::Valid);
+        }
     }
 
     #[test]
