@@ -50,9 +50,11 @@ after either outcome.
 External references are disabled by default. Callers must both allow their URI class with
 `UriTypeSet` and provide every payload through `VerifyContext::external_resources`; verification
 never performs network or filesystem I/O. Individual resources are limited to 8 MiB and the
-complete map to 32 MiB. `RetrievalMethod` currently accepts untransformed external
-`rawX509Certificate` data and the Merlin same-document `X509Data` XPath selection. Other retrieval
-transform chains fail closed instead of being ignored.
+complete map to 32 MiB. External key retrieval has an independent policy boundary: callers must
+also opt in with `VerifyContext::allowed_retrieval_method_uri_types`. Allowing external signed
+payloads never implicitly allows external key material. `RetrievalMethod` currently accepts
+untransformed external `rawX509Certificate` data and the Merlin same-document `X509Data` XPath
+selection. Other retrieval transform chains fail closed instead of being ignored.
 
 Internal DTD declarations are disabled by default and require
 `VerifyContext::allow_internal_dtd(true)`. External entity resolution remains disabled. XSLT is

@@ -18,12 +18,13 @@ use crate::c14n::canonicalize;
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 use super::parse::{
-    KeyInfo, MAX_REFERENCES_PER_SIGNATURE, ParseError, Reference, RetrievalMethodTransforms,
+    KeyInfo, MAX_REFERENCES_PER_SIGNATURE, MAX_X509_DATA_TOTAL_BINARY_LEN,
+    MAX_X509_DECODED_BINARY_LEN, ParseError, Reference, RetrievalMethodTransforms,
     SignatureAlgorithm, XMLDSIG_NS,
 };
 use super::parse::{
     parse_key_info, parse_reference_with_xpath_budget, parse_signed_info_with_xpath_budget,
-    parse_x509_certificate, parse_x509_data_dispatch, reference_digest_method,
+    parse_x509_certificate, parse_x509_data_dispatch_with_budget, reference_digest_method,
 };
 use super::signature::{
     SignatureVerificationError, verify_dsa_signature_spki, verify_ecdsa_signature_pem,
@@ -41,6 +42,7 @@ const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
 const MAX_EXTERNAL_RESOURCE_LEN: usize = 8 * 1024 * 1024;
 const MAX_EXTERNAL_RESOURCE_TOTAL_LEN: usize = 32 * 1024 * 1024;
+const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;
 /// Cryptographic verifier used by [`VerifyContext`].
 ///
 /// This trait intentionally has no `Send + Sync` supertraits so lightweight
@@ -145,6 +147,7 @@ pub struct VerifyContext<'a> {
     key_resolver: Option<&'a dyn KeyResolver>,
     process_manifests: bool,
     allowed_uri_types: UriTypeSet,
+    allowed_retrieval_method_uri_types: UriTypeSet,
     allowed_transforms: Option<HashSet<String>>,
     store_pre_digest: bool,
     transform_options: TransformOptions,
@@ -167,6 +170,7 @@ impl<'a> VerifyContext<'a> {
             key_resolver: None,
             process_manifests: false,
             allowed_uri_types: UriTypeSet::default(),
+            allowed_retrieval_method_uri_types: UriTypeSet::default(),
             allowed_transforms: None,
             store_pre_digest: false,
             transform_options: TransformOptions::default(),
@@ -225,6 +229,17 @@ impl<'a> VerifyContext<'a> {
     /// Restrict allowed reference URI classes.
     pub fn allowed_uri_types(mut self, types: UriTypeSet) -> Self {
         self.allowed_uri_types = types;
+        self
+    }
+
+    /// Restrict URI classes used to retrieve key material from `<KeyInfo>`.
+    ///
+    /// This policy is independent from [`Self::allowed_uri_types`]: allowing an
+    /// external signed payload does not implicitly allow external key retrieval.
+    /// Same-document retrieval is enabled by default; external retrieval requires
+    /// an explicit opt-in and still uses only caller-supplied resources.
+    pub fn allowed_retrieval_method_uri_types(mut self, types: UriTypeSet) -> Self {
+        self.allowed_retrieval_method_uri_types = types;
         self
     }
 
@@ -817,7 +832,7 @@ fn verify_signature_with_context(
             info,
             &resolver,
             ctx.external_resources,
-            ctx.allowed_uri_types,
+            ctx.allowed_retrieval_method_uri_types,
         )?;
     }
     let execution_budget = TransformExecutionBudget::default();
@@ -931,19 +946,36 @@ fn materialize_retrieval_methods(
     external_resources: Option<&HashMap<String, Vec<u8>>>,
     allowed_uri_types: UriTypeSet,
 ) -> Result<(), SignatureVerificationPipelineError> {
-    let retrievals = key_info
+    let retrieval_count = key_info
         .sources
         .iter()
-        .filter_map(|source| match source {
-            super::parse::KeyInfoSource::RetrievalMethod {
-                uri,
-                resource_type,
-                transforms,
-            } => Some((uri.clone(), resource_type.clone(), *transforms)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    for (uri, resource_type, transforms) in retrievals {
+        .filter(|source| matches!(source, super::parse::KeyInfoSource::RetrievalMethod { .. }))
+        .count();
+    if retrieval_count > MAX_RETRIEVAL_METHOD_COUNT {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "KeyInfo contains too many RetrievalMethod elements",
+        });
+    }
+
+    let mut total_binary_len = existing_x509_binary_len(key_info)?;
+    let mut seen = HashSet::new();
+    let mut materialized = Vec::with_capacity(key_info.sources.len());
+    for source in std::mem::take(&mut key_info.sources) {
+        let super::parse::KeyInfoSource::RetrievalMethod {
+            uri,
+            resource_type,
+            transforms,
+        } = source
+        else {
+            materialized.push(source);
+            continue;
+        };
+
+        let identity = (uri.clone(), resource_type.clone(), transforms);
+        if !seen.insert(identity) {
+            continue;
+        }
+
         if resource_type.as_deref() == Some("http://www.w3.org/2000/09/xmldsig#rawX509Certificate")
         {
             if !allowed_uri_types.allows(&uri) {
@@ -963,9 +995,15 @@ fn materialize_retrieval_methods(
                         )),
                     )
                 })?;
+            if certificate.len() > MAX_X509_DECODED_BINARY_LEN {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "raw X509 RetrievalMethod certificate exceeds maximum allowed length",
+                });
+            }
+            add_retrieval_binary_usage(&mut total_binary_len, certificate.len())?;
             let parsed = parse_x509_certificate(certificate)
                 .map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
-            key_info.sources.push(super::parse::KeyInfoSource::X509Data(
+            materialized.push(super::parse::KeyInfoSource::X509Data(
                 super::parse::X509DataInfo {
                     certificates: vec![certificate.clone()],
                     parsed_certificates: vec![parsed],
@@ -977,7 +1015,7 @@ fn materialize_retrieval_methods(
             if !allowed_uri_types.allows(&uri) {
                 return Err(SignatureVerificationPipelineError::DisallowedUri { uri });
             }
-            if transforms != RetrievalMethodTransforms::X509DataAncestor {
+            if transforms != RetrievalMethodTransforms::X509DataNodeSetFilter {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "X509Data RetrievalMethod requires the supported XPath selection",
                 });
@@ -992,41 +1030,82 @@ fn materialize_retrieval_methods(
                     reason: "X509Data RetrievalMethod target is missing or ambiguous",
                 },
             )?;
-            let containing = target.ancestors().find(|candidate| {
-                candidate.is_element()
-                    && candidate.tag_name().namespace() == Some(XMLDSIG_NS)
-                    && candidate.tag_name().name() == "X509Data"
-            });
-            let mut selected = target.descendants().filter(|candidate| {
-                candidate.is_element()
-                    && candidate.tag_name().namespace() == Some(XMLDSIG_NS)
-                    && candidate.tag_name().name() == "X509Data"
-                    && Some(*candidate) != containing
-            });
-            let node = match (containing, selected.next()) {
-                (Some(node), None) | (None, Some(node)) => node,
-                (None, None) => {
-                    return Err(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "X509Data RetrievalMethod selected no X509Data element",
-                    });
-                }
-                (Some(_), Some(_)) => {
-                    return Err(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "X509Data RetrievalMethod selected multiple X509Data elements",
-                    });
-                }
-            };
-            if selected.next().is_some() {
-                return Err(SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "X509Data RetrievalMethod selected multiple X509Data elements",
-                });
-            }
-            let data = parse_x509_data_dispatch(node)
+            let node = select_retrieved_x509_data_root(target)?;
+            let data = parse_x509_data_dispatch_with_budget(node, &mut total_binary_len)
                 .map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
-            key_info
-                .sources
-                .push(super::parse::KeyInfoSource::X509Data(data));
+            materialized.push(super::parse::KeyInfoSource::X509Data(data));
+        } else {
+            materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
+                uri,
+                resource_type,
+                transforms,
+            });
         }
+    }
+    key_info.sources = materialized;
+    Ok(())
+}
+
+fn select_retrieved_x509_data_root<'a, 'input>(
+    target: Node<'a, 'input>,
+) -> Result<Node<'a, 'input>, SignatureVerificationPipelineError> {
+    // XMLDSig XPath filtering evaluates the predicate for every node in the
+    // dereferenced node-set. `ancestor-or-self::ds:X509Data` therefore retains
+    // one X509Data descendant and its subtree; it cannot import an ancestor
+    // that was outside the URI target's node-set.
+    let mut roots = target.descendants().filter(|candidate| {
+        candidate.is_element()
+            && candidate.tag_name().namespace() == Some(XMLDSIG_NS)
+            && candidate.tag_name().name() == "X509Data"
+    });
+    let root = roots
+        .next()
+        .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "X509Data RetrievalMethod selected no X509Data element",
+        })?;
+    if roots.next().is_some() {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "X509Data RetrievalMethod selected multiple X509Data elements",
+        });
+    }
+    Ok(root)
+}
+
+fn existing_x509_binary_len(
+    key_info: &KeyInfo,
+) -> Result<usize, SignatureVerificationPipelineError> {
+    let mut total = 0usize;
+    for source in &key_info.sources {
+        if let super::parse::KeyInfoSource::X509Data(info) = source {
+            for len in info
+                .certificates
+                .iter()
+                .chain(&info.skis)
+                .chain(&info.crls)
+                .map(Vec::len)
+                .chain(info.digests.iter().map(|(_, digest)| digest.len()))
+            {
+                add_retrieval_binary_usage(&mut total, len)?;
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn add_retrieval_binary_usage(
+    total: &mut usize,
+    delta: usize,
+) -> Result<(), SignatureVerificationPipelineError> {
+    *total =
+        total
+            .checked_add(delta)
+            .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "RetrievalMethod X509Data binary length overflow",
+            })?;
+    if *total > MAX_X509_DATA_TOTAL_BINARY_LEN {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "RetrievalMethod X509Data exceeds maximum aggregate binary length",
+        });
     }
     Ok(())
 }
@@ -2427,9 +2506,9 @@ mod tests {
     }
 
     #[test]
-    fn retrieval_method_materializes_containing_or_descendant_x509_data() {
+    fn retrieval_method_materializes_single_x509_data_subtree() {
         for target_xml in [
-            r#"<ds:X509Data><ds:X509SubjectName Id="target">CN=leaf</ds:X509SubjectName></ds:X509Data>"#,
+            r#"<ds:X509Data Id="target"><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data>"#,
             r#"<holder Id="target"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder>"#,
         ] {
             let xml = format!(
@@ -2449,13 +2528,177 @@ mod tests {
                 None,
                 UriTypeSet::SAME_DOCUMENT,
             )
-            .expect("ancestor-or-self selection must accept either relation");
-            assert!(key_info.sources.iter().any(|source| matches!(
-                source,
-                super::super::parse::KeyInfoSource::X509Data(info)
+            .expect("XPath filter must produce one X509Data-rooted node-set");
+            assert!(matches!(
+                key_info.sources.as_slice(),
+                [super::super::parse::KeyInfoSource::X509Data(info)]
                     if info.subject_names == ["CN=leaf"]
-            )));
+            ));
         }
+    }
+
+    #[test]
+    fn retrieval_method_rejects_target_inside_external_x509_data_ancestor() {
+        // XPath filtering cannot add an ancestor that was outside the URI's
+        // dereferenced node-set, so this result is not rooted at X509Data.
+        let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+          <ds:KeyInfo><ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath></ds:Transform></ds:Transforms></ds:RetrievalMethod></ds:KeyInfo>
+          <ds:X509Data><ds:X509SubjectName Id="target">CN=leaf</ds:X509SubjectName></ds:X509Data>
+        </root>"##;
+        let document = Document::parse(xml).unwrap();
+        let key_info_node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .unwrap();
+        let mut key_info = parse_key_info(key_info_node).unwrap();
+
+        let error = materialize_retrieval_methods(
+            &mut key_info,
+            &UriReferenceResolver::new(&document),
+            None,
+            UriTypeSet::SAME_DOCUMENT,
+        )
+        .expect_err("filter output without an X509Data root must be rejected");
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "X509Data RetrievalMethod selected no X509Data element"
+            }
+        ));
+    }
+
+    #[test]
+    fn retrieval_method_rejects_ambiguous_x509_data_relation() {
+        // A transformed result with multiple X509Data roots is not one KeyInfo child.
+        let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+          <ds:KeyInfo><ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath></ds:Transform></ds:Transforms></ds:RetrievalMethod></ds:KeyInfo>
+          <holder Id="target"><ds:X509Data/><ds:X509Data/></holder>
+        </root>"##;
+        let document = Document::parse(xml).unwrap();
+        let key_info_node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .unwrap();
+        let mut key_info = parse_key_info(key_info_node).unwrap();
+
+        let error = materialize_retrieval_methods(
+            &mut key_info,
+            &UriReferenceResolver::new(&document),
+            None,
+            UriTypeSet::SAME_DOCUMENT,
+        )
+        .expect_err("multiple transformed X509Data roots must be rejected");
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "X509Data RetrievalMethod selected multiple X509Data elements"
+            }
+        ));
+    }
+
+    #[test]
+    fn retrieval_method_materialization_preserves_key_info_order() {
+        // Replacing the source in place keeps a later fallback behind the
+        // retrieved key material for first-match resolvers.
+        let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+          <ds:KeyInfo>
+            <ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath></ds:Transform></ds:Transforms></ds:RetrievalMethod>
+            <ds:KeyName>fallback</ds:KeyName>
+          </ds:KeyInfo>
+          <holder Id="target"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder>
+        </root>"##;
+        let document = Document::parse(xml).unwrap();
+        let key_info_node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .unwrap();
+        let mut key_info = parse_key_info(key_info_node).unwrap();
+
+        materialize_retrieval_methods(
+            &mut key_info,
+            &UriReferenceResolver::new(&document),
+            None,
+            UriTypeSet::SAME_DOCUMENT,
+        )
+        .unwrap();
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [
+                super::super::parse::KeyInfoSource::X509Data(_),
+                super::super::parse::KeyInfoSource::KeyName(name)
+            ] if name == "fallback"
+        ));
+    }
+
+    #[test]
+    fn retrieval_method_materialization_bounds_repeated_sources() {
+        // Repeating one allowed certificate must not multiply parsing and clones
+        // before SignatureValue validation.
+        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
+        let certificate = include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
+        )
+        .to_vec();
+        let resources = HashMap::from([("urn:certificate".to_string(), certificate)]);
+        let mut key_info = KeyInfo {
+            sources: (0..=64)
+                .map(|_| super::super::parse::KeyInfoSource::RetrievalMethod {
+                    uri: "urn:certificate".into(),
+                    resource_type: Some(RAW_X509_TYPE.into()),
+                    transforms: RetrievalMethodTransforms::None,
+                })
+                .collect(),
+        };
+        let document = Document::parse("<root/>").unwrap();
+
+        let error = materialize_retrieval_methods(
+            &mut key_info,
+            &UriReferenceResolver::new(&document),
+            Some(&resources),
+            UriTypeSet::ALL,
+        )
+        .expect_err("retrieval count must be bounded before materialization");
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "KeyInfo contains too many RetrievalMethod elements"
+            }
+        ));
+    }
+
+    #[test]
+    fn retrieval_method_materialization_deduplicates_within_count_limit() {
+        // Repeated references to the same raw certificate produce one parsed
+        // key source rather than one certificate clone per XML element.
+        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
+        let certificate = include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
+        )
+        .to_vec();
+        let resources = HashMap::from([("urn:certificate".to_string(), certificate)]);
+        let mut key_info = KeyInfo {
+            sources: (0..MAX_RETRIEVAL_METHOD_COUNT)
+                .map(|_| super::super::parse::KeyInfoSource::RetrievalMethod {
+                    uri: "urn:certificate".into(),
+                    resource_type: Some(RAW_X509_TYPE.into()),
+                    transforms: RetrievalMethodTransforms::None,
+                })
+                .collect(),
+        };
+        let document = Document::parse("<root/>").unwrap();
+
+        materialize_retrieval_methods(
+            &mut key_info,
+            &UriReferenceResolver::new(&document),
+            Some(&resources),
+            UriTypeSet::ALL,
+        )
+        .unwrap();
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [super::super::parse::KeyInfoSource::X509Data(info)]
+                if info.certificates.len() == 1
+        ));
     }
 
     #[test]

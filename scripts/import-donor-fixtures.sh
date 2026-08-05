@@ -35,6 +35,27 @@ replace_target() {
   return 1
 }
 
+normalize_imported_snapshot() {
+  local relative_path="$1"
+  local staging="$2"
+
+  if [[ "$relative_path" == "xmldsig/merlin-xmldsig-twenty-three" ]]; then
+    # The donor README contains unresolved placeholders and is not executable
+    # fixture data. Keep the imported corpus curated rather than publishing
+    # upstream prose as project documentation.
+    rm -f "$staging/Readme.txt"
+
+    # xmlsec 1.3.12's historical "-40" filenames contain an 80-bit HMAC,
+    # matching XMLDSig 1.1's security floor. Normalize only the local names;
+    # file contents remain byte-for-byte donor data.
+    for extension in tmpl xml; do
+      mv \
+        "$staging/signature-enveloping-hmac-sha1-40.$extension" \
+        "$staging/signature-enveloping-hmac-sha1-80.$extension"
+    done
+  fi
+}
+
 fixture_paths=("$@")
 if (( ${#fixture_paths[@]} == 0 )); then
   fixture_paths=(
@@ -100,6 +121,7 @@ for relative_path in "${fixture_paths[@]}"; do
       rm -rf "$staging"
       exit 1
     fi
+    normalize_imported_snapshot "$relative_path" "$staging"
     replace_target "$staging" "$target"
   else
     target_parent="$(dirname "$target")"

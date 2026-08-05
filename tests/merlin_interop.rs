@@ -9,8 +9,9 @@ use std::{
 use x509_parser::prelude::{FromDer, X509Certificate};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DsigError, DsigStatus, FailureReason, HmacSha1VerificationKey,
-    KeyResolutionError, KeyResolverConfig, SignatureAlgorithm, SignatureVerificationError,
-    UriTypeSet, VerificationKey, VerifyContext, X509ChainError, XPathHereSemantics,
+    KeyResolutionError, KeyResolverConfig, ParseError, SignatureAlgorithm,
+    SignatureVerificationError, UriTypeSet, VerificationKey, VerifyContext, X509ChainError,
+    XPathHereSemantics,
 };
 
 const MERLIN: &str = "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three";
@@ -123,10 +124,10 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         .with_output_length_bits(80)
         .expect("valid XMLDSig truncation");
     assert_valid(
-        "signature-enveloping-hmac-sha1-40",
+        "signature-enveloping-hmac-sha1-80",
         VerifyContext::new()
             .key(&truncated_hmac)
-            .verify(&xml("signature-enveloping-hmac-sha1-40")),
+            .verify(&xml("signature-enveloping-hmac-sha1-80")),
     );
 
     let resources = external_resources();
@@ -193,6 +194,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         VerifyContext::new()
             .key_resolver(&retrieval)
             .allowed_uri_types(UriTypeSet::ALL)
+            .allowed_retrieval_method_uri_types(UriTypeSet::ALL)
             .external_resources(&resources)
             .verify(&xml("signature-retrievalmethod-rawx509crt")),
     );
@@ -366,7 +368,7 @@ fn rejects_wrong_hmac_key_and_invalid_output_length() {
         .expect("wrong MAC is a validation result");
     assert_ne!(result.status, DsigStatus::Valid);
 
-    let malformed = xml("signature-enveloping-hmac-sha1-40").replacen(
+    let malformed = xml("signature-enveloping-hmac-sha1-80").replacen(
         "<HMACOutputLength>80</HMACOutputLength>",
         "<HMACOutputLength>72</HMACOutputLength>",
         1,
@@ -374,7 +376,7 @@ fn rejects_wrong_hmac_key_and_invalid_output_length() {
     assert!(malformed.contains("<HMACOutputLength>72</HMACOutputLength>"));
     assert!(VerifyContext::new().key(&wrong).verify(&malformed).is_err());
 
-    let implicit_full_length = xml("signature-enveloping-hmac-sha1-40").replacen(
+    let implicit_full_length = xml("signature-enveloping-hmac-sha1-80").replacen(
         "<HMACOutputLength>80</HMACOutputLength>",
         "",
         1,
@@ -461,14 +463,17 @@ fn rejects_dtd_and_unsupported_retrieval_defaults() {
         1,
     );
     let resources = external_resources();
+    let unsupported_error = VerifyContext::new()
+        .key_resolver(&DefaultKeyResolver::default())
+        .allow_internal_dtd(true)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .external_resources(&resources)
+        .verify(&unsupported)
+        .expect_err("unsupported RetrievalMethod XPath must fail closed");
     assert!(matches!(
-        VerifyContext::new()
-            .key_resolver(&DefaultKeyResolver::default())
-            .allow_internal_dtd(true)
-            .allowed_uri_types(UriTypeSet::ALL)
-            .external_resources(&resources)
-            .verify(&unsupported),
-        Err(DsigError::ParseKeyInfo(_))
+        unsupported_error,
+        DsigError::ParseKeyInfo(ParseError::InvalidStructure(reason))
+            if reason == "unsupported RetrievalMethod XPath selection"
     ));
 
     let retrieval = DefaultKeyResolver::new(KeyResolverConfig {
@@ -477,11 +482,26 @@ fn rejects_dtd_and_unsupported_retrieval_defaults() {
         verification_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005)),
         ..KeyResolverConfig::default()
     });
+    let reference_error = VerifyContext::new()
+        .key_resolver(&retrieval)
+        .external_resources(&resources)
+        .verify(&xml("signature-retrievalmethod-rawx509crt"))
+        .expect_err("external SignedInfo reference must require an explicit opt-in");
     assert!(matches!(
-        VerifyContext::new()
-            .key_resolver(&retrieval)
-            .external_resources(&resources)
-            .verify(&xml("signature-retrievalmethod-rawx509crt")),
-        Err(DsigError::DisallowedUri { .. })
+        reference_error,
+        DsigError::DisallowedUri { uri }
+            if uri == "http://www.w3.org/TR/xml-stylesheet"
+    ));
+
+    let retrieval_error = VerifyContext::new()
+        .key_resolver(&retrieval)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .external_resources(&resources)
+        .verify(&xml("signature-retrievalmethod-rawx509crt"))
+        .expect_err("external key retrieval must require its own explicit opt-in");
+    assert!(matches!(
+        retrieval_error,
+        DsigError::DisallowedUri { uri }
+            if uri == "tests/merlin-xmldsig-twenty-three/certs/balor.der"
     ));
 }

@@ -178,7 +178,7 @@ fn fixture_file_count_matches_expected() {
     let expected = [
         ("keys", 24),
         ("c14n", 41),
-        ("xmldsig", 127),
+        ("xmldsig", 126),
         ("saml", 2),
         ("xmlenc", 482),
     ];
@@ -199,7 +199,7 @@ fn merlin_xmldsig_snapshot_contains_complete_interop_inputs() {
     let required = [
         "xmldsig/merlin-xmldsig-twenty-three/signature.xml",
         "xmldsig/merlin-xmldsig-twenty-three/signature-external-dsa.xml",
-        "xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-hmac-sha1-40.xml",
+        "xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-hmac-sha1-80.xml",
         "xmldsig/merlin-xmldsig-twenty-three/signature-retrievalmethod-rawx509crt.xml",
         "xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt-crl.xml",
         "xmldsig/merlin-xmldsig-twenty-three/certs/ca.pem",
@@ -212,6 +212,20 @@ fn merlin_xmldsig_snapshot_contains_complete_interop_inputs() {
         let path = fixtures_dir().join(relative_path);
         assert!(path.is_file(), "missing Merlin fixture: {}", path.display());
     }
+}
+
+#[test]
+fn merlin_xmldsig_snapshot_normalizes_non_fixture_donor_artifacts() {
+    // The importer removes stale donor prose and gives the historical `-40`
+    // vector a local name matching its actual XMLDSig-compliant 80-bit output.
+    let dir = fixtures_dir().join("xmldsig/merlin-xmldsig-twenty-three");
+    assert!(!dir.join("Readme.txt").exists());
+    assert!(!dir.join("signature-enveloping-hmac-sha1-40.xml").exists());
+    assert!(!dir.join("signature-enveloping-hmac-sha1-40.tmpl").exists());
+
+    let fixture = fs::read_to_string(dir.join("signature-enveloping-hmac-sha1-80.xml"))
+        .expect("normalized Merlin HMAC fixture must be readable");
+    assert!(fixture.contains("<HMACOutputLength>80</HMACOutputLength>"));
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

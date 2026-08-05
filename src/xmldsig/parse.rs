@@ -37,6 +37,9 @@ const MAX_DER_ENCODED_KEY_VALUE_LEN: usize = 8192;
 const MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN: usize = 65_536;
 const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LEN.div_ceil(3) * 4;
 const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
+const MAX_KEY_INFO_CHILD_COUNT: usize = 64;
+const MAX_HMAC_OUTPUT_LENGTH_TEXT_LEN: usize = 32;
+const MAX_RETRIEVAL_XPATH_TEXT_LEN: usize = 256;
 const MAX_RSA_MODULUS_LEN: usize = 1024;
 const MAX_RSA_EXPONENT_LEN: usize = 8;
 pub(crate) const EC_P256_OID: &str = "1.2.840.10045.3.1.7";
@@ -44,12 +47,13 @@ pub(crate) const EC_P384_OID: &str = "1.3.132.0.34";
 const MAX_EC_PUBLIC_KEY_LEN: usize = 97;
 const MAX_X509_BASE64_TEXT_LEN: usize = 262_144;
 const MAX_X509_BASE64_NORMALIZED_LEN: usize = MAX_X509_BASE64_TEXT_LEN;
-const MAX_X509_DECODED_BINARY_LEN: usize = MAX_X509_BASE64_NORMALIZED_LEN.div_ceil(4) * 3;
+pub(crate) const MAX_X509_DECODED_BINARY_LEN: usize =
+    MAX_X509_BASE64_NORMALIZED_LEN.div_ceil(4) * 3;
 const MAX_X509_SUBJECT_NAME_TEXT_LEN: usize = 16_384;
 const MAX_X509_ISSUER_NAME_TEXT_LEN: usize = 16_384;
 const MAX_X509_SERIAL_NUMBER_TEXT_LEN: usize = 4096;
 const MAX_X509_DATA_ENTRY_COUNT: usize = 64;
-const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
+pub(crate) const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
 const MAX_X509_CHAIN_DEPTH: usize = 9;
 pub(crate) const MAX_REFERENCES_PER_SIGNATURE: usize = 64;
 
@@ -180,13 +184,13 @@ pub enum KeyInfoSource {
 }
 
 /// Transform forms accepted on `<RetrievalMethod>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RetrievalMethodTransforms {
     /// No transform chain is present.
     None,
-    /// Select the `ds:X509Data` ancestor-or-self node from a same-document object.
-    X509DataAncestor,
+    /// Filter a same-document node-set to one `ds:X509Data`-rooted subtree.
+    X509DataNodeSetFilter,
 }
 
 /// Parsed `<KeyValue>` dispatch result.
@@ -454,9 +458,9 @@ fn parse_hmac_output_length(
         ));
     }
     ensure_no_element_children(child, "HMACOutputLength")?;
-    let bits = child
-        .text()
-        .unwrap_or_default()
+    let text =
+        collect_text_content_bounded(child, MAX_HMAC_OUTPUT_LENGTH_TEXT_LEN, "HMACOutputLength")?;
+    let bits = text
         .trim()
         .parse::<usize>()
         .map_err(|_| ParseError::InvalidStructure("invalid HMACOutputLength".into()))?;
@@ -589,7 +593,13 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
     ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
 
     let mut sources = Vec::new();
-    for child in element_children(key_info_node) {
+    let mut x509_total_binary_len = 0usize;
+    for (index, child) in element_children(key_info_node).enumerate() {
+        if index >= MAX_KEY_INFO_CHILD_COUNT {
+            return Err(ParseError::InvalidStructure(
+                "KeyInfo contains too many child elements".into(),
+            ));
+        }
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "KeyName") => {
                 ensure_no_element_children(child, "KeyName")?;
@@ -602,7 +612,7 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
                 sources.push(KeyInfoSource::KeyValue(key_value));
             }
             (Some(XMLDSIG_NS), "X509Data") => {
-                let x509 = parse_x509_data_dispatch(child)?;
+                let x509 = parse_x509_data_dispatch_with_budget(child, &mut x509_total_binary_len)?;
                 sources.push(KeyInfoSource::X509Data(x509));
             }
             (Some(XMLDSIG_NS), "RetrievalMethod") => {
@@ -676,7 +686,10 @@ fn parse_retrieval_method_transforms(
             "unsupported RetrievalMethod transform chain".into(),
         ));
     }
-    let expression = xpath.text().unwrap_or_default().trim();
+    ensure_no_element_children(xpath, "XPath")?;
+    let expression =
+        collect_text_content_bounded(xpath, MAX_RETRIEVAL_XPATH_TEXT_LEN, "RetrievalMethod XPath")?;
+    let expression = expression.trim();
     let selects_x509_data = expression
         .strip_prefix("ancestor-or-self::")
         .and_then(|step| step.split_once(':'))
@@ -688,8 +701,7 @@ fn parse_retrieval_method_transforms(
             "unsupported RetrievalMethod XPath selection".into(),
         ));
     }
-    ensure_no_element_children(xpath, "XPath")?;
-    Ok(RetrievalMethodTransforms::X509DataAncestor)
+    Ok(RetrievalMethodTransforms::X509DataNodeSetFilter)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1029,19 +1041,21 @@ fn decode_crypto_binary(
     Ok(value)
 }
 
-pub(crate) fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
+pub(crate) fn parse_x509_data_dispatch_with_budget(
+    node: Node,
+    total_binary_len: &mut usize,
+) -> Result<X509DataInfo, ParseError> {
     verify_ds_element(node, "X509Data")?;
     ensure_no_non_whitespace_text(node, "X509Data")?;
 
     let mut info = X509DataInfo::default();
-    let mut total_binary_len = 0usize;
     for child in element_children(node) {
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "X509Certificate") => {
                 ensure_no_element_children(child, "X509Certificate")?;
                 ensure_x509_data_entry_budget(&info)?;
                 let cert = decode_x509_base64(child, "X509Certificate")?;
-                add_x509_data_usage(&mut total_binary_len, cert.len())?;
+                add_x509_data_usage(total_binary_len, cert.len())?;
                 let parsed_cert = parse_x509_certificate(cert.as_slice())?;
                 info.parsed_certificates.push(parsed_cert);
                 info.certificates.push(cert);
@@ -1065,14 +1079,14 @@ pub(crate) fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, Parse
                 ensure_no_element_children(child, "X509SKI")?;
                 ensure_x509_data_entry_budget(&info)?;
                 let ski = decode_x509_base64(child, "X509SKI")?;
-                add_x509_data_usage(&mut total_binary_len, ski.len())?;
+                add_x509_data_usage(total_binary_len, ski.len())?;
                 info.skis.push(ski);
             }
             (Some(XMLDSIG_NS), "X509CRL") => {
                 ensure_no_element_children(child, "X509CRL")?;
                 ensure_x509_data_entry_budget(&info)?;
                 let crl = decode_x509_base64(child, "X509CRL")?;
-                add_x509_data_usage(&mut total_binary_len, crl.len())?;
+                add_x509_data_usage(total_binary_len, crl.len())?;
                 info.crls.push(crl);
             }
             (Some(XMLDSIG11_NS), "X509Digest") => {
@@ -1080,7 +1094,7 @@ pub(crate) fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, Parse
                 ensure_x509_data_entry_budget(&info)?;
                 let algorithm = required_algorithm_attr(child, "X509Digest")?;
                 let digest = decode_x509_base64(child, "X509Digest")?;
-                add_x509_data_usage(&mut total_binary_len, digest.len())?;
+                add_x509_data_usage(total_binary_len, digest.len())?;
                 info.digests.push((algorithm.to_string(), digest));
             }
             (Some(XMLDSIG_NS), child_name) | (Some(XMLDSIG11_NS), child_name) => {
@@ -2952,7 +2966,7 @@ BA== </Modulus>
             [KeyInfoSource::RetrievalMethod {
                 uri,
                 resource_type: Some(resource_type),
-                transforms: RetrievalMethodTransforms::X509DataAncestor,
+                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter,
             }] if uri == "#keys"
                 && resource_type == "http://www.w3.org/2000/09/xmldsig#X509Data"
         ));
@@ -2975,9 +2989,33 @@ BA== </Modulus>
                 .sources
                 .as_slice(),
             [KeyInfoSource::RetrievalMethod {
-                transforms: RetrievalMethodTransforms::X509DataAncestor,
+                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter,
                 ..
             }]
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_reads_complete_retrieval_xpath_text() {
+        // XML comments split character data into multiple text nodes; all chunks
+        // still belong to the XPath parameter's string-value.
+        let valid = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+          <RetrievalMethod Type="http://www.w3.org/2000/09/xmldsig#X509Data" URI="#keys">
+            <Transforms><Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+              <XPath xmlns:ds="http://www.w3.org/2000/09/xmldsig#">ancestor-or-self::ds:X509<!-- split -->Data</XPath>
+            </Transform></Transforms>
+          </RetrievalMethod>
+        </KeyInfo>"##;
+        let document = Document::parse(valid).unwrap();
+        assert!(parse_key_info(document.root_element()).is_ok());
+
+        let unsupported =
+            valid.replace("X509<!-- split -->Data", "X509Data<!-- split -->[false()]");
+        let document = Document::parse(&unsupported).unwrap();
+        assert!(matches!(
+            parse_key_info(document.root_element()),
+            Err(ParseError::InvalidStructure(reason))
+                if reason == "unsupported RetrievalMethod XPath selection"
         ));
     }
 
@@ -3027,6 +3065,23 @@ BA== </Modulus>
         assert!(matches!(
             parse_key_info(doc.root_element()),
             Err(ParseError::InvalidStructure(_))
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_excessive_child_sources() {
+        // KeyInfo extensions are lax, but their parse work remains bounded.
+        let children = (0..=64)
+            .map(|index| format!(r#"<extension xmlns="urn:test" index="{index}"/>"#))
+            .collect::<String>();
+        let xml =
+            format!(r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">{children}</KeyInfo>"#);
+        let document = Document::parse(&xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(document.root_element()),
+            Err(ParseError::InvalidStructure(reason))
+                if reason == "KeyInfo contains too many child elements"
         ));
     }
 
@@ -3120,6 +3175,36 @@ BA== </Modulus>
     }
 
     // ── parse_signed_info: happy path ────────────────────────────────
+
+    #[test]
+    fn parse_hmac_output_length_reads_all_text_nodes() {
+        // A comment may split valid simple content without changing its value.
+        let xml = r#"<SignatureMethod xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <HMACOutputLength>8<!-- split -->0</HMACOutputLength>
+        </SignatureMethod>"#;
+        let document = Document::parse(xml).unwrap();
+
+        assert_eq!(
+            parse_hmac_output_length(document.root_element(), SignatureAlgorithm::HmacSha1)
+                .unwrap(),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn parse_hmac_output_length_rejects_hidden_suffix_text() {
+        // Reading only the first text node would misinterpret 800 bits as 80.
+        let xml = r#"<SignatureMethod xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <HMACOutputLength>80<!-- split -->0</HMACOutputLength>
+        </SignatureMethod>"#;
+        let document = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_hmac_output_length(document.root_element(), SignatureAlgorithm::HmacSha1),
+            Err(ParseError::InvalidStructure(reason))
+                if reason == "HMACOutputLength must be a byte-aligned value from 80 through 160"
+        ));
+    }
 
     #[test]
     fn parse_signed_info_rsa_sha256_with_reference() {
