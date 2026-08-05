@@ -28,6 +28,7 @@ use super::{
 #[derive(Debug, Clone)]
 pub struct HmacSha1VerificationKey {
     secret: Vec<u8>,
+    output_len: usize,
 }
 
 impl HmacSha1VerificationKey {
@@ -37,7 +38,22 @@ impl HmacSha1VerificationKey {
         if secret.is_empty() {
             return Err(KeyResolutionError::InvalidPublicKey);
         }
-        Ok(Self { secret })
+        Ok(Self {
+            secret,
+            output_len: 20,
+        })
+    }
+
+    /// Bind this key to an XMLDSig HMAC output length in bits.
+    pub fn with_output_length_bits(
+        mut self,
+        output_length_bits: u16,
+    ) -> Result<Self, KeyResolutionError> {
+        if !(80..=160).contains(&output_length_bits) || !output_length_bits.is_multiple_of(8) {
+            return Err(KeyResolutionError::InvalidHmacOutputLength);
+        }
+        self.output_len = usize::from(output_length_bits / 8);
+        Ok(self)
     }
 }
 
@@ -51,17 +67,14 @@ impl VerifyingKey for HmacSha1VerificationKey {
         if algorithm != SignatureAlgorithm::HmacSha1 {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
-        if !(10..=20).contains(&signature_value.len()) {
+        if signature_value.len() != self.output_len {
             return Ok(false);
         }
         let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(&self.secret)
             .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
         mac.update(signed_data);
         let expected = mac.finalize().into_bytes();
-        Ok(
-            subtle::ConstantTimeEq::ct_eq(&expected[..signature_value.len()], signature_value)
-                .into(),
-        )
+        Ok(subtle::ConstantTimeEq::ct_eq(&expected[..self.output_len], signature_value).into())
     }
 }
 
@@ -158,6 +171,9 @@ pub enum KeyResolutionError {
     /// Configured or embedded public key DER could not be parsed completely.
     #[error("invalid public key DER")]
     InvalidPublicKey,
+    /// HMAC-SHA1 output length is outside XMLDSig's byte-aligned 80-160 bit range.
+    #[error("HMAC-SHA1 output length must be byte-aligned and between 80 and 160 bits")]
+    InvalidHmacOutputLength,
     /// More than one configured certificate satisfies all X.509 selectors.
     #[error("X.509 lookup selectors match multiple configured certificates")]
     AmbiguousCertificate,
@@ -253,6 +269,7 @@ impl DefaultKeyResolver {
                     certificates: vec![certificate.clone()],
                     parsed_certificates: vec![parsed],
                     certificate_chain: vec![0],
+                    crls: info.crls.clone(),
                     ..X509DataInfo::default()
                 };
                 // Validate the selected certificate's own policy before
@@ -459,15 +476,6 @@ impl KeyResolver for DefaultKeyResolver {
                     })
                     .transpose()?,
                 KeyInfoSource::KeyValue(key_value) => {
-                    if self.config.allow_legacy_rsa_sha1
-                        && algorithm == SignatureAlgorithm::RsaSha1
-                        && let KeyValueInfo::Rsa { modulus, exponent } = key_value
-                    {
-                        let public_key_bytes = rsa_key_value_to_spki_der(modulus, exponent)?;
-                        return Ok(Some(Box::new(LegacyRsaSha1VerificationKey {
-                            public_key_bytes,
-                        })));
-                    }
                     match Self::resolve_key_value(key_value, algorithm) {
                         Ok(resolved) => resolved,
                         Err(error) if ec_key_value_error_allows_fallback(key_value, &error) => {
@@ -480,6 +488,11 @@ impl KeyResolver for DefaultKeyResolver {
                 KeyInfoSource::RetrievalMethod { .. } => None,
             };
             if let Some(key) = resolved {
+                if self.config.allow_legacy_rsa_sha1 && algorithm == SignatureAlgorithm::RsaSha1 {
+                    return Ok(Some(Box::new(LegacyRsaSha1VerificationKey {
+                        public_key_bytes: key.public_key_bytes,
+                    })));
+                }
                 return Ok(Some(Box::new(key)));
             }
         }
@@ -687,6 +700,14 @@ mod tests {
         pem.contents
     }
 
+    fn crl_der(pem_text: &str) -> Vec<u8> {
+        let (rest, pem) =
+            x509_parser::pem::parse_x509_pem(pem_text.as_bytes()).expect("fixture CRL is PEM");
+        assert!(rest.iter().all(|byte| byte.is_ascii_whitespace()));
+        assert_eq!(pem.label, "X509 CRL");
+        pem.contents
+    }
+
     #[test]
     fn defaults_match_key_resolution_policy() {
         // Defaults must remain compatible with xmlsec1's depth and opt-in trust policy.
@@ -715,6 +736,37 @@ mod tests {
             Err(DsigError::KeyResolution(
                 KeyResolutionError::AlgorithmMismatch
             ))
+        ));
+    }
+
+    #[test]
+    fn hmac_key_enforces_its_bound_output_length() {
+        let full = HmacSha1VerificationKey::new(b"secret".to_vec())
+            .expect("the fixture HMAC secret is non-empty");
+        let truncated = HmacSha1VerificationKey::new(b"secret".to_vec())
+            .expect("the fixture HMAC secret is non-empty")
+            .with_output_length_bits(80)
+            .expect("80 bits is a valid HMAC-SHA1 output length");
+        let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(b"secret")
+            .expect("HMAC accepts an arbitrary non-empty secret");
+        mac.update(b"data");
+        let expected = mac.finalize().into_bytes();
+
+        assert!(
+            !full
+                .verify(SignatureAlgorithm::HmacSha1, b"data", &expected[..10])
+                .expect("the key and algorithm match")
+        );
+        assert!(
+            truncated
+                .verify(SignatureAlgorithm::HmacSha1, b"data", &expected[..10])
+                .expect("the key and algorithm match")
+        );
+        assert!(matches!(
+            HmacSha1VerificationKey::new(b"secret".to_vec())
+                .expect("the fixture HMAC secret is non-empty")
+                .with_output_length_bits(79),
+            Err(KeyResolutionError::InvalidHmacOutputLength)
         ));
     }
 
@@ -832,6 +884,45 @@ mod tests {
             .expect("selector-resolved leaf should chain to its configured issuer");
 
         assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn selector_resolved_certificate_preserves_supplied_crls() {
+        let selector = "<KeyInfo><X509Data><X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName><X509CRL>CRL_PLACEHOLDER</X509CRL></X509Data></KeyInfo>";
+        let crl = crl_der(include_str!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-cert-revoked-crl.pem"
+        ));
+        let xml = replace_unprefixed_key_info(
+            RSA_KEY_VALUE_SIGNATURE,
+            &selector.replace("CRL_PLACEHOLDER", &STANDARD.encode(crl)),
+        );
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![
+                certificate_der(include_str!(
+                    "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+                )),
+                certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
+                certificate_der(include_str!("../../tests/fixtures/keys/cacert.pem")),
+            ],
+            verify_chains: true,
+            check_crls: true,
+            verification_time: Some(
+                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_773_964_800),
+            ),
+            max_chain_depth: 3,
+            ..KeyResolverConfig::default()
+        });
+
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .expect_err("selector lookup must retain and enforce the supplied CRL");
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::Chain(
+                super::super::X509ChainError::Revoked(0)
+            ))
+        ));
     }
 
     #[test]
@@ -1029,6 +1120,57 @@ mod tests {
             error,
             DsigError::Crypto(super::super::SignatureVerificationError::InvalidKeyDer)
         ));
+    }
+
+    #[test]
+    fn legacy_rsa_sha1_policy_applies_to_every_resolved_key_source() {
+        let certificate =
+            include_bytes!("../../tests/fixtures/xmldsig/phaos-xmldsig-three/certs/rsa-cert.der")
+                .to_vec();
+        let (_, parsed_certificate) = X509Certificate::from_der(&certificate)
+            .expect("the Phaos fixture is a DER certificate");
+        let public_key = parsed_certificate.public_key().raw.to_vec();
+        let certificate_metadata = parse_x509_certificate(&certificate)
+            .expect("the Phaos fixture has supported X.509 metadata");
+        let named_key = VerificationKey {
+            algorithm: SignatureAlgorithm::RsaSha1,
+            public_key_bytes: public_key.clone(),
+            certificate_der: None,
+            name: Some("legacy".into()),
+        };
+        let key_infos = [
+            KeyInfo {
+                sources: vec![KeyInfoSource::KeyName("legacy".into())],
+            },
+            KeyInfo {
+                sources: vec![KeyInfoSource::DerEncodedKeyValue(public_key)],
+            },
+            KeyInfo {
+                sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                    certificates: vec![certificate],
+                    parsed_certificates: vec![certificate_metadata],
+                    certificate_chain: vec![0],
+                    ..X509DataInfo::default()
+                })],
+            },
+        ];
+        let mut config = KeyResolverConfig {
+            allow_legacy_rsa_sha1: true,
+            ..KeyResolverConfig::default()
+        };
+        config.named_keys.insert("legacy".into(), named_key);
+        let resolver = DefaultKeyResolver::new(config);
+
+        for key_info in &key_infos {
+            let key = resolver
+                .resolve(Some(key_info), SignatureAlgorithm::RsaSha1)
+                .expect("the key source is valid")
+                .expect("each source must resolve under the legacy policy");
+            assert!(
+                !key.verify(SignatureAlgorithm::RsaSha1, b"data", &[0; 128])
+                    .expect("the legacy RSA key is structurally valid")
+            );
+        }
     }
 
     #[test]

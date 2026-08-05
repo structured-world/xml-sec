@@ -13,8 +13,8 @@ use xml_sec::xmldsig::{
     UriTypeSet, VerificationKey, VerifyContext, X509ChainError, XPathHereSemantics,
 };
 
-const MERLIN: &str = "donors/xmlsec/tests/merlin-xmldsig-twenty-three";
-const DONOR_EXTERNAL: &str = "donors/xmlsec/tests/external-data";
+const MERLIN: &str = "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three";
+const DONOR_EXTERNAL: &str = "tests/fixtures/xmldsig/external-data";
 const VERIFY_2005: u64 = 1_104_580_800;
 
 fn root() -> PathBuf {
@@ -112,12 +112,22 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
     );
 
     let hmac = HmacSha1VerificationKey::new(b"secret".to_vec()).expect("valid HMAC key");
-    for name in [
+    assert_valid(
         "signature-enveloping-hmac-sha1",
+        VerifyContext::new()
+            .key(&hmac)
+            .verify(&xml("signature-enveloping-hmac-sha1")),
+    );
+    let truncated_hmac = HmacSha1VerificationKey::new(b"secret".to_vec())
+        .expect("valid HMAC key")
+        .with_output_length_bits(80)
+        .expect("valid XMLDSig truncation");
+    assert_valid(
         "signature-enveloping-hmac-sha1-40",
-    ] {
-        assert_valid(name, VerifyContext::new().key(&hmac).verify(&xml(name)));
-    }
+        VerifyContext::new()
+            .key(&truncated_hmac)
+            .verify(&xml("signature-enveloping-hmac-sha1-40")),
+    );
 
     let resources = external_resources();
     for name in ["signature-external-dsa", "signature-external-b64-dsa"] {
@@ -320,26 +330,30 @@ fn bounds_external_resources_before_dereference() {
     let default = DefaultKeyResolver::default();
     let mut oversized = external_resources();
     oversized.insert("urn:oversized".into(), vec![0; 8 * 1024 * 1024 + 1]);
-    assert!(
+    assert!(matches!(
         VerifyContext::new()
             .key_resolver(&default)
             .allowed_uri_types(UriTypeSet::ALL)
             .external_resources(&oversized)
-            .verify(&xml("signature-external-dsa"))
-            .is_err()
-    );
+            .verify(&xml("signature-external-dsa")),
+        Err(DsigError::InvalidStructure {
+            reason: "external resource exceeds maximum allowed length"
+        })
+    ));
 
-    let aggregate = (0..5)
-        .map(|index| (format!("urn:aggregate:{index}"), vec![0; 7 * 1024 * 1024]))
-        .collect();
-    assert!(
+    let mut aggregate = external_resources();
+    aggregate
+        .extend((0..5).map(|index| (format!("urn:aggregate:{index}"), vec![0; 7 * 1024 * 1024])));
+    assert!(matches!(
         VerifyContext::new()
             .key_resolver(&default)
             .allowed_uri_types(UriTypeSet::ALL)
             .external_resources(&aggregate)
-            .verify(&xml("signature-external-dsa"))
-            .is_err()
-    );
+            .verify(&xml("signature-external-dsa")),
+        Err(DsigError::InvalidStructure {
+            reason: "external resources exceed maximum aggregate length"
+        })
+    ));
 }
 
 #[test]
@@ -405,12 +419,21 @@ fn rejects_missing_ambiguous_and_weak_key_resolution() {
         "<Object Id=\"object-4\"/><Object Id=\"object-4\">",
         1,
     );
+    let ambiguous_error = VerifyContext::new()
+        .key_resolver(&DefaultKeyResolver::default())
+        .allow_internal_dtd(true)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .external_resources(&resources)
+        .verify(&ambiguous)
+        .expect_err("duplicate ID must fail before key resolution");
     assert!(
-        VerifyContext::new()
-            .key_resolver(&DefaultKeyResolver::default())
-            .allow_internal_dtd(true)
-            .verify(&ambiguous)
-            .is_err()
+        matches!(
+            ambiguous_error,
+            DsigError::InvalidStructure {
+                reason: "X509Data RetrievalMethod target is missing or ambiguous"
+            }
+        ),
+        "unexpected duplicate-ID error: {ambiguous_error:?}"
     );
 
     let weak = VerifyContext::new()
@@ -425,27 +448,29 @@ fn rejects_missing_ambiguous_and_weak_key_resolution() {
 #[test]
 fn rejects_dtd_and_unsupported_retrieval_defaults() {
     // Internal DTD parsing and RetrievalMethod transform compatibility require exact opt-ins.
-    assert!(
+    assert!(matches!(
         VerifyContext::new()
             .key_resolver(&DefaultKeyResolver::default())
-            .verify(&xml("signature"))
-            .is_err()
-    );
+            .verify(&xml("signature")),
+        Err(DsigError::XmlParse(_))
+    ));
 
     let unsupported = xml("signature").replacen(
         "ancestor-or-self::dsig:X509Data",
         "descendant-or-self::dsig:X509Data",
         1,
     );
-    assert!(
+    let resources = external_resources();
+    assert!(matches!(
         VerifyContext::new()
             .key_resolver(&DefaultKeyResolver::default())
             .allow_internal_dtd(true)
-            .verify(&unsupported)
-            .is_err()
-    );
+            .allowed_uri_types(UriTypeSet::ALL)
+            .external_resources(&resources)
+            .verify(&unsupported),
+        Err(DsigError::ParseKeyInfo(_))
+    ));
 
-    let resources = external_resources();
     let retrieval = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![cert("ca.pem"), cert("balor.pem")],
         verify_chains: true,

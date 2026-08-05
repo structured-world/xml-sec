@@ -493,23 +493,18 @@ pub(crate) fn parse_reference_with_xpath_budget(
     // Optional <Transforms>
     let mut transforms = Vec::new();
     let mut transform_error = None;
-    let mut next = children.next().ok_or(ParseError::MissingElement {
-        element: "DigestMethod",
-    })?;
+    let (transforms_node, digest_method_node) =
+        reference_transforms_and_digest_method(&mut children)?;
 
-    if next.tag_name().name() == "Transforms" && next.tag_name().namespace() == Some(XMLDSIG_NS) {
-        match transforms::parse_transforms_with_budget(next, xpath_budget) {
+    if let Some(transforms_node) = transforms_node {
+        match transforms::parse_transforms_with_budget(transforms_node, xpath_budget) {
             Ok(parsed) => transforms = parsed,
             Err(error) => transform_error = Some(error),
         }
-        next = children.next().ok_or(ParseError::MissingElement {
-            element: "DigestMethod",
-        })?;
     }
 
     // Required <DigestMethod>
-    verify_ds_element(next, "DigestMethod")?;
-    let digest_uri = required_algorithm_attr(next, "DigestMethod")?;
+    let digest_uri = required_algorithm_attr(digest_method_node, "DigestMethod")?;
     let digest_method =
         DigestAlgorithm::from_uri(digest_uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
             uri: digest_uri.to_string(),
@@ -552,19 +547,29 @@ pub(crate) fn reference_digest_method(
 ) -> Result<DigestAlgorithm, ParseError> {
     verify_ds_element(reference_node, "Reference")?;
     let mut children = element_children(reference_node);
-    let mut next = children.next().ok_or(ParseError::MissingElement {
-        element: "DigestMethod",
-    })?;
-    if next.tag_name().namespace() == Some(XMLDSIG_NS) && next.tag_name().name() == "Transforms" {
-        next = children.next().ok_or(ParseError::MissingElement {
-            element: "DigestMethod",
-        })?;
-    }
-    verify_ds_element(next, "DigestMethod")?;
-    let uri = required_algorithm_attr(next, "DigestMethod")?;
+    let (_, digest_method_node) = reference_transforms_and_digest_method(&mut children)?;
+    let uri = required_algorithm_attr(digest_method_node, "DigestMethod")?;
     DigestAlgorithm::from_uri(uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
         uri: uri.to_owned(),
     })
+}
+
+fn reference_transforms_and_digest_method<'a, 'input>(
+    children: &mut impl Iterator<Item = Node<'a, 'input>>,
+) -> Result<(Option<Node<'a, 'input>>, Node<'a, 'input>), ParseError> {
+    let first = children.next().ok_or(ParseError::MissingElement {
+        element: "DigestMethod",
+    })?;
+    let transforms_node = is_ds_element(first, "Transforms").then_some(first);
+    let digest_method_node = if transforms_node.is_some() {
+        children.next().ok_or(ParseError::MissingElement {
+            element: "DigestMethod",
+        })?
+    } else {
+        first
+    };
+    verify_ds_element(digest_method_node, "DigestMethod")?;
+    Ok((transforms_node, digest_method_node))
 }
 
 /// Parse `<ds:KeyInfo>` and dispatch supported child sources.
@@ -666,9 +671,19 @@ fn parse_retrieval_method_transforms(
     if parameters.next().is_some()
         || xpath.tag_name().namespace() != Some(XMLDSIG_NS)
         || xpath.tag_name().name() != "XPath"
-        || xpath.text().unwrap_or_default().trim() != "ancestor-or-self::dsig:X509Data"
-        || xpath.lookup_namespace_uri(Some("dsig")) != Some(XMLDSIG_NS)
     {
+        return Err(ParseError::InvalidStructure(
+            "unsupported RetrievalMethod transform chain".into(),
+        ));
+    }
+    let expression = xpath.text().unwrap_or_default().trim();
+    let selects_x509_data = expression
+        .strip_prefix("ancestor-or-self::")
+        .and_then(|step| step.split_once(':'))
+        .is_some_and(|(prefix, local)| {
+            local == "X509Data" && xpath.lookup_namespace_uri(Some(prefix)) == Some(XMLDSIG_NS)
+        });
+    if !selects_x509_data {
         return Err(ParseError::InvalidStructure(
             "unsupported RetrievalMethod XPath selection".into(),
         ));
@@ -809,12 +824,38 @@ fn parse_dsa_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
     let q = next("Q")?;
     let g = next("G")?;
     let y = next("Y")?;
-    if children.next().is_some() {
+    let optional = children.collect::<Vec<_>>();
+    let valid_optional = match optional.as_slice() {
+        [] => true,
+        [j] => is_ds_element(*j, "J"),
+        [seed, counter] => is_ds_element(*seed, "Seed") && is_ds_element(*counter, "PgenCounter"),
+        [j, seed, counter] => {
+            is_ds_element(*j, "J")
+                && is_ds_element(*seed, "Seed")
+                && is_ds_element(*counter, "PgenCounter")
+        }
+        _ => false,
+    };
+    if !valid_optional {
         return Err(ParseError::InvalidStructure(
-            "DSAKeyValue supports exactly P, Q, G, and Y".into(),
+            "DSAKeyValue optional children must be J and/or a Seed/PgenCounter pair".into(),
         ));
     }
+    for child in optional {
+        let name = match child.tag_name().name() {
+            "J" => "J",
+            "Seed" => "Seed",
+            "PgenCounter" => "PgenCounter",
+            _ => unreachable!("optional DSA child shape was validated above"),
+        };
+        ensure_no_element_children(child, name)?;
+        decode_crypto_binary(child, name, MAX_RSA_MODULUS_LEN)?;
+    }
     Ok(KeyValueInfo::Dsa { p, q, g, y })
+}
+
+fn is_ds_element(node: Node<'_, '_>, name: &str) -> bool {
+    node.tag_name().namespace() == Some(XMLDSIG_NS) && node.tag_name().name() == name
 }
 
 fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
@@ -2914,6 +2955,62 @@ BA== </Modulus>
                 transforms: RetrievalMethodTransforms::X509DataAncestor,
             }] if uri == "#keys"
                 && resource_type == "http://www.w3.org/2000/09/xmldsig#X509Data"
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_accepts_namespace_equivalent_retrieval_xpath_prefix() {
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+          <RetrievalMethod Type="http://www.w3.org/2000/09/xmldsig#X509Data" URI="#keys">
+            <Transforms><Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+              <XPath xmlns:ds="http://www.w3.org/2000/09/xmldsig#">ancestor-or-self::ds:X509Data</XPath>
+            </Transform></Transforms>
+          </RetrievalMethod>
+        </KeyInfo>"##;
+        let doc = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element())
+                .unwrap()
+                .sources
+                .as_slice(),
+            [KeyInfoSource::RetrievalMethod {
+                transforms: RetrievalMethodTransforms::X509DataAncestor,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn parse_dsa_key_value_accepts_schema_optional_parameters_and_rejects_half_pair() {
+        let key_info = |optional: &str| {
+            format!(
+                r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyValue><DSAKeyValue>
+                <P>AQ==</P><Q>AQ==</Q><G>AQ==</G><Y>AQ==</Y>{optional}
+                </DSAKeyValue></KeyValue></KeyInfo>"#
+            )
+        };
+        for optional in [
+            "<J>AQ==</J>",
+            "<Seed>AQ==</Seed><PgenCounter>AQ==</PgenCounter>",
+            "<J>AQ==</J><Seed>AQ==</Seed><PgenCounter>AQ==</PgenCounter>",
+        ] {
+            let xml = key_info(optional);
+            let doc = Document::parse(&xml).unwrap();
+            assert!(matches!(
+                parse_key_info(doc.root_element())
+                    .unwrap()
+                    .sources
+                    .as_slice(),
+                [KeyInfoSource::KeyValue(KeyValueInfo::Dsa { .. })]
+            ));
+        }
+
+        let xml = key_info("<Seed>AQ==</Seed>");
+        let doc = Document::parse(&xml).unwrap();
+        assert!(matches!(
+            parse_key_info(doc.root_element()),
+            Err(ParseError::InvalidStructure(_))
         ));
     }
 

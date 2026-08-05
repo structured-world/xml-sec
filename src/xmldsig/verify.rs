@@ -785,6 +785,7 @@ fn verify_signature_with_context(
         &signed_info.references,
         ctx.allowed_uri_types,
         ctx.allowed_transform_uris(),
+        ctx.external_resources,
     )?;
 
     if let Some(resources) = ctx.external_resources {
@@ -991,17 +992,30 @@ fn materialize_retrieval_methods(
                     reason: "X509Data RetrievalMethod target is missing or ambiguous",
                 },
             )?;
-            let mut selected = target.descendants().filter(|candidate| {
+            let containing = target.ancestors().find(|candidate| {
                 candidate.is_element()
                     && candidate.tag_name().namespace() == Some(XMLDSIG_NS)
                     && candidate.tag_name().name() == "X509Data"
             });
-            let node =
-                selected
-                    .next()
-                    .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+            let mut selected = target.descendants().filter(|candidate| {
+                candidate.is_element()
+                    && candidate.tag_name().namespace() == Some(XMLDSIG_NS)
+                    && candidate.tag_name().name() == "X509Data"
+                    && Some(*candidate) != containing
+            });
+            let node = match (containing, selected.next()) {
+                (Some(node), None) | (None, Some(node)) => node,
+                (None, None) => {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
                         reason: "X509Data RetrievalMethod selected no X509Data element",
-                    })?;
+                    });
+                }
+                (Some(_), Some(_)) => {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "X509Data RetrievalMethod selected multiple X509Data elements",
+                    });
+                }
+            };
             if selected.next().is_some() {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "X509Data RetrievalMethod selected multiple X509Data elements",
@@ -1041,6 +1055,7 @@ fn process_manifest_references(
             std::slice::from_ref(reference),
             ctx.allowed_uri_types,
             ctx.allowed_transform_uris(),
+            ctx.external_resources,
         ) {
             Ok(()) => {}
             Err(
@@ -1165,7 +1180,7 @@ fn parse_manifest_references(
                         reason: "Manifest must contain only ds:Reference element children",
                     });
                 }
-                if references.len() == MAX_REFERENCES_PER_SIGNATURE {
+                if references.len() + invalid.len() == MAX_REFERENCES_PER_SIGNATURE {
                     return Err(SignatureVerificationPipelineError::InvalidStructure {
                         reason: "signed Manifests exceed the per-signature Reference limit",
                     });
@@ -1290,6 +1305,7 @@ fn enforce_reference_policies(
     references: &[Reference],
     allowed_uri_types: UriTypeSet,
     allowed_transforms: Option<&HashSet<String>>,
+    external_resources: Option<&HashMap<String, Vec<u8>>>,
 ) -> Result<(), SignatureVerificationPipelineError> {
     for reference in references {
         let uri = reference
@@ -1314,9 +1330,13 @@ fn enforce_reference_policies(
                 }
             }
 
-            let produces_binary = reference.transforms.last().is_some_and(|transform| {
-                matches!(transform, Transform::C14n(_) | Transform::Base64Decode)
-            });
+            let dereferences_to_binary = !uri.is_empty()
+                && !uri.starts_with('#')
+                && external_resources.is_some_and(|resources| resources.contains_key(uri));
+            let produces_binary = dereferences_to_binary
+                || reference.transforms.last().is_some_and(|transform| {
+                    matches!(transform, Transform::C14n(_) | Transform::Base64Decode)
+                });
             if !produces_binary && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI) {
                 return Err(SignatureVerificationPipelineError::DisallowedTransform {
                     algorithm: DEFAULT_IMPLICIT_C14N_URI.to_owned(),
@@ -2374,6 +2394,71 @@ mod tests {
     }
 
     #[test]
+    fn manifest_reference_limit_counts_unsupported_entries() {
+        let references = (0..=MAX_REFERENCES_PER_SIGNATURE)
+            .map(|index| {
+                format!(
+                    r##"<ds:Reference URI="#target-{index}"><ds:Transforms><ds:Transform Algorithm="urn:unsupported"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue></ds:Reference>"##
+                )
+            })
+            .collect::<String>();
+        let xml = format!(
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:Object Id="signed"><ds:Manifest>{references}</ds:Manifest></ds:Object></ds:Signature>"#
+        );
+        let document = Document::parse(&xml).unwrap();
+        let signature = document.root_element();
+        let object = signature.children().find(|node| node.is_element()).unwrap();
+        let authenticated = HashSet::from([object.id()]);
+
+        let error = match parse_manifest_references(
+            signature,
+            &authenticated,
+            &mut XPathSignatureParseBudget::default(),
+        ) {
+            Ok(_) => panic!("unsupported references must consume the same aggregate limit"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "signed Manifests exceed the per-signature Reference limit"
+            }
+        ));
+    }
+
+    #[test]
+    fn retrieval_method_materializes_containing_or_descendant_x509_data() {
+        for target_xml in [
+            r#"<ds:X509Data><ds:X509SubjectName Id="target">CN=leaf</ds:X509SubjectName></ds:X509Data>"#,
+            r#"<holder Id="target"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder>"#,
+        ] {
+            let xml = format!(
+                r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo><ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath></ds:Transform></ds:Transforms></ds:RetrievalMethod></ds:KeyInfo>{target_xml}</root>"##
+            );
+            let document = Document::parse(&xml).unwrap();
+            let key_info_node = document
+                .descendants()
+                .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+                .unwrap();
+            let mut key_info = parse_key_info(key_info_node).unwrap();
+            let resolver = UriReferenceResolver::new(&document);
+
+            materialize_retrieval_methods(
+                &mut key_info,
+                &resolver,
+                None,
+                UriTypeSet::SAME_DOCUMENT,
+            )
+            .expect("ancestor-or-self selection must accept either relation");
+            assert!(key_info.sources.iter().any(|source| matches!(
+                source,
+                super::super::parse::KeyInfoSource::X509Data(info)
+                    if info.subject_names == ["CN=leaf"]
+            )));
+        }
+    }
+
+    #[test]
     fn verify_context_does_not_hide_malformed_digest_behind_unsupported_transform() {
         // A bad DigestValue remains a parse error even when its transform URI is unsupported.
         let broken_xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
@@ -2628,7 +2713,7 @@ mod tests {
             allow_external: false,
         };
 
-        let err = enforce_reference_policies(&references, uri_types, None)
+        let err = enforce_reference_policies(&references, uri_types, None, None)
             .expect_err("missing URI must fail before allow_empty policy is evaluated");
         assert!(matches!(
             err,
@@ -2654,6 +2739,7 @@ mod tests {
                 std::slice::from_ref(&reference),
                 UriTypeSet::default(),
                 Some(&allowed),
+                None,
             )
             .expect("terminal binary output must not require implicit C14N");
         }
@@ -2668,6 +2754,7 @@ mod tests {
             std::slice::from_ref(&terminal_base64),
             UriTypeSet::default(),
             Some(&without_implicit_c14n),
+            None,
         )
         .expect("terminal Base64 output must not require implicit C14N");
 
@@ -2676,6 +2763,7 @@ mod tests {
             std::slice::from_ref(&no_transforms),
             UriTypeSet::default(),
             Some(&without_implicit_c14n),
+            None,
         )
         .expect_err("a node-set result must require allowlisted implicit C14N");
         assert!(matches!(
@@ -2683,6 +2771,16 @@ mod tests {
             SignatureVerificationPipelineError::DisallowedTransform { ref algorithm }
                 if algorithm == DEFAULT_IMPLICIT_C14N_URI
         ));
+
+        let external_resources = HashMap::from([("urn:payload".to_owned(), b"bytes".to_vec())]);
+        let detached = make_reference("urn:payload", vec![], DigestAlgorithm::Sha256, vec![0; 32]);
+        enforce_reference_policies(
+            std::slice::from_ref(&detached),
+            UriTypeSet::ALL,
+            Some(&without_implicit_c14n),
+            Some(&external_resources),
+        )
+        .expect("external octets without transforms must not require implicit C14N");
     }
 
     #[test]

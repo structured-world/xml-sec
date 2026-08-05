@@ -209,16 +209,42 @@ fn verify_certificate_signature(
     {
         return true;
     }
-    if certificate.signature_algorithm.algorithm.to_id_string() != "1.2.840.10040.4.3" {
+    verify_dsa_sha1_signature(
+        &certificate.signature_algorithm.algorithm.to_id_string(),
+        &certificate.signature_value.data,
+        certificate.tbs_certificate.as_ref(),
+        issuer.public_key().raw,
+    )
+}
+
+fn verify_crl_signature(crl: &CertificateRevocationList<'_>, issuer: &X509Certificate<'_>) -> bool {
+    if crl.verify_signature(issuer.public_key()).is_ok() {
+        return true;
+    }
+    verify_dsa_sha1_signature(
+        &crl.signature_algorithm.algorithm.to_id_string(),
+        &crl.signature_value.data,
+        crl.tbs_cert_list.as_ref(),
+        issuer.public_key().raw,
+    )
+}
+
+fn verify_dsa_sha1_signature(
+    algorithm_oid: &str,
+    signature_der: &[u8],
+    signed_data: &[u8],
+    issuer_spki_der: &[u8],
+) -> bool {
+    if algorithm_oid != "1.2.840.10040.4.3" {
         return false;
     }
-    let Ok(key) = dsa::VerifyingKey::from_public_key_der(issuer.public_key().raw) else {
+    let Ok(key) = dsa::VerifyingKey::from_public_key_der(issuer_spki_der) else {
         return false;
     };
-    let Ok(signature) = dsa::Signature::from_der(&certificate.signature_value.data) else {
+    let Ok(signature) = dsa::Signature::from_der(signature_der) else {
         return false;
     };
-    let digest = Sha1::digest(certificate.tbs_certificate.as_ref());
+    let digest = Sha1::digest(signed_data);
     key.verify_prehash(&digest, &signature).is_ok()
 }
 
@@ -349,7 +375,7 @@ fn verify_crls(
                 && crl
                     .next_update()
                     .is_none_or(|next| verification_time <= next);
-            if !time_valid || crl.verify_signature(issuer.public_key()).is_err() {
+            if !time_valid || !verify_crl_signature(crl, issuer) {
                 return Err(X509ChainError::InvalidCrl(*crl_index));
             }
             if crl.iter_revoked_certificates().any(|revoked| {
@@ -361,4 +387,35 @@ fn verify_crls(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xmldsig::{KeyInfoSource, parse::XMLDSIG_NS, parse_key_info};
+    use roxmltree::Document;
+
+    #[test]
+    fn dsa_sha1_crl_signature_uses_the_same_fallback_as_certificates() {
+        let xml = include_str!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt-crl.xml"
+        );
+        let document = Document::parse(xml).expect("the tracked Merlin document is valid XML");
+        let key_info_node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .expect("the Merlin document contains KeyInfo");
+        let key_info = parse_key_info(key_info_node).expect("the Merlin KeyInfo is valid");
+        let KeyInfoSource::X509Data(info) = &key_info.sources[0] else {
+            panic!("expected X509Data")
+        };
+        let (_, issuer) = X509Certificate::from_der(include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/ca.der"
+        ))
+        .expect("the tracked Merlin issuer is a DER certificate");
+        let (_, crl) = CertificateRevocationList::from_der(&info.crls[0])
+            .expect("the tracked Merlin CRL is valid DER");
+
+        assert!(verify_crl_signature(&crl, &issuer));
+    }
 }

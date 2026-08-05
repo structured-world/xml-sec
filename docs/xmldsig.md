@@ -1,7 +1,8 @@
 # XML Digital Signatures
 
 The `xmldsig` feature provides signing and verification pipelines for same-document XML
-signatures. It supports inclusive and exclusive canonicalization, enveloped signatures,
+signatures and detached references whose payloads the caller supplies. It supports inclusive and
+exclusive canonicalization, enveloped signatures,
 Base64, XPath 1.0, and XPath Filter 2.0 transforms, RSA PKCS#1 v1.5, ECDSA P-256/P-384,
 DSA-SHA1 and HMAC-SHA1 verification, embedded X.509 certificates, and configured key
 resolution.

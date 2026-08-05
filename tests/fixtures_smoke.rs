@@ -178,7 +178,7 @@ fn fixture_file_count_matches_expected() {
     let expected = [
         ("keys", 24),
         ("c14n", 41),
-        ("xmldsig", 81),
+        ("xmldsig", 127),
         ("saml", 2),
         ("xmlenc", 482),
     ];
@@ -190,6 +190,27 @@ fn fixture_file_count_matches_expected() {
             expected_count,
             "fixture corpus {corpus} changed; verify the change is intentional and update the expected count"
         );
+    }
+}
+
+#[test]
+fn merlin_xmldsig_snapshot_contains_complete_interop_inputs() {
+    // These files cover the distinct detached, HMAC, key-resolution, and CRL paths.
+    let required = [
+        "xmldsig/merlin-xmldsig-twenty-three/signature.xml",
+        "xmldsig/merlin-xmldsig-twenty-three/signature-external-dsa.xml",
+        "xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-hmac-sha1-40.xml",
+        "xmldsig/merlin-xmldsig-twenty-three/signature-retrievalmethod-rawx509crt.xml",
+        "xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt-crl.xml",
+        "xmldsig/merlin-xmldsig-twenty-three/certs/ca.pem",
+        "xmldsig/merlin-xmldsig-twenty-three/certs/balor.der",
+        "xmldsig/external-data/xml-stylesheet-2005",
+        "xmldsig/external-data/xml-stylesheet-2005.b64",
+    ];
+
+    for relative_path in required {
+        let path = fixtures_dir().join(relative_path);
+        assert!(path.is_file(), "missing Merlin fixture: {}", path.display());
     }
 }
 

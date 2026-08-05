@@ -221,11 +221,12 @@ pub fn verify_dsa_signature_spki(
     }
     let key = dsa::VerifyingKey::from_public_key_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    let signature = dsa::Signature::from_components(
+    let Some(signature) = dsa::Signature::from_components(
         crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[..20]),
         crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[20..]),
-    )
-    .ok_or(SignatureVerificationError::InvalidSignatureFormat)?;
+    ) else {
+        return Ok(false);
+    };
     let digest = Sha1::digest(signed_data);
     Ok(key.verify_prehash(&digest, &signature).is_ok())
 }
@@ -300,7 +301,7 @@ fn validate_rsa_public_key(
     algorithm: SignatureAlgorithm,
     minimum_modulus_bits: usize,
 ) -> Result<(), SignatureVerificationError> {
-    minimum_rsa_modulus_bits(algorithm)?;
+    ensure_rsa_signature_algorithm(algorithm)?;
     let modulus_start = rsa
         .modulus
         .iter()
@@ -331,14 +332,14 @@ fn validate_rsa_public_key(
     Ok(())
 }
 
-fn minimum_rsa_modulus_bits(
+fn ensure_rsa_signature_algorithm(
     algorithm: SignatureAlgorithm,
-) -> Result<usize, SignatureVerificationError> {
+) -> Result<(), SignatureVerificationError> {
     match algorithm {
         SignatureAlgorithm::RsaSha1
         | SignatureAlgorithm::RsaSha256
         | SignatureAlgorithm::RsaSha384
-        | SignatureAlgorithm::RsaSha512 => Ok(2048),
+        | SignatureAlgorithm::RsaSha512 => Ok(()),
         _ => Err(SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_string(),
         }),
@@ -692,12 +693,30 @@ mod tests {
             SignatureAlgorithm::EcdsaP256Sha256,
             SignatureAlgorithm::EcdsaP384Sha384,
         ] {
-            let err = minimum_rsa_modulus_bits(algorithm).unwrap_err();
+            let err = ensure_rsa_signature_algorithm(algorithm).unwrap_err();
             assert!(matches!(
                 err,
                 SignatureVerificationError::UnsupportedAlgorithm { .. }
             ));
         }
+    }
+
+    #[test]
+    fn malformed_dsa_components_are_verification_misses() {
+        let public_key = include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/lugh.der"
+        );
+        let signature = [0_u8; 40];
+
+        assert!(matches!(
+            verify_dsa_signature_spki(
+                SignatureAlgorithm::DsaSha1,
+                public_key,
+                b"signed",
+                &signature,
+            ),
+            Ok(false)
+        ));
     }
 
     #[test]

@@ -39,6 +39,9 @@ fixture_paths=("$@")
 if (( ${#fixture_paths[@]} == 0 )); then
   fixture_paths=(
     "xmldsig/aleksey-xmldsig-01/enveloping-rsa-x509chain.xml"
+    "xmldsig/merlin-xmldsig-twenty-three"
+    "xmldsig/external-data/xml-stylesheet-2005"
+    "xmldsig/external-data/xml-stylesheet-2005.b64"
     "xmlenc/aleksey-xmlenc-01/enc-aes128cbc-keyname.tmpl"
     "xmlenc/aleksey-xmlenc-01/enc-aes128gcm-keyname.tmpl"
     "xmlenc/aleksey-xmlenc-01/enc-aes256cbc-keyname.tmpl"
