@@ -1013,7 +1013,11 @@ fn decode_crypto_binary(
 
     let max_base64_len = max_decoded_len.div_ceil(3) * 4;
     let mut cleaned = String::with_capacity(max_base64_len);
-    for text in node.children().filter_map(|child| child.text()) {
+    for text in node
+        .children()
+        .filter(|child| child.is_text())
+        .filter_map(|child| child.text())
+    {
         normalize_xml_base64_text_with_limit(text, &mut cleaned, max_base64_len).map_err(
             |err| match err {
                 XmlBase64NormalizeLimitedError::InvalidWhitespace(err) => {
@@ -3167,6 +3171,43 @@ BA== </Modulus>
                 Err(ParseError::InvalidStructure(_))
             ));
         }
+    }
+
+    #[test]
+    fn parse_dsa_crypto_binary_ignores_comment_nodes() {
+        // XML comments split simple content without contributing to its string value.
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue><DSAKeyValue><Y>AQ<!-- split -->ID</Y></DSAKeyValue></KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element())
+                .unwrap()
+                .sources
+                .as_slice(),
+            [KeyInfoSource::KeyValue(KeyValueInfo::Dsa { y, .. })] if y == &[1, 2, 3]
+        ));
+    }
+
+    #[test]
+    fn parse_rsa_crypto_binary_ignores_comment_nodes() {
+        // The shared CryptoBinary decoder must apply XML simple-content semantics to every key type.
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue><RSAKeyValue>
+                <Modulus>AQ<!-- split -->ID</Modulus><Exponent>Aw==</Exponent>
+            </RSAKeyValue></KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element())
+                .unwrap()
+                .sources
+                .as_slice(),
+            [KeyInfoSource::KeyValue(KeyValueInfo::Rsa { modulus, exponent })]
+                if modulus == &[1, 2, 3] && exponent == &[3]
+        ));
     }
 
     #[test]
