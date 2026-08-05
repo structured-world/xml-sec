@@ -97,6 +97,23 @@ pub struct UriTypeSet {
     allow_external: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UriClass {
+    Empty,
+    SameDocument,
+    External,
+}
+
+fn classify_uri(uri: &str) -> UriClass {
+    if uri.is_empty() {
+        UriClass::Empty
+    } else if uri.starts_with('#') {
+        UriClass::SameDocument
+    } else {
+        UriClass::External
+    }
+}
+
 impl UriTypeSet {
     /// Create a custom URI policy.
     pub const fn new(allow_empty: bool, allow_same_document: bool, allow_external: bool) -> Self {
@@ -124,13 +141,11 @@ impl UriTypeSet {
     };
 
     fn allows(self, uri: &str) -> bool {
-        if uri.is_empty() {
-            return self.allow_empty;
+        match classify_uri(uri) {
+            UriClass::Empty => self.allow_empty,
+            UriClass::SameDocument => self.allow_same_document,
+            UriClass::External => self.allow_external,
         }
-        if uri.starts_with('#') {
-            return self.allow_same_document;
-        }
-        self.allow_external
     }
 }
 
@@ -978,13 +993,15 @@ fn materialize_retrieval_methods(
 
         if resource_type.as_deref() == Some("http://www.w3.org/2000/09/xmldsig#rawX509Certificate")
         {
-            if !allowed_uri_types.allows(&uri) {
-                return Err(SignatureVerificationPipelineError::DisallowedUri { uri });
-            }
-            if transforms != RetrievalMethodTransforms::None || uri.starts_with('#') {
+            if transforms != RetrievalMethodTransforms::None
+                || classify_uri(&uri) != UriClass::External
+            {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "raw X509 RetrievalMethod requires an untransformed external URI",
                 });
+            }
+            if !allowed_uri_types.allows(&uri) {
+                return Err(SignatureVerificationPipelineError::DisallowedUri { uri });
             }
             let certificate = external_resources
                 .and_then(|resources| resources.get(&uri))
@@ -2698,6 +2715,40 @@ mod tests {
             key_info.sources.as_slice(),
             [super::super::parse::KeyInfoSource::X509Data(info)]
                 if info.certificates.len() == 1
+        ));
+    }
+
+    #[test]
+    fn raw_x509_retrieval_rejects_empty_same_document_uri() {
+        // rawX509Certificate consumes external DER octets; an empty URI denotes
+        // the XML document and must never become a key into the external map.
+        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
+        let certificate = include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
+        )
+        .to_vec();
+        let resources = HashMap::from([(String::new(), certificate)]);
+        let mut key_info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::RetrievalMethod {
+                uri: String::new(),
+                resource_type: Some(RAW_X509_TYPE.into()),
+                transforms: RetrievalMethodTransforms::None,
+            }],
+        };
+        let document = Document::parse("<root/>").unwrap();
+
+        let error = materialize_retrieval_methods(
+            &mut key_info,
+            &UriReferenceResolver::new(&document),
+            Some(&resources),
+            UriTypeSet::ALL,
+        )
+        .expect_err("empty URI must retain same-document semantics");
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "raw X509 RetrievalMethod requires an untransformed external URI"
+            }
         ));
     }
 

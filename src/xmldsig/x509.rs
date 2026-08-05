@@ -121,9 +121,11 @@ pub fn verify_x509_certificate_chain(
         return validate_path(&path_der, info, options, verification_time);
     }
 
+    // Use the path-edge verifier here too: x509-parser does not verify legacy
+    // DSA-SHA1 roots, while our fallback must recognize them for rollover.
     let replace_untrusted_root = if path_der.len() > 1
         && last.subject() == last.issuer()
-        && last.verify_signature(None).is_ok()
+        && verify_certificate_signature(&last, &last)
     {
         let child = parse_certificate(path_der[path_der.len() - 2])?;
         child.issuer() == last.subject() && verify_certificate_signature(&child, &last)
@@ -394,6 +396,42 @@ mod tests {
     use super::*;
     use crate::xmldsig::{KeyInfoSource, parse::XMLDSIG_NS, parse_key_info};
     use roxmltree::Document;
+    use std::time::Duration;
+
+    #[test]
+    fn dsa_rollover_replaces_embedded_root_before_depth_validation() {
+        let leaf = include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
+        )
+        .to_vec();
+        let embedded_root =
+            include_bytes!("../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/ca.der")
+                .to_vec();
+
+        // Trust-anchor self-signatures are not part of path validation. Changing
+        // only that signature gives this test a distinct rollover certificate
+        // with the same subject and DSA public key as the embedded stale root.
+        let mut rollover_anchor = embedded_root.clone();
+        *rollover_anchor
+            .last_mut()
+            .expect("certificate is non-empty") ^= 1;
+        parse_certificate(&rollover_anchor).expect("modified trust anchor remains valid DER");
+        let anchors = vec![rollover_anchor];
+        let info = X509DataInfo {
+            certificates: vec![leaf, embedded_root],
+            certificate_chain: vec![0, 1],
+            ..X509DataInfo::default()
+        };
+        let options = X509ChainOptions {
+            trusted_certs: &anchors,
+            verification_time: UNIX_EPOCH + Duration::from_secs(1_104_580_800),
+            max_chain_depth: 2,
+            check_crls: false,
+        };
+
+        verify_x509_certificate_chain(&info, &options)
+            .expect("the stale DSA root must be replaced by the configured anchor");
+    }
 
     #[test]
     fn dsa_sha1_crl_signature_uses_the_same_fallback_as_certificates() {
