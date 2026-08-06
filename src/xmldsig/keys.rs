@@ -204,6 +204,9 @@ pub enum KeyResolutionError {
 /// the documented TOFU model without constructing a certificate path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyResolverConfig {
+    /// DER-encoded certificates available to X.509 selectors but not trusted
+    /// unless they chain to an entry in [`Self::trusted_certs`].
+    pub lookup_certs: Vec<Vec<u8>>,
     /// DER-encoded certificates accepted as trust anchors.
     pub trusted_certs: Vec<Vec<u8>>,
     /// Verification keys addressable by `<KeyName>` content.
@@ -223,6 +226,7 @@ pub struct KeyResolverConfig {
 impl Default for KeyResolverConfig {
     fn default() -> Self {
         Self {
+            lookup_certs: Vec::new(),
             trusted_certs: Vec::new(),
             named_keys: HashMap::new(),
             verify_chains: false,
@@ -264,7 +268,7 @@ impl DefaultKeyResolver {
                 .get(signing_index)
                 .ok_or(KeyResolutionError::InvalidCertificate)?;
             if self.config.verify_chains {
-                self.verify_x509_policy(info, None)?;
+                self.verify_x509_policy(info)?;
             }
             certificate_der
         } else {
@@ -281,10 +285,7 @@ impl DefaultKeyResolver {
                     crls: info.crls.clone(),
                     ..X509DataInfo::default()
                 };
-                // Validate the selected certificate's own policy before
-                // requiring a distinct configured certificate as its anchor.
-                self.verify_x509_policy(&selected, None)?;
-                self.verify_x509_policy(&selected, Some(certificate))?;
+                self.verify_x509_policy(&selected)?;
             }
             certificate
         };
@@ -304,23 +305,9 @@ impl DefaultKeyResolver {
         }))
     }
 
-    fn verify_x509_policy(
-        &self,
-        info: &X509DataInfo,
-        selected_lookup_certificate: Option<&[u8]>,
-    ) -> Result<(), KeyResolutionError> {
-        let trusted_certs = self
-            .config
-            .trusted_certs
-            .iter()
-            .filter(|certificate| {
-                selected_lookup_certificate
-                    .is_none_or(|selected| certificate.as_slice() != selected)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+    fn verify_x509_policy(&self, info: &X509DataInfo) -> Result<(), KeyResolutionError> {
         let options = X509ChainOptions {
-            trusted_certs: &trusted_certs,
+            trusted_certs: &self.config.trusted_certs,
             verification_time: self
                 .config
                 .verification_time
@@ -341,7 +328,12 @@ impl DefaultKeyResolver {
         }
 
         let mut matches = Vec::new();
-        for certificate_der in &self.config.trusted_certs {
+        for certificate_der in self
+            .config
+            .trusted_certs
+            .iter()
+            .chain(&self.config.lookup_certs)
+        {
             let parsed = parse_x509_certificate(certificate_der)
                 .map_err(|_| KeyResolutionError::InvalidCertificate)?;
             let is_match = x509_certificate_matches_any_selector(info, &parsed, certificate_der)
@@ -726,6 +718,7 @@ mod tests {
         let config = KeyResolverConfig::default();
 
         assert!(config.trusted_certs.is_empty());
+        assert!(config.lookup_certs.is_empty());
         assert!(config.named_keys.is_empty());
         assert!(!config.verify_chains);
         assert!(!config.check_crls);
@@ -834,8 +827,8 @@ mod tests {
         // embedding key material or supplying a preset verification key.
         let leaf_certificate_der = certificate_der(RSA_4096_CERTIFICATE);
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![leaf_certificate_der],
             trusted_certs: vec![
-                leaf_certificate_der,
                 certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
                 certificate_der(include_str!("../../tests/fixtures/keys/cacert.pem")),
             ],
@@ -855,9 +848,13 @@ mod tests {
     fn selector_resolved_certificate_obeys_chain_policy() {
         // Enabling chain verification must apply validity policy even when
         // X509Data contains only selectors and the matching cert is configured.
-        let certificate_der = certificate_der(RSA_4096_CERTIFICATE);
+        let leaf_certificate_der = certificate_der(RSA_4096_CERTIFICATE);
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-            trusted_certs: vec![certificate_der],
+            lookup_certs: vec![leaf_certificate_der],
+            trusted_certs: vec![
+                certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
+                certificate_der(include_str!("../../tests/fixtures/keys/cacert.pem")),
+            ],
             verify_chains: true,
             verification_time: Some(SystemTime::UNIX_EPOCH),
             ..KeyResolverConfig::default()
@@ -867,12 +864,52 @@ mod tests {
             .verify(&x509_signature_with_leaf_subject())
             .expect_err("selector-resolved certificate must satisfy chain policy");
 
-        assert!(matches!(
-            error,
-            DsigError::KeyResolution(KeyResolutionError::Chain(
-                super::super::X509ChainError::CertificateNotValid(_)
-            ))
-        ));
+        assert!(
+            matches!(
+                &error,
+                DsigError::KeyResolution(KeyResolutionError::Chain(
+                    super::super::X509ChainError::CertificateNotValid(_)
+                ))
+            ),
+            "unexpected selector policy error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn selector_resolved_configured_root_remains_a_trust_anchor() {
+        // A certificate explicitly configured in trusted_certs remains an
+        // anchor when X509Data selects it by subject instead of embedding it.
+        let mut params = rcgen::CertificateParams::new(Vec::new())
+            .expect("empty SAN list should produce valid certificate parameters");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "configured root");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key_pair = rcgen::KeyPair::generate().expect("test key generation should succeed");
+        let certificate = params
+            .self_signed(&key_pair)
+            .expect("test root should be self-signable");
+        let certificate_der = certificate.der().to_vec();
+        let key_info_xml = concat!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+            "<X509Data><X509SubjectName>CN=configured root</X509SubjectName></X509Data>",
+            "</KeyInfo>"
+        );
+        let document = roxmltree::Document::parse(key_info_xml)
+            .expect("static selector KeyInfo should parse as XML");
+        let key_info = super::super::parse_key_info(document.root_element())
+            .expect("static selector KeyInfo should satisfy XMLDSig structure");
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![certificate_der],
+            verify_chains: true,
+            ..KeyResolverConfig::default()
+        });
+
+        let resolved = resolver
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .expect("configured self-signed certificate should validate as its own anchor");
+
+        assert!(resolved.is_some());
     }
 
     #[test]
@@ -881,7 +918,7 @@ mod tests {
         // trust anchor; chain verification still requires a separate issuer.
         let certificate_der = certificate_der(RSA_4096_CERTIFICATE);
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-            trusted_certs: vec![certificate_der],
+            lookup_certs: vec![certificate_der],
             verify_chains: true,
             verification_time: Some(fixture_certificate_time()),
             ..KeyResolverConfig::default()
@@ -906,7 +943,8 @@ mod tests {
         let leaf = certificate_der(RSA_4096_CERTIFICATE);
         let issuer = certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem"));
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-            trusted_certs: vec![leaf, issuer],
+            lookup_certs: vec![leaf],
+            trusted_certs: vec![issuer],
             verify_chains: true,
             verification_time: Some(fixture_certificate_time()),
             ..KeyResolverConfig::default()
@@ -930,10 +968,10 @@ mod tests {
             &selector.replace("CRL_PLACEHOLDER", &STANDARD.encode(crl)),
         );
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![certificate_der(include_str!(
+                "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+            ))],
             trusted_certs: vec![
-                certificate_der(include_str!(
-                    "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
-                )),
                 certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
                 certificate_der(include_str!("../../tests/fixtures/keys/cacert.pem")),
             ],
@@ -964,6 +1002,7 @@ mod tests {
         // the same configured RSA certificate without embedded key material.
         let selectors = [
             "<X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>",
+            "<X509SubjectName>CN=  test   key rsa-2048  ,O=xml security library (HTTP://WWW.ALEKSEY.COM/XMLSEC),ST=california,C=us</X509SubjectName>",
             "<X509IssuerSerial><X509IssuerName>Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName><X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber></X509IssuerSerial>",
             "<X509SKI>bcOXN/nsVl8GatRbcKrPbzIbw0Y=</X509SKI>",
         ];
@@ -975,7 +1014,7 @@ mod tests {
             let key_info = format!("<KeyInfo><X509Data>{selector}</X509Data></KeyInfo>");
             let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, &key_info);
             let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-                trusted_certs: vec![configured_certificate.clone()],
+                lookup_certs: vec![configured_certificate.clone()],
                 ..KeyResolverConfig::default()
             });
             let result = super::super::VerifyContext::new()
@@ -994,7 +1033,7 @@ mod tests {
         let key_info = r#"<KeyInfo><X509Data><X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName><X509SKI>0X0XrEVCio75sBcl1TxymJ2IOiU=</X509SKI></X509Data></KeyInfo>"#;
         let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, key_info);
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-            trusted_certs: vec![
+            lookup_certs: vec![
                 certificate_der(include_str!(
                     "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
                 )),
@@ -1016,7 +1055,7 @@ mod tests {
         let key_info = "<KeyInfo><X509Data><X509SubjectName>CN=not-the-signer</X509SubjectName></X509Data></KeyInfo>";
         let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, key_info);
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-            trusted_certs: vec![certificate_der(include_str!(
+            lookup_certs: vec![certificate_der(include_str!(
                 "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
             ))],
             ..KeyResolverConfig::default()
@@ -1037,7 +1076,7 @@ mod tests {
         // Duplicate configured certificates must not make key selection order-dependent.
         let certificate = certificate_der(RSA_4096_CERTIFICATE);
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-            trusted_certs: vec![certificate.clone(), certificate],
+            lookup_certs: vec![certificate.clone(), certificate],
             ..KeyResolverConfig::default()
         });
         let error = super::super::VerifyContext::new()
@@ -1058,7 +1097,7 @@ mod tests {
         let key_info = "<KeyInfo xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\"><X509Data><dsig11:X509Digest Algorithm=\"urn:unsupported\">AQ==</dsig11:X509Digest></X509Data></KeyInfo>";
         let xml = replace_unprefixed_key_info(RSA_KEY_VALUE_SIGNATURE, key_info);
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-            trusted_certs: vec![certificate_der(include_str!(
+            lookup_certs: vec![certificate_der(include_str!(
                 "../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
             ))],
             ..KeyResolverConfig::default()

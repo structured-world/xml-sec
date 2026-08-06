@@ -12,7 +12,7 @@ fn resolver() -> &'static DefaultKeyResolver {
     static RESOLVER: OnceLock<DefaultKeyResolver> = OnceLock::new();
     RESOLVER.get_or_init(|| {
         DefaultKeyResolver::new(KeyResolverConfig {
-            trusted_certs: vec![TRUSTED_CERTIFICATE.to_vec()],
+            lookup_certs: vec![TRUSTED_CERTIFICATE.to_vec()],
             ..KeyResolverConfig::default()
         })
     })

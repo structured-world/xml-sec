@@ -18,6 +18,7 @@
 
 use der::Decode;
 use roxmltree::{Document, Node};
+use x509_cert::ext::pkix::name::DirectoryString;
 use x509_cert::name::Name;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
@@ -31,6 +32,7 @@ use super::whitespace::{
     normalize_xml_base64_text_with_limit,
 };
 use crate::c14n::C14nAlgorithm;
+use crate::c14n::xml_base::{compute_effective_xml_base, resolve_uri};
 
 /// XMLDSig namespace URI.
 pub(crate) const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
@@ -627,14 +629,23 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
             }
             (Some(XMLDSIG_NS), "RetrievalMethod") => {
                 ensure_no_non_whitespace_text(child, "RetrievalMethod")?;
-                let uri = child.attribute("URI").ok_or_else(|| {
+                let lexical_uri = child.attribute("URI").ok_or_else(|| {
                     ParseError::InvalidStructure("RetrievalMethod requires URI".into())
                 })?;
-                if uri.len() > MAX_KEY_NAME_TEXT_LEN {
+                if lexical_uri.len() > MAX_KEY_NAME_TEXT_LEN {
                     return Err(ParseError::InvalidStructure(
                         "RetrievalMethod URI exceeds maximum length".into(),
                     ));
                 }
+                let uri = if lexical_uri.is_empty() || lexical_uri.starts_with('#') {
+                    lexical_uri.to_owned()
+                } else {
+                    // RetrievalMethod is parsed independently from later key
+                    // materialization, so retain its resolved resource identity.
+                    compute_effective_xml_base(child, None)
+                        .map(|base| resolve_uri(&base, lexical_uri))
+                        .unwrap_or_else(|| lexical_uri.to_owned())
+                };
                 let resource_type = child.attribute("Type").map(str::to_string);
                 let transforms = if resource_type.as_deref()
                     == Some("http://www.w3.org/2000/09/xmldsig#X509Data")
@@ -646,7 +657,7 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
                     RetrievalMethodTransforms::None
                 };
                 sources.push(KeyInfoSource::RetrievalMethod {
-                    uri: uri.to_string(),
+                    uri,
                     resource_type,
                     transforms,
                 });
@@ -1351,6 +1362,60 @@ pub(crate) fn x509_selector_categories_match_chain(
 }
 
 fn distinguished_names_equal(left: &str, right: &str) -> bool {
+    fn attribute_values_equal(
+        left: &x509_cert::attr::AttributeTypeAndValue,
+        right: &x509_cert::attr::AttributeTypeAndValue,
+    ) -> bool {
+        if left.oid != right.oid {
+            return false;
+        }
+        match (
+            DirectoryString::try_from(&left.value),
+            DirectoryString::try_from(&right.value),
+        ) {
+            (Ok(left), Ok(right)) => {
+                // RFC 5280 section 7.1 requires caseIgnoreMatch with LDAP/X.520
+                // string preparation for PrintableString and UTF8String names.
+                let Ok(left) =
+                    x520_stringprep::x520_stringprep_to_case_ignore_string(left.value().as_ref())
+                else {
+                    return false;
+                };
+                let Ok(right) =
+                    x520_stringprep::x520_stringprep_to_case_ignore_string(right.value().as_ref())
+                else {
+                    return false;
+                };
+                left.trim_matches(' ') == right.trim_matches(' ')
+            }
+            _ => left.value == right.value,
+        }
+    }
+
+    fn rdns_equal(
+        left: &x509_cert::name::RelativeDistinguishedName,
+        right: &x509_cert::name::RelativeDistinguishedName,
+    ) -> bool {
+        if left.len() != right.len() {
+            return false;
+        }
+        // A DN is an ordered RDN sequence, but each individual RDN is a set.
+        let right = right.iter().collect::<Vec<_>>();
+        let mut matched = vec![false; right.len()];
+        left.iter().all(|left_attribute| {
+            right
+                .iter()
+                .enumerate()
+                .find(|(index, right_attribute)| {
+                    !matched[*index] && attribute_values_equal(left_attribute, right_attribute)
+                })
+                .is_some_and(|(index, _)| {
+                    matched[index] = true;
+                    true
+                })
+        })
+    }
+
     fn trailing_whitespace_is_escaped(value: &str) -> bool {
         let Some(prefix) = value.as_bytes().strip_suffix(b" ") else {
             return false;
@@ -1417,7 +1482,13 @@ fn distinguished_names_equal(left: &str, right: &str) -> bool {
     let parse_name = |value: &str| remove_separator_padding(value).parse::<Name>().ok();
     parse_name(left)
         .zip(parse_name(right))
-        .is_some_and(|(left, right)| left == right)
+        .is_some_and(|(left, right)| {
+            left.len() == right.len()
+                && left
+                    .iter_rdn()
+                    .zip(right.iter_rdn())
+                    .all(|(left, right)| rdns_equal(left, right))
+        })
 }
 
 fn ensure_x509_data_entry_budget(info: &X509DataInfo) -> Result<(), ParseError> {
@@ -2906,6 +2977,28 @@ BA== </Modulus>
         assert!(!distinguished_names_equal(
             "CN=leaf,O=example",
             "O=example,CN=leaf"
+        ));
+    }
+
+    #[test]
+    fn distinguished_name_matching_applies_x520_string_preparation() {
+        // RFC 5280 requires caseIgnoreMatch with insignificant-space handling
+        // for DirectoryString values rather than exact ASN.1 value equality.
+        assert!(distinguished_names_equal(
+            "CN=  TEST   key  ,O=Example",
+            "CN=test key,O=example"
+        ));
+        assert!(distinguished_names_equal(
+            "CN=Straße,O=Example",
+            "CN=STRASSE,O=EXAMPLE"
+        ));
+        assert!(distinguished_names_equal(
+            "CN=test+OU=security,O=example",
+            "OU=SECURITY+CN=TEST,O=EXAMPLE"
+        ));
+        assert!(!distinguished_names_equal(
+            "1.2.3.4=#040141,O=example",
+            "1.2.3.4=#040142,O=example"
         ));
     }
 

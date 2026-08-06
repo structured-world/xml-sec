@@ -24,8 +24,11 @@ interoperating with legacy libxmlsec1 `here()` behavior can explicitly select
 
 ## Verification Policy
 
-For production verification, configure `KeyResolverConfig` with explicit trust anchors when
-certificate-chain validation is required. Embedded certificates provide key material; they do
+For production verification, configure `KeyResolverConfig::lookup_certs` with untrusted
+certificates that selector-only `X509Data` may address, and configure
+`KeyResolverConfig::trusted_certs` only with explicit trust anchors. With chain validation
+enabled, a selected lookup certificate must chain to a trusted anchor. A trusted certificate
+selected directly remains an anchor, while embedded certificates provide key material and do
 not become trusted merely because they appear in `<KeyInfo>`.
 
 `VerifyResult::status` reports core validation: `Valid` means the cryptographic signature and
@@ -54,7 +57,9 @@ complete map to 32 MiB. External key retrieval has an independent policy boundar
 also opt in with `VerifyContext::allowed_retrieval_method_uri_types`. Allowing external signed
 payloads never implicitly allows external key material. `RetrievalMethod` currently accepts
 untransformed external `rawX509Certificate` data and the Merlin same-document `X509Data` XPath
-selection. Other retrieval transform chains fail closed instead of being ignored.
+selection. Relative external `Reference` and `RetrievalMethod` URIs are resolved against the
+owning element's effective `xml:base` using RFC 3986 before lookup, so resource-map keys must use
+that resolved URI. Other retrieval transform chains fail closed instead of being ignored.
 
 Internal DTD declarations are disabled by default and require
 `VerifyContext::allow_internal_dtd(true)`. External entity resolution remains disabled. XSLT is

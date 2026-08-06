@@ -163,12 +163,10 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         ("signature-x509-is", Some("macha.pem")),
         ("signature-x509-ski", Some("nemain.pem")),
     ] {
-        let mut trusted_certs = vec![cert("ca.pem")];
-        if let Some(selected) = selected {
-            trusted_certs.push(cert(selected));
-        }
+        let lookup_certs = selected.into_iter().map(cert).collect();
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-            trusted_certs,
+            lookup_certs,
+            trusted_certs: vec![cert("ca.pem")],
             verify_chains: true,
             verification_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005)),
             ..KeyResolverConfig::default()
@@ -184,7 +182,8 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
     }
 
     let retrieval = DefaultKeyResolver::new(KeyResolverConfig {
-        trusted_certs: vec![cert("ca.pem"), cert("balor.pem")],
+        lookup_certs: vec![cert("balor.pem")],
+        trusted_certs: vec![cert("ca.pem")],
         verify_chains: true,
         verification_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005)),
         ..KeyResolverConfig::default()
@@ -496,7 +495,8 @@ fn rejects_dtd_and_unsupported_retrieval_defaults() {
     ));
 
     let retrieval = DefaultKeyResolver::new(KeyResolverConfig {
-        trusted_certs: vec![cert("ca.pem"), cert("balor.pem")],
+        lookup_certs: vec![cert("balor.pem")],
+        trusted_certs: vec![cert("ca.pem")],
         verify_chains: true,
         verification_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005)),
         ..KeyResolverConfig::default()

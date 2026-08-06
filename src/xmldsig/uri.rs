@@ -17,6 +17,8 @@ use std::collections::{HashMap, HashSet};
 
 use roxmltree::{Document, Node, NodeId};
 
+use crate::c14n::xml_base::{compute_effective_xml_base, resolve_uri};
+
 use super::types::{NodeSet, NodeSetMaterializationBudget, TransformData, TransformError};
 
 /// Default ID attribute names to scan when building the ID index.
@@ -158,6 +160,23 @@ impl<'a> UriReferenceResolver<'a> {
         self.dereference_with_optional_budget(uri, Some(budget))
     }
 
+    pub(crate) fn dereference_from_with_budget(
+        &self,
+        uri: &str,
+        origin: Node<'_, '_>,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<TransformData<'a>, TransformError> {
+        // XMLDSig assigns special dereference semantics to lexical empty and
+        // fragment-only references. Only external references use XML Base.
+        if uri.is_empty() || uri.starts_with('#') {
+            return self.dereference_with_budget(uri, budget);
+        }
+        let resolved = compute_effective_xml_base(origin, None)
+            .map(|base| resolve_uri(&base, uri))
+            .unwrap_or_else(|| uri.to_owned());
+        self.dereference_with_budget(&resolved, budget)
+    }
+
     fn dereference_with_optional_budget(
         &self,
         uri: &str,
@@ -269,6 +288,10 @@ impl<'a> UriReferenceResolver<'a> {
 
     pub(crate) fn node_for_id(&self, id: &str) -> Option<Node<'a, 'a>> {
         self.id_map.get(id).copied()
+    }
+
+    pub(crate) fn node_for_node_id(&self, id: NodeId) -> Option<Node<'a, 'a>> {
+        self.doc.get_node(id)
     }
 
     /// Get the number of registered IDs.

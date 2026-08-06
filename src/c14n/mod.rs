@@ -28,7 +28,7 @@ pub(crate) mod ns_exclusive;
 pub(crate) mod ns_inclusive;
 pub(crate) mod prefix;
 pub(crate) mod serialize;
-mod xml_base;
+pub(crate) mod xml_base;
 
 use std::collections::HashSet;
 

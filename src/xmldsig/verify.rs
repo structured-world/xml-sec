@@ -473,8 +473,42 @@ pub fn process_reference(
         signature_node,
         reference_set,
         reference_index,
+        reference_origin_node(signature_node, reference_set, reference_index),
         &execution,
     )
+}
+
+fn reference_origin_node<'a, 'input>(
+    signature_node: Node<'a, 'input>,
+    reference_set: ReferenceSet,
+    reference_index: usize,
+) -> Option<Node<'a, 'input>> {
+    let is_reference = |node: &Node<'_, '_>| {
+        node.is_element()
+            && node.tag_name().namespace() == Some(XMLDSIG_NS)
+            && node.tag_name().name() == "Reference"
+    };
+    match reference_set {
+        ReferenceSet::SignedInfo => signature_node
+            .children()
+            .find(|node| {
+                node.is_element()
+                    && node.tag_name().namespace() == Some(XMLDSIG_NS)
+                    && node.tag_name().name() == "SignedInfo"
+            })?
+            .children()
+            .filter(is_reference)
+            .nth(reference_index),
+        ReferenceSet::Manifest => signature_node
+            .descendants()
+            .filter(|node| {
+                node.is_element()
+                    && node.tag_name().namespace() == Some(XMLDSIG_NS)
+                    && node.tag_name().name() == "Manifest"
+            })
+            .flat_map(|manifest| manifest.children().filter(is_reference))
+            .nth(reference_index),
+    }
 }
 
 struct ReferenceExecutionContext<'a> {
@@ -525,6 +559,7 @@ fn process_reference_with_options(
     signature_node: Node<'_, '_>,
     reference_set: ReferenceSet,
     reference_index: usize,
+    reference_node: Option<Node<'_, '_>>,
     execution: &ReferenceExecutionContext<'_>,
 ) -> Result<ReferenceResult, ReferenceProcessingError> {
     // 1. Dereference URI. Omitted URI is distinct from URI="" in XMLDSig and
@@ -533,8 +568,22 @@ fn process_reference_with_options(
         .uri
         .as_deref()
         .ok_or(ReferenceProcessingError::MissingUri)?;
-    let initial_data = resolver
-        .dereference_with_budget(uri, execution.transform_budget.node_set_materialization())
+    let initial_data = reference_node
+        .map_or_else(
+            || {
+                resolver.dereference_with_budget(
+                    uri,
+                    execution.transform_budget.node_set_materialization(),
+                )
+            },
+            |node| {
+                resolver.dereference_from_with_budget(
+                    uri,
+                    node,
+                    execution.transform_budget.node_set_materialization(),
+                )
+            },
+        )
         .map_err(ReferenceProcessingError::UriDereference)?;
 
     // 2. Apply transform chain
@@ -619,6 +668,7 @@ fn process_all_references_with_options(
             signature_node,
             ReferenceSet::SignedInfo,
             i,
+            reference_origin_node(signature_node, ReferenceSet::SignedInfo, i),
             execution,
         )?;
         let failed = matches!(result.status, DsigStatus::Invalid(_));
@@ -1222,7 +1272,7 @@ fn process_manifest_references(
         return Ok(Vec::new());
     }
     results.reserve(manifest_references.len());
-    for (index, reference) in &manifest_references {
+    for (index, reference, reference_node_id) in &manifest_references {
         match enforce_reference_policies(
             std::slice::from_ref(reference),
             ctx.allowed_uri_types,
@@ -1268,6 +1318,7 @@ fn process_manifest_references(
             signature_node,
             ReferenceSet::Manifest,
             *index,
+            resolver.node_for_node_id(*reference_node_id),
             execution,
         ) {
             Ok(result) => results.push(result),
@@ -1357,7 +1408,7 @@ fn parse_manifest_references(
                     });
                 }
                 match parse_reference_with_xpath_budget(child, xpath_parse_budget) {
-                    Ok(reference) => references.push((reference_index, reference)),
+                    Ok(reference) => references.push((reference_index, reference, child.id())),
                     Err(ParseError::Transform(super::TransformError::UnsupportedTransform(_))) => {
                         let digest_algorithm = reference_digest_method(child).map_err(|error| {
                             SignatureVerificationPipelineError::ParseManifestReference(error)
@@ -1392,7 +1443,7 @@ fn parse_manifest_references(
 }
 
 struct ParsedManifestReferences {
-    references: Vec<(usize, Reference)>,
+    references: Vec<(usize, Reference, NodeId)>,
     invalid_results: Vec<ReferenceResult>,
 }
 
@@ -1775,6 +1826,103 @@ mod tests {
             digest_method,
             digest_value,
         }
+    }
+
+    #[test]
+    fn reference_resolution_uses_each_elements_effective_xml_base() {
+        // Equal lexical URIs under different xml:base values identify distinct
+        // caller-owned resources and must not collide in the resolver.
+        let first = b"first payload";
+        let second = b"second payload";
+        let first_digest = base64::engine::general_purpose::STANDARD
+            .encode(compute_digest(DigestAlgorithm::Sha256, first));
+        let second_digest = base64::engine::general_purpose::STANDARD
+            .encode(compute_digest(DigestAlgorithm::Sha256, second));
+        let xml = format!(
+            r#"<root xml:base="https://example.test/base/" xmlns:ds="{XMLDSIG_NS}">
+                <ds:Signature><ds:SignedInfo>
+                    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+                    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+                    <ds:Reference xml:base="one/" URI="payload.bin">
+                        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                        <ds:DigestValue>{first_digest}</ds:DigestValue>
+                    </ds:Reference>
+                    <ds:Reference xml:base="../two/" URI="payload.bin">
+                        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                        <ds:DigestValue>{second_digest}</ds:DigestValue>
+                    </ds:Reference>
+                </ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue></ds:Signature>
+            </root>"#
+        );
+        let document = Document::parse(&xml).unwrap();
+        let signature = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
+            .unwrap();
+        let signed_info_node = signature
+            .children()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "SignedInfo")))
+            .unwrap();
+        let signed_info = parse_signed_info(signed_info_node).unwrap();
+        let resources = HashMap::from([
+            (
+                "https://example.test/base/one/payload.bin".into(),
+                first.to_vec(),
+            ),
+            (
+                "https://example.test/two/payload.bin".into(),
+                second.to_vec(),
+            ),
+        ]);
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+
+        let result = process_all_references(&signed_info.references, &resolver, signature, false)
+            .expect("each Reference should resolve against its own effective base");
+
+        assert!(result.all_valid());
+    }
+
+    #[test]
+    fn manifest_reference_resolution_uses_its_effective_xml_base() {
+        // Manifest references carry their own XML Base context and must not
+        // accidentally reuse the SignedInfo or Signature element context.
+        let payload = b"manifest payload";
+        let digest = base64::engine::general_purpose::STANDARD
+            .encode(compute_digest(DigestAlgorithm::Sha256, payload));
+        let xml = format!(
+            r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}" xml:base="https://example.test/">
+                <ds:Object><ds:Manifest xml:base="manifests/">
+                    <ds:Reference URI="payload.bin">
+                        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                        <ds:DigestValue>{digest}</ds:DigestValue>
+                    </ds:Reference>
+                </ds:Manifest></ds:Object>
+            </ds:Signature>"#
+        );
+        let document = Document::parse(&xml).unwrap();
+        let signature = document.root_element();
+        let reference_node = signature
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "Reference")))
+            .unwrap();
+        let reference = super::super::parse::parse_reference(reference_node).unwrap();
+        let resources = HashMap::from([(
+            "https://example.test/manifests/payload.bin".to_string(),
+            payload.to_vec(),
+        )]);
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+
+        let result = process_reference(
+            &reference,
+            &resolver,
+            signature,
+            ReferenceSet::Manifest,
+            0,
+            false,
+        )
+        .expect("Manifest Reference should inherit its own XML Base context");
+
+        assert_eq!(result.status, DsigStatus::Valid);
     }
 
     struct RejectingKey;
@@ -2675,6 +2823,46 @@ mod tests {
             key_info.sources.as_slice(),
             [super::super::parse::KeyInfoSource::X509Data(info)]
                 if info.subject_names == ["CN=leaf"]
+        ));
+    }
+
+    #[test]
+    fn raw_x509_retrieval_method_uses_inherited_xml_base() {
+        // RetrievalMethod URI is an attribute URI reference, so XML Base uses
+        // the effective base of the element bearing that attribute.
+        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
+        let xml = format!(
+            r#"<root xml:base="https://example.test/keys/" xmlns:ds="{XMLDSIG_NS}">
+                <ds:KeyInfo><ds:RetrievalMethod URI="signer.der" Type="{RAW_X509_TYPE}"/></ds:KeyInfo>
+            </root>"#
+        );
+        let document = Document::parse(&xml).unwrap();
+        let key_info_node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .unwrap();
+        let mut key_info = parse_key_info(key_info_node).unwrap();
+        let certificate = include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
+        )
+        .to_vec();
+        let resources = HashMap::from([(
+            "https://example.test/keys/signer.der".to_string(),
+            certificate,
+        )]);
+
+        materialize_retrieval_methods(
+            &mut key_info,
+            &UriReferenceResolver::new(&document),
+            Some(&resources),
+            UriTypeSet::ALL,
+        )
+        .expect("RetrievalMethod should resolve against inherited xml:base");
+
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [super::super::parse::KeyInfoSource::X509Data(info)]
+                if info.certificates.len() == 1
         ));
     }
 

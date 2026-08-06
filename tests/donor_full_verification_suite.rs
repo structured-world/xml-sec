@@ -178,7 +178,7 @@ fn donor_full_verification_suite_accepts_every_supported_case() {
             Expectation::Selected { certificate_paths } => {
                 let xml = read_fixture(&root.join(case.xml_path));
                 let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-                    trusted_certs: certificate_paths
+                    lookup_certs: certificate_paths
                         .iter()
                         .map(|path| read_pem_der(&root.join(path), "CERTIFICATE"))
                         .collect(),
