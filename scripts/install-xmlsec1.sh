@@ -3,7 +3,7 @@ set -euo pipefail
 
 readonly XMLSEC1_VERSION="1.3.13"
 readonly XMLSEC1_COMMIT="5fdd47dc35753438bdc38b6e96c1a3805c67a483"
-readonly XMLSEC1_ARCHIVE_SHA256="0917b7304ee2452e2110a60d18e501825c132fa5857558e0308d40457fa0992f"
+readonly XMLSEC1_REPOSITORY="https://github.com/lsh123/xmlsec.git"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 prefix="${XMLSEC1_PREFIX:-$repo_root/.tools/xmlsec1-${XMLSEC1_VERSION}-${XMLSEC1_COMMIT:0:12}}"
@@ -46,26 +46,21 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
-archive="$work_dir/xmlsec.tar.gz"
-source_dir="$work_dir/xmlsec-$XMLSEC1_COMMIT"
+source_dir="$work_dir/xmlsec"
 build_dir="$work_dir/build"
 stage_dir="$work_dir/stage"
 
-curl --fail --location --retry 3 --output "$archive" \
-  "https://codeload.github.com/lsh123/xmlsec/tar.gz/$XMLSEC1_COMMIT"
-
-if command -v sha256sum >/dev/null 2>&1; then
-  printf '%s  %s\n' "$XMLSEC1_ARCHIVE_SHA256" "$archive" | sha256sum --check -
-else
-  actual_sha256="$(shasum -a 256 "$archive" | awk '{print $1}')"
-  if [[ "$actual_sha256" != "$XMLSEC1_ARCHIVE_SHA256" ]]; then
-    printf 'xmlsec1 archive checksum mismatch: expected %s, got %s\n' \
-      "$XMLSEC1_ARCHIVE_SHA256" "$actual_sha256" >&2
-    exit 1
-  fi
+git init "$source_dir"
+git -C "$source_dir" remote add origin "$XMLSEC1_REPOSITORY"
+git -C "$source_dir" fetch --depth=1 origin "$XMLSEC1_COMMIT"
+fetched_commit="$(git -C "$source_dir" rev-parse FETCH_HEAD)"
+if [[ "$fetched_commit" != "$XMLSEC1_COMMIT" ]]; then
+  printf 'xmlsec1 source revision mismatch: expected %s, got %s\n' \
+    "$XMLSEC1_COMMIT" "$fetched_commit" >&2
+  exit 1
 fi
+git -C "$source_dir" checkout --detach "$XMLSEC1_COMMIT"
 
-tar --extract --file "$archive" --directory "$work_dir"
 mkdir -p "$build_dir" "$stage_dir"
 OBJ_DIR="$build_dir" "$source_dir/autogen.sh" \
   --prefix="$prefix" \

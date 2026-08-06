@@ -1512,9 +1512,8 @@ pub(crate) fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certif
 }
 
 fn x509_name_to_rfc4514(name: &X509Name<'_>) -> String {
-    let mut rdns = name.iter_rdn().cloned().collect::<Vec<_>>();
-    rdns.reverse();
-    X509Name::new(rdns, name.as_raw()).to_string()
+    let rdns = name.iter_rdn().cloned().collect::<Vec<_>>();
+    rdns.into_iter().rev().collect::<X509Name<'_>>().to_string()
 }
 
 fn format_x509_serial_hex(serial: &[u8]) -> String {
