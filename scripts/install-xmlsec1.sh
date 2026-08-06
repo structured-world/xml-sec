@@ -22,7 +22,7 @@ fi
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/xmlsec1-${XMLSEC1_VERSION}.XXXXXX")"
 previous_install="$work_dir/previous-install"
-had_previous_install=false
+previous_install_staged=false
 promoted_install=false
 
 cleanup() {
@@ -36,7 +36,7 @@ cleanup() {
     if [[ "$promoted_install" == true ]]; then
       rm -rf "$prefix"
     fi
-    if [[ "$had_previous_install" == true ]]; then
+    if [[ "$previous_install_staged" == true ]]; then
       if ! mv "$previous_install" "$prefix"; then
         printf 'failed to restore previous xmlsec1 installation at %s; backup remains at %s\n' \
           "$prefix" "$previous_install" >&2
@@ -86,7 +86,7 @@ staged_prefix="$stage_dir$prefix"
 mkdir -p "$(dirname "$prefix")"
 if [[ -e "$prefix" ]]; then
   mv "$prefix" "$previous_install"
-  had_previous_install=true
+  previous_install_staged=true
 fi
 mv "$staged_prefix" "$prefix"
 promoted_install=true
@@ -101,7 +101,7 @@ else
 fi
 
 rm -rf "$previous_install"
-had_previous_install=false
+previous_install_staged=false
 
 printf 'installed xmlsec1 %s snapshot %s at %s\n' \
   "$XMLSEC1_VERSION" "${XMLSEC1_COMMIT:0:12}" "$prefix"

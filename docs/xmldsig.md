@@ -25,11 +25,12 @@ interoperating with legacy libxmlsec1 `here()` behavior can explicitly select
 ## Verification Policy
 
 For production verification, configure `KeyResolverConfig::lookup_certs` with untrusted
-certificates that selector-only `X509Data` may address, and configure
+certificates that selector-only `X509Data` may address or use as path intermediates, and configure
 `KeyResolverConfig::trusted_certs` only with explicit trust anchors. With chain validation
-enabled, a selected lookup certificate must chain to a trusted anchor. A trusted certificate
-selected directly remains an anchor, while embedded certificates provide key material and do
-not become trusted merely because they appear in `<KeyInfo>`.
+enabled, a selected lookup certificate may chain through other lookup certificates but must end at
+a trusted anchor. A trusted certificate selected directly remains an anchor, while embedded
+certificates provide key material and do not become trusted merely because they appear in
+`<KeyInfo>`.
 
 `VerifyResult::status` reports core validation: `Valid` means the cryptographic signature and
 every `<SignedInfo>` reference succeeded. `Invalid(reason)` means core validation completed but

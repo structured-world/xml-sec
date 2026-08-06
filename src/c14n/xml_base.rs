@@ -123,6 +123,15 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
         return reference.to_string();
     }
 
+    // Query- and fragment-only references preserve the complete base path for
+    // both absolute and relative bases (RFC 3986 section 5.2.2).
+    if reference.starts_with('?') {
+        return format!("{}{reference}", strip_query_fragment(base));
+    }
+    if reference.starts_with('#') {
+        return format!("{}{reference}", base.split('#').next().unwrap_or(base));
+    }
+
     // Parse base URI components
     let base_parts = match parse_base(base) {
         Some(parts) => parts,
@@ -143,19 +152,6 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
     let scheme = base_parts.scheme;
     let authority = base_parts.authority;
     let base_path = base_parts.path;
-
-    // Reference starts with ? → query-only: keep base scheme+authority+path.
-    // Reference starts with # → fragment-only: keep base scheme+authority+path+query.
-    // Per RFC 3986 §5.2.2, these replace only the query/fragment components.
-    if reference.starts_with('?') || reference.starts_with('#') {
-        let base_no_qf = strip_query_fragment(base);
-        if reference.starts_with('?') {
-            return format!("{base_no_qf}{reference}");
-        }
-        // Fragment-only: keep query too
-        let base_no_frag = base.split('#').next().unwrap_or(base);
-        return format!("{base_no_frag}{reference}");
-    }
 
     // Split reference into path and query/fragment suffix. We apply
     // remove_dot_segments only to the path portion, then reattach the
@@ -461,6 +457,14 @@ mod tests {
         assert_eq!(resolve_uri("sub/dir/", "file.xml"), "sub/dir/file.xml");
         assert_eq!(resolve_uri("a/b/", "../c"), "a/c");
         assert_eq!(resolve_uri("a/b", "c"), "a/c");
+    }
+
+    #[test]
+    fn resolve_query_and_fragment_against_schemeless_base() {
+        // RFC 3986 replaces only the query or fragment even when the effective
+        // XML Base is itself relative rather than scheme-bearing.
+        assert_eq!(resolve_uri("a/b?old#frag", "?new"), "a/b?new");
+        assert_eq!(resolve_uri("a/b?old#frag", "#new"), "a/b?old#new");
     }
 
     #[test]

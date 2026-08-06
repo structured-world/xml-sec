@@ -16,9 +16,9 @@ use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
     X509ChainOptions, X509DataInfo,
     parse::{
-        EC_P256_OID, EC_P384_OID, ParseError, parse_x509_certificate,
-        x509_certificate_matches_any_selector, x509_data_has_lookup_identifiers,
-        x509_selector_categories_match_chain,
+        EC_P256_OID, EC_P384_OID, ParseError, build_x509_certificate_chain_from,
+        parse_x509_certificate, x509_certificate_matches_any_selector,
+        x509_data_has_lookup_identifiers, x509_selector_categories_match_chain,
     },
     verify_dsa_signature_spki, verify_ecdsa_signature_spki, verify_rsa_signature_spki,
     verify_x509_certificate_chain,
@@ -204,8 +204,9 @@ pub enum KeyResolutionError {
 /// the documented TOFU model without constructing a certificate path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyResolverConfig {
-    /// DER-encoded certificates available to X.509 selectors but not trusted
-    /// unless they chain to an entry in [`Self::trusted_certs`].
+    /// DER-encoded certificates available to X.509 selectors and as untrusted
+    /// path intermediates. They establish trust only by chaining to an entry in
+    /// [`Self::trusted_certs`].
     pub lookup_certs: Vec<Vec<u8>>,
     /// DER-encoded certificates accepted as trust anchors.
     pub trusted_certs: Vec<Vec<u8>>,
@@ -266,31 +267,28 @@ impl DefaultKeyResolver {
             let certificate_der = info
                 .certificates
                 .get(signing_index)
-                .ok_or(KeyResolutionError::InvalidCertificate)?;
+                .ok_or(KeyResolutionError::InvalidCertificate)?
+                .clone();
             if self.config.verify_chains {
                 self.verify_x509_policy(info)?;
             }
             certificate_der
         } else {
-            let Some(certificate) = self.resolve_configured_x509(info)? else {
+            let Some(selected) = self.resolve_configured_x509(info)? else {
                 return Ok(None);
             };
             if self.config.verify_chains {
-                let parsed = parse_x509_certificate(certificate)
-                    .map_err(|_| KeyResolutionError::InvalidCertificate)?;
-                let selected = X509DataInfo {
-                    certificates: vec![certificate.clone()],
-                    parsed_certificates: vec![parsed],
-                    certificate_chain: vec![0],
-                    crls: info.crls.clone(),
-                    ..X509DataInfo::default()
-                };
                 self.verify_x509_policy(&selected)?;
             }
-            certificate
+            selected
+                .certificate_chain
+                .first()
+                .and_then(|index| selected.certificates.get(*index))
+                .ok_or(KeyResolutionError::InvalidCertificate)?
+                .clone()
         };
 
-        let (rest, certificate) = X509Certificate::from_der(certificate_der)
+        let (rest, certificate) = X509Certificate::from_der(&certificate_der)
             .map_err(|_| KeyResolutionError::InvalidCertificate)?;
         if !rest.is_empty() {
             return Err(KeyResolutionError::InvalidCertificate);
@@ -300,7 +298,7 @@ impl DefaultKeyResolver {
         Ok(Some(VerificationKey {
             algorithm,
             public_key_bytes,
-            certificate_der: Some(certificate_der.clone()),
+            certificate_der: Some(certificate_der),
             name: None,
         }))
     }
@@ -319,14 +317,22 @@ impl DefaultKeyResolver {
         Ok(())
     }
 
-    fn resolve_configured_x509<'a>(
-        &'a self,
+    fn resolve_configured_x509(
+        &self,
         info: &X509DataInfo,
-    ) -> Result<Option<&'a Vec<u8>>, KeyResolutionError> {
+    ) -> Result<Option<X509DataInfo>, KeyResolutionError> {
         if !x509_data_has_lookup_identifiers(info) {
             return Ok(None);
         }
 
+        let mut available = X509DataInfo {
+            subject_names: info.subject_names.clone(),
+            issuer_serials: info.issuer_serials.clone(),
+            skis: info.skis.clone(),
+            crls: info.crls.clone(),
+            digests: info.digests.clone(),
+            ..X509DataInfo::default()
+        };
         let mut matches = Vec::new();
         for certificate_der in self
             .config
@@ -344,14 +350,16 @@ impl DefaultKeyResolver {
                     _ => KeyResolutionError::InvalidCertificate,
                 })?;
             if is_match {
-                matches.push((certificate_der, parsed));
+                matches.push((available.certificates.len(), parsed.clone()));
             }
+            available.certificates.push(certificate_der.clone());
+            available.parsed_certificates.push(parsed);
         }
 
         let matched_chain = X509DataInfo {
             certificates: matches
                 .iter()
-                .map(|(certificate, _)| (*certificate).clone())
+                .map(|(index, _)| available.certificates[*index].clone())
                 .collect(),
             parsed_certificates: matches.iter().map(|(_, parsed)| parsed.clone()).collect(),
             ..X509DataInfo::default()
@@ -372,9 +380,9 @@ impl DefaultKeyResolver {
             return Ok(None);
         }
 
-        match matches.as_slice() {
-            [] => Ok(None),
-            [(certificate, _)] => Ok(Some(certificate)),
+        let signing_index = match matches.as_slice() {
+            [] => return Ok(None),
+            [(index, _)] => *index,
             _ => {
                 let leaves = matches
                     .iter()
@@ -386,11 +394,19 @@ impl DefaultKeyResolver {
                     })
                     .collect::<Vec<_>>();
                 match leaves.as_slice() {
-                    [(certificate, _)] => Ok(Some(certificate)),
-                    _ => Err(KeyResolutionError::AmbiguousCertificate),
+                    [(index, _)] => *index,
+                    _ => return Err(KeyResolutionError::AmbiguousCertificate),
                 }
             }
-        }
+        };
+        available.certificate_chain = build_x509_certificate_chain_from(&available, signing_index)
+            .map_err(|error| match error {
+                ParseError::InvalidStructure(reason) if reason.contains("ambiguous") => {
+                    KeyResolutionError::AmbiguousCertificate
+                }
+                _ => KeyResolutionError::InvalidCertificate,
+            })?;
+        Ok(Some(available))
     }
 
     fn resolve_key_value(
@@ -955,6 +971,71 @@ mod tests {
             .expect("selector-resolved leaf should chain to its configured issuer");
 
         assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn selector_resolved_leaf_uses_lookup_intermediate() {
+        // Lookup certificates may complete an untrusted path, but only the
+        // separately configured root is allowed to establish trust.
+        let mut root_params =
+            rcgen::CertificateParams::new(Vec::new()).expect("empty root SAN list should be valid");
+        root_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "lookup root");
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        root_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let root = rcgen::CertifiedIssuer::self_signed(
+            root_params,
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root certificate should be self-signable");
+
+        let mut intermediate_params = rcgen::CertificateParams::new(Vec::new())
+            .expect("empty intermediate SAN list should be valid");
+        intermediate_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "lookup intermediate");
+        intermediate_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        intermediate_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let intermediate = rcgen::CertifiedIssuer::signed_by(
+            intermediate_params,
+            rcgen::KeyPair::generate().expect("intermediate key generation should succeed"),
+            &root,
+        )
+        .expect("root should sign the intermediate certificate");
+
+        let mut leaf_params =
+            rcgen::CertificateParams::new(Vec::new()).expect("empty leaf SAN list should be valid");
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "lookup leaf");
+        let leaf = leaf_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &intermediate,
+            )
+            .expect("intermediate should sign the leaf certificate");
+        let key_info_xml = concat!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+            "<X509Data><X509SubjectName>CN=lookup leaf</X509SubjectName></X509Data>",
+            "</KeyInfo>"
+        );
+        let document = roxmltree::Document::parse(key_info_xml)
+            .expect("static selector KeyInfo should parse as XML");
+        let key_info = super::super::parse_key_info(document.root_element())
+            .expect("static selector KeyInfo should satisfy XMLDSig structure");
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![leaf.der().to_vec(), intermediate.der().to_vec()],
+            trusted_certs: vec![root.der().to_vec()],
+            verify_chains: true,
+            ..KeyResolverConfig::default()
+        });
+
+        let resolved = resolver
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .expect("selector-resolved leaf should chain through the lookup intermediate");
+
+        assert!(resolved.is_some());
     }
 
     #[test]

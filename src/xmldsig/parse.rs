@@ -56,9 +56,11 @@ pub(crate) const MAX_X509_DECODED_BINARY_LEN: usize =
     MAX_X509_BASE64_NORMALIZED_LEN.div_ceil(4) * 3;
 const MAX_X509_SUBJECT_NAME_TEXT_LEN: usize = 16_384;
 const MAX_X509_ISSUER_NAME_TEXT_LEN: usize = 16_384;
+const MAX_X509_SERIAL_NUMBER_RAW_TEXT_LEN: usize = 16_384;
 // RFC 5280 permits at most 20 DER content octets for a positive certificate
-// serial number. The sign bit leaves 159 value bits, or at most 49 decimal digits.
-const MAX_X509_SERIAL_NUMBER_TEXT_LEN: usize = 49;
+// serial number. The sign bit leaves 159 value bits, or at most 49 significant
+// decimal digits; XML Schema permits insignificant leading zeroes.
+const MAX_X509_SERIAL_NUMBER_VALUE_DIGITS: usize = 49;
 const MAX_X509_SERIAL_NUMBER_BYTES: usize = 20;
 const MAX_X509_DATA_ENTRY_COUNT: usize = 64;
 pub(crate) const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
@@ -1151,6 +1153,21 @@ fn build_x509_certificate_chain(info: &X509DataInfo) -> Result<Vec<usize>, Parse
     }
 
     let signing_idx = select_x509_signing_certificate(info)?;
+    build_x509_certificate_chain_from(info, signing_idx)
+}
+
+/// Order an available certificate pool from a preselected signing certificate.
+pub(crate) fn build_x509_certificate_chain_from(
+    info: &X509DataInfo,
+    signing_idx: usize,
+) -> Result<Vec<usize>, ParseError> {
+    if signing_idx >= info.parsed_certificates.len()
+        || info.parsed_certificates.len() != info.certificates.len()
+    {
+        return Err(ParseError::InvalidStructure(
+            "X509Data certificate metadata is inconsistent".into(),
+        ));
+    }
     let mut chain = vec![signing_idx];
 
     loop {
@@ -1673,8 +1690,9 @@ fn format_x509_serial_value_hex(serial: &[u8]) -> String {
 fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
     let serial = serial.trim();
     let serial = serial.strip_prefix('+').unwrap_or(serial);
-    if serial.is_empty()
-        || serial.len() > MAX_X509_SERIAL_NUMBER_TEXT_LEN
+    let serial = serial.trim_start_matches('0');
+    let serial = if serial.is_empty() { "0" } else { serial };
+    if serial.len() > MAX_X509_SERIAL_NUMBER_VALUE_DIGITS
         || !serial.bytes().all(|byte| byte.is_ascii_digit())
     {
         return None;
@@ -1896,40 +1914,56 @@ fn collect_text_content_bounded(
 }
 
 fn collect_x509_serial_number(node: Node<'_, '_>) -> Result<String, ParseError> {
-    let mut serial = String::with_capacity(MAX_X509_SERIAL_NUMBER_TEXT_LEN);
+    let mut serial = String::with_capacity(MAX_X509_SERIAL_NUMBER_VALUE_DIGITS);
+    let mut raw_text_len = 0usize;
     let mut trailing_whitespace = false;
     let mut explicit_positive = false;
+    let mut saw_digit = false;
 
-    for byte in node
+    for chunk in node
         .children()
         .filter_map(|child| child.is_text().then(|| child.text()).flatten())
-        .flat_map(str::bytes)
     {
-        if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
-            trailing_whitespace |= explicit_positive || !serial.is_empty();
-            continue;
-        }
-        if byte == b'+' && serial.is_empty() && !explicit_positive && !trailing_whitespace {
-            explicit_positive = true;
-            continue;
-        }
-        if trailing_whitespace || !byte.is_ascii_digit() {
+        raw_text_len = raw_text_len.saturating_add(chunk.len());
+        if raw_text_len > MAX_X509_SERIAL_NUMBER_RAW_TEXT_LEN {
             return Err(ParseError::InvalidStructure(
-                "invalid X509SerialNumber decimal value".into(),
+                "X509SerialNumber exceeds maximum allowed text length".into(),
             ));
         }
-        if serial.len() == MAX_X509_SERIAL_NUMBER_TEXT_LEN {
-            return Err(ParseError::InvalidStructure(
-                "X509SerialNumber exceeds maximum allowed decimal length".into(),
-            ));
+        for byte in chunk.bytes() {
+            if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                trailing_whitespace |= explicit_positive || saw_digit;
+                continue;
+            }
+            if byte == b'+' && !saw_digit && !explicit_positive && !trailing_whitespace {
+                explicit_positive = true;
+                continue;
+            }
+            if trailing_whitespace || !byte.is_ascii_digit() {
+                return Err(ParseError::InvalidStructure(
+                    "invalid X509SerialNumber decimal value".into(),
+                ));
+            }
+            saw_digit = true;
+            if byte == b'0' && serial.is_empty() {
+                continue;
+            }
+            if serial.len() == MAX_X509_SERIAL_NUMBER_VALUE_DIGITS {
+                return Err(ParseError::InvalidStructure(
+                    "X509SerialNumber exceeds maximum allowed decimal value".into(),
+                ));
+            }
+            serial.push(char::from(byte));
         }
-        serial.push(char::from(byte));
     }
 
-    if serial.is_empty() {
+    if !saw_digit {
         return Err(ParseError::InvalidStructure(
             "X509IssuerSerial requires non-empty X509IssuerName and X509SerialNumber".into(),
         ));
+    }
+    if serial.is_empty() {
+        serial.push('0');
     }
     if x509_serial_decimal_to_hex(&serial).is_none() {
         return Err(ParseError::InvalidStructure(
@@ -2700,9 +2734,10 @@ BA== </Modulus>
 
     #[test]
     fn parse_key_info_uses_decimal_issuer_serial_to_select_x509_signing_certificate() {
+        let serial = "680572598617295163017172295025714171905498632019";
+        let padded_serial = format!("{}{}", "0".repeat(64), serial);
         assert_eq!(
-            x509_serial_decimal_to_hex("680572598617295163017172295025714171905498632019")
-                .as_deref(),
+            x509_serial_decimal_to_hex(&padded_serial).as_deref(),
             Some("7735EE487F6862DAF1B3956D961CCB0FA6F34F53")
         );
         let root = fixture_cert_base64("../../tests/fixtures/keys/cacert.pem");
@@ -2714,7 +2749,7 @@ BA== </Modulus>
                 <X509Data>
                     <X509IssuerSerial>
                         <X509IssuerName>Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName>
-                        <X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber>
+                        <X509SerialNumber>{padded_serial}</X509SerialNumber>
                     </X509IssuerSerial>
                     <X509Certificate>{root}</X509Certificate>
                     <X509Certificate>{intermediate}</X509Certificate>
@@ -2862,7 +2897,7 @@ BA== </Modulus>
 
     #[test]
     fn build_x509_certificate_chain_rejects_chain_exceeding_max_depth() {
-        let parsed_certificates = (0..=MAX_X509_CHAIN_DEPTH)
+        let parsed_certificates: Vec<ParsedX509Certificate> = (0..=MAX_X509_CHAIN_DEPTH)
             .map(|idx| ParsedX509Certificate {
                 subject_dn: format!("CN=cert-{idx}"),
                 issuer_dn: if idx == MAX_X509_CHAIN_DEPTH {
@@ -2878,7 +2913,9 @@ BA== </Modulus>
                 },
             })
             .collect();
+        let certificates = vec![Vec::new(); parsed_certificates.len()];
         let info = X509DataInfo {
+            certificates,
             parsed_certificates,
             ..X509DataInfo::default()
         };
@@ -2909,6 +2946,10 @@ BA== </Modulus>
             x509_serial_decimal_to_hex("0000000000000000000000000000000000000000000000001"),
             Some("01".into())
         );
+        assert_eq!(
+            x509_serial_decimal_to_hex("00000000000000000000000000000000000000000000000001"),
+            Some("01".into())
+        );
         assert_eq!(x509_serial_decimal_to_hex("+1"), Some("01".into()));
 
         for invalid in [
@@ -2919,7 +2960,6 @@ BA== </Modulus>
             "++1",
             "-1",
             "1a",
-            "00000000000000000000000000000000000000000000000001",
             "730750818665451459101842416358141509827966271488",
             "1461501637330902918203684832716283019655932542976",
         ] {
@@ -3032,7 +3072,7 @@ BA== </Modulus>
     #[test]
     fn parse_key_info_accepts_large_textual_x509_entries_within_entry_budget() {
         let issuer_name = "C".repeat(MAX_X509_ISSUER_NAME_TEXT_LEN);
-        let serial_number = "0".repeat(MAX_X509_SERIAL_NUMBER_TEXT_LEN - 1) + "1";
+        let serial_number = "0".repeat(MAX_X509_SERIAL_NUMBER_VALUE_DIGITS - 1) + "1";
         let issuer_serials = (0..52)
             .map(|_| {
                 format!(
@@ -3052,6 +3092,25 @@ BA== </Modulus>
             _ => panic!("expected X509Data source"),
         };
         assert_eq!(parsed.issuer_serials.len(), 52);
+    }
+
+    #[test]
+    fn parse_key_info_bounds_raw_x509_serial_text() {
+        // Leading zeroes are lexically valid, but their raw XML representation
+        // remains bounded independently from the canonical certificate value.
+        let serial = "0".repeat(MAX_X509_SERIAL_NUMBER_RAW_TEXT_LEN + 1);
+        let xml = format!(
+            "<KeyInfo xmlns=\"{XMLDSIG_NS}\"><X509Data><X509IssuerSerial><X509IssuerName>CN=issuer</X509IssuerName><X509SerialNumber>{serial}</X509SerialNumber></X509IssuerSerial></X509Data></KeyInfo>"
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let error = parse_key_info(doc.root_element()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::InvalidStructure(reason)
+                if reason == "X509SerialNumber exceeds maximum allowed text length"
+        ));
     }
 
     #[test]

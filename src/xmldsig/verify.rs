@@ -500,11 +500,18 @@ fn reference_origin_node<'a, 'input>(
             .filter(is_reference)
             .nth(reference_index),
         ReferenceSet::Manifest => signature_node
-            .descendants()
+            .children()
             .filter(|node| {
                 node.is_element()
                     && node.tag_name().namespace() == Some(XMLDSIG_NS)
-                    && node.tag_name().name() == "Manifest"
+                    && node.tag_name().name() == "Object"
+            })
+            .flat_map(|object| {
+                object.children().filter(|node| {
+                    node.is_element()
+                        && node.tag_name().namespace() == Some(XMLDSIG_NS)
+                        && node.tag_name().name() == "Manifest"
+                })
             })
             .flat_map(|manifest| manifest.children().filter(is_reference))
             .nth(reference_index),
@@ -1883,6 +1890,39 @@ mod tests {
     }
 
     #[test]
+    fn query_only_reference_resolves_against_relative_xml_base() {
+        // A query-only URI replaces the inherited base query without changing
+        // its relative path; no absolute document base is required by XML Base.
+        let payload = b"query-selected payload";
+        let digest = base64::engine::general_purpose::STANDARD
+            .encode(compute_digest(DigestAlgorithm::Sha256, payload));
+        let xml = format!(
+            r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo>
+                <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+                <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+                <ds:Reference xml:base="a/b?old" URI="?new">
+                    <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                    <ds:DigestValue>{digest}</ds:DigestValue>
+                </ds:Reference>
+            </ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue></ds:Signature>"#
+        );
+        let document = Document::parse(&xml).unwrap();
+        let signature = document.root_element();
+        let signed_info_node = signature
+            .children()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "SignedInfo")))
+            .unwrap();
+        let signed_info = parse_signed_info(signed_info_node).unwrap();
+        let resources = HashMap::from([("a/b?new".to_string(), payload.to_vec())]);
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+
+        let result = process_all_references(&signed_info.references, &resolver, signature, false)
+            .expect("query-only URI must resolve against the complete relative base path");
+
+        assert!(result.all_valid());
+    }
+
+    #[test]
     fn manifest_reference_resolution_uses_its_effective_xml_base() {
         // Manifest references carry their own XML Base context and must not
         // accidentally reuse the SignedInfo or Signature element context.
@@ -1921,6 +1961,62 @@ mod tests {
             false,
         )
         .expect("Manifest Reference should inherit its own XML Base context");
+
+        assert_eq!(result.status, DsigStatus::Valid);
+    }
+
+    #[test]
+    fn manifest_reference_index_ignores_nested_manifest_descendants() {
+        // The public Manifest index follows Signature/Object/Manifest structure;
+        // wrapper descendants must not steal an index and supply another base URI.
+        let payload = b"direct manifest payload";
+        let digest = base64::engine::general_purpose::STANDARD
+            .encode(compute_digest(DigestAlgorithm::Sha256, payload));
+        let xml = format!(
+            r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}" xml:base="https://example.test/">
+                <ds:Object><wrapper><ds:Manifest xml:base="nested/">
+                    <ds:Reference URI="payload.bin">
+                        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                        <ds:DigestValue>{digest}</ds:DigestValue>
+                    </ds:Reference>
+                </ds:Manifest></wrapper></ds:Object>
+                <ds:Object><ds:Manifest xml:base="direct/">
+                    <ds:Reference URI="payload.bin">
+                        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                        <ds:DigestValue>{digest}</ds:DigestValue>
+                    </ds:Reference>
+                </ds:Manifest></ds:Object>
+            </ds:Signature>"#
+        );
+        let document = Document::parse(&xml).unwrap();
+        let signature = document.root_element();
+        let direct_reference_node = signature
+            .children()
+            .filter(|node| node.has_tag_name((XMLDSIG_NS, "Object")))
+            .nth(1)
+            .unwrap()
+            .children()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "Manifest")))
+            .unwrap()
+            .children()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "Reference")))
+            .unwrap();
+        let reference = super::super::parse::parse_reference(direct_reference_node).unwrap();
+        let resources = HashMap::from([(
+            "https://example.test/direct/payload.bin".to_string(),
+            payload.to_vec(),
+        )]);
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+
+        let result = process_reference(
+            &reference,
+            &resolver,
+            signature,
+            ReferenceSet::Manifest,
+            0,
+            false,
+        )
+        .expect("Manifest index must select the direct Object/Manifest reference");
 
         assert_eq!(result.status, DsigStatus::Valid);
     }
