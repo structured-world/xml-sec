@@ -572,6 +572,55 @@ mod tests {
     }
 
     #[test]
+    fn pathless_relative_xml_base_preserves_relative_resource_identity() {
+        // Query-only xml:base values do not turn a relative URI into an
+        // absolute-path reference when resolving caller-owned resources.
+        let xml = r#"<root xml:base="?old">
+            <reference URI="data.bin"/>
+        </root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([("data.bin".to_owned(), b"payload".to_vec())]);
+        let budget = NodeSetMaterializationBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(reference.attribute("URI").unwrap(), reference, &budget)
+            .unwrap();
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
+    fn unicode_external_uri_resolves_without_panicking() {
+        // Untrusted XML may start a relative URI with a multibyte scalar; the
+        // resolver must produce its UTF-8 resource identity without panicking.
+        let xml = r#"<root xml:base="https://example.test/base/">
+            <reference URI="é?x"/>
+        </root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([(
+            "https://example.test/base/é?x".to_owned(),
+            b"payload".to_vec(),
+        )]);
+        let budget = NodeSetMaterializationBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(reference.attribute("URI").unwrap(), reference, &budget)
+            .unwrap();
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
     fn namespaced_id_attr_found_by_local_name() {
         // roxmltree strips prefix: `wsu:Id` → local name "Id", which is in DEFAULT_ID_ATTRS
         let xml =

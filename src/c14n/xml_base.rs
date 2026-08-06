@@ -150,7 +150,7 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
             }
             let (ref_path, ref_suffix) = split_path_suffix(reference);
             let base_path_only = strip_query_fragment(base);
-            let merged = merge_paths(base_path_only, ref_path);
+            let merged = merge_paths(base_path_only, ref_path, false);
             let cleaned = remove_dot_segments(&merged);
             return format!("{cleaned}{ref_suffix}");
         }
@@ -193,7 +193,7 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
     // Relative path — merge with base path (strip query/fragment from
     // base_path first, since merge operates on the path component only).
     let clean_base_path = strip_query_fragment(base_path);
-    let merged = merge_paths(clean_base_path, ref_path);
+    let merged = merge_paths(clean_base_path, ref_path, authority.is_some());
     let cleaned = remove_dot_segments(&merged);
     let mut result = recompose(scheme, authority, &cleaned);
     result.push_str(ref_suffix);
@@ -280,16 +280,14 @@ fn recompose(scheme: &str, authority: Option<&str>, path: &str) -> String {
 /// first character to preserve leading `?`/`#` semantics (those are handled
 /// separately as query-only / fragment-only references).
 fn split_path_suffix(reference: &str) -> (&str, &str) {
-    // Find the earliest '?' or '#' after position 0
-    let mut split_at = reference.len();
-    for ch in ['?', '#'] {
-        if let Some(pos) = reference[1..].find(ch) {
-            let abs_pos = pos + 1;
-            if abs_pos < split_at {
-                split_at = abs_pos;
-            }
-        }
-    }
+    // Character indices remain valid UTF-8 slice boundaries for untrusted XML
+    // attribute values. The first scalar is intentionally skipped because
+    // leading query/fragment references are handled before this helper.
+    let split_at = reference
+        .char_indices()
+        .skip(1)
+        .find_map(|(index, ch)| matches!(ch, '?' | '#').then_some(index))
+        .unwrap_or(reference.len());
     (&reference[..split_at], &reference[split_at..])
 }
 
@@ -303,8 +301,12 @@ fn strip_query_fragment(s: &str) -> &str {
 }
 
 /// Merge a relative reference with a base path per RFC 3986 §5.2.3.
-fn merge_paths(base_path: &str, reference: &str) -> String {
-    if base_path.is_empty() {
+///
+/// An authority with an empty path contributes the leading `/`; an empty
+/// schemeless base does not. Keeping that distinction explicit prevents a
+/// relative XML Base from changing the reference kind.
+fn merge_paths(base_path: &str, reference: &str, base_has_authority: bool) -> String {
+    if base_has_authority && base_path.is_empty() {
         format!("/{reference}")
     } else {
         // Remove everything after the last segment of base path.
@@ -325,7 +327,7 @@ mod merge_tests {
     /// Non-hierarchical base path (no '/') should return reference as-is.
     #[test]
     fn non_hierarchical_base_does_not_add_slash() {
-        assert_eq!(merge_paths("foo:bar", "baz"), "baz");
+        assert_eq!(merge_paths("foo:bar", "baz", false), "baz");
     }
 }
 
@@ -479,6 +481,13 @@ mod tests {
     }
 
     #[test]
+    fn resolve_pathless_schemeless_base_preserves_relative_reference() {
+        // A query-only relative base has no authority. RFC 3986 therefore
+        // preserves a relative reference instead of introducing a root slash.
+        assert_eq!(resolve_uri("?old", "data.bin"), "data.bin");
+    }
+
+    #[test]
     fn resolve_query_and_fragment_against_schemeless_base() {
         // RFC 3986 replaces only the query or fragment even when the effective
         // XML Base is itself relative rather than scheme-bearing.
@@ -528,6 +537,16 @@ mod tests {
         assert_eq!(
             resolve_uri("http://example.com/a/b", "c?x=1"),
             "http://example.com/a/c?x=1"
+        );
+    }
+
+    #[test]
+    fn resolve_unicode_reference_with_query_uses_utf8_boundaries() {
+        // XML attributes are Unicode strings. URI component splitting must not
+        // index through the first multibyte scalar as if it were one byte.
+        assert_eq!(
+            resolve_uri("https://example.test/base/", "é?x"),
+            "https://example.test/base/é?x"
         );
     }
 

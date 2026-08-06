@@ -400,11 +400,21 @@ impl DefaultKeyResolver {
                 }
             }
         };
-        available.certificate_chain = build_x509_certificate_chain_from(&available, signing_index)
-            .map_err(|error| match error {
-                X509ChainBuildError::AmbiguousIssuer => KeyResolutionError::AmbiguousCertificate,
-                _ => KeyResolutionError::InvalidCertificate,
-            })?;
+        // `available` preserves trusted certificates as a prefix. Selecting
+        // one of those exact certificates is already a terminal trust
+        // decision, even when the certificate is not self-signed.
+        available.certificate_chain = if signing_index < self.config.trusted_certs.len() {
+            vec![signing_index]
+        } else {
+            build_x509_certificate_chain_from(&available, signing_index).map_err(|error| {
+                match error {
+                    X509ChainBuildError::AmbiguousIssuer => {
+                        KeyResolutionError::AmbiguousCertificate
+                    }
+                    _ => KeyResolutionError::InvalidCertificate,
+                }
+            })?
+        };
         Ok(Some(available))
     }
 
@@ -929,6 +939,58 @@ mod tests {
         let resolved = resolver
             .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
             .expect("configured self-signed certificate should validate as its own anchor");
+
+        assert!(resolved.is_some());
+    }
+
+    #[test]
+    fn selector_resolved_non_self_signed_trust_anchor_terminates_the_path() {
+        // Trust is assigned to the exact configured certificate, not inferred
+        // from self-signing. A lookup-only issuer must not extend that anchor
+        // into a new path that requires another trust decision.
+        let mut issuer_params = rcgen::CertificateParams::new(Vec::new())
+            .expect("empty issuer SAN list should be valid");
+        issuer_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "lookup-only issuer");
+        issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        issuer_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let issuer = rcgen::CertifiedIssuer::self_signed(
+            issuer_params,
+            rcgen::KeyPair::generate().expect("issuer key generation should succeed"),
+        )
+        .expect("issuer certificate should be self-signable");
+
+        let mut anchor_params = rcgen::CertificateParams::new(Vec::new())
+            .expect("empty anchor SAN list should be valid");
+        anchor_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "direct trust anchor");
+        let anchor = anchor_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("anchor key generation should succeed"),
+                &issuer,
+            )
+            .expect("issuer should sign the directly trusted certificate");
+        let key_info_xml = concat!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+            "<X509Data><X509SubjectName>CN=direct trust anchor</X509SubjectName></X509Data>",
+            "</KeyInfo>"
+        );
+        let document = roxmltree::Document::parse(key_info_xml)
+            .expect("static selector KeyInfo should parse as XML");
+        let key_info = super::super::parse_key_info(document.root_element())
+            .expect("static selector KeyInfo should satisfy XMLDSig structure");
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![anchor.der().to_vec()],
+            lookup_certs: vec![issuer.der().to_vec()],
+            verify_chains: true,
+            ..KeyResolverConfig::default()
+        });
+
+        let resolved = resolver
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .expect("an explicitly trusted selected certificate must terminate its path");
 
         assert!(resolved.is_some());
     }
