@@ -51,14 +51,25 @@ struct InstallHarness {
 
 impl InstallHarness {
     fn new() -> Self {
+        Self::with_previous_install(true)
+    }
+
+    fn without_previous_install() -> Self {
+        Self::with_previous_install(false)
+    }
+
+    fn with_previous_install(has_previous_install: bool) -> Self {
         let root = TestDirectory::new();
         let tools = root.path().join("tools");
         let prefix = root.path().join("xmlsec-prefix");
 
-        std::fs::create_dir_all(prefix.join("bin")).expect("old installation must be creatable");
+        if has_previous_install {
+            std::fs::create_dir_all(prefix.join("bin"))
+                .expect("old installation must be creatable");
+            std::fs::write(prefix.join("sentinel"), "previous installation")
+                .expect("old installation sentinel must be writable");
+        }
         std::fs::create_dir_all(&tools).expect("fake tool directory must be creatable");
-        std::fs::write(prefix.join("sentinel"), "previous installation")
-            .expect("old installation sentinel must be writable");
 
         root.tool(
             "git",
@@ -67,7 +78,7 @@ impl InstallHarness {
         root.tool("nproc", "#!/bin/sh\nprintf '1\\n'\n");
         root.tool(
             "make",
-            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in DESTDIR=*) dest=${arg#DESTDIR=} ;; esac\ndone\nif [ -n \"${dest:-}\" ]; then\n  mkdir -p \"$dest$XMLSEC1_PREFIX/bin\"\n  printf '#!/bin/sh\\nexit 0\\n' > \"$dest$XMLSEC1_PREFIX/bin/xmlsec1\"\n  chmod +x \"$dest$XMLSEC1_PREFIX/bin/xmlsec1\"\nfi\n",
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in DESTDIR=*) dest=${arg#DESTDIR=} ;; esac\ndone\nif [ -n \"${dest:-}\" ]; then\n  mkdir -p \"$dest$XMLSEC1_PREFIX/bin\"\n  printf '#!/bin/sh\\nexit \"${XMLSEC1_SMOKE_EXIT:-0}\"\\n' > \"$dest$XMLSEC1_PREFIX/bin/xmlsec1\"\n  chmod +x \"$dest$XMLSEC1_PREFIX/bin/xmlsec1\"\nfi\n",
         );
         root.tool(
             "mv",
@@ -85,6 +96,7 @@ impl InstallHarness {
         &self,
         mv_fail_on: Option<u8>,
         reported_commit: Option<&str>,
+        smoke_exit: Option<u8>,
     ) -> std::process::ExitStatus {
         let inherited_path = std::env::var_os("PATH").expect("test process must have PATH");
         let path = std::env::join_paths(
@@ -107,6 +119,9 @@ impl InstallHarness {
         if let Some(reported_commit) = reported_commit {
             command.env("GIT_REPORTED_COMMIT", reported_commit);
         }
+        if let Some(smoke_exit) = smoke_exit {
+            command.env("XMLSEC1_SMOKE_EXIT", smoke_exit.to_string());
+        }
         command.status().expect("installation script must run")
     }
 }
@@ -117,7 +132,7 @@ fn failed_install_replacement_restores_previous_xmlsec() {
     // leave the previously working installation intact rather than letting
     // EXIT cleanup delete its backup.
     let harness = InstallHarness::new();
-    let status = harness.run(Some(2), None);
+    let status = harness.run(Some(2), None, None);
 
     assert!(
         !status.success(),
@@ -135,7 +150,7 @@ fn installer_rejects_source_revision_mismatch() {
     // Artifact compression is not source identity. The installer must reject
     // a fetch whose resolved Git object differs from the pinned commit.
     let harness = InstallHarness::new();
-    let status = harness.run(None, Some("0000000000000000000000000000000000000000"));
+    let status = harness.run(None, Some("0000000000000000000000000000000000000000"), None);
 
     assert!(
         !status.success(),
@@ -145,5 +160,19 @@ fn installer_rejects_source_revision_mismatch() {
         std::fs::read_to_string(harness.prefix.join("sentinel"))
             .expect("failed source verification must preserve the previous installation"),
         "previous installation"
+    );
+}
+
+#[test]
+fn failed_first_install_removes_promoted_prefix() {
+    // A failed smoke test must not leave an executable plus source marker that
+    // a later invocation could mistake for a validated installation.
+    let harness = InstallHarness::without_previous_install();
+    let status = harness.run(None, None, Some(17));
+
+    assert!(!status.success(), "injected smoke failure must propagate");
+    assert!(
+        !harness.prefix.exists(),
+        "failed first installation must remove its promoted prefix"
     );
 }

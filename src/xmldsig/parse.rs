@@ -16,7 +16,9 @@
 //! </Signature>
 //! ```
 
+use der::Decode;
 use roxmltree::{Document, Node};
+use x509_cert::name::Name;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 use x509_parser::public_key::PublicKey;
@@ -1349,16 +1351,73 @@ pub(crate) fn x509_selector_categories_match_chain(
 }
 
 fn distinguished_names_equal(left: &str, right: &str) -> bool {
-    fn components(name: &str) -> Vec<&str> {
-        name.trim()
-            .split(',')
-            .map(str::trim)
-            .filter(|component| !component.is_empty())
-            .collect()
+    fn trailing_whitespace_is_escaped(value: &str) -> bool {
+        let Some(prefix) = value.as_bytes().strip_suffix(b" ") else {
+            return false;
+        };
+        prefix
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count()
+            % 2
+            == 1
     }
-    let left = components(left);
-    let right = components(right);
-    left == right
+
+    fn remove_separator_padding(name: &str) -> String {
+        let mut normalized = String::with_capacity(name.len());
+        let mut chars = name
+            .trim_start_matches([' ', '\t', '\r', '\n'])
+            .chars()
+            .peekable();
+        let mut escaped = false;
+
+        while let Some(ch) = chars.next() {
+            if escaped {
+                normalized.push(ch);
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                normalized.push(ch);
+                escaped = true;
+                continue;
+            }
+            if matches!(ch, ',' | '+') {
+                while normalized
+                    .chars()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, ' ' | '\t' | '\r' | '\n'))
+                    && !trailing_whitespace_is_escaped(&normalized)
+                {
+                    normalized.pop();
+                }
+                normalized.push(ch);
+                while chars
+                    .next_if(|next| matches!(next, ' ' | '\t' | '\r' | '\n'))
+                    .is_some()
+                {}
+                continue;
+            }
+            normalized.push(ch);
+        }
+
+        while normalized
+            .chars()
+            .next_back()
+            .is_some_and(|last| matches!(last, ' ' | '\t' | '\r' | '\n'))
+            && !trailing_whitespace_is_escaped(&normalized)
+        {
+            normalized.pop();
+        }
+
+        normalized
+    }
+
+    let parse_name = |value: &str| remove_separator_padding(value).parse::<Name>().ok();
+    parse_name(left)
+        .zip(parse_name(right))
+        .is_some_and(|(left, right)| left == right)
 }
 
 fn ensure_x509_data_entry_budget(info: &X509DataInfo) -> Result<(), ParseError> {
@@ -1452,8 +1511,8 @@ pub(crate) fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certif
     // XMLDSig names follow RFC 4514 and serialize that sequence in reverse.
     // Normalize at the certificate boundary so matching remains ordered and
     // cannot confuse a DN with another hierarchy containing reversed RDNs.
-    let subject_dn = x509_name_to_rfc4514(cert.subject());
-    let issuer_dn = x509_name_to_rfc4514(cert.issuer());
+    let subject_dn = x509_name_to_rfc4514(cert.subject())?;
+    let issuer_dn = x509_name_to_rfc4514(cert.issuer())?;
     let serial_number = cert.tbs_certificate.raw_serial().to_vec();
     let serial_number_hex = format_x509_serial_value_hex(&serial_number);
 
@@ -1511,9 +1570,13 @@ pub(crate) fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certif
     })
 }
 
-fn x509_name_to_rfc4514(name: &X509Name<'_>) -> String {
-    let rdns = name.iter_rdn().cloned().collect::<Vec<_>>();
-    rdns.into_iter().rev().collect::<X509Name<'_>>().to_string()
+fn x509_name_to_rfc4514(name: &X509Name<'_>) -> Result<String, ParseError> {
+    let name = Name::from_der(name.as_raw()).map_err(|error| {
+        ParseError::InvalidStructure(format!(
+            "X509Certificate distinguished name is invalid DER: {error}"
+        ))
+    })?;
+    Ok(name.to_string())
 }
 
 fn format_x509_serial_hex(serial: &[u8]) -> String {
@@ -2843,6 +2906,33 @@ BA== </Modulus>
         assert!(!distinguished_names_equal(
             "CN=leaf,O=example",
             "O=example,CN=leaf"
+        ));
+    }
+
+    #[test]
+    fn distinguished_name_matching_handles_rfc4514_escaped_values() {
+        // Certificate values containing RFC 4514 separators and boundary spaces
+        // must remain one attribute when matched against an XMLDSig selector.
+        let value = " leading,plus+equals=slash\\trailing ";
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, value);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        let parsed = parse_x509_certificate(certificate.der()).unwrap();
+
+        assert_eq!(
+            parsed.subject_dn,
+            r"CN=\ leading\,plus\+equals=slash\\trailing\ "
+        );
+        assert!(distinguished_names_equal(
+            r"CN=\ leading\,plus\+equals=slash\\trailing\ ",
+            &parsed.subject_dn
+        ));
+        assert!(distinguished_names_equal(
+            "\n  CN=\\ leading\\,plus\\+equals=slash\\\\trailing\\ \n",
+            &parsed.subject_dn
         ));
     }
 

@@ -42,11 +42,12 @@ cbc = { version = "0.2.1", optional = true }
 
 # X.509 certificates
 x509-parser = { version = "0.18", features = ["verify"], optional = true }
+x509-cert = { version = "0.3", default-features = false, optional = true }
 der = { version = "0.8", optional = true }
 crypto-bigint = { version = "0.7", optional = true }
 
 # Base64 encoding/decoding
-base64 = "0.22"
+base64 = "0.23"
 
 # Error handling
 thiserror = "2"
@@ -75,6 +76,7 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:sxd-document-no-unsafe",
     "dep:sxd-xpath-no-unsafe",
     "dep:x509-parser",
+    "dep:x509-cert",
 ]
 xmlenc = [             # XML Encryption (encrypt + decrypt)
     "dep:aes",

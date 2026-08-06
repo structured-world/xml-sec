@@ -23,6 +23,7 @@ fi
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/xmlsec1-${XMLSEC1_VERSION}.XXXXXX")"
 previous_install="$work_dir/previous-install"
 had_previous_install=false
+promoted_install=false
 
 cleanup() {
   local status=$?
@@ -31,13 +32,17 @@ cleanup() {
 
   # Keep replacement transactional through the version smoke test. The
   # staged move is not a commit if installation or validation fails.
-  if (( status != 0 )) && [[ "$had_previous_install" == true ]]; then
-    rm -rf "$prefix"
-    if ! mv "$previous_install" "$prefix"; then
-      printf 'failed to restore previous xmlsec1 installation at %s; backup remains at %s\n' \
-        "$prefix" "$previous_install" >&2
-      status=1
-      remove_work_dir=false
+  if (( status != 0 )); then
+    if [[ "$promoted_install" == true ]]; then
+      rm -rf "$prefix"
+    fi
+    if [[ "$had_previous_install" == true ]]; then
+      if ! mv "$previous_install" "$prefix"; then
+        printf 'failed to restore previous xmlsec1 installation at %s; backup remains at %s\n' \
+          "$prefix" "$previous_install" >&2
+        status=1
+        remove_work_dir=false
+      fi
     fi
   fi
   if [[ "$remove_work_dir" == true ]]; then
@@ -84,6 +89,7 @@ if [[ -e "$prefix" ]]; then
   had_previous_install=true
 fi
 mv "$staged_prefix" "$prefix"
+promoted_install=true
 printf '%s\n' "$XMLSEC1_COMMIT" > "$marker"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
