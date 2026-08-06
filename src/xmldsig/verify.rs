@@ -169,7 +169,6 @@ pub struct VerifyContext<'a> {
     store_pre_digest: bool,
     transform_options: TransformOptions,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
-    allow_internal_dtd: bool,
 }
 
 impl<'a> VerifyContext<'a> {
@@ -192,7 +191,6 @@ impl<'a> VerifyContext<'a> {
             store_pre_digest: false,
             transform_options: TransformOptions::default(),
             external_resources: None,
-            allow_internal_dtd: false,
         }
     }
 
@@ -273,7 +271,7 @@ impl<'a> VerifyContext<'a> {
     /// Allow bounded internal DTD declarations while keeping external entity
     /// resolution disabled. This is off by default.
     pub fn allow_internal_dtd(mut self, enabled: bool) -> Self {
-        self.allow_internal_dtd = enabled;
+        self.transform_options = self.transform_options.allow_internal_dtd(enabled);
         self
     }
 
@@ -882,7 +880,7 @@ fn verify_signature_with_context(
     let doc = Document::parse_with_options(
         xml,
         roxmltree::ParsingOptions {
-            allow_dtd: ctx.allow_internal_dtd,
+            allow_dtd: ctx.transform_options.internal_dtd_allowed(),
             nodes_limit: XML_DOCUMENT_NODE_CEILING,
             entity_resolver: None,
         },
@@ -1905,6 +1903,79 @@ mod tests {
             .expect("each Reference should resolve against its own effective base");
 
         assert!(result.all_valid());
+    }
+
+    #[test]
+    fn internal_dtd_opt_in_applies_to_detached_xml_transforms() {
+        // The parse policy covers every XML document in one verification
+        // pipeline, including caller-owned octets converted to a node-set.
+        let detached = b"<!DOCTYPE payload [<!ELEMENT payload (#PCDATA)>]><payload>ok</payload>";
+        let digest = base64::engine::general_purpose::STANDARD.encode(compute_digest(
+            DigestAlgorithm::Sha256,
+            b"<payload>ok</payload>",
+        ));
+        let xml = format!(
+            r#"<root xmlns:ds="{XMLDSIG_NS}">
+  <ds:Signature>
+    <ds:SignedInfo>
+      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+      <ds:Reference URI="urn:detached-dtd">
+        <ds:Transforms>
+          <ds:Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/>
+        </ds:Transforms>
+        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+        <ds:DigestValue>{digest}</ds:DigestValue>
+      </ds:Reference>
+    </ds:SignedInfo>
+    <ds:SignatureValue>AQ==</ds:SignatureValue>
+  </ds:Signature>
+</root>"#
+        );
+        let resources = HashMap::from([("urn:detached-dtd".to_owned(), detached.to_vec())]);
+        let key = AcceptingKey;
+
+        let default_error = VerifyContext::new()
+            .key(&key)
+            .allowed_uri_types(UriTypeSet::ALL)
+            .external_resources(&resources)
+            .verify(&xml)
+            .expect_err("internal DTD parsing must remain disabled by default");
+        assert!(matches!(
+            default_error,
+            SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
+                crate::xmldsig::TransformError::XmlParse(_)
+            ))
+        ));
+
+        let result = VerifyContext::new()
+            .key(&key)
+            .allowed_uri_types(UriTypeSet::ALL)
+            .external_resources(&resources)
+            .allow_internal_dtd(true)
+            .verify(&xml)
+            .expect("the explicit DTD opt-in must cover detached XML transforms");
+
+        assert_eq!(result.status, DsigStatus::Valid);
+
+        let external_entity = br#"<!DOCTYPE payload [
+            <!ENTITY ext SYSTEM "file:///etc/passwd">
+        ]><payload>&ext;</payload>"#;
+        let external_entity_resources =
+            HashMap::from([("urn:detached-dtd".to_owned(), external_entity.to_vec())]);
+        let external_entity_error = VerifyContext::new()
+            .key(&key)
+            .allowed_uri_types(UriTypeSet::ALL)
+            .external_resources(&external_entity_resources)
+            .allow_internal_dtd(true)
+            .verify(&xml)
+            .expect_err("the internal-DTD opt-in must not resolve external entities");
+        assert!(matches!(
+            external_entity_error,
+            SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
+                crate::xmldsig::TransformError::XmlParse(_)
+            ))
+        ));
     }
 
     #[test]

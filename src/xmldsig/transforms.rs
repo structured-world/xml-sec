@@ -93,6 +93,7 @@ pub enum XPathHereSemantics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransformOptions {
     xpath_here_semantics: XPathHereSemantics,
+    allow_internal_dtd: bool,
 }
 
 #[derive(Default)]
@@ -247,8 +248,20 @@ impl TransformOptions {
         self
     }
 
+    /// Allow internal DTD declarations when a transform parses caller-supplied
+    /// octets as XML. External entity resolution remains disabled.
+    #[must_use]
+    pub fn allow_internal_dtd(mut self, enabled: bool) -> Self {
+        self.allow_internal_dtd = enabled;
+        self
+    }
+
     pub(crate) fn here_semantics(self) -> XPathHereSemantics {
         self.xpath_here_semantics
+    }
+
+    pub(crate) fn internal_dtd_allowed(self) -> bool {
+        self.allow_internal_dtd
     }
 }
 
@@ -779,7 +792,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
         let document = roxmltree::Document::parse_with_options(
             &xml,
             roxmltree::ParsingOptions {
-                allow_dtd: false,
+                allow_dtd: context.options.internal_dtd_allowed(),
                 nodes_limit: XML_DOCUMENT_NODE_CEILING,
                 entity_resolver: None,
             },

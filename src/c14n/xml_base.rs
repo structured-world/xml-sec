@@ -123,7 +123,7 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
     if has_scheme(reference) {
         let (absolute, suffix) = split_path_suffix(reference);
         let parts = parse_base(absolute).expect("has_scheme accepted the absolute reference");
-        let path = remove_dot_segments(parts.path);
+        let path = remove_dot_segments_from_absolute_reference(parts.path);
         let mut result = recompose(parts.scheme, parts.authority, &path);
         result.push_str(suffix);
         return result;
@@ -343,6 +343,20 @@ mod merge_tests {
 /// For absolute paths (starting with `/`), `..` at the root is a no-op.
 /// For relative paths, unresolved leading `..` segments are preserved.
 fn remove_dot_segments(path: &str) -> String {
+    remove_dot_segments_with_unmatched_parents(path, true)
+}
+
+/// Apply RFC 3986 section 5.2.4 to a reference that already supplied a scheme.
+/// Such a reference is the final target, so unresolved leading parents are
+/// discarded rather than retained for a later base-path merge.
+fn remove_dot_segments_from_absolute_reference(path: &str) -> String {
+    remove_dot_segments_with_unmatched_parents(path, false)
+}
+
+fn remove_dot_segments_with_unmatched_parents(
+    path: &str,
+    preserve_unmatched_parents: bool,
+) -> String {
     let is_absolute = path.starts_with('/');
     let mut segments: Vec<&str> = Vec::new();
 
@@ -364,7 +378,7 @@ fn remove_dot_segments(path: &str) -> String {
                 };
                 if can_pop {
                     segments.pop();
-                } else if !is_absolute {
+                } else if !is_absolute && preserve_unmatched_parents {
                     segments.push("..");
                 }
             }
@@ -521,6 +535,20 @@ mod tests {
         assert_eq!(
             resolve_uri("http://example.com/a", "urn:foo:bar"),
             "urn:foo:bar"
+        );
+    }
+
+    #[test]
+    fn resolve_rootless_absolute_uri_removes_leading_dot_segments() {
+        // Once a reference supplies its own scheme, RFC 3986 section 5.2.4
+        // discards unresolved leading dot segments from the final target path.
+        assert_eq!(
+            resolve_uri("https://example.test/base", "urn:../payload?version=1"),
+            "urn:payload?version=1"
+        );
+        assert_eq!(
+            resolve_uri("https://example.test/base", "urn:./payload"),
+            "urn:payload"
         );
     }
 

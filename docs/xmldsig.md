@@ -63,10 +63,12 @@ owning element's effective `xml:base` using RFC 3986 before lookup, so resource-
 that resolved URI. Other retrieval transform chains fail closed instead of being ignored.
 
 Internal DTD declarations are disabled by default and require
-`VerifyContext::allow_internal_dtd(true)`. External entity resolution remains disabled. XSLT is
-intentionally not executed because transforms operate on attacker-controlled documents; an
-authenticated Manifest reference using unsupported XSLT is reported as an invalid per-reference
-result without changing core `SignedInfo` validity.
+`VerifyContext::allow_internal_dtd(true)`. The policy applies consistently to the signed document
+and caller-supplied detached XML parsed by node-set transforms. Direct transform callers can set
+the same policy with `TransformOptions::allow_internal_dtd(true)`. External entity resolution
+remains disabled. XSLT is intentionally not executed because transforms operate on
+attacker-controlled documents; an authenticated Manifest reference using unsupported XSLT is
+reported as an invalid per-reference result without changing core `SignedInfo` validity.
 
 ## Current Scope
 
