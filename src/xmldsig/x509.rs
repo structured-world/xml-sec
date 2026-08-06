@@ -211,6 +211,12 @@ fn verify_certificate_signature(
     certificate: &X509Certificate<'_>,
     issuer: &X509Certificate<'_>,
 ) -> bool {
+    // RFC 5280 sections 4.1.1.2 and 4.1.2.3 require the outer and signed
+    // AlgorithmIdentifier values to be identical. Enforce this independently
+    // of the backend so the legacy DSA path cannot bypass the invariant.
+    if certificate.signature_algorithm != certificate.tbs_certificate.signature {
+        return false;
+    }
     if certificate
         .verify_signature(Some(issuer.public_key()))
         .is_ok()
@@ -250,6 +256,11 @@ fn certificate_names_equal(
 }
 
 fn verify_crl_signature(crl: &CertificateRevocationList<'_>, issuer: &X509Certificate<'_>) -> bool {
+    // RFC 5280 sections 5.1.1.2 and 5.1.2.2 impose the same equality rule on
+    // CRLs as certificates.
+    if crl.signature_algorithm != crl.tbs_cert_list.signature {
+        return false;
+    }
     if crl.verify_signature(issuer.public_key()).is_ok() {
         return true;
     }
@@ -512,6 +523,30 @@ mod tests {
     }
 
     #[test]
+    fn dsa_certificate_rejects_mismatched_inner_signature_algorithm() {
+        // The signed TBSCertificate algorithm is a separate RFC 5280 invariant;
+        // a valid signature over the original bytes must not bypass a mismatch
+        // in the parsed metadata through the legacy DSA fallback.
+        let (_, mut certificate) = X509Certificate::from_der(include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
+        ))
+        .expect("the tracked Merlin certificate is valid DER");
+        let (_, issuer) = X509Certificate::from_der(include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/ca.der"
+        ))
+        .expect("the tracked Merlin issuer is a DER certificate");
+        assert!(verify_certificate_signature(&certificate, &issuer));
+
+        certificate.tbs_certificate.signature = issuer.public_key().algorithm.clone();
+
+        assert_ne!(
+            certificate.tbs_certificate.signature,
+            certificate.signature_algorithm
+        );
+        assert!(!verify_certificate_signature(&certificate, &issuer));
+    }
+
+    #[test]
     fn dsa_sha1_crl_signature_uses_the_same_fallback_as_certificates() {
         let xml = include_str!(
             "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt-crl.xml"
@@ -533,5 +568,33 @@ mod tests {
             .expect("the tracked Merlin CRL is valid DER");
 
         assert!(verify_crl_signature(&crl, &issuer));
+    }
+
+    #[test]
+    fn dsa_crl_rejects_mismatched_inner_signature_algorithm() {
+        let xml = include_str!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt-crl.xml"
+        );
+        let document = Document::parse(xml).expect("the tracked Merlin document is valid XML");
+        let key_info_node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .expect("the Merlin document contains KeyInfo");
+        let key_info = parse_key_info(key_info_node).expect("the Merlin KeyInfo is valid");
+        let KeyInfoSource::X509Data(info) = &key_info.sources[0] else {
+            panic!("expected X509Data")
+        };
+        let (_, issuer) = X509Certificate::from_der(include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/ca.der"
+        ))
+        .expect("the tracked Merlin issuer is a DER certificate");
+        let (_, mut crl) = CertificateRevocationList::from_der(&info.crls[0])
+            .expect("the tracked Merlin CRL is valid DER");
+        assert!(verify_crl_signature(&crl, &issuer));
+
+        crl.tbs_cert_list.signature = issuer.public_key().algorithm.clone();
+
+        assert_ne!(crl.tbs_cert_list.signature, crl.signature_algorithm);
+        assert!(!verify_crl_signature(&crl, &issuer));
     }
 }

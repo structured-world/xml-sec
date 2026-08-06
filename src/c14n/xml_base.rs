@@ -142,24 +142,33 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
     let base_parts = match parse_base(base) {
         Some(parts) => parts,
         None => {
-            // Schemeless/relative base. Still perform path-merge and
-            // dot-segment removal so that a chain of relative xml:base
-            // values is correctly collapsed (e.g. "a/b/" + "c/" → "a/b/c/").
+            // Schemeless bases include both ordinary relative paths and
+            // network-path references. Preserve the latter's authority while
+            // applying the same RFC 3986 path merge and normalization rules.
             let (ref_path, ref_suffix) = split_path_suffix(reference);
-            if let Some(rest) = ref_path.strip_prefix("//") {
-                let authority_end = rest.find('/').unwrap_or(rest.len());
-                let authority = &rest[..authority_end];
-                let path = remove_dot_segments(&rest[authority_end..]);
+            if let Some((authority, path)) = parse_network_path(ref_path) {
+                let path = remove_dot_segments(path);
                 return format!("//{authority}{path}{ref_suffix}");
             }
+            let (base_path_with_authority, _) = split_path_suffix(base);
+            let network_base = parse_network_path(base_path_with_authority);
             if ref_path.starts_with('/') {
                 let path = remove_dot_segments(ref_path);
-                return format!("{path}{ref_suffix}");
+                return match network_base {
+                    Some((authority, _)) => format!("//{authority}{path}{ref_suffix}"),
+                    None => format!("{path}{ref_suffix}"),
+                };
             }
-            let base_path_only = strip_query_fragment(base);
-            let merged = merge_paths(base_path_only, ref_path, false);
+            let (base_path, authority) = match network_base {
+                Some((authority, path)) => (path, Some(authority)),
+                None => (base_path_with_authority, None),
+            };
+            let merged = merge_paths(base_path, ref_path, authority.is_some());
             let cleaned = remove_dot_segments(&merged);
-            return format!("{cleaned}{ref_suffix}");
+            return match authority {
+                Some(authority) => format!("//{authority}{cleaned}{ref_suffix}"),
+                None => format!("{cleaned}{ref_suffix}"),
+            };
         }
     };
     let scheme = base_parts.scheme;
@@ -269,6 +278,14 @@ fn parse_base(base: &str) -> Option<BaseParts<'_>> {
         authority,
         path: rest,
     })
+}
+
+/// Split a schemeless network-path reference into authority and path.
+/// Query and fragment components must already have been removed.
+fn parse_network_path(reference: &str) -> Option<(&str, &str)> {
+    let rest = reference.strip_prefix("//")?;
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    Some((&rest[..authority_end], &rest[authority_end..]))
 }
 
 /// Recompose a URI from scheme, optional authority, and path per RFC 3986 §5.3.
@@ -511,6 +528,32 @@ mod tests {
         assert_eq!(
             resolve_uri("a/b", "//cdn.example/x/../data.bin?version=1"),
             "//cdn.example/data.bin?version=1"
+        );
+    }
+
+    #[test]
+    fn resolve_against_network_path_base_preserves_authority() {
+        // A network-path base has an authority even without a scheme. RFC 3986
+        // resolution must not collapse it into an ordinary absolute path.
+        assert_eq!(
+            resolve_uri("//cdn.example/a/b/", "/x/../data.bin?version=1"),
+            "//cdn.example/data.bin?version=1"
+        );
+        assert_eq!(
+            resolve_uri("//cdn.example/a/b/", "../data.bin"),
+            "//cdn.example/a/data.bin"
+        );
+        assert_eq!(
+            resolve_uri("//cdn.example/a/b?old#fragment", "?new"),
+            "//cdn.example/a/b?new"
+        );
+        assert_eq!(
+            resolve_uri("//cdn.example/a/b?old#fragment", "#new"),
+            "//cdn.example/a/b?old#new"
+        );
+        assert_eq!(
+            resolve_uri("//cdn.example/a/b/", "//other.example/x/../data.bin"),
+            "//other.example/data.bin"
         );
     }
 

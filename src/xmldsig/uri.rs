@@ -618,6 +618,29 @@ mod tests {
     }
 
     #[test]
+    fn network_path_xml_base_preserves_external_resource_authority() {
+        // A schemeless authority remains part of the resolved caller-owned
+        // resource identity when an absolute-path URI replaces the base path.
+        let xml = r#"<root xml:base="//cdn.example/a/b/">
+            <reference URI="/x/../data.bin"/>
+        </root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([("//cdn.example/data.bin".to_owned(), b"payload".to_vec())]);
+        let budget = NodeSetMaterializationBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(reference.attribute("URI").unwrap(), reference, &budget)
+            .unwrap();
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
     fn unicode_external_uri_resolves_without_panicking() {
         // Untrusted XML may start a relative URI with a multibyte scalar; the
         // resolver must produce its UTF-8 resource identity without panicking.
