@@ -118,9 +118,15 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
         return base.to_string();
     }
 
-    // Reference with scheme → use as-is (already absolute)
+    // A scheme-bearing reference supplies every target component, but RFC 3986
+    // section 5.2.2 still requires dot-segment removal from its path.
     if has_scheme(reference) {
-        return reference.to_string();
+        let (absolute, suffix) = split_path_suffix(reference);
+        let parts = parse_base(absolute).expect("has_scheme accepted the absolute reference");
+        let path = remove_dot_segments(parts.path);
+        let mut result = recompose(parts.scheme, parts.authority, &path);
+        result.push_str(suffix);
+        return result;
     }
 
     // Query- and fragment-only references preserve the complete base path for
@@ -380,6 +386,19 @@ mod tests {
         assert_eq!(
             resolve_uri("http://a.com/b", "http://other.com/c"),
             "http://other.com/c"
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_reference_removes_dot_segments() {
+        // RFC 3986 applies dot-segment removal to an absolute reference too;
+        // its existing scheme only prevents inheritance from the base URI.
+        assert_eq!(
+            resolve_uri(
+                "https://base.example/ignored/",
+                "https://example.test/a/../data.bin?version=1#payload"
+            ),
+            "https://example.test/data.bin?version=1#payload"
         );
     }
 

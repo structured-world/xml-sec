@@ -16,9 +16,10 @@ use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
     X509ChainOptions, X509DataInfo,
     parse::{
-        EC_P256_OID, EC_P384_OID, ParseError, build_x509_certificate_chain_from,
-        parse_x509_certificate, x509_certificate_matches_any_selector,
-        x509_data_has_lookup_identifiers, x509_selector_categories_match_chain,
+        EC_P256_OID, EC_P384_OID, ParseError, X509ChainBuildError,
+        build_x509_certificate_chain_from, parse_x509_certificate,
+        x509_certificate_matches_any_selector, x509_data_has_lookup_identifiers,
+        x509_selector_categories_match_chain,
     },
     verify_dsa_signature_spki, verify_ecdsa_signature_spki, verify_rsa_signature_spki,
     verify_x509_certificate_chain,
@@ -401,9 +402,7 @@ impl DefaultKeyResolver {
         };
         available.certificate_chain = build_x509_certificate_chain_from(&available, signing_index)
             .map_err(|error| match error {
-                ParseError::InvalidStructure(reason) if reason.contains("ambiguous") => {
-                    KeyResolutionError::AmbiguousCertificate
-                }
+                X509ChainBuildError::AmbiguousIssuer => KeyResolutionError::AmbiguousCertificate,
                 _ => KeyResolutionError::InvalidCertificate,
             })?;
         Ok(Some(available))
@@ -789,6 +788,12 @@ mod tests {
                 .with_output_length_bits(79),
             Err(KeyResolutionError::InvalidHmacOutputLength)
         ));
+        assert!(matches!(
+            HmacSha1VerificationKey::new(b"secret".to_vec())
+                .expect("the fixture HMAC secret is non-empty")
+                .with_output_length_bits(81),
+            Err(KeyResolutionError::InvalidHmacOutputLength)
+        ));
     }
 
     #[test]
@@ -1034,6 +1039,80 @@ mod tests {
         let resolved = resolver
             .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
             .expect("selector-resolved leaf should chain through the lookup intermediate");
+
+        assert!(resolved.is_some());
+    }
+
+    #[test]
+    fn selector_resolved_leaf_disambiguates_same_subject_issuers_by_signature() {
+        // Certificate renewal may leave multiple configured intermediates with
+        // the same subject DN. The leaf signature, not pool order, identifies
+        // the one issuer that belongs to the verification path.
+        let mut root_params =
+            rcgen::CertificateParams::new(Vec::new()).expect("empty root SAN list should be valid");
+        root_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "shared-issuer root");
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        root_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let root = rcgen::CertifiedIssuer::self_signed(
+            root_params,
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root certificate should be self-signable");
+
+        let intermediate = |key: rcgen::KeyPair| {
+            let mut params = rcgen::CertificateParams::new(Vec::new())
+                .expect("empty intermediate SAN list should be valid");
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "renewed intermediate");
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+            rcgen::CertifiedIssuer::signed_by(params, key, &root)
+                .expect("root should sign the intermediate certificate")
+        };
+        let unrelated_intermediate = intermediate(
+            rcgen::KeyPair::generate().expect("unrelated intermediate key generation should work"),
+        );
+        let signing_intermediate = intermediate(
+            rcgen::KeyPair::generate().expect("signing intermediate key generation should work"),
+        );
+
+        let mut leaf_params =
+            rcgen::CertificateParams::new(Vec::new()).expect("empty leaf SAN list should be valid");
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "same-subject leaf");
+        let leaf = leaf_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &signing_intermediate,
+            )
+            .expect("the selected intermediate should sign the leaf certificate");
+        let key_info_xml = concat!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">",
+            "<X509Data><X509SubjectName>CN=same-subject leaf</X509SubjectName></X509Data>",
+            "</KeyInfo>"
+        );
+        let document = roxmltree::Document::parse(key_info_xml)
+            .expect("static selector KeyInfo should parse as XML");
+        let key_info = super::super::parse_key_info(document.root_element())
+            .expect("static selector KeyInfo should satisfy XMLDSig structure");
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![
+                leaf.der().to_vec(),
+                unrelated_intermediate.der().to_vec(),
+                signing_intermediate.der().to_vec(),
+            ],
+            trusted_certs: vec![root.der().to_vec()],
+            verify_chains: true,
+            ..KeyResolverConfig::default()
+        });
+
+        let resolved = resolver
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .expect("the leaf signature should select its unique same-subject issuer");
 
         assert!(resolved.is_some());
     }

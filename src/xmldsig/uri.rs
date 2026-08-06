@@ -546,6 +546,32 @@ mod tests {
     }
 
     #[test]
+    fn absolute_external_uri_uses_normalized_resource_identity() {
+        // Caller maps are keyed by the resolved RFC 3986 identity, not by an
+        // unnormalized spelling embedded in an untrusted Signature document.
+        let xml = r#"<root xml:base="https://base.example/ignored/">
+            <reference URI="https://example.test/a/../data.bin"/>
+        </root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([(
+            "https://example.test/data.bin".to_owned(),
+            b"payload".to_vec(),
+        )]);
+        let budget = NodeSetMaterializationBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(reference.attribute("URI").unwrap(), reference, &budget)
+            .unwrap();
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
     fn namespaced_id_attr_found_by_local_name() {
         // roxmltree strips prefix: `wsu:Id` → local name "Id", which is in DEFAULT_ID_ATTRS
         let xml =

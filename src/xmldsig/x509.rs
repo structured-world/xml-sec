@@ -219,6 +219,20 @@ fn verify_certificate_signature(
     )
 }
 
+/// Test a candidate certificate-path edge without assigning trust to either
+/// certificate. Path construction uses this only to distinguish certificates
+/// that share an issuer subject name; full policy validation still happens
+/// after the complete path has been assembled.
+pub(crate) fn certificate_signature_matches(certificate_der: &[u8], issuer_der: &[u8]) -> bool {
+    let (Ok(certificate), Ok(issuer)) = (
+        parse_certificate(certificate_der),
+        parse_certificate(issuer_der),
+    ) else {
+        return false;
+    };
+    certificate.issuer() == issuer.subject() && verify_certificate_signature(&certificate, &issuer)
+}
+
 fn verify_crl_signature(crl: &CertificateRevocationList<'_>, issuer: &X509Certificate<'_>) -> bool {
     if crl.verify_signature(issuer.public_key()).is_ok() {
         return true;

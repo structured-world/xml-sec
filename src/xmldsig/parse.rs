@@ -31,6 +31,7 @@ use super::whitespace::{
     XmlBase64NormalizeLimitedError, is_xml_whitespace_only, normalize_xml_base64_text,
     normalize_xml_base64_text_with_limit,
 };
+use super::x509::certificate_signature_matches;
 use crate::c14n::C14nAlgorithm;
 use crate::c14n::xml_base::{compute_effective_xml_base, resolve_uri};
 
@@ -478,6 +479,9 @@ fn parse_hmac_output_length(
         .trim()
         .parse::<usize>()
         .map_err(|_| ParseError::InvalidStructure("invalid HMACOutputLength".into()))?;
+    // XMLDSig 1.1 section 6.3.1 requires HMAC truncation to end on a
+    // byte boundary because SignatureValue is encoded as complete octets:
+    // https://www.w3.org/TR/xmldsig-core1/#sec-HMAC
     if !(80..=160).contains(&bits) || !bits.is_multiple_of(8) {
         return Err(ParseError::InvalidStructure(
             "HMACOutputLength must be a byte-aligned value from 80 through 160".into(),
@@ -1153,28 +1157,54 @@ fn build_x509_certificate_chain(info: &X509DataInfo) -> Result<Vec<usize>, Parse
     }
 
     let signing_idx = select_x509_signing_certificate(info)?;
-    build_x509_certificate_chain_from(info, signing_idx)
+    build_x509_certificate_chain_from(info, signing_idx).map_err(ParseError::from)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum X509ChainBuildError {
+    InconsistentMetadata,
+    DepthExceeded,
+    Cycle,
+    IssuerSignatureMismatch,
+    AmbiguousIssuer,
+}
+
+impl From<X509ChainBuildError> for ParseError {
+    fn from(error: X509ChainBuildError) -> Self {
+        let reason = match error {
+            X509ChainBuildError::InconsistentMetadata => {
+                "X509Data certificate metadata is inconsistent"
+            }
+            X509ChainBuildError::DepthExceeded => {
+                "X509Data certificate chain exceeds maximum depth"
+            }
+            X509ChainBuildError::Cycle => "X509Data certificate chain contains a cycle",
+            X509ChainBuildError::IssuerSignatureMismatch => {
+                "X509Data issuer candidates do not verify the certificate signature"
+            }
+            X509ChainBuildError::AmbiguousIssuer => {
+                "X509Data certificate chain contains ambiguous issuer certificates"
+            }
+        };
+        Self::InvalidStructure(reason.into())
+    }
 }
 
 /// Order an available certificate pool from a preselected signing certificate.
 pub(crate) fn build_x509_certificate_chain_from(
     info: &X509DataInfo,
     signing_idx: usize,
-) -> Result<Vec<usize>, ParseError> {
+) -> Result<Vec<usize>, X509ChainBuildError> {
     if signing_idx >= info.parsed_certificates.len()
         || info.parsed_certificates.len() != info.certificates.len()
     {
-        return Err(ParseError::InvalidStructure(
-            "X509Data certificate metadata is inconsistent".into(),
-        ));
+        return Err(X509ChainBuildError::InconsistentMetadata);
     }
     let mut chain = vec![signing_idx];
 
     loop {
         if chain.len() > MAX_X509_CHAIN_DEPTH {
-            return Err(ParseError::InvalidStructure(
-                "X509Data certificate chain exceeds maximum depth".into(),
-            ));
+            return Err(X509ChainBuildError::DepthExceeded);
         }
 
         let current_idx = *chain
@@ -1193,27 +1223,33 @@ pub(crate) fn build_x509_certificate_chain_from(
             .map(|(idx, _)| idx)
             .collect::<Vec<_>>();
 
-        match candidates.as_slice() {
+        let issuer_idx = match candidates.as_slice() {
             [] => break,
-            [issuer_idx] => {
-                if chain.contains(issuer_idx) {
-                    return Err(ParseError::InvalidStructure(
-                        "X509Data certificate chain contains a cycle".into(),
-                    ));
-                }
-                if chain.len() == MAX_X509_CHAIN_DEPTH {
-                    return Err(ParseError::InvalidStructure(
-                        "X509Data certificate chain exceeds maximum depth".into(),
-                    ));
-                }
-                chain.push(*issuer_idx);
-            }
+            [issuer_idx] => *issuer_idx,
             _ => {
-                return Err(ParseError::InvalidStructure(
-                    "X509Data certificate chain contains ambiguous issuer certificates".into(),
-                ));
+                let verified = candidates
+                    .into_iter()
+                    .filter(|issuer_idx| {
+                        certificate_signature_matches(
+                            &info.certificates[current_idx],
+                            &info.certificates[*issuer_idx],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                match verified.as_slice() {
+                    [issuer_idx] => *issuer_idx,
+                    [] => return Err(X509ChainBuildError::IssuerSignatureMismatch),
+                    _ => return Err(X509ChainBuildError::AmbiguousIssuer),
+                }
             }
+        };
+        if chain.contains(&issuer_idx) {
+            return Err(X509ChainBuildError::Cycle);
         }
+        if chain.len() == MAX_X509_CHAIN_DEPTH {
+            return Err(X509ChainBuildError::DepthExceeded);
+        }
+        chain.push(issuer_idx);
     }
 
     Ok(chain)
@@ -3661,6 +3697,22 @@ BA== </Modulus>
         // Reading only the first text node would misinterpret 800 bits as 80.
         let xml = r#"<SignatureMethod xmlns="http://www.w3.org/2000/09/xmldsig#">
             <HMACOutputLength>80<!-- split -->0</HMACOutputLength>
+        </SignatureMethod>"#;
+        let document = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_hmac_output_length(document.root_element(), SignatureAlgorithm::HmacSha1),
+            Err(ParseError::InvalidStructure(reason))
+                if reason == "HMACOutputLength must be a byte-aligned value from 80 through 160"
+        ));
+    }
+
+    #[test]
+    fn parse_hmac_output_length_rejects_non_octet_truncation() {
+        // XMLDSig 1.1 section 6.3.1 requires a byte boundary even though the
+        // HMACOutputLength schema represents the value as a bit count.
+        let xml = r#"<SignatureMethod xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <HMACOutputLength>81</HMACOutputLength>
         </SignatureMethod>"#;
         let document = Document::parse(xml).unwrap();
 
