@@ -145,10 +145,17 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
             // Schemeless/relative base. Still perform path-merge and
             // dot-segment removal so that a chain of relative xml:base
             // values is correctly collapsed (e.g. "a/b/" + "c/" → "a/b/c/").
-            if reference.starts_with("//") || reference.starts_with('/') {
-                return reference.to_string();
-            }
             let (ref_path, ref_suffix) = split_path_suffix(reference);
+            if let Some(rest) = ref_path.strip_prefix("//") {
+                let authority_end = rest.find('/').unwrap_or(rest.len());
+                let authority = &rest[..authority_end];
+                let path = remove_dot_segments(&rest[authority_end..]);
+                return format!("//{authority}{path}{ref_suffix}");
+            }
+            if ref_path.starts_with('/') {
+                let path = remove_dot_segments(ref_path);
+                return format!("{path}{ref_suffix}");
+            }
             let base_path_only = strip_query_fragment(base);
             let merged = merge_paths(base_path_only, ref_path, false);
             let cleaned = remove_dot_segments(&merged);
@@ -478,6 +485,19 @@ mod tests {
         assert_eq!(resolve_uri("sub/dir/", "file.xml"), "sub/dir/file.xml");
         assert_eq!(resolve_uri("a/b/", "../c"), "a/c");
         assert_eq!(resolve_uri("a/b", "c"), "a/c");
+    }
+
+    #[test]
+    fn resolve_absolute_path_normalizes_against_schemeless_base() {
+        assert_eq!(resolve_uri("a/b", "/x/../data.bin"), "/data.bin");
+    }
+
+    #[test]
+    fn resolve_network_path_normalizes_against_schemeless_base() {
+        assert_eq!(
+            resolve_uri("a/b", "//cdn.example/x/../data.bin?version=1"),
+            "//cdn.example/data.bin?version=1"
+        );
     }
 
     #[test]

@@ -956,14 +956,16 @@ fn verify_signature_with_context(
         Some(resources) => UriReferenceResolver::new(&doc).with_external_resources(resources),
         None => UriReferenceResolver::new(&doc),
     };
-    if let Some(info) = key_info.as_mut() {
+    let retrieval_materialization = if let Some(info) = key_info.as_mut() {
         materialize_retrieval_methods(
             info,
             &resolver,
             ctx.external_resources,
             ctx.allowed_retrieval_method_uri_types,
-        )?;
-    }
+        )?
+    } else {
+        RetrievalMaterialization::default()
+    };
     let execution_budget = TransformExecutionBudget::default();
     let pre_digest_budget = PreDigestRetentionBudget::default();
     let execution = ReferenceExecutionContext {
@@ -1016,6 +1018,9 @@ fn verify_signature_with_context(
     let Some(resolved_key) =
         resolve_verifying_key(ctx, key_info.as_ref(), signed_info.signature_method)?
     else {
+        if let Some(error) = retrieval_materialization.deferred_error {
+            return Err(error);
+        }
         return Ok(VerifyResult {
             status: DsigStatus::Invalid(FailureReason::KeyNotFound),
             signed_info_references: references.results,
@@ -1074,12 +1079,17 @@ fn verify_signature_with_context(
     })
 }
 
+#[derive(Debug, Default)]
+struct RetrievalMaterialization {
+    deferred_error: Option<SignatureVerificationPipelineError>,
+}
+
 fn materialize_retrieval_methods(
     key_info: &mut KeyInfo,
     resolver: &UriReferenceResolver<'_>,
     external_resources: Option<&HashMap<String, Vec<u8>>>,
     allowed_uri_types: UriTypeSet,
-) -> Result<(), SignatureVerificationPipelineError> {
+) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
     let retrieval_count = key_info
         .sources
         .iter()
@@ -1094,6 +1104,7 @@ fn materialize_retrieval_methods(
     let mut total_binary_len = existing_x509_binary_len(key_info)?;
     let mut seen = HashSet::new();
     let mut materialized = Vec::with_capacity(key_info.sources.len());
+    let mut outcome = RetrievalMaterialization::default();
     for source in std::mem::take(&mut key_info.sources) {
         let super::parse::KeyInfoSource::RetrievalMethod {
             uri,
@@ -1122,15 +1133,22 @@ fn materialize_retrieval_methods(
             if !allowed_uri_types.allows(&uri) {
                 return Err(SignatureVerificationPipelineError::DisallowedUri { uri });
             }
-            let certificate = external_resources
-                .and_then(|resources| resources.get(&uri))
-                .ok_or_else(|| {
+            let Some(certificate) = external_resources.and_then(|resources| resources.get(&uri))
+            else {
+                outcome.deferred_error.get_or_insert_with(|| {
                     SignatureVerificationPipelineError::Reference(
                         ReferenceProcessingError::Transform(super::TransformError::UnsupportedUri(
                             uri.clone(),
                         )),
                     )
-                })?;
+                });
+                materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
+                    uri,
+                    resource_type,
+                    transforms,
+                });
+                continue;
+            };
             if certificate.len() > MAX_X509_DECODED_BINARY_LEN {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "raw X509 RetrievalMethod certificate exceeds maximum allowed length",
@@ -1193,7 +1211,7 @@ fn materialize_retrieval_methods(
         }
     }
     key_info.sources = materialized;
-    Ok(())
+    Ok(outcome)
 }
 
 fn select_retrieved_x509_data_root<'a, 'input>(
@@ -2106,6 +2124,31 @@ mod tests {
                     super::super::parse::KeyInfoSource::RetrievalMethod { .. },
                     super::super::parse::KeyInfoSource::KeyName(name),
                 ] if name == "fallback"
+            ));
+            Ok(Some(Box::new(AcceptingKey)))
+        }
+
+        fn consumes_document_key_info(&self) -> bool {
+            true
+        }
+    }
+
+    struct EarlyKeyInfoResolver;
+
+    impl KeyResolver for EarlyKeyInfoResolver {
+        fn resolve<'a>(
+            &'a self,
+            key_info: Option<&KeyInfo>,
+            _algorithm: SignatureAlgorithm,
+        ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
+        {
+            let sources = &key_info.expect("KeyInfo must be parsed").sources;
+            assert!(matches!(
+                sources.as_slice(),
+                [
+                    super::super::parse::KeyInfoSource::KeyName(name),
+                    super::super::parse::KeyInfoSource::RetrievalMethod { .. },
+                ] if name == "primary"
             ));
             Ok(Some(Box::new(AcceptingKey)))
         }
@@ -3423,6 +3466,56 @@ mod tests {
             .verify(&xml)
             .expect("unsupported advisory retrieval must not abort key resolution");
         assert_eq!(result.status, DsigStatus::Valid);
+    }
+
+    #[test]
+    fn verify_context_does_not_eagerly_fail_unused_retrieval_fallback() {
+        // KeyInfo sources are alternatives in document order. Once an earlier
+        // source resolves, a missing later RetrievalMethod is irrelevant.
+        let xml = signature_with_target_reference("AQ==").replace(
+            "</ds:SignatureValue>\n  </ds:Signature>",
+            r#"</ds:SignatureValue>
+    <ds:KeyInfo>
+      <ds:KeyName>primary</ds:KeyName>
+      <ds:RetrievalMethod URI="missing.der" Type="http://www.w3.org/2000/09/xmldsig#rawX509Certificate"/>
+    </ds:KeyInfo>
+  </ds:Signature>"#,
+        );
+
+        let result = VerifyContext::new()
+            .key_resolver(&EarlyKeyInfoResolver)
+            .allowed_retrieval_method_uri_types(UriTypeSet::new(true, true, true))
+            .verify(&xml)
+            .expect("an unused missing retrieval fallback must not abort verification");
+
+        assert_eq!(result.status, DsigStatus::Valid);
+    }
+
+    #[test]
+    fn verify_context_reports_missing_retrieval_when_no_key_source_resolves() {
+        // Deferral changes ordering, not diagnostics: if no alternative source
+        // resolves, the first missing retrieval remains the pipeline failure.
+        let xml = signature_with_target_reference("AQ==").replace(
+            "</ds:SignatureValue>\n  </ds:Signature>",
+            r#"</ds:SignatureValue>
+    <ds:KeyInfo>
+      <ds:RetrievalMethod URI="missing.der" Type="http://www.w3.org/2000/09/xmldsig#rawX509Certificate"/>
+    </ds:KeyInfo>
+  </ds:Signature>"#,
+        );
+
+        let error = VerifyContext::new()
+            .key_resolver(&ConsumingKeyInfoResolver)
+            .allowed_retrieval_method_uri_types(UriTypeSet::new(true, true, true))
+            .verify(&xml)
+            .expect_err("a missing sole RetrievalMethod must remain an explicit error");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
+                crate::xmldsig::TransformError::UnsupportedUri(uri)
+            )) if uri == "missing.der"
+        ));
     }
 
     #[test]

@@ -595,6 +595,29 @@ mod tests {
     }
 
     #[test]
+    fn relative_xml_base_normalizes_absolute_external_path() {
+        // An absolute-path reference replaces a relative base path, but RFC
+        // 3986 dot-segment removal still defines the caller resource identity.
+        let xml = r#"<root xml:base="a/b">
+            <reference URI="/x/../data.bin"/>
+        </root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([("/data.bin".to_owned(), b"payload".to_vec())]);
+        let budget = NodeSetMaterializationBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(reference.attribute("URI").unwrap(), reference, &budget)
+            .unwrap();
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
     fn unicode_external_uri_resolves_without_panicking() {
         // Untrusted XML may start a relative URI with a multibyte scalar; the
         // resolver must produce its UTF-8 resource identity without panicking.

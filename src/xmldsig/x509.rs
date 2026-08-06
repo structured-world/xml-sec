@@ -12,7 +12,10 @@ use x509_parser::{
     revocation_list::CertificateRevocationList, time::ASN1Time,
 };
 
-use super::X509DataInfo;
+use super::{
+    X509DataInfo,
+    parse::{distinguished_names_equal, x509_name_to_rfc4514},
+};
 
 /// Inputs controlling X.509 certificate-chain validation.
 #[derive(Debug, Clone)]
@@ -124,11 +127,12 @@ pub fn verify_x509_certificate_chain(
     // Use the path-edge verifier here too: x509-parser does not verify legacy
     // DSA-SHA1 roots, while our fallback must recognize them for rollover.
     let replace_untrusted_root = if path_der.len() > 1
-        && last.subject() == last.issuer()
+        && certificate_names_equal(last.subject(), last.issuer())
         && verify_certificate_signature(&last, &last)
     {
         let child = parse_certificate(path_der[path_der.len() - 2])?;
-        child.issuer() == last.subject() && verify_certificate_signature(&child, &last)
+        certificate_names_equal(child.issuer(), last.subject())
+            && verify_certificate_signature(&child, &last)
     } else {
         false
     };
@@ -146,7 +150,7 @@ pub fn verify_x509_certificate_chain(
 
     let mut first_validation_error = None;
     for (anchor_der, _) in trusted_anchors.iter().filter(|(_, cert)| {
-        cert.subject() == candidate_child.issuer()
+        certificate_names_equal(cert.subject(), candidate_child.issuer())
             && verify_certificate_signature(&candidate_child, cert)
     }) {
         let mut candidate_path = candidate_base.to_vec();
@@ -190,7 +194,9 @@ fn validate_path(
         let [child, issuer] = pair else {
             unreachable!()
         };
-        if child.issuer() != issuer.subject() || !verify_certificate_signature(child, issuer) {
+        if !certificate_names_equal(child.issuer(), issuer.subject())
+            || !verify_certificate_signature(child, issuer)
+        {
             return Err(X509ChainError::InvalidSignature(position));
         }
     }
@@ -230,7 +236,17 @@ pub(crate) fn certificate_signature_matches(certificate_der: &[u8], issuer_der: 
     ) else {
         return false;
     };
-    certificate.issuer() == issuer.subject() && verify_certificate_signature(&certificate, &issuer)
+    verify_certificate_signature(&certificate, &issuer)
+}
+
+fn certificate_names_equal(
+    left: &x509_parser::x509::X509Name<'_>,
+    right: &x509_parser::x509::X509Name<'_>,
+) -> bool {
+    let (Ok(left), Ok(right)) = (x509_name_to_rfc4514(left), x509_name_to_rfc4514(right)) else {
+        return false;
+    };
+    distinguished_names_equal(&left, &right)
 }
 
 fn verify_crl_signature(crl: &CertificateRevocationList<'_>, issuer: &X509Certificate<'_>) -> bool {
@@ -373,7 +389,10 @@ fn verify_crls(
 
     for (position, cert) in path.iter().enumerate().take(path.len().saturating_sub(1)) {
         let issuer = &path[position + 1];
-        for (crl_index, crl) in crls.iter().filter(|(_, crl)| crl.issuer() == cert.issuer()) {
+        for (crl_index, crl) in crls
+            .iter()
+            .filter(|(_, crl)| certificate_names_equal(crl.issuer(), cert.issuer()))
+        {
             if issuer
                 .key_usage()
                 .map_err(|error| X509ChainError::InvalidDer {
@@ -411,6 +430,51 @@ mod tests {
     use crate::xmldsig::{KeyInfoSource, parse::XMLDSIG_NS, parse_key_info};
     use roxmltree::Document;
     use std::time::Duration;
+
+    #[test]
+    fn path_edge_signature_check_does_not_repeat_name_matching() {
+        // Path construction performs RFC 5280 name matching before asking this
+        // helper to disambiguate same-name candidates. Only proof of possession
+        // of the issuer key belongs in this second gate.
+        let issuer_key = rcgen::KeyPair::generate().expect("issuer key generation should succeed");
+        let issuer_key_pem = issuer_key.serialize_pem();
+        let mut signing_params = rcgen::CertificateParams::new(Vec::new())
+            .expect("empty issuer SAN list should be valid");
+        signing_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "signing name");
+        signing_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        signing_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let signing_issuer = rcgen::CertifiedIssuer::self_signed(signing_params, issuer_key)
+            .expect("issuer certificate should be self-signable");
+
+        let mut alternate_params = rcgen::CertificateParams::new(Vec::new())
+            .expect("empty alternate SAN list should be valid");
+        alternate_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "name already matched by caller");
+        alternate_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        alternate_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let alternate_issuer = rcgen::CertifiedIssuer::self_signed(
+            alternate_params,
+            rcgen::KeyPair::from_pem(&issuer_key_pem)
+                .expect("serialized issuer key should parse again"),
+        )
+        .expect("alternate issuer certificate should be self-signable");
+
+        let leaf = rcgen::CertificateParams::new(Vec::new())
+            .expect("empty leaf SAN list should be valid")
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &signing_issuer,
+            )
+            .expect("issuer should sign leaf certificate");
+
+        assert!(certificate_signature_matches(
+            leaf.der(),
+            alternate_issuer.der()
+        ));
+    }
 
     #[test]
     fn dsa_rollover_replaces_embedded_root_before_depth_validation() {

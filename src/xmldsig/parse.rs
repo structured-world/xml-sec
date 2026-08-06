@@ -1203,10 +1203,6 @@ pub(crate) fn build_x509_certificate_chain_from(
     let mut chain = vec![signing_idx];
 
     loop {
-        if chain.len() > MAX_X509_CHAIN_DEPTH {
-            return Err(X509ChainBuildError::DepthExceeded);
-        }
-
         let current_idx = *chain
             .last()
             .expect("chain starts with signing certificate index");
@@ -1414,7 +1410,7 @@ pub(crate) fn x509_selector_categories_match_chain(
     Ok(subject_match && issuer_serial_match && ski_match && digest_match)
 }
 
-fn distinguished_names_equal(left: &str, right: &str) -> bool {
+pub(crate) fn distinguished_names_equal(left: &str, right: &str) -> bool {
     fn attribute_values_equal(
         left: &x509_cert::attr::AttributeTypeAndValue,
         right: &x509_cert::attr::AttributeTypeAndValue,
@@ -1694,7 +1690,7 @@ pub(crate) fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certif
     })
 }
 
-fn x509_name_to_rfc4514(name: &X509Name<'_>) -> Result<String, ParseError> {
+pub(crate) fn x509_name_to_rfc4514(name: &X509Name<'_>) -> Result<String, ParseError> {
     let name = Name::from_der(name.as_raw()).map_err(|error| {
         ParseError::InvalidStructure(format!(
             "X509Certificate distinguished name is invalid DER: {error}"
