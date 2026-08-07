@@ -1176,8 +1176,20 @@ fn materialize_retrieval_methods(
                 });
             }
             add_retrieval_binary_usage(&mut total_binary_len, certificate.len())?;
-            let parsed = parse_x509_certificate(certificate)
-                .map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
+            let parsed = match parse_x509_certificate(certificate) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    outcome
+                        .deferred_error
+                        .get_or_insert(SignatureVerificationPipelineError::ParseKeyInfo(error));
+                    materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
+                        uri,
+                        resource_type,
+                        transforms,
+                    });
+                    continue;
+                }
+            };
             materialized.push(super::parse::KeyInfoSource::X509Data(
                 super::parse::X509DataInfo {
                     certificates: vec![certificate.clone()],
@@ -3623,6 +3635,31 @@ mod tests {
     }
 
     #[test]
+    fn verify_context_does_not_eagerly_parse_unused_retrieval_fallback() {
+        // Materialization must preserve ordered fallback semantics even when
+        // caller-supplied bytes exist but are not a certificate.
+        let xml = signature_with_target_reference("AQ==").replace(
+            "</ds:SignatureValue>\n  </ds:Signature>",
+            r#"</ds:SignatureValue>
+    <ds:KeyInfo>
+      <ds:KeyName>primary</ds:KeyName>
+      <ds:RetrievalMethod URI="malformed.der" Type="http://www.w3.org/2000/09/xmldsig#rawX509Certificate"/>
+    </ds:KeyInfo>
+  </ds:Signature>"#,
+        );
+        let resources = HashMap::from([("malformed.der".to_string(), b"not DER".to_vec())]);
+
+        let result = VerifyContext::new()
+            .key_resolver(&EarlyKeyInfoResolver)
+            .allowed_retrieval_method_uri_types(UriTypeSet::ALL)
+            .external_resources(&resources)
+            .verify(&xml)
+            .expect("an unused malformed retrieval fallback must not abort verification");
+
+        assert_eq!(result.status, DsigStatus::Valid);
+    }
+
+    #[test]
     fn verify_context_reports_missing_retrieval_when_no_key_source_resolves() {
         // Deferral changes ordering, not diagnostics: if no alternative source
         // resolves, the first missing retrieval remains the pipeline failure.
@@ -3646,6 +3683,33 @@ mod tests {
             SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
                 crate::xmldsig::TransformError::UnsupportedUri(uri)
             )) if uri == "missing.der"
+        ));
+    }
+
+    #[test]
+    fn verify_context_reports_malformed_retrieval_when_no_key_source_resolves() {
+        // Deferral must retain the parse error when the malformed certificate
+        // is the only candidate rather than degrading it to KeyNotFound.
+        let xml = signature_with_target_reference("AQ==").replace(
+            "</ds:SignatureValue>\n  </ds:Signature>",
+            r#"</ds:SignatureValue>
+    <ds:KeyInfo>
+      <ds:RetrievalMethod URI="malformed.der" Type="http://www.w3.org/2000/09/xmldsig#rawX509Certificate"/>
+    </ds:KeyInfo>
+  </ds:Signature>"#,
+        );
+        let resources = HashMap::from([("malformed.der".to_string(), b"not DER".to_vec())]);
+
+        let error = VerifyContext::new()
+            .key_resolver(&ConsumingKeyInfoResolver)
+            .allowed_retrieval_method_uri_types(UriTypeSet::ALL)
+            .external_resources(&resources)
+            .verify(&xml)
+            .expect_err("a malformed sole RetrievalMethod must remain a parse error");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::ParseKeyInfo(_)
         ));
     }
 
