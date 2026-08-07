@@ -1274,6 +1274,7 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
     let mut pending = vec![vec![signing_idx]];
     let mut completed = Vec::new();
     let mut depth_exceeded = false;
+    let mut issuer_cache = vec![None; info.parsed_certificates.len()];
     while let Some(path) = pending.pop() {
         let current_idx = *path
             .last()
@@ -1294,19 +1295,24 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
         if distinguished_names_equal(&current.subject_dn, &current.issuer_dn) {
             continue;
         }
-        let issuers = info
-            .parsed_certificates
+        let issuers = issuer_cache[current_idx].get_or_insert_with(|| {
+            info.parsed_certificates
+                .iter()
+                .enumerate()
+                .filter(|(issuer_idx, issuer)| {
+                    distinguished_names_equal(&issuer.subject_dn, &current.issuer_dn)
+                        && certificate_signature_matches(
+                            &info.certificates[current_idx],
+                            &info.certificates[*issuer_idx],
+                        )
+                })
+                .map(|(issuer_idx, _)| issuer_idx)
+                .collect::<Vec<_>>()
+        });
+        let issuers = issuers
             .iter()
-            .enumerate()
-            .filter(|(issuer_idx, issuer)| {
-                !path.contains(issuer_idx)
-                    && distinguished_names_equal(&issuer.subject_dn, &current.issuer_dn)
-                    && certificate_signature_matches(
-                        &info.certificates[current_idx],
-                        &info.certificates[*issuer_idx],
-                    )
-            })
-            .map(|(issuer_idx, _)| issuer_idx)
+            .copied()
+            .filter(|issuer_idx| !path.contains(issuer_idx))
             .collect::<Vec<_>>();
         if pending.len().saturating_add(issuers.len()) > max_candidate_paths {
             return Err(X509ChainBuildError::AmbiguousIssuer);

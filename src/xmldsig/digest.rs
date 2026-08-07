@@ -80,6 +80,7 @@ impl DigestAlgorithm {
 /// Returns the raw digest bytes (not base64-encoded).
 pub fn compute_digest(algorithm: DigestAlgorithm, data: &[u8]) -> Vec<u8> {
     compute_digest_with_provider(crate::provider::default_provider(), algorithm, data)
+        .expect("default provider advertises every XMLDSig digest")
 }
 
 /// Compute a digest with an explicitly selected provider.
@@ -87,10 +88,8 @@ pub fn compute_digest_with_provider(
     provider: &dyn crate::provider::CryptoProvider,
     algorithm: DigestAlgorithm,
     data: &[u8],
-) -> Vec<u8> {
-    provider
-        .digest(algorithm, data)
-        .expect("default provider advertises every XMLDSig digest")
+) -> Result<Vec<u8>, crate::provider::ProviderError> {
+    provider.digest(algorithm, data)
 }
 
 /// Constant-time comparison of two byte slices.
@@ -108,6 +107,122 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RejectingDigestProvider;
+
+    impl crate::provider::CryptoProvider for RejectingDigestProvider {
+        fn name(&self) -> &'static str {
+            "rejecting-digest"
+        }
+
+        fn supports(&self, query: crate::provider::CapabilityQuery<'_>) -> bool {
+            crate::provider::default_provider().supports(query)
+        }
+
+        fn fill_random(&self, output: &mut [u8]) -> Result<(), crate::provider::ProviderError> {
+            crate::provider::default_provider().fill_random(output)
+        }
+
+        fn digest(
+            &self,
+            algorithm: DigestAlgorithm,
+            _data: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            Err(crate::provider::ProviderError::Unsupported {
+                operation: crate::provider::ProviderOperation::Digest,
+                algorithm: Some(algorithm.uri().to_owned()),
+            })
+        }
+
+        fn sign(
+            &self,
+            key: &dyn super::super::SigningKey,
+            algorithm: super::super::SignatureAlgorithm,
+            data: &[u8],
+        ) -> Result<Vec<u8>, super::super::SigningKeyError> {
+            crate::provider::default_provider().sign(key, algorithm, data)
+        }
+
+        fn verify(
+            &self,
+            key: &dyn super::super::VerifyingKey,
+            algorithm: super::super::SignatureAlgorithm,
+            data: &[u8],
+            signature: &[u8],
+        ) -> Result<bool, super::super::DsigError> {
+            crate::provider::default_provider().verify(key, algorithm, data, signature)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn encrypt_data(
+            &self,
+            algorithm: crate::xmlenc::DataEncryptionAlgorithm,
+            key: &[u8],
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::default_provider().encrypt_data(algorithm, key, plaintext)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn decrypt_data(
+            &self,
+            algorithm: crate::xmlenc::DataEncryptionAlgorithm,
+            key: &[u8],
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::default_provider().decrypt_data(algorithm, key, ciphertext)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn wrap_key(
+            &self,
+            algorithm: crate::xmlenc::KeyWrapAlgorithm,
+            kek: &[u8],
+            key: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::default_provider().wrap_key(algorithm, kek, key)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn unwrap_key(
+            &self,
+            algorithm: crate::xmlenc::KeyWrapAlgorithm,
+            kek: &[u8],
+            wrapped: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::default_provider().unwrap_key(algorithm, kek, wrapped)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn transport_key(
+            &self,
+            key: &rsa::RsaPublicKey,
+            parameters: &crate::xmlenc::RsaOaepParameters,
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::default_provider().transport_key(key, parameters, plaintext)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn recover_key(
+            &self,
+            key: &rsa::RsaPrivateKey,
+            parameters: &crate::xmlenc::RsaOaepParameters,
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::default_provider().recover_key(key, parameters, ciphertext)
+        }
+    }
+
+    #[test]
+    fn explicit_provider_digest_failures_are_returned() {
+        // A restricted provider is caller-controlled and must never turn an
+        // unsupported document-selected digest into a process panic.
+        assert!(matches!(
+            compute_digest_with_provider(&RejectingDigestProvider, DigestAlgorithm::Sha256, b"x"),
+            Err(crate::provider::ProviderError::Unsupported { .. })
+        ));
+    }
 
     // ── from_uri / uri round-trip ────────────────────────────────────
 

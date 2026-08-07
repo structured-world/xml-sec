@@ -134,6 +134,7 @@ struct Base64WorkBudget {
 
 struct C14nOutputBudget {
     remaining: Cell<usize>,
+    max_bytes: usize,
 }
 
 fn charge_byte_budget(remaining: &Cell<usize>, bytes: usize) -> bool {
@@ -149,11 +150,19 @@ impl Default for C14nOutputBudget {
     fn default() -> Self {
         Self {
             remaining: Cell::new(MAX_C14N_OUTPUT_BYTES),
+            max_bytes: MAX_C14N_OUTPUT_BYTES,
         }
     }
 }
 
 impl C14nOutputBudget {
+    fn with_limit(max_bytes: usize) -> Self {
+        Self {
+            remaining: Cell::new(max_bytes),
+            max_bytes,
+        }
+    }
+
     fn remaining(&self) -> usize {
         self.remaining.get()
     }
@@ -161,7 +170,7 @@ impl C14nOutputBudget {
     fn charge(&self, bytes: usize) -> Result<(), TransformError> {
         if !charge_byte_budget(&self.remaining, bytes) {
             return Err(TransformError::C14nOutputTooLarge {
-                max_bytes: MAX_C14N_OUTPUT_BYTES,
+                max_bytes: self.max_bytes,
             });
         }
         Ok(())
@@ -199,18 +208,6 @@ impl TransformExecutionBudget {
         }
     }
 
-    fn with_c14n_limit(limit: usize) -> Self {
-        Self {
-            xpath: XPathWorkBudget::default(),
-            base64: Base64WorkBudget::default(),
-            c14n: C14nOutputBudget {
-                remaining: Cell::new(limit),
-            },
-            node_filter: NodeFilterWorkBudget::default(),
-            node_set_materialization: NodeSetMaterializationBudget::default(),
-        }
-    }
-
     fn with_node_filter_limit(limit: usize) -> Self {
         Self {
             xpath: XPathWorkBudget::default(),
@@ -235,6 +232,17 @@ impl TransformExecutionBudget {
 }
 
 impl TransformExecutionBudget {
+    pub(crate) fn with_c14n_limit(max_bytes: usize) -> Self {
+        Self {
+            c14n: C14nOutputBudget::with_limit(max_bytes),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn charge_c14n_output(&self, bytes: usize) -> Result<(), TransformError> {
+        self.c14n.charge(bytes)
+    }
+
     pub(crate) fn node_set_materialization(&self) -> &NodeSetMaterializationBudget {
         &self.node_set_materialization
     }
@@ -456,6 +464,18 @@ pub enum Transform {
     ///
     /// Input: `NodeSet` or `Binary` → Output: `Binary`
     Base64Decode,
+}
+
+impl Transform {
+    pub(crate) fn algorithm_uri(&self) -> &'static str {
+        match self {
+            Self::Enveloped => ENVELOPED_SIGNATURE_URI,
+            Self::XpathExcludeAllSignatures | Self::XPath(_) => XPATH_TRANSFORM_URI,
+            Self::XPathFilter2(_) => XPATH_FILTER2_TRANSFORM_URI,
+            Self::C14n(algorithm) => algorithm.uri(),
+            Self::Base64Decode => BASE64_TRANSFORM_URI,
+        }
+    }
 }
 
 /// Apply a single transform to the pipeline data.

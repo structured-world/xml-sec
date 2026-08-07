@@ -122,6 +122,7 @@ impl EncryptedDataBuilder {
 
     /// Encrypt one complete XML element or an XML content fragment.
     pub fn encrypt_xml(&self, xml: &str) -> Result<EncryptionResult, XmlEncError> {
+        self.policy.resources.validate()?;
         self.validate_plaintext_len(xml.len())?;
         validate_xml_plaintext(xml, &self.encrypted_type)?;
         self.encrypt_payload(xml.as_bytes(), Some(self.encrypted_type.clone()))
@@ -129,6 +130,7 @@ impl EncryptedDataBuilder {
 
     /// Encrypt opaque bytes without an XML `Type` attribute.
     pub fn encrypt_binary(&self, data: &[u8]) -> Result<EncryptionResult, XmlEncError> {
+        self.policy.resources.validate()?;
         self.encrypt_payload(data, None)
     }
 
@@ -138,9 +140,10 @@ impl EncryptedDataBuilder {
         xml: &str,
         options: DocumentEncryptionOptions<'_>,
     ) -> Result<String, XmlEncError> {
+        self.policy.resources.validate()?;
         self.validate_document_len(xml.len())?;
         let parsing_options = ParsingOptions {
-            allow_dtd: self.policy.xml.allow_internal_dtd,
+            allow_dtd: self.policy.xml.allow_internal_dtd && options.allow_dtd,
             entity_resolver: None,
             ..ParsingOptions::default()
         };
@@ -499,7 +502,7 @@ fn wrap_rsa_oaep(
         .map_err(|error| match error {
             crate::provider::ProviderError::Random(message) => XmlEncError::Rng(message),
             crate::provider::ProviderError::InvalidInput(reason) => {
-                XmlEncError::InvalidEncryptionConfig(reason.into())
+                XmlEncError::InvalidEncryptionConfig(reason.to_string())
             }
             error => XmlEncError::RsaEncrypt(error.to_string()),
         })
@@ -964,6 +967,60 @@ mod tests {
                 .direct_key([0_u8; 16])
                 .encrypt_document(&oversized_malformed, DocumentEncryptionOptions::default()),
             Err(XmlEncError::DocumentTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn document_dtd_requires_policy_and_per_call_opt_in() {
+        // Internal DTD parsing is a two-party decision: operation policy sets
+        // the ceiling and the call site must opt in for this document.
+        let document = "<!DOCTYPE root [<!ELEMENT root ANY>]><root/>";
+        let mut policy = crate::policy::EncryptionPolicy::default();
+        policy.xml.allow_internal_dtd = true;
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy.clone())
+            .encrypt_document(
+                document,
+                DocumentEncryptionOptions {
+                    element_id: None,
+                    allow_dtd: true,
+                },
+            )
+            .expect("both DTD controls should permit parsing");
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy)
+                .encrypt_document(document, DocumentEncryptionOptions::default()),
+            Err(XmlEncError::XmlParse(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_resource_policy_is_rejected_at_every_entry_point() {
+        // Entry points must reject an invalid snapshot before parsing or using
+        // any caller-selected limit derived from it.
+        let mut policy = crate::policy::EncryptionPolicy::default();
+        policy.resources.max_encryption_plaintext_bytes =
+            crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING + 1;
+        let builder = || {
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy.clone())
+        };
+
+        assert!(matches!(
+            builder().encrypt_xml("<broken>"),
+            Err(XmlEncError::Policy(_))
+        ));
+        assert!(matches!(
+            builder().encrypt_binary(b"x"),
+            Err(XmlEncError::Policy(_))
+        ));
+        assert!(matches!(
+            builder().encrypt_document("<broken>", DocumentEncryptionOptions::default()),
+            Err(XmlEncError::Policy(_))
         ));
     }
 

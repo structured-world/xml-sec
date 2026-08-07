@@ -354,7 +354,10 @@ pub struct EncryptionResult {
 pub struct DocumentEncryptionOptions<'a> {
     /// Select an element by `Id`, `ID`, or `id`; `None` selects the document root.
     pub element_id: Option<&'a str>,
-    /// Permit an internal DTD subset while parsing the caller's document.
+    /// Request internal-DTD parsing for this call.
+    ///
+    /// The operation policy must also permit internal DTDs; either control can
+    /// deny parsing, so a permissive caller option cannot weaken policy.
     pub allow_dtd: bool,
 }
 

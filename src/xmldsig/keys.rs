@@ -234,17 +234,13 @@ impl DefaultKeyResolver {
                 .ok_or(KeyResolutionError::InvalidCertificate)?
                 .clone();
             if trust.verify_x509_chains {
-                let selected = self.prepare_embedded_x509(info, signing_index, trust)?;
-                self.verify_x509_policy(&selected, trust)?;
+                self.prepare_embedded_x509(info, signing_index, trust)?;
             }
             certificate_der
         } else {
             let Some(selected) = self.resolve_configured_x509(info, trust)? else {
                 return Ok(None);
             };
-            if trust.verify_x509_chains {
-                self.verify_x509_policy(&selected, trust)?;
-            }
             selected
                 .certificate_chain
                 .first()
@@ -451,6 +447,9 @@ impl DefaultKeyResolver {
                 self.select_valid_x509_path(&mut available, signing_index, trust)?;
                 available.certificate_chain.clone()
             };
+        if trust.verify_x509_chains && signing_index < self.config.trusted_certs.len() {
+            self.verify_x509_policy(&available, trust)?;
+        }
         Ok(Some(available))
     }
 

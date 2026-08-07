@@ -287,20 +287,21 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
     }
 
     let expected_manifest = [
-        ("http://www.w3.org/TR/xml-stylesheet", true),
-        ("#reference-1", true),
-        ("#notaries", false),
+        ("http://www.w3.org/TR/xml-stylesheet", DsigStatus::Valid),
+        ("#reference-1", DsigStatus::Valid),
+        (
+            "#notaries",
+            // The donor uses an XSLT transform, which this pure-Rust profile
+            // intentionally does not execute; failure occurs before digest comparison.
+            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 2 }),
+        ),
     ];
     assert_eq!(result.manifest_references.len(), expected_manifest.len());
-    for (reference, (expected_uri, expected_valid)) in
+    for (reference, (expected_uri, expected_status)) in
         result.manifest_references.iter().zip(expected_manifest)
     {
         assert_eq!(reference.uri, expected_uri);
-        assert_eq!(
-            reference.status == DsigStatus::Valid,
-            expected_valid,
-            "{expected_uri}"
-        );
+        assert_eq!(reference.status, expected_status, "{expected_uri}");
     }
 }
 

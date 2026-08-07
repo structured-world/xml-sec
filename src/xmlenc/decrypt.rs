@@ -103,6 +103,27 @@ impl<'a> DecryptContext<'a> {
                     }
                     .into());
                 }
+                let digest =
+                    parse_oaep_digest(encrypted_key.encryption_method.oaep_digest.as_deref())?;
+                let mgf_digest = if transport == KeyTransportAlgorithm::RsaOaepMgf1p {
+                    OaepDigestAlgorithm::Sha1
+                } else {
+                    parse_oaep_mgf_digest(encrypted_key.encryption_method.mgf_algorithm.as_deref())?
+                };
+                for selected in [digest, mgf_digest] {
+                    if self
+                        .policy
+                        .oaep_digests
+                        .as_ref()
+                        .is_some_and(|allowed| !allowed.contains(&selected))
+                    {
+                        return Err(crate::policy::PolicyViolation::Algorithm {
+                            operation: "decryption",
+                            algorithm: selected.uri().to_owned(),
+                        }
+                        .into());
+                    }
+                }
             } else if let Ok(wrap) = KeyWrapAlgorithm::from_uri(uri)
                 && self
                     .policy
@@ -117,6 +138,14 @@ impl<'a> DecryptContext<'a> {
                 .into());
             }
         }
+        let ciphertext = STANDARD
+            .decode(&encrypted.cipher_data.value)
+            .map_err(|error| XmlEncError::Base64(error.to_string()))?;
+        validate_possible_plaintext_len(
+            algorithm,
+            ciphertext.len(),
+            self.policy.resources.max_encryption_plaintext_bytes,
+        )?;
         let key = resolve_content_key(
             self.provider,
             algorithm,
@@ -124,13 +153,14 @@ impl<'a> DecryptContext<'a> {
             self.resolver,
         )?;
         validate_key_len(algorithm, &key)?;
-        let ciphertext = STANDARD
-            .decode(&encrypted.cipher_data.value)
-            .map_err(|error| XmlEncError::Base64(error.to_string()))?;
         let plaintext = self
             .provider
             .decrypt_data(algorithm, &key, &ciphertext)
             .map_err(|error| map_data_decryption_error(algorithm, ciphertext.len(), error))?;
+        validate_plaintext_len(
+            plaintext.len(),
+            self.policy.resources.max_encryption_plaintext_bytes,
+        )?;
         match encrypted.encrypted_type.as_ref() {
             Some(EncryptedDataType::Element | EncryptedDataType::Content) => {
                 Ok(DecryptedContent::Xml(String::from_utf8(plaintext)?))
@@ -235,9 +265,9 @@ impl DecryptionKeyResolver for KekDecryptor {
                     }
                 }
                 crate::provider::ProviderError::AuthenticationFailed
-                | crate::provider::ProviderError::InvalidInput("AES key wrap framing") => {
-                    XmlEncError::KeyWrapIntegrity
-                }
+                | crate::provider::ProviderError::InvalidInput(
+                    crate::provider::ProviderInputError::AesKeyWrapFraming,
+                ) => XmlEncError::KeyWrapIntegrity,
                 error => XmlEncError::Provider(error),
             })?;
         validate_key_len(algorithm, &key)?;
@@ -356,7 +386,11 @@ fn recover_rsa_oaep(
         .recover_key(key, parameters, wrapped)
         .map_err(|error| match error {
             crate::provider::ProviderError::Random(message) => XmlEncError::Rng(message),
-            error => XmlEncError::Rsa(error.to_string()),
+            error @ (crate::provider::ProviderError::AuthenticationFailed
+            | crate::provider::ProviderError::InvalidInput(_)) => {
+                XmlEncError::Rsa(error.to_string())
+            }
+            error => XmlEncError::Provider(error),
         })
 }
 
@@ -547,6 +581,27 @@ fn validate_key_len(algorithm: DataEncryptionAlgorithm, key: &[u8]) -> Result<()
     }
 }
 
+fn validate_possible_plaintext_len(
+    algorithm: DataEncryptionAlgorithm,
+    ciphertext_len: usize,
+    maximum: usize,
+) -> Result<(), XmlEncError> {
+    let framing = match algorithm {
+        // CBC always contains a 16-byte IV and at least one padding byte.
+        DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => 17,
+        DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => 28,
+    };
+    validate_plaintext_len(ciphertext_len.saturating_sub(framing), maximum)
+}
+
+fn validate_plaintext_len(actual: usize, maximum: usize) -> Result<(), XmlEncError> {
+    if actual <= maximum {
+        Ok(())
+    } else {
+        Err(XmlEncError::PlaintextTooLarge { maximum, actual })
+    }
+}
+
 fn map_data_decryption_error(
     algorithm: DataEncryptionAlgorithm,
     ciphertext_len: usize,
@@ -561,7 +616,7 @@ fn map_data_decryption_error(
         ) => XmlEncError::AeadAuthenticationFailed,
         (
             DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm,
-            ProviderError::InvalidInput("AES-GCM framing"),
+            ProviderError::InvalidInput(crate::provider::ProviderInputError::AesGcmFraming),
         ) => XmlEncError::DataTooShort {
             algorithm: "AES-GCM",
             minimum: 28,
@@ -569,7 +624,7 @@ fn map_data_decryption_error(
         },
         (
             DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc,
-            ProviderError::InvalidInput("AES-CBC framing"),
+            ProviderError::InvalidInput(crate::provider::ProviderInputError::AesCbcFraming),
         ) if ciphertext_len < 32 => XmlEncError::DataTooShort {
             algorithm: "AES-CBC",
             minimum: 32,
@@ -577,13 +632,15 @@ fn map_data_decryption_error(
         },
         (
             DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc,
-            ProviderError::InvalidInput("AES-CBC framing"),
+            ProviderError::InvalidInput(crate::provider::ProviderInputError::AesCbcFraming),
         ) => XmlEncError::InvalidCbcCiphertextLength(ciphertext_len.saturating_sub(16)),
         (
             DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc,
-            ProviderError::InvalidInput("XMLEnc CBC padding"),
+            ProviderError::InvalidInput(crate::provider::ProviderInputError::XmlEncCbcPadding {
+                pad_len,
+            }),
         ) => XmlEncError::InvalidPadding {
-            pad_len: 0,
+            pad_len,
             block_size: 16,
         },
         (_, error) => XmlEncError::Provider(error),
@@ -772,8 +829,32 @@ mod tests {
                 &[0_u8; 27],
             ),
             Err(crate::provider::ProviderError::InvalidInput(
-                "AES-GCM framing"
+                crate::provider::ProviderInputError::AesGcmFraming
             ))
+        ));
+        let truncated = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            key_name: None,
+            encryption_method: super::super::EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            encrypted_keys: Vec::new(),
+            cipher_data: super::super::CipherData {
+                value: STANDARD.encode([0_u8; 27]),
+            },
+        };
+        assert!(matches!(
+            DecryptContext::new(&SymmetricKeyDecryptor::new([0_u8; 16])).decrypt_data(&truncated),
+            Err(XmlEncError::DataTooShort {
+                algorithm: "AES-GCM",
+                actual: 27,
+                ..
+            })
         ));
         let encrypted_key = EncryptedKey {
             id: None,
@@ -990,6 +1071,86 @@ mod tests {
         assert!(matches!(
             decryptor.resolve_key(crate::provider::default_provider(), DataEncryptionAlgorithm::Aes128Gcm, Some(&encrypted_key)),
             Err(XmlEncError::UnsupportedAlgorithm(uri)) if uri == "urn:unsupported:mgf"
+        ));
+    }
+
+    #[test]
+    fn decryption_policy_enforces_oaep_digest_and_plaintext_limits() {
+        // Algorithm and allocation policies are checked before key resolution
+        // or plaintext materialization, including the document-declared MGF.
+        let encrypted_key = EncryptedKey {
+            id: None,
+            recipient: None,
+            key_name: None,
+            encryption_method: super::super::EncryptionMethod {
+                algorithm: KeyTransportAlgorithm::RsaOaep11.uri().into(),
+                key_size_bits: None,
+                oaep_digest: Some(OaepDigestAlgorithm::Sha256.uri().into()),
+                mgf_algorithm: Some("http://www.w3.org/2009/xmlenc11#mgf1sha1".into()),
+                oaep_params: None,
+            },
+            cipher_data: super::super::CipherData {
+                value: STANDARD.encode([0_u8; 256]),
+            },
+            reference_list: None,
+            carried_key_name: None,
+        };
+        let encrypted = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            key_name: None,
+            encryption_method: super::super::EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            encrypted_keys: vec![encrypted_key],
+            cipher_data: super::super::CipherData {
+                value: STANDARD.encode([0_u8; 28]),
+            },
+        };
+        let policy = crate::policy::DecryptionPolicy {
+            oaep_digests: Some(std::collections::HashSet::from([
+                OaepDigestAlgorithm::Sha256,
+            ])),
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        assert!(matches!(
+            DecryptContext::new(&SymmetricKeyDecryptor::new([0_u8; 16]))
+                .policy(policy)
+                .decrypt_data(&encrypted),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::Algorithm { .. }
+            ))
+        ));
+
+        let ciphertext = crate::provider::default_provider()
+            .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &[0_u8; 16], b"four")
+            .expect("test encryption must succeed");
+        let bounded = EncryptedData {
+            encrypted_keys: Vec::new(),
+            cipher_data: super::super::CipherData {
+                value: STANDARD.encode(ciphertext),
+            },
+            ..encrypted
+        };
+        let policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_encryption_plaintext_bytes: 3,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        assert!(matches!(
+            DecryptContext::new(&SymmetricKeyDecryptor::new([0_u8; 16]))
+                .policy(policy)
+                .decrypt_data(&bounded),
+            Err(XmlEncError::PlaintextTooLarge {
+                maximum: 3,
+                actual: 4
+            })
         ));
     }
 

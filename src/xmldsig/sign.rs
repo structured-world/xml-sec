@@ -56,6 +56,10 @@ pub struct ComputedReferenceDigest {
 /// Errors returned by the XMLDSig signing digest pass.
 #[derive(Debug, thiserror::Error)]
 pub enum SigningDigestError {
+    /// The selected provider could not compute a reference digest.
+    #[error("cryptographic provider error: {0}")]
+    Provider(#[from] crate::provider::ProviderError),
+
     /// The compiled signing policy rejected an operation input.
     #[error("signing policy violation: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),
@@ -539,6 +543,9 @@ impl<'a> SignContext<'a> {
     /// base64 `<SignatureValue>`.
     pub fn sign_template(&self, xml: &str) -> Result<String, SigningError> {
         self.policy.resources.validate()?;
+        let execution_budget = TransformExecutionBudget::with_c14n_limit(
+            self.policy.resources.max_canonicalized_bytes,
+        );
         let transform_options = TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.xpath_here_semantics);
@@ -547,16 +554,12 @@ impl<'a> SignContext<'a> {
             transform_options,
             Some(&self.policy),
             self.provider,
+            &execution_budget,
         )?;
         let (algorithm, canonical_signed_info) = canonicalize_signed_info(&with_digests)?;
-        if canonical_signed_info.len() > self.policy.resources.max_canonicalized_bytes {
-            return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "canonicalized SignedInfo bytes",
-                maximum: self.policy.resources.max_canonicalized_bytes,
-                actual: canonical_signed_info.len(),
-            }
-            .into());
-        }
+        execution_budget
+            .charge_c14n_output(canonical_signed_info.len())
+            .map_err(SigningDigestError::Transform)?;
         if !algorithm.signing_allowed()
             || self
                 .policy
@@ -611,11 +614,13 @@ struct SigningReference {
 pub fn compute_reference_digest_values(
     xml: &str,
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
+    let execution_budget = TransformExecutionBudget::default();
     compute_reference_digest_values_with_options(
         xml,
         TransformOptions::default(),
         None,
         crate::provider::default_provider(),
+        &execution_budget,
     )
 }
 
@@ -624,6 +629,7 @@ fn compute_reference_digest_values_with_options(
     transform_options: TransformOptions,
     policy: Option<&crate::policy::SigningPolicy>,
     provider: &dyn crate::provider::CryptoProvider,
+    execution_budget: &TransformExecutionBudget,
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
     let doc = Document::parse(xml)?;
     let signature = find_signing_signature_node(&doc)?;
@@ -647,11 +653,21 @@ fn compute_reference_digest_values_with_options(
                 }
                 .into());
             }
+            if let Some(allowed) = policy.transforms.as_ref() {
+                for transform in &reference.transforms {
+                    let uri = transform.algorithm_uri();
+                    if !allowed.contains(uri) {
+                        return Err(crate::policy::PolicyViolation::Algorithm {
+                            operation: "signing transform",
+                            algorithm: uri.to_owned(),
+                        }
+                        .into());
+                    }
+                }
+            }
         }
     }
     let resolver = UriReferenceResolver::new(&doc);
-    let execution_budget = TransformExecutionBudget::default();
-
     references
         .into_iter()
         .enumerate()
@@ -677,10 +693,13 @@ fn compute_reference_digest_values_with_options(
                 initial_data,
                 &reference.transforms,
                 transform_options,
-                &execution_budget,
+                execution_budget,
             )?;
-            let digest =
-                super::compute_digest_with_provider(provider, reference.digest_method, &pre_digest);
+            let digest = super::compute_digest_with_provider(
+                provider,
+                reference.digest_method,
+                &pre_digest,
+            )?;
             let digest_value = base64::engine::general_purpose::STANDARD.encode(digest);
             Ok(ComputedReferenceDigest {
                 index,
@@ -699,11 +718,13 @@ fn compute_reference_digest_values_with_options(
 /// and writes the base64 digest into the matching `<DigestValue>` in document
 /// order.
 pub fn fill_reference_digest_values(xml: &str) -> Result<String, SigningDigestError> {
+    let execution_budget = TransformExecutionBudget::default();
     fill_reference_digest_values_with_options(
         xml,
         TransformOptions::default(),
         None,
         crate::provider::default_provider(),
+        &execution_budget,
     )
 }
 
@@ -712,11 +733,17 @@ fn fill_reference_digest_values_with_options(
     transform_options: TransformOptions,
     policy: Option<&crate::policy::SigningPolicy>,
     provider: &dyn crate::provider::CryptoProvider,
+    execution_budget: &TransformExecutionBudget,
 ) -> Result<String, SigningDigestError> {
-    let digest_values =
-        compute_reference_digest_values_with_options(xml, transform_options, policy, provider)?
-            .into_iter()
-            .map(|digest| digest.digest_value);
+    let digest_values = compute_reference_digest_values_with_options(
+        xml,
+        transform_options,
+        policy,
+        provider,
+        execution_budget,
+    )?
+    .into_iter()
+    .map(|digest| digest.digest_value);
     Ok(fill_signed_info_digest_values(xml, digest_values)?)
 }
 

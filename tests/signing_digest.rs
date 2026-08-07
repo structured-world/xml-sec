@@ -1,4 +1,7 @@
+use std::collections::HashSet;
+
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::policy::SigningPolicy;
 use xml_sec::xmldsig::mutation::append_signature_to_root;
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::uri::UriReferenceResolver;
@@ -266,6 +269,66 @@ fn computes_enveloped_signature_digest_for_whole_document() {
 
     let filled = fill_reference_digest_values(&xml).expect("fill digest values");
     assert_reference_digests_verify(&filled);
+}
+
+#[test]
+fn signing_policy_rejects_disallowed_reference_transform() {
+    // A signing policy is an execution boundary, not advisory metadata: every
+    // template transform must be accepted before any digest work runs.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template = template_with_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("")
+            .transform(Transform::Enveloped),
+    );
+    let xml =
+        append_signature_to_root("<root><payload/></root>", &template).expect("append signature");
+    let policy = SigningPolicy {
+        transforms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+        ..SigningPolicy::default()
+    };
+
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(policy)
+            .sign_template(&xml),
+        Err(SigningError::Digest(SigningDigestError::Policy(_)))
+    ));
+}
+
+#[test]
+fn signing_policy_shares_canonicalization_budget_with_signed_info() {
+    // Reference transforms and SignedInfo consume one operation-wide C14N
+    // allowance, preventing a template from multiplying the configured cap.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template = template_with_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#payload")
+            .transform(Transform::C14n(exclusive_c14n())),
+    );
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">canonicalized bytes</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_canonicalized_bytes: 32,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(policy)
+            .sign_template(&xml),
+        Err(SigningError::Digest(SigningDigestError::Transform(_)))
+    ));
 }
 
 #[test]

@@ -131,35 +131,13 @@ fn donor_full_verification_suite_accepts_every_supported_case() {
     compatibility_policy.key_trust.allow_legacy_rsa_sha1 = true;
 
     for case in cases() {
-        match case.expectation {
-            Expectation::Embedded => {
-                let xml = read_fixture(&root.join(case.xml_path));
-                let resolver = DefaultKeyResolver::default();
-                match VerifyContext::new()
-                    .policy(compatibility_policy.clone())
-                    .key_resolver(&resolver)
-                    .verify(&xml)
-                {
-                    Ok(result) if matches!(result.status, DsigStatus::Valid) => {
-                        passed += 1;
-                    }
-                    Ok(result) => {
-                        failed.push(format!(
-                            "{}: expected Valid, got {:?}",
-                            case.name, result.status
-                        ));
-                    }
-                    Err(err) => {
-                        failed.push(format!("{}: verification error {err}", case.name));
-                    }
-                }
-            }
+        let resolver = match case.expectation {
+            Expectation::Embedded => DefaultKeyResolver::default(),
             Expectation::Named {
                 key_name,
                 key_path,
                 algorithm,
             } => {
-                let xml = read_fixture(&root.join(case.xml_path));
                 let mut config = KeyResolverConfig::default();
                 config.named_keys.insert(
                     key_name.into(),
@@ -170,49 +148,19 @@ fn donor_full_verification_suite_accepts_every_supported_case() {
                         name: Some(key_name.into()),
                     },
                 );
-                let resolver = DefaultKeyResolver::new(config);
-                match VerifyContext::new()
-                    .policy(compatibility_policy.clone())
-                    .key_resolver(&resolver)
-                    .verify(&xml)
-                {
-                    Ok(result) if matches!(result.status, DsigStatus::Valid) => passed += 1,
-                    Ok(result) => failed.push(format!(
-                        "{}: expected Valid, got {:?}",
-                        case.name, result.status
-                    )),
-                    Err(err) => {
-                        failed.push(format!("{}: verification error {err}", case.name));
-                    }
-                }
+                DefaultKeyResolver::new(config)
             }
             Expectation::Selected { certificate_paths } => {
-                let xml = read_fixture(&root.join(case.xml_path));
-                let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+                DefaultKeyResolver::new(KeyResolverConfig {
                     lookup_certs: certificate_paths
                         .iter()
                         .map(|path| read_pem_der(&root.join(path), "CERTIFICATE"))
                         .collect(),
                     ..KeyResolverConfig::default()
-                });
-                match VerifyContext::new()
-                    .policy(compatibility_policy.clone())
-                    .key_resolver(&resolver)
-                    .verify(&xml)
-                {
-                    Ok(result) if matches!(result.status, DsigStatus::Valid) => passed += 1,
-                    Ok(result) => failed.push(format!(
-                        "{}: expected Valid, got {:?}",
-                        case.name, result.status
-                    )),
-                    Err(err) => {
-                        failed.push(format!("{}: verification error {err}", case.name));
-                    }
-                }
+                })
             }
             Expectation::Chain { trust_anchor_path } => {
-                let xml = read_fixture(&root.join(case.xml_path));
-                let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+                DefaultKeyResolver::new(KeyResolverConfig {
                     trusted_certs: vec![read_pem_der(&root.join(trust_anchor_path), "CERTIFICATE")],
                     trust: KeyTrustPolicy {
                         verify_x509_chains: true,
@@ -223,22 +171,21 @@ fn donor_full_verification_suite_accepts_every_supported_case() {
                         ..KeyTrustPolicy::default()
                     },
                     ..KeyResolverConfig::default()
-                });
-                match VerifyContext::new()
-                    .policy(compatibility_policy.clone())
-                    .key_resolver(&resolver)
-                    .verify(&xml)
-                {
-                    Ok(result) if matches!(result.status, DsigStatus::Valid) => passed += 1,
-                    Ok(result) => failed.push(format!(
-                        "{}: expected Valid, got {:?}",
-                        case.name, result.status
-                    )),
-                    Err(err) => {
-                        failed.push(format!("{}: verification error {err}", case.name));
-                    }
-                }
+                })
             }
+        };
+        let xml = read_fixture(&root.join(case.xml_path));
+        match VerifyContext::new()
+            .policy(compatibility_policy.clone())
+            .key_resolver(&resolver)
+            .verify(&xml)
+        {
+            Ok(result) if matches!(result.status, DsigStatus::Valid) => passed += 1,
+            Ok(result) => failed.push(format!(
+                "{}: expected Valid, got {:?}",
+                case.name, result.status
+            )),
+            Err(err) => failed.push(format!("{}: verification error {err}", case.name)),
         }
     }
 

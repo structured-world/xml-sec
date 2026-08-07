@@ -21,10 +21,11 @@ use crate::hard_limits::{CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING, XML_DOCUMENT
 #[cfg(test)]
 use super::digest::compute_digest;
 use super::digest::{DigestAlgorithm, constant_time_eq};
+#[cfg(test)]
+use super::parse::MAX_REFERENCES_PER_SIGNATURE;
 use super::parse::{
-    KeyInfo, MAX_REFERENCES_PER_SIGNATURE, MAX_X509_DATA_TOTAL_BINARY_LEN,
-    MAX_X509_DECODED_BINARY_LEN, ParseError, Reference, RetrievalMethodTransforms,
-    SignatureAlgorithm, XMLDSIG_NS,
+    KeyInfo, MAX_X509_DATA_TOTAL_BINARY_LEN, MAX_X509_DECODED_BINARY_LEN, ParseError, Reference,
+    RetrievalMethodTransforms, SignatureAlgorithm, XMLDSIG_NS,
 };
 use super::parse::{
     parse_key_info, parse_reference_with_xpath_budget, parse_signed_info_with_xpath_budget,
@@ -34,10 +35,11 @@ use super::signature::{
     SignatureVerificationError, verify_dsa_signature_spki, verify_ecdsa_signature_pem,
     verify_rsa_signature_pem,
 };
+#[cfg(test)]
+use super::transforms::{BASE64_TRANSFORM_URI, XPATH_TRANSFORM_URI};
 use super::transforms::{
-    BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget,
-    TransformOptions, XPATH_TRANSFORM_URI, XPathHereSemantics, XPathSignatureParseBudget,
-    execute_transforms_with_options_and_budget,
+    DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget, TransformOptions,
+    XPathHereSemantics, XPathSignatureParseBudget, execute_transforms_with_options_and_budget,
 };
 use super::uri::{UriReferenceResolver, same_document_reference_id};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
@@ -638,7 +640,7 @@ fn process_reference_with_options(
         execution.provider,
         reference.digest_method,
         &pre_digest_bytes,
-    );
+    )?;
 
     // 4. Compare with stored DigestValue (constant-time)
     let status = if constant_time_eq(&computed_digest, &reference.digest_value) {
@@ -738,6 +740,10 @@ fn process_all_references_with_options(
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReferenceProcessingError {
+    /// The selected provider could not compute the declared digest.
+    #[error("cryptographic provider error: {0}")]
+    Provider(#[from] crate::provider::ProviderError),
+
     /// `<Reference>` omitted the `URI` attribute, which we do not resolve implicitly.
     #[error("reference URI is required; omitted URI references are not supported")]
     MissingUri,
@@ -1155,7 +1161,10 @@ fn verify_signature_with_context(
     let manifest_references = if ctx.policy.process_manifests {
         let signed_info_reference_nodes =
             collect_authenticated_signed_info_reference_nodes(&signed_info.references, &resolver);
-        let remaining_reference_capacity = MAX_REFERENCES_PER_SIGNATURE
+        let remaining_reference_capacity = ctx
+            .policy
+            .resources
+            .max_references
             .checked_sub(signed_info.references.len())
             .ok_or(SignatureVerificationPipelineError::InvalidStructure {
                 reason: "SignedInfo exceeds the per-signature Reference limit",
@@ -1418,6 +1427,19 @@ fn process_manifest_references(
     }
     results.reserve(manifest_references.len());
     for (index, reference, reference_node_id) in &manifest_references {
+        if ctx
+            .policy
+            .digest_algorithms
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
+        {
+            results.push(manifest_reference_invalid_result(
+                reference,
+                *index,
+                FailureReason::ReferencePolicyViolation { ref_index: *index },
+            ));
+            continue;
+        }
         match enforce_reference_policies(
             std::slice::from_ref(reference),
             ctx.policy.reference_uri_types,
@@ -1678,7 +1700,7 @@ fn enforce_reference_policies(
 
         if let Some(allowed) = allowed_transforms {
             for transform in &reference.transforms {
-                let transform_uri = transform_uri(transform);
+                let transform_uri = transform.algorithm_uri();
                 if !allowed.contains(transform_uri) {
                     return Err(SignatureVerificationPipelineError::DisallowedTransform {
                         algorithm: transform_uri.to_owned(),
@@ -1702,16 +1724,6 @@ fn enforce_reference_policies(
         }
     }
     Ok(())
-}
-
-fn transform_uri(transform: &Transform) -> &'static str {
-    match transform {
-        Transform::Enveloped => super::transforms::ENVELOPED_SIGNATURE_URI,
-        Transform::XpathExcludeAllSignatures | Transform::XPath(_) => XPATH_TRANSFORM_URI,
-        Transform::XPathFilter2(_) => super::transforms::XPATH_FILTER2_TRANSFORM_URI,
-        Transform::C14n(algo) => algo.uri(),
-        Transform::Base64Decode => BASE64_TRANSFORM_URI,
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2939,6 +2951,48 @@ mod tests {
     }
 
     #[test]
+    fn verify_context_applies_digest_policy_to_manifest_references() {
+        // Manifest results are authenticated extension data and must obey the
+        // same digest allowlist as SignedInfo references.
+        let policy = crate::policy::VerificationPolicy {
+            process_manifests: true,
+            digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+            ..crate::policy::VerificationPolicy::default()
+        };
+        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |mut xml| {
+            let legacy = "http://www.w3.org/2000/09/xmldsig#sha1";
+            let offset = xml
+                .rfind(legacy)
+                .expect("Manifest DigestMethod must be present");
+            xml.replace_range(offset..offset + legacy.len(), DigestAlgorithm::Sha256.uri());
+            let value_start = xml[offset..]
+                .find("<ds:DigestValue>")
+                .map(|relative| offset + relative + "<ds:DigestValue>".len())
+                .expect("Manifest DigestValue must be present");
+            let value_end = xml[value_start..]
+                .find("</ds:DigestValue>")
+                .map(|relative| value_start + relative)
+                .expect("Manifest DigestValue must be closed");
+            xml.replace_range(
+                value_start..value_end,
+                &base64::engine::general_purpose::STANDARD.encode([0_u8; 32]),
+            );
+            xml
+        });
+        let result = VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .verify(&xml)
+            .expect("a disallowed Manifest digest is a per-reference result");
+
+        assert!(matches!(result.status, DsigStatus::Valid));
+        assert!(matches!(
+            result.manifest_references[0].status,
+            DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
+        ));
+    }
+
+    #[test]
     fn verify_context_skips_manifest_uri_work_when_signature_is_invalid() {
         // Missing Manifest URIs remain unauthenticated until SignatureValue
         // succeeds, so they cannot trigger Manifest policy processing here.
@@ -3118,6 +3172,32 @@ mod tests {
             .verify(&xml)
             .expect_err("one Manifest Reference must exceed the exhausted signature-wide limit");
 
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "signed Manifests exceed the per-signature Reference limit"
+            }
+        ));
+    }
+
+    #[test]
+    fn configured_reference_limit_is_shared_with_manifests() {
+        // Lowering the operation policy must lower the aggregate SignedInfo and
+        // Manifest capacity rather than falling back to the crate hard limit.
+        let policy = crate::policy::VerificationPolicy {
+            process_manifests: true,
+            resources: crate::policy::ResourcePolicy {
+                max_references: 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .verify(&signature_with_manifest_xml(true))
+            .expect_err("Manifest must exceed the caller-selected aggregate limit");
         assert!(matches!(
             error,
             SignatureVerificationPipelineError::InvalidStructure {

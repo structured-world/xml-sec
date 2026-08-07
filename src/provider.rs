@@ -53,6 +53,39 @@ pub struct CapabilityQuery<'a> {
     pub algorithm: Option<&'a str>,
 }
 
+/// Structured invalid-input reasons returned by cryptographic providers.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProviderInputError {
+    /// A primitive rejected a key or IV after its public preconditions were checked.
+    #[error("failed to initialize {0}")]
+    PrimitiveInitialization(&'static str),
+    /// AES-CBC input does not contain an IV followed by complete blocks.
+    #[error("invalid AES-CBC framing")]
+    AesCbcFraming,
+    /// AES-CBC block decryption failed.
+    #[error("invalid AES-CBC ciphertext")]
+    AesCbcCiphertext,
+    /// AES-CBC produced no plaintext block.
+    #[error("empty AES-CBC plaintext")]
+    AesCbcPlaintext,
+    /// XMLEnc CBC padding length is outside the valid block range.
+    #[error("invalid XMLEnc CBC padding length {pad_len}")]
+    XmlEncCbcPadding {
+        /// Last plaintext octet interpreted as the padding length.
+        pad_len: u8,
+    },
+    /// AES-GCM input does not contain a nonce and authentication tag.
+    #[error("invalid AES-GCM framing")]
+    AesGcmFraming,
+    /// AES key-wrap input or output framing is invalid.
+    #[error("invalid AES key-wrap framing")]
+    AesKeyWrapFraming,
+    /// The legacy RSA-OAEP URI requires MGF1-SHA1.
+    #[error("legacy RSA-OAEP requires MGF1-SHA1")]
+    LegacyRsaOaepMgf,
+}
+
 /// Failure returned by a cryptographic provider.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -73,9 +106,9 @@ pub enum ProviderError {
         /// Supplied key length.
         actual: usize,
     },
-    /// Input framing or padding is invalid.
+    /// Input framing, padding, or primitive initialization is invalid.
     #[error("invalid cryptographic input: {0}")]
-    InvalidInput(&'static str),
+    InvalidInput(ProviderInputError),
     /// Authenticated decryption or key-wrap integrity validation failed.
     #[error("cryptographic authentication failed")]
     AuthenticationFailed,
@@ -230,9 +263,8 @@ impl CryptoProvider for RustCryptoProvider {
                         | "http://www.w3.org/2001/04/xmlenc#sha512"
                 )
             }),
-            ProviderOperation::Sign | ProviderOperation::Verify => {
-                query.algorithm.is_none_or(is_supported_signature_uri)
-            }
+            ProviderOperation::Sign => query.algorithm.is_none_or(is_supported_signing_uri),
+            ProviderOperation::Verify => query.algorithm.is_none_or(is_supported_signature_uri),
             ProviderOperation::Encrypt | ProviderOperation::Decrypt => {
                 query.algorithm.is_none_or(is_supported_data_encryption_uri)
             }
@@ -395,6 +427,17 @@ fn is_supported_signature_uri(algorithm: &str) -> bool {
     )
 }
 
+fn is_supported_signing_uri(algorithm: &str) -> bool {
+    matches!(
+        algorithm,
+        "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
+            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384"
+            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512"
+            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"
+            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384"
+    )
+}
+
 fn is_supported_data_encryption_uri(algorithm: &str) -> bool {
     matches!(
         algorithm,
@@ -428,7 +471,7 @@ mod rustcrypto {
     use sha1::Sha1;
     use sha2::{Sha256, Sha384, Sha512};
 
-    use super::{CryptoProvider, ProviderError};
+    use super::{CryptoProvider, ProviderError, ProviderInputError};
     use crate::xmlenc::{
         DataEncryptionAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm,
         RsaOaepParameters,
@@ -497,12 +540,15 @@ mod rustcrypto {
         }
         *padded.last_mut().expect("padding is non-empty") = pad_len as u8;
         Encryptor::<C>::new_from_slices(key, &iv)
-            .map_err(|_| ProviderError::InvalidKeySize {
-                expected: key.len(),
-                actual: key.len(),
+            .map_err(|_| {
+                ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization("AES-CBC"))
             })?
             .encrypt_padded::<NoPadding>(&mut padded, plaintext.len() + pad_len)
-            .map_err(|_| ProviderError::InvalidInput("AES-CBC padding"))?;
+            .map_err(|_| {
+                ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(
+                    "AES-CBC padding",
+                ))
+            })?;
         let mut output = Vec::with_capacity(16 + padded.len());
         output.extend_from_slice(&iv);
         output.extend_from_slice(&padded);
@@ -514,26 +560,28 @@ mod rustcrypto {
         C: aes::cipher::BlockCipherDecrypt + aes::cipher::KeyInit,
     {
         if ciphertext.len() < 32 || !(ciphertext.len() - 16).is_multiple_of(16) {
-            return Err(ProviderError::InvalidInput("AES-CBC framing"));
+            return Err(ProviderError::InvalidInput(
+                ProviderInputError::AesCbcFraming,
+            ));
         }
         let (iv, body) = ciphertext.split_at(16);
         let mut plaintext = body.to_vec();
         Decryptor::<C>::new_from_slices(key, iv)
-            .map_err(|_| ProviderError::InvalidKeySize {
-                expected: key.len(),
-                actual: key.len(),
+            .map_err(|_| {
+                ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization("AES-CBC"))
             })?
             .decrypt_padded::<NoPadding>(&mut plaintext)
-            .map_err(|_| ProviderError::InvalidInput("AES-CBC ciphertext"))?;
-        let pad_len = usize::from(
-            *plaintext
-                .last()
-                .ok_or(ProviderError::InvalidInput("AES-CBC plaintext"))?,
-        );
-        if !(1..=16).contains(&pad_len) || pad_len > plaintext.len() {
-            return Err(ProviderError::InvalidInput("XMLEnc CBC padding"));
+            .map_err(|_| ProviderError::InvalidInput(ProviderInputError::AesCbcCiphertext))?;
+        let pad_len = *plaintext.last().ok_or(ProviderError::InvalidInput(
+            ProviderInputError::AesCbcPlaintext,
+        ))?;
+        let padding_bytes = usize::from(pad_len);
+        if !(1..=16).contains(&padding_bytes) || padding_bytes > plaintext.len() {
+            return Err(ProviderError::InvalidInput(
+                ProviderInputError::XmlEncCbcPadding { pad_len },
+            ));
         }
-        plaintext.truncate(plaintext.len() - pad_len);
+        plaintext.truncate(plaintext.len() - padding_bytes);
         Ok(plaintext)
     }
 
@@ -547,13 +595,15 @@ mod rustcrypto {
     {
         let mut nonce = [0_u8; 12];
         provider.fill_random(&mut nonce)?;
-        let cipher = C::new_from_slice(key).map_err(|_| ProviderError::InvalidKeySize {
-            expected: key.len(),
-            actual: key.len(),
+        let cipher = C::new_from_slice(key).map_err(|_| {
+            ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization("AES-GCM"))
         })?;
         let mut output = plaintext.to_vec();
-        let nonce = Nonce::try_from(nonce.as_slice())
-            .map_err(|_| ProviderError::InvalidInput("AES-GCM nonce"))?;
+        let nonce = Nonce::try_from(nonce.as_slice()).map_err(|_| {
+            ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(
+                "AES-GCM nonce",
+            ))
+        })?;
         cipher
             .encrypt_in_place(&nonce, &[], &mut output)
             .map_err(|_| ProviderError::AuthenticationFailed)?;
@@ -568,16 +618,20 @@ mod rustcrypto {
         C: AeadInOut + KeyInit,
     {
         if ciphertext.len() < 28 {
-            return Err(ProviderError::InvalidInput("AES-GCM framing"));
+            return Err(ProviderError::InvalidInput(
+                ProviderInputError::AesGcmFraming,
+            ));
         }
         let (nonce, body) = ciphertext.split_at(12);
-        let cipher = C::new_from_slice(key).map_err(|_| ProviderError::InvalidKeySize {
-            expected: key.len(),
-            actual: key.len(),
+        let cipher = C::new_from_slice(key).map_err(|_| {
+            ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization("AES-GCM"))
         })?;
         let mut plaintext = body.to_vec();
-        let nonce =
-            Nonce::try_from(nonce).map_err(|_| ProviderError::InvalidInput("AES-GCM nonce"))?;
+        let nonce = Nonce::try_from(nonce).map_err(|_| {
+            ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(
+                "AES-GCM nonce",
+            ))
+        })?;
         cipher
             .decrypt_in_place(&nonce, &[], &mut plaintext)
             .map_err(|_| ProviderError::AuthenticationFailed)?;
@@ -605,7 +659,7 @@ mod rustcrypto {
                 })?
                 .wrap_key(key, &mut output),
         }
-        .map_err(|_| ProviderError::InvalidInput("AES key wrap"))?;
+        .map_err(|_| ProviderError::InvalidInput(ProviderInputError::AesKeyWrapFraming))?;
         Ok(output)
     }
 
@@ -616,7 +670,9 @@ mod rustcrypto {
     ) -> Result<Vec<u8>, ProviderError> {
         check_key(algorithm.key_len(), kek)?;
         if wrapped.len() < 16 || !wrapped.len().is_multiple_of(8) {
-            return Err(ProviderError::InvalidInput("AES key wrap framing"));
+            return Err(ProviderError::InvalidInput(
+                ProviderInputError::AesKeyWrapFraming,
+            ));
         }
         let mut output = vec![0_u8; wrapped.len() - 8];
         let key = match algorithm {
@@ -647,7 +703,7 @@ mod rustcrypto {
             && parameters.mgf_digest != OaepDigestAlgorithm::Sha1
         {
             return Err(ProviderError::InvalidInput(
-                "legacy RSA-OAEP requires MGF1-SHA1",
+                ProviderInputError::LegacyRsaOaepMgf,
             ));
         }
         let mut rng = super::ProviderRng(provider);
@@ -716,6 +772,13 @@ mod rustcrypto {
         parameters: &RsaOaepParameters,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
+        if parameters.algorithm == KeyTransportAlgorithm::RsaOaepMgf1p
+            && parameters.mgf_digest != OaepDigestAlgorithm::Sha1
+        {
+            return Err(ProviderError::InvalidInput(
+                ProviderInputError::LegacyRsaOaepMgf,
+            ));
+        }
         let mut rng = super::ProviderRng(provider);
         macro_rules! decrypt_with {
             ($digest:ty, $mgf:ty) => {
@@ -799,8 +862,42 @@ mod tests {
             algorithm: None
         }));
         assert!(!RUST_CRYPTO_PROVIDER.supports(CapabilityQuery {
+            operation: ProviderOperation::Sign,
+            algorithm: Some("http://www.w3.org/2000/09/xmldsig#rsa-sha1")
+        }));
+        assert!(RUST_CRYPTO_PROVIDER.supports(CapabilityQuery {
+            operation: ProviderOperation::Verify,
+            algorithm: Some("http://www.w3.org/2000/09/xmldsig#rsa-sha1")
+        }));
+        assert!(!RUST_CRYPTO_PROVIDER.supports(CapabilityQuery {
             operation: ProviderOperation::Verify,
             algorithm: Some("urn:unsupported:signature"),
         }));
+    }
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn legacy_oaep_mgf_constraint_is_symmetric() {
+        use rsa::pkcs8::DecodePrivateKey;
+
+        // The legacy URI fixes MGF1 to SHA-1 for both directions; rejecting
+        // before RSA processing keeps transport and recovery capabilities equal.
+        let key = rsa::RsaPrivateKey::from_pkcs8_pem(include_str!(
+            "../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("RSA fixture must parse");
+        let parameters = crate::xmlenc::RsaOaepParameters {
+            algorithm: crate::xmlenc::KeyTransportAlgorithm::RsaOaepMgf1p,
+            digest: crate::xmlenc::OaepDigestAlgorithm::Sha256,
+            mgf_digest: crate::xmlenc::OaepDigestAlgorithm::Sha256,
+            label: Vec::new(),
+        };
+
+        assert!(matches!(
+            RUST_CRYPTO_PROVIDER.recover_key(&key, &parameters, &[0_u8; 256]),
+            Err(ProviderError::InvalidInput(
+                ProviderInputError::LegacyRsaOaepMgf
+            ))
+        ));
     }
 }

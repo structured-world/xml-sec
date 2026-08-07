@@ -4,7 +4,10 @@
 //! document targets, tenant identity, and external resource bytes remain in
 //! operation request contexts and are deliberately not stored here.
 
-use std::{collections::HashSet, time::SystemTime};
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+use std::collections::HashSet;
+#[cfg(feature = "xmldsig")]
+use std::time::SystemTime;
 
 #[cfg(feature = "xmldsig")]
 use crate::xmldsig::{DigestAlgorithm, SignatureAlgorithm, UriTypeSet, XPathHereSemantics};
@@ -95,32 +98,55 @@ impl Default for ResourcePolicy {
 impl ResourcePolicy {
     /// Validate policy values against non-configurable implementation ceilings.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
-        self.within(
+        Self::within(
             "XML nodes",
             self.max_xml_nodes,
             crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
         )?;
-        self.within(
+        Self::within(
             "canonicalized bytes",
             self.max_canonicalized_bytes,
             crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING,
         )?;
-        self.within("signature references", self.max_references, 64)?;
-        self.within(
+        Self::within("signature references", self.max_references, 64)?;
+        Self::within(
             "reference transforms",
             self.max_transforms_per_reference,
             64,
         )?;
-        self.within(
+        Self::within(
             "encryption document",
             self.max_encryption_document_bytes,
             crate::hard_limits::ENCRYPTION_DOCUMENT_BYTE_CEILING,
         )?;
-        Ok(())
+        Self::within(
+            "external resource bytes",
+            self.max_external_resource_bytes,
+            crate::hard_limits::EXTERNAL_RESOURCE_BYTE_CEILING,
+        )?;
+        Self::within(
+            "aggregate external resource bytes",
+            self.max_external_resource_total_bytes,
+            crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING,
+        )?;
+        Self::within(
+            "encryption plaintext bytes",
+            self.max_encryption_plaintext_bytes,
+            crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING,
+        )?;
+        Self::within(
+            "encryption recipients",
+            self.max_encryption_recipients,
+            crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
+        )?;
+        Self::within(
+            "encryption metadata bytes",
+            self.max_encryption_metadata_bytes,
+            crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
+        )
     }
 
     fn within(
-        &self,
         resource: &'static str,
         selected: usize,
         ceiling: usize,
@@ -178,8 +204,8 @@ impl Default for KeyTrustPolicy {
 #[cfg(feature = "xmldsig")]
 impl KeyTrustPolicy {
     fn validate(&self) -> Result<(), PolicyViolation> {
-        ResourcePolicy::default().within("X.509 chain depth", self.max_x509_chain_depth, 9)?;
-        ResourcePolicy::default().within("X.509 candidate paths", self.max_x509_candidate_paths, 64)
+        ResourcePolicy::within("X.509 chain depth", self.max_x509_chain_depth, 9)?;
+        ResourcePolicy::within("X.509 candidate paths", self.max_x509_candidate_paths, 64)
     }
 }
 
@@ -209,7 +235,6 @@ pub struct VerificationPolicy {
     pub resources: ResourcePolicy,
 }
 
-#[cfg(feature = "xmldsig")]
 #[cfg(feature = "xmldsig")]
 impl VerificationPolicy {
     /// Validate the complete snapshot against implementation hard ceilings.
@@ -261,7 +286,6 @@ pub struct SigningPolicy {
     pub resources: ResourcePolicy,
 }
 
-#[cfg(feature = "xmldsig")]
 /// Immutable policy snapshot for XMLEnc encryption.
 #[cfg(feature = "xmlenc")]
 #[derive(Debug, Clone, Default)]
@@ -280,7 +304,6 @@ pub struct EncryptionPolicy {
     pub resources: ResourcePolicy,
 }
 
-#[cfg(feature = "xmlenc")]
 /// Immutable policy snapshot for XMLEnc decryption.
 #[cfg(feature = "xmlenc")]
 pub type DecryptionPolicy = EncryptionPolicy;
@@ -303,6 +326,35 @@ mod tests {
                 actual: 100_001,
             })
         ));
+    }
+
+    #[test]
+    fn every_resource_policy_field_obeys_its_hard_ceiling() {
+        // Each public tuning knob is only a stricter operational limit; none
+        // may raise the implementation's allocation ceiling.
+        let mut policies = Vec::new();
+        let mut external = ResourcePolicy::default();
+        external.max_external_resource_bytes += 1;
+        policies.push(external);
+        let mut aggregate = ResourcePolicy::default();
+        aggregate.max_external_resource_total_bytes += 1;
+        policies.push(aggregate);
+        let mut plaintext = ResourcePolicy::default();
+        plaintext.max_encryption_plaintext_bytes += 1;
+        policies.push(plaintext);
+        let mut recipients = ResourcePolicy::default();
+        recipients.max_encryption_recipients += 1;
+        policies.push(recipients);
+        let mut metadata = ResourcePolicy::default();
+        metadata.max_encryption_metadata_bytes += 1;
+        policies.push(metadata);
+
+        for policy in policies {
+            assert!(matches!(
+                policy.validate(),
+                Err(PolicyViolation::ResourceLimit { .. })
+            ));
+        }
     }
 
     #[cfg(feature = "xmldsig")]
