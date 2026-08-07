@@ -15,7 +15,7 @@ use roxmltree::{Document, Node, NodeId};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
-use crate::c14n::canonicalize;
+use crate::c14n::{canonicalize_bounded, is_output_limit_error};
 use crate::hard_limits::{CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING, XML_DOCUMENT_NODE_CEILING};
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
@@ -539,6 +539,10 @@ impl Default for CanonicalizedDataBudget {
 }
 
 impl CanonicalizedDataBudget {
+    fn remaining(&self) -> usize {
+        self.remaining.get()
+    }
+
     fn charge(&self, bytes: usize) -> Result<(), ReferenceProcessingError> {
         let Some(remaining) = self.remaining.get().checked_sub(bytes) else {
             self.remaining.set(0);
@@ -997,12 +1001,24 @@ fn verify_signature_with_context(
         .map(|node: Node<'_, '_>| node.id())
         .collect();
     let mut canonical_signed_info = Vec::new();
-    canonicalize(
+    canonicalize_bounded(
         &doc,
         Some(&|node| signed_info_subtree.contains(&node.id())),
         &signed_info.c14n_method,
+        canonicalized_data_budget.remaining(),
         &mut canonical_signed_info,
-    )?;
+    )
+    .map_err(|error| {
+        if is_output_limit_error(&error) {
+            SignatureVerificationPipelineError::Reference(
+                ReferenceProcessingError::CanonicalizedDataTooLarge {
+                    max_bytes: canonicalized_data_budget.max_bytes,
+                },
+            )
+        } else {
+            SignatureVerificationPipelineError::Canonicalization(error)
+        }
+    })?;
     canonicalized_data_budget.charge(canonical_signed_info.len())?;
 
     let signature_value = decode_signature_value(signature_children.signature_value_node)?;

@@ -1207,7 +1207,7 @@ pub(crate) fn build_x509_certificate_chain_from(
             .last()
             .expect("chain starts with signing certificate index");
         let current = &info.parsed_certificates[current_idx];
-        if current.subject_dn == current.issuer_dn {
+        if distinguished_names_equal(&current.subject_dn, &current.issuer_dn) {
             break;
         }
 
@@ -1215,7 +1215,10 @@ pub(crate) fn build_x509_certificate_chain_from(
             .parsed_certificates
             .iter()
             .enumerate()
-            .filter(|(idx, cert)| *idx != current_idx && cert.subject_dn == current.issuer_dn)
+            .filter(|(idx, cert)| {
+                *idx != current_idx
+                    && distinguished_names_equal(&cert.subject_dn, &current.issuer_dn)
+            })
             .map(|(idx, _)| idx)
             .collect::<Vec<_>>();
 
@@ -1288,11 +1291,11 @@ fn select_x509_signing_certificate(info: &X509DataInfo) -> Result<usize, ParseEr
         .iter()
         .enumerate()
         .filter(|(_, cert)| {
-            cert.subject_dn != cert.issuer_dn
+            !distinguished_names_equal(&cert.subject_dn, &cert.issuer_dn)
                 && !info
                     .parsed_certificates
                     .iter()
-                    .any(|other| other.issuer_dn == cert.subject_dn)
+                    .any(|other| distinguished_names_equal(&other.issuer_dn, &cert.subject_dn))
         })
         .map(|(idx, _)| idx)
         .collect::<Vec<_>>();
@@ -2704,6 +2707,41 @@ BA== </Modulus>
         };
 
         assert_eq!(x509_info.certificate_chain, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn chain_builder_matches_x509_equivalent_distinguished_names() {
+        // RFC 5280 name chaining uses X.501 matching rather than the lexical
+        // RFC 4514 rendering. Case differences in DirectoryString values must
+        // not disconnect an otherwise valid configured path.
+        let certificates = [
+            fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+            fixture_cert_base64("../../tests/fixtures/keys/ca2cert.pem"),
+            fixture_cert_base64("../../tests/fixtures/keys/cacert.pem"),
+        ]
+        .map(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap()
+        })
+        .to_vec();
+        let mut parsed_certificates = certificates
+            .iter()
+            .map(|certificate| parse_x509_certificate(certificate).unwrap())
+            .collect::<Vec<_>>();
+        parsed_certificates[0].issuer_dn = parsed_certificates[1].subject_dn.to_ascii_lowercase();
+        parsed_certificates[1].issuer_dn = parsed_certificates[2].subject_dn.to_ascii_lowercase();
+        let info = X509DataInfo {
+            certificates,
+            parsed_certificates,
+            ..X509DataInfo::default()
+        };
+
+        assert_eq!(select_x509_signing_certificate(&info).unwrap(), 0);
+        assert_eq!(
+            build_x509_certificate_chain_from(&info, 0).unwrap(),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]

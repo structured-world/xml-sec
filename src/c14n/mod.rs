@@ -240,6 +240,30 @@ pub fn canonicalize(
     )
 }
 
+#[cfg(any(feature = "xmldsig", test))]
+/// Canonicalize through the closure visibility API while refusing to append
+/// beyond `max_output_bytes`; the serializer stops before the excess write.
+pub(crate) fn canonicalize_bounded(
+    doc: &Document,
+    node_set: Option<&dyn Fn(Node) -> bool>,
+    algo: &C14nAlgorithm,
+    max_output_bytes: usize,
+    output: &mut Vec<u8>,
+) -> Result<(), C14nError> {
+    let visibility = node_set.map(|predicate| ClosureVisibility { predicate });
+    canonicalize_with_visibility_and_position_bounded(
+        doc,
+        visibility
+            .as_ref()
+            .map(|visibility| visibility as &dyn NodeVisibility),
+        algo,
+        None,
+        max_output_bytes,
+        output,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn canonicalize_with_visibility(
     doc: &Document,
     visibility: Option<&dyn NodeVisibility>,

@@ -387,12 +387,9 @@ fn remove_dot_segments_with_unmatched_parents(
                 // - For absolute paths, do not traverse above root (the
                 //   leading "" segment from the initial '/' is preserved).
                 // - For relative paths, preserve unmatched ".." segments.
-                let can_pop = match segments.last() {
-                    Some(&"") => false,   // root segment of absolute path
-                    Some(&"..") => false, // already an unmatched ".."
-                    Some(_) => true,
-                    None => false,
-                };
+                let root_segments = usize::from(is_absolute);
+                let can_pop =
+                    segments.len() > root_segments && !matches!(segments.last(), Some(&".."));
                 if can_pop {
                     segments.pop();
                 } else if !is_absolute && preserve_unmatched_parents {
@@ -439,6 +436,20 @@ mod tests {
                 "https://example.test/a/../data.bin?version=1#payload"
             ),
             "https://example.test/data.bin?version=1#payload"
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_reference_consumes_interior_empty_segment() {
+        // RFC 3986 treats the empty segment introduced by the second slash as
+        // an ordinary path segment. The following parent segment removes it;
+        // only the leading empty segment represents the absolute-path root.
+        assert_eq!(
+            resolve_uri(
+                "https://base.example/ignored/",
+                "https://example.test/a//../b"
+            ),
+            "https://example.test/a/b"
         );
     }
 

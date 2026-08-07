@@ -17,7 +17,7 @@ use super::{
     X509ChainOptions, X509DataInfo,
     parse::{
         EC_P256_OID, EC_P384_OID, ParseError, X509ChainBuildError,
-        build_x509_certificate_chain_from, parse_x509_certificate,
+        build_x509_certificate_chain_from, distinguished_names_equal, parse_x509_certificate,
         x509_certificate_matches_any_selector, x509_data_has_lookup_identifiers,
         x509_selector_categories_match_chain,
     },
@@ -388,10 +388,10 @@ impl DefaultKeyResolver {
                 let leaves = matches
                     .iter()
                     .filter(|(_, candidate)| {
-                        candidate.subject_dn != candidate.issuer_dn
-                            && !matches
-                                .iter()
-                                .any(|(_, other)| other.issuer_dn == candidate.subject_dn)
+                        !distinguished_names_equal(&candidate.subject_dn, &candidate.issuer_dn)
+                            && !matches.iter().any(|(_, other)| {
+                                distinguished_names_equal(&other.issuer_dn, &candidate.subject_dn)
+                            })
                     })
                     .collect::<Vec<_>>();
                 match leaves.as_slice() {
