@@ -1254,6 +1254,76 @@ pub(crate) fn build_x509_certificate_chain_from(
     Ok(chain)
 }
 
+/// Enumerate signature-valid certificate paths that terminate at a certificate
+/// in the trusted prefix. Trust and certificate policy are intentionally not
+/// assigned here; callers must fully validate every returned candidate.
+pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
+    info: &X509DataInfo,
+    signing_idx: usize,
+    trusted_prefix_len: usize,
+    max_depth: usize,
+    max_candidate_paths: usize,
+) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
+    if signing_idx >= info.parsed_certificates.len()
+        || info.parsed_certificates.len() != info.certificates.len()
+        || trusted_prefix_len > info.certificates.len()
+    {
+        return Err(X509ChainBuildError::InconsistentMetadata);
+    }
+
+    let mut pending = vec![vec![signing_idx]];
+    let mut completed = Vec::new();
+    let mut depth_exceeded = false;
+    while let Some(path) = pending.pop() {
+        let current_idx = *path
+            .last()
+            .expect("candidate path starts with signing certificate index");
+        if current_idx < trusted_prefix_len {
+            completed.push(path);
+            if completed.len() > max_candidate_paths {
+                return Err(X509ChainBuildError::AmbiguousIssuer);
+            }
+            continue;
+        }
+        if path.len() == max_depth {
+            depth_exceeded = true;
+            continue;
+        }
+
+        let current = &info.parsed_certificates[current_idx];
+        if distinguished_names_equal(&current.subject_dn, &current.issuer_dn) {
+            continue;
+        }
+        let issuers = info
+            .parsed_certificates
+            .iter()
+            .enumerate()
+            .filter(|(issuer_idx, issuer)| {
+                !path.contains(issuer_idx)
+                    && distinguished_names_equal(&issuer.subject_dn, &current.issuer_dn)
+                    && certificate_signature_matches(
+                        &info.certificates[current_idx],
+                        &info.certificates[*issuer_idx],
+                    )
+            })
+            .map(|(issuer_idx, _)| issuer_idx)
+            .collect::<Vec<_>>();
+        if pending.len().saturating_add(issuers.len()) > max_candidate_paths {
+            return Err(X509ChainBuildError::AmbiguousIssuer);
+        }
+        for issuer_idx in issuers {
+            let mut candidate = path.clone();
+            candidate.push(issuer_idx);
+            pending.push(candidate);
+        }
+    }
+
+    if completed.is_empty() && depth_exceeded {
+        return Err(X509ChainBuildError::DepthExceeded);
+    }
+    Ok(completed)
+}
+
 fn select_x509_signing_certificate(info: &X509DataInfo) -> Result<usize, ParseError> {
     let has_lookup_identifiers = x509_data_has_lookup_identifiers(info);
     let mut candidates = Vec::new();

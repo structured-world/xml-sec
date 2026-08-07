@@ -18,7 +18,9 @@ use std::collections::{HashMap, HashSet};
 use crate::c14n::{canonicalize_bounded, is_output_limit_error};
 use crate::hard_limits::{CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING, XML_DOCUMENT_NODE_CEILING};
 
-use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
+#[cfg(test)]
+use super::digest::compute_digest;
+use super::digest::{DigestAlgorithm, constant_time_eq};
 use super::parse::{
     KeyInfo, MAX_REFERENCES_PER_SIGNATURE, MAX_X509_DATA_TOTAL_BINARY_LEN,
     MAX_X509_DECODED_BINARY_LEN, ParseError, Reference, RetrievalMethodTransforms,
@@ -42,8 +44,6 @@ use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_SIGNATURE_VALUE_TEXT_LEN: usize = 65_536;
-const MAX_EXTERNAL_RESOURCE_LEN: usize = 8 * 1024 * 1024;
-const MAX_EXTERNAL_RESOURCE_TOTAL_LEN: usize = 32 * 1024 * 1024;
 const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;
 /// Cryptographic verifier used by [`VerifyContext`].
 ///
@@ -75,6 +75,20 @@ pub trait KeyResolver {
         key_info: Option<&KeyInfo>,
         algorithm: SignatureAlgorithm,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError>;
+
+    /// Resolve under the operation's immutable policy snapshot.
+    ///
+    /// Implementations that make trust or key-source decisions must override
+    /// this method. The default preserves source-only custom resolvers whose
+    /// behavior is independent of policy.
+    fn resolve_with_policy<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        _policy: &crate::policy::VerificationPolicy,
+    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+        self.resolve(key_info, algorithm)
+    }
 
     /// Return `true` when this resolver consumes document `<KeyInfo>` material.
     ///
@@ -162,12 +176,9 @@ impl Default for UriTypeSet {
 pub struct VerifyContext<'a> {
     key: Option<&'a dyn VerifyingKey>,
     key_resolver: Option<&'a dyn KeyResolver>,
-    process_manifests: bool,
-    allowed_uri_types: UriTypeSet,
-    allowed_retrieval_method_uri_types: UriTypeSet,
-    allowed_transforms: Option<HashSet<String>>,
+    policy: crate::policy::VerificationPolicy,
+    provider: &'a dyn crate::provider::CryptoProvider,
     store_pre_digest: bool,
-    transform_options: TransformOptions,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
 }
 
@@ -184,12 +195,9 @@ impl<'a> VerifyContext<'a> {
         Self {
             key: None,
             key_resolver: None,
-            process_manifests: false,
-            allowed_uri_types: UriTypeSet::default(),
-            allowed_retrieval_method_uri_types: UriTypeSet::default(),
-            allowed_transforms: None,
+            policy: crate::policy::VerificationPolicy::default(),
+            provider: crate::provider::default_provider(),
             store_pre_digest: false,
-            transform_options: TransformOptions::default(),
             external_resources: None,
         }
     }
@@ -203,6 +211,18 @@ impl<'a> VerifyContext<'a> {
     /// Set a key resolver fallback used when `key()` is not provided.
     pub fn key_resolver(mut self, resolver: &'a dyn KeyResolver) -> Self {
         self.key_resolver = Some(resolver);
+        self
+    }
+
+    /// Replace the complete immutable verification policy snapshot.
+    pub fn policy(mut self, policy: crate::policy::VerificationPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Select the cryptographic provider for this verification operation.
+    pub fn provider(mut self, provider: &'a dyn crate::provider::CryptoProvider) -> Self {
+        self.provider = provider;
         self
     }
 
@@ -237,13 +257,13 @@ impl<'a> VerifyContext<'a> {
     /// Structural/parse errors in Manifest content abort `verify()` and are
     /// returned as `Err(...)`.
     pub fn process_manifests(mut self, enabled: bool) -> Self {
-        self.process_manifests = enabled;
+        self.policy.process_manifests = enabled;
         self
     }
 
     /// Restrict allowed reference URI classes.
     pub fn allowed_uri_types(mut self, types: UriTypeSet) -> Self {
-        self.allowed_uri_types = types;
+        self.policy.reference_uri_types = types;
         self
     }
 
@@ -254,7 +274,7 @@ impl<'a> VerifyContext<'a> {
     /// Same-document retrieval is enabled by default; external retrieval requires
     /// an explicit opt-in and still uses only caller-supplied resources.
     pub fn allowed_retrieval_method_uri_types(mut self, types: UriTypeSet) -> Self {
-        self.allowed_retrieval_method_uri_types = types;
+        self.policy.retrieval_uri_types = types;
         self
     }
 
@@ -271,7 +291,7 @@ impl<'a> VerifyContext<'a> {
     /// Allow bounded internal DTD declarations while keeping external entity
     /// resolution disabled. This is off by default.
     pub fn allow_internal_dtd(mut self, enabled: bool) -> Self {
-        self.transform_options = self.transform_options.allow_internal_dtd(enabled);
+        self.policy.xml.allow_internal_dtd = enabled;
         self
     }
 
@@ -290,7 +310,7 @@ impl<'a> VerifyContext<'a> {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.allowed_transforms = Some(transforms.into_iter().map(Into::into).collect());
+        self.policy.transforms = Some(transforms.into_iter().map(Into::into).collect());
         self
     }
 
@@ -312,12 +332,18 @@ impl<'a> VerifyContext<'a> {
     /// Use [`XPathHereSemantics::XmlSecLegacy`] only for documents known to
     /// have been generated with libxmlsec1's `<Transform>` interpretation.
     pub fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
-        self.transform_options = self.transform_options.xpath_here_semantics(semantics);
+        self.policy.xpath_here_semantics = semantics;
         self
     }
 
     fn allowed_transform_uris(&self) -> Option<&HashSet<String>> {
-        self.allowed_transforms.as_ref()
+        self.policy.transforms.as_ref()
+    }
+
+    fn transform_options(&self) -> TransformOptions {
+        TransformOptions::default()
+            .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
+            .xpath_here_semantics(self.policy.xpath_here_semantics)
     }
 
     /// Verify one XMLDSig signature using this context.
@@ -465,6 +491,7 @@ pub fn process_reference(
         transform_options: TransformOptions::default(),
         transform_budget: &execution_budget,
         canonicalized_data_budget: &canonicalized_data_budget,
+        provider: crate::provider::default_provider(),
     };
     process_reference_with_options(
         reference,
@@ -522,6 +549,7 @@ struct ReferenceExecutionContext<'a> {
     transform_options: TransformOptions,
     transform_budget: &'a TransformExecutionBudget,
     canonicalized_data_budget: &'a CanonicalizedDataBudget,
+    provider: &'a dyn crate::provider::CryptoProvider,
 }
 
 struct CanonicalizedDataBudget {
@@ -554,7 +582,6 @@ impl CanonicalizedDataBudget {
         Ok(())
     }
 
-    #[cfg(test)]
     fn with_limit(max_bytes: usize) -> Self {
         Self {
             remaining: Cell::new(max_bytes),
@@ -607,7 +634,11 @@ fn process_reference_with_options(
     .map_err(ReferenceProcessingError::Transform)?;
 
     // 3. Compute digest
-    let computed_digest = compute_digest(reference.digest_method, &pre_digest_bytes);
+    let computed_digest = super::compute_digest_with_provider(
+        execution.provider,
+        reference.digest_method,
+        &pre_digest_bytes,
+    );
 
     // 4. Compare with stored DigestValue (constant-time)
     let status = if constant_time_eq(&computed_digest, &reference.digest_value) {
@@ -661,6 +692,7 @@ pub fn process_all_references(
         transform_options: TransformOptions::default(),
         transform_budget: &execution_budget,
         canonicalized_data_budget: &canonicalized_data_budget,
+        provider: crate::provider::default_provider(),
     };
     process_all_references_with_options(references, resolver, signature_node, &execution)
 }
@@ -759,6 +791,14 @@ pub struct VerifyResult {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DsigError {
+    /// The compiled verification policy rejected an operation input.
+    #[error("verification policy violation: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
+
+    /// The selected provider cannot execute the requested operation.
+    #[error("cryptographic provider error: {0}")]
+    Provider(#[from] crate::provider::ProviderError),
+
     /// XML parsing failed.
     #[error("XML parse error: {0}")]
     XmlParse(#[from] roxmltree::Error),
@@ -884,11 +924,13 @@ fn verify_signature_with_context(
     xml: &str,
     ctx: &VerifyContext<'_>,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
+    ctx.policy.validate()?;
     let doc = Document::parse_with_options(
         xml,
         roxmltree::ParsingOptions {
-            allow_dtd: ctx.transform_options.internal_dtd_allowed(),
-            nodes_limit: XML_DOCUMENT_NODE_CEILING,
+            allow_dtd: ctx.policy.xml.allow_internal_dtd,
+            nodes_limit: u32::try_from(ctx.policy.resources.max_xml_nodes)
+                .unwrap_or(XML_DOCUMENT_NODE_CEILING),
             entity_resolver: None,
         },
     )?;
@@ -931,19 +973,56 @@ fn verify_signature_with_context(
     let mut xpath_parse_budget = XPathSignatureParseBudget::default();
     let signed_info =
         parse_signed_info_with_xpath_budget(signed_info_node, &mut xpath_parse_budget)?;
+    if signed_info.references.len() > ctx.policy.resources.max_references {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "signature references",
+            maximum: ctx.policy.resources.max_references,
+            actual: signed_info.references.len(),
+        }
+        .into());
+    }
+    for reference in &signed_info.references {
+        if reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "reference transforms",
+                maximum: ctx.policy.resources.max_transforms_per_reference,
+                actual: reference.transforms.len(),
+            }
+            .into());
+        }
+    }
+    ctx.policy
+        .check_signature_algorithm(signed_info.signature_method)?;
+    for reference in &signed_info.references {
+        if ctx
+            .policy
+            .digest_algorithms
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
+        {
+            return Err(crate::policy::PolicyViolation::Algorithm {
+                operation: "verification",
+                algorithm: reference.digest_method.uri().to_string(),
+            }
+            .into());
+        }
+    }
     enforce_reference_policies(
         &signed_info.references,
-        ctx.allowed_uri_types,
+        ctx.policy.reference_uri_types,
         ctx.allowed_transform_uris(),
     )?;
 
     if let Some(resources) = ctx.external_resources {
         let mut total = 0usize;
         for bytes in resources.values() {
-            if bytes.len() > MAX_EXTERNAL_RESOURCE_LEN {
-                return Err(SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "external resource exceeds maximum allowed length",
-                });
+            if bytes.len() > ctx.policy.resources.max_external_resource_bytes {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "external resource bytes",
+                    maximum: ctx.policy.resources.max_external_resource_bytes,
+                    actual: bytes.len(),
+                }
+                .into());
             }
             total = total.checked_add(bytes.len()).ok_or(
                 SignatureVerificationPipelineError::InvalidStructure {
@@ -951,10 +1030,13 @@ fn verify_signature_with_context(
                 },
             )?;
         }
-        if total > MAX_EXTERNAL_RESOURCE_TOTAL_LEN {
-            return Err(SignatureVerificationPipelineError::InvalidStructure {
-                reason: "external resources exceed maximum aggregate length",
-            });
+        if total > ctx.policy.resources.max_external_resource_total_bytes {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "aggregate external resource bytes",
+                maximum: ctx.policy.resources.max_external_resource_total_bytes,
+                actual: total,
+            }
+            .into());
         }
     }
     let resolver = match ctx.external_resources {
@@ -966,18 +1048,20 @@ fn verify_signature_with_context(
             info,
             &resolver,
             ctx.external_resources,
-            ctx.allowed_retrieval_method_uri_types,
+            ctx.policy.retrieval_uri_types,
         )?
     } else {
         RetrievalMaterialization::default()
     };
     let execution_budget = TransformExecutionBudget::default();
-    let canonicalized_data_budget = CanonicalizedDataBudget::default();
+    let canonicalized_data_budget =
+        CanonicalizedDataBudget::with_limit(ctx.policy.resources.max_canonicalized_bytes);
     let execution = ReferenceExecutionContext {
         store_pre_digest: ctx.store_pre_digest,
-        transform_options: ctx.transform_options,
+        transform_options: ctx.transform_options(),
         transform_budget: &execution_budget,
         canonicalized_data_budget: &canonicalized_data_budget,
+        provider: ctx.provider,
     };
     let references = process_all_references_with_options(
         &signed_info.references,
@@ -1048,7 +1132,8 @@ fn verify_signature_with_context(
         });
     };
     let verifier = resolved_key.as_ref();
-    let signature_valid = verifier.verify(
+    let signature_valid = ctx.provider.verify(
+        verifier,
         signed_info.signature_method,
         &canonical_signed_info,
         &signature_value,
@@ -1067,7 +1152,7 @@ fn verify_signature_with_context(
         });
     }
 
-    let manifest_references = if ctx.process_manifests {
+    let manifest_references = if ctx.policy.process_manifests {
         let signed_info_reference_nodes =
             collect_authenticated_signed_info_reference_nodes(&signed_info.references, &resolver);
         let remaining_reference_capacity = MAX_REFERENCES_PER_SIGNATURE
@@ -1335,7 +1420,7 @@ fn process_manifest_references(
     for (index, reference, reference_node_id) in &manifest_references {
         match enforce_reference_policies(
             std::slice::from_ref(reference),
-            ctx.allowed_uri_types,
+            ctx.policy.reference_uri_types,
             ctx.allowed_transform_uris(),
         ) {
             Ok(()) => {}
@@ -1567,7 +1652,7 @@ fn resolve_verifying_key<'k>(
         return Ok(Some(ResolvedVerifyingKey::Borrowed(key)));
     }
     if let Some(resolver) = ctx.key_resolver {
-        let resolved = resolver.resolve(key_info, algorithm)?;
+        let resolved = resolver.resolve_with_policy(key_info, algorithm, &ctx.policy)?;
         return Ok(resolved.map(ResolvedVerifyingKey::Owned));
     }
     Ok(None)
@@ -3869,6 +3954,7 @@ mod tests {
             transform_options: TransformOptions::default(),
             transform_budget: &transform_budget,
             canonicalized_data_budget: &canonicalized_data_budget,
+            provider: crate::provider::default_provider(),
         };
 
         let error = process_all_references_with_options(
@@ -4233,6 +4319,7 @@ mod tests {
             transform_options: TransformOptions::default(),
             transform_budget: &budget,
             canonicalized_data_budget: &canonicalized_data_budget,
+            provider: crate::provider::default_provider(),
         };
 
         let error = process_all_references_with_options(
@@ -4271,6 +4358,7 @@ mod tests {
             transform_options: TransformOptions::default(),
             transform_budget: &budget,
             canonicalized_data_budget: &canonicalized_data_budget,
+            provider: crate::provider::default_provider(),
         };
 
         let error = process_all_references_with_options(

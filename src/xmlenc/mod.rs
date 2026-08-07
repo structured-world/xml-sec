@@ -20,8 +20,9 @@ mod parse;
 mod types;
 
 pub use decrypt::{
-    DecryptionKeyResolver, DocumentDecryptionOptions, KekDecryptor, PrivateKeyDecryptor,
-    SymmetricKeyDecryptor, decrypt, decrypt_data, decrypt_document, decrypt_document_with_options,
+    DecryptContext, DecryptionKeyResolver, DocumentDecryptionOptions, KekDecryptor,
+    PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt, decrypt_data, decrypt_document,
+    decrypt_document_with_options,
 };
 pub use encrypt::EncryptedDataBuilder;
 pub use parse::parse_encrypted_data;

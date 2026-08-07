@@ -68,7 +68,7 @@ pub mod x509;
 mod xpath;
 
 pub use builder::{ReferenceBuilder, SignatureBuilder, SignatureBuilderError};
-pub use digest::{DigestAlgorithm, compute_digest, constant_time_eq};
+pub use digest::{DigestAlgorithm, compute_digest, compute_digest_with_provider, constant_time_eq};
 pub use keys::{
     DefaultKeyResolver, HmacSha1VerificationKey, KeyResolutionError, KeyResolverConfig,
     VerificationKey,

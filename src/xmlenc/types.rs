@@ -12,22 +12,8 @@ pub const XMLENC11_NS: &str = "http://www.w3.org/2009/xmlenc11#";
 pub const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
 /// Maximum normalized base64 text accepted from a `CipherValue`.
-pub const MAX_CIPHER_VALUE_BASE64_LEN: usize = 16 * 1024 * 1024;
-/// Maximum plaintext accepted by the encryption API.
-///
-/// The limit leaves room for CBC/GCM framing while guaranteeing that the
-/// resulting base64 `CipherValue` fits the parser's input bound.
-pub const MAX_ENCRYPTION_PLAINTEXT_LEN: usize = (MAX_CIPHER_VALUE_BASE64_LEN / 4 * 3) - 32;
-/// Maximum caller-owned XML document size accepted for node encryption.
-///
-/// This separately bounds parser work while leaving room around a maximum-size
-/// selected plaintext element or content fragment.
-pub const MAX_ENCRYPTION_DOCUMENT_LEN: usize = MAX_CIPHER_VALUE_BASE64_LEN;
-/// Maximum number of independently wrapped copies of one content key.
-pub const MAX_ENCRYPTION_RECIPIENTS: usize = 64;
-/// Maximum byte length of one caller-controlled XML metadata value.
-pub const MAX_ENCRYPTION_METADATA_LEN: usize = 4 * 1024;
-
+pub const MAX_CIPHER_VALUE_BASE64_LEN: usize =
+    crate::hard_limits::ENCRYPTION_CIPHER_VALUE_BASE64_BYTE_CEILING;
 /// The `Type` attribute on an `EncryptedData` element.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncryptedDataType {
@@ -40,7 +26,7 @@ pub enum EncryptedDataType {
 }
 
 /// Supported content-encryption algorithms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataEncryptionAlgorithm {
     /// AES-128 in CBC mode with XMLEnc padding.
     Aes128Cbc,
@@ -130,7 +116,7 @@ impl KeyWrapAlgorithm {
 }
 
 /// Supported asymmetric session-key transport algorithms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyTransportAlgorithm {
     /// XML Encryption 1.0 OAEP with SHA-1 and MGF1-SHA-1.
     RsaOaepMgf1p,
@@ -139,7 +125,7 @@ pub enum KeyTransportAlgorithm {
 }
 
 /// Supported symmetric key-wrap algorithms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyWrapAlgorithm {
     /// RFC 3394 AES key wrap with a 128-bit KEK.
     AesKw128,
@@ -148,7 +134,7 @@ pub enum KeyWrapAlgorithm {
 }
 
 /// Digest algorithms accepted by RSA-OAEP encryption.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OaepDigestAlgorithm {
     /// SHA-1, retained for legacy XMLEnc OAEP interoperability.
     Sha1,
@@ -452,6 +438,14 @@ pub enum DecryptedContent {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum XmlEncError {
+    /// The compiled encryption or decryption policy rejected an operation input.
+    #[error("XML Encryption policy violation: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
+
+    /// The selected cryptographic provider rejected or failed an operation.
+    #[error("cryptographic provider error: {0}")]
+    Provider(#[from] crate::provider::ProviderError),
+
     /// XML document parsing failed.
     #[error("XML parsing error: {0}")]
     XmlParse(#[from] roxmltree::Error),

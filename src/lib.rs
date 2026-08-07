@@ -32,8 +32,12 @@
 
 pub mod c14n;
 pub mod error;
-#[cfg(feature = "xmldsig")]
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 mod hard_limits;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub mod policy;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub mod provider;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 mod xml;
 

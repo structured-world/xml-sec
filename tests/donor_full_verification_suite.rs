@@ -5,6 +5,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use xml_sec::policy::{KeyTrustPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DsigStatus, KeyResolverConfig, SignatureAlgorithm, VerificationKey,
     VerifyContext,
@@ -126,13 +127,19 @@ fn donor_full_verification_suite_accepts_every_supported_case() {
     let root = project_root();
     let mut passed = 0usize;
     let mut failed = Vec::<String>::new();
+    let mut compatibility_policy = VerificationPolicy::default();
+    compatibility_policy.key_trust.allow_legacy_rsa_sha1 = true;
 
     for case in cases() {
         match case.expectation {
             Expectation::Embedded => {
                 let xml = read_fixture(&root.join(case.xml_path));
                 let resolver = DefaultKeyResolver::default();
-                match VerifyContext::new().key_resolver(&resolver).verify(&xml) {
+                match VerifyContext::new()
+                    .policy(compatibility_policy.clone())
+                    .key_resolver(&resolver)
+                    .verify(&xml)
+                {
                     Ok(result) if matches!(result.status, DsigStatus::Valid) => {
                         passed += 1;
                     }
@@ -164,7 +171,11 @@ fn donor_full_verification_suite_accepts_every_supported_case() {
                     },
                 );
                 let resolver = DefaultKeyResolver::new(config);
-                match VerifyContext::new().key_resolver(&resolver).verify(&xml) {
+                match VerifyContext::new()
+                    .policy(compatibility_policy.clone())
+                    .key_resolver(&resolver)
+                    .verify(&xml)
+                {
                     Ok(result) if matches!(result.status, DsigStatus::Valid) => passed += 1,
                     Ok(result) => failed.push(format!(
                         "{}: expected Valid, got {:?}",
@@ -184,7 +195,11 @@ fn donor_full_verification_suite_accepts_every_supported_case() {
                         .collect(),
                     ..KeyResolverConfig::default()
                 });
-                match VerifyContext::new().key_resolver(&resolver).verify(&xml) {
+                match VerifyContext::new()
+                    .policy(compatibility_policy.clone())
+                    .key_resolver(&resolver)
+                    .verify(&xml)
+                {
                     Ok(result) if matches!(result.status, DsigStatus::Valid) => passed += 1,
                     Ok(result) => failed.push(format!(
                         "{}: expected Valid, got {:?}",
@@ -199,14 +214,21 @@ fn donor_full_verification_suite_accepts_every_supported_case() {
                 let xml = read_fixture(&root.join(case.xml_path));
                 let resolver = DefaultKeyResolver::new(KeyResolverConfig {
                     trusted_certs: vec![read_pem_der(&root.join(trust_anchor_path), "CERTIFICATE")],
-                    verify_chains: true,
-                    // 2027-01-15 UTC, inside the donor chain's 2026-2126 validity window.
-                    verification_time: Some(
-                        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
-                    ),
+                    trust: KeyTrustPolicy {
+                        verify_x509_chains: true,
+                        // 2027-01-15 UTC, inside the donor chain's 2026-2126 validity window.
+                        verification_time: Some(
+                            SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                        ),
+                        ..KeyTrustPolicy::default()
+                    },
                     ..KeyResolverConfig::default()
                 });
-                match VerifyContext::new().key_resolver(&resolver).verify(&xml) {
+                match VerifyContext::new()
+                    .policy(compatibility_policy.clone())
+                    .key_resolver(&resolver)
+                    .verify(&xml)
+                {
                     Ok(result) if matches!(result.status, DsigStatus::Valid) => passed += 1,
                     Ok(result) => failed.push(format!(
                         "{}: expected Valid, got {:?}",

@@ -5,8 +5,6 @@
 //!
 //! All digest computation uses RustCrypto hash implementations.
 
-use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha384, Sha512};
 use subtle::ConstantTimeEq;
 
 /// Digest algorithms supported by XMLDSig.
@@ -81,12 +79,18 @@ impl DigestAlgorithm {
 ///
 /// Returns the raw digest bytes (not base64-encoded).
 pub fn compute_digest(algorithm: DigestAlgorithm, data: &[u8]) -> Vec<u8> {
-    match algorithm {
-        DigestAlgorithm::Sha1 => Sha1::digest(data).to_vec(),
-        DigestAlgorithm::Sha256 => Sha256::digest(data).to_vec(),
-        DigestAlgorithm::Sha384 => Sha384::digest(data).to_vec(),
-        DigestAlgorithm::Sha512 => Sha512::digest(data).to_vec(),
-    }
+    compute_digest_with_provider(crate::provider::default_provider(), algorithm, data)
+}
+
+/// Compute a digest with an explicitly selected provider.
+pub fn compute_digest_with_provider(
+    provider: &dyn crate::provider::CryptoProvider,
+    algorithm: DigestAlgorithm,
+    data: &[u8],
+) -> Vec<u8> {
+    provider
+        .digest(algorithm, data)
+        .expect("default provider advertises every XMLDSig digest")
 }
 
 /// Constant-time comparison of two byte slices.

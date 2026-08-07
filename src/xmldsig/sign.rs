@@ -23,7 +23,7 @@ use x509_parser::prelude::FromDer;
 use crate::c14n::canonicalize;
 
 use super::builder::{SignatureBuilder, SignatureBuilderError};
-use super::digest::{DigestAlgorithm, compute_digest};
+use super::digest::DigestAlgorithm;
 use super::mutation::{
     XmlMutationError, append_signature_to_root, fill_key_info, fill_signature_value,
     fill_signed_info_digest_values,
@@ -56,6 +56,10 @@ pub struct ComputedReferenceDigest {
 /// Errors returned by the XMLDSig signing digest pass.
 #[derive(Debug, thiserror::Error)]
 pub enum SigningDigestError {
+    /// The compiled signing policy rejected an operation input.
+    #[error("signing policy violation: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
+
     /// The input XML document is not well-formed.
     #[error("XML parse error: {0}")]
     XmlParse(#[from] roxmltree::Error),
@@ -97,6 +101,10 @@ pub enum SigningDigestError {
 /// Errors returned by the full XMLDSig signing pipeline.
 #[derive(Debug, thiserror::Error)]
 pub enum SigningError {
+    /// The compiled signing policy rejected an operation input.
+    #[error("signing policy violation: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
+
     /// Reference digest computation failed.
     #[error("signing digest pass failed: {0}")]
     Digest(#[from] SigningDigestError),
@@ -130,6 +138,10 @@ pub enum SigningError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SigningKeyError {
+    /// The selected provider cannot execute the requested operation.
+    #[error("cryptographic provider error: {0}")]
+    Provider(#[from] crate::provider::ProviderError),
+
     /// PEM input could not be parsed.
     #[error("invalid PEM private key")]
     InvalidKeyPem,
@@ -472,7 +484,8 @@ impl SigningKey for EcdsaP384SigningKey {
 pub struct SignContext<'a> {
     signing_key: &'a dyn SigningKey,
     key_info_writer: Option<&'a dyn KeyInfoWriter>,
-    transform_options: TransformOptions,
+    policy: crate::policy::SigningPolicy,
+    provider: &'a dyn crate::provider::CryptoProvider,
 }
 
 impl<'a> SignContext<'a> {
@@ -481,8 +494,23 @@ impl<'a> SignContext<'a> {
         Self {
             signing_key,
             key_info_writer: None,
-            transform_options: TransformOptions::default(),
+            policy: crate::policy::SigningPolicy::default(),
+            provider: crate::provider::default_provider(),
         }
+    }
+
+    /// Replace the complete immutable signing policy snapshot.
+    #[must_use]
+    pub fn policy(mut self, policy: crate::policy::SigningPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Select the cryptographic provider for digest and randomness operations.
+    #[must_use]
+    pub fn provider(mut self, provider: &'a dyn crate::provider::CryptoProvider) -> Self {
+        self.provider = provider;
+        self
     }
 
     /// Configure signing to populate the direct `<Signature>/<KeyInfo>` placeholder.
@@ -499,7 +527,7 @@ impl<'a> SignContext<'a> {
     /// signatures compatible with libxmlsec1's `<Transform>` interpretation.
     #[must_use]
     pub fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
-        self.transform_options = self.transform_options.xpath_here_semantics(semantics);
+        self.policy.xpath_here_semantics = semantics;
         self
     }
 
@@ -510,9 +538,41 @@ impl<'a> SignContext<'a> {
     /// canonicalizes `<SignedInfo>`, signs those canonical bytes, and fills the
     /// base64 `<SignatureValue>`.
     pub fn sign_template(&self, xml: &str) -> Result<String, SigningError> {
-        let with_digests = fill_reference_digest_values_with_options(xml, self.transform_options)?;
+        self.policy.resources.validate()?;
+        let transform_options = TransformOptions::default()
+            .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
+            .xpath_here_semantics(self.policy.xpath_here_semantics);
+        let with_digests = fill_reference_digest_values_with_options(
+            xml,
+            transform_options,
+            Some(&self.policy),
+            self.provider,
+        )?;
         let (algorithm, canonical_signed_info) = canonicalize_signed_info(&with_digests)?;
-        let signature_value = self.signing_key.sign(algorithm, &canonical_signed_info)?;
+        if canonical_signed_info.len() > self.policy.resources.max_canonicalized_bytes {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "canonicalized SignedInfo bytes",
+                maximum: self.policy.resources.max_canonicalized_bytes,
+                actual: canonical_signed_info.len(),
+            }
+            .into());
+        }
+        if !algorithm.signing_allowed()
+            || self
+                .policy
+                .signature_algorithms
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&algorithm))
+        {
+            return Err(crate::policy::PolicyViolation::Algorithm {
+                operation: "signing",
+                algorithm: algorithm.uri().to_string(),
+            }
+            .into());
+        }
+        let signature_value =
+            self.provider
+                .sign(self.signing_key, algorithm, &canonical_signed_info)?;
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature_value);
         let signed = fill_signature_value(&with_digests, &signature_b64)?;
         if let Some(writer) = self.key_info_writer {
@@ -551,17 +611,44 @@ struct SigningReference {
 pub fn compute_reference_digest_values(
     xml: &str,
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
-    compute_reference_digest_values_with_options(xml, TransformOptions::default())
+    compute_reference_digest_values_with_options(
+        xml,
+        TransformOptions::default(),
+        None,
+        crate::provider::default_provider(),
+    )
 }
 
 fn compute_reference_digest_values_with_options(
     xml: &str,
     transform_options: TransformOptions,
+    policy: Option<&crate::policy::SigningPolicy>,
+    provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
     let doc = Document::parse(xml)?;
     let signature = find_signing_signature_node(&doc)?;
     let signed_info = find_required_child(signature, "SignedInfo")?;
     let references = parse_signing_references(signed_info)?;
+    if let Some(policy) = policy {
+        if references.len() > policy.resources.max_references {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "signature references",
+                maximum: policy.resources.max_references,
+                actual: references.len(),
+            }
+            .into());
+        }
+        for reference in &references {
+            if reference.transforms.len() > policy.resources.max_transforms_per_reference {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "reference transforms",
+                    maximum: policy.resources.max_transforms_per_reference,
+                    actual: reference.transforms.len(),
+                }
+                .into());
+            }
+        }
+    }
     let resolver = UriReferenceResolver::new(&doc);
     let execution_budget = TransformExecutionBudget::default();
 
@@ -569,6 +656,18 @@ fn compute_reference_digest_values_with_options(
         .into_iter()
         .enumerate()
         .map(|(index, reference)| {
+            if policy.is_some_and(|policy| {
+                policy
+                    .digest_algorithms
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
+            }) {
+                return Err(crate::policy::PolicyViolation::Algorithm {
+                    operation: "signing",
+                    algorithm: reference.digest_method.uri().to_string(),
+                }
+                .into());
+            }
             let initial_data = resolver.dereference_with_budget(
                 &reference.uri,
                 execution_budget.node_set_materialization(),
@@ -580,7 +679,8 @@ fn compute_reference_digest_values_with_options(
                 transform_options,
                 &execution_budget,
             )?;
-            let digest = compute_digest(reference.digest_method, &pre_digest);
+            let digest =
+                super::compute_digest_with_provider(provider, reference.digest_method, &pre_digest);
             let digest_value = base64::engine::general_purpose::STANDARD.encode(digest);
             Ok(ComputedReferenceDigest {
                 index,
@@ -599,16 +699,24 @@ fn compute_reference_digest_values_with_options(
 /// and writes the base64 digest into the matching `<DigestValue>` in document
 /// order.
 pub fn fill_reference_digest_values(xml: &str) -> Result<String, SigningDigestError> {
-    fill_reference_digest_values_with_options(xml, TransformOptions::default())
+    fill_reference_digest_values_with_options(
+        xml,
+        TransformOptions::default(),
+        None,
+        crate::provider::default_provider(),
+    )
 }
 
 fn fill_reference_digest_values_with_options(
     xml: &str,
     transform_options: TransformOptions,
+    policy: Option<&crate::policy::SigningPolicy>,
+    provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<String, SigningDigestError> {
-    let digest_values = compute_reference_digest_values_with_options(xml, transform_options)?
-        .into_iter()
-        .map(|digest| digest.digest_value);
+    let digest_values =
+        compute_reference_digest_values_with_options(xml, transform_options, policy, provider)?
+            .into_iter()
+            .map(|digest| digest.digest_value);
     Ok(fill_signed_info_digest_values(xml, digest_values)?)
 }
 

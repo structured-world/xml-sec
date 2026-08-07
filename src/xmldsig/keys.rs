@@ -17,9 +17,9 @@ use super::{
     X509ChainOptions, X509DataInfo,
     parse::{
         EC_P256_OID, EC_P384_OID, ParseError, X509ChainBuildError,
-        build_x509_certificate_chain_from, distinguished_names_equal, parse_x509_certificate,
-        x509_certificate_matches_any_selector, x509_data_has_lookup_identifiers,
-        x509_selector_categories_match_chain,
+        build_x509_certificate_paths_to_trusted_prefix, distinguished_names_equal,
+        parse_x509_certificate, x509_certificate_matches_any_selector,
+        x509_data_has_lookup_identifiers, x509_selector_categories_match_chain,
     },
     verify_dsa_signature_spki, verify_ecdsa_signature_spki, verify_rsa_signature_spki,
     verify_x509_certificate_chain,
@@ -88,31 +88,6 @@ impl VerifyingKey for HmacSha1VerificationKey {
     }
 }
 
-struct LegacyRsaSha1VerificationKey {
-    public_key_bytes: Vec<u8>,
-}
-
-impl VerifyingKey for LegacyRsaSha1VerificationKey {
-    fn verify(
-        &self,
-        algorithm: SignatureAlgorithm,
-        signed_data: &[u8],
-        signature_value: &[u8],
-    ) -> Result<bool, DsigError> {
-        if algorithm != SignatureAlgorithm::RsaSha1 {
-            return Err(KeyResolutionError::AlgorithmMismatch.into());
-        }
-        verify_rsa_signature_spki_with_minimum(
-            algorithm,
-            &self.public_key_bytes,
-            signed_data,
-            signature_value,
-            1024,
-        )
-        .map_err(DsigError::Crypto)
-    }
-}
-
 /// A public verification key available to key resolvers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationKey {
@@ -146,8 +121,14 @@ impl VerifyingKey for VerificationKey {
             SignatureAlgorithm::HmacSha1 => {
                 return Err(KeyResolutionError::AlgorithmMismatch.into());
             }
-            SignatureAlgorithm::RsaSha1
-            | SignatureAlgorithm::RsaSha256
+            SignatureAlgorithm::RsaSha1 => verify_rsa_signature_spki_with_minimum(
+                algorithm,
+                &self.public_key_bytes,
+                signed_data,
+                signature_value,
+                1024,
+            ),
+            SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
             | SignatureAlgorithm::RsaSha512 => verify_rsa_signature_spki(
                 algorithm,
@@ -203,7 +184,7 @@ pub enum KeyResolutionError {
 /// The configuration owns all key material and has no global registry. Chain
 /// verification is opt-in so callers that pin an embedded certificate can use
 /// the documented TOFU model without constructing a certificate path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KeyResolverConfig {
     /// DER-encoded certificates available to X.509 selectors and as untrusted
     /// path intermediates. They establish trust only by chaining to an entry in
@@ -213,31 +194,12 @@ pub struct KeyResolverConfig {
     pub trusted_certs: Vec<Vec<u8>>,
     /// Verification keys addressable by `<KeyName>` content.
     pub named_keys: HashMap<String, VerificationKey>,
-    /// Whether embedded X.509 certificate chains must terminate at a trust anchor.
-    pub verify_chains: bool,
-    /// Whether embedded CRLs are authenticated and enforced during chain validation.
-    pub check_crls: bool,
-    /// Allow verify-only RSA-SHA1 keys down to 1024 bits for legacy corpora.
-    pub allow_legacy_rsa_sha1: bool,
-    /// Certificate verification time override; `None` selects the system clock.
-    pub verification_time: Option<SystemTime>,
-    /// Maximum certificates in a validated path, including the trust anchor.
-    pub max_chain_depth: usize,
-}
-
-impl Default for KeyResolverConfig {
-    fn default() -> Self {
-        Self {
-            lookup_certs: Vec::new(),
-            trusted_certs: Vec::new(),
-            named_keys: HashMap::new(),
-            verify_chains: false,
-            check_crls: false,
-            allow_legacy_rsa_sha1: false,
-            verification_time: None,
-            max_chain_depth: 9,
-        }
-    }
+    /// Trust defaults used only by direct [`KeyResolver::resolve`] calls.
+    ///
+    /// [`super::VerifyContext`] composes these defaults fail-closed with its
+    /// operation policy through `resolve_with_policy`; resolver-local defaults
+    /// cannot weaken a verification pipeline policy.
+    pub trust: crate::policy::KeyTrustPolicy,
 }
 
 /// Configuration-driven resolver for embedded certificates, DER keys, and key names.
@@ -263,6 +225,7 @@ impl DefaultKeyResolver {
         &self,
         info: &X509DataInfo,
         algorithm: SignatureAlgorithm,
+        trust: &crate::policy::KeyTrustPolicy,
     ) -> Result<Option<VerificationKey>, KeyResolutionError> {
         let certificate_der = if let Some(&signing_index) = info.certificate_chain.first() {
             let certificate_der = info
@@ -270,16 +233,17 @@ impl DefaultKeyResolver {
                 .get(signing_index)
                 .ok_or(KeyResolutionError::InvalidCertificate)?
                 .clone();
-            if self.config.verify_chains {
-                self.verify_x509_policy(info)?;
+            if trust.verify_x509_chains {
+                let selected = self.prepare_embedded_x509(info, signing_index, trust)?;
+                self.verify_x509_policy(&selected, trust)?;
             }
             certificate_der
         } else {
-            let Some(selected) = self.resolve_configured_x509(info)? else {
+            let Some(selected) = self.resolve_configured_x509(info, trust)? else {
                 return Ok(None);
             };
-            if self.config.verify_chains {
-                self.verify_x509_policy(&selected)?;
+            if trust.verify_x509_chains {
+                self.verify_x509_policy(&selected, trust)?;
             }
             selected
                 .certificate_chain
@@ -304,23 +268,100 @@ impl DefaultKeyResolver {
         }))
     }
 
-    fn verify_x509_policy(&self, info: &X509DataInfo) -> Result<(), KeyResolutionError> {
+    fn verify_x509_policy(
+        &self,
+        info: &X509DataInfo,
+        trust: &crate::policy::KeyTrustPolicy,
+    ) -> Result<(), KeyResolutionError> {
         let options = X509ChainOptions {
             trusted_certs: &self.config.trusted_certs,
-            verification_time: self
-                .config
-                .verification_time
-                .unwrap_or_else(SystemTime::now),
-            max_chain_depth: self.config.max_chain_depth,
-            check_crls: self.config.check_crls,
+            verification_time: trust.verification_time.unwrap_or_else(SystemTime::now),
+            max_chain_depth: trust.max_x509_chain_depth,
+            check_crls: trust.check_crls,
         };
         verify_x509_certificate_chain(info, &options)?;
         Ok(())
     }
 
+    fn prepare_embedded_x509(
+        &self,
+        info: &X509DataInfo,
+        signing_index: usize,
+        trust: &crate::policy::KeyTrustPolicy,
+    ) -> Result<X509DataInfo, KeyResolutionError> {
+        let signing_der = info
+            .certificates
+            .get(signing_index)
+            .ok_or(KeyResolutionError::InvalidCertificate)?;
+        let mut available = X509DataInfo {
+            crls: info.crls.clone(),
+            ..X509DataInfo::default()
+        };
+        for certificate in self
+            .config
+            .trusted_certs
+            .iter()
+            .chain(&self.config.lookup_certs)
+            .chain(&info.certificates)
+        {
+            if available
+                .certificates
+                .iter()
+                .any(|known| known == certificate)
+            {
+                continue;
+            }
+            available.parsed_certificates.push(
+                parse_x509_certificate(certificate)
+                    .map_err(|_| KeyResolutionError::InvalidCertificate)?,
+            );
+            available.certificates.push(certificate.clone());
+        }
+        let signing_index = available
+            .certificates
+            .iter()
+            .position(|certificate| certificate == signing_der)
+            .ok_or(KeyResolutionError::InvalidCertificate)?;
+        self.select_valid_x509_path(&mut available, signing_index, trust)?;
+        Ok(available)
+    }
+
+    fn select_valid_x509_path(
+        &self,
+        available: &mut X509DataInfo,
+        signing_index: usize,
+        trust: &crate::policy::KeyTrustPolicy,
+    ) -> Result<(), KeyResolutionError> {
+        let candidates = build_x509_certificate_paths_to_trusted_prefix(
+            available,
+            signing_index,
+            self.config.trusted_certs.len(),
+            trust.max_x509_chain_depth,
+            trust.max_x509_candidate_paths,
+        )
+        .map_err(|error| match error {
+            X509ChainBuildError::AmbiguousIssuer => KeyResolutionError::AmbiguousCertificate,
+            _ => KeyResolutionError::InvalidCertificate,
+        })?;
+        let mut first_error = None;
+        for candidate in candidates {
+            available.certificate_chain = candidate;
+            match self.verify_x509_policy(available, trust) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        Err(first_error.unwrap_or(KeyResolutionError::Chain(
+            super::X509ChainError::UntrustedRoot,
+        )))
+    }
+
     fn resolve_configured_x509(
         &self,
         info: &X509DataInfo,
+        trust: &crate::policy::KeyTrustPolicy,
     ) -> Result<Option<X509DataInfo>, KeyResolutionError> {
         if !x509_data_has_lookup_identifiers(info) {
             return Ok(None);
@@ -403,18 +444,13 @@ impl DefaultKeyResolver {
         // `available` preserves trusted certificates as a prefix. Selecting
         // one of those exact certificates is already a terminal trust
         // decision, even when the certificate is not self-signed.
-        available.certificate_chain = if signing_index < self.config.trusted_certs.len() {
-            vec![signing_index]
-        } else {
-            build_x509_certificate_chain_from(&available, signing_index).map_err(|error| {
-                match error {
-                    X509ChainBuildError::AmbiguousIssuer => {
-                        KeyResolutionError::AmbiguousCertificate
-                    }
-                    _ => KeyResolutionError::InvalidCertificate,
-                }
-            })?
-        };
+        available.certificate_chain =
+            if signing_index < self.config.trusted_certs.len() || !trust.verify_x509_chains {
+                vec![signing_index]
+            } else {
+                self.select_valid_x509_path(&mut available, signing_index, trust)?;
+                available.certificate_chain.clone()
+            };
         Ok(Some(available))
     }
 
@@ -468,13 +504,12 @@ impl DefaultKeyResolver {
             name: None,
         }))
     }
-}
 
-impl KeyResolver for DefaultKeyResolver {
-    fn resolve<'a>(
+    fn resolve_with_trust<'a>(
         &'a self,
         key_info: Option<&KeyInfo>,
         algorithm: SignatureAlgorithm,
+        trust: &crate::policy::KeyTrustPolicy,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
         let Some(key_info) = key_info else {
             return Ok(None);
@@ -482,7 +517,7 @@ impl KeyResolver for DefaultKeyResolver {
         let mut deferred_key_value_error = None;
         for source in &key_info.sources {
             let resolved = match source {
-                KeyInfoSource::X509Data(info) => self.resolve_x509(info, algorithm)?,
+                KeyInfoSource::X509Data(info) => self.resolve_x509(info, algorithm, trust)?,
                 KeyInfoSource::DerEncodedKeyValue(public_key_bytes) => {
                     validate_spki_algorithm(public_key_bytes, algorithm)?;
                     Some(VerificationKey {
@@ -517,11 +552,6 @@ impl KeyResolver for DefaultKeyResolver {
                 KeyInfoSource::RetrievalMethod { .. } => None,
             };
             if let Some(key) = resolved {
-                if self.config.allow_legacy_rsa_sha1 && algorithm == SignatureAlgorithm::RsaSha1 {
-                    return Ok(Some(Box::new(LegacyRsaSha1VerificationKey {
-                        public_key_bytes: key.public_key_bytes,
-                    })));
-                }
                 return Ok(Some(Box::new(key)));
             }
         }
@@ -529,6 +559,47 @@ impl KeyResolver for DefaultKeyResolver {
             return Err(error.into());
         }
         Ok(None)
+    }
+}
+
+impl KeyResolver for DefaultKeyResolver {
+    fn resolve<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+        self.resolve_with_trust(key_info, algorithm, &self.config.trust)
+    }
+
+    fn resolve_with_policy<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+        // Resolver defaults and operation policy compose fail-closed. X.509
+        // validation requirements can only become stricter, while the legacy
+        // algorithm opt-in remains exclusively context-owned and is enforced
+        // before key resolution.
+        let trust = crate::policy::KeyTrustPolicy {
+            verify_x509_chains: policy.key_trust.verify_x509_chains
+                || self.config.trust.verify_x509_chains,
+            max_x509_chain_depth: policy
+                .key_trust
+                .max_x509_chain_depth
+                .min(self.config.trust.max_x509_chain_depth),
+            max_x509_candidate_paths: policy
+                .key_trust
+                .max_x509_candidate_paths
+                .min(self.config.trust.max_x509_candidate_paths),
+            allow_legacy_rsa_sha1: policy.key_trust.allow_legacy_rsa_sha1,
+            check_crls: policy.key_trust.check_crls || self.config.trust.check_crls,
+            verification_time: policy
+                .key_trust
+                .verification_time
+                .or(self.config.trust.verification_time),
+        };
+        self.resolve_with_trust(key_info, algorithm, &trust)
     }
 
     fn consumes_document_key_info(&self) -> bool {
@@ -653,6 +724,20 @@ mod tests {
 
     use super::*;
 
+    fn chain_policy() -> crate::policy::KeyTrustPolicy {
+        crate::policy::KeyTrustPolicy {
+            verify_x509_chains: true,
+            ..crate::policy::KeyTrustPolicy::default()
+        }
+    }
+
+    fn chain_policy_at(verification_time: SystemTime) -> crate::policy::KeyTrustPolicy {
+        crate::policy::KeyTrustPolicy {
+            verification_time: Some(verification_time),
+            ..chain_policy()
+        }
+    }
+
     const SIGNED_SAML: &str =
         include_str!("../../tests/fixtures/saml/response_signed_by_idp_ecdsa.xml");
     const SAML_PUBLIC_KEY: &str =
@@ -737,6 +822,35 @@ mod tests {
         pem.contents
     }
 
+    fn generated_certificate_params(common_name: &str, is_ca: bool) -> rcgen::CertificateParams {
+        let mut params = rcgen::CertificateParams::new(Vec::new())
+            .expect("empty SAN list should produce valid certificate parameters");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        if is_ca {
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        }
+        params
+    }
+
+    fn x509_info(certificates: Vec<Vec<u8>>, signing_index: usize) -> X509DataInfo {
+        let parsed_certificates = certificates
+            .iter()
+            .map(|certificate| {
+                parse_x509_certificate(certificate)
+                    .expect("generated certificate should have supported metadata")
+            })
+            .collect();
+        X509DataInfo {
+            certificates,
+            parsed_certificates,
+            certificate_chain: vec![signing_index],
+            ..X509DataInfo::default()
+        }
+    }
+
     #[test]
     fn defaults_match_key_resolution_policy() {
         // Defaults must remain compatible with xmlsec1's depth and opt-in trust policy.
@@ -745,11 +859,10 @@ mod tests {
         assert!(config.trusted_certs.is_empty());
         assert!(config.lookup_certs.is_empty());
         assert!(config.named_keys.is_empty());
-        assert!(!config.verify_chains);
-        assert!(!config.check_crls);
-        assert!(!config.allow_legacy_rsa_sha1);
-        assert_eq!(config.verification_time, None);
-        assert_eq!(config.max_chain_depth, 9);
+        assert!(!config.trust.verify_x509_chains);
+        assert!(!config.trust.check_crls);
+        assert_eq!(config.trust.verification_time, None);
+        assert_eq!(config.trust.max_x509_chain_depth, 9);
     }
 
     #[test]
@@ -886,8 +999,7 @@ mod tests {
                 certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
                 certificate_der(include_str!("../../tests/fixtures/keys/cacert.pem")),
             ],
-            verify_chains: true,
-            verification_time: Some(SystemTime::UNIX_EPOCH),
+            trust: chain_policy_at(SystemTime::UNIX_EPOCH),
             ..KeyResolverConfig::default()
         });
         let error = super::super::VerifyContext::new()
@@ -932,7 +1044,7 @@ mod tests {
             .expect("static selector KeyInfo should satisfy XMLDSig structure");
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             trusted_certs: vec![certificate_der],
-            verify_chains: true,
+            trust: chain_policy(),
             ..KeyResolverConfig::default()
         });
 
@@ -984,7 +1096,7 @@ mod tests {
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             trusted_certs: vec![anchor.der().to_vec()],
             lookup_certs: vec![issuer.der().to_vec()],
-            verify_chains: true,
+            trust: chain_policy(),
             ..KeyResolverConfig::default()
         });
 
@@ -996,14 +1108,56 @@ mod tests {
     }
 
     #[test]
+    fn selector_resolved_leaf_stops_at_non_self_signed_trust_anchor() {
+        // A configured anchor terminates trust even when a lookup certificate
+        // could continue the issuer-name chain beyond it.
+        let external_issuer = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("external issuer", true),
+            rcgen::KeyPair::generate().expect("external issuer key generation should succeed"),
+        )
+        .expect("external issuer should be self-signable");
+        let anchor = rcgen::CertifiedIssuer::signed_by(
+            generated_certificate_params("non-self-signed anchor", true),
+            rcgen::KeyPair::generate().expect("anchor key generation should succeed"),
+            &external_issuer,
+        )
+        .expect("external issuer should sign the anchor");
+        let leaf = generated_certificate_params("anchor leaf", false)
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &anchor,
+            )
+            .expect("anchor should sign the leaf");
+        let leaf_metadata = parse_x509_certificate(leaf.der())
+            .expect("generated leaf should have supported metadata");
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                subject_names: vec![leaf_metadata.subject_dn],
+                ..X509DataInfo::default()
+            })],
+        };
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![anchor.der().to_vec()],
+            lookup_certs: vec![leaf.der().to_vec(), external_issuer.der().to_vec()],
+            trust: chain_policy(),
+            ..KeyResolverConfig::default()
+        });
+
+        let resolved = resolver
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .expect("path construction must stop at the configured anchor");
+
+        assert!(resolved.is_some());
+    }
+
+    #[test]
     fn selector_resolved_leaf_does_not_anchor_itself() {
         // A certificate available for selector lookup is not automatically a
         // trust anchor; chain verification still requires a separate issuer.
         let certificate_der = certificate_der(RSA_4096_CERTIFICATE);
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             lookup_certs: vec![certificate_der],
-            verify_chains: true,
-            verification_time: Some(fixture_certificate_time()),
+            trust: chain_policy_at(fixture_certificate_time()),
             ..KeyResolverConfig::default()
         });
         let error = super::super::VerifyContext::new()
@@ -1028,8 +1182,7 @@ mod tests {
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             lookup_certs: vec![leaf],
             trusted_certs: vec![issuer],
-            verify_chains: true,
-            verification_time: Some(fixture_certificate_time()),
+            trust: chain_policy_at(fixture_certificate_time()),
             ..KeyResolverConfig::default()
         });
         let result = super::super::VerifyContext::new()
@@ -1094,13 +1247,112 @@ mod tests {
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             lookup_certs: vec![leaf.der().to_vec(), intermediate.der().to_vec()],
             trusted_certs: vec![root.der().to_vec()],
-            verify_chains: true,
+            trust: chain_policy(),
             ..KeyResolverConfig::default()
         });
 
         let resolved = resolver
             .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
             .expect("selector-resolved leaf should chain through the lookup intermediate");
+
+        assert!(resolved.is_some());
+    }
+
+    #[test]
+    fn embedded_leaf_uses_configured_lookup_intermediate() {
+        // lookup_certs are untrusted path-building material for every X509Data
+        // source, including an embedded leaf and raw-certificate retrieval.
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("embedded root", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        let intermediate = rcgen::CertifiedIssuer::signed_by(
+            generated_certificate_params("embedded intermediate", true),
+            rcgen::KeyPair::generate().expect("intermediate key generation should succeed"),
+            &root,
+        )
+        .expect("root should sign the intermediate");
+        let leaf = generated_certificate_params("embedded leaf", false)
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &intermediate,
+            )
+            .expect("intermediate should sign the leaf");
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(x509_info(
+                vec![leaf.der().to_vec()],
+                0,
+            ))],
+        };
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![intermediate.der().to_vec()],
+            trusted_certs: vec![root.der().to_vec()],
+            trust: chain_policy(),
+            ..KeyResolverConfig::default()
+        });
+
+        let resolved = resolver
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .expect("embedded leaf should chain through the configured lookup intermediate");
+
+        assert!(resolved.is_some());
+    }
+
+    #[test]
+    fn selector_resolved_leaf_chooses_unique_valid_same_key_path() {
+        // Cross-signing can produce issuer certificates with the same subject
+        // and public key. Trust policy, not the immediate signature edge, must
+        // select the sole path that reaches a configured anchor.
+        let trusted_root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("trusted cross-sign root", true),
+            rcgen::KeyPair::generate().expect("trusted root key generation should succeed"),
+        )
+        .expect("trusted root should be self-signable");
+        let untrusted_root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("untrusted cross-sign root", true),
+            rcgen::KeyPair::generate().expect("untrusted root key generation should succeed"),
+        )
+        .expect("untrusted root should be self-signable");
+        let shared_params = generated_certificate_params("shared cross-sign issuer", true);
+        let shared_key =
+            rcgen::KeyPair::generate().expect("shared issuer key generation should succeed");
+        let trusted_intermediate = shared_params
+            .signed_by(&shared_key, &trusted_root)
+            .expect("trusted root should cross-sign the shared issuer key");
+        let untrusted_intermediate = shared_params
+            .signed_by(&shared_key, &untrusted_root)
+            .expect("untrusted root should cross-sign the shared issuer key");
+        let shared_issuer = rcgen::Issuer::from_params(&shared_params, &shared_key);
+        let leaf = generated_certificate_params("cross-signed leaf", false)
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &shared_issuer,
+            )
+            .expect("shared issuer key should sign the leaf");
+        let leaf_metadata = parse_x509_certificate(leaf.der())
+            .expect("generated leaf should have supported metadata");
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                subject_names: vec![leaf_metadata.subject_dn],
+                ..X509DataInfo::default()
+            })],
+        };
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![trusted_root.der().to_vec()],
+            lookup_certs: vec![
+                leaf.der().to_vec(),
+                untrusted_intermediate.der().to_vec(),
+                trusted_intermediate.der().to_vec(),
+                untrusted_root.der().to_vec(),
+            ],
+            trust: chain_policy(),
+            ..KeyResolverConfig::default()
+        });
+
+        let resolved = resolver
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .expect("the sole path to a configured anchor should be selected");
 
         assert!(resolved.is_some());
     }
@@ -1168,7 +1420,7 @@ mod tests {
                 signing_intermediate.der().to_vec(),
             ],
             trusted_certs: vec![root.der().to_vec()],
-            verify_chains: true,
+            trust: chain_policy(),
             ..KeyResolverConfig::default()
         });
 
@@ -1197,12 +1449,13 @@ mod tests {
                 certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
                 certificate_der(include_str!("../../tests/fixtures/keys/cacert.pem")),
             ],
-            verify_chains: true,
-            check_crls: true,
-            verification_time: Some(
-                SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_773_964_800),
-            ),
-            max_chain_depth: 3,
+            trust: crate::policy::KeyTrustPolicy {
+                check_crls: true,
+                max_x509_chain_depth: 3,
+                ..chain_policy_at(
+                    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_773_964_800),
+                )
+            },
             ..KeyResolverConfig::default()
         });
 
@@ -1403,27 +1656,39 @@ mod tests {
 
     #[test]
     fn rsa_key_value_rejects_legacy_weak_modulus() {
-        // Embedded keys must obey the same 2048-bit minimum as certificate and DER keys.
-        let resolver = DefaultKeyResolver::default();
+        // The secure policy rejects legacy RSA-SHA1 independently of whether
+        // the capable key came from RSAKeyValue, DER, X.509, or KeyName.
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trust: crate::policy::KeyTrustPolicy {
+                allow_legacy_rsa_sha1: true,
+                ..crate::policy::KeyTrustPolicy::default()
+            },
+            ..KeyResolverConfig::default()
+        });
         let error = super::super::VerifyContext::new()
             .key_resolver(&resolver)
             .verify(LEGACY_RSA_KEY_VALUE_SIGNATURE)
-            .expect_err("1024-bit RSAKeyValue must fail closed");
+            .expect_err("context policy must override permissive resolver defaults");
 
         assert!(matches!(
             error,
-            DsigError::Crypto(super::super::SignatureVerificationError::InvalidKeyDer)
+            DsigError::Policy(crate::policy::PolicyViolation::Algorithm {
+                operation: "verification",
+                ..
+            })
         ));
     }
 
     #[test]
-    fn legacy_rsa_sha1_policy_applies_to_every_resolved_key_source() {
+    fn generic_key_resolution_keeps_legacy_capability_source_independent() {
         let certificate =
             include_bytes!("../../tests/fixtures/xmldsig/phaos-xmldsig-three/certs/rsa-cert.der")
                 .to_vec();
         let (_, parsed_certificate) = X509Certificate::from_der(&certificate)
             .expect("the Phaos fixture is a DER certificate");
         let public_key = parsed_certificate.public_key().raw.to_vec();
+        let rsa_public_key = rsa::RsaPublicKey::from_public_key_der(&public_key)
+            .expect("the Phaos certificate contains an RSA public key");
         let certificate_metadata = parse_x509_certificate(&certificate)
             .expect("the Phaos fixture has supported X.509 metadata");
         let named_key = VerificationKey {
@@ -1437,7 +1702,13 @@ mod tests {
                 sources: vec![KeyInfoSource::KeyName("legacy".into())],
             },
             KeyInfo {
-                sources: vec![KeyInfoSource::DerEncodedKeyValue(public_key)],
+                sources: vec![KeyInfoSource::DerEncodedKeyValue(public_key.clone())],
+            },
+            KeyInfo {
+                sources: vec![KeyInfoSource::KeyValue(KeyValueInfo::Rsa {
+                    modulus: rsa_public_key.n().to_be_bytes_trimmed_vartime().to_vec(),
+                    exponent: rsa_public_key.e().to_be_bytes_trimmed_vartime().to_vec(),
+                })],
             },
             KeyInfo {
                 sources: vec![KeyInfoSource::X509Data(X509DataInfo {
@@ -1448,18 +1719,16 @@ mod tests {
                 })],
             },
         ];
-        let mut config = KeyResolverConfig {
-            allow_legacy_rsa_sha1: true,
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            named_keys: HashMap::from([("legacy".into(), named_key.clone())]),
             ..KeyResolverConfig::default()
-        };
-        config.named_keys.insert("legacy".into(), named_key);
-        let resolver = DefaultKeyResolver::new(config);
+        });
 
         for key_info in &key_infos {
             let key = resolver
                 .resolve(Some(key_info), SignatureAlgorithm::RsaSha1)
                 .expect("the key source is valid")
-                .expect("each source must resolve under the legacy policy");
+                .expect("key resolution remains independent from operation policy");
             assert!(
                 !key.verify(SignatureAlgorithm::RsaSha1, b"data", &[0; 128])
                     .expect("the legacy RSA key is structurally valid")
@@ -1766,7 +2035,7 @@ mod tests {
     fn chain_verification_rejects_untrusted_embedded_certificate() {
         // Enabling chain policy must fail closed when no trust anchor is configured.
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-            verify_chains: true,
+            trust: chain_policy(),
             ..KeyResolverConfig::default()
         });
         let error = super::super::VerifyContext::new()

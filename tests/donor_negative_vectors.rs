@@ -12,10 +12,11 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use roxmltree::Document;
 use x509_parser::prelude::{FromDer, X509Certificate};
+use xml_sec::policy::PolicyViolation;
 use xml_sec::xmldsig::{
     DsigError, DsigStatus, FailureReason, KeyInfoSource, ParseError, SignatureAlgorithm,
-    SignatureVerificationError, VerificationKey, VerifyContext, X509ChainError, X509ChainOptions,
-    X509DataInfo, parse_key_info, verify_signature_with_pem_key, verify_x509_certificate_chain,
+    VerificationKey, VerifyContext, X509ChainError, X509ChainOptions, X509DataInfo, parse_key_info,
+    verify_signature_with_pem_key, verify_x509_certificate_chain,
 };
 
 const PHAOS_DIR: &str = "tests/fixtures/xmldsig/phaos-xmldsig-three";
@@ -73,7 +74,13 @@ fn phaos_bad_digest_reports_reference_mismatch_before_key_use() {
     // is advisory. The unrelated strong key is never used because digest
     // validation fails first, proving the exact fail-fast boundary.
     let xml = read_vector("signature-rsa-enveloped-bad-digest-val.xml");
-    let result = verify_signature_with_pem_key(&xml, STRONG_RSA_PUBLIC_KEY, false)
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy.key_trust.allow_legacy_rsa_sha1 = true;
+    let key = phaos_verification_key();
+    let result = VerifyContext::new()
+        .policy(policy)
+        .key(&key)
+        .verify(&xml)
         .expect("bad DigestValue must be a completed invalid verification");
 
     assert_eq!(
@@ -102,8 +109,8 @@ fn phaos_bad_signature_artifact_fails_on_its_unsupported_md5_reference() {
 
 #[test]
 fn phaos_valid_baseline_rejects_legacy_rsa_key_policy() {
-    // References in the historical positive vector are valid, but its
-    // 1024-bit RSA key is below the crate's 2048-bit verification minimum.
+    // References in the historical positive vector are valid, but RSA-SHA1 is
+    // rejected by the default verification policy before backend key handling.
     let xml = read_vector("signature-rsa-enveloped.xml");
     let key = phaos_verification_key();
     let error = VerifyContext::new()
@@ -113,7 +120,10 @@ fn phaos_valid_baseline_rejects_legacy_rsa_key_policy() {
 
     assert!(matches!(
         error,
-        DsigError::Crypto(SignatureVerificationError::InvalidKeyDer)
+        DsigError::Policy(PolicyViolation::Algorithm {
+            operation: "verification",
+            ..
+        })
     ));
 }
 

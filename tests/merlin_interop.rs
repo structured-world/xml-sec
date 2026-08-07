@@ -7,16 +7,25 @@ use std::{
 };
 
 use x509_parser::prelude::{FromDer, X509Certificate};
+use xml_sec::policy::KeyTrustPolicy;
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DsigError, DsigStatus, FailureReason, HmacSha1VerificationKey,
-    KeyResolutionError, KeyResolverConfig, ParseError, SignatureAlgorithm,
-    SignatureVerificationError, UriTypeSet, VerificationKey, VerifyContext, X509ChainError,
-    XPathHereSemantics,
+    KeyResolutionError, KeyResolverConfig, ParseError, SignatureAlgorithm, UriTypeSet,
+    VerificationKey, VerifyContext, X509ChainError, XPathHereSemantics,
 };
 
 const MERLIN: &str = "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three";
 const DONOR_EXTERNAL: &str = "tests/fixtures/xmldsig/external-data";
 const VERIFY_2005: u64 = 1_104_580_800;
+
+fn chain_policy(check_crls: bool) -> KeyTrustPolicy {
+    KeyTrustPolicy {
+        verify_x509_chains: true,
+        check_crls,
+        verification_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005)),
+        ..KeyTrustPolicy::default()
+    }
+}
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -101,13 +110,13 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
                 .verify(&xml(name)),
         );
     }
-    let legacy_rsa = DefaultKeyResolver::new(KeyResolverConfig {
-        allow_legacy_rsa_sha1: true,
-        ..KeyResolverConfig::default()
-    });
+    let legacy_rsa = DefaultKeyResolver::default();
+    let mut legacy_policy = xml_sec::policy::VerificationPolicy::default();
+    legacy_policy.key_trust.allow_legacy_rsa_sha1 = true;
     assert_valid(
         "signature-enveloping-rsa",
         VerifyContext::new()
+            .policy(legacy_policy)
             .key_resolver(&legacy_rsa)
             .verify(&xml("signature-enveloping-rsa")),
     );
@@ -167,8 +176,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             lookup_certs,
             trusted_certs: vec![cert("ca.pem")],
-            verify_chains: true,
-            verification_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005)),
+            trust: chain_policy(false),
             ..KeyResolverConfig::default()
         });
         assert_valid(
@@ -184,8 +192,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
     let retrieval = DefaultKeyResolver::new(KeyResolverConfig {
         lookup_certs: vec![cert("balor.pem")],
         trusted_certs: vec![cert("ca.pem")],
-        verify_chains: true,
-        verification_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005)),
+        trust: chain_policy(false),
         ..KeyResolverConfig::default()
     });
     assert_valid(
@@ -204,9 +211,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
     let revoked_resources = external_resources();
     let revoked = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![cert("ca.pem")],
-        verify_chains: true,
-        check_crls: true,
-        verification_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005)),
+        trust: chain_policy(true),
         ..KeyResolverConfig::default()
     });
     let revoked_error = VerifyContext::new()
@@ -231,7 +236,10 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
 
     let complex = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![cert("merlin.pem")],
-        verification_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005)),
+        trust: KeyTrustPolicy {
+            verification_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005)),
+            ..KeyTrustPolicy::default()
+        },
         ..KeyResolverConfig::default()
     });
     let result = VerifyContext::new()
@@ -337,9 +345,12 @@ fn bounds_external_resources_before_dereference() {
             .allowed_uri_types(UriTypeSet::ALL)
             .external_resources(&oversized)
             .verify(&xml("signature-external-dsa")),
-        Err(DsigError::InvalidStructure {
-            reason: "external resource exceeds maximum allowed length"
-        })
+        Err(DsigError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "external resource bytes",
+                ..
+            }
+        ))
     ));
 
     let mut aggregate = external_resources();
@@ -351,9 +362,12 @@ fn bounds_external_resources_before_dereference() {
             .allowed_uri_types(UriTypeSet::ALL)
             .external_resources(&aggregate)
             .verify(&xml("signature-external-dsa")),
-        Err(DsigError::InvalidStructure {
-            reason: "external resources exceed maximum aggregate length"
-        })
+        Err(DsigError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "aggregate external resource bytes",
+                ..
+            }
+        ))
     ));
 }
 
@@ -461,7 +475,12 @@ fn rejects_missing_ambiguous_and_weak_key_resolution() {
         .verify(&xml("signature-enveloping-rsa"));
     assert!(matches!(
         weak,
-        Err(DsigError::Crypto(SignatureVerificationError::InvalidKeyDer))
+        Err(DsigError::Policy(
+            xml_sec::policy::PolicyViolation::Algorithm {
+                operation: "verification",
+                ..
+            }
+        ))
     ));
 }
 
@@ -497,8 +516,7 @@ fn rejects_dtd_and_unsupported_retrieval_defaults() {
     let retrieval = DefaultKeyResolver::new(KeyResolverConfig {
         lookup_certs: vec![cert("balor.pem")],
         trusted_certs: vec![cert("ca.pem")],
-        verify_chains: true,
-        verification_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005)),
+        trust: chain_policy(false),
         ..KeyResolverConfig::default()
     });
     let reference_error = VerifyContext::new()

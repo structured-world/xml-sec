@@ -1,38 +1,22 @@
 //! XMLEnc content encryption, key wrapping, and XML generation.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
-use aes::{
-    Aes128, Aes256,
-    cipher::{BlockModeEncrypt, KeyIvInit, block_padding::NoPadding},
-};
-use aes_gcm::{
-    Aes128Gcm, Aes256Gcm, Nonce,
-    aead::{AeadInOut, KeyInit},
-};
-use aes_kw::{KwAes128, KwAes256};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use cbc::Encryptor;
-use getrandom::{SysRng, rand_core::TryRng};
 use quick_xml::{
     Writer,
     events::{BytesEnd, BytesStart, BytesText, Event},
 };
 use roxmltree::{Document, Node, ParsingOptions};
-use rsa::{Oaep, RsaPublicKey, traits::PaddingScheme};
-use sha1::Sha1;
-use sha2::{Sha256, Sha384, Sha512};
+use rsa::RsaPublicKey;
 
 use crate::xml::is_xml_1_0_character;
 
-use super::types::{
-    MAX_ENCRYPTION_DOCUMENT_LEN, MAX_ENCRYPTION_METADATA_LEN, MAX_ENCRYPTION_PLAINTEXT_LEN,
-    MAX_ENCRYPTION_RECIPIENTS, XMLDSIG_NS, XMLENC_NS, XMLENC11_NS,
-};
+use super::types::{XMLDSIG_NS, XMLENC_NS, XMLENC11_NS};
 use super::{
     DataEncryptionAlgorithm, DocumentEncryptionOptions, EncryptedDataType, EncryptionRecipient,
-    EncryptionResult, KeyWrapAlgorithm, OaepDigestAlgorithm, ReplacementMode, RsaOaepParameters,
-    XmlEncError, has_single_element_with_boundary_trivia,
+    EncryptionResult, KeyWrapAlgorithm, ReplacementMode, RsaOaepParameters, XmlEncError,
+    has_single_element_with_boundary_trivia,
 };
 
 const XML_WHITESPACE: &[char] = &[' ', '\t', '\n', '\r'];
@@ -46,6 +30,8 @@ pub struct EncryptedDataBuilder {
     direct_key: Option<Vec<u8>>,
     direct_key_name: Option<String>,
     recipients: Vec<EncryptionRecipient>,
+    policy: crate::policy::EncryptionPolicy,
+    provider: Arc<dyn crate::provider::CryptoProvider>,
 }
 
 impl fmt::Debug for EncryptedDataBuilder {
@@ -61,6 +47,8 @@ impl fmt::Debug for EncryptedDataBuilder {
             )
             .field("direct_key_name", &self.direct_key_name)
             .field("recipients", &self.recipients)
+            .field("policy", &self.policy)
+            .field("provider", &self.provider.name())
             .finish()
     }
 }
@@ -75,7 +63,21 @@ impl EncryptedDataBuilder {
             direct_key: None,
             direct_key_name: None,
             recipients: Vec::new(),
+            policy: crate::policy::EncryptionPolicy::default(),
+            provider: Arc::new(crate::provider::RustCryptoProvider),
         }
+    }
+
+    /// Replace the complete immutable encryption policy snapshot.
+    pub fn policy(mut self, policy: crate::policy::EncryptionPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Select the cryptographic provider for this operation context.
+    pub fn provider(mut self, provider: Arc<dyn crate::provider::CryptoProvider>) -> Self {
+        self.provider = provider;
+        self
     }
 
     /// Set whether XML encryption covers one element or its child content.
@@ -120,7 +122,7 @@ impl EncryptedDataBuilder {
 
     /// Encrypt one complete XML element or an XML content fragment.
     pub fn encrypt_xml(&self, xml: &str) -> Result<EncryptionResult, XmlEncError> {
-        validate_plaintext_len(xml.len())?;
+        self.validate_plaintext_len(xml.len())?;
         validate_xml_plaintext(xml, &self.encrypted_type)?;
         self.encrypt_payload(xml.as_bytes(), Some(self.encrypted_type.clone()))
     }
@@ -136,9 +138,9 @@ impl EncryptedDataBuilder {
         xml: &str,
         options: DocumentEncryptionOptions<'_>,
     ) -> Result<String, XmlEncError> {
-        validate_document_len(xml.len())?;
+        self.validate_document_len(xml.len())?;
         let parsing_options = ParsingOptions {
-            allow_dtd: options.allow_dtd,
+            allow_dtd: self.policy.xml.allow_internal_dtd,
             entity_resolver: None,
             ..ParsingOptions::default()
         };
@@ -171,20 +173,25 @@ impl EncryptedDataBuilder {
         plaintext: &[u8],
         encrypted_type: Option<EncryptedDataType>,
     ) -> Result<EncryptionResult, XmlEncError> {
-        validate_plaintext_len(plaintext.len())?;
+        self.validate_plaintext_len(plaintext.len())?;
         self.validate_configuration()?;
 
         let content_key = if let Some(key) = &self.direct_key {
             validate_content_key(self.algorithm, key)?;
             key.clone()
         } else {
-            random_bytes(self.algorithm.key_len())?
+            random_bytes(self.provider.as_ref(), self.algorithm.key_len())?
         };
-        let ciphertext = encrypt_content(self.algorithm, &content_key, plaintext)?;
+        let ciphertext = encrypt_content(
+            self.provider.as_ref(),
+            self.algorithm,
+            &content_key,
+            plaintext,
+        )?;
         let encrypted_keys = self
             .recipients
             .iter()
-            .map(|recipient| wrap_content_key(recipient, &content_key))
+            .map(|recipient| wrap_content_key(self.provider.as_ref(), recipient, &content_key))
             .collect::<Result<Vec<_>, _>>()?;
         let encrypted_data_xml = render_encrypted_data(
             self.algorithm,
@@ -207,19 +214,32 @@ impl EncryptedDataBuilder {
     }
 
     fn validate_configuration(&self) -> Result<(), XmlEncError> {
+        self.policy.resources.validate()?;
+        if self
+            .policy
+            .data_algorithms
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&self.algorithm))
+        {
+            return Err(crate::policy::PolicyViolation::Algorithm {
+                operation: "encryption",
+                algorithm: self.algorithm.to_string(),
+            }
+            .into());
+        }
         if matches!(self.encrypted_type, EncryptedDataType::Other(_)) {
             return Err(XmlEncError::InvalidEncryptionConfig(
                 "Other Type hints are not valid for XML encryption".into(),
             ));
         }
-        if self.recipients.len() > MAX_ENCRYPTION_RECIPIENTS {
+        if self.recipients.len() > self.policy.resources.max_encryption_recipients {
             return Err(XmlEncError::TooManyRecipients {
-                maximum: MAX_ENCRYPTION_RECIPIENTS,
+                maximum: self.policy.resources.max_encryption_recipients,
                 actual: self.recipients.len(),
             });
         }
-        validate_metadata("EncryptedData Id", self.id.as_deref())?;
-        validate_key_name("direct KeyName", self.direct_key_name.as_deref())?;
+        self.validate_metadata("EncryptedData Id", self.id.as_deref())?;
+        self.validate_key_name("direct KeyName", self.direct_key_name.as_deref())?;
         for recipient in &self.recipients {
             match recipient {
                 EncryptionRecipient::RsaOaep {
@@ -228,17 +248,46 @@ impl EncryptedDataBuilder {
                     key_name,
                     ..
                 } => {
-                    validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
-                    validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
-                    validate_metadata_len("OAEPparams", parameters.label.len())?;
+                    if self
+                        .policy
+                        .key_transport_algorithms
+                        .as_ref()
+                        .is_some_and(|allowed| !allowed.contains(&parameters.algorithm))
+                        || self.policy.oaep_digests.as_ref().is_some_and(|allowed| {
+                            !allowed.contains(&parameters.digest)
+                                || !allowed.contains(&parameters.mgf_digest)
+                        })
+                    {
+                        return Err(crate::policy::PolicyViolation::Algorithm {
+                            operation: "encryption",
+                            algorithm: parameters.algorithm.uri().to_string(),
+                        }
+                        .into());
+                    }
+                    self.validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
+                    self.validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
+                    self.validate_metadata_len("OAEPparams", parameters.label.len())?;
                 }
                 EncryptionRecipient::AesKeyWrap {
+                    algorithm,
                     recipient,
                     key_name,
                     ..
                 } => {
-                    validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
-                    validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
+                    if self
+                        .policy
+                        .key_wrap_algorithms
+                        .as_ref()
+                        .is_some_and(|allowed| !allowed.contains(algorithm))
+                    {
+                        return Err(crate::policy::PolicyViolation::Algorithm {
+                            operation: "encryption",
+                            algorithm: algorithm.uri().to_string(),
+                        }
+                        .into());
+                    }
+                    self.validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
+                    self.validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
                 }
             }
         }
@@ -257,33 +306,85 @@ impl EncryptedDataBuilder {
             _ => Ok(()),
         }
     }
+
+    fn validate_metadata(
+        &self,
+        field: &'static str,
+        value: Option<&str>,
+    ) -> Result<(), XmlEncError> {
+        validate_metadata(
+            field,
+            value,
+            self.policy.resources.max_encryption_metadata_bytes,
+        )
+    }
+
+    fn validate_key_name(
+        &self,
+        field: &'static str,
+        value: Option<&str>,
+    ) -> Result<(), XmlEncError> {
+        validate_key_name(
+            field,
+            value,
+            self.policy.resources.max_encryption_metadata_bytes,
+        )
+    }
+
+    fn validate_metadata_len(&self, field: &'static str, actual: usize) -> Result<(), XmlEncError> {
+        validate_metadata_len(
+            field,
+            actual,
+            self.policy.resources.max_encryption_metadata_bytes,
+        )
+    }
+
+    fn validate_plaintext_len(&self, actual: usize) -> Result<(), XmlEncError> {
+        validate_plaintext_len(actual, self.policy.resources.max_encryption_plaintext_bytes)
+    }
+
+    fn validate_document_len(&self, actual: usize) -> Result<(), XmlEncError> {
+        validate_document_len(actual, self.policy.resources.max_encryption_document_bytes)
+    }
 }
 
-fn validate_metadata(field: &'static str, value: Option<&str>) -> Result<(), XmlEncError> {
+fn validate_metadata(
+    field: &'static str,
+    value: Option<&str>,
+    maximum: usize,
+) -> Result<(), XmlEncError> {
     if value.is_some_and(|value| !value.chars().all(is_xml_1_0_character)) {
         return Err(XmlEncError::InvalidEncryptionConfig(format!(
             "{field} contains a character forbidden by XML 1.0"
         )));
     }
-    validate_metadata_len(field, value.map_or(0, str::len))
+    validate_metadata_len(field, value.map_or(0, str::len), maximum)
 }
 
-fn validate_key_name(field: &'static str, value: Option<&str>) -> Result<(), XmlEncError> {
+fn validate_key_name(
+    field: &'static str,
+    value: Option<&str>,
+    maximum: usize,
+) -> Result<(), XmlEncError> {
     if value.is_some_and(str::is_empty) {
         return Err(XmlEncError::InvalidEncryptionConfig(format!(
             "{field} must not be empty"
         )));
     }
-    validate_metadata(field, value)
+    validate_metadata(field, value, maximum)
 }
 
-fn validate_metadata_len(field: &'static str, actual: usize) -> Result<(), XmlEncError> {
-    if actual <= MAX_ENCRYPTION_METADATA_LEN {
+fn validate_metadata_len(
+    field: &'static str,
+    actual: usize,
+    maximum: usize,
+) -> Result<(), XmlEncError> {
+    if actual <= maximum {
         Ok(())
     } else {
         Err(XmlEncError::EncryptionMetadataTooLarge {
             field,
-            maximum: MAX_ENCRYPTION_METADATA_LEN,
+            maximum,
             actual,
         })
     }
@@ -306,23 +407,17 @@ struct ContentBoundaries {
     start_tag_end: usize,
 }
 
-fn validate_plaintext_len(actual: usize) -> Result<(), XmlEncError> {
-    if actual <= MAX_ENCRYPTION_PLAINTEXT_LEN {
+fn validate_plaintext_len(actual: usize, maximum: usize) -> Result<(), XmlEncError> {
+    if actual <= maximum {
         Ok(())
     } else {
-        Err(XmlEncError::PlaintextTooLarge {
-            maximum: MAX_ENCRYPTION_PLAINTEXT_LEN,
-            actual,
-        })
+        Err(XmlEncError::PlaintextTooLarge { maximum, actual })
     }
 }
 
-fn validate_document_len(actual: usize) -> Result<(), XmlEncError> {
-    if actual > MAX_ENCRYPTION_DOCUMENT_LEN {
-        return Err(XmlEncError::DocumentTooLarge {
-            maximum: MAX_ENCRYPTION_DOCUMENT_LEN,
-            actual,
-        });
+fn validate_document_len(actual: usize, maximum: usize) -> Result<(), XmlEncError> {
+    if actual > maximum {
+        return Err(XmlEncError::DocumentTooLarge { maximum, actual });
     }
     Ok(())
 }
@@ -339,88 +434,26 @@ fn validate_content_key(algorithm: DataEncryptionAlgorithm, key: &[u8]) -> Resul
     }
 }
 
-fn random_bytes(len: usize) -> Result<Vec<u8>, XmlEncError> {
+fn random_bytes(
+    provider: &dyn crate::provider::CryptoProvider,
+    len: usize,
+) -> Result<Vec<u8>, XmlEncError> {
     let mut bytes = vec![0_u8; len];
-    SysRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|error| XmlEncError::Rng(error.to_string()))?;
+    provider.fill_random(&mut bytes)?;
     Ok(bytes)
 }
 
 fn encrypt_content(
+    provider: &dyn crate::provider::CryptoProvider,
     algorithm: DataEncryptionAlgorithm,
     key: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, XmlEncError> {
-    validate_content_key(algorithm, key)?;
-    match algorithm {
-        DataEncryptionAlgorithm::Aes128Cbc => encrypt_cbc::<Aes128>(key, plaintext),
-        DataEncryptionAlgorithm::Aes256Cbc => encrypt_cbc::<Aes256>(key, plaintext),
-        DataEncryptionAlgorithm::Aes128Gcm => encrypt_gcm::<Aes128Gcm>(key, plaintext),
-        DataEncryptionAlgorithm::Aes256Gcm => encrypt_gcm::<Aes256Gcm>(key, plaintext),
-    }
-}
-
-fn encrypt_cbc<C>(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, XmlEncError>
-where
-    C: aes::cipher::BlockCipherEncrypt + aes::cipher::KeyInit,
-{
-    const BLOCK: usize = 16;
-    let iv = random_bytes(BLOCK)?;
-    let pad_len = BLOCK - (plaintext.len() % BLOCK);
-    let mut padded = Vec::with_capacity(plaintext.len() + pad_len);
-    padded.extend_from_slice(plaintext);
-    if pad_len > 1 {
-        padded.extend_from_slice(&random_bytes(pad_len - 1)?);
-    }
-    padded.push(pad_len as u8);
-    let padded_len = padded.len();
-    Encryptor::<C>::new_from_slices(key, &iv)
-        .map_err(|_| XmlEncError::InvalidKeySize {
-            algorithm: if key.len() == 16 {
-                DataEncryptionAlgorithm::Aes128Cbc
-            } else {
-                DataEncryptionAlgorithm::Aes256Cbc
-            },
-            expected: key.len(),
-            actual: key.len(),
-        })?
-        .encrypt_padded::<NoPadding>(&mut padded, padded_len)
-        .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))?;
-    let mut output = Vec::with_capacity(BLOCK + padded.len());
-    output.extend_from_slice(&iv);
-    output.extend_from_slice(&padded);
-    Ok(output)
-}
-
-fn encrypt_gcm<C>(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, XmlEncError>
-where
-    C: AeadInOut + KeyInit,
-{
-    const NONCE_LEN: usize = 12;
-    let nonce = random_bytes(NONCE_LEN)?;
-    let cipher = C::new_from_slice(key).map_err(|_| XmlEncError::InvalidKeySize {
-        algorithm: if key.len() == 16 {
-            DataEncryptionAlgorithm::Aes128Gcm
-        } else {
-            DataEncryptionAlgorithm::Aes256Gcm
-        },
-        expected: key.len(),
-        actual: key.len(),
-    })?;
-    let mut encrypted = plaintext.to_vec();
-    let nonce_value = Nonce::try_from(nonce.as_slice())
-        .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))?;
-    cipher
-        .encrypt_in_place(&nonce_value, b"", &mut encrypted)
-        .map_err(|_| XmlEncError::AeadAuthenticationFailed)?;
-    let mut output = Vec::with_capacity(NONCE_LEN + encrypted.len());
-    output.extend_from_slice(&nonce);
-    output.extend_from_slice(&encrypted);
-    Ok(output)
+    Ok(provider.encrypt_data(algorithm, key, plaintext)?)
 }
 
 fn wrap_content_key(
+    provider: &dyn crate::provider::CryptoProvider,
     recipient: &EncryptionRecipient,
     content_key: &[u8],
 ) -> Result<WrappedKey, XmlEncError> {
@@ -435,7 +468,7 @@ fn wrap_content_key(
             oaep: Some(parameters.clone()),
             recipient: recipient.clone(),
             key_name: key_name.clone(),
-            ciphertext: wrap_rsa_oaep(public_key, parameters, content_key)?,
+            ciphertext: wrap_rsa_oaep(provider, public_key, parameters, content_key)?,
         }),
         EncryptionRecipient::AesKeyWrap {
             kek,
@@ -443,121 +476,33 @@ fn wrap_content_key(
             recipient,
             key_name,
         } => {
-            if kek.len() != algorithm.key_len() {
-                return Err(XmlEncError::InvalidKekSize {
-                    algorithm: *algorithm,
-                    expected: algorithm.key_len(),
-                    actual: kek.len(),
-                });
-            }
-            let mut output = vec![0_u8; content_key.len() + 8];
-            let wrapped = match algorithm {
-                KeyWrapAlgorithm::AesKw128 => KwAes128::new_from_slice(kek)
-                    .map_err(|_| invalid_kek_size(*algorithm, kek.len()))?
-                    .wrap_key(content_key, &mut output),
-                KeyWrapAlgorithm::AesKw256 => KwAes256::new_from_slice(kek)
-                    .map_err(|_| invalid_kek_size(*algorithm, kek.len()))?
-                    .wrap_key(content_key, &mut output),
-            }
-            .map_err(|_| XmlEncError::KeyWrapIntegrity)?;
+            let wrapped = provider.wrap_key(*algorithm, kek, content_key)?;
             Ok(WrappedKey {
                 algorithm_uri: algorithm.uri(),
                 oaep: None,
                 recipient: recipient.clone(),
                 key_name: key_name.clone(),
-                ciphertext: wrapped.to_vec(),
+                ciphertext: wrapped,
             })
         }
     }
 }
 
 fn wrap_rsa_oaep(
+    provider: &dyn crate::provider::CryptoProvider,
     public_key: &RsaPublicKey,
     parameters: &RsaOaepParameters,
     content_key: &[u8],
 ) -> Result<Vec<u8>, XmlEncError> {
-    if parameters.algorithm == super::KeyTransportAlgorithm::RsaOaepMgf1p
-        && parameters.mgf_digest != OaepDigestAlgorithm::Sha1
-    {
-        return Err(XmlEncError::InvalidEncryptionConfig(
-            "legacy rsa-oaep-mgf1p requires MGF1-SHA1".into(),
-        ));
-    }
-    let mut rng = SysRng;
-    macro_rules! encrypt_with {
-        ($digest:ty, $mgf:ty) => {
-            // Call `PaddingScheme` directly: it accepts `TryCryptoRng`, so a
-            // `SysRng` failure returns `rsa::Error::Rng` for the mapping below
-            // instead of entering RSA's infallible `CryptoRng` convenience API.
-            Oaep::<$digest, $mgf>::new_with_mgf_hash_and_label(parameters.label.clone()).encrypt(
-                &mut rng,
-                public_key,
-                content_key,
-            )
-        };
-    }
-    let result = match (parameters.digest, parameters.mgf_digest) {
-        (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha1) => {
-            encrypt_with!(Sha1, Sha1)
-        }
-        (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha256) => {
-            encrypt_with!(Sha1, Sha256)
-        }
-        (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha384) => {
-            encrypt_with!(Sha1, Sha384)
-        }
-        (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha512) => {
-            encrypt_with!(Sha1, Sha512)
-        }
-        (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha1) => {
-            encrypt_with!(Sha256, Sha1)
-        }
-        (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha256) => {
-            encrypt_with!(Sha256, Sha256)
-        }
-        (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha384) => {
-            encrypt_with!(Sha256, Sha384)
-        }
-        (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha512) => {
-            encrypt_with!(Sha256, Sha512)
-        }
-        (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha1) => {
-            encrypt_with!(Sha384, Sha1)
-        }
-        (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha256) => {
-            encrypt_with!(Sha384, Sha256)
-        }
-        (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha384) => {
-            encrypt_with!(Sha384, Sha384)
-        }
-        (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha512) => {
-            encrypt_with!(Sha384, Sha512)
-        }
-        (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha1) => {
-            encrypt_with!(Sha512, Sha1)
-        }
-        (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha256) => {
-            encrypt_with!(Sha512, Sha256)
-        }
-        (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha384) => {
-            encrypt_with!(Sha512, Sha384)
-        }
-        (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha512) => {
-            encrypt_with!(Sha512, Sha512)
-        }
-    };
-    result.map_err(|error| match error {
-        rsa::Error::Rng => XmlEncError::Rng("RSA-OAEP random generation failed".into()),
-        error => XmlEncError::RsaEncrypt(error.to_string()),
-    })
-}
-
-fn invalid_kek_size(algorithm: KeyWrapAlgorithm, actual: usize) -> XmlEncError {
-    XmlEncError::InvalidKekSize {
-        algorithm,
-        expected: algorithm.key_len(),
-        actual,
-    }
+    provider
+        .transport_key(public_key, parameters, content_key)
+        .map_err(|error| match error {
+            crate::provider::ProviderError::Random(message) => XmlEncError::Rng(message),
+            crate::provider::ProviderError::InvalidInput(reason) => {
+                XmlEncError::InvalidEncryptionConfig(reason.into())
+            }
+            error => XmlEncError::RsaEncrypt(error.to_string()),
+        })
 }
 
 fn render_encrypted_data(
@@ -802,13 +747,20 @@ fn replace_range(xml: &str, range: std::ops::Range<usize>, replacement: &str) ->
 
 #[cfg(test)]
 mod tests {
+    use getrandom::SysRng;
     use getrandom::rand_core::UnwrapErr;
     use rsa::{RsaPrivateKey, RsaPublicKey};
 
     use super::*;
+    use crate::hard_limits::{
+        ENCRYPTION_DOCUMENT_BYTE_CEILING as MAX_ENCRYPTION_DOCUMENT_LEN,
+        ENCRYPTION_METADATA_BYTE_CEILING as MAX_ENCRYPTION_METADATA_LEN,
+        ENCRYPTION_PLAINTEXT_BYTE_CEILING as MAX_ENCRYPTION_PLAINTEXT_LEN,
+        ENCRYPTION_RECIPIENT_CEILING as MAX_ENCRYPTION_RECIPIENTS,
+    };
     use crate::xmlenc::{
-        KekDecryptor, PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt, decrypt_document,
-        parse_encrypted_data,
+        KekDecryptor, OaepDigestAlgorithm, PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt,
+        decrypt_document, parse_encrypted_data,
     };
 
     #[test]
@@ -942,9 +894,15 @@ mod tests {
             .expect_err("missing key source must fail");
         assert!(matches!(no_key, XmlEncError::InvalidEncryptionConfig(_)));
 
-        assert!(validate_plaintext_len(MAX_ENCRYPTION_PLAINTEXT_LEN).is_ok());
+        assert!(
+            validate_plaintext_len(MAX_ENCRYPTION_PLAINTEXT_LEN, MAX_ENCRYPTION_PLAINTEXT_LEN,)
+                .is_ok()
+        );
         assert!(matches!(
-            validate_plaintext_len(MAX_ENCRYPTION_PLAINTEXT_LEN + 1),
+            validate_plaintext_len(
+                MAX_ENCRYPTION_PLAINTEXT_LEN + 1,
+                MAX_ENCRYPTION_PLAINTEXT_LEN,
+            ),
             Err(XmlEncError::PlaintextTooLarge { .. })
         ));
 
