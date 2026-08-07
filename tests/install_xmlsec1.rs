@@ -77,8 +77,8 @@ impl InstallHarness {
         );
         root.tool("nproc", "#!/bin/sh\nprintf '1\\n'\n");
         root.tool(
-            "make",
-            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in DESTDIR=*) dest=${arg#DESTDIR=} ;; esac\ndone\nif [ -n \"${dest:-}\" ]; then\n  mkdir -p \"$dest$XMLSEC1_PREFIX/bin\"\n  printf '#!/bin/sh\\nexit \"${XMLSEC1_SMOKE_EXIT:-0}\"\\n' > \"$dest$XMLSEC1_PREFIX/bin/xmlsec1\"\n  chmod +x \"$dest$XMLSEC1_PREFIX/bin/xmlsec1\"\nfi\n",
+          "make",
+          "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in DESTDIR=*) dest=${arg#DESTDIR=} ;; esac\ndone\nif [ -n \"${dest:-}\" ]; then\n  mkdir -p \"$dest$XMLSEC1_PREFIX/bin\"\n  printf '#!/bin/sh\\nprintf \"%%s\\\\n\" \"${XMLSEC1_SMOKE_OUTPUT-xmlsec1 1.3.13 (openssl)}\"\\nexit \"${XMLSEC1_SMOKE_EXIT:-0}\"\\n' > \"$dest$XMLSEC1_PREFIX/bin/xmlsec1\"\n  chmod +x \"$dest$XMLSEC1_PREFIX/bin/xmlsec1\"\nfi\n",
         );
         root.tool(
             "mv",
@@ -97,6 +97,7 @@ impl InstallHarness {
         mv_fail_on: Option<u8>,
         reported_commit: Option<&str>,
         smoke_exit: Option<u8>,
+        smoke_output: Option<&str>,
     ) -> std::process::ExitStatus {
         let inherited_path = std::env::var_os("PATH").expect("test process must have PATH");
         let path = std::env::join_paths(
@@ -122,6 +123,9 @@ impl InstallHarness {
         if let Some(smoke_exit) = smoke_exit {
             command.env("XMLSEC1_SMOKE_EXIT", smoke_exit.to_string());
         }
+        if let Some(smoke_output) = smoke_output {
+            command.env("XMLSEC1_SMOKE_OUTPUT", smoke_output);
+        }
         command.status().expect("installation script must run")
     }
 }
@@ -132,7 +136,7 @@ fn failed_install_replacement_restores_previous_xmlsec() {
     // leave the previously working installation intact rather than letting
     // EXIT cleanup delete its backup.
     let harness = InstallHarness::new();
-    let status = harness.run(Some(2), None, None);
+    let status = harness.run(Some(2), None, None, None);
 
     assert!(
         !status.success(),
@@ -150,7 +154,12 @@ fn installer_rejects_source_revision_mismatch() {
     // Artifact compression is not source identity. The installer must reject
     // a fetch whose resolved Git object differs from the pinned commit.
     let harness = InstallHarness::new();
-    let status = harness.run(None, Some("0000000000000000000000000000000000000000"), None);
+    let status = harness.run(
+        None,
+        Some("0000000000000000000000000000000000000000"),
+        None,
+        None,
+    );
 
     assert!(
         !status.success(),
@@ -168,11 +177,46 @@ fn failed_first_install_removes_promoted_prefix() {
     // A failed smoke test must not leave an executable plus source marker that
     // a later invocation could mistake for a validated installation.
     let harness = InstallHarness::without_previous_install();
-    let status = harness.run(None, None, Some(17));
+    let status = harness.run(None, None, Some(17), None);
 
     assert!(!status.success(), "injected smoke failure must propagate");
     assert!(
         !harness.prefix.exists(),
         "failed first installation must remove its promoted prefix"
+    );
+}
+
+#[test]
+fn malformed_version_output_restores_previous_installation() {
+    // Exit status alone is not source identity: a successful binary with an
+    // unexpected version must not replace the previously validated install.
+    let harness = InstallHarness::new();
+    for output in ["", "xmlsec1", "xmlsec1 1.3.12", "other 1.3.13"] {
+        let status = harness.run(None, None, None, Some(output));
+
+        assert!(
+            !status.success(),
+            "unexpected version output {output:?} must fail closed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(harness.prefix.join("sentinel"))
+                .expect("version mismatch must restore the previous installation"),
+            "previous installation"
+        );
+        assert!(!harness.prefix.join(".xmlsec-source-commit").exists());
+    }
+}
+
+#[test]
+fn exact_version_output_commits_the_new_installation() {
+    let harness = InstallHarness::new();
+    let status = harness.run(None, None, None, Some("xmlsec1 1.3.13 (openssl)"));
+
+    assert!(status.success(), "the pinned version must pass validation");
+    assert!(!harness.prefix.join("sentinel").exists());
+    assert_eq!(
+        std::fs::read_to_string(harness.prefix.join(".xmlsec-source-commit"))
+            .expect("successful validation must write the source marker"),
+        "5fdd47dc35753438bdc38b6e96c1a3805c67a483\n"
     );
 }

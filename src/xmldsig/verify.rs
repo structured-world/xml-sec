@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::c14n::canonicalize;
-use crate::hard_limits::{STORED_PRE_DIGEST_BYTE_CEILING, XML_DOCUMENT_NODE_CEILING};
+use crate::hard_limits::{CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING, XML_DOCUMENT_NODE_CEILING};
 
 use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
 use super::parse::{
@@ -297,9 +297,10 @@ impl<'a> VerifyContext<'a> {
     /// Store pre-digest buffers for diagnostics.
     ///
     /// Retained reference buffers and canonicalized `<SignedInfo>` share a
-    /// non-configurable 32 MiB safety ceiling. Verification returns
-    /// [`ReferenceProcessingError::PreDigestDataTooLarge`] rather than retaining
-    /// more diagnostic data.
+    /// non-configurable 32 MiB safety ceiling. Canonicalized `<SignedInfo>` is
+    /// charged even when diagnostic retention is disabled because signature
+    /// verification always materializes it. Verification returns
+    /// [`ReferenceProcessingError::CanonicalizedDataTooLarge`] on overflow.
     pub fn store_pre_digest(mut self, enabled: bool) -> Self {
         self.store_pre_digest = enabled;
         self
@@ -458,12 +459,12 @@ pub fn process_reference(
     store_pre_digest: bool,
 ) -> Result<ReferenceResult, ReferenceProcessingError> {
     let execution_budget = TransformExecutionBudget::default();
-    let pre_digest_budget = PreDigestRetentionBudget::default();
+    let canonicalized_data_budget = CanonicalizedDataBudget::default();
     let execution = ReferenceExecutionContext {
         store_pre_digest,
         transform_options: TransformOptions::default(),
         transform_budget: &execution_budget,
-        pre_digest_budget: &pre_digest_budget,
+        canonicalized_data_budget: &canonicalized_data_budget,
     };
     process_reference_with_options(
         reference,
@@ -520,28 +521,28 @@ struct ReferenceExecutionContext<'a> {
     store_pre_digest: bool,
     transform_options: TransformOptions,
     transform_budget: &'a TransformExecutionBudget,
-    pre_digest_budget: &'a PreDigestRetentionBudget,
+    canonicalized_data_budget: &'a CanonicalizedDataBudget,
 }
 
-struct PreDigestRetentionBudget {
+struct CanonicalizedDataBudget {
     remaining: Cell<usize>,
     max_bytes: usize,
 }
 
-impl Default for PreDigestRetentionBudget {
+impl Default for CanonicalizedDataBudget {
     fn default() -> Self {
         Self {
-            remaining: Cell::new(STORED_PRE_DIGEST_BYTE_CEILING),
-            max_bytes: STORED_PRE_DIGEST_BYTE_CEILING,
+            remaining: Cell::new(CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING),
+            max_bytes: CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING,
         }
     }
 }
 
-impl PreDigestRetentionBudget {
+impl CanonicalizedDataBudget {
     fn charge(&self, bytes: usize) -> Result<(), ReferenceProcessingError> {
         let Some(remaining) = self.remaining.get().checked_sub(bytes) else {
             self.remaining.set(0);
-            return Err(ReferenceProcessingError::PreDigestDataTooLarge {
+            return Err(ReferenceProcessingError::CanonicalizedDataTooLarge {
                 max_bytes: self.max_bytes,
             });
         };
@@ -614,7 +615,9 @@ fn process_reference_with_options(
     };
 
     let pre_digest_data = if execution.store_pre_digest {
-        execution.pre_digest_budget.charge(pre_digest_bytes.len())?;
+        execution
+            .canonicalized_data_budget
+            .charge(pre_digest_bytes.len())?;
         Some(pre_digest_bytes)
     } else {
         None
@@ -648,12 +651,12 @@ pub fn process_all_references(
     store_pre_digest: bool,
 ) -> Result<ReferencesResult, ReferenceProcessingError> {
     let execution_budget = TransformExecutionBudget::default();
-    let pre_digest_budget = PreDigestRetentionBudget::default();
+    let canonicalized_data_budget = CanonicalizedDataBudget::default();
     let execution = ReferenceExecutionContext {
         store_pre_digest,
         transform_options: TransformOptions::default(),
         transform_budget: &execution_budget,
-        pre_digest_budget: &pre_digest_budget,
+        canonicalized_data_budget: &canonicalized_data_budget,
     };
     process_all_references_with_options(references, resolver, signature_node, &execution)
 }
@@ -711,10 +714,10 @@ pub enum ReferenceProcessingError {
     #[error("transform failed: {0}")]
     Transform(#[source] super::types::TransformError),
 
-    /// Diagnostic pre-digest buffers would exceed their signature-wide cap.
-    #[error("stored pre-digest data exceeds signature-wide maximum of {max_bytes} bytes")]
-    PreDigestDataTooLarge {
-        /// Maximum bytes retained across all reference diagnostics.
+    /// Canonicalized signature data would exceed its signature-wide cap.
+    #[error("canonicalized signature data exceeds signature-wide maximum of {max_bytes} bytes")]
+    CanonicalizedDataTooLarge {
+        /// Maximum bytes consumed by canonicalized SignedInfo and retained diagnostics.
         max_bytes: usize,
     },
 }
@@ -965,12 +968,12 @@ fn verify_signature_with_context(
         RetrievalMaterialization::default()
     };
     let execution_budget = TransformExecutionBudget::default();
-    let pre_digest_budget = PreDigestRetentionBudget::default();
+    let canonicalized_data_budget = CanonicalizedDataBudget::default();
     let execution = ReferenceExecutionContext {
         store_pre_digest: ctx.store_pre_digest,
         transform_options: ctx.transform_options,
         transform_budget: &execution_budget,
-        pre_digest_budget: &pre_digest_budget,
+        canonicalized_data_budget: &canonicalized_data_budget,
     };
     let references = process_all_references_with_options(
         &signed_info.references,
@@ -1000,9 +1003,7 @@ fn verify_signature_with_context(
         &signed_info.c14n_method,
         &mut canonical_signed_info,
     )?;
-    if ctx.store_pre_digest {
-        pre_digest_budget.charge(canonical_signed_info.len())?;
-    }
+    canonicalized_data_budget.charge(canonical_signed_info.len())?;
 
     let signature_value = decode_signature_value(signature_children.signature_value_node)?;
     if signed_info.signature_method == SignatureAlgorithm::HmacSha1 {
@@ -1053,11 +1054,17 @@ fn verify_signature_with_context(
     let manifest_references = if ctx.process_manifests {
         let signed_info_reference_nodes =
             collect_authenticated_signed_info_reference_nodes(&signed_info.references, &resolver);
+        let remaining_reference_capacity = MAX_REFERENCES_PER_SIGNATURE
+            .checked_sub(signed_info.references.len())
+            .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignedInfo exceeds the per-signature Reference limit",
+            })?;
         process_manifest_references(
             signature_node,
             &resolver,
             ctx,
             &signed_info_reference_nodes,
+            remaining_reference_capacity,
             &execution,
             &mut xpath_parse_budget,
         )?
@@ -1281,12 +1288,14 @@ fn process_manifest_references(
     resolver: &UriReferenceResolver<'_>,
     ctx: &VerifyContext<'_>,
     signed_info_reference_nodes: &HashSet<NodeId>,
+    remaining_reference_capacity: usize,
     execution: &ReferenceExecutionContext<'_>,
     xpath_parse_budget: &mut XPathSignatureParseBudget,
 ) -> Result<Vec<ReferenceResult>, SignatureVerificationPipelineError> {
     let parsed = parse_manifest_references(
         signature_node,
         signed_info_reference_nodes,
+        remaining_reference_capacity,
         xpath_parse_budget,
     )?;
     let manifest_references = parsed.references;
@@ -1377,6 +1386,7 @@ fn manifest_reference_invalid_result(
 fn parse_manifest_references(
     signature_node: Node<'_, '_>,
     signed_info_reference_nodes: &HashSet<NodeId>,
+    remaining_reference_capacity: usize,
     xpath_parse_budget: &mut XPathSignatureParseBudget,
 ) -> Result<ParsedManifestReferences, SignatureVerificationPipelineError> {
     let mut references = Vec::new();
@@ -1425,7 +1435,7 @@ fn parse_manifest_references(
                         reason: "Manifest must contain only ds:Reference element children",
                     });
                 }
-                if references.len() + invalid.len() == MAX_REFERENCES_PER_SIGNATURE {
+                if references.len() + invalid.len() >= remaining_reference_capacity {
                     return Err(SignatureVerificationPipelineError::InvalidStructure {
                         reason: "signed Manifests exceed the per-signature Reference limit",
                     });
@@ -2956,11 +2966,45 @@ mod tests {
         let error = match parse_manifest_references(
             signature,
             &authenticated,
+            MAX_REFERENCES_PER_SIGNATURE,
             &mut XPathSignatureParseBudget::default(),
         ) {
             Ok(_) => panic!("unsupported references must consume the same aggregate limit"),
             Err(error) => error,
         };
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "signed Manifests exceed the per-signature Reference limit"
+            }
+        ));
+    }
+
+    #[test]
+    fn manifest_reference_limit_includes_signed_info_references() {
+        // The per-signature ceiling is shared by core and authenticated
+        // Manifest references; enabling Manifest processing must not reset it.
+        let xml = signature_with_manifest_xml(true);
+        let reference_start = xml
+            .find(r##"<ds:Reference URI="#manifest">"##)
+            .expect("fixture SignedInfo must reference the Manifest");
+        let reference_end = xml[reference_start..]
+            .find("</ds:Reference>")
+            .map(|offset| reference_start + offset + "</ds:Reference>".len())
+            .expect("fixture SignedInfo Reference must be closed");
+        let repeated = xml[reference_start..reference_end].repeat(MAX_REFERENCES_PER_SIGNATURE);
+        let xml = format!(
+            "{}{repeated}{}",
+            &xml[..reference_start],
+            &xml[reference_end..]
+        );
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .process_manifests(true)
+            .verify(&xml)
+            .expect_err("one Manifest Reference must exceed the exhausted signature-wide limit");
+
         assert!(matches!(
             error,
             SignatureVerificationPipelineError::InvalidStructure {
@@ -3739,12 +3783,12 @@ mod tests {
         let resources = HashMap::from([("urn:repeated".to_owned(), payload)]);
         let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
         let transform_budget = TransformExecutionBudget::default();
-        let pre_digest_budget = PreDigestRetentionBudget::with_limit(32);
+        let canonicalized_data_budget = CanonicalizedDataBudget::with_limit(32);
         let execution = ReferenceExecutionContext {
             store_pre_digest: true,
             transform_options: TransformOptions::default(),
             transform_budget: &transform_budget,
-            pre_digest_budget: &pre_digest_budget,
+            canonicalized_data_budget: &canonicalized_data_budget,
         };
 
         let error = process_all_references_with_options(
@@ -3758,7 +3802,29 @@ mod tests {
         );
         assert!(matches!(
             error,
-            ReferenceProcessingError::PreDigestDataTooLarge { max_bytes: 32 }
+            ReferenceProcessingError::CanonicalizedDataTooLarge { max_bytes: 32 }
+        ));
+    }
+
+    #[test]
+    fn canonical_signed_info_is_bounded_without_diagnostic_retention() {
+        // SignedInfo is always materialized for crypto verification, so its
+        // canonical bytes must consume the ceiling even under default options.
+        let xml = signature_with_target_reference("AQ==");
+        let marker = "<ds:SignatureMethod";
+        let padding = " ".repeat(CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING + 1);
+        let xml = xml.replacen(marker, &format!("{padding}{marker}"), 1);
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .verify(&xml)
+            .expect_err("canonicalized SignedInfo must remain bounded by default");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Reference(
+                ReferenceProcessingError::CanonicalizedDataTooLarge { .. }
+            )
         ));
     }
 
@@ -4081,12 +4147,12 @@ mod tests {
             make_reference("", vec![transform], DigestAlgorithm::Sha256, digest),
         ];
         let budget = TransformExecutionBudget::with_xpath_limit(12);
-        let pre_digest_budget = PreDigestRetentionBudget::default();
+        let canonicalized_data_budget = CanonicalizedDataBudget::default();
         let execution = ReferenceExecutionContext {
             store_pre_digest: false,
             transform_options: TransformOptions::default(),
             transform_budget: &budget,
-            pre_digest_budget: &pre_digest_budget,
+            canonicalized_data_budget: &canonicalized_data_budget,
         };
 
         let error = process_all_references_with_options(
@@ -4119,12 +4185,12 @@ mod tests {
             make_reference("#selected", vec![], DigestAlgorithm::Sha256, digest),
         ];
         let budget = TransformExecutionBudget::with_node_set_materialization_limit(30);
-        let pre_digest_budget = PreDigestRetentionBudget::default();
+        let canonicalized_data_budget = CanonicalizedDataBudget::default();
         let execution = ReferenceExecutionContext {
             store_pre_digest: false,
             transform_options: TransformOptions::default(),
             transform_budget: &budget,
-            pre_digest_budget: &pre_digest_budget,
+            canonicalized_data_budget: &canonicalized_data_budget,
         };
 
         let error = process_all_references_with_options(

@@ -90,15 +90,28 @@ if [[ -e "$prefix" ]]; then
 fi
 mv "$staged_prefix" "$prefix"
 promoted_install=true
-printf '%s\n' "$XMLSEC1_COMMIT" > "$marker"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  DYLD_LIBRARY_PATH="$prefix/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
-    "$prefix/bin/xmlsec1" --version
+  version_output="$(
+    DYLD_LIBRARY_PATH="$prefix/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
+      "$prefix/bin/xmlsec1" --version
+  )"
 else
-  LD_LIBRARY_PATH="$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-    "$prefix/bin/xmlsec1" --version
+  version_output="$(
+    LD_LIBRARY_PATH="$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+      "$prefix/bin/xmlsec1" --version
+  )"
 fi
+version_program=""
+version_number=""
+read -r version_program version_number _ <<< "$version_output" || true
+if [[ "$version_program" != "xmlsec1" || "$version_number" != "$XMLSEC1_VERSION" ]]; then
+  printf 'xmlsec1 version mismatch: expected xmlsec1 %s, got %s\n' \
+    "$XMLSEC1_VERSION" "${version_output:-<empty output>}" >&2
+  exit 1
+fi
+printf '%s\n' "$version_output"
+printf '%s\n' "$XMLSEC1_COMMIT" > "$marker"
 
 rm -rf "$previous_install"
 previous_install_staged=false

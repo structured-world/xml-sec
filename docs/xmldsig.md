@@ -57,10 +57,11 @@ never performs network or filesystem I/O. Individual resources are limited to 8 
 complete map to 32 MiB. External key retrieval has an independent policy boundary: callers must
 also opt in with `VerifyContext::allowed_retrieval_method_uri_types`. Allowing external signed
 payloads never implicitly allows external key material. `RetrievalMethod` currently accepts
-untransformed external `rawX509Certificate` data and the Merlin same-document `X509Data` XPath
-selection. Relative external `Reference` and `RetrievalMethod` URIs are resolved against the
-owning element's effective `xml:base` using RFC 3986 before lookup, so resource-map keys must use
-that resolved URI. Other retrieval transform chains fail closed instead of being ignored.
+untransformed external `rawX509Certificate` data, untransformed direct same-document `X509Data`,
+and the Merlin same-document `X509Data` XPath selection. Relative external `Reference` and
+`RetrievalMethod` URIs are resolved against the owning element's effective `xml:base` using RFC
+3986 before lookup, so resource-map keys must use that resolved URI. Other retrieval transform
+chains fail closed instead of being ignored.
 
 Internal DTD declarations are disabled by default and require
 `VerifyContext::allow_internal_dtd(true)`. The policy applies consistently to the signed document

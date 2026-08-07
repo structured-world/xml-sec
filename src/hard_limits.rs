@@ -6,5 +6,5 @@
 /// Maximum XML nodes allocated while parsing one verification or transform document.
 pub(crate) const XML_DOCUMENT_NODE_CEILING: u32 = 100_000;
 
-/// Maximum bytes retained across one verification result's diagnostic buffers.
-pub(crate) const STORED_PRE_DIGEST_BYTE_CEILING: usize = 32 * 1024 * 1024;
+/// Maximum canonicalized SignedInfo plus retained diagnostics for one signature.
+pub(crate) const CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING: usize = 32 * 1024 * 1024;
