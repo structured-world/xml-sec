@@ -23,13 +23,16 @@ use super::digest::compute_digest;
 use super::digest::{DigestAlgorithm, constant_time_eq};
 #[cfg(test)]
 use super::parse::MAX_REFERENCES_PER_SIGNATURE;
+#[cfg(test)]
+use super::parse::parse_key_info;
 use super::parse::{
     KeyInfo, MAX_X509_DATA_TOTAL_BINARY_LEN, MAX_X509_DECODED_BINARY_LEN, ParseError, Reference,
     RetrievalMethodTransforms, SignatureAlgorithm, XMLDSIG_NS,
 };
 use super::parse::{
-    parse_key_info, parse_reference_with_xpath_budget, parse_signed_info_with_xpath_budget,
-    parse_x509_certificate, parse_x509_data_dispatch_with_budget, reference_digest_method,
+    parse_key_info_with_provider, parse_reference_with_xpath_budget,
+    parse_signed_info_with_xpath_budget, parse_x509_certificate,
+    parse_x509_data_dispatch_with_budget_and_provider, reference_digest_method,
 };
 use super::signature::{
     SignatureVerificationError, verify_dsa_signature_spki, verify_ecdsa_signature_pem,
@@ -91,6 +94,21 @@ pub trait KeyResolver {
         _policy: &crate::policy::VerificationPolicy,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
         self.resolve(key_info, algorithm)
+    }
+
+    /// Resolve under both the operation policy and cryptographic provider.
+    ///
+    /// Resolvers that evaluate cryptographic key metadata, such as
+    /// `X509Digest`, must override this hook. The default keeps existing
+    /// policy-aware custom resolvers source-compatible.
+    fn resolve_with_policy_and_provider<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+        _provider: &dyn crate::provider::CryptoProvider,
+    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+        self.resolve_with_policy(key_info, algorithm, policy)
     }
 
     /// Return `true` when this resolver consumes document `<KeyInfo>` material.
@@ -970,7 +988,7 @@ fn verify_signature_with_context(
     let mut key_info = if should_parse_key_info {
         signature_children
             .key_info_node
-            .map(parse_key_info)
+            .map(|node| parse_key_info_with_provider(node, ctx.provider))
             .transpose()
             .map_err(SignatureVerificationPipelineError::ParseKeyInfo)?
     } else {
@@ -1056,6 +1074,7 @@ fn verify_signature_with_context(
             &resolver,
             ctx.external_resources,
             ctx.policy.retrieval_uri_types,
+            ctx.provider,
         )?
     } else {
         RetrievalMaterialization::default()
@@ -1205,6 +1224,7 @@ fn materialize_retrieval_methods(
     resolver: &UriReferenceResolver<'_>,
     external_resources: Option<&HashMap<String, Vec<u8>>>,
     allowed_uri_types: UriTypeSet,
+    provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
     let retrieval_count = key_info
         .sources
@@ -1327,8 +1347,12 @@ fn materialize_retrieval_methods(
                     });
                 }
             };
-            let data = parse_x509_data_dispatch_with_budget(node, &mut total_binary_len)
-                .map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
+            let data = parse_x509_data_dispatch_with_budget_and_provider(
+                node,
+                &mut total_binary_len,
+                provider,
+            )
+            .map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
             materialized.push(super::parse::KeyInfoSource::X509Data(data));
         } else {
             materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
@@ -1683,7 +1707,12 @@ fn resolve_verifying_key<'k>(
         return Ok(Some(ResolvedVerifyingKey::Borrowed(key)));
     }
     if let Some(resolver) = ctx.key_resolver {
-        let resolved = resolver.resolve_with_policy(key_info, algorithm, &ctx.policy)?;
+        let resolved = resolver.resolve_with_policy_and_provider(
+            key_info,
+            algorithm,
+            &ctx.policy,
+            ctx.provider,
+        )?;
         return Ok(resolved.map(ResolvedVerifyingKey::Owned));
     }
     Ok(None)
@@ -3357,6 +3386,7 @@ mod tests {
                     &resolver,
                     None,
                     UriTypeSet::SAME_DOCUMENT,
+                    crate::provider::default_provider(),
                 )
                 .expect("XPath filter must produce one X509Data-rooted node-set");
                 assert!(matches!(
@@ -3388,6 +3418,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             None,
             UriTypeSet::SAME_DOCUMENT,
+            crate::provider::default_provider(),
         )
         .expect("a direct X509Data target needs no transform");
         assert!(matches!(
@@ -3427,6 +3458,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             Some(&resources),
             UriTypeSet::ALL,
+            crate::provider::default_provider(),
         )
         .expect("RetrievalMethod should resolve against inherited xml:base");
 
@@ -3457,6 +3489,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             None,
             UriTypeSet::SAME_DOCUMENT,
+            crate::provider::default_provider(),
         )
         .expect_err("a wrapper target requires an explicit selection transform");
         assert!(matches!(
@@ -3487,6 +3520,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             None,
             UriTypeSet::SAME_DOCUMENT,
+            crate::provider::default_provider(),
         )
         .expect_err("filter output without an X509Data root must be rejected");
         assert!(matches!(
@@ -3516,6 +3550,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             None,
             UriTypeSet::SAME_DOCUMENT,
+            crate::provider::default_provider(),
         )
         .expect_err("multiple transformed X509Data roots must be rejected");
         assert!(matches!(
@@ -3549,6 +3584,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             None,
             UriTypeSet::SAME_DOCUMENT,
+            crate::provider::default_provider(),
         )
         .unwrap();
         assert!(matches!(
@@ -3586,6 +3622,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             Some(&resources),
             UriTypeSet::ALL,
+            crate::provider::default_provider(),
         )
         .expect_err("retrieval count must be bounded before materialization");
         assert!(matches!(
@@ -3622,6 +3659,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             Some(&resources),
             UriTypeSet::ALL,
+            crate::provider::default_provider(),
         )
         .unwrap();
         assert!(matches!(
@@ -3655,6 +3693,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             Some(&resources),
             UriTypeSet::ALL,
+            crate::provider::default_provider(),
         )
         .expect_err("empty URI must retain same-document semantics");
         assert!(matches!(

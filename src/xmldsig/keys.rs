@@ -226,7 +226,8 @@ impl DefaultKeyResolver {
         info: &X509DataInfo,
         algorithm: SignatureAlgorithm,
         trust: &crate::policy::KeyTrustPolicy,
-    ) -> Result<Option<VerificationKey>, KeyResolutionError> {
+        provider: &dyn crate::provider::CryptoProvider,
+    ) -> Result<Option<VerificationKey>, DsigError> {
         let certificate_der = if let Some(&signing_index) = info.certificate_chain.first() {
             let certificate_der = info
                 .certificates
@@ -238,7 +239,7 @@ impl DefaultKeyResolver {
             }
             certificate_der
         } else {
-            let Some(selected) = self.resolve_configured_x509(info, trust)? else {
+            let Some(selected) = self.resolve_configured_x509(info, trust, provider)? else {
                 return Ok(None);
             };
             selected
@@ -252,7 +253,7 @@ impl DefaultKeyResolver {
         let (rest, certificate) = X509Certificate::from_der(&certificate_der)
             .map_err(|_| KeyResolutionError::InvalidCertificate)?;
         if !rest.is_empty() {
-            return Err(KeyResolutionError::InvalidCertificate);
+            return Err(KeyResolutionError::InvalidCertificate.into());
         }
         let public_key_bytes = certificate.public_key().raw.to_vec();
         validate_spki_algorithm(&public_key_bytes, algorithm)?;
@@ -369,7 +370,8 @@ impl DefaultKeyResolver {
         &self,
         info: &X509DataInfo,
         trust: &crate::policy::KeyTrustPolicy,
-    ) -> Result<Option<X509DataInfo>, KeyResolutionError> {
+        provider: &dyn crate::provider::CryptoProvider,
+    ) -> Result<Option<X509DataInfo>, DsigError> {
         if !x509_data_has_lookup_identifiers(info) {
             return Ok(None);
         }
@@ -405,13 +407,9 @@ impl DefaultKeyResolver {
             }
             let parsed = parse_x509_certificate(certificate_der)
                 .map_err(|_| KeyResolutionError::InvalidCertificate)?;
-            let is_match = x509_certificate_matches_any_selector(info, &parsed, certificate_der)
-                .map_err(|error| match error {
-                    ParseError::UnsupportedAlgorithm { uri } => {
-                        KeyResolutionError::UnsupportedDigestAlgorithm(uri)
-                    }
-                    _ => KeyResolutionError::InvalidCertificate,
-                })?;
+            let is_match =
+                x509_certificate_matches_any_selector(info, &parsed, certificate_der, provider)
+                    .map_err(map_x509_selector_error)?;
             if is_match {
                 matches.push((available.certificates.len(), parsed.clone()));
             }
@@ -430,19 +428,18 @@ impl DefaultKeyResolver {
             parsed_certificates: matches.iter().map(|(_, parsed)| parsed.clone()).collect(),
             ..X509DataInfo::default()
         };
-        if !x509_selector_categories_match_chain(&X509DataInfo {
-            subject_names: info.subject_names.clone(),
-            issuer_serials: info.issuer_serials.clone(),
-            skis: info.skis.clone(),
-            digests: info.digests.clone(),
-            ..matched_chain
-        })
-        .map_err(|error| match error {
-            ParseError::UnsupportedAlgorithm { uri } => {
-                KeyResolutionError::UnsupportedDigestAlgorithm(uri)
-            }
-            _ => KeyResolutionError::InvalidCertificate,
-        })? {
+        if !x509_selector_categories_match_chain(
+            &X509DataInfo {
+                subject_names: info.subject_names.clone(),
+                issuer_serials: info.issuer_serials.clone(),
+                skis: info.skis.clone(),
+                digests: info.digests.clone(),
+                ..matched_chain
+            },
+            provider,
+        )
+        .map_err(map_x509_selector_error)?
+        {
             return Ok(None);
         }
 
@@ -461,7 +458,7 @@ impl DefaultKeyResolver {
                     .collect::<Vec<_>>();
                 match leaves.as_slice() {
                     [(index, _)] => *index,
-                    _ => return Err(KeyResolutionError::AmbiguousCertificate),
+                    _ => return Err(KeyResolutionError::AmbiguousCertificate.into()),
                 }
             }
         };
@@ -538,14 +535,18 @@ impl DefaultKeyResolver {
         key_info: Option<&KeyInfo>,
         algorithm: SignatureAlgorithm,
         trust: &crate::policy::KeyTrustPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+        trust.validate()?;
         let Some(key_info) = key_info else {
             return Ok(None);
         };
         let mut deferred_key_value_error = None;
         for source in &key_info.sources {
             let resolved = match source {
-                KeyInfoSource::X509Data(info) => self.resolve_x509(info, algorithm, trust)?,
+                KeyInfoSource::X509Data(info) => {
+                    self.resolve_x509(info, algorithm, trust, provider)?
+                }
                 KeyInfoSource::DerEncodedKeyValue(public_key_bytes) => {
                     validate_spki_algorithm(public_key_bytes, algorithm)?;
                     Some(VerificationKey {
@@ -596,7 +597,12 @@ impl KeyResolver for DefaultKeyResolver {
         key_info: Option<&KeyInfo>,
         algorithm: SignatureAlgorithm,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
-        self.resolve_with_trust(key_info, algorithm, &self.config.trust)
+        self.resolve_with_trust(
+            key_info,
+            algorithm,
+            &self.config.trust,
+            crate::provider::default_provider(),
+        )
     }
 
     fn resolve_with_policy<'a>(
@@ -604,6 +610,21 @@ impl KeyResolver for DefaultKeyResolver {
         key_info: Option<&KeyInfo>,
         algorithm: SignatureAlgorithm,
         policy: &crate::policy::VerificationPolicy,
+    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+        self.resolve_with_policy_and_provider(
+            key_info,
+            algorithm,
+            policy,
+            crate::provider::default_provider(),
+        )
+    }
+
+    fn resolve_with_policy_and_provider<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
         // Resolver defaults and operation policy compose fail-closed. X.509
         // validation requirements can only become stricter, while the legacy
@@ -627,11 +648,21 @@ impl KeyResolver for DefaultKeyResolver {
                 .verification_time
                 .or(self.config.trust.verification_time),
         };
-        self.resolve_with_trust(key_info, algorithm, &trust)
+        self.resolve_with_trust(key_info, algorithm, &trust, provider)
     }
 
     fn consumes_document_key_info(&self) -> bool {
         true
+    }
+}
+
+fn map_x509_selector_error(error: ParseError) -> DsigError {
+    match error {
+        ParseError::Provider(error) => DsigError::Provider(error),
+        ParseError::UnsupportedAlgorithm { uri } => {
+            KeyResolutionError::UnsupportedDigestAlgorithm(uri).into()
+        }
+        _ => KeyResolutionError::InvalidCertificate.into(),
     }
 }
 
@@ -747,10 +778,125 @@ fn validate_spki_algorithm(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use base64::{Engine, engine::general_purpose::STANDARD};
     use rsa::{pkcs8::DecodePublicKey, traits::PublicKeyParts};
 
     use super::*;
+
+    struct RejectSecondSha512Provider {
+        sha512_calls: AtomicUsize,
+    }
+
+    impl crate::provider::CryptoProvider for RejectSecondSha512Provider {
+        fn name(&self) -> &'static str {
+            "reject-second-sha512"
+        }
+
+        fn supports(&self, query: crate::provider::CapabilityQuery<'_>) -> bool {
+            crate::provider::default_provider().supports(query)
+        }
+
+        fn fill_random(&self, output: &mut [u8]) -> Result<(), crate::provider::ProviderError> {
+            crate::provider::default_provider().fill_random(output)
+        }
+
+        fn digest(
+            &self,
+            algorithm: super::super::DigestAlgorithm,
+            data: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            if algorithm == super::super::DigestAlgorithm::Sha512
+                && self.sha512_calls.fetch_add(1, Ordering::Relaxed) > 0
+            {
+                return Err(crate::provider::ProviderError::Unsupported {
+                    operation: crate::provider::ProviderOperation::Digest,
+                    algorithm: Some(algorithm.uri().to_owned()),
+                });
+            }
+            crate::provider::default_provider().digest(algorithm, data)
+        }
+
+        fn sign(
+            &self,
+            key: &dyn super::super::SigningKey,
+            algorithm: SignatureAlgorithm,
+            data: &[u8],
+        ) -> Result<Vec<u8>, super::super::SigningKeyError> {
+            crate::provider::default_provider().sign(key, algorithm, data)
+        }
+
+        fn verify(
+            &self,
+            key: &dyn VerifyingKey,
+            algorithm: SignatureAlgorithm,
+            data: &[u8],
+            signature: &[u8],
+        ) -> Result<bool, DsigError> {
+            crate::provider::default_provider().verify(key, algorithm, data, signature)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn encrypt_data(
+            &self,
+            algorithm: crate::xmlenc::DataEncryptionAlgorithm,
+            key: &[u8],
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::default_provider().encrypt_data(algorithm, key, plaintext)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn decrypt_data(
+            &self,
+            algorithm: crate::xmlenc::DataEncryptionAlgorithm,
+            key: &[u8],
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::default_provider().decrypt_data(algorithm, key, ciphertext)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn wrap_key(
+            &self,
+            algorithm: crate::xmlenc::KeyWrapAlgorithm,
+            kek: &[u8],
+            key: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::default_provider().wrap_key(algorithm, kek, key)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn unwrap_key(
+            &self,
+            algorithm: crate::xmlenc::KeyWrapAlgorithm,
+            kek: &[u8],
+            wrapped: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::default_provider().unwrap_key(algorithm, kek, wrapped)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn transport_key(
+            &self,
+            key: &rsa::RsaPublicKey,
+            parameters: &crate::xmlenc::RsaOaepParameters,
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::default_provider().transport_key(key, parameters, plaintext)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn recover_key(
+            &self,
+            key: &rsa::RsaPrivateKey,
+            parameters: &crate::xmlenc::RsaOaepParameters,
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::default_provider().recover_key(key, parameters, ciphertext)
+        }
+    }
 
     fn chain_policy() -> crate::policy::KeyTrustPolicy {
         crate::policy::KeyTrustPolicy {
@@ -891,6 +1037,40 @@ mod tests {
         assert!(!config.trust.check_crls);
         assert_eq!(config.trust.verification_time, None);
         assert_eq!(config.trust.max_x509_chain_depth, 9);
+    }
+
+    #[test]
+    fn resolver_rejects_zero_composed_x509_resource_limits() {
+        // Resolver-local defaults tighten the operation snapshot after the
+        // context validates it, so the composed trust policy needs its own gate.
+        for trust in [
+            crate::policy::KeyTrustPolicy {
+                verify_x509_chains: true,
+                max_x509_chain_depth: 0,
+                ..crate::policy::KeyTrustPolicy::default()
+            },
+            crate::policy::KeyTrustPolicy {
+                verify_x509_chains: true,
+                max_x509_candidate_paths: 0,
+                ..crate::policy::KeyTrustPolicy::default()
+            },
+        ] {
+            let certificate = certificate_der(RSA_4096_CERTIFICATE);
+            let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+                trusted_certs: vec![certificate],
+                trust,
+                ..KeyResolverConfig::default()
+            });
+            let error = super::super::VerifyContext::new()
+                .key_resolver(&resolver)
+                .verify(&x509_signature_with_leaf_subject())
+                .expect_err("zero composed X.509 limits must fail as policy errors");
+
+            assert!(matches!(
+                error,
+                DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit { actual: 0, .. })
+            ));
+        }
     }
 
     #[test]
@@ -1397,6 +1577,86 @@ mod tests {
     }
 
     #[test]
+    fn self_issued_rollover_continues_to_same_name_trusted_signer() {
+        // Subject/issuer name equality does not prove self-signing: rollover
+        // certificates may be issued by a distinct same-name trust anchor.
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("rollover authority", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        let rollover_params = generated_certificate_params("rollover authority", true);
+        let rollover_key =
+            rcgen::KeyPair::generate().expect("rollover key generation should succeed");
+        let rollover_certificate = rollover_params
+            .signed_by(&rollover_key, &root)
+            .expect("root should sign the same-name rollover certificate");
+        let rollover_issuer = rcgen::Issuer::from_params(&rollover_params, &rollover_key);
+        let leaf = generated_certificate_params("rollover leaf", false)
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &rollover_issuer,
+            )
+            .expect("rollover key should sign the leaf");
+        let leaf_metadata =
+            parse_x509_certificate(leaf.der()).expect("generated leaf metadata should parse");
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                subject_names: vec![leaf_metadata.subject_dn],
+                ..X509DataInfo::default()
+            })],
+        };
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![root.der().to_vec()],
+            lookup_certs: vec![leaf.der().to_vec(), rollover_certificate.der().to_vec()],
+            trust: chain_policy(),
+            ..KeyResolverConfig::default()
+        });
+
+        let resolved = resolver
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .expect("same-name rollover path must reach its configured signer");
+
+        assert!(resolved.is_some());
+    }
+
+    #[test]
+    fn x509_candidate_limit_counts_generated_partial_paths() {
+        // A narrow DFS frontier can still generate unbounded partial paths over
+        // time, so the resource limit must account for every generated state.
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("candidate root", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        let intermediate = rcgen::CertifiedIssuer::signed_by(
+            generated_certificate_params("candidate intermediate", true),
+            rcgen::KeyPair::generate().expect("intermediate key generation should succeed"),
+            &root,
+        )
+        .expect("root should sign the intermediate");
+        let leaf = generated_certificate_params("candidate leaf", false)
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &intermediate,
+            )
+            .expect("intermediate should sign the leaf");
+        let info = x509_info(
+            vec![
+                root.der().to_vec(),
+                intermediate.der().to_vec(),
+                leaf.der().to_vec(),
+            ],
+            2,
+        );
+
+        assert!(matches!(
+            build_x509_certificate_paths_to_trusted_prefix(&info, 2, 1, 9, 2),
+            Err(X509ChainBuildError::AmbiguousIssuer)
+        ));
+    }
+
+    #[test]
     fn selector_resolved_leaf_disambiguates_same_subject_issuers_by_signature() {
         // Certificate renewal may leave multiple configured intermediates with
         // the same subject DN. The leaf signature, not pool order, identifies
@@ -1661,6 +1921,39 @@ mod tests {
     }
 
     #[test]
+    fn x509_digest_selector_uses_operation_provider() {
+        // The SHA-512 selector is distinct from the SHA-256 reference digest,
+        // so only provider-aware key selection can surface this rejection.
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![certificate_der(RSA_4096_CERTIFICATE)],
+            trusted_certs: vec![
+                certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
+                certificate_der(include_str!("../../tests/fixtures/keys/cacert.pem")),
+            ],
+            ..KeyResolverConfig::default()
+        });
+        let provider = RejectSecondSha512Provider {
+            sha512_calls: AtomicUsize::new(0),
+        };
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .provider(&provider)
+            .verify(X509_DIGEST_SIGNATURE)
+            .expect_err("X509Digest selection must use the operation provider");
+
+        assert!(
+            matches!(
+                error,
+                DsigError::Provider(crate::provider::ProviderError::Unsupported {
+                    operation: crate::provider::ProviderOperation::Digest,
+                    algorithm: Some(ref uri),
+                }) if uri == super::super::DigestAlgorithm::Sha512.uri()
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
     fn resolves_named_key_end_to_end() {
         // KeyName lookup must preserve the same cryptographic result as embedded X509Data.
         let xml = replace_key_info(
@@ -1748,6 +2041,40 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn embedded_x509_digest_selection_uses_operation_provider() {
+        // Embedded certificate selection happens while KeyInfo is parsed, so
+        // that parser path must retain the verification operation's provider.
+        let certificate = certificate_der(RSA_4096_CERTIFICATE);
+        let digest =
+            super::super::compute_digest(super::super::DigestAlgorithm::Sha512, &certificate);
+        let xml = format!(
+            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data><X509Certificate>{}</X509Certificate><X509Digest xmlns=\"http://www.w3.org/2009/xmldsig11#\" Algorithm=\"{}\">{}</X509Digest></X509Data></KeyInfo>",
+            STANDARD.encode(&certificate),
+            super::super::DigestAlgorithm::Sha512.uri(),
+            STANDARD.encode(digest),
+        );
+        let document = roxmltree::Document::parse(&xml).expect("generated KeyInfo must be XML");
+        let provider = RejectSecondSha512Provider {
+            sha512_calls: AtomicUsize::new(1),
+        };
+
+        let error =
+            super::super::parse::parse_key_info_with_provider(document.root_element(), &provider)
+                .expect_err("embedded X509Digest selection must use the operation provider");
+
+        assert!(
+            matches!(
+                error,
+                ParseError::Provider(crate::provider::ProviderError::Unsupported {
+                    operation: crate::provider::ProviderOperation::Digest,
+                    algorithm: Some(ref uri),
+                }) if uri == super::super::DigestAlgorithm::Sha512.uri()
+            ),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

@@ -259,30 +259,80 @@ impl CryptoProvider for RustCryptoProvider {
 
     fn supports(&self, query: CapabilityQuery<'_>) -> bool {
         match query.operation {
-            ProviderOperation::Digest => query.algorithm.is_none_or(|algorithm| {
-                matches!(
-                    algorithm,
-                    "http://www.w3.org/2000/09/xmldsig#sha1"
-                        | "http://www.w3.org/2001/04/xmlenc#sha256"
-                        | "http://www.w3.org/2001/04/xmldsig-more#sha384"
-                        | "http://www.w3.org/2001/04/xmlenc#sha512"
-                )
-            }),
-            ProviderOperation::Sign => query.algorithm.is_none_or(is_supported_signing_uri),
-            ProviderOperation::Verify => query.algorithm.is_none_or(is_supported_signature_uri),
+            ProviderOperation::Digest => {
+                #[cfg(feature = "xmldsig")]
+                {
+                    query.algorithm.is_none_or(|algorithm| {
+                        matches!(
+                            algorithm,
+                            "http://www.w3.org/2000/09/xmldsig#sha1"
+                                | "http://www.w3.org/2001/04/xmlenc#sha256"
+                                | "http://www.w3.org/2001/04/xmldsig-more#sha384"
+                                | "http://www.w3.org/2001/04/xmlenc#sha512"
+                        )
+                    })
+                }
+                #[cfg(not(feature = "xmldsig"))]
+                {
+                    false
+                }
+            }
+            ProviderOperation::Sign => {
+                #[cfg(feature = "xmldsig")]
+                {
+                    query.algorithm.is_none_or(is_supported_signing_uri)
+                }
+                #[cfg(not(feature = "xmldsig"))]
+                {
+                    false
+                }
+            }
+            ProviderOperation::Verify => {
+                #[cfg(feature = "xmldsig")]
+                {
+                    query.algorithm.is_none_or(is_supported_signature_uri)
+                }
+                #[cfg(not(feature = "xmldsig"))]
+                {
+                    false
+                }
+            }
             ProviderOperation::Encrypt | ProviderOperation::Decrypt => {
-                query.algorithm.is_none_or(is_supported_data_encryption_uri)
+                #[cfg(feature = "xmlenc")]
+                {
+                    query.algorithm.is_none_or(is_supported_data_encryption_uri)
+                }
+                #[cfg(not(feature = "xmlenc"))]
+                {
+                    false
+                }
             }
             ProviderOperation::KeyWrap | ProviderOperation::KeyUnwrap => {
-                query.algorithm.is_none_or(is_supported_key_wrap_uri)
+                #[cfg(feature = "xmlenc")]
+                {
+                    query.algorithm.is_none_or(is_supported_key_wrap_uri)
+                }
+                #[cfg(not(feature = "xmlenc"))]
+                {
+                    false
+                }
             }
-            ProviderOperation::KeyTransport => query.algorithm.is_none_or(|algorithm| {
-                matches!(
-                    algorithm,
-                    "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"
-                        | "http://www.w3.org/2009/xmlenc11#rsa-oaep"
-                )
-            }),
+            ProviderOperation::KeyTransport => {
+                #[cfg(feature = "xmlenc")]
+                {
+                    query.algorithm.is_none_or(|algorithm| {
+                        matches!(
+                            algorithm,
+                            "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"
+                                | "http://www.w3.org/2009/xmlenc11#rsa-oaep"
+                        )
+                    })
+                }
+                #[cfg(not(feature = "xmlenc"))]
+                {
+                    false
+                }
+            }
             ProviderOperation::Random => true,
             ProviderOperation::KeyAgreement | ProviderOperation::Kdf => false,
         }
@@ -418,6 +468,7 @@ impl RustCryptoProvider {
     }
 }
 
+#[cfg(feature = "xmldsig")]
 fn is_supported_signature_uri(algorithm: &str) -> bool {
     matches!(
         algorithm,
@@ -432,6 +483,7 @@ fn is_supported_signature_uri(algorithm: &str) -> bool {
     )
 }
 
+#[cfg(feature = "xmldsig")]
 fn is_supported_signing_uri(algorithm: &str) -> bool {
     matches!(
         algorithm,
@@ -443,6 +495,7 @@ fn is_supported_signing_uri(algorithm: &str) -> bool {
     )
 }
 
+#[cfg(feature = "xmlenc")]
 fn is_supported_data_encryption_uri(algorithm: &str) -> bool {
     matches!(
         algorithm,
@@ -453,6 +506,7 @@ fn is_supported_data_encryption_uri(algorithm: &str) -> bool {
     )
 }
 
+#[cfg(feature = "xmlenc")]
 fn is_supported_key_wrap_uri(algorithm: &str) -> bool {
     matches!(
         algorithm,
@@ -989,6 +1043,41 @@ mod tests {
             operation: ProviderOperation::Verify,
             algorithm: Some("urn:unsupported:signature"),
         }));
+    }
+
+    #[cfg(not(feature = "xmlenc"))]
+    #[test]
+    fn capability_query_hides_xmlenc_operations_when_feature_is_disabled() {
+        // Capability discovery is a runtime API over the current build, so it
+        // must not advertise methods removed from CryptoProvider by cfg.
+        for operation in [
+            ProviderOperation::Encrypt,
+            ProviderOperation::Decrypt,
+            ProviderOperation::KeyWrap,
+            ProviderOperation::KeyUnwrap,
+            ProviderOperation::KeyTransport,
+        ] {
+            assert!(!RUST_CRYPTO_PROVIDER.supports(CapabilityQuery {
+                operation,
+                algorithm: None,
+            }));
+        }
+    }
+
+    #[cfg(not(feature = "xmldsig"))]
+    #[test]
+    fn capability_query_hides_xmldsig_operations_when_feature_is_disabled() {
+        // Digest/sign/verify methods do not exist in an xmlenc-only provider.
+        for operation in [
+            ProviderOperation::Digest,
+            ProviderOperation::Sign,
+            ProviderOperation::Verify,
+        ] {
+            assert!(!RUST_CRYPTO_PROVIDER.supports(CapabilityQuery {
+                operation,
+                algorithm: None,
+            }));
+        }
     }
 
     #[cfg(feature = "xmldsig")]

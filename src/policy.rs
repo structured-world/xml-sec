@@ -177,7 +177,7 @@ pub struct KeyTrustPolicy {
     pub verify_x509_chains: bool,
     /// Maximum validated path depth.
     pub max_x509_chain_depth: usize,
-    /// Maximum signature-valid candidate paths considered before validation.
+    /// Maximum complete or partial signature-valid path states generated.
     pub max_x509_candidate_paths: usize,
     /// Permit legacy RSA-SHA1 verification after key resolution.
     pub allow_legacy_rsa_sha1: bool,
@@ -203,7 +203,7 @@ impl Default for KeyTrustPolicy {
 
 #[cfg(feature = "xmldsig")]
 impl KeyTrustPolicy {
-    fn validate(&self) -> Result<(), PolicyViolation> {
+    pub(crate) fn validate(&self) -> Result<(), PolicyViolation> {
         ResourcePolicy::within("X.509 chain depth", self.max_x509_chain_depth, 9)?;
         ResourcePolicy::within("X.509 candidate paths", self.max_x509_candidate_paths, 64)
     }

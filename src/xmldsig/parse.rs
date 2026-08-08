@@ -25,7 +25,9 @@ use x509_parser::prelude::FromDer;
 use x509_parser::public_key::PublicKey;
 use x509_parser::x509::X509Name;
 
-use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
+#[cfg(test)]
+use super::digest::compute_digest;
+use super::digest::{DigestAlgorithm, compute_digest_with_provider, constant_time_eq};
 use super::transforms::{self, Transform};
 use super::whitespace::{
     XmlBase64NormalizeLimitedError, is_xml_whitespace_only, normalize_xml_base64_text,
@@ -321,6 +323,10 @@ pub enum X509PublicKeyInfo {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParseError {
+    /// The selected cryptographic provider could not evaluate parsed key metadata.
+    #[error("cryptographic provider error: {0}")]
+    Provider(#[from] crate::provider::ProviderError),
+
     /// Missing required element.
     #[error("missing required element: <{element}>")]
     MissingElement {
@@ -607,6 +613,13 @@ fn reference_transforms_and_digest_method<'a, 'input>(
 /// rejected fail-closed.
 /// `<X509Data>` may still be empty or contain only non-XMLDSig extension children.
 pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
+    parse_key_info_with_provider(key_info_node, crate::provider::default_provider())
+}
+
+pub(crate) fn parse_key_info_with_provider(
+    key_info_node: Node,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<KeyInfo, ParseError> {
     verify_ds_element(key_info_node, "KeyInfo")?;
     ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
 
@@ -630,7 +643,11 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
                 sources.push(KeyInfoSource::KeyValue(key_value));
             }
             (Some(XMLDSIG_NS), "X509Data") => {
-                let x509 = parse_x509_data_dispatch_with_budget(child, &mut x509_total_binary_len)?;
+                let x509 = parse_x509_data_dispatch_with_budget_and_provider(
+                    child,
+                    &mut x509_total_binary_len,
+                    provider,
+                )?;
                 sources.push(KeyInfoSource::X509Data(x509));
             }
             (Some(XMLDSIG_NS), "RetrievalMethod") => {
@@ -1082,9 +1099,10 @@ fn decode_crypto_binary(
     Ok(value)
 }
 
-pub(crate) fn parse_x509_data_dispatch_with_budget(
+pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
     node: Node,
     total_binary_len: &mut usize,
+    provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<X509DataInfo, ParseError> {
     verify_ds_element(node, "X509Data")?;
     ensure_no_non_whitespace_text(node, "X509Data")?;
@@ -1147,16 +1165,19 @@ pub(crate) fn parse_x509_data_dispatch_with_budget(
         }
     }
 
-    info.certificate_chain = build_x509_certificate_chain(&info)?;
+    info.certificate_chain = build_x509_certificate_chain(&info, provider)?;
     Ok(info)
 }
 
-fn build_x509_certificate_chain(info: &X509DataInfo) -> Result<Vec<usize>, ParseError> {
+fn build_x509_certificate_chain(
+    info: &X509DataInfo,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<Vec<usize>, ParseError> {
     if info.parsed_certificates.is_empty() {
         return Ok(Vec::new());
     }
 
-    let signing_idx = select_x509_signing_certificate(info)?;
+    let signing_idx = select_x509_signing_certificate(info, provider)?;
     build_x509_certificate_chain_from(info, signing_idx).map_err(ParseError::from)
 }
 
@@ -1270,9 +1291,13 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
     {
         return Err(X509ChainBuildError::InconsistentMetadata);
     }
+    if max_candidate_paths == 0 {
+        return Err(X509ChainBuildError::AmbiguousIssuer);
+    }
 
     let mut pending = vec![vec![signing_idx]];
     let mut completed = Vec::new();
+    let mut generated_paths = 1usize;
     let mut depth_exceeded = false;
     let mut issuer_cache = vec![None; info.parsed_certificates.len()];
     while let Some(path) = pending.pop() {
@@ -1281,9 +1306,6 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
             .expect("candidate path starts with signing certificate index");
         if current_idx < trusted_prefix_len {
             completed.push(path);
-            if completed.len() > max_candidate_paths {
-                return Err(X509ChainBuildError::AmbiguousIssuer);
-            }
             continue;
         }
         if path.len() == max_depth {
@@ -1292,9 +1314,6 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
         }
 
         let current = &info.parsed_certificates[current_idx];
-        if distinguished_names_equal(&current.subject_dn, &current.issuer_dn) {
-            continue;
-        }
         let issuers = issuer_cache[current_idx].get_or_insert_with(|| {
             info.parsed_certificates
                 .iter()
@@ -1314,9 +1333,10 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
             .copied()
             .filter(|issuer_idx| !path.contains(issuer_idx))
             .collect::<Vec<_>>();
-        if pending.len().saturating_add(issuers.len()) > max_candidate_paths {
+        if generated_paths.saturating_add(issuers.len()) > max_candidate_paths {
             return Err(X509ChainBuildError::AmbiguousIssuer);
         }
+        generated_paths += issuers.len();
         for issuer_idx in issuers {
             let mut candidate = path.clone();
             candidate.push(issuer_idx);
@@ -1330,7 +1350,10 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
     Ok(completed)
 }
 
-fn select_x509_signing_certificate(info: &X509DataInfo) -> Result<usize, ParseError> {
+fn select_x509_signing_certificate(
+    info: &X509DataInfo,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<usize, ParseError> {
     let has_lookup_identifiers = x509_data_has_lookup_identifiers(info);
     let mut candidates = Vec::new();
     if has_lookup_identifiers {
@@ -1340,11 +1363,11 @@ fn select_x509_signing_certificate(info: &X509DataInfo) -> Result<usize, ParseEr
             .zip(&info.certificates)
             .enumerate()
         {
-            if x509_certificate_matches_any_selector(info, parsed, der)? {
+            if x509_certificate_matches_any_selector(info, parsed, der, provider)? {
                 candidates.push(idx);
             }
         }
-        if !x509_selector_categories_match_chain(info)? {
+        if !x509_selector_categories_match_chain(info, provider)? {
             return Err(ParseError::InvalidStructure(
                 "X509Data lookup identifiers do not match the embedded certificate chain".into(),
             ));
@@ -1411,6 +1434,7 @@ pub(crate) fn x509_certificate_matches_any_selector(
     info: &X509DataInfo,
     certificate: &ParsedX509Certificate,
     certificate_der: &[u8],
+    provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<bool, ParseError> {
     let subject_match = info
         .subject_names
@@ -1437,13 +1461,17 @@ pub(crate) fn x509_certificate_matches_any_selector(
                 uri: algorithm_uri.clone(),
             }
         })?;
-        digest_match |= constant_time_eq(&compute_digest(algorithm, certificate_der), expected);
+        digest_match |= constant_time_eq(
+            &compute_digest_with_provider(provider, algorithm, certificate_der)?,
+            expected,
+        );
     }
     Ok(subject_match || issuer_serial_match || ski_match || digest_match)
 }
 
 pub(crate) fn x509_selector_categories_match_chain(
     info: &X509DataInfo,
+    provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<bool, ParseError> {
     let subject_match = info.subject_names.iter().all(|subject| {
         info.parsed_certificates
@@ -1480,10 +1508,14 @@ pub(crate) fn x509_selector_categories_match_chain(
                 uri: algorithm_uri.clone(),
             }
         })?;
-        digest_match &= info
-            .certificates
-            .iter()
-            .any(|certificate| constant_time_eq(&compute_digest(algorithm, certificate), expected));
+        let mut category_match = false;
+        for certificate in &info.certificates {
+            category_match |= constant_time_eq(
+                &compute_digest_with_provider(provider, algorithm, certificate)?,
+                expected,
+            );
+        }
+        digest_match &= category_match;
     }
 
     Ok(subject_match && issuer_serial_match && ski_match && digest_match)
@@ -2813,7 +2845,10 @@ BA== </Modulus>
             ..X509DataInfo::default()
         };
 
-        assert_eq!(select_x509_signing_certificate(&info).unwrap(), 0);
+        assert_eq!(
+            select_x509_signing_certificate(&info, crate::provider::default_provider()).unwrap(),
+            0
+        );
         assert_eq!(
             build_x509_certificate_chain_from(&info, 0).unwrap(),
             vec![0, 1, 2]
@@ -3066,7 +3101,8 @@ BA== </Modulus>
             ..X509DataInfo::default()
         };
 
-        let err = build_x509_certificate_chain(&info).unwrap_err();
+        let err =
+            build_x509_certificate_chain(&info, crate::provider::default_provider()).unwrap_err();
         assert!(
             matches!(err, ParseError::InvalidStructure(message) if message.contains("maximum depth"))
         );

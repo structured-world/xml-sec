@@ -38,6 +38,11 @@ randomness behind the provider boundary. Custom `SigningKey` implementations who
 randomness must implement `SigningKey::sign_with_provider`; deterministic and externally managed
 keys can use the default implementation.
 
+`VerifyContext::provider` covers every verification-time cryptographic operation, including
+reference digests, signature verification, and `X509Digest` selector evaluation performed by
+`DefaultKeyResolver`. Custom resolvers that evaluate cryptographic key metadata should override
+`KeyResolver::resolve_with_policy_and_provider`; source-only resolvers can retain the default hook.
+
 ## Verification Policy
 
 For production verification, configure `KeyResolverConfig::lookup_certs` with untrusted
@@ -48,6 +53,10 @@ a trusted anchor. A trusted certificate selected directly remains an anchor, whi
 certificates provide key material and do not become trusted merely because they appear in
 `<KeyInfo>`. Exact DER duplicates across configured pools are evaluated once; when the same
 certificate is present in both pools, its explicit trusted classification is retained.
+Configured chain depth and candidate-path limits are validated after resolver defaults compose with
+the operation policy. Candidate-path accounting includes every generated partial path, and
+self-issued rollover certificates continue toward a distinct same-name issuer when its signature
+validates; neither condition can bypass the configured work bounds or trust anchor requirement.
 
 `VerifyResult::status` reports core validation: `Valid` means the cryptographic signature and
 every `<SignedInfo>` reference succeeded. `Invalid(reason)` means core validation completed but
