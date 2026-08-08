@@ -385,6 +385,38 @@ fn signing_policy_covers_implicit_and_signed_info_canonicalization() {
 }
 
 #[test]
+fn signing_internal_dtd_policy_reaches_builder_and_mutation_reparses() {
+    // The parser opt-in is operation-wide: source validation, digest mutation,
+    // SignedInfo canonicalization, and final mutation must agree on DTD policy.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    let xml = "<!DOCTYPE root [<!ENTITY value 'signed'>]><root><payload ID=\"payload\">&value;</payload></root>";
+
+    assert!(matches!(
+        SignContext::new(&private_key).sign_with_builder(xml, &builder),
+        Err(SigningError::XmlMutation(
+            xml_sec::xmldsig::mutation::XmlMutationError::XmlParse(roxmltree::Error::DtdDetected)
+        ))
+    ));
+
+    let mut policy = SigningPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let signed = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_with_builder(xml, &builder)
+        .expect("internal-DTD opt-in must reach every signing parse and reparse");
+    assert!(!signed.contains("<DigestValue></DigestValue>"));
+    assert!(!signed.contains("<SignatureValue></SignatureValue>"));
+}
+
+#[test]
 fn fills_only_signed_info_reference_digest_values() {
     // Manifests can contain their own DigestValue elements inside the same
     // Signature. Signing the outer SignedInfo must not treat those as template

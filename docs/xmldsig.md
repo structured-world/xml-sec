@@ -27,6 +27,10 @@ executes, including the default C14N 1.0 coercion when a reference transform cha
 set and the declared canonicalization method for `<SignedInfo>`. Reference output and
 `<SignedInfo>` serialization consume one bounded canonicalization budget, so policy rejection
 occurs during rendering rather than after an oversized buffer has already been allocated.
+The same immutable policy controls every signing parse and mutation reparse, including source
+validation in `sign_with_builder`, digest filling, `SignedInfo` parsing, signature filling, and
+optional `KeyInfo` filling. An internal-DTD opt-in and XML node ceiling therefore cannot be lost
+between stages.
 
 ## Verification Policy
 
@@ -36,7 +40,8 @@ certificates that selector-only `X509Data` may address or use as path intermedia
 enabled, a selected lookup certificate may chain through other lookup certificates but must end at
 a trusted anchor. A trusted certificate selected directly remains an anchor, while embedded
 certificates provide key material and do not become trusted merely because they appear in
-`<KeyInfo>`.
+`<KeyInfo>`. Exact DER duplicates across configured pools are evaluated once; when the same
+certificate is present in both pools, its explicit trusted classification is retained.
 
 `VerifyResult::status` reports core validation: `Valid` means the cryptographic signature and
 every `<SignedInfo>` reference succeeded. `Invalid(reason)` means core validation completed but
@@ -74,7 +79,8 @@ chains fail closed instead of being ignored.
 Internal DTD declarations are disabled by default and require
 `VerifyContext::allow_internal_dtd(true)`. The policy applies consistently to the signed document
 and caller-supplied detached XML parsed by node-set transforms. Direct transform callers can set
-the same policy with `TransformOptions::allow_internal_dtd(true)`. External entity resolution
+the same policy with `TransformOptions::allow_internal_dtd(true)`. Signing uses the corresponding
+`SigningPolicy::xml.allow_internal_dtd` decision across its complete pipeline. External entity resolution
 remains disabled. XSLT is intentionally not executed because transforms operate on
 attacker-controlled documents; an authenticated Manifest reference using unsupported XSLT is
 reported as an invalid per-reference result without changing core `SignedInfo` validity.

@@ -6,13 +6,16 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use roxmltree::{Document, ParsingOptions};
 use rsa::RsaPrivateKey;
 
-use super::parse::parse_encrypted_data_node;
+use super::parse::{parse_encrypted_data_node_with_limit, parse_encrypted_data_with_policy};
 use super::types::XMLENC_NS;
 use super::{
     DataEncryptionAlgorithm, DecryptedContent, EncryptedData, EncryptedDataType, EncryptedKey,
     KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm, RsaOaepParameters, XmlEncError,
-    has_single_element_with_boundary_trivia, parse_encrypted_data,
+    has_single_element_with_boundary_trivia,
 };
+
+#[cfg(test)]
+use super::parse_encrypted_data;
 
 /// Supplies a content-encryption key for parsed XMLEnc data.
 pub trait DecryptionKeyResolver {
@@ -68,13 +71,17 @@ impl<'a> DecryptContext<'a> {
 
     /// Parse and decrypt a standalone `EncryptedData` XML fragment.
     pub fn decrypt(&self, xml: &str) -> Result<DecryptedContent, XmlEncError> {
-        let encrypted = parse_encrypted_data(xml)?;
+        let encrypted = parse_encrypted_data_with_policy(xml, &self.policy)?;
         self.decrypt_data(&encrypted)
     }
 
     /// Decrypt an already parsed `EncryptedData` value.
     pub fn decrypt_data(&self, encrypted: &EncryptedData) -> Result<DecryptedContent, XmlEncError> {
         self.policy.resources.validate()?;
+        validate_recipient_count(
+            encrypted.encrypted_keys.len(),
+            self.policy.resources.max_encryption_recipients,
+        )?;
         let algorithm = DataEncryptionAlgorithm::from_uri(&encrypted.encryption_method.algorithm)?;
         if self
             .policy
@@ -392,11 +399,9 @@ fn decrypt_document_with_context(
     encrypted_data_id: Option<&str>,
     context: &DecryptContext<'_>,
 ) -> Result<String, XmlEncError> {
-    let parsing_options = || ParsingOptions {
-        allow_dtd: context.policy.xml.allow_internal_dtd,
-        entity_resolver: None,
-        ..ParsingOptions::default()
-    };
+    context.policy.resources.validate()?;
+    validate_encryption_document_len(xml.len(), &context.policy)?;
+    let parsing_options = || decryption_parsing_options(&context.policy);
     let document = Document::parse_with_options(xml, parsing_options())?;
     let mut matches = document.descendants().filter(|node| {
         node.has_tag_name((XMLENC_NS, "EncryptedData"))
@@ -408,21 +413,26 @@ fn decrypt_document_with_context(
     }
 
     let range = selected.range();
-    let encrypted = parse_encrypted_data_node(selected)?;
+    let encrypted = parse_encrypted_data_node_with_limit(
+        selected,
+        context.policy.resources.max_encryption_recipients,
+    )?;
     let DecryptedContent::Xml(plaintext) = context.decrypt_data(&encrypted)? else {
         return Err(XmlEncError::ReplacementRequiresXml);
     };
 
+    let output_len = xml.len() - range.len() + plaintext.len();
+    validate_encryption_document_len(output_len, &context.policy)?;
     validate_plaintext_fragment(
         xml,
         range.start,
         range.end,
         &plaintext,
         encrypted.encrypted_type.as_ref(),
-        context.policy.xml.allow_internal_dtd,
+        &context.policy,
     )?;
 
-    let mut output = String::with_capacity(xml.len() - range.len() + plaintext.len());
+    let mut output = String::with_capacity(output_len);
     output.push_str(&xml[..range.start]);
     output.push_str(&plaintext);
     output.push_str(&xml[range.end..]);
@@ -436,7 +446,7 @@ fn validate_plaintext_fragment(
     replacement_end: usize,
     plaintext: &str,
     encrypted_type: Option<&EncryptedDataType>,
-    allow_dtd: bool,
+    policy: &crate::policy::DecryptionPolicy,
 ) -> Result<(), XmlEncError> {
     const WRAPPER_NS: &str = "urn:structured-world:xml-sec:decrypted-fragment";
     const WRAPPER_START: &str = "<xmlsec-internal:fragment xmlns:xmlsec-internal=\"urn:structured-world:xml-sec:decrypted-fragment\">";
@@ -456,14 +466,7 @@ fn validate_plaintext_fragment(
     wrapped.push_str(WRAPPER_END);
     wrapped.push_str(&xml[replacement_end..]);
 
-    let document = Document::parse_with_options(
-        &wrapped,
-        ParsingOptions {
-            allow_dtd,
-            entity_resolver: None,
-            ..ParsingOptions::default()
-        },
-    )?;
+    let document = Document::parse_with_options(&wrapped, decryption_parsing_options(policy))?;
     let wrapper = document
         .descendants()
         .find(|node| {
@@ -486,6 +489,42 @@ fn validate_plaintext_fragment(
         return Err(XmlEncError::InvalidStructure(
             "Element plaintext must contain exactly one element".into(),
         ));
+    }
+    Ok(())
+}
+
+fn decryption_parsing_options<'a>(policy: &crate::policy::DecryptionPolicy) -> ParsingOptions<'a> {
+    ParsingOptions {
+        allow_dtd: policy.xml.allow_internal_dtd,
+        nodes_limit: u32::try_from(policy.resources.max_xml_nodes)
+            .unwrap_or(crate::hard_limits::XML_DOCUMENT_NODE_CEILING),
+        entity_resolver: None,
+    }
+}
+
+fn validate_encryption_document_len(
+    actual: usize,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<(), XmlEncError> {
+    if actual > policy.resources.max_encryption_document_bytes {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "encryption document",
+            maximum: policy.resources.max_encryption_document_bytes,
+            actual,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_recipient_count(actual: usize, maximum: usize) -> Result<(), XmlEncError> {
+    if actual > maximum {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "encryption recipients",
+            maximum,
+            actual,
+        }
+        .into());
     }
     Ok(())
 }
@@ -788,6 +827,58 @@ mod tests {
             decrypt(&xml, &resolver).expect("second recipient key must be tried"),
             DecryptedContent::Bytes(plaintext.as_bytes().to_vec())
         );
+    }
+
+    #[test]
+    fn decryption_policy_bounds_recipients_before_key_resolution() {
+        // Both XML parsing and caller-constructed typed input must reject an
+        // oversized recipient set before any resolver can inspect candidates.
+        let key = [0x29_u8; 16];
+        let encrypted = encrypted_gcm_element("", "bounded recipients", None, true, &key);
+        let recipient_key = |recipient: &str| {
+            format!(
+                "<xenc:EncryptedKey Recipient=\"{recipient}\"><xenc:EncryptionMethod Algorithm=\"urn:test:key\"/><xenc:CipherData><xenc:CipherValue>YQ==</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey>"
+            )
+        };
+        let key_info = format!(
+            "<ds:KeyInfo xmlns:ds=\"{}\">{}{}</ds:KeyInfo>",
+            crate::xmlenc::types::XMLDSIG_NS,
+            recipient_key("alice"),
+            recipient_key("bob")
+        );
+        let xml = encrypted.replacen(
+            "<xenc:CipherData>",
+            &format!("{key_info}<xenc:CipherData>"),
+            1,
+        );
+        let parsed = parse_encrypted_data(&xml).expect("default parser accepts two recipients");
+        let policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_encryption_recipients: 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        let resolver = SymmetricKeyDecryptor::new(key);
+        let context = DecryptContext::new(&resolver).policy(policy);
+
+        for error in [
+            context
+                .decrypt(&xml)
+                .expect_err("XML recipient collection must be bounded"),
+            context
+                .decrypt_data(&parsed)
+                .expect_err("typed recipient collection must be bounded"),
+        ] {
+            assert!(matches!(
+                error,
+                XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "encryption recipients",
+                    maximum: 1,
+                    actual: 2,
+                })
+            ));
+        }
     }
 
     #[test]
@@ -1422,6 +1513,52 @@ mod tests {
                 "{type_uri} plaintext must not escape its replacement boundary"
             );
         }
+    }
+
+    #[test]
+    fn document_decryption_applies_byte_and_node_policy_before_parsing() {
+        // Caller-owned XML must meet the compiled resource policy before the
+        // initial DOM allocation; reparsed output uses the same node ceiling.
+        let key = [0x38_u8; 16];
+        let encrypted = encrypted_gcm_element(
+            "http://www.w3.org/2001/04/xmlenc#Content",
+            "plaintext",
+            None,
+            false,
+            &key,
+        );
+        let document = format!("<root xmlns:xenc=\"{XMLENC_NS}\"><a/>{encrypted}</root>");
+        let byte_policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_encryption_document_bytes: document.len() - 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        assert!(matches!(
+            DecryptContext::new(&SymmetricKeyDecryptor::new(key))
+                .policy(byte_policy)
+                .decrypt_document(&document, None),
+            Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "encryption document",
+                maximum,
+                actual,
+            })) if maximum == document.len() - 1 && actual == document.len()
+        ));
+
+        let node_policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_nodes: 3,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        assert!(matches!(
+            DecryptContext::new(&SymmetricKeyDecryptor::new(key))
+                .policy(node_policy)
+                .decrypt_document(&document, None),
+            Err(XmlEncError::XmlParse(error)) if error.to_string() == "nodes limit reached"
+        ));
     }
 
     #[test]

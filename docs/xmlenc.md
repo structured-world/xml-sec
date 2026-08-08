@@ -70,7 +70,8 @@ fn example(encrypted_xml: &str) -> Result<(), Box<dyn std::error::Error>> {
 `PrivateKeyDecryptor` unwraps embedded RSA-OAEP `EncryptedKey` values and `KekDecryptor`
 unwraps AES-KW values. RSA PKCS#1 v1.5 transport, `CipherReference`, and unauthenticated external
 resource loading are rejected; only inline `CipherValue` is accepted. Encryption inputs and
-recipient counts are bounded before allocation.
+recipient counts are bounded before allocation. Decryption applies the same aggregate recipient
+ceiling while parsing and rechecks caller-constructed `EncryptedData` before key resolution.
 
 For multiple recipients, `DecryptContext` validates transport, wrap, digest, and MGF policy as
 each `EncryptedKey` becomes a resolver candidate. A malformed or disallowed key for another
@@ -82,7 +83,10 @@ padding removal. Invalid padding is reported only as `XmlEncError::InvalidPaddin
 provider error nor the public error exposes the final decrypted octet or derived padding length.
 
 Use `decrypt_document` to replace one typed `EncryptedData` in a complete XML string. Pass its
-`Id` when the document contains multiple encrypted regions. DTD parsing remains disabled by
+`Id` when the document contains multiple encrypted regions. The compiled decryption policy checks
+the caller-owned document byte ceiling before DOM allocation and applies its XML node ceiling to
+the initial document, replacement-boundary validation, and final output reparse. The projected
+output byte length is checked before constructing the replacement. DTD parsing remains disabled by
 default; legacy documents that need an internal DTD can opt in through
 `decrypt_document_with_options` and `DocumentDecryptionOptions`. That API never installs an
 external entity resolver.

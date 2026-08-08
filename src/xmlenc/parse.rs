@@ -1,7 +1,7 @@
 //! Strict parsing for the subset of XMLEnc needed by the decryption API.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use roxmltree::{Document, Node};
+use roxmltree::{Document, Node, ParsingOptions};
 
 use super::types::{
     CipherData, EncryptedData, EncryptedDataType, EncryptedKey, EncryptionMethod,
@@ -15,20 +15,51 @@ struct ParsedKeyInfo {
 
 /// Parse one `xenc:EncryptedData` document fragment.
 pub fn parse_encrypted_data(xml: &str) -> Result<EncryptedData, XmlEncError> {
-    let document = Document::parse(xml)?;
-    parse_encrypted_data_node(document.root_element())
+    parse_encrypted_data_with_policy(xml, &crate::policy::DecryptionPolicy::default())
 }
 
-pub(super) fn parse_encrypted_data_node(node: Node<'_, '_>) -> Result<EncryptedData, XmlEncError> {
+pub(super) fn parse_encrypted_data_with_policy(
+    xml: &str,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<EncryptedData, XmlEncError> {
+    policy.resources.validate()?;
+    if xml.len() > policy.resources.max_encryption_document_bytes {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "encryption document",
+            maximum: policy.resources.max_encryption_document_bytes,
+            actual: xml.len(),
+        }
+        .into());
+    }
+    let document = Document::parse_with_options(
+        xml,
+        ParsingOptions {
+            allow_dtd: policy.xml.allow_internal_dtd,
+            nodes_limit: u32::try_from(policy.resources.max_xml_nodes)
+                .unwrap_or(crate::hard_limits::XML_DOCUMENT_NODE_CEILING),
+            entity_resolver: None,
+        },
+    )?;
+    parse_encrypted_data_node_with_limit(
+        document.root_element(),
+        policy.resources.max_encryption_recipients,
+    )
+}
+
+pub(super) fn parse_encrypted_data_node_with_limit(
+    node: Node<'_, '_>,
+    max_encryption_recipients: usize,
+) -> Result<EncryptedData, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedData")?;
     let mut children = element_children(node);
     let encryption_method =
         parse_encryption_method(next_required(&mut children, "EncryptionMethod")?)?;
 
     let key_info = match children.peek() {
-        Some(child) if child.has_tag_name((XMLDSIG_NS, "KeyInfo")) => {
-            parse_key_info(next_required(&mut children, "KeyInfo")?)?
-        }
+        Some(child) if child.has_tag_name((XMLDSIG_NS, "KeyInfo")) => parse_key_info(
+            next_required(&mut children, "KeyInfo")?,
+            max_encryption_recipients,
+        )?,
         _ => ParsedKeyInfo {
             key_name: None,
             encrypted_keys: Vec::new(),
@@ -53,7 +84,10 @@ pub(super) fn parse_encrypted_data_node(node: Node<'_, '_>) -> Result<EncryptedD
     })
 }
 
-fn parse_key_info(node: Node<'_, '_>) -> Result<ParsedKeyInfo, XmlEncError> {
+fn parse_key_info(
+    node: Node<'_, '_>,
+    max_encryption_recipients: usize,
+) -> Result<ParsedKeyInfo, XmlEncError> {
     require_element(node, XMLDSIG_NS, "KeyInfo")?;
     let mut key_name = None;
     let mut encrypted_keys = Vec::new();
@@ -67,6 +101,14 @@ fn parse_key_info(node: Node<'_, '_>) -> Result<ParsedKeyInfo, XmlEncError> {
             }
             key_name = Some(parse_key_name(child)?);
         } else if child.has_tag_name((XMLENC_NS, "EncryptedKey")) {
+            if encrypted_keys.len() == max_encryption_recipients {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "encryption recipients",
+                    maximum: max_encryption_recipients,
+                    actual: encrypted_keys.len() + 1,
+                }
+                .into());
+            }
             encrypted_keys.push(parse_encrypted_key(child)?);
         } else if child.has_tag_name((XMLENC_NS, "AgreementMethod")) {
             // Agreement methods require a separate key-derivation trust boundary.

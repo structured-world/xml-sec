@@ -10,7 +10,7 @@ use getrandom::SysRng;
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey};
-use roxmltree::{Document, Node};
+use roxmltree::{Document, Node, ParsingOptions};
 use rsa::RsaPrivateKey;
 use rsa::pkcs1v15::Signature as RsaPkcs1v15Signature;
 use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
@@ -25,8 +25,9 @@ use crate::c14n::{canonicalize_bounded, is_output_limit_error};
 use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::DigestAlgorithm;
 use super::mutation::{
-    XmlMutationError, append_signature_to_root, fill_key_info, fill_signature_value,
-    fill_signed_info_digest_values,
+    XmlMutationError, append_signature_to_root_with_options, fill_key_info_with_options,
+    fill_signature_value_with_options, fill_signed_info_digest_values,
+    fill_signed_info_digest_values_with_options,
 };
 use super::parse::{
     MAX_REFERENCES_PER_SIGNATURE, SignatureAlgorithm, XMLDSIG_NS, parse_signed_info,
@@ -578,10 +579,15 @@ impl<'a> SignContext<'a> {
             self.provider
                 .sign(self.signing_key, algorithm, &canonical_signed_info)?;
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature_value);
-        let signed = fill_signature_value(&with_digests, &signature_b64)?;
+        let signed =
+            fill_signature_value_with_options(&with_digests, &signature_b64, Some(&self.policy))?;
         if let Some(writer) = self.key_info_writer {
             let key_info_content = writer.write_key_info(self.signing_key)?;
-            Ok(fill_key_info(&signed, &key_info_content)?)
+            Ok(fill_key_info_with_options(
+                &signed,
+                &key_info_content,
+                Some(&self.policy),
+            )?)
         } else {
             Ok(signed)
         }
@@ -593,8 +599,9 @@ impl<'a> SignContext<'a> {
         xml: &str,
         builder: &SignatureBuilder,
     ) -> Result<String, SigningError> {
+        self.policy.resources.validate()?;
         let template = builder.build_template()?;
-        let templated = append_signature_to_root(xml, &template)?;
+        let templated = append_signature_to_root_with_options(xml, &template, Some(&self.policy))?;
         self.sign_template(&templated)
     }
 }
@@ -632,7 +639,7 @@ fn compute_reference_digest_values_with_options(
     provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
-    let doc = Document::parse(xml)?;
+    let doc = parse_signing_document(xml, policy)?;
     let signature = find_signing_signature_node(&doc)?;
     let signed_info = find_required_child(signature, "SignedInfo")?;
     let references = parse_signing_references(signed_info)?;
@@ -755,7 +762,11 @@ fn fill_reference_digest_values_with_options(
     )?
     .into_iter()
     .map(|digest| digest.digest_value);
-    Ok(fill_signed_info_digest_values(xml, digest_values)?)
+    Ok(if let Some(policy) = policy {
+        fill_signed_info_digest_values_with_options(xml, digest_values, Some(policy))?
+    } else {
+        fill_signed_info_digest_values(xml, digest_values)?
+    })
 }
 
 fn canonicalize_signed_info(
@@ -763,7 +774,7 @@ fn canonicalize_signed_info(
     policy: &crate::policy::SigningPolicy,
     execution_budget: &TransformExecutionBudget,
 ) -> Result<(SignatureAlgorithm, Vec<u8>), SigningError> {
-    let doc = Document::parse(xml).map_err(SigningDigestError::XmlParse)?;
+    let doc = parse_signing_document(xml, Some(policy)).map_err(SigningDigestError::XmlParse)?;
     let signature = find_signing_signature_node(&doc).map_err(SigningError::Digest)?;
     let signed_info_node =
         find_required_child(signature, "SignedInfo").map_err(SigningError::Digest)?;
@@ -803,6 +814,24 @@ fn canonicalize_signed_info(
         }
     })?;
     Ok((signed_info.signature_method, canonical_signed_info))
+}
+
+fn parse_signing_document<'a>(
+    xml: &'a str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<Document<'a>, roxmltree::Error> {
+    let Some(policy) = policy else {
+        return Document::parse(xml);
+    };
+    Document::parse_with_options(
+        xml,
+        ParsingOptions {
+            allow_dtd: policy.xml.allow_internal_dtd,
+            nodes_limit: u32::try_from(policy.resources.max_xml_nodes)
+                .unwrap_or(crate::hard_limits::XML_DOCUMENT_NODE_CEILING),
+            entity_resolver: None,
+        },
+    )
 }
 
 fn parse_private_key_pem(private_key_pem: &str) -> Result<Vec<u8>, SigningKeyError> {

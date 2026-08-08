@@ -383,12 +383,26 @@ impl DefaultKeyResolver {
             ..X509DataInfo::default()
         };
         let mut matches = Vec::new();
-        for certificate_der in self
+        let mut trusted_prefix_len = 0usize;
+        for (trusted, certificate_der) in self
             .config
             .trusted_certs
             .iter()
-            .chain(&self.config.lookup_certs)
+            .map(|certificate| (true, certificate))
+            .chain(
+                self.config
+                    .lookup_certs
+                    .iter()
+                    .map(|certificate| (false, certificate)),
+            )
         {
+            if available
+                .certificates
+                .iter()
+                .any(|available_der| available_der == certificate_der)
+            {
+                continue;
+            }
             let parsed = parse_x509_certificate(certificate_der)
                 .map_err(|_| KeyResolutionError::InvalidCertificate)?;
             let is_match = x509_certificate_matches_any_selector(info, &parsed, certificate_der)
@@ -403,6 +417,9 @@ impl DefaultKeyResolver {
             }
             available.certificates.push(certificate_der.clone());
             available.parsed_certificates.push(parsed);
+            if trusted {
+                trusted_prefix_len += 1;
+            }
         }
 
         let matched_chain = X509DataInfo {
@@ -451,19 +468,15 @@ impl DefaultKeyResolver {
         // `available` preserves trusted certificates as a prefix. Selecting
         // one of those exact certificates is already a terminal trust
         // decision, even when the certificate is not self-signed.
-        available.certificate_chain =
-            if signing_index < self.config.trusted_certs.len() || !trust.verify_x509_chains {
-                vec![signing_index]
-            } else {
-                self.select_valid_x509_path(
-                    &mut available,
-                    signing_index,
-                    self.config.trusted_certs.len(),
-                    trust,
-                )?;
-                available.certificate_chain.clone()
-            };
-        if trust.verify_x509_chains && signing_index < self.config.trusted_certs.len() {
+        available.certificate_chain = if signing_index < trusted_prefix_len
+            || !trust.verify_x509_chains
+        {
+            vec![signing_index]
+        } else {
+            self.select_valid_x509_path(&mut available, signing_index, trusted_prefix_len, trust)?;
+            available.certificate_chain.clone()
+        };
+        if trust.verify_x509_chains && signing_index < trusted_prefix_len {
             self.verify_x509_policy(&available, trust)?;
         }
         Ok(Some(available))
@@ -1568,17 +1581,48 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_x509_selector_fails_closed() {
-        // Duplicate configured certificates must not make key selection order-dependent.
+    fn overlapping_trusted_and_lookup_certificate_preserves_trust() {
+        // One physical certificate appearing in both pools is one candidate;
+        // deduplication must retain the stronger trusted classification.
         let certificate = certificate_der(RSA_4096_CERTIFICATE);
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-            lookup_certs: vec![certificate.clone(), certificate],
+            trusted_certs: vec![certificate.clone()],
+            lookup_certs: vec![certificate],
+            ..KeyResolverConfig::default()
+        });
+        let result = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&x509_signature_with_leaf_subject())
+            .expect("trusted/lookup overlap must resolve as one trusted candidate");
+
+        assert_eq!(result.status, super::super::DsigStatus::Valid);
+    }
+
+    #[test]
+    fn distinct_x509_selector_matches_remain_ambiguous() {
+        // Deduplication is identity-based, not selector-based: two distinct
+        // certificates with the same subject remain separate candidates.
+        let certificate = || {
+            generated_certificate_params("ambiguous selector", false)
+                .self_signed(
+                    &rcgen::KeyPair::generate().expect("test key generation should succeed"),
+                )
+                .expect("test certificate should be self-signable")
+                .der()
+                .to_vec()
+        };
+        let xml = replace_unprefixed_key_info(
+            X509_DIGEST_SIGNATURE,
+            "<KeyInfo><X509Data><X509SubjectName>CN=ambiguous selector</X509SubjectName></X509Data></KeyInfo>",
+        );
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![certificate(), certificate()],
             ..KeyResolverConfig::default()
         });
         let error = super::super::VerifyContext::new()
             .key_resolver(&resolver)
-            .verify(&x509_signature_with_leaf_subject())
-            .expect_err("ambiguous X509 selector lookup must fail closed");
+            .verify(&xml)
+            .expect_err("distinct selector matches must fail closed");
 
         assert!(matches!(
             error,
