@@ -90,6 +90,10 @@ and the Merlin same-document `X509Data` XPath selection. Relative external `Refe
 `RetrievalMethod` URIs are resolved against the owning element's effective `xml:base` using RFC
 3986 before lookup, so resource-map keys must use that resolved URI. Other retrieval transform
 chains fail closed instead of being ignored.
+`VerifyContext::allowed_transforms` applies to Reference transforms and implicit C14N,
+the declared SignedInfo canonicalization method, and supported RetrievalMethod transforms.
+Allowing XPath for signed payload processing therefore also explicitly permits the bounded
+Merlin X509Data retrieval selector; omitting XPath rejects that key-retrieval path.
 
 Internal DTD declarations are disabled by default and require
 `VerifyContext::allow_internal_dtd(true)`. The policy applies consistently to the signed document

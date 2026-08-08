@@ -39,11 +39,11 @@ use super::signature::{
     verify_rsa_signature_pem,
 };
 #[cfg(test)]
-use super::transforms::{BASE64_TRANSFORM_URI, XPATH_TRANSFORM_URI};
+use super::transforms::BASE64_TRANSFORM_URI;
 use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget, TransformOptions,
-    XPathHereSemantics, XPathSignatureParseBudget, execute_transforms_with_options_and_budget,
-    transform_chain_produces_binary,
+    XPATH_TRANSFORM_URI, XPathHereSemantics, XPathSignatureParseBudget,
+    execute_transforms_with_options_and_budget, transform_chain_produces_binary,
 };
 use super::uri::{UriReferenceResolver, same_document_reference_id};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
@@ -316,16 +316,16 @@ impl<'a> VerifyContext<'a> {
         self
     }
 
-    /// Restrict allowed transform algorithms by URI.
+    /// Restrict allowed transform and canonicalization algorithms by URI.
     ///
     /// Example values:
     /// - `http://www.w3.org/2000/09/xmldsig#enveloped-signature`
     /// - `http://www.w3.org/2001/10/xml-exc-c14n#`
     ///
-    /// When a `<Reference>` has no explicit canonicalization transform, XMLDSig
-    /// applies implicit default C14N (`http://www.w3.org/TR/2001/REC-xml-c14n-20010315`).
-    /// If an allowlist is configured, include that URI as well unless all
-    /// references use explicit `Transform::C14n(...)`.
+    /// The allowlist covers explicit Reference and RetrievalMethod transforms,
+    /// the declared SignedInfo canonicalization method, and implicit default
+    /// C14N (`http://www.w3.org/TR/2001/REC-xml-c14n-20010315`) when a Reference
+    /// transform chain ends as a node set.
     pub fn allowed_transforms<I, S>(mut self, transforms: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1037,6 +1037,7 @@ fn verify_signature_with_context(
         ctx.policy.reference_uri_types,
         ctx.allowed_transform_uris(),
     )?;
+    enforce_transform_allowed(ctx.allowed_transform_uris(), signed_info.c14n_method.uri())?;
 
     if let Some(resources) = ctx.external_resources {
         let mut total = 0usize;
@@ -1074,6 +1075,7 @@ fn verify_signature_with_context(
             &resolver,
             ctx.external_resources,
             ctx.policy.retrieval_uri_types,
+            ctx.allowed_transform_uris(),
             ctx.provider,
         )?
     } else {
@@ -1224,6 +1226,7 @@ fn materialize_retrieval_methods(
     resolver: &UriReferenceResolver<'_>,
     external_resources: Option<&HashMap<String, Vec<u8>>>,
     allowed_uri_types: UriTypeSet,
+    allowed_transforms: Option<&HashSet<String>>,
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
     let retrieval_count = key_info
@@ -1339,6 +1342,7 @@ fn materialize_retrieval_methods(
                     });
                 }
                 RetrievalMethodTransforms::X509DataNodeSetFilter => {
+                    enforce_transform_allowed(allowed_transforms, XPATH_TRANSFORM_URI)?;
                     select_retrieved_x509_data_root(target)?
                 }
                 RetrievalMethodTransforms::Unsupported => {
@@ -1739,11 +1743,7 @@ fn enforce_reference_policies(
         if let Some(allowed) = allowed_transforms {
             for transform in &reference.transforms {
                 let transform_uri = transform.algorithm_uri();
-                if !allowed.contains(transform_uri) {
-                    return Err(SignatureVerificationPipelineError::DisallowedTransform {
-                        algorithm: transform_uri.to_owned(),
-                    });
-                }
+                enforce_transform_allowed(Some(allowed), transform_uri)?;
             }
 
             // External dereference has an octet-stream data type independent of
@@ -1754,12 +1754,22 @@ fn enforce_reference_policies(
                 classify_uri(uri) == UriClass::External,
                 &reference.transforms,
             );
-            if !produces_binary && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI) {
-                return Err(SignatureVerificationPipelineError::DisallowedTransform {
-                    algorithm: DEFAULT_IMPLICIT_C14N_URI.to_owned(),
-                });
+            if !produces_binary {
+                enforce_transform_allowed(Some(allowed), DEFAULT_IMPLICIT_C14N_URI)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn enforce_transform_allowed(
+    allowed_transforms: Option<&HashSet<String>>,
+    algorithm: &str,
+) -> Result<(), SignatureVerificationPipelineError> {
+    if allowed_transforms.is_some_and(|allowed| !allowed.contains(algorithm)) {
+        return Err(SignatureVerificationPipelineError::DisallowedTransform {
+            algorithm: algorithm.to_owned(),
+        });
     }
     Ok(())
 }
@@ -2596,6 +2606,56 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn verify_context_applies_transform_allowlist_to_signed_info_c14n() {
+        // Reference C14N remains allowlisted; only the distinct SignedInfo
+        // canonicalization method should trigger this policy rejection.
+        let xml = signature_with_target_reference("AQ==").replacen(
+            "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+            "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>",
+            1,
+        );
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .allowed_transforms(["http://www.w3.org/2001/10/xml-exc-c14n#"])
+            .verify(&xml)
+            .expect_err("SignedInfo C14N must obey the operation transform allowlist");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::DisallowedTransform { ref algorithm }
+                if algorithm == "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"
+        ));
+    }
+
+    #[test]
+    fn verify_context_applies_transform_allowlist_to_key_retrieval() {
+        // The reference and SignedInfo both use exclusive C14N. The only XPath
+        // operation is document-selected key retrieval and must be rejected.
+        let xml = signature_with_target_reference("AQ==")
+            .replacen(
+                "</ds:Signature>",
+                r##"<ds:KeyInfo><ds:RetrievalMethod URI="#keys" Type="http://www.w3.org/2000/09/xmldsig#X509Data"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath></ds:Transform></ds:Transforms></ds:RetrievalMethod></ds:KeyInfo></ds:Signature>"##,
+                1,
+            )
+            .replacen(
+                "</root>",
+                r#"<holder ID="keys"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder></root>"#,
+                1,
+            );
+        let error = VerifyContext::new()
+            .key_resolver(&ConsumingKeyInfoResolver)
+            .allowed_transforms(["http://www.w3.org/2001/10/xml-exc-c14n#"])
+            .verify(&xml)
+            .expect_err("RetrievalMethod XPath must obey the operation transform allowlist");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::DisallowedTransform { ref algorithm }
+                if algorithm == XPATH_TRANSFORM_URI
+        ));
+    }
+
     fn signature_with_manifest_xml(valid_manifest_digest: bool) -> String {
         signature_with_manifest_xml_with_manifest_mutation(valid_manifest_digest, |xml| xml)
     }
@@ -3386,6 +3446,7 @@ mod tests {
                     &resolver,
                     None,
                     UriTypeSet::SAME_DOCUMENT,
+                    None,
                     crate::provider::default_provider(),
                 )
                 .expect("XPath filter must produce one X509Data-rooted node-set");
@@ -3418,6 +3479,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             None,
             UriTypeSet::SAME_DOCUMENT,
+            None,
             crate::provider::default_provider(),
         )
         .expect("a direct X509Data target needs no transform");
@@ -3458,6 +3520,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             Some(&resources),
             UriTypeSet::ALL,
+            None,
             crate::provider::default_provider(),
         )
         .expect("RetrievalMethod should resolve against inherited xml:base");
@@ -3489,6 +3552,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             None,
             UriTypeSet::SAME_DOCUMENT,
+            None,
             crate::provider::default_provider(),
         )
         .expect_err("a wrapper target requires an explicit selection transform");
@@ -3520,6 +3584,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             None,
             UriTypeSet::SAME_DOCUMENT,
+            None,
             crate::provider::default_provider(),
         )
         .expect_err("filter output without an X509Data root must be rejected");
@@ -3550,6 +3615,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             None,
             UriTypeSet::SAME_DOCUMENT,
+            None,
             crate::provider::default_provider(),
         )
         .expect_err("multiple transformed X509Data roots must be rejected");
@@ -3584,6 +3650,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             None,
             UriTypeSet::SAME_DOCUMENT,
+            None,
             crate::provider::default_provider(),
         )
         .unwrap();
@@ -3622,6 +3689,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             Some(&resources),
             UriTypeSet::ALL,
+            None,
             crate::provider::default_provider(),
         )
         .expect_err("retrieval count must be bounded before materialization");
@@ -3659,6 +3727,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             Some(&resources),
             UriTypeSet::ALL,
+            None,
             crate::provider::default_provider(),
         )
         .unwrap();
@@ -3693,6 +3762,7 @@ mod tests {
             &UriReferenceResolver::new(&document),
             Some(&resources),
             UriTypeSet::ALL,
+            None,
             crate::provider::default_provider(),
         )
         .expect_err("empty URI must retain same-document semantics");

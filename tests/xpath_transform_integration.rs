@@ -63,7 +63,11 @@ fn verify(signed: &str) -> Result<xml_sec::xmldsig::VerifyResult, DsigError> {
     let resolver = DefaultKeyResolver::default();
     VerifyContext::new()
         .key_resolver(&resolver)
-        .allowed_transforms([XPATH_FILTER2_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI])
+        .allowed_transforms([
+            XPATH_FILTER2_TRANSFORM_URI,
+            DEFAULT_IMPLICIT_C14N_URI,
+            exclusive_c14n().uri(),
+        ])
         .verify(signed)
 }
 
@@ -130,7 +134,7 @@ fn filter2_transform_is_enforced_by_the_allowlist() {
     let resolver = DefaultKeyResolver::default();
     let error = VerifyContext::new()
         .key_resolver(&resolver)
-        .allowed_transforms([DEFAULT_IMPLICIT_C14N_URI])
+        .allowed_transforms([DEFAULT_IMPLICIT_C14N_URI, exclusive_c14n().uri()])
         .verify(&signed)
         .expect_err("unlisted Filter 2.0 transform must be rejected");
 
@@ -202,7 +206,11 @@ fn here_semantics_are_explicit_across_signing_and_verification() {
         .expect("standards-mode XPath document must sign");
     let standard_result = VerifyContext::new()
         .key_resolver(&resolver)
-        .allowed_transforms([XPATH_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI])
+        .allowed_transforms([
+            XPATH_TRANSFORM_URI,
+            DEFAULT_IMPLICIT_C14N_URI,
+            exclusive_c14n().uri(),
+        ])
         .verify(&standard)
         .expect("standards-mode signature must be processable");
     assert_eq!(standard_result.status, DsigStatus::Valid);

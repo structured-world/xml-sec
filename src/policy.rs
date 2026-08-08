@@ -223,7 +223,7 @@ pub struct VerificationPolicy {
     pub reference_uri_types: UriTypeSet,
     /// Allowed RetrievalMethod URI classes.
     pub retrieval_uri_types: UriTypeSet,
-    /// Allowed transform URIs; `None` accepts every implemented transform.
+    /// Allowed transform and canonicalization URIs; `None` accepts every implemented algorithm.
     pub transforms: Option<HashSet<String>>,
     /// Whether authenticated Manifest references are processed.
     pub process_manifests: bool,

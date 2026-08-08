@@ -65,7 +65,7 @@ fn base64_reference_round_trips_through_signing_and_verification() {
     let resolver = DefaultKeyResolver::default();
     let verified = VerifyContext::new()
         .key_resolver(&resolver)
-        .allowed_transforms([BASE64_TRANSFORM_URI])
+        .allowed_transforms([BASE64_TRANSFORM_URI, exclusive_c14n().uri()])
         .store_pre_digest(true)
         .verify(&signed)
         .expect("signed Base64 reference must verify");

@@ -669,7 +669,13 @@ pub(crate) fn parse_key_info_with_provider(
                         .map(|base| resolve_uri(&base, lexical_uri))
                         .unwrap_or_else(|| lexical_uri.to_owned())
                 };
-                let resource_type = child.attribute("Type").map(str::to_string);
+                let resource_type = child.attribute("Type");
+                if resource_type.is_some_and(|value| value.len() > MAX_KEY_NAME_TEXT_LEN) {
+                    return Err(ParseError::InvalidStructure(
+                        "RetrievalMethod Type exceeds maximum length".into(),
+                    ));
+                }
+                let resource_type = resource_type.map(str::to_owned);
                 let transforms = if resource_type.as_deref()
                     == Some("http://www.w3.org/2000/09/xmldsig#X509Data")
                 {
@@ -3562,6 +3568,23 @@ BA== </Modulus>
                 transforms: RetrievalMethodTransforms::X509DataNodeSetFilter,
             }] if uri == "#keys"
                 && resource_type == "http://www.w3.org/2000/09/xmldsig#X509Data"
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_oversized_retrieval_method_type() {
+        // Type is advisory, but retaining it must not allocate unbounded
+        // attacker-controlled KeyInfo metadata before resolution.
+        let oversized_type = "x".repeat(MAX_KEY_NAME_TEXT_LEN + 1);
+        let xml = format!(
+            r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><RetrievalMethod URI="#key" Type="{oversized_type}"/></KeyInfo>"##
+        );
+        let document = Document::parse(&xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(document.root_element()),
+            Err(ParseError::InvalidStructure(reason))
+                if reason == "RetrievalMethod Type exceeds maximum length"
         ));
     }
 
