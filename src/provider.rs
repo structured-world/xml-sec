@@ -71,8 +71,9 @@ pub enum ProviderInputError {
     AesCbcPlaintext,
     /// XMLEnc CBC padding length is outside the valid block range.
     ///
-    /// This variant deliberately carries no decrypted bytes: provider errors
-    /// may cross a trust boundary and must not become a padding oracle.
+    /// This variant deliberately carries no decrypted bytes or padding length.
+    /// CBC remains unauthenticated, so callers must authenticate ciphertexts
+    /// before acting on decryption results or reject CBC through operation policy.
     #[error("invalid XMLEnc CBC padding")]
     XmlEncCbcPadding,
     /// AES-GCM input does not contain a nonce and authentication tag.

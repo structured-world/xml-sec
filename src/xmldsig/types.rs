@@ -710,6 +710,10 @@ pub enum TransformError {
     #[error("XML transform input parse error: {0}")]
     XmlParse(String),
 
+    /// XML octets exceeded the operation policy's document node ceiling.
+    #[error("XML transform input exceeds the configured node limit")]
+    XmlNodeLimit,
+
     /// The Signature node passed to the enveloped transform belongs to a
     /// different `Document` than the input `NodeSet`.
     #[error("enveloped-signature transform: invalid Signature node for this document")]

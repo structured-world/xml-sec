@@ -10,7 +10,7 @@ use getrandom::SysRng;
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey};
-use roxmltree::{Document, Node, ParsingOptions};
+use roxmltree::{Document, Node};
 use rsa::RsaPrivateKey;
 use rsa::pkcs1v15::Signature as RsaPkcs1v15Signature;
 use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
@@ -544,9 +544,7 @@ impl<'a> SignContext<'a> {
     /// base64 `<SignatureValue>`.
     pub fn sign_template(&self, xml: &str) -> Result<String, SigningError> {
         self.policy.resources.validate()?;
-        let execution_budget = TransformExecutionBudget::with_c14n_limit(
-            self.policy.resources.max_canonicalized_bytes,
-        );
+        let execution_budget = TransformExecutionBudget::from_resources(&self.policy.resources);
         let transform_options = TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.xpath_here_semantics);
@@ -820,18 +818,7 @@ fn parse_signing_document<'a>(
     xml: &'a str,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<Document<'a>, roxmltree::Error> {
-    let Some(policy) = policy else {
-        return Document::parse(xml);
-    };
-    Document::parse_with_options(
-        xml,
-        ParsingOptions {
-            allow_dtd: policy.xml.allow_internal_dtd,
-            nodes_limit: u32::try_from(policy.resources.max_xml_nodes)
-                .unwrap_or(crate::hard_limits::XML_DOCUMENT_NODE_CEILING),
-            entity_resolver: None,
-        },
-    )
+    super::mutation::parse_with_options(xml, policy)
 }
 
 fn parse_private_key_pem(private_key_pem: &str) -> Result<Vec<u8>, SigningKeyError> {

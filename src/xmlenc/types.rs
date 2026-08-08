@@ -479,8 +479,8 @@ pub enum XmlEncError {
     InvalidCbcCiphertextLength(usize),
     /// XMLEnc random padding is invalid.
     ///
-    /// No decrypted padding details are exposed because they would provide a
-    /// CBC padding oracle to callers processing attacker-controlled input.
+    /// No decrypted padding details are exposed. This does not authenticate CBC
+    /// ciphertexts or make success/failure safe to expose to an attacker.
     #[error("invalid XMLEnc padding")]
     InvalidPadding,
     /// GCM authentication failed.

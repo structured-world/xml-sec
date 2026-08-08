@@ -124,7 +124,7 @@ impl EncryptedDataBuilder {
     pub fn encrypt_xml(&self, xml: &str) -> Result<EncryptionResult, XmlEncError> {
         self.policy.resources.validate()?;
         self.validate_plaintext_len(xml.len())?;
-        validate_xml_plaintext(xml, &self.encrypted_type)?;
+        validate_xml_plaintext(xml, &self.encrypted_type, &self.policy)?;
         self.encrypt_payload(xml.as_bytes(), Some(self.encrypted_type.clone()))
     }
 
@@ -142,11 +142,10 @@ impl EncryptedDataBuilder {
     ) -> Result<String, XmlEncError> {
         self.policy.resources.validate()?;
         self.validate_document_len(xml.len())?;
-        let parsing_options = ParsingOptions {
-            allow_dtd: self.policy.xml.allow_internal_dtd && options.allow_dtd,
-            entity_resolver: None,
-            ..ParsingOptions::default()
-        };
+        let parsing_options = encryption_parsing_options(
+            &self.policy,
+            self.policy.xml.allow_internal_dtd && options.allow_dtd,
+        );
         let document = Document::parse_with_options(xml, parsing_options)?;
         let selected = select_encryption_target(&document, options.element_id)?;
         let range = selected.range();
@@ -626,10 +625,12 @@ fn write_event(writer: &mut Writer<Vec<u8>>, event: Event<'_>) -> Result<(), Xml
 fn validate_xml_plaintext(
     xml: &str,
     encrypted_type: &EncryptedDataType,
+    policy: &crate::policy::EncryptionPolicy,
 ) -> Result<(), XmlEncError> {
+    let parsing_options = || encryption_parsing_options(policy, policy.xml.allow_internal_dtd);
     match encrypted_type {
         EncryptedDataType::Element => {
-            let document = Document::parse(xml)?;
+            let document = Document::parse_with_options(xml, parsing_options())?;
             if !has_single_element_with_boundary_trivia(document.root()) {
                 return Err(XmlEncError::InvalidStructure(
                     "Element plaintext must contain exactly one element".into(),
@@ -639,12 +640,24 @@ fn validate_xml_plaintext(
         }
         EncryptedDataType::Content => {
             let wrapped = format!("<xmlsec-content>{xml}</xmlsec-content>");
-            let _ = Document::parse(&wrapped)?;
+            let _ = Document::parse_with_options(&wrapped, parsing_options())?;
             Ok(())
         }
         EncryptedDataType::Other(_) => Err(XmlEncError::InvalidEncryptionConfig(
             "encrypt_xml requires Element or Content Type".into(),
         )),
+    }
+}
+
+fn encryption_parsing_options<'a>(
+    policy: &crate::policy::EncryptionPolicy,
+    allow_dtd: bool,
+) -> ParsingOptions<'a> {
+    ParsingOptions {
+        allow_dtd,
+        nodes_limit: u32::try_from(policy.resources.max_xml_nodes)
+            .unwrap_or(crate::hard_limits::XML_DOCUMENT_NODE_CEILING),
+        entity_resolver: None,
     }
 }
 
@@ -967,6 +980,34 @@ mod tests {
                 .direct_key([0_u8; 16])
                 .encrypt_document(&oversized_malformed, DocumentEncryptionOptions::default()),
             Err(XmlEncError::DocumentTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn encryption_policy_bounds_xml_nodes_at_both_parse_entry_points() {
+        // XML plaintext and whole-document encryption are separate parser paths;
+        // both must consume the same immutable operation-policy node ceiling.
+        let policy = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_nodes: 4,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let builder = || {
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy.clone())
+        };
+        let xml = "<root><a/><b/><c/><d/></root>";
+
+        assert!(matches!(
+            builder().encrypt_xml(xml),
+            Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
+        ));
+        assert!(matches!(
+            builder().encrypt_document(xml, DocumentEncryptionOptions::default()),
+            Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
         ));
     }
 

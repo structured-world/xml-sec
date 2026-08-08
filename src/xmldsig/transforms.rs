@@ -96,13 +96,26 @@ pub struct TransformOptions {
     allow_internal_dtd: bool,
 }
 
-#[derive(Default)]
 pub(crate) struct TransformExecutionBudget {
     xpath: XPathWorkBudget,
     base64: Base64WorkBudget,
     c14n: C14nOutputBudget,
     node_filter: NodeFilterWorkBudget,
     node_set_materialization: NodeSetMaterializationBudget,
+    xml_node_limit: u32,
+}
+
+impl Default for TransformExecutionBudget {
+    fn default() -> Self {
+        Self {
+            xpath: XPathWorkBudget::default(),
+            base64: Base64WorkBudget::default(),
+            c14n: C14nOutputBudget::default(),
+            node_filter: NodeFilterWorkBudget::default(),
+            node_set_materialization: NodeSetMaterializationBudget::default(),
+            xml_node_limit: XML_DOCUMENT_NODE_CEILING,
+        }
+    }
 }
 
 struct NodeFilterWorkBudget {
@@ -205,6 +218,7 @@ impl TransformExecutionBudget {
             c14n: C14nOutputBudget::default(),
             node_filter: NodeFilterWorkBudget::default(),
             node_set_materialization: NodeSetMaterializationBudget::default(),
+            xml_node_limit: XML_DOCUMENT_NODE_CEILING,
         }
     }
 
@@ -217,6 +231,7 @@ impl TransformExecutionBudget {
                 remaining: Cell::new(limit),
             },
             node_set_materialization: NodeSetMaterializationBudget::default(),
+            xml_node_limit: XML_DOCUMENT_NODE_CEILING,
         }
     }
 
@@ -227,14 +242,24 @@ impl TransformExecutionBudget {
             c14n: C14nOutputBudget::default(),
             node_filter: NodeFilterWorkBudget::default(),
             node_set_materialization: NodeSetMaterializationBudget::with_limit(limit),
+            xml_node_limit: XML_DOCUMENT_NODE_CEILING,
+        }
+    }
+
+    pub(crate) fn with_c14n_limit(max_bytes: usize) -> Self {
+        Self {
+            c14n: C14nOutputBudget::with_limit(max_bytes),
+            ..Self::default()
         }
     }
 }
 
 impl TransformExecutionBudget {
-    pub(crate) fn with_c14n_limit(max_bytes: usize) -> Self {
+    pub(crate) fn from_resources(resources: &crate::policy::ResourcePolicy) -> Self {
         Self {
-            c14n: C14nOutputBudget::with_limit(max_bytes),
+            c14n: C14nOutputBudget::with_limit(resources.max_canonicalized_bytes),
+            xml_node_limit: u32::try_from(resources.max_xml_nodes)
+                .unwrap_or(XML_DOCUMENT_NODE_CEILING),
             ..Self::default()
         }
     }
@@ -821,11 +846,14 @@ fn execute_transform_chain<'s, 'e, 'd>(
             &xml,
             roxmltree::ParsingOptions {
                 allow_dtd: context.options.internal_dtd_allowed(),
-                nodes_limit: XML_DOCUMENT_NODE_CEILING,
+                nodes_limit: context.budget.xml_node_limit,
                 entity_resolver: None,
             },
         )
-        .map_err(|error| TransformError::XmlParse(error.to_string()))?;
+        .map_err(|error| match error {
+            roxmltree::Error::NodesLimitReached => TransformError::XmlNodeLimit,
+            other => TransformError::XmlParse(other.to_string()),
+        })?;
         context.state.document_reparsed();
         let nodes = super::types::NodeSet::entire_document_with_comments_with_budget(
             &document,
@@ -1022,7 +1050,7 @@ pub(crate) fn transform_chain_produces_binary(
     initial_binary: bool,
     transforms: &[Transform],
 ) -> bool {
-    transforms.iter().fold(initial_binary, |_, transform| {
+    transforms.last().map_or(initial_binary, |transform| {
         matches!(transform, Transform::C14n(_) | Transform::Base64Decode)
     })
 }
@@ -1857,10 +1885,7 @@ mod tests {
         )
         .expect_err("external XML exceeding the node ceiling must fail during parse");
 
-        assert!(matches!(
-            error,
-            TransformError::XmlParse(message) if message == "nodes limit reached"
-        ));
+        assert!(matches!(error, TransformError::XmlNodeLimit));
     }
 
     #[test]

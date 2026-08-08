@@ -12,7 +12,7 @@ use quick_xml::{Reader, Writer};
 
 use super::parse::XMLDSIG_NS;
 
-fn parse_with_options<'a>(
+pub(super) fn parse_with_options<'a>(
     xml: &'a str,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<roxmltree::Document<'a>, roxmltree::Error> {

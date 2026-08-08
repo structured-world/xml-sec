@@ -1060,7 +1060,7 @@ fn verify_signature_with_context(
     } else {
         RetrievalMaterialization::default()
     };
-    let execution_budget = TransformExecutionBudget::default();
+    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
     let canonicalized_data_budget =
         CanonicalizedDataBudget::with_limit(ctx.policy.resources.max_canonicalized_bytes);
     let execution = ReferenceExecutionContext {
@@ -1969,6 +1969,7 @@ fn verify_with_algorithm(
 mod tests {
     use super::*;
     use crate::c14n::C14nAlgorithm;
+    use crate::xmldsig::TransformError;
     use crate::xmldsig::digest::DigestAlgorithm;
     use crate::xmldsig::parse::{Reference, parse_signed_info};
     use crate::xmldsig::transforms::Transform;
@@ -2120,6 +2121,77 @@ mod tests {
                 crate::xmldsig::TransformError::XmlParse(_)
             ))
         ));
+    }
+
+    #[test]
+    fn verification_policy_bounds_reference_canonicalization() {
+        // Reference transforms and SignedInfo canonicalization are one operation;
+        // references must not fall back to the transform hard-limit budget.
+        let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+        let xml = format!(
+            r#"<root xmlns:ds="{XMLDSIG_NS}"><payload>{}</payload><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"#,
+            "payload".repeat(16)
+        );
+        let policy = crate::policy::VerificationPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_canonicalized_bytes: 64,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .verify(&xml)
+            .expect_err("reference canonicalization must consume the policy budget");
+
+        assert!(
+            matches!(
+                error,
+                SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
+                    TransformError::C14nOutputTooLarge { max_bytes: 64 }
+                ))
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn verification_policy_bounds_detached_xml_nodes() {
+        // Caller-owned detached octets become a second XML document during a
+        // node-set transform and must inherit the same operation node ceiling.
+        let detached = format!("<payload>{}</payload>", "<n/>".repeat(32));
+        let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+        let xml = format!(
+            r#"<root xmlns:ds="{XMLDSIG_NS}"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="urn:detached-nodes"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"#
+        );
+        let resources = HashMap::from([("urn:detached-nodes".to_owned(), detached.into_bytes())]);
+        let policy = crate::policy::VerificationPolicy {
+            reference_uri_types: UriTypeSet::ALL,
+            resources: crate::policy::ResourcePolicy {
+                max_xml_nodes: 24,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .external_resources(&resources)
+            .verify(&xml)
+            .expect_err("detached XML must inherit the policy node ceiling");
+
+        assert!(
+            matches!(
+                error,
+                SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
+                    TransformError::XmlNodeLimit
+                ))
+            ),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

@@ -71,7 +71,8 @@ fn example(encrypted_xml: &str) -> Result<(), Box<dyn std::error::Error>> {
 unwraps AES-KW values. RSA PKCS#1 v1.5 transport, `CipherReference`, and unauthenticated external
 resource loading are rejected; only inline `CipherValue` is accepted. Encryption inputs and
 recipient counts are bounded before allocation. Decryption applies the same aggregate recipient
-ceiling while parsing and rechecks caller-constructed `EncryptedData` before key resolution.
+ceiling while parsing, bounds each retained identifier, algorithm URI, key name, OAEP label, and
+reference URI, and rechecks caller-constructed `EncryptedData` before key resolution.
 
 For multiple recipients, `DecryptContext` validates transport, wrap, digest, and MGF policy as
 each `EncryptedKey` becomes a resolver candidate. A malformed or disallowed key for another
@@ -81,6 +82,10 @@ symmetric key remains authoritative and does not consult unrelated embedded key 
 AES-CBC framing is bounded before decryption and the exact plaintext bound is checked again after
 padding removal. Invalid padding is reported only as `XmlEncError::InvalidPadding`; neither the
 provider error nor the public error exposes the final decrypted octet or derived padding length.
+That uniform diagnostic does not authenticate CBC or remove the success-versus-failure signal.
+Applications processing attacker-controlled ciphertext must authenticate the enclosing protocol
+before acting on plaintext, or exclude AES-CBC with `EncryptionPolicy::data_algorithms` and use
+AES-GCM.
 
 Use `decrypt_document` to replace one typed `EncryptedData` in a complete XML string. Pass its
 `Id` when the document contains multiple encrypted regions. The compiled decryption policy checks

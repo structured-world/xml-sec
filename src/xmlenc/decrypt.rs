@@ -6,7 +6,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use roxmltree::{Document, ParsingOptions};
 use rsa::RsaPrivateKey;
 
-use super::parse::{parse_encrypted_data_node_with_limit, parse_encrypted_data_with_policy};
+use super::parse::{
+    parse_encrypted_data_node_with_policy, parse_encrypted_data_with_policy,
+    validate_encrypted_data_metadata,
+};
 use super::types::XMLENC_NS;
 use super::{
     DataEncryptionAlgorithm, DecryptedContent, EncryptedData, EncryptedDataType, EncryptedKey,
@@ -78,6 +81,7 @@ impl<'a> DecryptContext<'a> {
     /// Decrypt an already parsed `EncryptedData` value.
     pub fn decrypt_data(&self, encrypted: &EncryptedData) -> Result<DecryptedContent, XmlEncError> {
         self.policy.resources.validate()?;
+        validate_encrypted_data_metadata(encrypted, &self.policy)?;
         validate_recipient_count(
             encrypted.encrypted_keys.len(),
             self.policy.resources.max_encryption_recipients,
@@ -413,10 +417,7 @@ fn decrypt_document_with_context(
     }
 
     let range = selected.range();
-    let encrypted = parse_encrypted_data_node_with_limit(
-        selected,
-        context.policy.resources.max_encryption_recipients,
-    )?;
+    let encrypted = parse_encrypted_data_node_with_policy(selected, &context.policy)?;
     let DecryptedContent::Xml(plaintext) = context.decrypt_data(&encrypted)? else {
         return Err(XmlEncError::ReplacementRequiresXml);
     };
@@ -634,7 +635,8 @@ fn validate_possible_plaintext_len(
 ) -> Result<(), XmlEncError> {
     let framing = match algorithm {
         // CBC always contains a 16-byte IV and at least one complete padded
-        // block, so this is the greatest plaintext length possible on success.
+        // block. Subtracting that minimum framing gives the greatest plaintext
+        // length possible on success and therefore a safe pre-decryption bound.
         DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => 32,
         DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => 28,
     };
@@ -1289,9 +1291,52 @@ mod tests {
     }
 
     #[test]
+    fn typed_decryption_input_cannot_bypass_metadata_policy() {
+        // Callers may construct EncryptedData directly instead of using the XML
+        // parser, so the operation boundary must enforce the same metadata cap.
+        let ciphertext = crate::provider::default_provider()
+            .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &[0_u8; 16], b"data")
+            .expect("test encryption must succeed");
+        let encrypted = EncryptedData {
+            id: Some("oversized".into()),
+            encrypted_type: None,
+            key_name: None,
+            encryption_method: super::super::EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            encrypted_keys: Vec::new(),
+            cipher_data: super::super::CipherData {
+                value: STANDARD.encode(ciphertext),
+            },
+        };
+        let policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_encryption_metadata_bytes: 8,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+
+        assert!(matches!(
+            DecryptContext::new(&SymmetricKeyDecryptor::new([0_u8; 16]))
+                .policy(policy)
+                .decrypt_data(&encrypted),
+            Err(XmlEncError::EncryptionMetadataTooLarge {
+                field: "EncryptedData Id",
+                maximum: 8,
+                actual: 9,
+            })
+        ));
+    }
+
+    #[test]
     fn cbc_padding_errors_do_not_expose_decrypted_octets() {
-        // Public decryption errors must not reveal the attacker-controlled
-        // final CBC plaintext byte used during padding validation.
+        // The error contract hides padding details, but callers still need an
+        // authenticated envelope or a policy that rejects unauthenticated CBC.
         let error = map_data_decryption_error(
             DataEncryptionAlgorithm::Aes128Cbc,
             32,
@@ -1557,7 +1602,7 @@ mod tests {
             DecryptContext::new(&SymmetricKeyDecryptor::new(key))
                 .policy(node_policy)
                 .decrypt_document(&document, None),
-            Err(XmlEncError::XmlParse(error)) if error.to_string() == "nodes limit reached"
+            Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
         ));
     }
 

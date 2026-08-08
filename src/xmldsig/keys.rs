@@ -1330,7 +1330,12 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(matches!(error, DsigError::KeyResolution(_)));
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::Chain(
+                super::super::X509ChainError::UntrustedRoot
+            ))
+        ));
     }
 
     #[test]
@@ -1588,6 +1593,7 @@ mod tests {
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             trusted_certs: vec![certificate.clone()],
             lookup_certs: vec![certificate],
+            trust: chain_policy_at(fixture_certificate_time()),
             ..KeyResolverConfig::default()
         });
         let result = super::super::VerifyContext::new()
