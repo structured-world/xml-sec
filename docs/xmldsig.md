@@ -22,6 +22,12 @@ The signing and verification contexts share the same reference-transform impleme
 interoperating with legacy libxmlsec1 `here()` behavior can explicitly select
 [`XPathHereSemantics::XmlSecLegacy`] on both contexts.
 
+`SigningPolicy::transforms` applies to every canonicalization algorithm the signing pipeline
+executes, including the default C14N 1.0 coercion when a reference transform chain ends as a node
+set and the declared canonicalization method for `<SignedInfo>`. Reference output and
+`<SignedInfo>` serialization consume one bounded canonicalization budget, so policy rejection
+occurs during rendering rather than after an oversized buffer has already been allocated.
+
 ## Verification Policy
 
 For production verification, configure `KeyResolverConfig::lookup_certs` with untrusted
@@ -45,6 +51,8 @@ that the input contained no Manifest. `VerifyContext::process_manifests(false)` 
 because Manifests were not processed; core validation failures and unsigned, unreferenced, or
 structurally excluded Manifest blocks can also produce an empty list. Callers must distinguish the
 disabled state from an enabled pass with no authenticated Manifest references.
+Manifest references obey the same per-reference transform-count ceiling and transform allowlist as
+`<SignedInfo>` references; a violation is recorded in that Manifest reference's independent status.
 
 Malformed XMLDSig structure, unsupported algorithms, disallowed reference URIs, and
 inconsistent `KeyInfo` metadata are processing errors rather than validity statuses. Treat both

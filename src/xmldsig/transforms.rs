@@ -243,6 +243,14 @@ impl TransformExecutionBudget {
         self.c14n.charge(bytes)
     }
 
+    pub(crate) fn remaining_c14n_output(&self) -> usize {
+        self.c14n.remaining()
+    }
+
+    pub(crate) fn c14n_output_limit(&self) -> usize {
+        self.c14n.max_bytes
+    }
+
     pub(crate) fn node_set_materialization(&self) -> &NodeSetMaterializationBudget {
         &self.node_set_materialization
     }
@@ -612,7 +620,7 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                 budget.c14n.remaining(),
                 &mut output,
             )
-            .map_err(map_c14n_limit_error)?;
+            .map_err(|error| map_c14n_limit_error(error, budget.c14n.max_bytes))?;
             budget.c14n.charge(output.len())?;
             Ok(TransformData::Binary(output))
         }
@@ -880,7 +888,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
             context.budget.c14n.remaining(),
             &mut output,
         )
-        .map_err(map_c14n_limit_error)?;
+        .map_err(|error| map_c14n_limit_error(error, context.budget.c14n.max_bytes))?;
         context.budget.c14n.charge(output.len())?;
         return execute_transform_chain(
             source_signature,
@@ -995,21 +1003,28 @@ fn finalize_transform_data(
                 c14n_budget.remaining(),
                 &mut output,
             )
-            .map_err(map_c14n_limit_error)?;
+            .map_err(|error| map_c14n_limit_error(error, c14n_budget.max_bytes))?;
             c14n_budget.charge(output.len())?;
             Ok(output)
         }
     }
 }
 
-fn map_c14n_limit_error(error: c14n::C14nError) -> TransformError {
+fn map_c14n_limit_error(error: c14n::C14nError, max_bytes: usize) -> TransformError {
     if c14n::is_output_limit_error(&error) {
-        TransformError::C14nOutputTooLarge {
-            max_bytes: MAX_C14N_OUTPUT_BYTES,
-        }
+        TransformError::C14nOutputTooLarge { max_bytes }
     } else {
         TransformError::C14n(error)
     }
+}
+
+pub(crate) fn transform_chain_produces_binary(
+    initial_binary: bool,
+    transforms: &[Transform],
+) -> bool {
+    transforms.iter().fold(initial_binary, |_, transform| {
+        matches!(transform, Transform::C14n(_) | Transform::Base64Decode)
+    })
 }
 
 /// Parse a `<Transforms>` element into a `Vec<Transform>`.
@@ -1828,6 +1843,13 @@ mod tests {
         );
         let transforms = [Transform::XPath(XPathExpression::new("true()"))];
 
+        execute_transforms(
+            signature_document.root_element(),
+            TransformData::Binary(b"<root><n/></root>".to_vec()),
+            &transforms,
+        )
+        .expect("external XML below the node ceiling must parse and transform");
+
         let error = execute_transforms(
             signature_document.root_element(),
             TransformData::Binary(xml.into_bytes()),
@@ -1835,7 +1857,10 @@ mod tests {
         )
         .expect_err("external XML exceeding the node ceiling must fail during parse");
 
-        assert!(matches!(error, TransformError::XmlParse(_)));
+        assert!(matches!(
+            error,
+            TransformError::XmlParse(message) if message == "nodes limit reached"
+        ));
     }
 
     #[test]
@@ -1886,9 +1911,7 @@ mod tests {
 
             assert!(matches!(
                 error,
-                TransformError::C14nOutputTooLarge {
-                    max_bytes: MAX_C14N_OUTPUT_BYTES
-                }
+                TransformError::C14nOutputTooLarge { max_bytes: 64 }
             ));
         }
     }

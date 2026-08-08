@@ -70,11 +70,11 @@ pub enum ProviderInputError {
     #[error("empty AES-CBC plaintext")]
     AesCbcPlaintext,
     /// XMLEnc CBC padding length is outside the valid block range.
-    #[error("invalid XMLEnc CBC padding length {pad_len}")]
-    XmlEncCbcPadding {
-        /// Last plaintext octet interpreted as the padding length.
-        pad_len: u8,
-    },
+    ///
+    /// This variant deliberately carries no decrypted bytes: provider errors
+    /// may cross a trust boundary and must not become a padding oracle.
+    #[error("invalid XMLEnc CBC padding")]
+    XmlEncCbcPadding,
     /// AES-GCM input does not contain a nonce and authentication tag.
     #[error("invalid AES-GCM framing")]
     AesGcmFraming,
@@ -578,7 +578,7 @@ mod rustcrypto {
         let padding_bytes = usize::from(pad_len);
         if !(1..=16).contains(&padding_bytes) || padding_bytes > plaintext.len() {
             return Err(ProviderError::InvalidInput(
-                ProviderInputError::XmlEncCbcPadding { pad_len },
+                ProviderInputError::XmlEncCbcPadding,
             ));
         }
         plaintext.truncate(plaintext.len() - padding_bytes);
@@ -895,6 +895,12 @@ mod tests {
 
         assert!(matches!(
             RUST_CRYPTO_PROVIDER.recover_key(&key, &parameters, &[0_u8; 256]),
+            Err(ProviderError::InvalidInput(
+                ProviderInputError::LegacyRsaOaepMgf
+            ))
+        ));
+        assert!(matches!(
+            RUST_CRYPTO_PROVIDER.transport_key(&key.to_public_key(), &parameters, &[0_u8; 16]),
             Err(ProviderError::InvalidInput(
                 ProviderInputError::LegacyRsaOaepMgf
             ))

@@ -40,6 +40,7 @@ use super::transforms::{BASE64_TRANSFORM_URI, XPATH_TRANSFORM_URI};
 use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget, TransformOptions,
     XPathHereSemantics, XPathSignatureParseBudget, execute_transforms_with_options_and_budget,
+    transform_chain_produces_binary,
 };
 use super::uri::{UriReferenceResolver, same_document_reference_id};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
@@ -1427,6 +1428,14 @@ fn process_manifest_references(
     }
     results.reserve(manifest_references.len());
     for (index, reference, reference_node_id) in &manifest_references {
+        if reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference {
+            results.push(manifest_reference_invalid_result(
+                reference,
+                *index,
+                FailureReason::ReferencePolicyViolation { ref_index: *index },
+            ));
+            continue;
+        }
         if ctx
             .policy
             .digest_algorithms
@@ -1712,10 +1721,10 @@ fn enforce_reference_policies(
             // whether the caller supplied the resource. Every transform then
             // determines the next type, including implicit binary-to-node-set
             // adapters before XML-level transforms.
-            let mut produces_binary = classify_uri(uri) == UriClass::External;
-            for transform in &reference.transforms {
-                produces_binary = matches!(transform, Transform::C14n(_) | Transform::Base64Decode);
-            }
+            let produces_binary = transform_chain_produces_binary(
+                classify_uri(uri) == UriClass::External,
+                &reference.transforms,
+            );
             if !produces_binary && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI) {
                 return Err(SignatureVerificationPipelineError::DisallowedTransform {
                     algorithm: DEFAULT_IMPLICIT_C14N_URI.to_owned(),
@@ -2984,6 +2993,49 @@ mod tests {
             .policy(policy)
             .verify(&xml)
             .expect("a disallowed Manifest digest is a per-reference result");
+
+        assert!(matches!(result.status, DsigStatus::Valid));
+        assert!(matches!(
+            result.manifest_references[0].status,
+            DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
+        ));
+    }
+
+    #[test]
+    fn verify_context_applies_transform_count_policy_to_manifest_references() {
+        // Authenticated Manifest references share the caller's per-reference
+        // transform ceiling and fail before transform execution when exceeded.
+        let policy = crate::policy::VerificationPolicy {
+            process_manifests: true,
+            resources: crate::policy::ResourcePolicy {
+                max_transforms_per_reference: 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |mut xml| {
+            let manifest_start = xml
+                .find("<ds:Manifest")
+                .expect("fixture must contain a Manifest");
+            let manifest = xml[manifest_start..].replacen(
+                "<ds:DigestMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#sha1\"/>",
+                concat!(
+                    "<ds:Transforms>",
+                    "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+                    "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+                    "</ds:Transforms>",
+                    "<ds:DigestMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#sha1\"/>"
+                ),
+                1,
+            );
+            xml.replace_range(manifest_start.., &manifest);
+            xml
+        });
+        let result = VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .verify(&xml)
+            .expect("Manifest transform policy is a per-reference result");
 
         assert!(matches!(result.status, DsigStatus::Valid));
         assert!(matches!(

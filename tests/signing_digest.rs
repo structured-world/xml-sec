@@ -7,11 +7,12 @@ use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::uri::UriReferenceResolver;
 use xml_sec::xmldsig::verify::process_all_references;
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, DigestAlgorithm, DsigStatus, EcdsaP256SigningKey, EcdsaP384SigningKey,
-    KeyInfoWriter, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
-    SignatureBuilder, SigningDigestError, SigningError, SigningKey, SigningKeyError,
-    SigningPublicKeyInfo, Transform, X509CertificateKeyInfoWriter, compute_reference_digest_values,
-    fill_reference_digest_values, parse_key_info, verify_signature_with_pem_key,
+    DEFAULT_IMPLICIT_C14N_URI, DefaultKeyResolver, DigestAlgorithm, DsigStatus,
+    EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriter, ReferenceBuilder, RsaSigningKey,
+    SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError,
+    SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, X509CertificateKeyInfoWriter,
+    compute_reference_digest_values, fill_reference_digest_values, parse_key_info,
+    verify_signature_with_pem_key,
 };
 
 fn exclusive_c14n() -> C14nAlgorithm {
@@ -311,13 +312,15 @@ fn signing_policy_shares_canonicalization_budget_with_signed_info() {
             .transform(Transform::C14n(exclusive_c14n())),
     );
     let xml = append_signature_to_root(
-        "<root><payload ID=\"payload\">canonicalized bytes</payload></root>",
+        "<root><payload ID=\"payload\">x</payload></root>",
         &template,
     )
     .expect("append signature");
-    let policy = SigningPolicy {
+    let constrained = SigningPolicy {
         resources: xml_sec::policy::ResourcePolicy {
-            max_canonicalized_bytes: 32,
+            // The reference serializes below this bound; SignedInfo pushes the
+            // operation-wide total over it.
+            max_canonicalized_bytes: 64,
             ..xml_sec::policy::ResourcePolicy::default()
         },
         ..SigningPolicy::default()
@@ -325,9 +328,59 @@ fn signing_policy_shares_canonicalization_budget_with_signed_info() {
 
     assert!(matches!(
         SignContext::new(&private_key)
-            .policy(policy)
+            .policy(constrained)
             .sign_template(&xml),
         Err(SigningError::Digest(SigningDigestError::Transform(_)))
+    ));
+
+    let sufficient = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_canonicalized_bytes: 4_096,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    SignContext::new(&private_key)
+        .policy(sufficient)
+        .sign_template(&xml)
+        .expect("the same reference must sign when the combined budget fits");
+}
+
+#[test]
+fn signing_policy_covers_implicit_and_signed_info_canonicalization() {
+    // The transform allowlist covers algorithms executed implicitly by the
+    // pipeline, not only explicit Reference/Transforms children.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template =
+        template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"));
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">x</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+
+    let implicit_disallowed = SigningPolicy {
+        transforms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+        ..SigningPolicy::default()
+    };
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(implicit_disallowed)
+            .sign_template(&xml),
+        Err(SigningError::Digest(SigningDigestError::Policy(_)))
+    ));
+
+    let signed_info_disallowed = SigningPolicy {
+        transforms: Some(HashSet::from([DEFAULT_IMPLICIT_C14N_URI.to_owned()])),
+        ..SigningPolicy::default()
+    };
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(signed_info_disallowed)
+            .sign_template(&xml),
+        Err(SigningError::Policy(_))
     ));
 }
 

@@ -72,6 +72,15 @@ unwraps AES-KW values. RSA PKCS#1 v1.5 transport, `CipherReference`, and unauthe
 resource loading are rejected; only inline `CipherValue` is accepted. Encryption inputs and
 recipient counts are bounded before allocation.
 
+For multiple recipients, `DecryptContext` validates transport, wrap, digest, and MGF policy as
+each `EncryptedKey` becomes a resolver candidate. A malformed or disallowed key for another
+recipient therefore cannot suppress a later matching candidate. A resolver that supplies a direct
+symmetric key remains authoritative and does not consult unrelated embedded key hints.
+
+AES-CBC framing is bounded before decryption and the exact plaintext bound is checked again after
+padding removal. Invalid padding is reported only as `XmlEncError::InvalidPadding`; neither the
+provider error nor the public error exposes the final decrypted octet or derived padding length.
+
 Use `decrypt_document` to replace one typed `EncryptedData` in a complete XML string. Pass its
 `Id` when the document contains multiple encrypted regions. DTD parsing remains disabled by
 default; legacy documents that need an internal DTD can opt in through

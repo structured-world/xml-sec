@@ -477,14 +477,12 @@ pub enum XmlEncError {
     /// CBC ciphertext is not a non-empty multiple of the AES block size.
     #[error("AES-CBC ciphertext length must be a non-zero multiple of 16 bytes, got {0}")]
     InvalidCbcCiphertextLength(usize),
-    /// XMLEnc's final random-padding length byte is invalid.
-    #[error("invalid XMLEnc padding length {pad_len} for {block_size}-byte block")]
-    InvalidPadding {
-        /// Padding length from plaintext's final byte.
-        pad_len: u8,
-        /// Cipher block size.
-        block_size: usize,
-    },
+    /// XMLEnc random padding is invalid.
+    ///
+    /// No decrypted padding details are exposed because they would provide a
+    /// CBC padding oracle to callers processing attacker-controlled input.
+    #[error("invalid XMLEnc padding")]
+    InvalidPadding,
     /// GCM authentication failed.
     #[error("AES-GCM authentication failed")]
     AeadAuthenticationFailed,

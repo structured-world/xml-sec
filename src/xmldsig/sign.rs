@@ -20,7 +20,7 @@ use sha2::{Sha256, Sha384, Sha512};
 use std::collections::HashSet;
 use x509_parser::prelude::FromDer;
 
-use crate::c14n::canonicalize;
+use crate::c14n::{canonicalize_bounded, is_output_limit_error};
 
 use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::DigestAlgorithm;
@@ -32,9 +32,9 @@ use super::parse::{
     MAX_REFERENCES_PER_SIGNATURE, SignatureAlgorithm, XMLDSIG_NS, parse_signed_info,
 };
 use super::transforms::{
-    Transform, TransformExecutionBudget, TransformOptions, XPathHereSemantics,
-    XPathSignatureParseBudget, execute_transforms_with_options_and_budget,
-    parse_transforms_with_budget,
+    DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget, TransformOptions,
+    XPathHereSemantics, XPathSignatureParseBudget, execute_transforms_with_options_and_budget,
+    parse_transforms_with_budget, transform_chain_produces_binary,
 };
 use super::types::TransformError;
 use super::uri::UriReferenceResolver;
@@ -556,7 +556,8 @@ impl<'a> SignContext<'a> {
             self.provider,
             &execution_budget,
         )?;
-        let (algorithm, canonical_signed_info) = canonicalize_signed_info(&with_digests)?;
+        let (algorithm, canonical_signed_info) =
+            canonicalize_signed_info(&with_digests, &self.policy, &execution_budget)?;
         execution_budget
             .charge_c14n_output(canonical_signed_info.len())
             .map_err(SigningDigestError::Transform)?;
@@ -664,6 +665,16 @@ fn compute_reference_digest_values_with_options(
                         .into());
                     }
                 }
+                let initial_binary = !reference.uri.is_empty() && !reference.uri.starts_with('#');
+                if !transform_chain_produces_binary(initial_binary, &reference.transforms)
+                    && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI)
+                {
+                    return Err(crate::policy::PolicyViolation::Algorithm {
+                        operation: "signing transform",
+                        algorithm: DEFAULT_IMPLICIT_C14N_URI.to_owned(),
+                    }
+                    .into());
+                }
             }
         }
     }
@@ -747,23 +758,50 @@ fn fill_reference_digest_values_with_options(
     Ok(fill_signed_info_digest_values(xml, digest_values)?)
 }
 
-fn canonicalize_signed_info(xml: &str) -> Result<(SignatureAlgorithm, Vec<u8>), SigningError> {
+fn canonicalize_signed_info(
+    xml: &str,
+    policy: &crate::policy::SigningPolicy,
+    execution_budget: &TransformExecutionBudget,
+) -> Result<(SignatureAlgorithm, Vec<u8>), SigningError> {
     let doc = Document::parse(xml).map_err(SigningDigestError::XmlParse)?;
     let signature = find_signing_signature_node(&doc).map_err(SigningError::Digest)?;
     let signed_info_node =
         find_required_child(signature, "SignedInfo").map_err(SigningError::Digest)?;
     let signed_info = parse_signed_info(signed_info_node)?;
+    if policy
+        .transforms
+        .as_ref()
+        .is_some_and(|allowed| !allowed.contains(signed_info.c14n_method.uri()))
+    {
+        return Err(crate::policy::PolicyViolation::Algorithm {
+            operation: "SignedInfo canonicalization",
+            algorithm: signed_info.c14n_method.uri().to_owned(),
+        }
+        .into());
+    }
     let signed_info_subtree: HashSet<_> = signed_info_node
         .descendants()
         .map(|node: Node<'_, '_>| node.id())
         .collect();
     let mut canonical_signed_info = Vec::new();
-    canonicalize(
+    canonicalize_bounded(
         &doc,
         Some(&|node| signed_info_subtree.contains(&node.id())),
         &signed_info.c14n_method,
+        execution_budget.remaining_c14n_output(),
         &mut canonical_signed_info,
-    )?;
+    )
+    .map_err(|error| {
+        if is_output_limit_error(&error) {
+            SigningError::Digest(SigningDigestError::Transform(
+                TransformError::C14nOutputTooLarge {
+                    max_bytes: execution_budget.c14n_output_limit(),
+                },
+            ))
+        } else {
+            SigningError::Canonicalization(error)
+        }
+    })?;
     Ok((signed_info.signature_method, canonical_signed_info))
 }
 

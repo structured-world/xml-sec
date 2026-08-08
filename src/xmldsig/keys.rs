@@ -293,13 +293,23 @@ impl DefaultKeyResolver {
             crls: info.crls.clone(),
             ..X509DataInfo::default()
         };
-        for certificate in self
-            .config
-            .trusted_certs
-            .iter()
-            .chain(&self.config.lookup_certs)
-            .chain(&info.certificates)
-        {
+        let mut trusted_prefix_len = 0;
+        for certificate in &self.config.trusted_certs {
+            if available
+                .certificates
+                .iter()
+                .any(|known| known == certificate)
+            {
+                continue;
+            }
+            available.parsed_certificates.push(
+                parse_x509_certificate(certificate)
+                    .map_err(|_| KeyResolutionError::InvalidCertificate)?,
+            );
+            available.certificates.push(certificate.clone());
+            trusted_prefix_len += 1;
+        }
+        for certificate in self.config.lookup_certs.iter().chain(&info.certificates) {
             if available
                 .certificates
                 .iter()
@@ -318,7 +328,7 @@ impl DefaultKeyResolver {
             .iter()
             .position(|certificate| certificate == signing_der)
             .ok_or(KeyResolutionError::InvalidCertificate)?;
-        self.select_valid_x509_path(&mut available, signing_index, trust)?;
+        self.select_valid_x509_path(&mut available, signing_index, trusted_prefix_len, trust)?;
         Ok(available)
     }
 
@@ -326,12 +336,13 @@ impl DefaultKeyResolver {
         &self,
         available: &mut X509DataInfo,
         signing_index: usize,
+        trusted_prefix_len: usize,
         trust: &crate::policy::KeyTrustPolicy,
     ) -> Result<(), KeyResolutionError> {
         let candidates = build_x509_certificate_paths_to_trusted_prefix(
             available,
             signing_index,
-            self.config.trusted_certs.len(),
+            trusted_prefix_len,
             trust.max_x509_chain_depth,
             trust.max_x509_candidate_paths,
         )
@@ -444,7 +455,12 @@ impl DefaultKeyResolver {
             if signing_index < self.config.trusted_certs.len() || !trust.verify_x509_chains {
                 vec![signing_index]
             } else {
-                self.select_valid_x509_path(&mut available, signing_index, trust)?;
+                self.select_valid_x509_path(
+                    &mut available,
+                    signing_index,
+                    self.config.trusted_certs.len(),
+                    trust,
+                )?;
                 available.certificate_chain.clone()
             };
         if trust.verify_x509_chains && signing_index < self.config.trusted_certs.len() {
@@ -1258,20 +1274,25 @@ mod tests {
     }
 
     #[test]
-    fn embedded_leaf_uses_configured_lookup_intermediate() {
-        // lookup_certs are untrusted path-building material for every X509Data
-        // source, including an embedded leaf and raw-certificate retrieval.
-        let root = rcgen::CertifiedIssuer::self_signed(
-            generated_certificate_params("embedded root", true),
+    fn embedded_leaf_uses_lookup_intermediate_with_duplicate_anchor() {
+        // Deduplicating repeated trust anchors must not shift an untrusted
+        // lookup intermediate into the trusted prefix used by path building.
+        let trusted_root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("unrelated trusted root", true),
             rcgen::KeyPair::generate().expect("root key generation should succeed"),
         )
         .expect("root should be self-signable");
+        let issuer_root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("untrusted issuer root", true),
+            rcgen::KeyPair::generate().expect("issuer root key generation should succeed"),
+        )
+        .expect("issuer root should be self-signable");
         let intermediate = rcgen::CertifiedIssuer::signed_by(
             generated_certificate_params("embedded intermediate", true),
             rcgen::KeyPair::generate().expect("intermediate key generation should succeed"),
-            &root,
+            &issuer_root,
         )
-        .expect("root should sign the intermediate");
+        .expect("issuer root should sign the intermediate");
         let leaf = generated_certificate_params("embedded leaf", false)
             .signed_by(
                 &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
@@ -1286,16 +1307,17 @@ mod tests {
         };
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             lookup_certs: vec![intermediate.der().to_vec()],
-            trusted_certs: vec![root.der().to_vec()],
+            trusted_certs: vec![trusted_root.der().to_vec(), trusted_root.der().to_vec()],
             trust: chain_policy(),
             ..KeyResolverConfig::default()
         });
 
-        let resolved = resolver
-            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
-            .expect("embedded leaf should chain through the configured lookup intermediate");
+        let error = match resolver.resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256) {
+            Ok(_) => panic!("an untrusted lookup intermediate must not become a trust anchor"),
+            Err(error) => error,
+        };
 
-        assert!(resolved.is_some());
+        assert!(matches!(error, DsigError::KeyResolution(_)));
     }
 
     #[test]

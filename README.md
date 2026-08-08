@@ -39,6 +39,7 @@ Currently implemented (core paths):
 - XMLDSig parsing, same-document URI dereference, enveloped/C14N/Base64/XPath 1.0/XPath Filter 2.0 transform chains, and digest verification
 - XMLDSig full verify pipeline (`SignedInfo` canonicalization + `SignatureValue` verification)
 - XMLDSig template signing pipeline (`DigestValue` fill + `SignedInfo` canonicalization + `SignatureValue` fill), including enveloped SAML Response templates
+- Typed signing and verification policy covers explicit transforms, implicit reference canonicalization, and `SignedInfo` canonicalization under shared work limits
 - XMLDSig signing KeyInfo writer for embedded X.509 certificates
 - Built-in verification-key resolution from embedded X.509/DER/`KeyValue` sources and configured `KeyName`, X.509 subject, issuer/serial, SKI, or digest selectors
 - RSA PKCS#1 v1.5 verification helpers for SHA-1 / SHA-256 / SHA-384 / SHA-512
@@ -49,7 +50,8 @@ Currently implemented (core paths):
 - Caller-supplied, bounded external references and X.509 `RetrievalMethod` resolution without implicit I/O
 - XMLEnc AES-128/256-CBC and AES-128/256-GCM encryption/decryption with direct
   keys, RSA-OAEP key transport, AES-128/256-KW, multiple recipients, and
-  Element/Content document replacement
+  Element/Content document replacement; recipient policy is evaluated only for
+  candidate keys and CBC failures expose no decrypted padding details
 
 Still in progress:
 - XMLDSig DSA-SHA256, broader HMAC verification/signing, and RSA-PSS algorithms
