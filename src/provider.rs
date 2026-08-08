@@ -5,7 +5,7 @@
 //! opaque behind the operation-specific key traits exposed by `xmldsig` and
 //! `xmlenc`; this provider owns stateless primitives and randomness.
 
-#[cfg(feature = "xmlenc")]
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 use getrandom::rand_core::TryCryptoRng;
 use getrandom::{SysRng, rand_core::TryRng};
 
@@ -134,6 +134,10 @@ pub trait CryptoProvider: Send + Sync {
     fn digest(&self, algorithm: DigestAlgorithm, data: &[u8]) -> Result<Vec<u8>, ProviderError>;
 
     /// Sign bytes with an opaque key handle.
+    ///
+    /// Providers that delegate primitive signing to the supplied key must call
+    /// [`crate::xmldsig::SigningKey::sign_with_provider`] so randomized
+    /// primitives consume this provider's randomness.
     #[cfg(feature = "xmldsig")]
     fn sign(
         &self,
@@ -221,10 +225,10 @@ pub fn default_provider() -> &'static dyn CryptoProvider {
 }
 
 /// Adapter used when a RustCrypto primitive requires a fallible RNG object.
-#[cfg(feature = "xmlenc")]
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) struct ProviderRng<'a>(pub(crate) &'a dyn CryptoProvider);
 
-#[cfg(feature = "xmlenc")]
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 impl TryRng for ProviderRng<'_> {
     type Error = ProviderError;
 
@@ -245,7 +249,7 @@ impl TryRng for ProviderRng<'_> {
     }
 }
 
-#[cfg(feature = "xmlenc")]
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 impl TryCryptoRng for ProviderRng<'_> {}
 
 impl CryptoProvider for RustCryptoProvider {
@@ -310,7 +314,7 @@ impl CryptoProvider for RustCryptoProvider {
         data: &[u8],
     ) -> Result<Vec<u8>, crate::xmldsig::SigningKeyError> {
         self.require(ProviderOperation::Sign, Some(algorithm.uri()))?;
-        key.sign(algorithm, data)
+        key.sign_with_provider(self, algorithm, data)
     }
 
     #[cfg(feature = "xmldsig")]
@@ -850,7 +854,118 @@ mod rustcrypto {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "xmldsig")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    #[cfg(feature = "xmldsig")]
+    struct CountingRandomProvider {
+        random_calls: AtomicUsize,
+    }
+
+    #[cfg(feature = "xmldsig")]
+    impl CryptoProvider for CountingRandomProvider {
+        fn name(&self) -> &'static str {
+            "counting-random"
+        }
+
+        fn supports(&self, query: CapabilityQuery<'_>) -> bool {
+            RUST_CRYPTO_PROVIDER.supports(query)
+        }
+
+        fn fill_random(&self, output: &mut [u8]) -> Result<(), ProviderError> {
+            self.random_calls.fetch_add(1, Ordering::Relaxed);
+            RUST_CRYPTO_PROVIDER.fill_random(output)
+        }
+
+        fn digest(
+            &self,
+            algorithm: DigestAlgorithm,
+            data: &[u8],
+        ) -> Result<Vec<u8>, ProviderError> {
+            RUST_CRYPTO_PROVIDER.digest(algorithm, data)
+        }
+
+        fn sign(
+            &self,
+            key: &dyn crate::xmldsig::SigningKey,
+            algorithm: crate::xmldsig::SignatureAlgorithm,
+            data: &[u8],
+        ) -> Result<Vec<u8>, crate::xmldsig::SigningKeyError> {
+            key.sign_with_provider(self, algorithm, data)
+        }
+
+        fn verify(
+            &self,
+            key: &dyn crate::xmldsig::VerifyingKey,
+            algorithm: crate::xmldsig::SignatureAlgorithm,
+            data: &[u8],
+            signature: &[u8],
+        ) -> Result<bool, crate::xmldsig::DsigError> {
+            RUST_CRYPTO_PROVIDER.verify(key, algorithm, data, signature)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn encrypt_data(
+            &self,
+            algorithm: DataEncryptionAlgorithm,
+            key: &[u8],
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, ProviderError> {
+            RUST_CRYPTO_PROVIDER.encrypt_data(algorithm, key, plaintext)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn decrypt_data(
+            &self,
+            algorithm: DataEncryptionAlgorithm,
+            key: &[u8],
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, ProviderError> {
+            RUST_CRYPTO_PROVIDER.decrypt_data(algorithm, key, ciphertext)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn wrap_key(
+            &self,
+            algorithm: KeyWrapAlgorithm,
+            kek: &[u8],
+            key: &[u8],
+        ) -> Result<Vec<u8>, ProviderError> {
+            RUST_CRYPTO_PROVIDER.wrap_key(algorithm, kek, key)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn unwrap_key(
+            &self,
+            algorithm: KeyWrapAlgorithm,
+            kek: &[u8],
+            wrapped: &[u8],
+        ) -> Result<Vec<u8>, ProviderError> {
+            RUST_CRYPTO_PROVIDER.unwrap_key(algorithm, kek, wrapped)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn transport_key(
+            &self,
+            key: &rsa::RsaPublicKey,
+            parameters: &RsaOaepParameters,
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, ProviderError> {
+            RUST_CRYPTO_PROVIDER.transport_key(key, parameters, plaintext)
+        }
+
+        #[cfg(feature = "xmlenc")]
+        fn recover_key(
+            &self,
+            key: &rsa::RsaPrivateKey,
+            parameters: &RsaOaepParameters,
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, ProviderError> {
+            RUST_CRYPTO_PROVIDER.recover_key(key, parameters, ciphertext)
+        }
+    }
 
     #[test]
     fn capability_query_is_explicit_about_unimplemented_operations() {
@@ -874,6 +989,29 @@ mod tests {
             operation: ProviderOperation::Verify,
             algorithm: Some("urn:unsupported:signature"),
         }));
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn rsa_signing_uses_the_selected_providers_randomness() {
+        use crate::xmldsig::{RsaSigningKey, SignatureAlgorithm};
+
+        // RSA PKCS#1 v1.5 uses randomness for blinding even though its wire
+        // signature is deterministic; the selected provider owns that source.
+        let key = RsaSigningKey::from_pkcs8_pem(include_str!(
+            "../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("RSA fixture must parse");
+        let provider = CountingRandomProvider {
+            random_calls: AtomicUsize::new(0),
+        };
+
+        let signature = provider
+            .sign(&key, SignatureAlgorithm::RsaSha256, b"signed info")
+            .expect("RSA signing must succeed");
+
+        assert!(!signature.is_empty());
+        assert!(provider.random_calls.load(Ordering::Relaxed) > 0);
     }
 
     #[cfg(feature = "xmlenc")]

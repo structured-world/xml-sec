@@ -32,6 +32,12 @@ validation in `sign_with_builder`, digest filling, `SignedInfo` parsing, signatu
 optional `KeyInfo` filling. An internal-DTD opt-in and XML node ceiling therefore cannot be lost
 between stages.
 
+`SignContext::provider` selects both digest primitives and operation randomness. Built-in RSA
+signing routes its blinding randomness through that provider rather than acquiring operating-system
+randomness behind the provider boundary. Custom `SigningKey` implementations whose primitive uses
+randomness must implement `SigningKey::sign_with_provider`; deterministic and externally managed
+keys can use the default implementation.
+
 ## Verification Policy
 
 For production verification, configure `KeyResolverConfig::lookup_certs` with untrusted

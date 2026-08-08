@@ -10,7 +10,7 @@ use super::parse::{
     parse_encrypted_data_node_with_policy, parse_encrypted_data_with_policy,
     validate_encrypted_data_metadata,
 };
-use super::types::XMLENC_NS;
+use super::types::{MAX_CIPHER_VALUE_BASE64_LEN, XMLENC_NS};
 use super::{
     DataEncryptionAlgorithm, DecryptedContent, EncryptedData, EncryptedDataType, EncryptedKey,
     KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm, RsaOaepParameters, XmlEncError,
@@ -99,6 +99,11 @@ impl<'a> DecryptContext<'a> {
             }
             .into());
         }
+        validate_typed_cipher_values(
+            encrypted,
+            algorithm,
+            self.policy.resources.max_encryption_plaintext_bytes,
+        )?;
         let ciphertext = STANDARD
             .decode(&encrypted.cipher_data.value)
             .map_err(|error| XmlEncError::Base64(error.to_string()))?;
@@ -601,19 +606,87 @@ fn validate_encrypted_key_policy(
                 .into());
             }
         }
-    } else if let Ok(wrap) = KeyWrapAlgorithm::from_uri(uri)
-        && policy
+    } else {
+        let wrap = KeyWrapAlgorithm::from_uri(uri)?;
+        if policy
             .key_wrap_algorithms
             .as_ref()
             .is_some_and(|allowed| !allowed.contains(&wrap))
-    {
-        return Err(crate::policy::PolicyViolation::Algorithm {
-            operation: "decryption",
-            algorithm: uri.clone(),
+        {
+            return Err(crate::policy::PolicyViolation::Algorithm {
+                operation: "decryption",
+                algorithm: uri.clone(),
+            }
+            .into());
         }
-        .into());
     }
     Ok(())
+}
+
+fn validate_typed_cipher_values(
+    encrypted: &EncryptedData,
+    algorithm: DataEncryptionAlgorithm,
+    maximum_plaintext: usize,
+) -> Result<(), XmlEncError> {
+    let maximum_ciphertext = match algorithm {
+        DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => {
+            (maximum_plaintext / 16)
+                .saturating_add(1)
+                .saturating_mul(16)
+                .saturating_add(16)
+        }
+        DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => {
+            maximum_plaintext.saturating_add(28)
+        }
+    };
+    let projected = validate_cipher_value_len(&encrypted.cipher_data.value, maximum_ciphertext)?;
+    if projected > maximum_ciphertext {
+        return Err(XmlEncError::PlaintextTooLarge {
+            maximum: maximum_plaintext,
+            actual: projected.saturating_sub(ciphertext_framing_len(algorithm)),
+        });
+    }
+
+    let maximum_wrapped_key = projected_decoded_len_for_encoded_len(MAX_CIPHER_VALUE_BASE64_LEN);
+    for encrypted_key in &encrypted.encrypted_keys {
+        validate_cipher_value_len(&encrypted_key.cipher_data.value, maximum_wrapped_key)?;
+    }
+    Ok(())
+}
+
+fn validate_cipher_value_len(value: &str, maximum_decoded: usize) -> Result<usize, XmlEncError> {
+    if value.len() > MAX_CIPHER_VALUE_BASE64_LEN {
+        return Err(XmlEncError::InvalidStructure(format!(
+            "CipherValue exceeds {MAX_CIPHER_VALUE_BASE64_LEN}-byte limit"
+        )));
+    }
+    Ok(projected_decoded_len(value).min(maximum_decoded.saturating_add(1)))
+}
+
+fn projected_decoded_len(value: &str) -> usize {
+    let padding = value
+        .as_bytes()
+        .iter()
+        .rev()
+        .take(2)
+        .take_while(|byte| **byte == b'=')
+        .count();
+    projected_decoded_len_for_encoded_len(value.len()).saturating_sub(padding)
+}
+
+fn projected_decoded_len_for_encoded_len(encoded_len: usize) -> usize {
+    encoded_len
+        .checked_add(3)
+        .map(|length| length / 4)
+        .and_then(|quanta| quanta.checked_mul(3))
+        .unwrap_or(usize::MAX)
+}
+
+const fn ciphertext_framing_len(algorithm: DataEncryptionAlgorithm) -> usize {
+    match algorithm {
+        DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => 32,
+        DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => 28,
+    }
 }
 
 fn validate_key_len(algorithm: DataEncryptionAlgorithm, key: &[u8]) -> Result<(), XmlEncError> {
@@ -634,9 +707,10 @@ fn validate_possible_plaintext_len(
     maximum: usize,
 ) -> Result<(), XmlEncError> {
     let framing = match algorithm {
-        // CBC always contains a 16-byte IV and at least one complete padded
-        // block. Subtracting that minimum framing gives the greatest plaintext
-        // length possible on success and therefore a safe pre-decryption bound.
+        // CBC contains a 16-byte IV and 1 to 16 padding bytes. Assuming the
+        // largest padding yields the smallest plaintext possible on success,
+        // which is the safe pre-decryption lower bound checked here. The exact
+        // plaintext length is checked after decryption.
         DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => 32,
         DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => 28,
     };
@@ -693,6 +767,8 @@ fn map_data_decryption_error(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use aes_gcm::{
         Aes128Gcm,
         aead::{AeadInOut, KeyInit},
@@ -709,6 +785,27 @@ mod tests {
     struct RecipientKeyResolver {
         recipient: &'static str,
         key: Vec<u8>,
+    }
+
+    struct CountingResolver {
+        candidate_calls: Cell<usize>,
+        key: Vec<u8>,
+    }
+
+    impl DecryptionKeyResolver for CountingResolver {
+        fn resolve_key(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+        ) -> Result<Vec<u8>, XmlEncError> {
+            if encrypted_key.is_some() {
+                self.candidate_calls.set(self.candidate_calls.get() + 1);
+                Ok(self.key.clone())
+            } else {
+                Err(XmlEncError::KeyNotFound)
+            }
+        }
     }
 
     impl DecryptionKeyResolver for RecipientKeyResolver {
@@ -813,7 +910,7 @@ mod tests {
             "<ds:KeyInfo xmlns:ds=\"{}\">{}{}</ds:KeyInfo>",
             crate::xmlenc::types::XMLDSIG_NS,
             recipient_key("alice", KeyTransportAlgorithm::RsaOaep11.uri()),
-            recipient_key("bob", "urn:test:recipient-key")
+            recipient_key("bob", KeyWrapAlgorithm::AesKw128.uri())
         );
         let xml = encrypted.replacen(
             "<xenc:CipherData>",
@@ -1331,6 +1428,126 @@ mod tests {
                 actual: 9,
             })
         ));
+    }
+
+    #[test]
+    fn typed_cipher_values_are_bounded_before_decode_or_resolution() {
+        // Public typed input bypasses the XML parser, so the decryption boundary
+        // must re-establish both content and recipient CipherValue size invariants.
+        let key = [0x41_u8; 16];
+        let ciphertext = crate::provider::default_provider()
+            .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
+            .expect("test encryption must succeed");
+        let mut encrypted = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            key_name: None,
+            encryption_method: super::super::EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            encrypted_keys: Vec::new(),
+            cipher_data: super::super::CipherData {
+                value: STANDARD.encode(ciphertext),
+            },
+        };
+        let policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_encryption_plaintext_bytes: 4,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        encrypted.cipher_data.value = "A".repeat(48);
+        assert!(matches!(
+            DecryptContext::new(&SymmetricKeyDecryptor::new(key))
+                .policy(policy)
+                .decrypt_data(&encrypted),
+            Err(XmlEncError::PlaintextTooLarge { .. })
+        ));
+
+        encrypted.cipher_data.value = STANDARD.encode([0_u8; 28]);
+        encrypted.encrypted_keys.push(EncryptedKey {
+            id: None,
+            recipient: None,
+            key_name: None,
+            encryption_method: super::super::EncryptionMethod {
+                algorithm: KeyWrapAlgorithm::AesKw128.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            cipher_data: super::super::CipherData {
+                value: "A".repeat(MAX_CIPHER_VALUE_BASE64_LEN + 4),
+            },
+            reference_list: None,
+            carried_key_name: None,
+        });
+        let resolver = CountingResolver {
+            candidate_calls: Cell::new(0),
+            key: key.to_vec(),
+        };
+        assert!(matches!(
+            DecryptContext::new(&resolver).decrypt_data(&encrypted),
+            Err(XmlEncError::InvalidStructure(_))
+        ));
+        assert_eq!(resolver.candidate_calls.get(), 0);
+    }
+
+    #[test]
+    fn unknown_encrypted_key_algorithm_never_reaches_resolver() {
+        // Extension URIs cannot bypass transport/wrap allowlists by relying on
+        // an application resolver that happens to return usable key bytes.
+        let key = [0x42_u8; 16];
+        let ciphertext = crate::provider::default_provider()
+            .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
+            .expect("test encryption must succeed");
+        let encrypted = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            key_name: None,
+            encryption_method: super::super::EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            encrypted_keys: vec![EncryptedKey {
+                id: None,
+                recipient: None,
+                key_name: None,
+                encryption_method: super::super::EncryptionMethod {
+                    algorithm: "urn:example:unknown-key-algorithm".into(),
+                    key_size_bits: None,
+                    oaep_digest: None,
+                    mgf_algorithm: None,
+                    oaep_params: None,
+                },
+                cipher_data: super::super::CipherData {
+                    value: STANDARD.encode([0_u8; 24]),
+                },
+                reference_list: None,
+                carried_key_name: None,
+            }],
+            cipher_data: super::super::CipherData {
+                value: STANDARD.encode(ciphertext),
+            },
+        };
+        let resolver = CountingResolver {
+            candidate_calls: Cell::new(0),
+            key: key.to_vec(),
+        };
+
+        assert!(matches!(
+            DecryptContext::new(&resolver).decrypt_data(&encrypted),
+            Err(XmlEncError::UnsupportedAlgorithm(_))
+        ));
+        assert_eq!(resolver.candidate_calls.get(), 0);
     }
 
     #[test]

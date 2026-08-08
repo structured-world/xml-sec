@@ -6,7 +6,6 @@
 //! must continue to reject empty or malformed stored digest values.
 
 use base64::Engine;
-use getrandom::SysRng;
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey};
@@ -221,6 +220,20 @@ pub trait SigningKey {
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError>;
 
+    /// Sign while sourcing any primitive randomness from the selected provider.
+    ///
+    /// Deterministic or externally managed keys can rely on this default. Keys
+    /// whose primitive uses randomness, including RSA blinding, must override it.
+    fn sign_with_provider(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: SignatureAlgorithm,
+        canonical_signed_info: &[u8],
+    ) -> Result<Vec<u8>, SigningKeyError> {
+        let _ = provider;
+        self.sign(algorithm, canonical_signed_info)
+    }
+
     /// Return structured public key material corresponding to this signing key.
     fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError>;
 }
@@ -338,16 +351,32 @@ impl SigningKey for RsaSigningKey {
         algorithm: SignatureAlgorithm,
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
+        self.sign_with_provider(
+            crate::provider::default_provider(),
+            algorithm,
+            canonical_signed_info,
+        )
+    }
+
+    fn sign_with_provider(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: SignatureAlgorithm,
+        canonical_signed_info: &[u8],
+    ) -> Result<Vec<u8>, SigningKeyError> {
         match algorithm {
             SignatureAlgorithm::RsaSha256 => sign_rsa_pkcs1v15_with_rng(
+                provider,
                 RsaPkcs1v15SigningKey::<Sha256>::new(self.key.clone()),
                 canonical_signed_info,
             ),
             SignatureAlgorithm::RsaSha384 => sign_rsa_pkcs1v15_with_rng(
+                provider,
                 RsaPkcs1v15SigningKey::<Sha384>::new(self.key.clone()),
                 canonical_signed_info,
             ),
             SignatureAlgorithm::RsaSha512 => sign_rsa_pkcs1v15_with_rng(
+                provider,
                 RsaPkcs1v15SigningKey::<Sha512>::new(self.key.clone()),
                 canonical_signed_info,
             ),
@@ -372,11 +401,13 @@ impl SigningKey for RsaSigningKey {
 }
 
 fn sign_rsa_pkcs1v15_with_rng(
+    provider: &dyn crate::provider::CryptoProvider,
     key: impl RandomizedSigner<RsaPkcs1v15Signature>,
     canonical_signed_info: &[u8],
 ) -> Result<Vec<u8>, SigningKeyError> {
+    let mut rng = crate::provider::ProviderRng(provider);
     let signature = key
-        .try_sign_with_rng(&mut SysRng, canonical_signed_info)
+        .try_sign_with_rng(&mut rng, canonical_signed_info)
         .map_err(|_| SigningKeyError::SigningFailed)?;
     Ok(signature.to_vec())
 }

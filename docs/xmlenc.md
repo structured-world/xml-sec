@@ -72,12 +72,15 @@ unwraps AES-KW values. RSA PKCS#1 v1.5 transport, `CipherReference`, and unauthe
 resource loading are rejected; only inline `CipherValue` is accepted. Encryption inputs and
 recipient counts are bounded before allocation. Decryption applies the same aggregate recipient
 ceiling while parsing, bounds each retained identifier, algorithm URI, key name, OAEP label, and
-reference URI, and rechecks caller-constructed `EncryptedData` before key resolution.
+reference URI, and rechecks caller-constructed `EncryptedData` before decoding or key resolution.
+That typed-input check bounds both encoded and projected decoded `CipherValue` sizes, so callers
+cannot bypass parser allocation limits by constructing the public model directly.
 
 For multiple recipients, `DecryptContext` validates transport, wrap, digest, and MGF policy as
 each `EncryptedKey` becomes a resolver candidate. A malformed or disallowed key for another
 recipient therefore cannot suppress a later matching candidate. A resolver that supplies a direct
 symmetric key remains authoritative and does not consult unrelated embedded key hints.
+Unknown key transport and wrap URIs fail closed before an application resolver is invoked.
 
 AES-CBC framing is bounded before decryption and the exact plaintext bound is checked again after
 padding removal. Invalid padding is reported only as `XmlEncError::InvalidPadding`; neither the
@@ -95,3 +98,8 @@ output byte length is checked before constructing the replacement. DTD parsing r
 default; legacy documents that need an internal DTD can opt in through
 `decrypt_document_with_options` and `DocumentDecryptionOptions`. That API never installs an
 external entity resolver.
+
+`encrypt_document` also checks the exact projected document length after cipher framing, base64,
+and `EncryptedData` serialization but before allocating the replacement document. This keeps
+generated Element and Content output within the same document policy accepted by reciprocal
+decryption.

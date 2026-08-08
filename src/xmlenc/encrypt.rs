@@ -155,6 +155,12 @@ impl EncryptedDataBuilder {
             EncryptedDataType::Element => {
                 let result =
                     self.encrypt_payload(source.as_bytes(), Some(EncryptedDataType::Element))?;
+                validate_replacement_document_len(
+                    xml.len(),
+                    range.len(),
+                    result.encrypted_data_xml.len(),
+                    self.policy.resources.max_encryption_document_bytes,
+                )?;
                 Ok(replace_range(xml, range, &result.encrypted_data_xml))
             }
             EncryptedDataType::Content => {
@@ -162,6 +168,28 @@ impl EncryptedDataBuilder {
                 let plaintext = &source[boundaries.content.clone()];
                 let result =
                     self.encrypt_payload(plaintext.as_bytes(), Some(EncryptedDataType::Content))?;
+                let (removed, inserted) = if boundaries.self_closing {
+                    let slash = source[..boundaries.start_tag_end]
+                        .rfind('/')
+                        .ok_or_else(|| {
+                            XmlEncError::InvalidStructure("self-closing tag has no slash".into())
+                        })?;
+                    (
+                        range.len(),
+                        slash
+                            .saturating_add(result.encrypted_data_xml.len())
+                            .saturating_add(boundaries.qualified_name.len())
+                            .saturating_add(4),
+                    )
+                } else {
+                    (boundaries.content.len(), result.encrypted_data_xml.len())
+                };
+                validate_replacement_document_len(
+                    xml.len(),
+                    removed,
+                    inserted,
+                    self.policy.resources.max_encryption_document_bytes,
+                )?;
                 replace_element_content(xml, range, source, boundaries, &result.encrypted_data_xml)
             }
             EncryptedDataType::Other(_) => Err(XmlEncError::InvalidEncryptionConfig(
@@ -422,6 +450,18 @@ fn validate_document_len(actual: usize, maximum: usize) -> Result<(), XmlEncErro
         return Err(XmlEncError::DocumentTooLarge { maximum, actual });
     }
     Ok(())
+}
+
+fn validate_replacement_document_len(
+    document_len: usize,
+    removed_len: usize,
+    inserted_len: usize,
+    maximum: usize,
+) -> Result<(), XmlEncError> {
+    let actual = document_len
+        .saturating_sub(removed_len)
+        .saturating_add(inserted_len);
+    validate_document_len(actual, maximum)
 }
 
 fn validate_content_key(algorithm: DataEncryptionAlgorithm, key: &[u8]) -> Result<(), XmlEncError> {
@@ -981,6 +1021,37 @@ mod tests {
                 .encrypt_document(&oversized_malformed, DocumentEncryptionOptions::default()),
             Err(XmlEncError::DocumentTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn encrypted_replacement_must_fit_document_policy() {
+        // Cipher framing, base64, and EncryptedData markup expand the selected
+        // range; the returned document must remain valid input to decryption.
+        for encrypted_type in [EncryptedDataType::Element, EncryptedDataType::Content] {
+            let document = "<root><target ID=\"selected\">x</target></root>";
+            let policy = crate::policy::EncryptionPolicy {
+                resources: crate::policy::ResourcePolicy {
+                    max_encryption_document_bytes: document.len(),
+                    ..crate::policy::ResourcePolicy::default()
+                },
+                ..crate::policy::EncryptionPolicy::default()
+            };
+
+            assert!(matches!(
+                EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                    .encryption_type(encrypted_type)
+                    .direct_key([0_u8; 16])
+                    .policy(policy)
+                    .encrypt_document(
+                        document,
+                        DocumentEncryptionOptions {
+                            element_id: Some("selected"),
+                            allow_dtd: false,
+                        },
+                    ),
+                Err(XmlEncError::DocumentTooLarge { .. })
+            ));
+        }
     }
 
     #[test]

@@ -51,7 +51,8 @@ Currently implemented (core paths):
 - XMLEnc AES-128/256-CBC and AES-128/256-GCM encryption/decryption with direct
   keys, RSA-OAEP key transport, AES-128/256-KW, multiple recipients, and
   Element/Content document replacement; document, node, and aggregate recipient
-  limits are enforced before expensive work. CBC failures expose no decrypted
+  limits cover caller-constructed ciphertext and generated replacement output
+  before expensive work. CBC failures expose no decrypted
   padding details, but CBC remains unauthenticated and can be excluded by policy
 
 Still in progress:
