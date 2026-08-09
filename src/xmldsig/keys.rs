@@ -136,7 +136,7 @@ impl VerifyingKey for VerificationKey {
                 signed_data,
                 signature_value,
             ),
-            SignatureAlgorithm::EcdsaP256Sha256 | SignatureAlgorithm::EcdsaP384Sha384 => {
+            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384 => {
                 verify_ecdsa_signature_spki(
                     algorithm,
                     &self.public_key_bytes,
@@ -529,7 +529,7 @@ impl DefaultKeyResolver {
             } => {
                 if !matches!(
                     algorithm,
-                    SignatureAlgorithm::EcdsaP256Sha256 | SignatureAlgorithm::EcdsaP384Sha384
+                    SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384
                 ) {
                     return Ok(None);
                 }
@@ -777,16 +777,11 @@ fn validate_spki_algorithm(
             | SignatureAlgorithm::RsaSha512,
             PublicKey::RSA(_),
         ) => Ok(()),
-        (SignatureAlgorithm::EcdsaP256Sha256, PublicKey::EC(_))
-            if curve_oid.as_deref() == Some("1.2.840.10045.3.1.7") =>
-        {
-            Ok(())
-        }
-        // xmlsec's OpenSSL backend maps ecdsa-sha384 to EVP_sha384() plus the
-        // generic EC key class, without restricting the curve to P-384. Keep
-        // P-521/SHA-384 compatible with that donor contract.
-        (SignatureAlgorithm::EcdsaP384Sha384, PublicKey::EC(_))
-            if matches!(curve_oid.as_deref(), Some("1.3.132.0.34" | "1.3.132.0.35")) =>
+        (SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384, PublicKey::EC(_))
+            if matches!(
+                curve_oid.as_deref(),
+                Some("1.2.840.10045.3.1.7" | "1.3.132.0.34" | "1.3.132.0.35")
+            ) =>
         {
             Ok(())
         }
@@ -1320,7 +1315,7 @@ mod tests {
         });
 
         let resolved = resolver
-            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaSha256)
             .expect("configured self-signed certificate should validate as its own anchor");
 
         assert!(resolved.is_some());
@@ -1372,7 +1367,7 @@ mod tests {
         });
 
         let resolved = resolver
-            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaSha256)
             .expect("an explicitly trusted selected certificate must terminate its path");
 
         assert!(resolved.is_some());
@@ -1415,7 +1410,7 @@ mod tests {
         });
 
         let resolved = resolver
-            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaSha256)
             .expect("path construction must stop at the configured anchor");
 
         assert!(resolved.is_some());
@@ -1523,7 +1518,7 @@ mod tests {
         });
 
         let resolved = resolver
-            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaSha256)
             .expect("selector-resolved leaf should chain through the lookup intermediate");
 
         assert!(resolved.is_some());
@@ -1589,7 +1584,7 @@ mod tests {
             });
             let error = match resolver.resolve_with_policy_and_provider(
                 Some(&key_info),
-                SignatureAlgorithm::EcdsaP256Sha256,
+                SignatureAlgorithm::EcdsaSha256,
                 &policy,
                 &provider,
             ) {
@@ -1632,7 +1627,7 @@ mod tests {
         };
         let error = match resolver.resolve_with_policy_and_provider(
             Some(&key_info),
-            SignatureAlgorithm::EcdsaP256Sha256,
+            SignatureAlgorithm::EcdsaSha256,
             &policy,
             &provider,
         ) {
@@ -1687,7 +1682,7 @@ mod tests {
             ..KeyResolverConfig::default()
         });
 
-        let error = match resolver.resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256) {
+        let error = match resolver.resolve(Some(&key_info), SignatureAlgorithm::EcdsaSha256) {
             Ok(_) => panic!("an untrusted lookup intermediate must not become a trust anchor"),
             Err(error) => error,
         };
@@ -1752,7 +1747,7 @@ mod tests {
         });
 
         let resolved = resolver
-            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaSha256)
             .expect("the sole path to a configured anchor should be selected");
 
         assert!(resolved.is_some());
@@ -1796,7 +1791,7 @@ mod tests {
         });
 
         let resolved = resolver
-            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaSha256)
             .expect("same-name rollover path must reach its configured signer");
 
         assert!(resolved.is_some());
@@ -1913,7 +1908,7 @@ mod tests {
         });
 
         let resolved = resolver
-            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaP256Sha256)
+            .resolve(Some(&key_info), SignatureAlgorithm::EcdsaSha256)
             .expect("the leaf signature should select its unique same-subject issuer");
 
         assert!(resolved.is_some());
@@ -2181,7 +2176,7 @@ mod tests {
         config.named_keys.insert(
             "idp-signing".into(),
             VerificationKey {
-                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                algorithm: SignatureAlgorithm::EcdsaSha256,
                 public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
                 certificate_der: None,
                 name: Some("idp-signing".into()),
@@ -2447,7 +2442,7 @@ mod tests {
         config.named_keys.insert(
             "idp-signing".into(),
             VerificationKey {
-                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                algorithm: SignatureAlgorithm::EcdsaSha256,
                 public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
                 certificate_der: None,
                 name: Some("idp-signing".into()),
@@ -2471,7 +2466,7 @@ mod tests {
         config.named_keys.insert(
             "idp-signing".into(),
             VerificationKey {
-                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                algorithm: SignatureAlgorithm::EcdsaSha256,
                 public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
                 certificate_der: None,
                 name: Some("idp-signing".into()),
@@ -2495,7 +2490,7 @@ mod tests {
         config.named_keys.insert(
             "idp-signing".into(),
             VerificationKey {
-                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                algorithm: SignatureAlgorithm::EcdsaSha256,
                 public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
                 certificate_der: None,
                 name: Some("idp-signing".into()),
@@ -2520,7 +2515,7 @@ mod tests {
         config.named_keys.insert(
             "idp-signing".into(),
             VerificationKey {
-                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                algorithm: SignatureAlgorithm::EcdsaSha256,
                 public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
                 certificate_der: None,
                 name: Some("idp-signing".into()),
@@ -2544,7 +2539,7 @@ mod tests {
         config.named_keys.insert(
             "idp-signing".into(),
             VerificationKey {
-                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                algorithm: SignatureAlgorithm::EcdsaSha256,
                 public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
                 certificate_der: None,
                 name: Some("idp-signing".into()),
@@ -2578,7 +2573,7 @@ mod tests {
             config.named_keys.insert(
                 "idp-signing".into(),
                 VerificationKey {
-                    algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                    algorithm: SignatureAlgorithm::EcdsaSha256,
                     public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
                     certificate_der: None,
                     name: Some("idp-signing".into()),
@@ -2595,28 +2590,32 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_ec_curve_falls_back_to_later_key_name() {
-        // A valid P-384 key is unusable for an ECDSA-SHA256 signature but must not
-        // prevent a later P-256 KeyName from resolving the same document.
+    fn supported_ec_curve_does_not_fall_back_to_later_key_name() {
+        // ECDSA-SHA256 accepts P-384, so this first source is a usable key and
+        // must not be skipped merely because a later P-256 KeyName happens to
+        // verify the signature. Verification fails against the selected key.
         let key_info = r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:KeyValue><dsig11:ECKeyValue><dsig11:NamedCurve URI="urn:oid:1.3.132.0.34"/><dsig11:PublicKey>BO/yd/OZzDfjX4qivDY/vsUIuh6KWAxoxW5P4ukvwd+T6pVljWsX2UBJNNy5MdhTwB8e2YwB8kUbJwdsAS/XGi/fz8unFrs+lVlAgIs6s/xBYFbfUoRiAacD2SpVDe6XBA==</dsig11:PublicKey></dsig11:ECKeyValue></ds:KeyValue><ds:KeyName>idp-signing</ds:KeyName></ds:KeyInfo>"#;
         let xml = replace_key_info(SIGNED_SAML, key_info);
         let mut config = KeyResolverConfig::default();
         config.named_keys.insert(
             "idp-signing".into(),
             VerificationKey {
-                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                algorithm: SignatureAlgorithm::EcdsaSha256,
                 public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
                 certificate_der: None,
                 name: Some("idp-signing".into()),
             },
         );
         let resolver = DefaultKeyResolver::new(config);
-        let result = super::super::VerifyContext::new()
+        let error = super::super::VerifyContext::new()
             .key_resolver(&resolver)
             .verify(&xml)
-            .expect("later KeyName should resolve after mismatched ECKeyValue");
+            .expect_err("a usable first key source must not fall through after verification");
 
-        assert_eq!(result.status, super::super::DsigStatus::Valid);
+        assert!(matches!(
+            error,
+            DsigError::Crypto(super::super::SignatureVerificationError::InvalidSignatureFormat)
+        ));
     }
 
     #[test]
@@ -2635,17 +2634,17 @@ mod tests {
     }
 
     #[test]
-    fn lone_mismatched_ec_curve_reports_algorithm_mismatch() {
+    fn lone_supported_ec_curve_reaches_signature_verification() {
         let key_info = r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:KeyValue><dsig11:ECKeyValue><dsig11:NamedCurve URI="urn:oid:1.3.132.0.34"/><dsig11:PublicKey>BO/yd/OZzDfjX4qivDY/vsUIuh6KWAxoxW5P4ukvwd+T6pVljWsX2UBJNNy5MdhTwB8e2YwB8kUbJwdsAS/XGi/fz8unFrs+lVlAgIs6s/xBYFbfUoRiAacD2SpVDe6XBA==</dsig11:PublicKey></dsig11:ECKeyValue></ds:KeyValue></ds:KeyInfo>"#;
         let xml = replace_key_info(SIGNED_SAML, key_info);
         let error = super::super::VerifyContext::new()
             .key_resolver(&DefaultKeyResolver::default())
             .verify(&xml)
-            .expect_err("lone mismatched ECKeyValue should surface typed key error");
+            .expect_err("a supported EC curve must reach signature verification");
 
         assert!(matches!(
             error,
-            DsigError::KeyResolution(KeyResolutionError::AlgorithmMismatch)
+            DsigError::Crypto(super::super::SignatureVerificationError::InvalidSignatureFormat)
         ));
     }
 
@@ -2709,7 +2708,7 @@ mod tests {
         config.named_keys.insert(
             "mislabeled".into(),
             VerificationKey {
-                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                algorithm: SignatureAlgorithm::EcdsaSha256,
                 public_key_bytes: public_key_der(RSA_PUBLIC_KEY),
                 certificate_der: None,
                 name: Some("mislabeled".into()),
@@ -2738,7 +2737,7 @@ mod tests {
         config.named_keys.insert(
             "malformed".into(),
             VerificationKey {
-                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                algorithm: SignatureAlgorithm::EcdsaSha256,
                 public_key_bytes: vec![1, 2, 3],
                 certificate_der: None,
                 name: Some("malformed".into()),

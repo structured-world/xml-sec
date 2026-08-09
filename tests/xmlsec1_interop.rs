@@ -458,7 +458,7 @@ fn xmlsec1_verifies_ecdsa_signatures_from_xml_sec() {
 
     let p256_signed = signed_payload_xml(
         &p256_key,
-        &signing_builder(SignatureAlgorithm::EcdsaP256Sha256, DigestAlgorithm::Sha256),
+        &signing_builder(SignatureAlgorithm::EcdsaSha256, DigestAlgorithm::Sha256),
     );
     assert_xmlsec1_accepts(
         &p256_signed,
@@ -467,7 +467,7 @@ fn xmlsec1_verifies_ecdsa_signatures_from_xml_sec() {
 
     let p384_signed = signed_payload_xml(
         &p384_key,
-        &signing_builder(SignatureAlgorithm::EcdsaP384Sha384, DigestAlgorithm::Sha384),
+        &signing_builder(SignatureAlgorithm::EcdsaSha384, DigestAlgorithm::Sha384),
     );
     assert_xmlsec1_accepts(
         &p384_signed,

@@ -361,8 +361,8 @@ fn x509_signature_algorithm(oid: &str) -> Option<SignatureAlgorithm> {
         "1.2.840.113549.1.1.11" => Some(SignatureAlgorithm::RsaSha256),
         "1.2.840.113549.1.1.12" => Some(SignatureAlgorithm::RsaSha384),
         "1.2.840.113549.1.1.13" => Some(SignatureAlgorithm::RsaSha512),
-        "1.2.840.10045.4.3.2" => Some(SignatureAlgorithm::EcdsaP256Sha256),
-        "1.2.840.10045.4.3.3" => Some(SignatureAlgorithm::EcdsaP384Sha384),
+        "1.2.840.10045.4.3.2" => Some(SignatureAlgorithm::EcdsaSha256),
+        "1.2.840.10045.4.3.3" => Some(SignatureAlgorithm::EcdsaSha384),
         _ => None,
     }
 }
@@ -516,8 +516,60 @@ fn verify_crls(
 mod tests {
     use super::*;
     use crate::xmldsig::{KeyInfoSource, parse::XMLDSIG_NS, parse_key_info};
+    use p256::pkcs8::EncodePublicKey;
     use roxmltree::Document;
+    use sha2::{Digest, Sha256, Sha384};
+    use signature::hazmat::PrehashSigner;
     use std::time::Duration;
+
+    #[test]
+    fn x509_ecdsa_hash_oid_does_not_select_the_issuer_curve() {
+        // RFC 5758 signature OIDs select the digest while SubjectPublicKeyInfo
+        // selects the curve. Both non-default pairings must therefore reach
+        // the provider with the issuer's actual curve rather than a curve
+        // inferred from the hash OID.
+        let data = b"certificate tbs bytes";
+
+        let p384_key = p384::ecdsa::SigningKey::from_slice(&[0x42; 48])
+            .expect("fixed P-384 test key must be valid");
+        let p384_signature: p384::ecdsa::Signature = p384_key
+            .sign_prehash(&Sha256::digest(data))
+            .expect("P-384 must sign a SHA-256 prehash");
+        let p384_spki = p384_key
+            .verifying_key()
+            .to_public_key_der()
+            .expect("P-384 SPKI must encode");
+        assert!(
+            verify_x509_signature_with_provider(
+                "1.2.840.10045.4.3.2",
+                p384_signature.to_der().as_bytes(),
+                data,
+                p384_spki.as_bytes(),
+                crate::provider::default_provider(),
+            )
+            .expect("P-384 with SHA-256 must be a supported X.509 pairing")
+        );
+
+        let p256_key = p256::ecdsa::SigningKey::from_slice(&[0x24; 32])
+            .expect("fixed P-256 test key must be valid");
+        let p256_signature: p256::ecdsa::Signature = p256_key
+            .sign_prehash(&Sha384::digest(data))
+            .expect("P-256 must sign a SHA-384 prehash");
+        let p256_spki = p256_key
+            .verifying_key()
+            .to_public_key_der()
+            .expect("P-256 SPKI must encode");
+        assert!(
+            verify_x509_signature_with_provider(
+                "1.2.840.10045.4.3.3",
+                p256_signature.to_der().as_bytes(),
+                data,
+                p256_spki.as_bytes(),
+                crate::provider::default_provider(),
+            )
+            .expect("P-256 with SHA-384 must be a supported X.509 pairing")
+        );
+    }
 
     #[test]
     fn path_edge_signature_check_does_not_repeat_name_matching() {

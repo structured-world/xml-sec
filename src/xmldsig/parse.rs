@@ -87,15 +87,10 @@ pub enum SignatureAlgorithm {
     RsaSha384,
     /// RSA with SHA-512.
     RsaSha512,
-    /// ECDSA P-256 with SHA-256.
-    EcdsaP256Sha256,
-    /// XMLDSig `ecdsa-sha384` URI.
-    ///
-    /// The variant name is historical.
-    ///
-    /// Verification currently accepts this XMLDSig URI for P-384 and for the
-    /// donor P-521 interop case.
-    EcdsaP384Sha384,
+    /// ECDSA with SHA-256; the key selects the elliptic curve.
+    EcdsaSha256,
+    /// ECDSA with SHA-384; the key selects the elliptic curve.
+    EcdsaSha384,
 }
 
 impl SignatureAlgorithm {
@@ -109,8 +104,8 @@ impl SignatureAlgorithm {
             "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256" => Some(Self::RsaSha256),
             "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384" => Some(Self::RsaSha384),
             "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512" => Some(Self::RsaSha512),
-            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256" => Some(Self::EcdsaP256Sha256),
-            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384" => Some(Self::EcdsaP384Sha384),
+            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256" => Some(Self::EcdsaSha256),
+            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384" => Some(Self::EcdsaSha384),
             _ => None,
         }
     }
@@ -125,8 +120,8 @@ impl SignatureAlgorithm {
             Self::RsaSha256 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
             Self::RsaSha384 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384",
             Self::RsaSha512 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512",
-            Self::EcdsaP256Sha256 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
-            Self::EcdsaP384Sha384 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
+            Self::EcdsaSha256 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
+            Self::EcdsaSha384 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
         }
     }
 
@@ -2236,7 +2231,7 @@ mod tests {
     fn signature_algorithm_from_uri_ecdsa_sha256() {
         assert_eq!(
             SignatureAlgorithm::from_uri("http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"),
-            Some(SignatureAlgorithm::EcdsaP256Sha256)
+            Some(SignatureAlgorithm::EcdsaSha256)
         );
     }
 
@@ -2257,8 +2252,8 @@ mod tests {
             SignatureAlgorithm::RsaSha256,
             SignatureAlgorithm::RsaSha384,
             SignatureAlgorithm::RsaSha512,
-            SignatureAlgorithm::EcdsaP256Sha256,
-            SignatureAlgorithm::EcdsaP384Sha384,
+            SignatureAlgorithm::EcdsaSha256,
+            SignatureAlgorithm::EcdsaSha384,
         ] {
             assert_eq!(
                 SignatureAlgorithm::from_uri(algo.uri()),
@@ -2274,7 +2269,7 @@ mod tests {
         assert!(!SignatureAlgorithm::HmacSha1.signing_allowed());
         assert!(!SignatureAlgorithm::RsaSha1.signing_allowed());
         assert!(SignatureAlgorithm::RsaSha256.signing_allowed());
-        assert!(SignatureAlgorithm::EcdsaP256Sha256.signing_allowed());
+        assert!(SignatureAlgorithm::EcdsaSha256.signing_allowed());
     }
 
     // ── find_signature_node ──────────────────────────────────────────
@@ -4012,7 +4007,7 @@ BA== </Modulus>
         let doc = Document::parse(xml).unwrap();
         let si = parse_signed_info(doc.root_element()).unwrap();
 
-        assert_eq!(si.signature_method, SignatureAlgorithm::EcdsaP256Sha256);
+        assert_eq!(si.signature_method, SignatureAlgorithm::EcdsaSha256);
         assert_eq!(si.references.len(), 2);
         assert_eq!(si.references[0].uri.as_deref(), Some("#a"));
         assert_eq!(si.references[0].digest_method, DigestAlgorithm::Sha256);

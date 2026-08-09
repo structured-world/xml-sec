@@ -13,9 +13,10 @@ use roxmltree::{Document, Node};
 use rsa::RsaPrivateKey;
 use rsa::pkcs1v15::Signature as RsaPkcs1v15Signature;
 use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
-use rsa::signature::{RandomizedSigner, SignatureEncoding, Signer};
+use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use rsa::traits::PublicKeyParts;
-use sha2::{Sha256, Sha384, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
+use signature::hazmat::PrehashSigner;
 use std::collections::HashSet;
 use x509_parser::prelude::FromDer;
 
@@ -438,14 +439,18 @@ impl SigningKey for EcdsaP256SigningKey {
         algorithm: SignatureAlgorithm,
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
-        if algorithm != SignatureAlgorithm::EcdsaP256Sha256 {
-            return Err(SigningKeyError::UnsupportedAlgorithm {
-                uri: algorithm.uri().to_string(),
-            });
-        }
+        let prehash = match algorithm {
+            SignatureAlgorithm::EcdsaSha256 => Sha256::digest(canonical_signed_info).to_vec(),
+            SignatureAlgorithm::EcdsaSha384 => Sha384::digest(canonical_signed_info).to_vec(),
+            _ => {
+                return Err(SigningKeyError::UnsupportedAlgorithm {
+                    uri: algorithm.uri().to_string(),
+                });
+            }
+        };
         let signature: P256Signature = self
             .key
-            .try_sign(canonical_signed_info)
+            .sign_prehash(&prehash)
             .map_err(|_| SigningKeyError::SigningFailed)?;
         Ok(signature.to_bytes().to_vec())
     }
@@ -490,14 +495,18 @@ impl SigningKey for EcdsaP384SigningKey {
         algorithm: SignatureAlgorithm,
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
-        if algorithm != SignatureAlgorithm::EcdsaP384Sha384 {
-            return Err(SigningKeyError::UnsupportedAlgorithm {
-                uri: algorithm.uri().to_string(),
-            });
-        }
+        let prehash = match algorithm {
+            SignatureAlgorithm::EcdsaSha256 => Sha256::digest(canonical_signed_info).to_vec(),
+            SignatureAlgorithm::EcdsaSha384 => Sha384::digest(canonical_signed_info).to_vec(),
+            _ => {
+                return Err(SigningKeyError::UnsupportedAlgorithm {
+                    uri: algorithm.uri().to_string(),
+                });
+            }
+        };
         let signature: P384Signature = self
             .key
-            .try_sign(canonical_signed_info)
+            .sign_prehash(&prehash)
             .map_err(|_| SigningKeyError::SigningFailed)?;
         Ok(signature.to_bytes().to_vec())
     }

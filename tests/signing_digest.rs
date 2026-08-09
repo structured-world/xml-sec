@@ -141,23 +141,14 @@ fn signing_keys_reject_unsupported_signature_algorithms() {
         "tests/fixtures/keys/ec/ec-prime256v1-key.pem",
     ))
     .expect("P-256 private key fixture must parse");
-    let p384_key = EcdsaP384SigningKey::from_pkcs8_pem(&read_fixture(
-        "tests/fixtures/keys/ec/ec-prime384v1-key.pem",
-    ))
-    .expect("P-384 private key fixture must parse");
-
     for (result, expected_uri) in [
         (
-            rsa_key.sign(SignatureAlgorithm::EcdsaP256Sha256, b"signed-info"),
-            SignatureAlgorithm::EcdsaP256Sha256.uri(),
+            rsa_key.sign(SignatureAlgorithm::EcdsaSha256, b"signed-info"),
+            SignatureAlgorithm::EcdsaSha256.uri(),
         ),
         (
             p256_key.sign(SignatureAlgorithm::RsaSha256, b"signed-info"),
             SignatureAlgorithm::RsaSha256.uri(),
-        ),
-        (
-            p384_key.sign(SignatureAlgorithm::EcdsaP256Sha256, b"signed-info"),
-            SignatureAlgorithm::EcdsaP256Sha256.uri(),
         ),
     ] {
         assert!(matches!(
@@ -872,7 +863,7 @@ fn signs_ecdsa_p256_template_and_verifies_round_trip() {
     ))
     .expect("P-256 private key fixture must parse");
     let public_key_pem = read_fixture("tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem");
-    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaP256Sha256)
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaSha256)
         .add_reference(
             ReferenceBuilder::new(DigestAlgorithm::Sha256)
                 .uri("#payload")
@@ -902,7 +893,7 @@ fn signs_ecdsa_p384_template_and_verifies_round_trip() {
     ))
     .expect("P-384 private key fixture must parse");
     let public_key_pem = read_fixture("tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem");
-    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaP384Sha384)
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaSha384)
         .add_reference(
             ReferenceBuilder::new(DigestAlgorithm::Sha384)
                 .uri("#payload")
@@ -921,6 +912,52 @@ fn signs_ecdsa_p384_template_and_verifies_round_trip() {
     assert_eq!(verify_result.status, DsigStatus::Valid);
     assert!(signed.contains("<SignatureValue>"));
     assert!(!signed.contains("<DigestValue></DigestValue>"));
+}
+
+#[test]
+fn signs_ecdsa_with_digest_independent_of_curve() {
+    // XMLDSig SignatureMethod selects the hash; the signing key selects the
+    // curve and SignatureValue width. Exercise both non-default pairings
+    // through the complete template, signing, and verification pipeline.
+    let p256_key = EcdsaP256SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime256v1-key.pem",
+    ))
+    .expect("P-256 private key fixture must parse");
+    let p384_key = EcdsaP384SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime384v1-key.pem",
+    ))
+    .expect("P-384 private key fixture must parse");
+    let cases: [(&dyn SigningKey, SignatureAlgorithm, &str); 2] = [
+        (
+            &p384_key,
+            SignatureAlgorithm::EcdsaSha256,
+            "tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem",
+        ),
+        (
+            &p256_key,
+            SignatureAlgorithm::EcdsaSha384,
+            "tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem",
+        ),
+    ];
+
+    for (key, algorithm, public_key_path) in cases {
+        let builder = SignatureBuilder::new(exclusive_c14n(), algorithm).add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+        let signed = SignContext::new(key)
+            .sign_with_builder(
+                "<root><payload ID=\"payload\">hello</payload></root>",
+                &builder,
+            )
+            .expect("curve-independent ECDSA signing must succeed");
+        let public_key_pem = read_fixture(public_key_path);
+        let result = verify_signature_with_pem_key(&signed, &public_key_pem, true)
+            .expect("curve-independent ECDSA verification must run");
+
+        assert_eq!(result.status, DsigStatus::Valid, "{}", algorithm.uri());
+    }
 }
 
 #[test]

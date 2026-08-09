@@ -40,6 +40,8 @@ fn xmlsec11_expected(path: &Path) -> ExpectedOutcome {
         .unwrap_or_default();
     match name {
         "signature-enveloping-p256_sha256.xml"
+        | "signature-enveloping-p256_sha384.xml"
+        | "signature-enveloping-p384_sha256.xml"
         | "signature-enveloping-p384_sha384.xml"
         | "signature-enveloping-derencoded-ec.xml" => ExpectedOutcome::Valid,
         name if name.contains("hmac") => ExpectedOutcome::Unsupported("HMAC signature method"),
@@ -119,10 +121,10 @@ fn donor_interop_vectors_have_explicit_pass_or_fail_closed_accounting() {
         }
     }
 
-    assert_eq!(valid, 3, "all supported ECKeyValue vectors must verify");
+    assert_eq!(valid, 5, "all supported ECKeyValue vectors must verify");
     assert_eq!(
         unsupported.len(),
-        51,
+        49,
         "all remaining vectors must be accounted for"
     );
 }

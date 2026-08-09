@@ -3,7 +3,8 @@
 The `xmldsig` feature provides signing and verification pipelines for same-document XML
 signatures and detached references whose payloads the caller supplies. It supports inclusive and
 exclusive canonicalization, enveloped signatures,
-Base64, XPath 1.0, and XPath Filter 2.0 transforms, RSA PKCS#1 v1.5, ECDSA P-256/P-384,
+Base64, XPath 1.0, and XPath Filter 2.0 transforms, RSA PKCS#1 v1.5, ECDSA SHA-256/SHA-384
+with P-256/P-384/P-521 verification keys,
 DSA-SHA1 and HMAC-SHA1 verification, embedded X.509 certificates, and configured key
 resolution.
 
@@ -117,7 +118,9 @@ reported as an invalid per-reference result without changing core `SignedInfo` v
 ## Current Scope
 
 Implemented algorithms include RSA PKCS#1 v1.5 with SHA-1/SHA-256/SHA-384/SHA-512 for
-verification, SHA-256/SHA-384/SHA-512 for signing, and ECDSA P-256/SHA-256 and P-384/SHA-384.
+verification, SHA-256/SHA-384/SHA-512 for signing, and ECDSA with SHA-256 or SHA-384. ECDSA
+verification selects P-256, P-384, or P-521 from the SPKI independently of the hash identifier;
+the built-in P-256 and P-384 signing keys support either ECDSA hash identifier.
 DSA-SHA1 and HMAC-SHA1 (including XMLDSig's byte-aligned 80-160-bit truncation range) are
 verify-only legacy algorithms.
 DSA-SHA256, broader HMAC verification/signing, RSA-PSS, and implicit external resource loading are

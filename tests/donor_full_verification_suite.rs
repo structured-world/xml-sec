@@ -84,7 +84,7 @@ fn cases() -> Vec<VectorCase> {
             expectation: Expectation::Named {
                 key_name: "TestKeyName-ec-prime256v1",
                 key_path: "tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem",
-                algorithm: SignatureAlgorithm::EcdsaP256Sha256,
+                algorithm: SignatureAlgorithm::EcdsaSha256,
             },
         },
         VectorCase {
@@ -93,7 +93,7 @@ fn cases() -> Vec<VectorCase> {
             expectation: Expectation::Named {
                 key_name: "TestKeyName-ec-prime521v1",
                 key_path: "tests/fixtures/keys/ec/ec-prime521v1-pubkey.pem",
-                algorithm: SignatureAlgorithm::EcdsaP384Sha384,
+                algorithm: SignatureAlgorithm::EcdsaSha384,
             },
         },
         VectorCase {

@@ -2001,7 +2001,7 @@ fn verify_with_algorithm(
             signed_data,
             signature_value,
         )?),
-        SignatureAlgorithm::EcdsaP256Sha256 | SignatureAlgorithm::EcdsaP384Sha384 => {
+        SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384 => {
             // Malformed ECDSA signature bytes are treated as a verification miss
             // (Ok(false)) instead of a pipeline error; only key/algorithm and
             // crypto-operation failures propagate as Err.

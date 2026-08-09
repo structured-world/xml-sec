@@ -43,9 +43,9 @@ Currently implemented (core paths):
 - XMLDSig signing KeyInfo writer for embedded X.509 certificates
 - Built-in verification-key resolution from embedded X.509/DER/`KeyValue` sources and configured `KeyName`, X.509 subject, issuer/serial, SKI, or digest selectors
 - RSA PKCS#1 v1.5 verification helpers for SHA-1 / SHA-256 / SHA-384 / SHA-512
-- ECDSA verification helpers for P-256/SHA-256 and P-384/SHA-384
+- ECDSA SHA-256/SHA-384 verification for P-256, P-384, and P-521 keys
 - Legacy DSA-SHA1 and HMAC-SHA1 verification, including truncated HMAC output
-- RSA PKCS#1 v1.5 and ECDSA P-256/P-384 signing from PKCS#8 private keys
+- RSA PKCS#1 v1.5 and ECDSA SHA-256/SHA-384 signing with P-256/P-384 PKCS#8 keys
 - Opt-in X.509 certificate-chain validation with explicit trust anchors, validity checks, CA constraints, and authenticated CRLs
 - Caller-supplied external references and X.509 `RetrievalMethod` resolution with bounded RFC 3986 `xml:base` processing and no implicit I/O
 - XMLEnc AES-128/256-CBC and AES-128/256-GCM encryption/decryption with direct
