@@ -9,12 +9,73 @@
 //! This module provides a minimal RFC 3986 relative URI resolver — just
 //! enough for `xml:base` fixup. It is NOT a general-purpose URI library.
 
+use std::cell::Cell;
+
 use roxmltree::Node;
 
 use super::NodeVisibility;
 
 /// The XML namespace URI.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+
+/// Deterministic limits shared by XML Base consumers in one operation.
+pub(crate) struct XmlBaseResolutionBudget {
+    remaining_bytes: Cell<usize>,
+    max_bytes: usize,
+    max_components: usize,
+}
+
+impl Default for XmlBaseResolutionBudget {
+    fn default() -> Self {
+        Self::with_limits(
+            crate::hard_limits::XML_BASE_COMPONENT_CEILING,
+            crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING,
+        )
+    }
+}
+
+impl XmlBaseResolutionBudget {
+    pub(crate) fn with_limits(max_components: usize, max_bytes: usize) -> Self {
+        Self {
+            remaining_bytes: Cell::new(max_bytes),
+            max_bytes,
+            max_components,
+        }
+    }
+
+    fn check_components(&self, actual: usize) -> Result<(), XmlBaseResolutionError> {
+        if actual > self.max_components {
+            return Err(XmlBaseResolutionError::Components {
+                maximum: self.max_components,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    fn charge_bytes(&self, bytes: usize) -> Result<(), XmlBaseResolutionError> {
+        let remaining = self.remaining_bytes.get();
+        let Some(next) = remaining.checked_sub(bytes) else {
+            self.remaining_bytes.set(0);
+            return Err(XmlBaseResolutionError::Bytes {
+                maximum: self.max_bytes,
+                actual: self
+                    .max_bytes
+                    .saturating_add(bytes.saturating_sub(remaining)),
+            });
+        };
+        self.remaining_bytes.set(next);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum XmlBaseResolutionError {
+    #[error("XML Base resolution exceeds maximum of {maximum} inherited components: got {actual}")]
+    Components { maximum: usize, actual: usize },
+    #[error("XML Base resolution exceeds cumulative maximum of {maximum} bytes: got {actual}")]
+    Bytes { maximum: usize, actual: usize },
+}
 
 /// Compute the effective `xml:base` for an element by resolving the ancestor
 /// chain per [RFC 3986 §5](https://www.rfc-editor.org/rfc/rfc3986#section-5).
@@ -34,6 +95,7 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 ///
 /// Returns `None` if the considered ancestor chain has no non-empty
 /// `xml:base` attribute.
+#[cfg(test)]
 pub(crate) fn compute_effective_xml_base(
     start: Node<'_, '_>,
     visibility: Option<&dyn NodeVisibility>,
@@ -69,6 +131,62 @@ pub(crate) fn compute_effective_xml_base(
         effective = resolve_uri(&effective, relative);
     }
     Some(effective)
+}
+
+/// Budgeted form used for attacker-controlled XMLDSig URI resolution.
+pub(crate) fn compute_effective_xml_base_with_budget(
+    start: Node<'_, '_>,
+    visibility: Option<&dyn NodeVisibility>,
+    budget: &XmlBaseResolutionBudget,
+) -> Result<Option<String>, XmlBaseResolutionError> {
+    let mut bases: Vec<&str> = Vec::new();
+    let mut current = Some(start);
+    while let Some(node) = current {
+        if node.is_element() {
+            let base = xml_base_value(node);
+            if let Some(set) = visibility
+                && preserves_xml_base_context(node, set)
+            {
+                break;
+            }
+            if let Some(base) = base {
+                let component_count = bases.len().saturating_add(1);
+                budget.check_components(component_count)?;
+                budget.charge_bytes(base.len())?;
+                bases.push(base);
+            }
+        }
+        current = node.parent();
+    }
+
+    let Some(first) = bases.pop() else {
+        return Ok(None);
+    };
+    budget.charge_bytes(first.len())?;
+    let mut effective = first.to_owned();
+    for relative in bases.into_iter().rev() {
+        effective = resolve_uri_with_budget(&effective, relative, budget)?;
+    }
+    Ok(Some(effective))
+}
+
+pub(crate) fn resolve_uri_with_budget(
+    base: &str,
+    reference: &str,
+    budget: &XmlBaseResolutionBudget,
+) -> Result<String, XmlBaseResolutionError> {
+    let input_bytes = base
+        .len()
+        .checked_add(reference.len())
+        .and_then(|bytes| bytes.checked_add(1))
+        .ok_or(XmlBaseResolutionError::Bytes {
+            maximum: budget.max_bytes,
+            actual: usize::MAX,
+        })?;
+    budget.charge_bytes(input_bytes)?;
+    let resolved = resolve_uri(base, reference);
+    budget.charge_bytes(resolved.len())?;
+    Ok(resolved)
 }
 
 /// Whether a selected element establishes its source `xml:base` context in the

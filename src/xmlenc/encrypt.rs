@@ -1137,6 +1137,26 @@ mod tests {
     }
 
     #[test]
+    fn zero_resource_ceilings_allow_operations_that_consume_none() {
+        // Zero is deny-all, not an invalid policy. Direct-key encryption has no
+        // recipients, and an empty binary payload consumes no plaintext bytes.
+        let policy = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_encryption_plaintext_bytes: 0,
+                max_encryption_recipients: 0,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy)
+            .encrypt_binary(&[])
+            .expect("zero ceilings must allow resources the operation does not consume");
+    }
+
+    #[test]
     fn element_plaintext_enforces_replacement_node_contract() {
         // Element ciphertext must be safe for the reciprocal document replacement:
         // boundary whitespace/comments are harmless, but processing instructions are not.

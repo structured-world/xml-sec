@@ -30,7 +30,7 @@ use super::parse::{
     RetrievalMethodTransforms, SignatureAlgorithm, XMLDSIG_NS,
 };
 use super::parse::{
-    parse_key_info_with_provider, parse_reference_with_xpath_budget,
+    parse_key_info_with_provider_and_xml_base_budget, parse_reference_with_xpath_budget,
     parse_signed_info_with_xpath_budget, parse_x509_certificate,
     parse_x509_data_dispatch_with_budget_and_provider, reference_digest_method,
 };
@@ -639,6 +639,7 @@ fn process_reference_with_options(
                     uri,
                     node,
                     execution.transform_budget.node_set_materialization(),
+                    execution.transform_budget.xml_base_resolution(),
                 )
             },
         )
@@ -959,6 +960,7 @@ fn verify_signature_with_context(
             entity_resolver: None,
         },
     )?;
+    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
     let mut signatures = doc.descendants().filter(|node| {
         node.is_element()
             && node.tag_name().name() == "Signature"
@@ -988,7 +990,13 @@ fn verify_signature_with_context(
     let mut key_info = if should_parse_key_info {
         signature_children
             .key_info_node
-            .map(|node| parse_key_info_with_provider(node, ctx.provider))
+            .map(|node| {
+                parse_key_info_with_provider_and_xml_base_budget(
+                    node,
+                    ctx.provider,
+                    execution_budget.xml_base_resolution(),
+                )
+            })
             .transpose()
             .map_err(SignatureVerificationPipelineError::ParseKeyInfo)?
     } else {
@@ -1081,7 +1089,6 @@ fn verify_signature_with_context(
     } else {
         RetrievalMaterialization::default()
     };
-    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
     let canonicalized_data_budget =
         CanonicalizedDataBudget::with_limit(ctx.policy.resources.max_canonicalized_bytes);
     let execution = ReferenceExecutionContext {
@@ -2572,6 +2579,57 @@ mod tests {
         assert!(matches!(
             err,
             SignatureVerificationPipelineError::DisallowedUri { .. }
+        ));
+    }
+
+    #[test]
+    fn verify_context_bounds_effective_xml_base_components() {
+        // External URI resolution must stop before repeatedly copying an
+        // attacker-controlled chain of effective XML Base values.
+        let mut xml = minimal_signature_xml("payload", "");
+        for _ in 0..65 {
+            xml = format!(r#"<n xml:base="segment/">{xml}</n>"#);
+        }
+        let resources = HashMap::new();
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .allowed_uri_types(UriTypeSet::ALL)
+            .external_resources(&resources)
+            .verify(&xml)
+            .expect_err("XML Base component work must be bounded before lookup");
+
+        assert!(
+            error.to_string().contains("XML Base resolution"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn verify_context_bounds_cumulative_xml_base_resolution_bytes() {
+        // The operation-wide byte budget charges intermediate URI copies, not
+        // merely the small final external resource returned by the caller map.
+        let mut xml = minimal_signature_xml("payload", "");
+        for _ in 0..2 {
+            xml = format!(r#"<n xml:base="segment/">{xml}</n>"#);
+        }
+        let resources = HashMap::new();
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xml_base_resolution_bytes = 32;
+        let error = VerifyContext::new()
+            .policy(policy)
+            .key(&AcceptingKey)
+            .allowed_uri_types(UriTypeSet::ALL)
+            .external_resources(&resources)
+            .verify(&xml)
+            .expect_err("cumulative XML Base copies must obey the operation budget");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Reference(
+                ReferenceProcessingError::UriDereference(
+                    TransformError::XmlBaseResolutionTooLarge { max_bytes: 32, .. }
+                )
+            )
         ));
     }
 

@@ -17,7 +17,10 @@ use std::collections::{HashMap, HashSet};
 
 use roxmltree::{Document, Node, NodeId};
 
-use crate::c14n::xml_base::{compute_effective_xml_base, resolve_uri};
+use crate::c14n::xml_base::{
+    XmlBaseResolutionBudget, XmlBaseResolutionError, compute_effective_xml_base_with_budget,
+    resolve_uri_with_budget,
+};
 
 use super::types::{NodeSet, NodeSetMaterializationBudget, TransformData, TransformError};
 
@@ -165,15 +168,20 @@ impl<'a> UriReferenceResolver<'a> {
         uri: &str,
         origin: Node<'_, '_>,
         budget: &NodeSetMaterializationBudget,
+        xml_base_budget: &XmlBaseResolutionBudget,
     ) -> Result<TransformData<'a>, TransformError> {
         // XMLDSig assigns special dereference semantics to lexical empty and
         // fragment-only references. Only external references use XML Base.
         if uri.is_empty() || uri.starts_with('#') {
             return self.dereference_with_budget(uri, budget);
         }
-        let resolved = compute_effective_xml_base(origin, None)
-            .map(|base| resolve_uri(&base, uri))
-            .unwrap_or_else(|| uri.to_owned());
+        let resolved = match compute_effective_xml_base_with_budget(origin, None, xml_base_budget)
+            .map_err(map_xml_base_resolution_error)?
+        {
+            Some(base) => resolve_uri_with_budget(&base, uri, xml_base_budget)
+                .map_err(map_xml_base_resolution_error)?,
+            None => uri.to_owned(),
+        };
         self.dereference_with_budget(&resolved, budget)
     }
 
@@ -297,6 +305,23 @@ impl<'a> UriReferenceResolver<'a> {
     /// Get the number of registered IDs.
     pub fn id_count(&self) -> usize {
         self.id_map.len()
+    }
+}
+
+fn map_xml_base_resolution_error(error: XmlBaseResolutionError) -> TransformError {
+    match error {
+        XmlBaseResolutionError::Components { maximum, actual } => {
+            TransformError::XmlBaseComponentsTooLarge {
+                max: maximum,
+                actual,
+            }
+        }
+        XmlBaseResolutionError::Bytes { maximum, actual } => {
+            TransformError::XmlBaseResolutionTooLarge {
+                max_bytes: maximum,
+                actual,
+            }
+        }
     }
 }
 
@@ -562,10 +587,16 @@ mod tests {
             b"payload".to_vec(),
         )]);
         let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
         let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
 
         let data = resolver
-            .dereference_from_with_budget(reference.attribute("URI").unwrap(), reference, &budget)
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
             .unwrap();
 
         assert_eq!(data.into_binary().unwrap(), b"payload");
@@ -585,10 +616,16 @@ mod tests {
             .unwrap();
         let resources = HashMap::from([("data.bin".to_owned(), b"payload".to_vec())]);
         let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
         let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
 
         let data = resolver
-            .dereference_from_with_budget(reference.attribute("URI").unwrap(), reference, &budget)
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
             .unwrap();
 
         assert_eq!(data.into_binary().unwrap(), b"payload");
@@ -608,10 +645,16 @@ mod tests {
             .unwrap();
         let resources = HashMap::from([("/data.bin".to_owned(), b"payload".to_vec())]);
         let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
         let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
 
         let data = resolver
-            .dereference_from_with_budget(reference.attribute("URI").unwrap(), reference, &budget)
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
             .unwrap();
 
         assert_eq!(data.into_binary().unwrap(), b"payload");
@@ -631,10 +674,16 @@ mod tests {
             .unwrap();
         let resources = HashMap::from([("//cdn.example/data.bin".to_owned(), b"payload".to_vec())]);
         let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
         let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
 
         let data = resolver
-            .dereference_from_with_budget(reference.attribute("URI").unwrap(), reference, &budget)
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
             .unwrap();
 
         assert_eq!(data.into_binary().unwrap(), b"payload");
@@ -657,10 +706,16 @@ mod tests {
             b"payload".to_vec(),
         )]);
         let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
         let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
 
         let data = resolver
-            .dereference_from_with_budget(reference.attribute("URI").unwrap(), reference, &budget)
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
             .unwrap();
 
         assert_eq!(data.into_binary().unwrap(), b"payload");
@@ -678,10 +733,16 @@ mod tests {
             .unwrap();
         let resources = HashMap::from([("urn:payload".to_owned(), b"payload".to_vec())]);
         let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
         let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
 
         let data = resolver
-            .dereference_from_with_budget(reference.attribute("URI").unwrap(), reference, &budget)
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
             .unwrap();
 
         assert_eq!(data.into_binary().unwrap(), b"payload");

@@ -46,8 +46,8 @@ Currently implemented (core paths):
 - ECDSA verification helpers for P-256/SHA-256 and P-384/SHA-384
 - Legacy DSA-SHA1 and HMAC-SHA1 verification, including truncated HMAC output
 - RSA PKCS#1 v1.5 and ECDSA P-256/P-384 signing from PKCS#8 private keys
-- Opt-in X.509 certificate-chain validation with explicit trust anchors, validity checks, CA constraints, and CRLs
-- Caller-supplied, bounded external references and X.509 `RetrievalMethod` resolution without implicit I/O
+- Opt-in X.509 certificate-chain validation with explicit trust anchors, validity checks, CA constraints, and authenticated CRLs
+- Caller-supplied external references and X.509 `RetrievalMethod` resolution with bounded RFC 3986 `xml:base` processing and no implicit I/O
 - XMLEnc AES-128/256-CBC and AES-128/256-GCM encryption/decryption with direct
   keys, RSA-OAEP key transport, AES-128/256-KW, multiple recipients, and
   Element/Content document replacement; document, node, and aggregate recipient

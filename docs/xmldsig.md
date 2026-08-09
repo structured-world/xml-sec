@@ -88,12 +88,18 @@ payloads never implicitly allows external key material. `RetrievalMethod` curren
 untransformed external `rawX509Certificate` data, untransformed direct same-document `X509Data`,
 and the Merlin same-document `X509Data` XPath selection. Relative external `Reference` and
 `RetrievalMethod` URIs are resolved against the owning element's effective `xml:base` using RFC
-3986 before lookup, so resource-map keys must use that resolved URI. Other retrieval transform
-chains fail closed instead of being ignored.
+3986 before lookup, so resource-map keys must use that resolved URI. The compiled resource policy
+bounds both inherited `xml:base` components and cumulative URI-resolution bytes across external
+References, `RetrievalMethod`, and C14N 1.1 fixup; implementation ceilings are 64 components and
+1 MiB per operation. Other retrieval transform chains fail closed instead of being ignored.
 `VerifyContext::allowed_transforms` applies to Reference transforms and implicit C14N,
 the declared SignedInfo canonicalization method, and supported RetrievalMethod transforms.
 Allowing XPath for signed payload processing therefore also explicitly permits the bounded
 Merlin X509Data retrieval selector; omitting XPath rejects that key-retrieval path.
+
+CRL checking is meaningful only inside authenticated X.509 path validation. A policy that enables
+CRLs without enabling certificate-chain validation is rejected during context construction rather
+than silently accepting a control the resolver cannot enforce.
 
 Internal DTD declarations are disabled by default and require
 `VerifyContext::allow_internal_dtd(true)`. The policy applies consistently to the signed document

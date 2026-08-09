@@ -714,6 +714,24 @@ pub enum TransformError {
     #[error("XML transform input exceeds the configured node limit")]
     XmlNodeLimit,
 
+    /// Effective XML Base resolution crossed too many inherited attributes.
+    #[error("XML Base resolution exceeds maximum of {max} inherited components: got {actual}")]
+    XmlBaseComponentsTooLarge {
+        /// Maximum inherited components permitted by the operation policy.
+        max: usize,
+        /// Number of inherited components encountered.
+        actual: usize,
+    },
+
+    /// Effective XML Base resolution exhausted its cumulative byte budget.
+    #[error("XML Base resolution exceeds cumulative maximum of {max_bytes} bytes: got {actual}")]
+    XmlBaseResolutionTooLarge {
+        /// Maximum cumulative bytes permitted by the operation policy.
+        max_bytes: usize,
+        /// Conservatively charged cumulative byte count.
+        actual: usize,
+    },
+
     /// The Signature node passed to the enveloped transform belongs to a
     /// different `Document` than the input `NodeSet`.
     #[error("enveloped-signature transform: invalid Signature node for this document")]

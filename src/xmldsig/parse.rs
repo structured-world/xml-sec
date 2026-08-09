@@ -35,7 +35,9 @@ use super::whitespace::{
 };
 use super::x509::certificate_signature_matches;
 use crate::c14n::C14nAlgorithm;
-use crate::c14n::xml_base::{compute_effective_xml_base, resolve_uri};
+use crate::c14n::xml_base::{
+    XmlBaseResolutionBudget, compute_effective_xml_base_with_budget, resolve_uri_with_budget,
+};
 
 /// XMLDSig namespace URI.
 pub(crate) const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
@@ -620,6 +622,15 @@ pub(crate) fn parse_key_info_with_provider(
     key_info_node: Node,
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<KeyInfo, ParseError> {
+    let xml_base_budget = XmlBaseResolutionBudget::default();
+    parse_key_info_with_provider_and_xml_base_budget(key_info_node, provider, &xml_base_budget)
+}
+
+pub(crate) fn parse_key_info_with_provider_and_xml_base_budget(
+    key_info_node: Node,
+    provider: &dyn crate::provider::CryptoProvider,
+    xml_base_budget: &XmlBaseResolutionBudget,
+) -> Result<KeyInfo, ParseError> {
     verify_ds_element(key_info_node, "KeyInfo")?;
     ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
 
@@ -665,9 +676,13 @@ pub(crate) fn parse_key_info_with_provider(
                 } else {
                     // RetrievalMethod is parsed independently from later key
                     // materialization, so retain its resolved resource identity.
-                    compute_effective_xml_base(child, None)
-                        .map(|base| resolve_uri(&base, lexical_uri))
-                        .unwrap_or_else(|| lexical_uri.to_owned())
+                    match compute_effective_xml_base_with_budget(child, None, xml_base_budget)
+                        .map_err(|error| ParseError::InvalidStructure(error.to_string()))?
+                    {
+                        Some(base) => resolve_uri_with_budget(&base, lexical_uri, xml_base_budget)
+                            .map_err(|error| ParseError::InvalidStructure(error.to_string()))?,
+                        None => lexical_uri.to_owned(),
+                    }
                 };
                 let resource_type = child.attribute("Type");
                 if resource_type.is_some_and(|value| value.len() > MAX_KEY_NAME_TEXT_LEN) {
@@ -3585,6 +3600,28 @@ BA== </Modulus>
             parse_key_info(document.root_element()),
             Err(ParseError::InvalidStructure(reason))
                 if reason == "RetrievalMethod Type exceeds maximum length"
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_bounds_retrieval_method_xml_base_chain() {
+        // RetrievalMethod resolves its resource identity during parsing, so it
+        // must use the same bounded XML Base algorithm as Reference lookup.
+        let mut xml =
+            format!(r#"<KeyInfo xmlns="{XMLDSIG_NS}"><RetrievalMethod URI="key.der"/></KeyInfo>"#);
+        for _ in 0..65 {
+            xml = format!(r#"<n xml:base="segment/">{xml}</n>"#);
+        }
+        let document = Document::parse(&xml).unwrap();
+        let key_info = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .unwrap();
+
+        assert!(matches!(
+            parse_key_info(key_info),
+            Err(ParseError::InvalidStructure(reason))
+                if reason.contains("XML Base resolution")
         ));
     }
 

@@ -1074,6 +1074,31 @@ mod tests {
     }
 
     #[test]
+    fn resolver_rejects_crl_checking_without_chain_validation() {
+        // CRL authentication is part of path validation. A resolver must not
+        // accept a configuration that would silently skip the requested check.
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![certificate_der(RSA_4096_CERTIFICATE)],
+            trust: crate::policy::KeyTrustPolicy {
+                check_crls: true,
+                ..crate::policy::KeyTrustPolicy::default()
+            },
+            ..KeyResolverConfig::default()
+        });
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .verify(&x509_signature_with_leaf_subject())
+            .expect_err("CRL-only trust policy must fail before certificate use");
+
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::KeyTrust {
+                reason: "CRL checking requires X.509 chain validation"
+            })
+        ));
+    }
+
+    #[test]
     fn hmac_key_rejects_empty_secret_and_wrong_algorithm() {
         // HMAC secrets are caller-owned and cannot be reused as asymmetric keys.
         assert!(matches!(

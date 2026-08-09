@@ -61,6 +61,10 @@ pub struct ResourcePolicy {
     pub max_references: usize,
     /// Maximum transforms in one reference.
     pub max_transforms_per_reference: usize,
+    /// Maximum inherited `xml:base` components in one URI resolution.
+    pub max_xml_base_components: usize,
+    /// Maximum cumulative bytes processed while resolving `xml:base` URIs.
+    pub max_xml_base_resolution_bytes: usize,
     /// Maximum canonical bytes retained across one signature operation.
     pub max_canonicalized_bytes: usize,
     /// Maximum decoded external resource bytes.
@@ -83,6 +87,8 @@ impl Default for ResourcePolicy {
             max_xml_nodes: crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
             max_references: 64,
             max_transforms_per_reference: 64,
+            max_xml_base_components: crate::hard_limits::XML_BASE_COMPONENT_CEILING,
+            max_xml_base_resolution_bytes: crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING,
             max_canonicalized_bytes: crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING,
             max_external_resource_bytes: crate::hard_limits::EXTERNAL_RESOURCE_BYTE_CEILING,
             max_external_resource_total_bytes:
@@ -113,6 +119,16 @@ impl ResourcePolicy {
             "reference transforms",
             self.max_transforms_per_reference,
             64,
+        )?;
+        Self::within(
+            "XML Base components",
+            self.max_xml_base_components,
+            crate::hard_limits::XML_BASE_COMPONENT_CEILING,
+        )?;
+        Self::within(
+            "XML Base resolution bytes",
+            self.max_xml_base_resolution_bytes,
+            crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING,
         )?;
         Self::within(
             "encryption document",
@@ -151,7 +167,7 @@ impl ResourcePolicy {
         selected: usize,
         ceiling: usize,
     ) -> Result<(), PolicyViolation> {
-        if selected == 0 || selected > ceiling {
+        if selected > ceiling {
             return Err(PolicyViolation::ResourceLimit {
                 resource,
                 maximum: ceiling,
@@ -159,6 +175,21 @@ impl ResourcePolicy {
             });
         }
         Ok(())
+    }
+
+    fn nonzero_within(
+        resource: &'static str,
+        selected: usize,
+        ceiling: usize,
+    ) -> Result<(), PolicyViolation> {
+        if selected == 0 {
+            return Err(PolicyViolation::ResourceLimit {
+                resource,
+                maximum: ceiling,
+                actual: selected,
+            });
+        }
+        Self::within(resource, selected, ceiling)
     }
 }
 
@@ -182,6 +213,7 @@ pub struct KeyTrustPolicy {
     /// Permit legacy RSA-SHA1 verification after key resolution.
     pub allow_legacy_rsa_sha1: bool,
     /// Authenticate and enforce embedded CRLs during path validation.
+    /// Requires [`Self::verify_x509_chains`].
     pub check_crls: bool,
     /// Verification time override; `None` selects the system clock.
     pub verification_time: Option<SystemTime>,
@@ -204,8 +236,13 @@ impl Default for KeyTrustPolicy {
 #[cfg(feature = "xmldsig")]
 impl KeyTrustPolicy {
     pub(crate) fn validate(&self) -> Result<(), PolicyViolation> {
-        ResourcePolicy::within("X.509 chain depth", self.max_x509_chain_depth, 9)?;
-        ResourcePolicy::within("X.509 candidate paths", self.max_x509_candidate_paths, 64)
+        if self.check_crls && !self.verify_x509_chains {
+            return Err(PolicyViolation::KeyTrust {
+                reason: "CRL checking requires X.509 chain validation",
+            });
+        }
+        ResourcePolicy::nonzero_within("X.509 chain depth", self.max_x509_chain_depth, 9)?;
+        ResourcePolicy::nonzero_within("X.509 candidate paths", self.max_x509_candidate_paths, 64)
     }
 }
 
@@ -339,6 +376,12 @@ mod tests {
         let mut aggregate = ResourcePolicy::default();
         aggregate.max_external_resource_total_bytes += 1;
         policies.push(aggregate);
+        let mut xml_base_components = ResourcePolicy::default();
+        xml_base_components.max_xml_base_components += 1;
+        policies.push(xml_base_components);
+        let mut xml_base_bytes = ResourcePolicy::default();
+        xml_base_bytes.max_xml_base_resolution_bytes += 1;
+        policies.push(xml_base_bytes);
         let mut plaintext = ResourcePolicy::default();
         plaintext.max_encryption_plaintext_bytes += 1;
         policies.push(plaintext);
@@ -355,6 +398,46 @@ mod tests {
                 Err(PolicyViolation::ResourceLimit { .. })
             ));
         }
+    }
+
+    #[test]
+    fn resource_policy_accepts_zero_as_a_deny_all_ceiling() {
+        // Zero is a valid policy decision for resources that an operation can
+        // avoid consuming; runtime checks must reject only actual non-zero use.
+        let policy = ResourcePolicy {
+            max_xml_nodes: 0,
+            max_references: 0,
+            max_transforms_per_reference: 0,
+            max_xml_base_components: 0,
+            max_xml_base_resolution_bytes: 0,
+            max_canonicalized_bytes: 0,
+            max_external_resource_bytes: 0,
+            max_external_resource_total_bytes: 0,
+            max_encryption_plaintext_bytes: 0,
+            max_encryption_document_bytes: 0,
+            max_encryption_recipients: 0,
+            max_encryption_metadata_bytes: 0,
+        };
+
+        assert_eq!(policy.validate(), Ok(()));
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn crl_checking_requires_x509_chain_validation() {
+        // CRLs authenticate through the validated issuer path. Accepting this
+        // combination would advertise a security control the resolver skips.
+        let policy = KeyTrustPolicy {
+            check_crls: true,
+            ..KeyTrustPolicy::default()
+        };
+
+        assert!(matches!(
+            policy.validate(),
+            Err(PolicyViolation::KeyTrust {
+                reason: "CRL checking requires X.509 chain validation"
+            })
+        ));
     }
 
     #[cfg(feature = "xmldsig")]

@@ -158,6 +158,22 @@ pub enum C14nError {
     /// Algorithm not yet implemented.
     #[error("unsupported algorithm: {0}")]
     UnsupportedAlgorithm(String),
+    /// The inherited `xml:base` chain exceeds the configured component limit.
+    #[error("XML Base resolution exceeds maximum of {max} inherited components: got {actual}")]
+    XmlBaseComponentsTooLarge {
+        /// Configured maximum inherited components.
+        max: usize,
+        /// Number of inherited components encountered.
+        actual: usize,
+    },
+    /// Cumulative `xml:base` resolution work exceeds the configured byte limit.
+    #[error("XML Base resolution exceeds maximum of {max_bytes} bytes: got at least {actual}")]
+    XmlBaseResolutionTooLarge {
+        /// Configured maximum cumulative bytes.
+        max_bytes: usize,
+        /// Minimum cumulative byte count that exceeded the maximum.
+        actual: usize,
+    },
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -287,6 +303,7 @@ pub(crate) fn canonicalize_with_visibility_and_position(
         algo,
         tracked_element,
         None,
+        None,
         output,
     )
 }
@@ -306,6 +323,28 @@ pub(crate) fn canonicalize_with_visibility_and_position_bounded(
         algo,
         tracked_element,
         Some(max_output_bytes),
+        None,
+        output,
+    )
+}
+
+#[cfg(any(feature = "xmldsig", test))]
+pub(crate) fn canonicalize_with_visibility_and_position_bounded_with_xml_base_budget(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    algo: &C14nAlgorithm,
+    tracked_element: Option<NodeId>,
+    max_output_bytes: usize,
+    xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
+    output: &mut Vec<u8>,
+) -> Result<Option<usize>, C14nError> {
+    canonicalize_with_visibility_and_position_impl(
+        doc,
+        visibility,
+        algo,
+        tracked_element,
+        Some(max_output_bytes),
+        Some(xml_base_resolution),
         output,
     )
 }
@@ -316,8 +355,11 @@ fn canonicalize_with_visibility_and_position_impl(
     algo: &C14nAlgorithm,
     tracked_element: Option<NodeId>,
     max_output_bytes: Option<usize>,
+    xml_base_resolution: Option<&xml_base::XmlBaseResolutionBudget>,
     output: &mut Vec<u8>,
 ) -> Result<Option<usize>, C14nError> {
+    let default_xml_base_resolution = xml_base::XmlBaseResolutionBudget::default();
+    let xml_base_resolution = xml_base_resolution.unwrap_or(&default_xml_base_resolution);
     // inherit_xml_attrs: Inclusive C14N inherits xml:* attrs from ancestors
     // per §2.4. Exclusive C14N explicitly omits this per Exc-C14N §3.
     // fixup_xml_base: C14N 1.1 resolves relative xml:base URIs via RFC 3986.
@@ -336,6 +378,7 @@ fn canonicalize_with_visibility_and_position_impl(
                 config,
                 tracked_element,
                 max_output_bytes,
+                xml_base_resolution,
                 output,
             )
         }
@@ -353,6 +396,7 @@ fn canonicalize_with_visibility_and_position_impl(
                 config,
                 tracked_element,
                 max_output_bytes,
+                xml_base_resolution,
                 output,
             )
         }
@@ -370,6 +414,7 @@ fn canonicalize_with_visibility_and_position_impl(
                 config,
                 tracked_element,
                 max_output_bytes,
+                xml_base_resolution,
                 output,
             )
         }
@@ -385,6 +430,7 @@ fn serialize_canonical_visible_with_position_dispatch(
     config: C14nConfig,
     tracked_element: Option<NodeId>,
     max_output_bytes: Option<usize>,
+    xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
     output: &mut Vec<u8>,
 ) -> Result<Option<usize>, C14nError> {
     match max_output_bytes {
@@ -394,7 +440,7 @@ fn serialize_canonical_visible_with_position_dispatch(
             with_comments,
             renderer,
             config,
-            CanonicalOutputOptions::bounded(tracked_element, max_output_bytes),
+            CanonicalOutputOptions::bounded(tracked_element, max_output_bytes, xml_base_resolution),
             output,
         ),
         None => serialize_canonical_visible_with_position(
@@ -601,6 +647,44 @@ mod tests {
             output.len() <= 64,
             "bounded output grew to {} bytes",
             output.len()
+        );
+    }
+
+    #[test]
+    fn c14n_1_1_bounds_inherited_xml_base_components() {
+        // C14N 1.1 subset fixup walks ancestors outside the selected node set.
+        // Bounding that walk prevents deeply nested xml:base chains from
+        // multiplying URI-resolution work during canonicalization.
+        let mut xml = String::new();
+        for _ in 0..=crate::hard_limits::XML_BASE_COMPONENT_CEILING {
+            xml.push_str(r#"<n xml:base="segment/">"#);
+        }
+        xml.push_str("<leaf/>");
+        for _ in 0..=crate::hard_limits::XML_BASE_COMPONENT_CEILING {
+            xml.push_str("</n>");
+        }
+        let document = Document::parse(&xml).expect("fixed XML must parse");
+        let leaf = document
+            .descendants()
+            .find(|node| node.has_tag_name("leaf"))
+            .expect("leaf");
+        let visible = |node: Node<'_, '_>| node == leaf;
+        let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
+        let mut output = Vec::new();
+
+        let error = canonicalize_with_visibility(
+            &document,
+            Some(&ClosureVisibility {
+                predicate: &visible,
+            }),
+            &algorithm,
+            &mut output,
+        )
+        .expect_err("C14N must reject an overlong inherited xml:base chain");
+
+        assert!(
+            error.to_string().contains("XML Base"),
+            "unexpected C14N error: {error}"
         );
     }
 }

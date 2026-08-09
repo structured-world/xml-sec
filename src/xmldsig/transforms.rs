@@ -34,6 +34,7 @@ use super::xpath::{
     XPathDocumentRelation, XPathWorkBudget, apply_xpath_filter_with_semantics_and_budget,
     apply_xpath_filter2_with_semantics_and_budget, compile_xpath, is_xpath_whitespace,
 };
+use crate::c14n::xml_base::XmlBaseResolutionBudget;
 use crate::c14n::{self, C14nAlgorithm};
 use crate::hard_limits::XML_DOCUMENT_NODE_CEILING;
 
@@ -102,6 +103,7 @@ pub(crate) struct TransformExecutionBudget {
     c14n: C14nOutputBudget,
     node_filter: NodeFilterWorkBudget,
     node_set_materialization: NodeSetMaterializationBudget,
+    xml_base_resolution: XmlBaseResolutionBudget,
     xml_node_limit: u32,
 }
 
@@ -113,6 +115,7 @@ impl Default for TransformExecutionBudget {
             c14n: C14nOutputBudget::default(),
             node_filter: NodeFilterWorkBudget::default(),
             node_set_materialization: NodeSetMaterializationBudget::default(),
+            xml_base_resolution: XmlBaseResolutionBudget::default(),
             xml_node_limit: XML_DOCUMENT_NODE_CEILING,
         }
     }
@@ -218,6 +221,7 @@ impl TransformExecutionBudget {
             c14n: C14nOutputBudget::default(),
             node_filter: NodeFilterWorkBudget::default(),
             node_set_materialization: NodeSetMaterializationBudget::default(),
+            xml_base_resolution: XmlBaseResolutionBudget::default(),
             xml_node_limit: XML_DOCUMENT_NODE_CEILING,
         }
     }
@@ -231,6 +235,7 @@ impl TransformExecutionBudget {
                 remaining: Cell::new(limit),
             },
             node_set_materialization: NodeSetMaterializationBudget::default(),
+            xml_base_resolution: XmlBaseResolutionBudget::default(),
             xml_node_limit: XML_DOCUMENT_NODE_CEILING,
         }
     }
@@ -242,6 +247,7 @@ impl TransformExecutionBudget {
             c14n: C14nOutputBudget::default(),
             node_filter: NodeFilterWorkBudget::default(),
             node_set_materialization: NodeSetMaterializationBudget::with_limit(limit),
+            xml_base_resolution: XmlBaseResolutionBudget::default(),
             xml_node_limit: XML_DOCUMENT_NODE_CEILING,
         }
     }
@@ -258,6 +264,10 @@ impl TransformExecutionBudget {
     pub(crate) fn from_resources(resources: &crate::policy::ResourcePolicy) -> Self {
         Self {
             c14n: C14nOutputBudget::with_limit(resources.max_canonicalized_bytes),
+            xml_base_resolution: XmlBaseResolutionBudget::with_limits(
+                resources.max_xml_base_components,
+                resources.max_xml_base_resolution_bytes,
+            ),
             xml_node_limit: u32::try_from(resources.max_xml_nodes)
                 .unwrap_or(XML_DOCUMENT_NODE_CEILING),
             ..Self::default()
@@ -278,6 +288,10 @@ impl TransformExecutionBudget {
 
     pub(crate) fn node_set_materialization(&self) -> &NodeSetMaterializationBudget {
         &self.node_set_materialization
+    }
+
+    pub(crate) fn xml_base_resolution(&self) -> &XmlBaseResolutionBudget {
+        &self.xml_base_resolution
     }
 }
 
@@ -637,12 +651,13 @@ fn apply_transform_with_options_and_state<'s, 'd>(
         Transform::C14n(algo) => {
             let nodes = input.into_node_set()?;
             let mut output = Vec::new();
-            c14n::canonicalize_with_visibility_and_position_bounded(
+            c14n::canonicalize_with_visibility_and_position_bounded_with_xml_base_budget(
                 nodes.document(),
                 Some(&nodes),
                 algo,
                 None,
                 budget.c14n.remaining(),
+                budget.xml_base_resolution(),
                 &mut output,
             )
             .map_err(|error| map_c14n_limit_error(error, budget.c14n.max_bytes))?;
@@ -830,7 +845,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
     context: &TransformExecutionContext<'_>,
 ) -> Result<Vec<u8>, TransformError> {
     let Some((transform, remaining)) = transforms.split_first() else {
-        return finalize_transform_data(data, &context.budget.c14n);
+        return finalize_transform_data(data, context.budget);
     };
 
     if transform_requires_node_set(transform)
@@ -908,15 +923,17 @@ fn execute_transform_chain<'s, 'e, 'd>(
             .filter(|signature| nodes.contains(*signature))
             .map(|signature| signature.id());
         let mut output = Vec::new();
-        let position = c14n::canonicalize_with_visibility_and_position_bounded(
-            nodes.document(),
-            Some(nodes),
-            algo,
-            tracked_element,
-            context.budget.c14n.remaining(),
-            &mut output,
-        )
-        .map_err(|error| map_c14n_limit_error(error, context.budget.c14n.max_bytes))?;
+        let position =
+            c14n::canonicalize_with_visibility_and_position_bounded_with_xml_base_budget(
+                nodes.document(),
+                Some(nodes),
+                algo,
+                tracked_element,
+                context.budget.c14n.remaining(),
+                context.budget.xml_base_resolution(),
+                &mut output,
+            )
+            .map_err(|error| map_c14n_limit_error(error, context.budget.c14n.max_bytes))?;
         context.budget.c14n.charge(output.len())?;
         return execute_transform_chain(
             source_signature,
@@ -1012,7 +1029,7 @@ fn transform_requires_node_set(transform: &Transform) -> bool {
 
 fn finalize_transform_data(
     data: TransformData<'_>,
-    c14n_budget: &C14nOutputBudget,
+    budget: &TransformExecutionBudget,
 ) -> Result<Vec<u8>, TransformError> {
     // Final coercion: if the result is still a NodeSet, canonicalize with
     // default inclusive C14N 1.0 per XMLDSig spec §4.3.3.2.
@@ -1023,26 +1040,34 @@ fn finalize_transform_data(
             let algo = C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI)
                 .expect("default C14N algorithm URI must be supported by C14nAlgorithm::from_uri");
             let mut output = Vec::new();
-            c14n::canonicalize_with_visibility_and_position_bounded(
+            c14n::canonicalize_with_visibility_and_position_bounded_with_xml_base_budget(
                 nodes.document(),
                 Some(&nodes),
                 &algo,
                 None,
-                c14n_budget.remaining(),
+                budget.c14n.remaining(),
+                budget.xml_base_resolution(),
                 &mut output,
             )
-            .map_err(|error| map_c14n_limit_error(error, c14n_budget.max_bytes))?;
-            c14n_budget.charge(output.len())?;
+            .map_err(|error| map_c14n_limit_error(error, budget.c14n.max_bytes))?;
+            budget.c14n.charge(output.len())?;
             Ok(output)
         }
     }
 }
 
 fn map_c14n_limit_error(error: c14n::C14nError, max_bytes: usize) -> TransformError {
-    if c14n::is_output_limit_error(&error) {
-        TransformError::C14nOutputTooLarge { max_bytes }
-    } else {
-        TransformError::C14n(error)
+    match error {
+        error if c14n::is_output_limit_error(&error) => {
+            TransformError::C14nOutputTooLarge { max_bytes }
+        }
+        c14n::C14nError::XmlBaseComponentsTooLarge { max, actual } => {
+            TransformError::XmlBaseComponentsTooLarge { max, actual }
+        }
+        c14n::C14nError::XmlBaseResolutionTooLarge { max_bytes, actual } => {
+            TransformError::XmlBaseResolutionTooLarge { max_bytes, actual }
+        }
+        error => TransformError::C14n(error),
     }
 }
 
@@ -1604,6 +1629,40 @@ mod tests {
         assert!(matches!(
             result.unwrap_err(),
             TransformError::TypeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn c14n_1_1_uses_the_compiled_xml_base_policy() {
+        // The operation's compiled resource policy must govern C14N 1.1
+        // fixup as well as external Reference and RetrievalMethod resolution.
+        let document = Document::parse(
+            r#"<root xml:base="one/"><parent xml:base="two/"><leaf/></parent></root>"#,
+        )
+        .unwrap();
+        let leaf = document
+            .descendants()
+            .find(|node| node.has_tag_name("leaf"))
+            .unwrap();
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_base_components: 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = TransformExecutionBudget::from_resources(&resources);
+        let algorithm = C14nAlgorithm::new(crate::c14n::C14nMode::Inclusive1_1, false);
+
+        let error = execute_transforms_with_options_and_budget(
+            document.root_element(),
+            TransformData::NodeSet(NodeSet::subtree(leaf).unwrap()),
+            &[Transform::C14n(algorithm)],
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect_err("C14N must use the operation's XML Base component limit");
+
+        assert!(matches!(
+            error,
+            TransformError::XmlBaseComponentsTooLarge { max: 1, actual: 2 }
         ));
     }
 
