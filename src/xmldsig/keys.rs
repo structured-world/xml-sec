@@ -1068,7 +1068,11 @@ mod tests {
 
             assert!(matches!(
                 error,
-                DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit { actual: 0, .. })
+                DsigError::Policy(crate::policy::PolicyViolation::InvalidResourceLimit {
+                    requirement: "limit must be nonzero",
+                    actual: 0,
+                    ..
+                })
             ));
         }
     }

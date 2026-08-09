@@ -189,6 +189,7 @@ pub(crate) fn serialize_canonical(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn serialize_canonical_visible_with_position(
     doc: &Document,
     visibility: Option<&dyn NodeVisibility>,
@@ -199,13 +200,36 @@ pub(crate) fn serialize_canonical_visible_with_position(
     output: &mut Vec<u8>,
 ) -> Result<Option<usize>, C14nError> {
     let xml_base_resolution = XmlBaseResolutionBudget::default();
+    serialize_canonical_visible_with_position_with_xml_base_budget(
+        doc,
+        visibility,
+        with_comments,
+        ns_renderer,
+        config,
+        tracked_element,
+        &xml_base_resolution,
+        output,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn serialize_canonical_visible_with_position_with_xml_base_budget(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    with_comments: bool,
+    ns_renderer: &dyn NsRenderer,
+    config: C14nConfig,
+    tracked_element: Option<NodeId>,
+    xml_base_resolution: &XmlBaseResolutionBudget,
+    output: &mut Vec<u8>,
+) -> Result<Option<usize>, C14nError> {
     serialize_canonical_visible_with_position_bounded(
         doc,
         visibility,
         with_comments,
         ns_renderer,
         config,
-        CanonicalOutputOptions::unbounded(tracked_element, &xml_base_resolution),
+        CanonicalOutputOptions::unbounded(tracked_element, xml_base_resolution),
         output,
     )
 }

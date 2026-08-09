@@ -303,7 +303,9 @@ impl<'a> VerifyContext<'a> {
     ///
     /// The map is the complete external I/O boundary: verification never
     /// performs network or filesystem access. External URIs must also be
-    /// enabled through [`UriTypeSet`].
+    /// enabled through [`UriTypeSet`]. Map keys are RFC 3986 resolved URI
+    /// identities: use normalized paths with dot segments removed and retain
+    /// query or fragment suffixes.
     pub fn external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
         self.external_resources = Some(resources);
         self
@@ -1073,15 +1075,18 @@ fn verify_signature_with_context(
             .into());
         }
     }
+    let resolver = UriReferenceResolver::new(&doc).with_external_resource_limits(
+        ctx.policy.resources.max_external_resource_bytes,
+        ctx.policy.resources.max_external_resource_total_bytes,
+    );
     let resolver = match ctx.external_resources {
-        Some(resources) => UriReferenceResolver::new(&doc).with_external_resources(resources),
-        None => UriReferenceResolver::new(&doc),
+        Some(resources) => resolver.with_external_resources(resources),
+        None => resolver,
     };
     let retrieval_materialization = if let Some(info) = key_info.as_mut() {
         materialize_retrieval_methods(
             info,
             &resolver,
-            ctx.external_resources,
             ctx.policy.retrieval_uri_types,
             ctx.allowed_transform_uris(),
             ctx.provider,
@@ -1231,7 +1236,6 @@ struct RetrievalMaterialization {
 fn materialize_retrieval_methods(
     key_info: &mut KeyInfo,
     resolver: &UriReferenceResolver<'_>,
-    external_resources: Option<&HashMap<String, Vec<u8>>>,
     allowed_uri_types: UriTypeSet,
     allowed_transforms: Option<&HashSet<String>>,
     provider: &dyn crate::provider::CryptoProvider,
@@ -1279,8 +1283,12 @@ fn materialize_retrieval_methods(
             if !allowed_uri_types.allows(&uri) {
                 return Err(SignatureVerificationPipelineError::DisallowedUri { uri });
             }
-            let Some(certificate) = external_resources.and_then(|resources| resources.get(&uri))
-            else {
+            let certificate = resolver.external_resource(&uri).map_err(|error| {
+                SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
+                    error,
+                ))
+            })?;
+            let Some(certificate) = certificate else {
                 outcome.deferred_error.get_or_insert_with(|| {
                     SignatureVerificationPipelineError::Reference(
                         ReferenceProcessingError::Transform(super::TransformError::UnsupportedUri(
@@ -1317,7 +1325,7 @@ fn materialize_retrieval_methods(
             };
             materialized.push(super::parse::KeyInfoSource::X509Data(
                 super::parse::X509DataInfo {
-                    certificates: vec![certificate.clone()],
+                    certificates: vec![certificate.to_vec()],
                     parsed_certificates: vec![parsed],
                     certificate_chain: vec![0],
                     ..super::parse::X509DataInfo::default()
@@ -2634,6 +2642,45 @@ mod tests {
     }
 
     #[test]
+    fn verify_context_meters_repeated_external_dereferences() {
+        // One caller-owned entry can be referenced repeatedly. The aggregate
+        // ceiling bounds bytes cloned and processed, not just unique map data.
+        let payload = b"payload";
+        let digest = base64::engine::general_purpose::STANDARD.encode(
+            crate::xmldsig::compute_digest(DigestAlgorithm::Sha1, payload),
+        );
+        let reference = format!(
+            r#"<ds:Reference URI="urn:payload"><ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference>"#
+        );
+        let xml = format!(
+            r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>{reference}{reference}</ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature>"#
+        );
+        let resources = HashMap::from([("urn:payload".to_owned(), payload.to_vec())]);
+        let policy = crate::policy::VerificationPolicy {
+            reference_uri_types: UriTypeSet::ALL,
+            resources: crate::policy::ResourcePolicy {
+                max_external_resource_bytes: payload.len(),
+                max_external_resource_total_bytes: payload.len(),
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .external_resources(&resources)
+            .verify(&xml)
+            .expect_err("the second dereference must exhaust the aggregate byte ceiling");
+
+        assert!(
+            error
+                .to_string()
+                .contains("aggregate external resource bytes")
+        );
+    }
+
+    #[test]
     fn verify_context_rejects_empty_uri_when_policy_disallows_empty() {
         let xml = minimal_signature_xml("", "");
         let err = VerifyContext::new()
@@ -3502,7 +3549,6 @@ mod tests {
                 materialize_retrieval_methods(
                     &mut key_info,
                     &resolver,
-                    None,
                     UriTypeSet::SAME_DOCUMENT,
                     None,
                     crate::provider::default_provider(),
@@ -3535,7 +3581,6 @@ mod tests {
         materialize_retrieval_methods(
             &mut key_info,
             &UriReferenceResolver::new(&document),
-            None,
             UriTypeSet::SAME_DOCUMENT,
             None,
             crate::provider::default_provider(),
@@ -3572,11 +3617,11 @@ mod tests {
             "https://example.test/keys/signer.der".to_string(),
             certificate,
         )]);
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
 
         materialize_retrieval_methods(
             &mut key_info,
-            &UriReferenceResolver::new(&document),
-            Some(&resources),
+            &resolver,
             UriTypeSet::ALL,
             None,
             crate::provider::default_provider(),
@@ -3608,7 +3653,6 @@ mod tests {
         let error = materialize_retrieval_methods(
             &mut key_info,
             &UriReferenceResolver::new(&document),
-            None,
             UriTypeSet::SAME_DOCUMENT,
             None,
             crate::provider::default_provider(),
@@ -3640,7 +3684,6 @@ mod tests {
         let error = materialize_retrieval_methods(
             &mut key_info,
             &UriReferenceResolver::new(&document),
-            None,
             UriTypeSet::SAME_DOCUMENT,
             None,
             crate::provider::default_provider(),
@@ -3671,7 +3714,6 @@ mod tests {
         let error = materialize_retrieval_methods(
             &mut key_info,
             &UriReferenceResolver::new(&document),
-            None,
             UriTypeSet::SAME_DOCUMENT,
             None,
             crate::provider::default_provider(),
@@ -3706,7 +3748,6 @@ mod tests {
         materialize_retrieval_methods(
             &mut key_info,
             &UriReferenceResolver::new(&document),
-            None,
             UriTypeSet::SAME_DOCUMENT,
             None,
             crate::provider::default_provider(),
@@ -3741,11 +3782,11 @@ mod tests {
                 .collect(),
         };
         let document = Document::parse("<root/>").unwrap();
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
 
         let error = materialize_retrieval_methods(
             &mut key_info,
-            &UriReferenceResolver::new(&document),
-            Some(&resources),
+            &resolver,
             UriTypeSet::ALL,
             None,
             crate::provider::default_provider(),
@@ -3779,11 +3820,11 @@ mod tests {
                 .collect(),
         };
         let document = Document::parse("<root/>").unwrap();
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
 
         materialize_retrieval_methods(
             &mut key_info,
-            &UriReferenceResolver::new(&document),
-            Some(&resources),
+            &resolver,
             UriTypeSet::ALL,
             None,
             crate::provider::default_provider(),
@@ -3814,11 +3855,11 @@ mod tests {
             }],
         };
         let document = Document::parse("<root/>").unwrap();
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
 
         let error = materialize_retrieval_methods(
             &mut key_info,
-            &UriReferenceResolver::new(&document),
-            Some(&resources),
+            &resolver,
             UriTypeSet::ALL,
             None,
             crate::provider::default_provider(),

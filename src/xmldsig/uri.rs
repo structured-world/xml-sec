@@ -12,6 +12,7 @@
 //! External URI bytes are resolved only from an explicit caller-owned map; this
 //! module never performs network or filesystem I/O.
 
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
@@ -31,6 +32,52 @@ use super::types::{NodeSet, NodeSetMaterializationBudget, TransformData, Transfo
 /// - `Id` — XMLDSig (`<ds:Signature Id="...">`)
 /// - `id` — general XML
 const DEFAULT_ID_ATTRS: &[&str] = &["ID", "Id", "id"];
+
+struct ExternalResourceBudget {
+    remaining_total_bytes: Cell<usize>,
+    max_resource_bytes: usize,
+    max_total_bytes: usize,
+}
+
+impl Default for ExternalResourceBudget {
+    fn default() -> Self {
+        Self::with_limits(
+            crate::hard_limits::EXTERNAL_RESOURCE_BYTE_CEILING,
+            crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING,
+        )
+    }
+}
+
+impl ExternalResourceBudget {
+    fn with_limits(max_resource_bytes: usize, max_total_bytes: usize) -> Self {
+        Self {
+            remaining_total_bytes: Cell::new(max_total_bytes),
+            max_resource_bytes,
+            max_total_bytes,
+        }
+    }
+
+    fn charge(&self, bytes: usize) -> Result<(), TransformError> {
+        if bytes > self.max_resource_bytes {
+            return Err(TransformError::ExternalResourceTooLarge {
+                max_bytes: self.max_resource_bytes,
+                actual: bytes,
+            });
+        }
+        let remaining = self.remaining_total_bytes.get();
+        let Some(next) = remaining.checked_sub(bytes) else {
+            self.remaining_total_bytes.set(0);
+            return Err(TransformError::ExternalResourceTotalTooLarge {
+                max_bytes: self.max_total_bytes,
+                actual: self
+                    .max_total_bytes
+                    .saturating_add(bytes.saturating_sub(remaining)),
+            });
+        };
+        self.remaining_total_bytes.set(next);
+        Ok(())
+    }
+}
 
 /// Resolves same-document URI references against a parsed XML document.
 ///
@@ -58,6 +105,7 @@ pub struct UriReferenceResolver<'a> {
     /// ID → element node mapping for O(1) fragment lookups.
     id_map: HashMap<&'a str, Node<'a, 'a>>,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
+    external_resource_budget: ExternalResourceBudget,
 }
 
 impl<'a> UriReferenceResolver<'a> {
@@ -128,15 +176,39 @@ impl<'a> UriReferenceResolver<'a> {
             doc,
             id_map,
             external_resources: None,
+            external_resource_budget: ExternalResourceBudget::default(),
         }
     }
 
     /// Attach an explicit caller-owned external-resource map.
     ///
-    /// No network or filesystem access is performed by this resolver.
+    /// No network or filesystem access is performed by this resolver. Keys are
+    /// RFC 3986 resolved URI identities: paths have dot segments removed while
+    /// query and fragment suffixes are retained.
     pub fn with_external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
         self.external_resources = Some(resources);
         self
+    }
+
+    pub(crate) fn with_external_resource_limits(
+        mut self,
+        max_resource_bytes: usize,
+        max_total_bytes: usize,
+    ) -> Self {
+        self.external_resource_budget =
+            ExternalResourceBudget::with_limits(max_resource_bytes, max_total_bytes);
+        self
+    }
+
+    pub(crate) fn external_resource(&self, uri: &str) -> Result<Option<&'a [u8]>, TransformError> {
+        let Some(bytes) = self
+            .external_resources
+            .and_then(|resources| resources.get(uri))
+        else {
+            return Ok(None);
+        };
+        self.external_resource_budget.charge(bytes.len())?;
+        Ok(Some(bytes))
     }
 
     /// Dereference a URI string to a [`TransformData`].
@@ -180,7 +252,8 @@ impl<'a> UriReferenceResolver<'a> {
         {
             Some(base) => resolve_uri_with_budget(&base, uri, xml_base_budget)
                 .map_err(map_xml_base_resolution_error)?,
-            None => uri.to_owned(),
+            None => resolve_uri_with_budget("", uri, xml_base_budget)
+                .map_err(map_xml_base_resolution_error)?,
         };
         self.dereference_with_budget(&resolved, budget)
     }
@@ -208,9 +281,8 @@ impl<'a> UriReferenceResolver<'a> {
             // xmlsec1 also passes fragments through without decoding.
             self.dereference_fragment(fragment, budget)
         } else {
-            self.external_resources
-                .and_then(|resources| resources.get(uri))
-                .map(|bytes| TransformData::Binary(bytes.clone()))
+            self.external_resource(uri)?
+                .map(|bytes| TransformData::Binary(bytes.to_vec()))
                 .ok_or_else(|| TransformError::UnsupportedUri(uri.to_string()))
         }
     }
@@ -598,6 +670,36 @@ mod tests {
                 &xml_base_budget,
             )
             .unwrap();
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
+    fn external_uri_without_xml_base_uses_normalized_resource_identity() {
+        // RFC 3986 normalization defines the caller map key even when the
+        // document does not provide an explicit XML Base ancestor.
+        let xml = r#"<root><reference URI="https://example.test/a/../data.bin"/></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([(
+            "https://example.test/data.bin".to_owned(),
+            b"payload".to_vec(),
+        )]);
+        let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
+            .expect("the normalized resource key must resolve without xml:base");
 
         assert_eq!(data.into_binary().unwrap(), b"payload");
     }

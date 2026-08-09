@@ -732,6 +732,24 @@ pub enum TransformError {
         actual: usize,
     },
 
+    /// One external resource exceeds the operation's per-resource byte limit.
+    #[error("external resource bytes exceed maximum of {max_bytes}: got {actual}")]
+    ExternalResourceTooLarge {
+        /// Maximum bytes permitted for one external resource.
+        max_bytes: usize,
+        /// Bytes in the selected external resource.
+        actual: usize,
+    },
+
+    /// Repeated external dereferences exhausted the operation-wide byte budget.
+    #[error("aggregate external resource bytes exceed maximum of {max_bytes}: got {actual}")]
+    ExternalResourceTotalTooLarge {
+        /// Maximum cumulative bytes permitted across dereferences.
+        max_bytes: usize,
+        /// Cumulative dereferenced bytes that exceeded the maximum.
+        actual: usize,
+    },
+
     /// The Signature node passed to the enveloped transform belongs to a
     /// different `Document` than the input `NodeSet`.
     #[error("enveloped-signature transform: invalid Signature node for this document")]

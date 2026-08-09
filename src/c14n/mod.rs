@@ -39,8 +39,8 @@ use ns_inclusive::InclusiveNsRenderer;
 #[cfg(any(feature = "xmldsig", test))]
 use serialize::CanonicalOutputLimitExceeded;
 use serialize::{
-    C14nConfig, CanonicalOutputOptions, serialize_canonical_visible_with_position,
-    serialize_canonical_visible_with_position_bounded,
+    C14nConfig, CanonicalOutputOptions, serialize_canonical_visible_with_position_bounded,
+    serialize_canonical_visible_with_position_with_xml_base_budget,
 };
 
 /// C14N algorithm mode (without the comments flag).
@@ -443,13 +443,14 @@ fn serialize_canonical_visible_with_position_dispatch(
             CanonicalOutputOptions::bounded(tracked_element, max_output_bytes, xml_base_resolution),
             output,
         ),
-        None => serialize_canonical_visible_with_position(
+        None => serialize_canonical_visible_with_position_with_xml_base_budget(
             doc,
             visibility,
             with_comments,
             renderer,
             config,
             tracked_element,
+            xml_base_resolution,
             output,
         ),
     }
@@ -686,5 +687,41 @@ mod tests {
             error.to_string().contains("XML Base"),
             "unexpected C14N error: {error}"
         );
+    }
+
+    #[test]
+    fn unbounded_output_preserves_the_callers_xml_base_budget() {
+        // Output capacity and XML Base work are independent limits. Omitting
+        // an output ceiling must not replace the caller's XML Base policy.
+        let document = Document::parse(
+            r#"<root xml:base="one/"><parent xml:base="two/"><leaf/></parent></root>"#,
+        )
+        .unwrap();
+        let leaf = document
+            .descendants()
+            .find(|node| node.has_tag_name("leaf"))
+            .unwrap();
+        let visible = |node: Node<'_, '_>| node == leaf;
+        let budget = xml_base::XmlBaseResolutionBudget::with_limits(1, usize::MAX);
+        let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
+        let mut output = Vec::new();
+
+        let error = canonicalize_with_visibility_and_position_impl(
+            &document,
+            Some(&ClosureVisibility {
+                predicate: &visible,
+            }),
+            &algorithm,
+            None,
+            None,
+            Some(&budget),
+            &mut output,
+        )
+        .expect_err("the caller's component ceiling must survive unbounded dispatch");
+
+        assert!(matches!(
+            error,
+            C14nError::XmlBaseComponentsTooLarge { max: 1, actual: 2 }
+        ));
     }
 }

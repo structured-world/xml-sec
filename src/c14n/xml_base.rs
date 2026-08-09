@@ -100,37 +100,8 @@ pub(crate) fn compute_effective_xml_base(
     start: Node<'_, '_>,
     visibility: Option<&dyn NodeVisibility>,
 ) -> Option<String> {
-    let mut bases: Vec<&str> = Vec::new();
-    let mut current = Some(start);
-    while let Some(n) = current {
-        if n.is_element() {
-            let base = xml_base_value(n);
-            if let Some(set) = visibility
-                && preserves_xml_base_context(n, set)
-            {
-                // A visible non-empty base establishes the context that
-                // descendants inherit in the canonical output. Reapplying
-                // ancestors above that boundary would duplicate the context.
-                break;
-            }
-            if let Some(base) = base {
-                bases.push(base);
-            }
-        }
-        current = n.parent();
-    }
-
-    if bases.is_empty() {
-        return None;
-    }
-
-    // bases is closest-first, root-last. Reverse to resolve root→closest.
-    bases.reverse();
-    let mut effective = bases[0].to_string();
-    for &relative in &bases[1..] {
-        effective = resolve_uri(&effective, relative);
-    }
-    Some(effective)
+    compute_effective_xml_base_with_budget(start, visibility, &XmlBaseResolutionBudget::default())
+        .expect("test XML Base fixtures stay within implementation ceilings")
 }
 
 /// Budgeted form used for attacker-controlled XMLDSig URI resolution.

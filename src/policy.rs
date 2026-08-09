@@ -38,6 +38,16 @@ pub enum PolicyViolation {
         /// Observed consumption.
         actual: usize,
     },
+    /// A configured resource limit violates a structural policy requirement.
+    #[error("{resource} has invalid policy limit {actual}: {requirement}")]
+    InvalidResourceLimit {
+        /// Resource whose configured limit was rejected.
+        resource: &'static str,
+        /// Required property of the configured limit.
+        requirement: &'static str,
+        /// Rejected configured value.
+        actual: usize,
+    },
     /// The selected key source or trust mode is disallowed.
     #[error("key/trust policy rejected the operation: {reason}")]
     KeyTrust {
@@ -69,7 +79,7 @@ pub struct ResourcePolicy {
     pub max_canonicalized_bytes: usize,
     /// Maximum decoded external resource bytes.
     pub max_external_resource_bytes: usize,
-    /// Maximum aggregate external resource bytes.
+    /// Maximum bytes in the complete external map and cumulatively dereferenced.
     pub max_external_resource_total_bytes: usize,
     /// Maximum XMLEnc plaintext bytes.
     pub max_encryption_plaintext_bytes: usize,
@@ -183,9 +193,9 @@ impl ResourcePolicy {
         ceiling: usize,
     ) -> Result<(), PolicyViolation> {
         if selected == 0 {
-            return Err(PolicyViolation::ResourceLimit {
+            return Err(PolicyViolation::InvalidResourceLimit {
                 resource,
-                maximum: ceiling,
+                requirement: "limit must be nonzero",
                 actual: selected,
             });
         }
@@ -420,6 +430,23 @@ mod tests {
         };
 
         assert_eq!(policy.validate(), Ok(()));
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn mandatory_x509_limits_report_the_nonzero_requirement() {
+        // A lower-bound violation must not be reported as exceeding the upper
+        // ceiling: that diagnostic points callers toward the wrong correction.
+        let policy = KeyTrustPolicy {
+            max_x509_chain_depth: 0,
+            ..KeyTrustPolicy::default()
+        };
+
+        let error = policy.validate().expect_err("zero depth must be rejected");
+        assert!(
+            error.to_string().contains("must be nonzero"),
+            "unexpected lower-bound diagnostic: {error}"
+        );
     }
 
     #[cfg(feature = "xmldsig")]

@@ -681,7 +681,8 @@ pub(crate) fn parse_key_info_with_provider_and_xml_base_budget(
                     {
                         Some(base) => resolve_uri_with_budget(&base, lexical_uri, xml_base_budget)
                             .map_err(|error| ParseError::InvalidStructure(error.to_string()))?,
-                        None => lexical_uri.to_owned(),
+                        None => resolve_uri_with_budget("", lexical_uri, xml_base_budget)
+                            .map_err(|error| ParseError::InvalidStructure(error.to_string()))?,
                     }
                 };
                 let resource_type = child.attribute("Type");
@@ -3622,6 +3623,23 @@ BA== </Modulus>
             parse_key_info(key_info),
             Err(ParseError::InvalidStructure(reason))
                 if reason.contains("XML Base resolution")
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_normalizes_external_retrieval_without_xml_base() {
+        // RetrievalMethod stores the resolved identity used for caller-map
+        // lookup, including RFC 3986 normalization when no base is declared.
+        let xml = format!(
+            r#"<KeyInfo xmlns="{XMLDSIG_NS}"><RetrievalMethod URI="https://example.test/a/../key.der"/></KeyInfo>"#
+        );
+        let document = Document::parse(&xml).unwrap();
+        let key_info = parse_key_info(document.root_element()).unwrap();
+
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [KeyInfoSource::RetrievalMethod { uri, .. }]
+                if uri == "https://example.test/key.der"
         ));
     }
 

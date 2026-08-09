@@ -1151,9 +1151,20 @@ mod tests {
 
         EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
             .direct_key([0_u8; 16])
-            .policy(policy)
+            .policy(policy.clone())
             .encrypt_binary(&[])
             .expect("zero ceilings must allow resources the operation does not consume");
+
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy)
+                .encrypt_binary(b"x"),
+            Err(XmlEncError::PlaintextTooLarge {
+                maximum: 0,
+                actual: 1
+            })
+        ));
     }
 
     #[test]
