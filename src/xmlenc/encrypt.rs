@@ -1118,6 +1118,18 @@ mod tests {
         // Internal DTD parsing is a two-party decision: operation policy sets
         // the ceiling and the call site must opt in for this document.
         let document = "<!DOCTYPE root [<!ELEMENT root ANY>]><root/>";
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .encrypt_document(
+                    document,
+                    DocumentEncryptionOptions {
+                        element_id: None,
+                        allow_dtd: true,
+                    },
+                ),
+            Err(XmlEncError::XmlParse(_))
+        ));
         let mut policy = crate::policy::EncryptionPolicy::default();
         policy.xml.allow_internal_dtd = true;
         EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
@@ -1189,11 +1201,21 @@ mod tests {
         assert!(matches!(
             EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
                 .direct_key([0_u8; 16])
-                .policy(policy)
+                .policy(policy.clone())
                 .encrypt_binary(b"x"),
             Err(XmlEncError::PlaintextTooLarge {
                 maximum: 0,
                 actual: 1
+            })
+        ));
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .recipient_aes_kw([0_u8; 16], KeyWrapAlgorithm::AesKw128)
+                .policy(policy)
+                .encrypt_binary(&[]),
+            Err(XmlEncError::TooManyRecipients {
+                maximum: 0,
+                actual: 1,
             })
         ));
     }

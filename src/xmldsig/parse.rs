@@ -16,7 +16,10 @@
 //! </Signature>
 //! ```
 
-use der::Decode;
+use der::{
+    Decode,
+    asn1::{Ia5StringRef, ObjectIdentifier},
+};
 use roxmltree::{Document, Node};
 use x509_cert::ext::pkix::name::DirectoryString;
 use x509_cert::name::Name;
@@ -1662,6 +1665,33 @@ fn x509_attribute_values_equal(
 ) -> bool {
     if left.oid != right.oid {
         return false;
+    }
+    const EMAIL_ADDRESS: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.1");
+    const DOMAIN_COMPONENT: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("0.9.2342.19200300.100.1.25");
+    if left.oid == EMAIL_ADDRESS {
+        let (Ok(left), Ok(right)) = (
+            Ia5StringRef::try_from(&left.value),
+            Ia5StringRef::try_from(&right.value),
+        ) else {
+            return false;
+        };
+        let (Some((left_local, left_domain)), Some((right_local, right_domain))) = (
+            left.as_str().rsplit_once('@'),
+            right.as_str().rsplit_once('@'),
+        ) else {
+            return false;
+        };
+        return left_local == right_local && left_domain.eq_ignore_ascii_case(right_domain);
+    }
+    if left.oid == DOMAIN_COMPONENT {
+        let (Ok(left), Ok(right)) = (
+            Ia5StringRef::try_from(&left.value),
+            Ia5StringRef::try_from(&right.value),
+        ) else {
+            return false;
+        };
+        return left.as_str().eq_ignore_ascii_case(right.as_str());
     }
     match (
         DirectoryString::try_from(&left.value),
@@ -3367,6 +3397,20 @@ BA== </Modulus>
         assert!(!distinguished_names_equal(
             "1.2.3.4=#040141,O=example",
             "1.2.3.4=#040142,O=example"
+        ));
+    }
+
+    #[test]
+    fn distinguished_name_matching_applies_ia5_matching_rules() {
+        // RFC 5280 emailAddress matching preserves the local part while the
+        // domain is case-insensitive; domainComponent is case-insensitive too.
+        assert!(distinguished_names_equal(
+            "EMAIL=ops@EXAMPLE.COM,DC=EXAMPLE,DC=COM",
+            "EMAIL=ops@example.com,DC=example,DC=com"
+        ));
+        assert!(!distinguished_names_equal(
+            "EMAIL=OPS@example.com,DC=example,DC=com",
+            "EMAIL=ops@example.com,DC=example,DC=com"
         ));
     }
 

@@ -69,7 +69,12 @@ self-issued rollover certificates continue toward a distinct same-name issuer wh
 validates; neither condition can bypass the configured work bounds or trust anchor requirement.
 Path validation excludes self-issued rollover CAs from `pathLenConstraint`, applies supported RFC
 5280 NameConstraints to every subordinate certificate, and rejects critical extensions whose
-semantics are not implemented. When `X509Data` supplies multiple selector categories, every
+semantics are not implemented. Processed critical certificate extensions are KeyUsage
+(`2.5.29.15`), SubjectAlternativeName (`2.5.29.17`), BasicConstraints (`2.5.29.19`), and
+NameConstraints (`2.5.29.30`). A chain using critical ExtendedKeyUsage (`2.5.29.37`) or
+CertificatePolicies (`2.5.29.32`) therefore fails closed until those semantics are implemented;
+encode them as non-critical only when that matches the issuing PKI's security contract.
+When `X509Data` supplies multiple selector categories, every
 category must match certificates on the same selected, policy-valid path rather than unrelated
 certificates from the lookup pool.
 
@@ -88,6 +93,9 @@ structurally excluded Manifest blocks can also produce an empty list. Callers mu
 disabled state from an enabled pass with no authenticated Manifest references.
 Manifest references obey the same per-reference transform-count ceiling and transform allowlist as
 `<SignedInfo>` references; a violation is recorded in that Manifest reference's independent status.
+They also share `ResourcePolicy::max_references` with `<SignedInfo>`: every parsed Manifest
+reference consumes that operation-wide budget, including entries whose transforms are unsupported
+and retained only as independent failure results.
 
 Malformed XMLDSig structure, unsupported algorithms in core signature processing, disallowed URIs
 in `<SignedInfo>` references, and inconsistent `KeyInfo` metadata are processing errors rather
@@ -139,6 +147,9 @@ verification selects P-256, P-384, or P-521 from the SPKI independently of the h
 the built-in P-256 and P-384 signing keys support either ECDSA hash identifier.
 DSA-SHA1 and HMAC-SHA1 (including XMLDSig's byte-aligned 80-160-bit truncation range) are
 verify-only legacy algorithms.
+RSA-SHA1 verification is default-deny: callers must explicitly enable
+`VerificationPolicy::key_trust.allow_legacy_rsa_sha1`; selecting the algorithm in untrusted XML
+does not opt the operation into legacy cryptography. RSA-SHA1 signing remains unsupported.
 X.509 path and CRL authentication additionally supports standard RSA-PSS with SHA-256/SHA-384/
 SHA-512 parameters, including RFC 4055 issuer-key restrictions, and Ed25519. DSA-SHA256, broader HMAC verification/signing, XMLDSig
 `SignatureMethod` RSA-PSS, and implicit external resource loading are not currently supported.

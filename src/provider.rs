@@ -653,7 +653,11 @@ mod rustcrypto_x509 {
                 mgf_digest,
                 salt_len,
             } => {
-                let Some(key) = rsa_pss_public_key_from_spki(issuer_spki_der, algorithm) else {
+                // RFC 4055 key restrictions are part of signature validity. Check
+                // them before provider capability so an incompatible key is a
+                // deterministic non-match even when the requested MGF is unsupported.
+                let Some(key) = compatible_rsa_pss_public_key_from_spki(issuer_spki_der, algorithm)
+                else {
                     return Ok(false);
                 };
                 if digest != mgf_digest {
@@ -728,7 +732,7 @@ mod rustcrypto_x509 {
         Ok(verified.is_ok())
     }
 
-    fn rsa_pss_public_key_from_spki(
+    fn compatible_rsa_pss_public_key_from_spki(
         spki_der: &[u8],
         signature_algorithm: X509SignatureAlgorithm,
     ) -> Option<RsaPublicKey> {

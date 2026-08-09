@@ -7,7 +7,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer,
-    KeyIdMethod, KeyPair, KeyUsagePurpose, SerialNumber, date_time_ymd,
+    KeyIdMethod, KeyPair, KeyUsagePurpose, RevokedCertParams, SerialNumber, date_time_ymd,
 };
 use roxmltree::Document;
 use xml_sec::xmldsig::{
@@ -594,5 +594,76 @@ fn rejects_crl_signed_by_certificate_without_crl_sign_usage() {
             position: 1,
             required: "cRLSign",
         })
+    );
+}
+
+#[test]
+fn same_name_ca_rollover_skips_crl_from_the_previous_key() {
+    // Issuer names are not key identities. A stale same-name CRL must not
+    // prevent the selected issuer's CRL from revoking the target certificate.
+    let mut root_params = CertificateParams::new(Vec::new()).unwrap();
+    root_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "rollover root");
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root =
+        rcgen::CertifiedIssuer::self_signed(root_params, KeyPair::generate().unwrap()).unwrap();
+
+    let issuer_params = || {
+        let mut params = CertificateParams::new(Vec::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "rollover issuer");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params
+    };
+    let old_issuer = Issuer::new(issuer_params(), KeyPair::generate().unwrap());
+    let current_key = KeyPair::generate().unwrap();
+    let current_certificate = issuer_params().signed_by(&current_key, &root).unwrap();
+    let current_issuer = Issuer::new(issuer_params(), current_key);
+
+    let mut leaf_params = CertificateParams::new(Vec::new()).unwrap();
+    leaf_params.serial_number = Some(SerialNumber::from(42_u64));
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "rollover leaf");
+    let leaf = leaf_params
+        .signed_by(&KeyPair::generate().unwrap(), &current_issuer)
+        .unwrap();
+    let crl_params = |number, revoked_certs| CertificateRevocationListParams {
+        this_update: date_time_ymd(2026, 3, 15),
+        next_update: date_time_ymd(2026, 4, 15),
+        crl_number: SerialNumber::from(number),
+        issuing_distribution_point: None,
+        revoked_certs,
+        key_identifier_method: KeyIdMethod::Sha256,
+    };
+    let old_crl = crl_params(1_u64, Vec::new())
+        .signed_by(&old_issuer)
+        .unwrap();
+    let current_crl = crl_params(
+        2_u64,
+        vec![RevokedCertParams {
+            serial_number: SerialNumber::from(42_u64),
+            revocation_time: date_time_ymd(2026, 3, 16),
+            reason_code: None,
+            invalidity_date: None,
+        }],
+    )
+    .signed_by(&current_issuer)
+    .unwrap();
+    let mut info = generated_info(vec![
+        leaf.der().to_vec(),
+        current_certificate.der().to_vec(),
+        root.der().to_vec(),
+    ]);
+    info.crls = vec![old_crl.der().to_vec(), current_crl.der().to_vec()];
+    let anchors = [root.der().to_vec()];
+
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&anchors, true)),
+        Err(X509ChainError::Revoked(0))
     );
 }

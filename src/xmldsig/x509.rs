@@ -657,8 +657,10 @@ fn validate_certificate_names(
     position: usize,
     constraining_position: usize,
 ) -> Result<(), X509ChainError> {
-    let subject = GeneralName::DirectoryName(certificate.subject().clone());
-    validate_general_name(&subject, constraints, position, constraining_position)?;
+    if certificate.subject().iter().next().is_some() {
+        let subject = GeneralName::DirectoryName(certificate.subject().clone());
+        validate_general_name(&subject, constraints, position, constraining_position)?;
+    }
     for attribute in certificate.subject().iter_email() {
         let email = attribute
             .as_str()
@@ -704,15 +706,17 @@ fn validate_general_name(
     let mut matches_permitted = false;
     for subtree in permitted {
         has_permitted_form = true;
-        matches_permitted |= general_name_within_subtree(name, &subtree.base)?;
+        matches_permitted |=
+            general_name_within_subtree(name, &subtree.base)? == NameConstraintMatch::Match;
     }
     let excluded = constraints
         .excluded_subtrees
         .iter()
         .flatten()
         .filter(|subtree| general_names_have_same_form(name, &subtree.base))
-        .try_fold(false, |matched, subtree| {
-            general_name_within_subtree(name, &subtree.base).map(|current| matched || current)
+        .try_fold(false, |rejected, subtree| {
+            general_name_within_subtree(name, &subtree.base)
+                .map(|current| rejected || current != NameConstraintMatch::NoMatch)
         })?;
     if excluded || (has_permitted_form && !matches_permitted) {
         return Err(X509ChainError::NameConstraintViolation {
@@ -734,16 +738,29 @@ fn general_names_have_same_form(left: &GeneralName<'_>, right: &GeneralName<'_>)
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameConstraintMatch {
+    Match,
+    NoMatch,
+    Unevaluable,
+}
+
+impl From<bool> for NameConstraintMatch {
+    fn from(matched: bool) -> Self {
+        if matched { Self::Match } else { Self::NoMatch }
+    }
+}
+
 fn general_name_within_subtree(
     name: &GeneralName<'_>,
     subtree: &GeneralName<'_>,
-) -> Result<bool, X509ChainError> {
+) -> Result<NameConstraintMatch, X509ChainError> {
     Ok(match (name, subtree) {
         (GeneralName::DNSName(name), GeneralName::DNSName(subtree)) => {
-            dns_name_within_subtree(name, subtree, true)
+            dns_name_within_subtree(name, subtree, true).into()
         }
         (GeneralName::RFC822Name(name), GeneralName::RFC822Name(subtree)) => {
-            email_within_subtree(name, subtree)
+            email_within_subtree(name, subtree).into()
         }
         (GeneralName::DirectoryName(name), GeneralName::DirectoryName(subtree)) => {
             let name = x509_name_to_rfc4514(name).map_err(|error| X509ChainError::InvalidDer {
@@ -755,15 +772,16 @@ fn general_name_within_subtree(
                     kind: "certificate name constraint",
                     message: error.to_string(),
                 })?;
-            distinguished_name_within_subtree(&name, &subtree)
+            distinguished_name_within_subtree(&name, &subtree).into()
         }
-        (GeneralName::URI(name), GeneralName::URI(subtree)) => {
-            uri_host(name).is_some_and(|host| dns_name_within_subtree(host, subtree, false))
-        }
+        (GeneralName::URI(name), GeneralName::URI(subtree)) => uri_host(name)
+            .map_or(NameConstraintMatch::Unevaluable, |host| {
+                dns_name_within_subtree(host, subtree, false).into()
+            }),
         (GeneralName::IPAddress(name), GeneralName::IPAddress(subtree)) => {
-            ip_address_within_subtree(name, subtree)
+            ip_address_within_subtree(name, subtree).into()
         }
-        _ => false,
+        _ => NameConstraintMatch::NoMatch,
     })
 }
 
@@ -837,6 +855,42 @@ fn ip_mask_is_contiguous(mask: &[u8]) -> bool {
     true
 }
 
+fn certificate_subject_key_identifier<'a>(
+    certificate: &'a X509Certificate<'a>,
+) -> Option<&'a [u8]> {
+    certificate
+        .extensions()
+        .iter()
+        .find_map(|extension| match extension.parsed_extension() {
+            ParsedExtension::SubjectKeyIdentifier(identifier) => Some(identifier.0),
+            _ => None,
+        })
+}
+
+fn crl_authority_key_matches(
+    crl: &CertificateRevocationList<'_>,
+    issuer: &X509Certificate<'_>,
+) -> Result<Option<bool>, X509ChainError> {
+    let authority_key = crl
+        .extensions()
+        .iter()
+        .find(|extension| extension.oid.to_id_string() == "2.5.29.35")
+        .map(|extension| match extension.parsed_extension() {
+            ParsedExtension::AuthorityKeyIdentifier(identifier) => {
+                Ok(identifier.key_identifier.as_ref().map(|key| key.0))
+            }
+            _ => Err(X509ChainError::InvalidDer {
+                kind: "CRL AuthorityKeyIdentifier",
+                message: "extension could not be decoded".into(),
+            }),
+        })
+        .transpose()?
+        .flatten();
+    Ok(authority_key
+        .zip(certificate_subject_key_identifier(issuer))
+        .map(|(authority, subject)| authority == subject))
+}
+
 fn verify_crls(
     path: &[X509Certificate<'_>],
     crl_der: &[Vec<u8>],
@@ -869,6 +923,16 @@ fn verify_crls(
             .iter()
             .filter(|(_, crl)| certificate_names_equal(crl.issuer(), cert.issuer()))
         {
+            let authority_key_match = crl_authority_key_matches(crl, issuer)?;
+            if authority_key_match == Some(false) {
+                continue;
+            }
+            if !verify_crl_signature_with_provider(crl, issuer, provider)? {
+                if authority_key_match == Some(true) {
+                    return Err(X509ChainError::InvalidCrl(*crl_index));
+                }
+                continue;
+            }
             if issuer
                 .key_usage()
                 .map_err(|error| X509ChainError::InvalidDer {
@@ -886,7 +950,7 @@ fn verify_crls(
                 && crl
                     .next_update()
                     .is_none_or(|next| verification_time <= next);
-            if !time_valid || !verify_crl_signature_with_provider(crl, issuer, provider)? {
+            if !time_valid {
                 return Err(X509ChainError::InvalidCrl(*crl_index));
             }
             if crl.iter_revoked_certificates().any(|revoked| {
@@ -1342,6 +1406,70 @@ mod tests {
     }
 
     #[test]
+    fn empty_subject_with_critical_san_skips_directory_name_constraints() {
+        // RFC 5280 permits an empty subject when a critical SAN carries the
+        // identity. An absent DirectoryName need not match a permitted subtree.
+        let mut permitted_directory = rcgen::DistinguishedName::new();
+        permitted_directory.push(rcgen::DnType::OrganizationName, "Example Corp");
+        let mut root_params = generated_certificate_params("empty-subject authority", true);
+        root_params.name_constraints = Some(rcgen::NameConstraints {
+            permitted_subtrees: vec![rcgen::GeneralSubtree::DirectoryName(permitted_directory)],
+            excluded_subtrees: Vec::new(),
+        });
+        let root = rcgen::CertifiedIssuer::self_signed(
+            root_params,
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("constrained root should be self-signable");
+        let mut leaf_params = rcgen::CertificateParams::new(vec!["allowed.example".into()])
+            .expect("DNS SAN should be valid");
+        leaf_params.distinguished_name = rcgen::DistinguishedName::new();
+        let leaf = leaf_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &root,
+            )
+            .expect("root should sign empty-subject leaf");
+
+        verify_generated_path(
+            vec![leaf.der().to_vec(), root.der().to_vec()],
+            root.der().to_vec(),
+        )
+        .expect("only present name forms should be constrained");
+    }
+
+    #[test]
+    fn unevaluable_uri_names_fail_closed_for_both_constraint_forms() {
+        use x509_parser::extensions::GeneralSubtree;
+
+        // A URI without a DNS host is not a non-match: treating it that way
+        // would bypass excluded URI subtrees while rejecting permitted ones.
+        let uri = GeneralName::URI("urn:example:opaque");
+        for constraints in [
+            NameConstraints {
+                permitted_subtrees: Some(vec![GeneralSubtree {
+                    base: GeneralName::URI(".example.com"),
+                }]),
+                excluded_subtrees: None,
+            },
+            NameConstraints {
+                permitted_subtrees: None,
+                excluded_subtrees: Some(vec![GeneralSubtree {
+                    base: GeneralName::URI(".example.com"),
+                }]),
+            },
+        ] {
+            assert_eq!(
+                validate_general_name(&uri, &constraints, 0, 1),
+                Err(X509ChainError::NameConstraintViolation {
+                    position: 0,
+                    constraining_position: 1,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn unknown_critical_certificate_extension_fails_closed() {
         let root = rcgen::CertifiedIssuer::self_signed(
             generated_certificate_params("critical-extension root", true),
@@ -1360,13 +1488,15 @@ mod tests {
             )
             .expect("root should sign leaf certificate");
 
-        assert!(
+        assert_eq!(
             verify_generated_path(
                 vec![leaf.der().to_vec(), root.der().to_vec()],
                 root.der().to_vec(),
-            )
-            .is_err(),
-            "an unprocessed critical extension must reject the path"
+            ),
+            Err(X509ChainError::UnsupportedCriticalExtension {
+                position: 0,
+                oid: "1.2.3.4".into(),
+            })
         );
     }
 
