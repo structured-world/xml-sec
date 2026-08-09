@@ -1274,6 +1274,7 @@ pub(crate) fn build_x509_certificate_chain_from(
             [issuer_idx] => *issuer_idx,
             _ => {
                 let mut verified = Vec::new();
+                let mut unsupported_oid = None;
                 for issuer_idx in candidates {
                     match certificate_signature_matches_with_provider(
                         &info.certificates[current_idx],
@@ -1282,18 +1283,31 @@ pub(crate) fn build_x509_certificate_chain_from(
                     ) {
                         Ok(true) => verified.push(issuer_idx),
                         Ok(false) => {}
+                        Err(super::X509ChainError::Provider(
+                            crate::provider::ProviderError::Unsupported {
+                                operation: crate::provider::ProviderOperation::VerifyCertificate,
+                                algorithm: Some(oid),
+                            },
+                        )) => {
+                            unsupported_oid.get_or_insert(oid);
+                        }
                         Err(super::X509ChainError::Provider(error)) => {
                             return Err(X509ChainBuildError::Provider(error));
                         }
                         Err(super::X509ChainError::UnsupportedSignatureAlgorithm { oid }) => {
-                            return Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { oid });
+                            unsupported_oid.get_or_insert(oid);
                         }
                         Err(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
                     }
                 }
                 match verified.as_slice() {
                     [issuer_idx] => *issuer_idx,
-                    [] => return Err(X509ChainBuildError::IssuerSignatureMismatch),
+                    [] => {
+                        if let Some(oid) = unsupported_oid {
+                            return Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { oid });
+                        }
+                        return Err(X509ChainBuildError::IssuerSignatureMismatch);
+                    }
                     _ => return Err(X509ChainBuildError::AmbiguousIssuer),
                 }
             }
@@ -1335,6 +1349,7 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
     let mut completed = Vec::new();
     let mut generated_paths = 1usize;
     let mut depth_exceeded = false;
+    let mut unsupported_oid = None;
     let mut issuer_cache = vec![None; info.parsed_certificates.len()];
     while let Some(path) = pending.pop() {
         let current_idx = *path
@@ -1363,11 +1378,26 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
                 ) {
                     Ok(true) => verified.push(issuer_idx),
                     Ok(false) => {}
+                    Err(super::X509ChainError::Provider(
+                        crate::provider::ProviderError::Unsupported {
+                            operation: crate::provider::ProviderOperation::VerifyCertificate,
+                            algorithm: Some(oid),
+                        },
+                    )) => {
+                        // Unsupported is an algorithm capability, so changing
+                        // the issuer key cannot make this child verifiable.
+                        // Prune this DFS branch but retain sibling paths.
+                        unsupported_oid.get_or_insert(oid);
+                        break;
+                    }
                     Err(super::X509ChainError::Provider(error)) => {
                         return Err(X509ChainBuildError::Provider(error));
                     }
                     Err(super::X509ChainError::UnsupportedSignatureAlgorithm { oid }) => {
-                        return Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { oid });
+                        // The mapper rejected this child's AlgorithmIdentifier;
+                        // no issuer candidate can alter it on the current path.
+                        unsupported_oid.get_or_insert(oid);
+                        break;
                     }
                     Err(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
                 }
@@ -1393,8 +1423,13 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
         }
     }
 
-    if completed.is_empty() && depth_exceeded {
-        return Err(X509ChainBuildError::DepthExceeded);
+    if completed.is_empty() {
+        if let Some(oid) = unsupported_oid {
+            return Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { oid });
+        }
+        if depth_exceeded {
+            return Err(X509ChainBuildError::DepthExceeded);
+        }
     }
     Ok(completed)
 }

@@ -1627,13 +1627,8 @@ mod tests {
             assert!(matches!(
                 error,
                 DsigError::KeyResolution(KeyResolutionError::Chain(
-                    super::super::X509ChainError::Provider(
-                        crate::provider::ProviderError::Unsupported {
-                            operation: crate::provider::ProviderOperation::VerifyCertificate,
-                            ..
-                        }
-                    )
-                ))
+                    super::super::X509ChainError::UnsupportedSignatureAlgorithm { ref oid }
+                )) if oid == "1.2.840.10045.4.3.2"
             ));
             assert_eq!(provider.verification_calls.load(Ordering::Relaxed), 1);
         }
@@ -1944,6 +1939,120 @@ mod tests {
             .expect("the leaf signature should select its unique same-subject issuer");
 
         assert!(resolved.is_some());
+    }
+
+    #[test]
+    fn x509_path_builder_skips_branch_local_unsupported_algorithms() {
+        // An untrusted intermediate can share both the subject and public key
+        // of the valid path while using an unsupported signature algorithm on
+        // its own parent edge. That branch must not suppress the valid path.
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("unsupported-edge root", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root certificate should be self-signable");
+        let signing_intermediate = rcgen::CertifiedIssuer::signed_by(
+            generated_certificate_params("shared unsupported-edge issuer", true),
+            rcgen::KeyPair::generate().expect("signing issuer key generation should succeed"),
+            &root,
+        )
+        .expect("root should sign the intermediate certificate");
+        let key_unsupported_intermediate = rcgen::CertifiedIssuer::signed_by(
+            generated_certificate_params("shared unsupported-edge issuer", true),
+            rcgen::KeyPair::generate().expect("unsupported issuer key generation should succeed"),
+            &root,
+        )
+        .expect("root should sign the alternate intermediate certificate");
+        let leaf = generated_certificate_params("unsupported-edge leaf", false)
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &signing_intermediate,
+            )
+            .expect("signing intermediate should sign the leaf");
+
+        let ordered = x509_info(
+            vec![
+                leaf.der().to_vec(),
+                key_unsupported_intermediate.der().to_vec(),
+                signing_intermediate.der().to_vec(),
+                root.der().to_vec(),
+            ],
+            0,
+        );
+        let key_selective_provider = RejectSecondSha512Provider {
+            sha512_calls: AtomicUsize::new(0),
+            verification_calls: AtomicUsize::new(0),
+            reject_verification_call: Some(0),
+            rejected_verification_data: None,
+        };
+        assert_eq!(
+            super::super::parse::build_x509_certificate_chain_from(
+                &ordered,
+                0,
+                &key_selective_provider,
+            )
+            .expect("one unsupported issuer key must not suppress a usable candidate"),
+            vec![0, 2, 3]
+        );
+
+        let mut unsupported_intermediate = signing_intermediate.der().to_vec();
+        let ecdsa_sha256_oid = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+        let offsets = unsupported_intermediate
+            .windows(ecdsa_sha256_oid.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == ecdsa_sha256_oid).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            offsets.len(),
+            2,
+            "certificate must repeat its signature OID"
+        );
+        for offset in offsets {
+            unsupported_intermediate[offset + ecdsa_sha256_oid.len() - 1] = 0x04;
+        }
+
+        let anchored = x509_info(
+            vec![
+                root.der().to_vec(),
+                leaf.der().to_vec(),
+                signing_intermediate.der().to_vec(),
+                unsupported_intermediate,
+            ],
+            1,
+        );
+        assert_eq!(
+            build_x509_certificate_paths_to_trusted_prefix(
+                &anchored,
+                1,
+                1,
+                4,
+                8,
+                crate::provider::default_provider(),
+            )
+            .expect("a branch-local provider gap must not abort path enumeration"),
+            vec![vec![1, 2, 0]]
+        );
+
+        let unsupported_only = x509_info(
+            vec![
+                root.der().to_vec(),
+                leaf.der().to_vec(),
+                anchored.certificates[3].clone(),
+            ],
+            1,
+        );
+        assert!(matches!(
+            build_x509_certificate_paths_to_trusted_prefix(
+                &unsupported_only,
+                1,
+                1,
+                4,
+                8,
+                crate::provider::default_provider(),
+            ),
+            Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { ref oid })
+                if oid == "1.2.840.10045.4.3.4"
+        ));
     }
 
     #[test]

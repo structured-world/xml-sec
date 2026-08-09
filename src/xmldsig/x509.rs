@@ -338,6 +338,9 @@ fn x509_signature_algorithm(
     let oid = identifier.algorithm.to_id_string();
     let algorithm = match oid.as_str() {
         "1.2.840.10040.4.3" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha1),
+        "2.16.840.1.101.3.4.3.2" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha256),
+        "2.16.840.1.101.3.4.3.3" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha384),
+        "2.16.840.1.101.3.4.3.4" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha512),
         "1.2.840.113549.1.1.5" | "1.3.14.3.2.29" => {
             X509SignatureAlgorithm::RsaPkcs1v15(super::DigestAlgorithm::Sha1)
         }
@@ -351,8 +354,10 @@ fn x509_signature_algorithm(
             X509SignatureAlgorithm::RsaPkcs1v15(super::DigestAlgorithm::Sha512)
         }
         "1.2.840.113549.1.1.10" => parse_rsa_pss_algorithm(identifier)?,
+        "1.2.840.10045.4.1" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha1),
         "1.2.840.10045.4.3.2" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha256),
         "1.2.840.10045.4.3.3" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha384),
+        "1.2.840.10045.4.3.4" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha512),
         "1.3.101.112" => X509SignatureAlgorithm::Ed25519,
         _ => return Err(X509ChainError::UnsupportedSignatureAlgorithm { oid }),
     };
@@ -564,6 +569,8 @@ fn verify_crls(
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr as _;
+
     use super::*;
     use crate::xmldsig::{KeyInfoSource, parse::XMLDSIG_NS, parse_key_info};
     use p256::pkcs8::EncodePublicKey;
@@ -571,9 +578,7 @@ mod tests {
     use sha2::{Digest, Sha256, Sha384};
     use signature::hazmat::PrehashSigner;
     use std::time::Duration;
-    use x509_parser::oid_registry::{
-        OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, OID_SIG_ECDSA_WITH_SHA512,
-    };
+    use x509_parser::oid_registry::{OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, Oid};
 
     #[test]
     fn x509_ecdsa_hash_oid_does_not_select_the_issuer_curve() {
@@ -696,17 +701,51 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_x509_signature_algorithm_remains_diagnosable() {
-        // ECDSA-with-SHA512 is not implemented by the selected provider yet;
-        // that capability gap is distinct from a cryptographically invalid
-        // certificate signature and must remain visible to the caller.
-        let identifier = AlgorithmIdentifier::new(OID_SIG_ECDSA_WITH_SHA512, None);
+    fn every_modeled_non_parameterized_x509_algorithm_reaches_the_provider() {
+        // Parsing and provider capability are separate contracts. Once an OID
+        // has a typed representation, custom providers must get the chance to
+        // implement it even when RustCrypto does not.
+        for (oid, expected) in [
+            (
+                "2.16.840.1.101.3.4.3.2",
+                X509SignatureAlgorithm::Dsa(super::super::DigestAlgorithm::Sha256),
+            ),
+            (
+                "2.16.840.1.101.3.4.3.3",
+                X509SignatureAlgorithm::Dsa(super::super::DigestAlgorithm::Sha384),
+            ),
+            (
+                "2.16.840.1.101.3.4.3.4",
+                X509SignatureAlgorithm::Dsa(super::super::DigestAlgorithm::Sha512),
+            ),
+            (
+                "1.2.840.10045.4.1",
+                X509SignatureAlgorithm::Ecdsa(super::super::DigestAlgorithm::Sha1),
+            ),
+            (
+                "1.2.840.10045.4.3.4",
+                X509SignatureAlgorithm::Ecdsa(super::super::DigestAlgorithm::Sha512),
+            ),
+        ] {
+            let identifier = AlgorithmIdentifier::new(
+                Oid::from_str(oid).expect("static signature OID must parse"),
+                None,
+            );
+            assert_eq!(x509_signature_algorithm(&identifier), Ok(expected), "{oid}");
+        }
+    }
+
+    #[test]
+    fn unknown_x509_signature_algorithm_remains_diagnosable() {
+        let oid = "1.2.3.4.5";
+        let identifier = AlgorithmIdentifier::new(
+            Oid::from_str(oid).expect("static unknown OID must parse"),
+            None,
+        );
 
         assert_eq!(
             x509_signature_algorithm(&identifier),
-            Err(X509ChainError::UnsupportedSignatureAlgorithm {
-                oid: "1.2.840.10045.4.3.4".into(),
-            })
+            Err(X509ChainError::UnsupportedSignatureAlgorithm { oid: oid.into() })
         );
     }
 

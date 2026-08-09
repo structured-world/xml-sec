@@ -45,7 +45,9 @@ reference digests, document signatures, `X509Digest` selector evaluation, X.509 
 edges, complete certificate paths, and CRL authentication performed by `DefaultKeyResolver`.
 Certificate authentication uses a separate typed algorithm contract so RSA-PSS parameters and
 Ed25519 are not collapsed into the narrower XMLDSig `SignatureMethod` enum. Unsupported certificate
-OIDs remain typed path errors rather than ordinary signature mismatches.
+OIDs remain typed path errors rather than ordinary signature mismatches. Every certificate OID
+represented by that contract reaches the selected provider; the built-in provider may reject a
+capability such as ECDSA-SHA512 while a custom provider can implement it.
 Custom resolvers that evaluate cryptographic key metadata should override
 `KeyResolver::resolve_with_policy_and_provider`; source-only resolvers can retain the default hook.
 
