@@ -39,8 +39,9 @@ randomness must implement `SigningKey::sign_with_provider`; deterministic and ex
 keys can use the default implementation.
 
 `VerifyContext::provider` covers every verification-time cryptographic operation, including
-reference digests, signature verification, and `X509Digest` selector evaluation performed by
-`DefaultKeyResolver`. Custom resolvers that evaluate cryptographic key metadata should override
+reference digests, document signatures, `X509Digest` selector evaluation, X.509 candidate-path
+edges, complete certificate paths, and CRL authentication performed by `DefaultKeyResolver`.
+Custom resolvers that evaluate cryptographic key metadata should override
 `KeyResolver::resolve_with_policy_and_provider`; source-only resolvers can retain the default hook.
 
 ## Verification Policy
@@ -92,8 +93,9 @@ and the Merlin same-document `X509Data` XPath selection. Relative external `Refe
 `RetrievalMethod` URIs are resolved against the owning element's effective `xml:base` using RFC
 3986 before lookup, so resource-map keys must use that resolved URI. The compiled resource policy
 bounds both inherited `xml:base` components and cumulative URI-resolution bytes across external
-References, `RetrievalMethod`, and C14N 1.1 fixup; implementation ceilings are 64 components and
-1 MiB per operation. Other retrieval transform chains fail closed instead of being ignored.
+References, `RetrievalMethod`, Reference transforms, and SignedInfo C14N 1.1 fixup; implementation
+ceilings are 64 components and 1 MiB per operation. Other retrieval transform chains fail closed
+instead of being ignored.
 `VerifyContext::allowed_transforms` applies to Reference transforms and implicit C14N,
 the declared SignedInfo canonicalization method, and supported RetrievalMethod transforms.
 Allowing XPath for signed payload processing therefore also explicitly permits the bounded

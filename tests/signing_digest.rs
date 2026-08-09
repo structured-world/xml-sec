@@ -347,6 +347,53 @@ fn signing_policy_shares_canonicalization_budget_with_signed_info() {
 }
 
 #[test]
+fn signing_policy_applies_xml_base_budget_to_signed_info_c14n() {
+    // SignedInfo canonicalization is part of the same operation as Reference
+    // transforms and must not replace the compiled XML Base policy with hard
+    // defaults when inherited context is reconstructed.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template =
+        template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"));
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">x</payload></root>",
+        &template,
+    )
+    .expect("append signature")
+    .replacen(
+        "http://www.w3.org/2001/10/xml-exc-c14n#",
+        "http://www.w3.org/2006/12/xml-c14n11",
+        1,
+    )
+    .replace(
+        "<Signature xmlns=",
+        "<outer xml:base=\"one/\"><inner xml:base=\"two/\"><Signature xmlns=",
+    )
+    .replace("</Signature>", "</Signature></inner></outer>");
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_base_components: 1,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    let result = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_template(&xml);
+    assert!(
+        matches!(
+            result,
+            Err(SigningError::Canonicalization(
+                xml_sec::c14n::C14nError::XmlBaseComponentsTooLarge { max: 1, actual: 2 }
+            ))
+        ),
+        "unexpected signing result: {result:?}"
+    );
+}
+
+#[test]
 fn signing_policy_covers_implicit_and_signed_info_canonicalization() {
     // The transform allowlist covers algorithms executed implicitly by the
     // pipeline, not only explicit Reference/Transforms children.

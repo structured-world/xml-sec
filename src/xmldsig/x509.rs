@@ -3,17 +3,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use der::Decode;
-use dsa::pkcs8::DecodePublicKey;
-use sha1::{Digest, Sha1};
-use signature::hazmat::PrehashVerifier;
-
 use x509_parser::{
     certificate::X509Certificate, extensions::ParsedExtension, prelude::FromDer,
     revocation_list::CertificateRevocationList, time::ASN1Time,
 };
 
 use super::{
-    X509DataInfo,
+    SignatureAlgorithm, VerificationKey, X509DataInfo,
     parse::{distinguished_names_equal, x509_name_to_rfc4514},
 };
 
@@ -34,6 +30,9 @@ pub struct X509ChainOptions<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum X509ChainError {
+    /// The selected cryptographic provider rejected path authentication.
+    #[error("cryptographic provider rejected X.509 authentication: {0}")]
+    Provider(#[from] crate::provider::ProviderError),
     /// The configured path limit cannot contain a certificate.
     #[error("maximum certificate chain depth must be greater than zero")]
     InvalidDepth,
@@ -89,6 +88,14 @@ pub fn verify_x509_certificate_chain(
     info: &X509DataInfo,
     options: &X509ChainOptions<'_>,
 ) -> Result<(), X509ChainError> {
+    verify_x509_certificate_chain_with_provider(info, options, crate::provider::default_provider())
+}
+
+pub(crate) fn verify_x509_certificate_chain_with_provider(
+    info: &X509DataInfo,
+    options: &X509ChainOptions<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<(), X509ChainError> {
     if options.max_chain_depth == 0 {
         return Err(X509ChainError::InvalidDepth);
     }
@@ -121,18 +128,18 @@ pub fn verify_x509_certificate_chain(
     let verification_time = system_time_to_asn1(options.verification_time)?;
     let embedded_anchor = trusted_anchors.iter().any(|(der, _)| *der == last.as_raw());
     if embedded_anchor {
-        return validate_path(&path_der, info, options, verification_time);
+        return validate_path(&path_der, info, options, verification_time, provider);
     }
 
     // Use the path-edge verifier here too: x509-parser does not verify legacy
     // DSA-SHA1 roots, while our fallback must recognize them for rollover.
     let replace_untrusted_root = if path_der.len() > 1
         && certificate_names_equal(last.subject(), last.issuer())
-        && verify_certificate_signature(&last, &last)
+        && verify_certificate_signature_with_provider(&last, &last, provider)?
     {
         let child = parse_certificate(path_der[path_der.len() - 2])?;
         certificate_names_equal(child.issuer(), last.subject())
-            && verify_certificate_signature(&child, &last)
+            && verify_certificate_signature_with_provider(&child, &last, provider)?
     } else {
         false
     };
@@ -149,13 +156,15 @@ pub fn verify_x509_certificate_chain(
     )?;
 
     let mut first_validation_error = None;
-    for (anchor_der, _) in trusted_anchors.iter().filter(|(_, cert)| {
-        certificate_names_equal(cert.subject(), candidate_child.issuer())
-            && verify_certificate_signature(&candidate_child, cert)
-    }) {
+    for (anchor_der, cert) in &trusted_anchors {
+        if !certificate_names_equal(cert.subject(), candidate_child.issuer())
+            || !verify_certificate_signature_with_provider(&candidate_child, cert, provider)?
+        {
+            continue;
+        }
         let mut candidate_path = candidate_base.to_vec();
         candidate_path.push(anchor_der);
-        match validate_path(&candidate_path, info, options, verification_time) {
+        match validate_path(&candidate_path, info, options, verification_time, provider) {
             Ok(()) => return Ok(()),
             Err(error) => first_validation_error.get_or_insert(error),
         };
@@ -169,6 +178,7 @@ fn validate_path(
     info: &X509DataInfo,
     options: &X509ChainOptions<'_>,
     verification_time: ASN1Time,
+    provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<(), X509ChainError> {
     if path_der.len() > options.max_chain_depth {
         return Err(X509ChainError::DepthExceeded(options.max_chain_depth));
@@ -195,39 +205,48 @@ fn validate_path(
             unreachable!()
         };
         if !certificate_names_equal(child.issuer(), issuer.subject())
-            || !verify_certificate_signature(child, issuer)
+            || !verify_certificate_signature_with_provider(child, issuer, provider)?
         {
             return Err(X509ChainError::InvalidSignature(position));
         }
     }
 
     if options.check_crls {
-        verify_crls(&path, &info.crls, verification_time)?;
+        verify_crls(&path, &info.crls, verification_time, provider)?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn verify_certificate_signature(
     certificate: &X509Certificate<'_>,
     issuer: &X509Certificate<'_>,
 ) -> bool {
+    verify_certificate_signature_with_provider(
+        certificate,
+        issuer,
+        crate::provider::default_provider(),
+    )
+    .unwrap_or(false)
+}
+
+fn verify_certificate_signature_with_provider(
+    certificate: &X509Certificate<'_>,
+    issuer: &X509Certificate<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<bool, X509ChainError> {
     // RFC 5280 sections 4.1.1.2 and 4.1.2.3 require the outer and signed
     // AlgorithmIdentifier values to be identical. Enforce this independently
     // of the backend so the legacy DSA path cannot bypass the invariant.
     if certificate.signature_algorithm != certificate.tbs_certificate.signature {
-        return false;
+        return Ok(false);
     }
-    if certificate
-        .verify_signature(Some(issuer.public_key()))
-        .is_ok()
-    {
-        return true;
-    }
-    verify_dsa_sha1_signature(
+    verify_x509_signature_with_provider(
         &certificate.signature_algorithm.algorithm.to_id_string(),
         &certificate.signature_value.data,
         certificate.tbs_certificate.as_ref(),
         issuer.public_key().raw,
+        provider,
     )
 }
 
@@ -235,14 +254,28 @@ fn verify_certificate_signature(
 /// certificate. Path construction uses this only to distinguish certificates
 /// that share an issuer subject name; full policy validation still happens
 /// after the complete path has been assembled.
+#[cfg(test)]
 pub(crate) fn certificate_signature_matches(certificate_der: &[u8], issuer_der: &[u8]) -> bool {
+    certificate_signature_matches_with_provider(
+        certificate_der,
+        issuer_der,
+        crate::provider::default_provider(),
+    )
+    .unwrap_or(false)
+}
+
+pub(crate) fn certificate_signature_matches_with_provider(
+    certificate_der: &[u8],
+    issuer_der: &[u8],
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<bool, X509ChainError> {
     let (Ok(certificate), Ok(issuer)) = (
         parse_certificate(certificate_der),
         parse_certificate(issuer_der),
     ) else {
-        return false;
+        return Ok(false);
     };
-    verify_certificate_signature(&certificate, &issuer)
+    verify_certificate_signature_with_provider(&certificate, &issuer, provider)
 }
 
 fn certificate_names_equal(
@@ -255,40 +288,83 @@ fn certificate_names_equal(
     distinguished_names_equal(&left, &right)
 }
 
+#[cfg(test)]
 fn verify_crl_signature(crl: &CertificateRevocationList<'_>, issuer: &X509Certificate<'_>) -> bool {
+    verify_crl_signature_with_provider(crl, issuer, crate::provider::default_provider())
+        .unwrap_or(false)
+}
+
+fn verify_crl_signature_with_provider(
+    crl: &CertificateRevocationList<'_>,
+    issuer: &X509Certificate<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<bool, X509ChainError> {
     // RFC 5280 sections 5.1.1.2 and 5.1.2.2 impose the same equality rule on
     // CRLs as certificates.
     if crl.signature_algorithm != crl.tbs_cert_list.signature {
-        return false;
+        return Ok(false);
     }
-    if crl.verify_signature(issuer.public_key()).is_ok() {
-        return true;
-    }
-    verify_dsa_sha1_signature(
+    verify_x509_signature_with_provider(
         &crl.signature_algorithm.algorithm.to_id_string(),
         &crl.signature_value.data,
         crl.tbs_cert_list.as_ref(),
         issuer.public_key().raw,
+        provider,
     )
 }
 
-fn verify_dsa_sha1_signature(
+fn verify_x509_signature_with_provider(
     algorithm_oid: &str,
     signature_der: &[u8],
     signed_data: &[u8],
     issuer_spki_der: &[u8],
-) -> bool {
-    if algorithm_oid != "1.2.840.10040.4.3" {
-        return false;
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<bool, X509ChainError> {
+    let Some(algorithm) = x509_signature_algorithm(algorithm_oid) else {
+        return Ok(false);
+    };
+    let signature = if algorithm == SignatureAlgorithm::DsaSha1 {
+        let Ok(signature) = dsa::Signature::from_der(signature_der) else {
+            return Ok(false);
+        };
+        let r = signature.r().to_be_bytes();
+        let s = signature.s().to_be_bytes();
+        let r = &r[r.iter().position(|byte| *byte != 0).unwrap_or(r.len())..];
+        let s = &s[s.iter().position(|byte| *byte != 0).unwrap_or(s.len())..];
+        if r.len() > 20 || s.len() > 20 {
+            return Ok(false);
+        }
+        let mut fixed = vec![0_u8; 40];
+        fixed[20 - r.len()..20].copy_from_slice(r);
+        fixed[40 - s.len()..].copy_from_slice(s);
+        fixed
+    } else {
+        signature_der.to_vec()
+    };
+    let key = VerificationKey {
+        algorithm,
+        public_key_bytes: issuer_spki_der.to_vec(),
+        certificate_der: None,
+        name: None,
+    };
+    match provider.verify(&key, algorithm, signed_data, &signature) {
+        Ok(verified) => Ok(verified),
+        Err(super::DsigError::Provider(error)) => Err(error.into()),
+        Err(_) => Ok(false),
     }
-    let Ok(key) = dsa::VerifyingKey::from_public_key_der(issuer_spki_der) else {
-        return false;
-    };
-    let Ok(signature) = dsa::Signature::from_der(signature_der) else {
-        return false;
-    };
-    let digest = Sha1::digest(signed_data);
-    key.verify_prehash(&digest, &signature).is_ok()
+}
+
+fn x509_signature_algorithm(oid: &str) -> Option<SignatureAlgorithm> {
+    match oid {
+        "1.2.840.10040.4.3" => Some(SignatureAlgorithm::DsaSha1),
+        "1.2.840.113549.1.1.5" | "1.3.14.3.2.29" => Some(SignatureAlgorithm::RsaSha1),
+        "1.2.840.113549.1.1.11" => Some(SignatureAlgorithm::RsaSha256),
+        "1.2.840.113549.1.1.12" => Some(SignatureAlgorithm::RsaSha384),
+        "1.2.840.113549.1.1.13" => Some(SignatureAlgorithm::RsaSha512),
+        "1.2.840.10045.4.3.2" => Some(SignatureAlgorithm::EcdsaP256Sha256),
+        "1.2.840.10045.4.3.3" => Some(SignatureAlgorithm::EcdsaP384Sha384),
+        _ => None,
+    }
 }
 
 fn validate_leaf_key_usage(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
@@ -377,6 +453,7 @@ fn verify_crls(
     path: &[X509Certificate<'_>],
     crl_der: &[Vec<u8>],
     verification_time: ASN1Time,
+    provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<(), X509ChainError> {
     let crls = crl_der
         .iter()
@@ -421,7 +498,7 @@ fn verify_crls(
                 && crl
                     .next_update()
                     .is_none_or(|next| verification_time <= next);
-            if !time_valid || !verify_crl_signature(crl, issuer) {
+            if !time_valid || !verify_crl_signature_with_provider(crl, issuer, provider)? {
                 return Err(X509ChainError::InvalidCrl(*crl_index));
             }
             if crl.iter_revoked_certificates().any(|revoked| {

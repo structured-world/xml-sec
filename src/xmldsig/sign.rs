@@ -19,7 +19,7 @@ use sha2::{Sha256, Sha384, Sha512};
 use std::collections::HashSet;
 use x509_parser::prelude::FromDer;
 
-use crate::c14n::{canonicalize_bounded, is_output_limit_error};
+use crate::c14n::{canonicalize_bounded_with_xml_base_budget, is_output_limit_error};
 
 use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::DigestAlgorithm;
@@ -824,11 +824,12 @@ fn canonicalize_signed_info(
         .map(|node: Node<'_, '_>| node.id())
         .collect();
     let mut canonical_signed_info = Vec::new();
-    canonicalize_bounded(
+    canonicalize_bounded_with_xml_base_budget(
         &doc,
         Some(&|node| signed_info_subtree.contains(&node.id())),
         &signed_info.c14n_method,
         execution_budget.remaining_c14n_output(),
+        execution_budget.xml_base_resolution(),
         &mut canonical_signed_info,
     )
     .map_err(|error| {

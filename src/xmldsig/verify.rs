@@ -15,7 +15,7 @@ use roxmltree::{Document, Node, NodeId};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
-use crate::c14n::{canonicalize_bounded, is_output_limit_error};
+use crate::c14n::{canonicalize_bounded_with_xml_base_budget, is_output_limit_error};
 use crate::hard_limits::{CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING, XML_DOCUMENT_NODE_CEILING};
 
 #[cfg(test)]
@@ -1125,11 +1125,12 @@ fn verify_signature_with_context(
         .map(|node: Node<'_, '_>| node.id())
         .collect();
     let mut canonical_signed_info = Vec::new();
-    canonicalize_bounded(
+    canonicalize_bounded_with_xml_base_budget(
         &doc,
         Some(&|node| signed_info_subtree.contains(&node.id())),
         &signed_info.c14n_method,
         canonicalized_data_budget.remaining(),
+        execution_budget.xml_base_resolution(),
         &mut canonical_signed_info,
     )
     .map_err(|error| {
@@ -2637,6 +2638,44 @@ mod tests {
                 ReferenceProcessingError::UriDereference(
                     TransformError::XmlBaseResolutionTooLarge { max_bytes: 32, .. }
                 )
+            )
+        ));
+    }
+
+    #[test]
+    fn verify_context_applies_xml_base_policy_to_signed_info_c14n() {
+        // The SignedInfo node-set excludes its ancestors, so C14N 1.1 must
+        // resolve their inherited xml:base values through the same operation
+        // budget already used by Reference processing.
+        let xml = signature_with_target_reference("AQ==")
+            .replacen(
+                "http://www.w3.org/2001/10/xml-exc-c14n#",
+                "http://www.w3.org/2006/12/xml-c14n11",
+                1,
+            )
+            .replace(
+                "  <ds:Signature>",
+                "  <outer xml:base=\"one/\"><inner xml:base=\"two/\"><ds:Signature>",
+            )
+            .replace("  </ds:Signature>", "  </ds:Signature></inner></outer>");
+        let policy = crate::policy::VerificationPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_base_components: 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .verify(&xml)
+            .expect_err("SignedInfo C14N must use the operation XML Base budget");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Canonicalization(
+                crate::c14n::C14nError::XmlBaseComponentsTooLarge { max: 1, actual: 2 }
             )
         ));
     }

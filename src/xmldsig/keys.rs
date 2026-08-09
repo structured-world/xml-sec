@@ -22,7 +22,7 @@ use super::{
         x509_data_has_lookup_identifiers, x509_selector_categories_match_chain,
     },
     verify_dsa_signature_spki, verify_ecdsa_signature_spki, verify_rsa_signature_spki,
-    verify_x509_certificate_chain,
+    x509::verify_x509_certificate_chain_with_provider,
 };
 
 /// Caller-owned HMAC-SHA1 verification key.
@@ -235,7 +235,7 @@ impl DefaultKeyResolver {
                 .ok_or(KeyResolutionError::InvalidCertificate)?
                 .clone();
             if trust.verify_x509_chains {
-                self.prepare_embedded_x509(info, signing_index, trust)?;
+                self.prepare_embedded_x509(info, signing_index, trust, provider)?;
             }
             certificate_der
         } else {
@@ -269,6 +269,7 @@ impl DefaultKeyResolver {
         &self,
         info: &X509DataInfo,
         trust: &crate::policy::KeyTrustPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<(), KeyResolutionError> {
         let options = X509ChainOptions {
             trusted_certs: &self.config.trusted_certs,
@@ -276,7 +277,7 @@ impl DefaultKeyResolver {
             max_chain_depth: trust.max_x509_chain_depth,
             check_crls: trust.check_crls,
         };
-        verify_x509_certificate_chain(info, &options)?;
+        verify_x509_certificate_chain_with_provider(info, &options, provider)?;
         Ok(())
     }
 
@@ -285,6 +286,7 @@ impl DefaultKeyResolver {
         info: &X509DataInfo,
         signing_index: usize,
         trust: &crate::policy::KeyTrustPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<X509DataInfo, KeyResolutionError> {
         let signing_der = info
             .certificates
@@ -329,7 +331,13 @@ impl DefaultKeyResolver {
             .iter()
             .position(|certificate| certificate == signing_der)
             .ok_or(KeyResolutionError::InvalidCertificate)?;
-        self.select_valid_x509_path(&mut available, signing_index, trusted_prefix_len, trust)?;
+        self.select_valid_x509_path(
+            &mut available,
+            signing_index,
+            trusted_prefix_len,
+            trust,
+            provider,
+        )?;
         Ok(available)
     }
 
@@ -339,6 +347,7 @@ impl DefaultKeyResolver {
         signing_index: usize,
         trusted_prefix_len: usize,
         trust: &crate::policy::KeyTrustPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<(), KeyResolutionError> {
         let candidates = build_x509_certificate_paths_to_trusted_prefix(
             available,
@@ -346,15 +355,19 @@ impl DefaultKeyResolver {
             trusted_prefix_len,
             trust.max_x509_chain_depth,
             trust.max_x509_candidate_paths,
+            provider,
         )
         .map_err(|error| match error {
             X509ChainBuildError::AmbiguousIssuer => KeyResolutionError::AmbiguousCertificate,
+            X509ChainBuildError::Provider(error) => {
+                KeyResolutionError::Chain(super::X509ChainError::Provider(error))
+            }
             _ => KeyResolutionError::InvalidCertificate,
         })?;
         let mut first_error = None;
         for candidate in candidates {
             available.certificate_chain = candidate;
-            match self.verify_x509_policy(available, trust) {
+            match self.verify_x509_policy(available, trust, provider) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     first_error.get_or_insert(error);
@@ -465,16 +478,21 @@ impl DefaultKeyResolver {
         // `available` preserves trusted certificates as a prefix. Selecting
         // one of those exact certificates is already a terminal trust
         // decision, even when the certificate is not self-signed.
-        available.certificate_chain = if signing_index < trusted_prefix_len
-            || !trust.verify_x509_chains
-        {
-            vec![signing_index]
-        } else {
-            self.select_valid_x509_path(&mut available, signing_index, trusted_prefix_len, trust)?;
-            available.certificate_chain.clone()
-        };
+        available.certificate_chain =
+            if signing_index < trusted_prefix_len || !trust.verify_x509_chains {
+                vec![signing_index]
+            } else {
+                self.select_valid_x509_path(
+                    &mut available,
+                    signing_index,
+                    trusted_prefix_len,
+                    trust,
+                    provider,
+                )?;
+                available.certificate_chain.clone()
+            };
         if trust.verify_x509_chains && signing_index < trusted_prefix_len {
-            self.verify_x509_policy(&available, trust)?;
+            self.verify_x509_policy(&available, trust, provider)?;
         }
         Ok(Some(available))
     }
@@ -787,6 +805,9 @@ mod tests {
 
     struct RejectSecondSha512Provider {
         sha512_calls: AtomicUsize,
+        verification_calls: AtomicUsize,
+        reject_verification_call: Option<usize>,
+        rejected_verification_data: Option<Vec<u8>>,
     }
 
     impl crate::provider::CryptoProvider for RejectSecondSha512Provider {
@@ -834,6 +855,19 @@ mod tests {
             data: &[u8],
             signature: &[u8],
         ) -> Result<bool, DsigError> {
+            let call = self.verification_calls.fetch_add(1, Ordering::Relaxed);
+            if self.reject_verification_call == Some(call)
+                || self
+                    .rejected_verification_data
+                    .as_deref()
+                    .is_some_and(|rejected| rejected == data)
+            {
+                return Err(crate::provider::ProviderError::Unsupported {
+                    operation: crate::provider::ProviderOperation::Verify,
+                    algorithm: Some(algorithm.uri().to_owned()),
+                }
+                .into());
+            }
             crate::provider::default_provider().verify(key, algorithm, data, signature)
         }
 
@@ -1496,6 +1530,125 @@ mod tests {
     }
 
     #[test]
+    fn x509_path_signatures_use_the_operation_provider() {
+        // Embedded and selector-resolved certificates converge on the same
+        // path validator. Neither source may fall back to a crate-global
+        // verifier when the operation provider rejects certificate signatures.
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("provider root", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        let leaf = generated_certificate_params("provider leaf", false)
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &root,
+            )
+            .expect("root should sign the leaf");
+        let leaf_der = leaf.der().to_vec();
+        let leaf_metadata =
+            parse_x509_certificate(&leaf_der).expect("generated leaf metadata should parse");
+        let policy = crate::policy::VerificationPolicy {
+            key_trust: chain_policy(),
+            ..crate::policy::VerificationPolicy::default()
+        };
+
+        let cases = [
+            (
+                KeyInfo {
+                    sources: vec![KeyInfoSource::X509Data(x509_info(
+                        vec![leaf_der.clone()],
+                        0,
+                    ))],
+                },
+                Vec::new(),
+            ),
+            (
+                KeyInfo {
+                    sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                        subject_names: vec![leaf_metadata.subject_dn],
+                        ..X509DataInfo::default()
+                    })],
+                },
+                vec![leaf_der],
+            ),
+        ];
+
+        for (key_info, lookup_certs) in cases {
+            let provider = RejectSecondSha512Provider {
+                sha512_calls: AtomicUsize::new(0),
+                verification_calls: AtomicUsize::new(0),
+                reject_verification_call: Some(0),
+                rejected_verification_data: None,
+            };
+            let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+                trusted_certs: vec![root.der().to_vec()],
+                lookup_certs,
+                trust: chain_policy(),
+                ..KeyResolverConfig::default()
+            });
+            let error = match resolver.resolve_with_policy_and_provider(
+                Some(&key_info),
+                SignatureAlgorithm::EcdsaP256Sha256,
+                &policy,
+                &provider,
+            ) {
+                Ok(_) => panic!("the operation provider must gate every X.509 path signature"),
+                Err(error) => error,
+            };
+
+            assert!(matches!(
+                error,
+                DsigError::KeyResolution(KeyResolutionError::Chain(
+                    super::super::X509ChainError::Provider(
+                        crate::provider::ProviderError::Unsupported {
+                            operation: crate::provider::ProviderOperation::Verify,
+                            ..
+                        }
+                    )
+                ))
+            ));
+            assert_eq!(provider.verification_calls.load(Ordering::Relaxed), 1);
+        }
+
+        // A provider rejection after path construction proves complete-path
+        // validation does not switch back to the crate-global provider.
+        let provider = RejectSecondSha512Provider {
+            sha512_calls: AtomicUsize::new(0),
+            verification_calls: AtomicUsize::new(0),
+            reject_verification_call: Some(1),
+            rejected_verification_data: None,
+        };
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![root.der().to_vec()],
+            trust: chain_policy(),
+            ..KeyResolverConfig::default()
+        });
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(x509_info(
+                vec![leaf.der().to_vec()],
+                0,
+            ))],
+        };
+        let error = match resolver.resolve_with_policy_and_provider(
+            Some(&key_info),
+            SignatureAlgorithm::EcdsaP256Sha256,
+            &policy,
+            &provider,
+        ) {
+            Ok(_) => panic!("complete-path validation must retain the operation provider"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::Chain(
+                super::super::X509ChainError::Provider(_)
+            ))
+        ));
+        assert_eq!(provider.verification_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn embedded_leaf_uses_lookup_intermediate_with_duplicate_anchor() {
         // Deduplicating repeated trust anchors must not shift an untrusted
         // lookup intermediate into the trusted prefix used by path building.
@@ -1680,7 +1833,14 @@ mod tests {
         );
 
         assert!(matches!(
-            build_x509_certificate_paths_to_trusted_prefix(&info, 2, 1, 9, 2),
+            build_x509_certificate_paths_to_trusted_prefix(
+                &info,
+                2,
+                1,
+                9,
+                2,
+                crate::provider::default_provider(),
+            ),
             Err(X509ChainBuildError::AmbiguousIssuer)
         ));
     }
@@ -1765,9 +1925,13 @@ mod tests {
         let crl = crl_der(include_str!(
             "../../tests/fixtures/keys/rsa/rsa-2048-cert-revoked-crl.pem"
         ));
+        let (_, parsed_crl) =
+            x509_parser::revocation_list::CertificateRevocationList::from_der(&crl)
+                .expect("tracked CRL must parse");
+        let crl_signed_data = parsed_crl.tbs_cert_list.as_ref().to_vec();
         let xml = replace_unprefixed_key_info(
             RSA_KEY_VALUE_SIGNATURE,
-            &selector.replace("CRL_PLACEHOLDER", &STANDARD.encode(crl)),
+            &selector.replace("CRL_PLACEHOLDER", &STANDARD.encode(&crl)),
         );
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             lookup_certs: vec![certificate_der(include_str!(
@@ -1795,6 +1959,27 @@ mod tests {
             error,
             DsigError::KeyResolution(KeyResolutionError::Chain(
                 super::super::X509ChainError::Revoked(0)
+            ))
+        ));
+
+        // Match the exact TBSCertList bytes so earlier certificate-edge
+        // verification succeeds and the provider rejection occurs at CRL
+        // authentication itself.
+        let provider = RejectSecondSha512Provider {
+            sha512_calls: AtomicUsize::new(0),
+            verification_calls: AtomicUsize::new(0),
+            reject_verification_call: None,
+            rejected_verification_data: Some(crl_signed_data),
+        };
+        let error = super::super::VerifyContext::new()
+            .key_resolver(&resolver)
+            .provider(&provider)
+            .verify(&xml)
+            .expect_err("CRL authentication must retain the operation provider");
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::Chain(
+                super::super::X509ChainError::Provider(_)
             ))
         ));
     }
@@ -1963,6 +2148,9 @@ mod tests {
         });
         let provider = RejectSecondSha512Provider {
             sha512_calls: AtomicUsize::new(0),
+            verification_calls: AtomicUsize::new(0),
+            reject_verification_call: None,
+            rejected_verification_data: None,
         };
         let error = super::super::VerifyContext::new()
             .key_resolver(&resolver)
@@ -2088,6 +2276,9 @@ mod tests {
         let document = roxmltree::Document::parse(&xml).expect("generated KeyInfo must be XML");
         let provider = RejectSecondSha512Provider {
             sha512_calls: AtomicUsize::new(1),
+            verification_calls: AtomicUsize::new(0),
+            reject_verification_call: None,
+            rejected_verification_data: None,
         };
 
         let error =

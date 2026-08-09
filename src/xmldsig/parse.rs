@@ -33,7 +33,7 @@ use super::whitespace::{
     XmlBase64NormalizeLimitedError, is_xml_whitespace_only, normalize_xml_base64_text,
     normalize_xml_base64_text_with_limit,
 };
-use super::x509::certificate_signature_matches;
+use super::x509::certificate_signature_matches_with_provider;
 use crate::c14n::C14nAlgorithm;
 use crate::c14n::xml_base::{
     XmlBaseResolutionBudget, compute_effective_xml_base_with_budget, resolve_uri_with_budget,
@@ -1200,16 +1200,17 @@ fn build_x509_certificate_chain(
     }
 
     let signing_idx = select_x509_signing_certificate(info, provider)?;
-    build_x509_certificate_chain_from(info, signing_idx).map_err(ParseError::from)
+    build_x509_certificate_chain_from(info, signing_idx, provider).map_err(ParseError::from)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum X509ChainBuildError {
     InconsistentMetadata,
     DepthExceeded,
     Cycle,
     IssuerSignatureMismatch,
     AmbiguousIssuer,
+    Provider(crate::provider::ProviderError),
 }
 
 impl From<X509ChainBuildError> for ParseError {
@@ -1228,6 +1229,7 @@ impl From<X509ChainBuildError> for ParseError {
             X509ChainBuildError::AmbiguousIssuer => {
                 "X509Data certificate chain contains ambiguous issuer certificates"
             }
+            X509ChainBuildError::Provider(error) => return Self::Provider(error),
         };
         Self::InvalidStructure(reason.into())
     }
@@ -1237,6 +1239,7 @@ impl From<X509ChainBuildError> for ParseError {
 pub(crate) fn build_x509_certificate_chain_from(
     info: &X509DataInfo,
     signing_idx: usize,
+    provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<Vec<usize>, X509ChainBuildError> {
     if signing_idx >= info.parsed_certificates.len()
         || info.parsed_certificates.len() != info.certificates.len()
@@ -1269,15 +1272,21 @@ pub(crate) fn build_x509_certificate_chain_from(
             [] => break,
             [issuer_idx] => *issuer_idx,
             _ => {
-                let verified = candidates
-                    .into_iter()
-                    .filter(|issuer_idx| {
-                        certificate_signature_matches(
-                            &info.certificates[current_idx],
-                            &info.certificates[*issuer_idx],
-                        )
-                    })
-                    .collect::<Vec<_>>();
+                let mut verified = Vec::new();
+                for issuer_idx in candidates {
+                    match certificate_signature_matches_with_provider(
+                        &info.certificates[current_idx],
+                        &info.certificates[issuer_idx],
+                        provider,
+                    ) {
+                        Ok(true) => verified.push(issuer_idx),
+                        Ok(false) => {}
+                        Err(super::X509ChainError::Provider(error)) => {
+                            return Err(X509ChainBuildError::Provider(error));
+                        }
+                        Err(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
+                    }
+                }
                 match verified.as_slice() {
                     [issuer_idx] => *issuer_idx,
                     [] => return Err(X509ChainBuildError::IssuerSignatureMismatch),
@@ -1306,6 +1315,7 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
     trusted_prefix_len: usize,
     max_depth: usize,
     max_candidate_paths: usize,
+    provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
     if signing_idx >= info.parsed_certificates.len()
         || info.parsed_certificates.len() != info.certificates.len()
@@ -1336,20 +1346,30 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
         }
 
         let current = &info.parsed_certificates[current_idx];
-        let issuers = issuer_cache[current_idx].get_or_insert_with(|| {
-            info.parsed_certificates
-                .iter()
-                .enumerate()
-                .filter(|(issuer_idx, issuer)| {
-                    distinguished_names_equal(&issuer.subject_dn, &current.issuer_dn)
-                        && certificate_signature_matches(
-                            &info.certificates[current_idx],
-                            &info.certificates[*issuer_idx],
-                        )
-                })
-                .map(|(issuer_idx, _)| issuer_idx)
-                .collect::<Vec<_>>()
-        });
+        if issuer_cache[current_idx].is_none() {
+            let mut verified = Vec::new();
+            for (issuer_idx, issuer) in info.parsed_certificates.iter().enumerate() {
+                if !distinguished_names_equal(&issuer.subject_dn, &current.issuer_dn) {
+                    continue;
+                }
+                match certificate_signature_matches_with_provider(
+                    &info.certificates[current_idx],
+                    &info.certificates[issuer_idx],
+                    provider,
+                ) {
+                    Ok(true) => verified.push(issuer_idx),
+                    Ok(false) => {}
+                    Err(super::X509ChainError::Provider(error)) => {
+                        return Err(X509ChainBuildError::Provider(error));
+                    }
+                    Err(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
+                }
+            }
+            issuer_cache[current_idx] = Some(verified);
+        }
+        let issuers = issuer_cache[current_idx]
+            .as_ref()
+            .expect("issuer cache entry was initialized");
         let issuers = issuers
             .iter()
             .copied()
@@ -2872,7 +2892,8 @@ BA== </Modulus>
             0
         );
         assert_eq!(
-            build_x509_certificate_chain_from(&info, 0).unwrap(),
+            build_x509_certificate_chain_from(&info, 0, crate::provider::default_provider())
+                .unwrap(),
             vec![0, 1, 2]
         );
     }
