@@ -69,7 +69,10 @@ self-issued rollover certificates continue toward a distinct same-name issuer wh
 validates; neither condition can bypass the configured work bounds or trust anchor requirement.
 Path validation excludes self-issued rollover CAs from `pathLenConstraint`, applies supported RFC
 5280 NameConstraints to every subordinate certificate, and rejects critical extensions whose
-semantics are not implemented. Processed critical certificate extensions are KeyUsage
+semantics are not implemented. Empty certificate subjects require exactly one critical, non-empty
+SubjectAlternativeName, and malformed IPv4/IPv6 constraint lengths or non-contiguous CIDR masks
+fail the path rather than behaving as ordinary name mismatches. Processed critical certificate
+extensions are KeyUsage
 (`2.5.29.15`), SubjectAlternativeName (`2.5.29.17`), BasicConstraints (`2.5.29.19`), and
 NameConstraints (`2.5.29.30`). A chain using critical ExtendedKeyUsage (`2.5.29.37`) or
 CertificatePolicies (`2.5.29.32`) therefore fails closed until those semantics are implemented;
@@ -155,5 +158,8 @@ RSA-SHA1 verification is default-deny: callers must explicitly enable
 does not opt the operation into legacy cryptography, and this gate runs before key resolution.
 RSA-SHA1 signing remains unsupported.
 X.509 path and CRL authentication additionally supports standard RSA-PSS with SHA-256/SHA-384/
-SHA-512 parameters, including RFC 4055 issuer-key restrictions, and Ed25519. DSA-SHA256, broader HMAC verification/signing, XMLDSig
-`SignatureMethod` RSA-PSS, and implicit external resource loading are not currently supported.
+SHA-512 parameters, including RFC 4055 issuer-key restrictions, and Ed25519. Signature
+`AlgorithmIdentifier` parameters are validated before provider dispatch: DSA, ECDSA, and Ed25519
+require absent parameters; RSA PKCS#1 accepts NULL or absent; RSA-PSS requires valid typed
+parameters. DSA-SHA256, broader HMAC verification/signing, XMLDSig `SignatureMethod` RSA-PSS, and
+implicit external resource loading are not currently supported.

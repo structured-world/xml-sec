@@ -82,6 +82,7 @@ impl<'a> DecryptContext<'a> {
     pub fn decrypt_data(&self, encrypted: &EncryptedData) -> Result<DecryptedContent, XmlEncError> {
         self.policy.resources.validate()?;
         validate_encrypted_data_metadata(encrypted, &self.policy)?;
+        encrypted.encryption_method.validate_structure()?;
         validate_recipient_count(
             encrypted.encrypted_keys.len(),
             self.policy.resources.max_encryption_recipients,
@@ -795,6 +796,11 @@ mod tests {
         key: Vec<u8>,
     }
 
+    struct AllCallsResolver {
+        calls: Cell<usize>,
+        key: Vec<u8>,
+    }
+
     impl DecryptionKeyResolver for CountingResolver {
         fn resolve_key(
             &self,
@@ -808,6 +814,18 @@ mod tests {
             } else {
                 Err(XmlEncError::KeyNotFound)
             }
+        }
+    }
+
+    impl DecryptionKeyResolver for AllCallsResolver {
+        fn resolve_key(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            _encrypted_key: Option<&EncryptedKey>,
+        ) -> Result<Vec<u8>, XmlEncError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.key.clone())
         }
     }
 
@@ -1566,6 +1584,43 @@ mod tests {
             Err(XmlEncError::InvalidStructure(message))
                 if message == "MGF is only valid for XML Encryption 1.1 RSA-OAEP"
         ));
+    }
+
+    #[test]
+    fn typed_content_method_is_validated_before_key_resolution() {
+        // Caller-constructed values bypass XML parsing, so a fixed-size AES
+        // KeySize mismatch must fail at the operation boundary.
+        let key = [0x44_u8; 16];
+        let ciphertext = crate::provider::default_provider()
+            .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
+            .expect("test encryption must succeed");
+        let encrypted = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            key_name: None,
+            encryption_method: super::super::EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
+                key_size_bits: Some(256),
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            encrypted_keys: Vec::new(),
+            cipher_data: super::super::CipherData {
+                value: STANDARD.encode(ciphertext),
+            },
+        };
+        let resolver = AllCallsResolver {
+            calls: Cell::new(0),
+            key: key.to_vec(),
+        };
+
+        assert!(matches!(
+            DecryptContext::new(&resolver).decrypt_data(&encrypted),
+            Err(XmlEncError::InvalidStructure(message))
+                if message.contains("requires KeySize 128, got 256")
+        ));
+        assert_eq!(resolver.calls.get(), 0);
     }
 
     #[test]

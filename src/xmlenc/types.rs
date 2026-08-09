@@ -413,15 +413,11 @@ impl EncryptionMethod {
 }
 
 fn fixed_aes_key_size(algorithm: &str) -> Option<usize> {
-    match algorithm {
-        "http://www.w3.org/2001/04/xmlenc#aes128-cbc"
-        | "http://www.w3.org/2009/xmlenc11#aes128-gcm"
-        | "http://www.w3.org/2001/04/xmlenc#kw-aes128" => Some(128),
-        "http://www.w3.org/2001/04/xmlenc#aes256-cbc"
-        | "http://www.w3.org/2009/xmlenc11#aes256-gcm"
-        | "http://www.w3.org/2001/04/xmlenc#kw-aes256" => Some(256),
-        _ => None,
-    }
+    let key_len = DataEncryptionAlgorithm::from_uri(algorithm)
+        .map(DataEncryptionAlgorithm::key_len)
+        .or_else(|_| KeyWrapAlgorithm::from_uri(algorithm).map(KeyWrapAlgorithm::key_len))
+        .ok()?;
+    Some(key_len * 8)
 }
 
 /// Inline ciphertext data.

@@ -232,6 +232,7 @@ fn validate_path(
         } else {
             validate_ca_constraints(cert, position)?;
         }
+        validate_subject_identity(cert)?;
         validate_critical_extensions(cert, position)?;
     }
     validate_path_length_constraints(&path)?;
@@ -252,6 +253,45 @@ fn validate_path(
         verify_crls(&path, &info.crls, verification_time, provider)?;
     }
     Ok(())
+}
+
+fn validate_subject_identity(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
+    if cert.subject().iter().next().is_some() {
+        return Ok(());
+    }
+
+    let mut san_extensions = cert
+        .extensions()
+        .iter()
+        .filter(|extension| extension.oid.to_id_string() == "2.5.29.17");
+    let Some(extension) = san_extensions.next() else {
+        return Err(invalid_subject_identity(
+            "an empty subject requires a critical SubjectAlternativeName",
+        ));
+    };
+    if san_extensions.next().is_some() {
+        return Err(invalid_subject_identity(
+            "an empty subject must not contain duplicate SubjectAlternativeName extensions",
+        ));
+    }
+    let ParsedExtension::SubjectAlternativeName(names) = extension.parsed_extension() else {
+        return Err(invalid_subject_identity(
+            "SubjectAlternativeName could not be parsed",
+        ));
+    };
+    if !extension.critical || names.general_names.is_empty() {
+        return Err(invalid_subject_identity(
+            "an empty subject requires a critical, non-empty SubjectAlternativeName",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_subject_identity(message: &str) -> X509ChainError {
+    X509ChainError::InvalidDer {
+        kind: "certificate subject identity",
+        message: message.into(),
+    }
 }
 
 #[cfg(test)]
@@ -392,7 +432,54 @@ fn x509_signature_algorithm(
         "1.3.101.112" => X509SignatureAlgorithm::Ed25519,
         _ => return Err(X509ChainError::UnsupportedSignatureAlgorithm { oid }),
     };
+    match &algorithm {
+        X509SignatureAlgorithm::Dsa(_)
+        | X509SignatureAlgorithm::Ecdsa(_)
+        | X509SignatureAlgorithm::Ed25519 => require_absent_signature_parameters(identifier)?,
+        X509SignatureAlgorithm::RsaPkcs1v15(_) => {
+            require_null_or_absent_signature_parameters(identifier)?;
+        }
+        X509SignatureAlgorithm::RsaPss { .. } => {}
+    }
     Ok(algorithm)
+}
+
+fn require_absent_signature_parameters(
+    identifier: &AlgorithmIdentifier<'_>,
+) -> Result<(), X509ChainError> {
+    if identifier.parameters.is_some() {
+        return Err(invalid_signature_parameters(
+            identifier,
+            "parameters must be absent",
+        ));
+    }
+    Ok(())
+}
+
+fn require_null_or_absent_signature_parameters(
+    identifier: &AlgorithmIdentifier<'_>,
+) -> Result<(), X509ChainError> {
+    if identifier
+        .parameters
+        .as_ref()
+        .is_some_and(|parameters| parameters.tag() != x509_parser::asn1_rs::Tag::Null)
+    {
+        return Err(invalid_signature_parameters(
+            identifier,
+            "parameters must be NULL or absent",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_signature_parameters(
+    identifier: &AlgorithmIdentifier<'_>,
+    requirement: &str,
+) -> X509ChainError {
+    X509ChainError::InvalidDer {
+        kind: "X.509 signature AlgorithmIdentifier parameters",
+        message: format!("{}: {requirement}", identifier.algorithm),
+    }
 }
 
 fn parse_rsa_pss_algorithm(
@@ -634,6 +721,9 @@ fn ensure_supported_name_constraints(
         .flatten()
         .chain(constraints.excluded_subtrees.iter().flatten())
     {
+        if let GeneralName::IPAddress(bytes) = &subtree.base {
+            validate_ip_name_constraint(bytes)?;
+        }
         if matches!(
             subtree.base,
             GeneralName::OtherName(..)
@@ -779,7 +869,7 @@ fn general_name_within_subtree(
                 dns_name_within_subtree(host, subtree, false).into()
             }),
         (GeneralName::IPAddress(name), GeneralName::IPAddress(subtree)) => {
-            ip_address_within_subtree(name, subtree).into()
+            ip_address_within_subtree(name, subtree)?.into()
         }
         _ => NameConstraintMatch::NoMatch,
     })
@@ -826,19 +916,39 @@ fn uri_host(uri: &str) -> Option<&str> {
     (!host.is_empty() && host.parse::<std::net::IpAddr>().is_err()).then_some(host)
 }
 
-fn ip_address_within_subtree(address: &[u8], subtree: &[u8]) -> bool {
-    if subtree.len() != address.len().saturating_mul(2) || !matches!(address.len(), 4 | 16) {
-        return false;
+fn ip_address_within_subtree(address: &[u8], subtree: &[u8]) -> Result<bool, X509ChainError> {
+    if !matches!(address.len(), 4 | 16) {
+        return Err(X509ChainError::InvalidDer {
+            kind: "IP subject alternative name",
+            message: format!("expected 4 or 16 octets, got {}", address.len()),
+        });
     }
-    let (network, mask) = subtree.split_at(address.len());
-    if !ip_mask_is_contiguous(mask) {
-        return false;
+    let (network, mask) = validate_ip_name_constraint(subtree)?;
+    if network.len() != address.len() {
+        return Ok(false);
     }
-    address
+    Ok(address
         .iter()
         .zip(network)
         .zip(mask)
-        .all(|((address, network), mask)| address & mask == network & mask)
+        .all(|((address, network), mask)| address & mask == network & mask))
+}
+
+fn validate_ip_name_constraint(subtree: &[u8]) -> Result<(&[u8], &[u8]), X509ChainError> {
+    if !matches!(subtree.len(), 8 | 32) {
+        return Err(X509ChainError::InvalidDer {
+            kind: "IP name constraint",
+            message: format!("expected 8 or 32 octets, got {}", subtree.len()),
+        });
+    }
+    let (network, mask) = subtree.split_at(subtree.len() / 2);
+    if !ip_mask_is_contiguous(mask) {
+        return Err(X509ChainError::InvalidDer {
+            kind: "IP name constraint",
+            message: "network mask is not contiguous".into(),
+        });
+    }
+    Ok((network, mask))
 }
 
 fn ip_mask_is_contiguous(mask: &[u8]) -> bool {
@@ -1167,6 +1277,56 @@ mod tests {
     }
 
     #[test]
+    fn x509_signature_parameters_follow_each_algorithm_profile() {
+        use x509_parser::asn1_rs::{Any, Tag};
+
+        // DSA, ECDSA, and Ed25519 signature identifiers require absent
+        // parameters. A NULL is not equivalent for these algorithm profiles.
+        for oid in [
+            "1.2.840.10040.4.3",
+            "2.16.840.1.101.3.4.3.2",
+            "1.2.840.10045.4.1",
+            "1.2.840.10045.4.3.2",
+            "1.3.101.112",
+        ] {
+            let identifier = AlgorithmIdentifier::new(
+                Oid::from_str(oid).expect("static signature OID must parse"),
+                Some(Any::from_tag_and_data(Tag::Null, &[])),
+            );
+            assert!(matches!(
+                x509_signature_algorithm(&identifier),
+                Err(X509ChainError::InvalidDer {
+                    kind: "X.509 signature AlgorithmIdentifier parameters",
+                    ..
+                })
+            ));
+        }
+
+        // RSA PKCS#1 signature identifiers accept absent and NULL parameters
+        // for interoperability, but no other ASN.1 value.
+        let rsa_oid =
+            Oid::from_str("1.2.840.113549.1.1.11").expect("static RSA signature OID must parse");
+        for parameters in [None, Some(Any::from_tag_and_data(Tag::Null, &[]))] {
+            assert!(matches!(
+                x509_signature_algorithm(&AlgorithmIdentifier::new(rsa_oid.clone(), parameters)),
+                Ok(X509SignatureAlgorithm::RsaPkcs1v15(
+                    super::super::DigestAlgorithm::Sha256
+                ))
+            ));
+        }
+        assert!(matches!(
+            x509_signature_algorithm(&AlgorithmIdentifier::new(
+                rsa_oid,
+                Some(Any::from_tag_and_data(Tag::OctetString, &[])),
+            )),
+            Err(X509ChainError::InvalidDer {
+                kind: "X.509 signature AlgorithmIdentifier parameters",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn unknown_x509_signature_algorithm_remains_diagnosable() {
         let oid = "1.2.3.4.5";
         let identifier = AlgorithmIdentifier::new(
@@ -1332,18 +1492,49 @@ mod tests {
             ".example.com",
             false,
         ));
-        assert!(ip_address_within_subtree(
-            &[192, 0, 2, 42],
-            &[192, 0, 2, 0, 255, 255, 255, 0],
+        assert!(
+            ip_address_within_subtree(&[192, 0, 2, 42], &[192, 0, 2, 0, 255, 255, 255, 0],)
+                .expect("valid IPv4 constraint must evaluate")
+        );
+        assert!(
+            !ip_address_within_subtree(&[192, 0, 3, 42], &[192, 0, 2, 0, 255, 255, 255, 0],)
+                .expect("valid non-matching IPv4 constraint must evaluate")
+        );
+        assert!(matches!(
+            ip_address_within_subtree(&[192, 0, 2, 42], &[192, 0, 2, 0, 255, 0, 255, 0],),
+            Err(X509ChainError::InvalidDer {
+                kind: "IP name constraint",
+                ..
+            })
         ));
-        assert!(!ip_address_within_subtree(
-            &[192, 0, 3, 42],
-            &[192, 0, 2, 0, 255, 255, 255, 0],
-        ));
-        assert!(!ip_address_within_subtree(
-            &[192, 0, 2, 42],
-            &[192, 0, 2, 0, 255, 0, 255, 0],
-        ));
+    }
+
+    #[test]
+    fn malformed_ip_name_constraints_fail_before_matching() {
+        use x509_parser::extensions::GeneralSubtree;
+
+        let name = GeneralName::IPAddress(&[192, 0, 2, 42]);
+        for malformed in [
+            &[192, 0, 2, 0, 255, 255, 255][..],
+            &[192, 0, 2, 0, 255, 0, 255, 0][..],
+        ] {
+            for permitted in [true, false] {
+                let subtree = GeneralSubtree {
+                    base: GeneralName::IPAddress(malformed),
+                };
+                let constraints = NameConstraints {
+                    permitted_subtrees: permitted.then(|| vec![subtree.clone()]),
+                    excluded_subtrees: (!permitted).then(|| vec![subtree]),
+                };
+                assert!(matches!(
+                    validate_general_name(&name, &constraints, 0, 1),
+                    Err(X509ChainError::InvalidDer {
+                        kind: "IP name constraint",
+                        ..
+                    })
+                ));
+            }
+        }
     }
 
     #[test]
@@ -1402,6 +1593,57 @@ mod tests {
                 accepted,
                 "unexpected subject constraint result for {organization} / {email}: {result:?}",
             );
+        }
+    }
+
+    #[test]
+    fn empty_subject_requires_a_critical_nonempty_san() {
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("subject identity authority", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+
+        let mut missing_san = rcgen::CertificateParams::new(Vec::new())
+            .expect("empty SAN list should produce certificate parameters");
+        missing_san.distinguished_name = rcgen::DistinguishedName::new();
+        let missing_san = missing_san
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &root,
+            )
+            .expect("test issuer should sign an empty-subject certificate");
+
+        let mut noncritical_san = rcgen::CertificateParams::new(Vec::new())
+            .expect("empty SAN list should produce certificate parameters");
+        noncritical_san.distinguished_name = rcgen::DistinguishedName::new();
+        // GeneralNames ::= SEQUENCE { dNSName [2] "a" }. Using a custom
+        // extension is intentional because rcgen correctly marks its normal
+        // SAN extension critical whenever the subject is empty.
+        noncritical_san
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[2, 5, 29, 17],
+                vec![0x30, 0x03, 0x82, 0x01, b'a'],
+            ));
+        let noncritical_san = noncritical_san
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &root,
+            )
+            .expect("test issuer should sign a non-critical-SAN certificate");
+
+        for leaf in [missing_san, noncritical_san] {
+            assert!(matches!(
+                verify_generated_path(
+                    vec![leaf.der().to_vec(), root.der().to_vec()],
+                    root.der().to_vec(),
+                ),
+                Err(X509ChainError::InvalidDer {
+                    kind: "certificate subject identity",
+                    ..
+                })
+            ));
         }
     }
 

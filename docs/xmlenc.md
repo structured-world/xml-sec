@@ -78,8 +78,10 @@ resource loading are rejected; only inline `CipherValue` is accepted. Encryption
 recipient counts are bounded before allocation. Decryption applies the same aggregate recipient
 ceiling while parsing, bounds each retained identifier, algorithm URI, key name, OAEP label, and
 reference URI, and rechecks caller-constructed `EncryptedData` before decoding or key resolution.
-That typed-input check bounds both encoded and projected decoded `CipherValue` sizes, so callers
-cannot bypass parser allocation limits by constructing the public model directly.
+That typed-input check validates the top-level content `EncryptionMethod` and every embedded key
+method before resolver dispatch, and bounds both encoded and projected decoded `CipherValue`
+sizes. Callers therefore cannot bypass parser structural or allocation limits by constructing the
+public model directly.
 
 For multiple recipients, `DecryptContext` validates transport, wrap, digest, and MGF policy as
 each `EncryptedKey` becomes a resolver candidate. A malformed or disallowed key for another
