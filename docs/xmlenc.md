@@ -39,6 +39,8 @@ the operating-system RNG and wrapped once per recipient. The crate's secure RSA-
 SHA-256/MGF1-SHA-256. XMLEnc 1.1 itself defaults omitted parameters to SHA-1/MGF1-SHA-1, so
 `xml-sec` always emits explicit `ds:DigestMethod` and `xenc11:MGF` values rather than relying on
 those implicit legacy defaults. SHA-1 OAEP remains available only through explicit parameters.
+The legacy `rsa-oaep-mgf1p` URI fixes MGF1 to SHA-1; configuration validation rejects any other
+MGF digest before provider dispatch because that URI has no wire field capable of representing it.
 
 `encrypt_document` selects the root or an element by `Id`, `ID`, or `id`, then replaces either
 the complete element or only its child content according to `EncryptedDataType`. See

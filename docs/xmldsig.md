@@ -47,7 +47,9 @@ Certificate authentication uses a separate typed algorithm contract so RSA-PSS p
 Ed25519 are not collapsed into the narrower XMLDSig `SignatureMethod` enum. Unsupported certificate
 OIDs remain typed path errors rather than ordinary signature mismatches. Every certificate OID
 represented by that contract reaches the selected provider; the built-in provider may reject a
-capability such as ECDSA-SHA512 while a custom provider can implement it.
+capability such as ECDSA-SHA512 while a custom provider can implement it. For an
+`id-RSASSA-PSS` issuer key, the built-in provider also enforces the SPKI hash, MGF, minimum salt,
+and trailer-field restrictions before verifying a certificate signature.
 Custom resolvers that evaluate cryptographic key metadata should override
 `KeyResolver::resolve_with_policy_and_provider`; source-only resolvers can retain the default hook.
 
@@ -65,6 +67,11 @@ Configured chain depth and candidate-path limits are validated after resolver de
 the operation policy. Candidate-path accounting includes every generated partial path, and
 self-issued rollover certificates continue toward a distinct same-name issuer when its signature
 validates; neither condition can bypass the configured work bounds or trust anchor requirement.
+Path validation excludes self-issued rollover CAs from `pathLenConstraint`, applies supported RFC
+5280 NameConstraints to every subordinate certificate, and rejects critical extensions whose
+semantics are not implemented. When `X509Data` supplies multiple selector categories, every
+category must match certificates on the same selected, policy-valid path rather than unrelated
+certificates from the lookup pool.
 
 `VerifyResult::status` reports core validation: `Valid` means the cryptographic signature and
 every `<SignedInfo>` reference succeeded. `Invalid(reason)` means core validation completed but
@@ -82,10 +89,11 @@ disabled state from an enabled pass with no authenticated Manifest references.
 Manifest references obey the same per-reference transform-count ceiling and transform allowlist as
 `<SignedInfo>` references; a violation is recorded in that Manifest reference's independent status.
 
-Malformed XMLDSig structure, unsupported algorithms, disallowed reference URIs, and
-inconsistent `KeyInfo` metadata are processing errors rather than validity statuses. Treat both
-`Invalid(reason)` and an API error as a rejected document; never continue an authentication flow
-after either outcome.
+Malformed XMLDSig structure, unsupported algorithms in core signature processing, disallowed URIs
+in `<SignedInfo>` references, and inconsistent `KeyInfo` metadata are processing errors rather
+than validity statuses. Manifest policy violations and unsupported transforms remain independent
+per-reference statuses as described above. Treat both `Invalid(reason)` and an API error as a
+rejected document; never continue an authentication flow after either outcome.
 
 External references are disabled by default. Callers must both allow their URI class with
 `UriTypeSet` and provide every payload through `VerifyContext::external_resources`; verification
@@ -112,11 +120,13 @@ CRL checking is meaningful only inside authenticated X.509 path validation. A po
 CRLs without enabling certificate-chain validation is rejected during context construction rather
 than silently accepting a control the resolver cannot enforce.
 
-Internal DTD declarations are disabled by default and require
-`VerifyContext::allow_internal_dtd(true)`. The policy applies consistently to the signed document
-and caller-supplied detached XML parsed by node-set transforms. Direct transform callers can set
-the same policy with `TransformOptions::allow_internal_dtd(true)`. Signing uses the corresponding
-`SigningPolicy::xml.allow_internal_dtd` decision across its complete pipeline. External entity resolution
+Internal DTD declarations are disabled by default. Verification requires the operation's
+`VerificationPolicy::xml.allow_internal_dtd` decision; the
+`VerifyContext::allow_internal_dtd(true)` convenience method updates that same policy snapshot
+rather than bypassing a separate policy gate. The decision applies consistently to the signed
+document and caller-supplied detached XML parsed by node-set transforms. Direct transform callers
+can set the corresponding option with `TransformOptions::allow_internal_dtd(true)`. Signing uses
+`SigningPolicy::xml.allow_internal_dtd` across its complete pipeline. External entity resolution
 remains disabled. XSLT is intentionally not executed because transforms operate on
 attacker-controlled documents; an authenticated Manifest reference using unsupported XSLT is
 reported as an invalid per-reference result without changing core `SignedInfo` validity.
@@ -130,5 +140,5 @@ the built-in P-256 and P-384 signing keys support either ECDSA hash identifier.
 DSA-SHA1 and HMAC-SHA1 (including XMLDSig's byte-aligned 80-160-bit truncation range) are
 verify-only legacy algorithms.
 X.509 path and CRL authentication additionally supports standard RSA-PSS with SHA-256/SHA-384/
-SHA-512 parameters and Ed25519. DSA-SHA256, broader HMAC verification/signing, XMLDSig
+SHA-512 parameters, including RFC 4055 issuer-key restrictions, and Ed25519. DSA-SHA256, broader HMAC verification/signing, XMLDSig
 `SignatureMethod` RSA-PSS, and implicit external resource loading are not currently supported.

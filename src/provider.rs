@@ -652,10 +652,15 @@ mod rustcrypto_x509 {
                 digest,
                 mgf_digest,
                 salt_len,
-            } if digest == mgf_digest => {
-                verify_rsa_pss(digest, salt_len, signed_data, signature, issuer_spki_der)
+            } => {
+                let Some(key) = rsa_pss_public_key_from_spki(issuer_spki_der, algorithm) else {
+                    return Ok(false);
+                };
+                if digest != mgf_digest {
+                    return unsupported(algorithm);
+                }
+                verify_rsa_pss(digest, salt_len, signed_data, signature, key)
             }
-            X509SignatureAlgorithm::RsaPss { .. } => unsupported(algorithm),
             X509SignatureAlgorithm::Ed25519 => {
                 let Ok(key) = ed25519_dalek::VerifyingKey::from_public_key_der(issuer_spki_der)
                 else {
@@ -694,11 +699,8 @@ mod rustcrypto_x509 {
         salt_len: usize,
         signed_data: &[u8],
         signature: &[u8],
-        issuer_spki_der: &[u8],
+        key: RsaPublicKey,
     ) -> Result<bool, ProviderError> {
-        let Some(key) = rsa_public_key_from_spki(issuer_spki_der) else {
-            return Ok(false);
-        };
         let Ok(signature) = RsaPssSignature::try_from(signature) else {
             return Ok(false);
         };
@@ -726,19 +728,60 @@ mod rustcrypto_x509 {
         Ok(verified.is_ok())
     }
 
-    fn rsa_public_key_from_spki(spki_der: &[u8]) -> Option<RsaPublicKey> {
-        if let Ok(key) = RsaPublicKey::from_public_key_der(spki_der) {
-            return Some(key);
-        }
-
-        // RFC 4055 permits id-RSASSA-PSS in SubjectPublicKeyInfo. The generic
-        // PKCS#8 decoder accepts rsaEncryption SPKIs, so extract the same
-        // PKCS#1 key payload explicitly when the container carries the PSS OID.
+    fn rsa_pss_public_key_from_spki(
+        spki_der: &[u8],
+        signature_algorithm: X509SignatureAlgorithm,
+    ) -> Option<RsaPublicKey> {
         let (_, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(spki_der).ok()?;
-        if spki.algorithm.algorithm.to_id_string() != "1.2.840.113549.1.1.10" {
-            return None;
+        match spki.algorithm.algorithm.to_id_string().as_str() {
+            "1.2.840.113549.1.1.1" => RsaPublicKey::from_public_key_der(spki_der).ok(),
+            "1.2.840.113549.1.1.10" => {
+                if let Some(parameters) = spki.algorithm.parameters.as_ref()
+                    && !rsa_pss_key_parameters_allow(parameters, signature_algorithm)
+                {
+                    return None;
+                }
+                RsaPublicKey::from_pkcs1_der(&spki.subject_public_key.data).ok()
+            }
+            _ => None,
         }
-        RsaPublicKey::from_pkcs1_der(&spki.subject_public_key.data).ok()
+    }
+
+    fn rsa_pss_key_parameters_allow(
+        parameters: &x509_parser::asn1_rs::Any<'_>,
+        signature_algorithm: X509SignatureAlgorithm,
+    ) -> bool {
+        let X509SignatureAlgorithm::RsaPss {
+            digest,
+            mgf_digest,
+            salt_len,
+        } = signature_algorithm
+        else {
+            return false;
+        };
+        let Ok(parameters) =
+            x509_parser::signature_algorithm::RsaSsaPssParams::try_from(parameters)
+        else {
+            return false;
+        };
+        let Ok(mask) = parameters.mask_gen_algorithm() else {
+            return false;
+        };
+        parameters.trailer_field() == 1
+            && x509_digest_from_oid(&parameters.hash_algorithm_oid().to_id_string()) == Some(digest)
+            && mask.mgf.to_id_string() == "1.2.840.113549.1.1.8"
+            && x509_digest_from_oid(&mask.hash.to_id_string()) == Some(mgf_digest)
+            && usize::try_from(parameters.salt_length()).is_ok_and(|minimum| salt_len >= minimum)
+    }
+
+    fn x509_digest_from_oid(oid: &str) -> Option<DigestAlgorithm> {
+        match oid {
+            "1.3.14.3.2.26" => Some(DigestAlgorithm::Sha1),
+            "2.16.840.1.101.3.4.2.1" => Some(DigestAlgorithm::Sha256),
+            "2.16.840.1.101.3.4.2.2" => Some(DigestAlgorithm::Sha384),
+            "2.16.840.1.101.3.4.2.3" => Some(DigestAlgorithm::Sha512),
+            _ => None,
+        }
     }
 
     fn dsa_der_to_xmldsig(signature: &[u8]) -> Option<Vec<u8>> {
@@ -1456,10 +1499,12 @@ mod tests {
     #[cfg(feature = "xmldsig")]
     #[test]
     fn rustcrypto_provider_verifies_parameterized_rsa_pss_certificates() {
+        use der::{Decode as _, Encode as _};
         use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
         use rsa::{RsaPrivateKey, pkcs8::EncodePublicKey, pss::SigningKey as RsaPssSigningKey};
         use sha2::Sha256;
         use signature::{RandomizedSigner, SignatureEncoding};
+        use x509_cert::spki::{AlgorithmIdentifierOwned, ObjectIdentifier};
 
         // X.509 RSASSA-PSS carries salt and MGF parameters that cannot be
         // represented by the XMLDSig SignatureAlgorithm enum.
@@ -1492,15 +1537,20 @@ mod tests {
                 .expect("standard RSA-PSS parameters must be supported")
         );
 
-        let mut pss_spki = public_key.as_bytes().to_vec();
-        let rsa_encryption_oid = [
-            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
-        ];
-        let oid_offset = pss_spki
-            .windows(rsa_encryption_oid.len())
-            .position(|window| window == rsa_encryption_oid)
-            .expect("RSA SPKI must identify rsaEncryption");
-        pss_spki[oid_offset + rsa_encryption_oid.len() - 1] = 0x0a;
+        let mut pss_spki = x509_cert::SubjectPublicKeyInfo::from_der(public_key.as_bytes())
+            .expect("RSA SPKI must decode");
+        let pss_parameters = der::asn1::Any::from_der(&[
+            0x30, 0x34, 0xa0, 0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
+            0x04, 0x02, 0x01, 0x05, 0x00, 0xa1, 0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48,
+            0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+            0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0xa2, 0x03, 0x02, 0x01, 0x20,
+        ])
+        .expect("standard SHA-256 PSS parameters must decode");
+        pss_spki.algorithm = AlgorithmIdentifierOwned {
+            oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10"),
+            parameters: Some(pss_parameters),
+        };
+        let pss_spki = pss_spki.to_der().expect("PSS SPKI must encode");
 
         assert!(
             RUST_CRYPTO_PROVIDER
@@ -1516,6 +1566,30 @@ mod tests {
                 )
                 .expect("RFC 4055 PSS SubjectPublicKeyInfo must be supported")
         );
+
+        for incompatible in [
+            X509SignatureAlgorithm::RsaPss {
+                digest: DigestAlgorithm::Sha384,
+                mgf_digest: DigestAlgorithm::Sha256,
+                salt_len: 32,
+            },
+            X509SignatureAlgorithm::RsaPss {
+                digest: DigestAlgorithm::Sha256,
+                mgf_digest: DigestAlgorithm::Sha384,
+                salt_len: 32,
+            },
+            X509SignatureAlgorithm::RsaPss {
+                digest: DigestAlgorithm::Sha256,
+                mgf_digest: DigestAlgorithm::Sha256,
+                salt_len: 16,
+            },
+        ] {
+            assert!(
+                !RUST_CRYPTO_PROVIDER
+                    .verify_x509_signature(incompatible, signed_data, &signature, &pss_spki,)
+                    .expect("incompatible PSS key restrictions are invalid, not unsupported")
+            );
+        }
     }
 
     #[cfg(feature = "xmlenc")]

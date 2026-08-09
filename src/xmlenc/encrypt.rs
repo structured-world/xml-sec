@@ -278,6 +278,13 @@ impl EncryptedDataBuilder {
                     key_name,
                     ..
                 } => {
+                    if parameters.algorithm == super::KeyTransportAlgorithm::RsaOaepMgf1p
+                        && parameters.mgf_digest != super::OaepDigestAlgorithm::Sha1
+                    {
+                        return Err(XmlEncError::InvalidEncryptionConfig(
+                            "legacy RSA-OAEP fixes MGF1 to SHA-1".into(),
+                        ));
+                    }
                     if self
                         .policy
                         .key_transport_algorithms
@@ -805,6 +812,7 @@ fn replace_range(xml: &str, range: std::ops::Range<usize>, replacement: &str) ->
 mod tests {
     use getrandom::SysRng;
     use getrandom::rand_core::UnwrapErr;
+    use rsa::pkcs8::DecodePublicKey as _;
     use rsa::{RsaPrivateKey, RsaPublicKey};
 
     use super::*;
@@ -900,6 +908,29 @@ mod tests {
             .expect("RSA recipient must recover content key"),
             super::super::DecryptedContent::Xml("<secret/>".into())
         );
+    }
+
+    #[test]
+    fn legacy_oaep_rejects_non_sha1_mgf_during_configuration_validation() {
+        // The legacy URI has no MGF child on the wire, so accepting another
+        // digest here would let a permissive provider emit ambiguous ciphertext.
+        let public = RsaPublicKey::from_public_key_pem(include_str!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"
+        ))
+        .expect("tracked RSA public key must parse");
+        let parameters = RsaOaepParameters {
+            algorithm: super::super::KeyTransportAlgorithm::RsaOaepMgf1p,
+            digest: OaepDigestAlgorithm::Sha256,
+            mgf_digest: OaepDigestAlgorithm::Sha256,
+            label: Vec::new(),
+        };
+        let builder = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .add_recipient(EncryptionRecipient::rsa_oaep(public).oaep_parameters(parameters));
+
+        assert!(matches!(
+            builder.validate_configuration(),
+            Err(XmlEncError::InvalidEncryptionConfig(_))
+        ));
     }
 
     #[test]

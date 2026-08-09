@@ -1335,9 +1335,59 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
     max_candidate_paths: usize,
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
+    if trusted_prefix_len > info.certificates.len() {
+        return Err(X509ChainBuildError::InconsistentMetadata);
+    }
+    build_x509_certificate_paths(
+        info,
+        signing_idx,
+        |index| index < trusted_prefix_len,
+        false,
+        max_depth,
+        max_candidate_paths,
+        provider,
+    )
+}
+
+/// Enumerate signature-valid paths that reach any candidate selector target.
+/// A matching intermediate is retained as a candidate and traversal continues
+/// so callers can test selector categories against every longer path as well.
+pub(crate) fn build_x509_certificate_paths_to_selector_targets(
+    info: &X509DataInfo,
+    signing_idx: usize,
+    targets: &[usize],
+    max_depth: usize,
+    max_candidate_paths: usize,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
+    if targets
+        .iter()
+        .any(|index| *index >= info.certificates.len())
+    {
+        return Err(X509ChainBuildError::InconsistentMetadata);
+    }
+    build_x509_certificate_paths(
+        info,
+        signing_idx,
+        |index| targets.contains(&index),
+        true,
+        max_depth,
+        max_candidate_paths,
+        provider,
+    )
+}
+
+fn build_x509_certificate_paths(
+    info: &X509DataInfo,
+    signing_idx: usize,
+    is_terminal: impl Fn(usize) -> bool,
+    continue_after_terminal: bool,
+    max_depth: usize,
+    max_candidate_paths: usize,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
     if signing_idx >= info.parsed_certificates.len()
         || info.parsed_certificates.len() != info.certificates.len()
-        || trusted_prefix_len > info.certificates.len()
     {
         return Err(X509ChainBuildError::InconsistentMetadata);
     }
@@ -1355,9 +1405,11 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
         let current_idx = *path
             .last()
             .expect("candidate path starts with signing certificate index");
-        if current_idx < trusted_prefix_len {
-            completed.push(path);
-            continue;
+        if is_terminal(current_idx) {
+            completed.push(path.clone());
+            if !continue_after_terminal {
+                continue;
+            }
         }
         if path.len() == max_depth {
             depth_exceeded = true;
@@ -1384,11 +1436,10 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
                             algorithm: Some(oid),
                         },
                     )) => {
-                        // Unsupported is an algorithm capability, so changing
-                        // the issuer key cannot make this child verifiable.
-                        // Prune this DFS branch but retain sibling paths.
+                        // Provider capability can depend on the issuer SPKI,
+                        // so retain the diagnostic but try every same-DN key.
                         unsupported_oid.get_or_insert(oid);
-                        break;
+                        continue;
                     }
                     Err(super::X509ChainError::Provider(error)) => {
                         return Err(X509ChainBuildError::Provider(error));
@@ -1605,133 +1656,143 @@ pub(crate) fn x509_selector_categories_match_chain(
     Ok(subject_match && issuer_serial_match && ski_match && digest_match)
 }
 
-pub(crate) fn distinguished_names_equal(left: &str, right: &str) -> bool {
-    fn attribute_values_equal(
-        left: &x509_cert::attr::AttributeTypeAndValue,
-        right: &x509_cert::attr::AttributeTypeAndValue,
-    ) -> bool {
-        if left.oid != right.oid {
-            return false;
-        }
-        match (
-            DirectoryString::try_from(&left.value),
-            DirectoryString::try_from(&right.value),
-        ) {
-            (Ok(left), Ok(right)) => {
-                // RFC 5280 section 7.1 requires caseIgnoreMatch with LDAP/X.520
-                // string preparation for PrintableString and UTF8String names.
-                let Ok(left) =
-                    x520_stringprep::x520_stringprep_to_case_ignore_string(left.value().as_ref())
-                else {
-                    return false;
-                };
-                let Ok(right) =
-                    x520_stringprep::x520_stringprep_to_case_ignore_string(right.value().as_ref())
-                else {
-                    return false;
-                };
-                left.trim_matches(' ') == right.trim_matches(' ')
-            }
-            _ => left.value == right.value,
-        }
+fn x509_attribute_values_equal(
+    left: &x509_cert::attr::AttributeTypeAndValue,
+    right: &x509_cert::attr::AttributeTypeAndValue,
+) -> bool {
+    if left.oid != right.oid {
+        return false;
     }
-
-    fn rdns_equal(
-        left: &x509_cert::name::RelativeDistinguishedName,
-        right: &x509_cert::name::RelativeDistinguishedName,
-    ) -> bool {
-        if left.len() != right.len() {
-            return false;
+    match (
+        DirectoryString::try_from(&left.value),
+        DirectoryString::try_from(&right.value),
+    ) {
+        (Ok(left), Ok(right)) => {
+            // RFC 5280 section 7.1 requires caseIgnoreMatch with LDAP/X.520
+            // string preparation for PrintableString and UTF8String names.
+            let Ok(left) =
+                x520_stringprep::x520_stringprep_to_case_ignore_string(left.value().as_ref())
+            else {
+                return false;
+            };
+            let Ok(right) =
+                x520_stringprep::x520_stringprep_to_case_ignore_string(right.value().as_ref())
+            else {
+                return false;
+            };
+            left.trim_matches(' ') == right.trim_matches(' ')
         }
-        // A DN is an ordered RDN sequence, but each individual RDN is a set.
-        let right = right.iter().collect::<Vec<_>>();
-        let mut matched = vec![false; right.len()];
-        left.iter().all(|left_attribute| {
-            right
-                .iter()
-                .enumerate()
-                .find(|(index, right_attribute)| {
-                    !matched[*index] && attribute_values_equal(left_attribute, right_attribute)
-                })
-                .is_some_and(|(index, _)| {
-                    matched[index] = true;
-                    true
-                })
-        })
+        _ => left.value == right.value,
     }
+}
 
-    fn trailing_whitespace_is_escaped(value: &str) -> bool {
-        let Some(prefix) = value.as_bytes().strip_suffix(b" ") else {
-            return false;
-        };
-        prefix
+fn x509_rdns_equal(
+    left: &x509_cert::name::RelativeDistinguishedName,
+    right: &x509_cert::name::RelativeDistinguishedName,
+) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    // A DN is an ordered RDN sequence, but each individual RDN is a set.
+    let right = right.iter().collect::<Vec<_>>();
+    let mut matched = vec![false; right.len()];
+    left.iter().all(|left_attribute| {
+        right
             .iter()
-            .rev()
-            .take_while(|byte| **byte == b'\\')
-            .count()
-            % 2
-            == 1
-    }
+            .enumerate()
+            .find(|(index, right_attribute)| {
+                !matched[*index] && x509_attribute_values_equal(left_attribute, right_attribute)
+            })
+            .is_some_and(|(index, _)| {
+                matched[index] = true;
+                true
+            })
+    })
+}
 
-    fn remove_separator_padding(name: &str) -> String {
-        let mut normalized = String::with_capacity(name.len());
-        let mut chars = name
-            .trim_start_matches([' ', '\t', '\r', '\n'])
-            .chars()
-            .peekable();
-        let mut escaped = false;
+fn trailing_whitespace_is_escaped(value: &str) -> bool {
+    let Some(prefix) = value.as_bytes().strip_suffix(b" ") else {
+        return false;
+    };
+    prefix
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
 
-        while let Some(ch) = chars.next() {
-            if escaped {
-                normalized.push(ch);
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                normalized.push(ch);
-                escaped = true;
-                continue;
-            }
-            if matches!(ch, ',' | '+') {
-                while normalized
-                    .chars()
-                    .next_back()
-                    .is_some_and(|last| matches!(last, ' ' | '\t' | '\r' | '\n'))
-                    && !trailing_whitespace_is_escaped(&normalized)
-                {
-                    normalized.pop();
-                }
-                normalized.push(ch);
-                while chars
-                    .next_if(|next| matches!(next, ' ' | '\t' | '\r' | '\n'))
-                    .is_some()
-                {}
-                continue;
+fn parse_distinguished_name(value: &str) -> Option<Name> {
+    let mut normalized = String::with_capacity(value.len());
+    let mut chars = value
+        .trim_start_matches([' ', '\t', '\r', '\n'])
+        .chars()
+        .peekable();
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            normalized.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            normalized.push(ch);
+            escaped = true;
+            continue;
+        }
+        if matches!(ch, ',' | '+') {
+            while normalized
+                .chars()
+                .next_back()
+                .is_some_and(|last| matches!(last, ' ' | '\t' | '\r' | '\n'))
+                && !trailing_whitespace_is_escaped(&normalized)
+            {
+                normalized.pop();
             }
             normalized.push(ch);
+            while chars
+                .next_if(|next| matches!(next, ' ' | '\t' | '\r' | '\n'))
+                .is_some()
+            {}
+            continue;
         }
-
-        while normalized
-            .chars()
-            .next_back()
-            .is_some_and(|last| matches!(last, ' ' | '\t' | '\r' | '\n'))
-            && !trailing_whitespace_is_escaped(&normalized)
-        {
-            normalized.pop();
-        }
-
-        normalized
+        normalized.push(ch);
     }
 
-    let parse_name = |value: &str| remove_separator_padding(value).parse::<Name>().ok();
-    parse_name(left)
-        .zip(parse_name(right))
+    while normalized
+        .chars()
+        .next_back()
+        .is_some_and(|last| matches!(last, ' ' | '\t' | '\r' | '\n'))
+        && !trailing_whitespace_is_escaped(&normalized)
+    {
+        normalized.pop();
+    }
+    normalized.parse().ok()
+}
+
+pub(crate) fn distinguished_names_equal(left: &str, right: &str) -> bool {
+    parse_distinguished_name(left)
+        .zip(parse_distinguished_name(right))
         .is_some_and(|(left, right)| {
             left.len() == right.len()
                 && left
                     .iter_rdn()
                     .zip(right.iter_rdn())
-                    .all(|(left, right)| rdns_equal(left, right))
+                    .all(|(left, right)| x509_rdns_equal(left, right))
+        })
+}
+
+pub(crate) fn distinguished_name_within_subtree(name: &str, subtree: &str) -> bool {
+    parse_distinguished_name(name)
+        .zip(parse_distinguished_name(subtree))
+        .is_some_and(|(name, subtree)| {
+            subtree.len() <= name.len()
+                && name
+                    .iter_rdn()
+                    .zip(subtree.iter_rdn())
+                    .all(|(name, subtree)| x509_rdns_equal(name, subtree))
         })
 }
 

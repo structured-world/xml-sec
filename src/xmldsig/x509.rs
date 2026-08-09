@@ -3,13 +3,17 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use x509_parser::{
-    certificate::X509Certificate, extensions::ParsedExtension, prelude::FromDer,
-    revocation_list::CertificateRevocationList, time::ASN1Time, x509::AlgorithmIdentifier,
+    certificate::X509Certificate,
+    extensions::{GeneralName, NameConstraints, ParsedExtension},
+    prelude::FromDer,
+    revocation_list::CertificateRevocationList,
+    time::ASN1Time,
+    x509::AlgorithmIdentifier,
 };
 
 use super::{
     X509DataInfo,
-    parse::{distinguished_names_equal, x509_name_to_rfc4514},
+    parse::{distinguished_name_within_subtree, distinguished_names_equal, x509_name_to_rfc4514},
 };
 use crate::provider::X509SignatureAlgorithm;
 
@@ -63,6 +67,30 @@ pub enum X509ChainError {
         position: usize,
         /// Maximum permitted subordinate CA count.
         limit: u32,
+    },
+    /// A subordinate certificate is outside a CA's permitted name space.
+    #[error(
+        "certificate at chain position {position} violates name constraints from position {constraining_position}"
+    )]
+    NameConstraintViolation {
+        /// Position of the subordinate certificate.
+        position: usize,
+        /// Position of the CA carrying NameConstraints.
+        constraining_position: usize,
+    },
+    /// A critical certificate extension is not implemented by path validation.
+    #[error("certificate at chain position {position} has unsupported critical extension {oid}")]
+    UnsupportedCriticalExtension {
+        /// Position of the certificate in the validated path.
+        position: usize,
+        /// Extension object identifier.
+        oid: String,
+    },
+    /// NameConstraints is not a critical CA extension as required by RFC 5280.
+    #[error("certificate at chain position {position} has invalid NameConstraints placement")]
+    InvalidNameConstraints {
+        /// Position of the certificate carrying the invalid extension.
+        position: usize,
     },
     /// A certificate key usage extension forbids the required operation.
     #[error("certificate at chain position {position} does not permit {required}")]
@@ -204,7 +232,10 @@ fn validate_path(
         } else {
             validate_ca_constraints(cert, position)?;
         }
+        validate_critical_extensions(cert, position)?;
     }
+    validate_path_length_constraints(&path)?;
+    validate_name_constraints(&path)?;
 
     for (position, pair) in path.windows(2).enumerate() {
         let [child, issuer] = pair else {
@@ -471,8 +502,7 @@ fn validate_ca_constraints(
     cert: &X509Certificate<'_>,
     position: usize,
 ) -> Result<(), X509ChainError> {
-    let constraints = cert
-        .extensions()
+    cert.extensions()
         .iter()
         .find_map(|extension| match extension.parsed_extension() {
             ParsedExtension::BasicConstraints(value) => Some(value),
@@ -495,13 +525,316 @@ fn validate_ca_constraints(
         });
     }
 
-    if let Some(limit) = constraints.path_len_constraint {
-        let subordinate_ca_count = position.saturating_sub(1);
+    Ok(())
+}
+
+fn basic_constraints(
+    cert: &X509Certificate<'_>,
+) -> Option<x509_parser::extensions::BasicConstraints> {
+    cert.extensions()
+        .iter()
+        .find_map(|extension| match extension.parsed_extension() {
+            ParsedExtension::BasicConstraints(value) => Some(value.clone()),
+            _ => None,
+        })
+}
+
+fn validate_path_length_constraints(path: &[X509Certificate<'_>]) -> Result<(), X509ChainError> {
+    for (position, cert) in path.iter().enumerate().skip(1) {
+        let Some(limit) = basic_constraints(cert).and_then(|value| value.path_len_constraint)
+        else {
+            continue;
+        };
+        let subordinate_ca_count = path[1..position]
+            .iter()
+            .filter(|subordinate| {
+                basic_constraints(subordinate).is_some_and(|value| value.ca)
+                    && !certificate_names_equal(subordinate.subject(), subordinate.issuer())
+            })
+            .count();
         if subordinate_ca_count > limit as usize {
             return Err(X509ChainError::PathLengthExceeded { position, limit });
         }
     }
     Ok(())
+}
+
+fn validate_critical_extensions(
+    cert: &X509Certificate<'_>,
+    position: usize,
+) -> Result<(), X509ChainError> {
+    for extension in cert
+        .extensions()
+        .iter()
+        .filter(|extension| extension.critical)
+    {
+        let oid = extension.oid.to_id_string();
+        if !matches!(
+            oid.as_str(),
+            "2.5.29.15" | "2.5.29.17" | "2.5.29.19" | "2.5.29.30"
+        ) {
+            return Err(X509ChainError::UnsupportedCriticalExtension { position, oid });
+        }
+        if matches!(
+            extension.parsed_extension(),
+            ParsedExtension::UnsupportedExtension { .. }
+                | ParsedExtension::ParseError { .. }
+                | ParsedExtension::Unparsed
+        ) {
+            return Err(X509ChainError::UnsupportedCriticalExtension { position, oid });
+        }
+    }
+    Ok(())
+}
+
+fn validate_name_constraints(path: &[X509Certificate<'_>]) -> Result<(), X509ChainError> {
+    for (position, certificate) in path.iter().enumerate() {
+        if let Some(extension) = certificate
+            .extensions()
+            .iter()
+            .find(|extension| extension.oid.to_id_string() == "2.5.29.30")
+            && (position == 0 || !extension.critical)
+        {
+            return Err(X509ChainError::InvalidNameConstraints { position });
+        }
+    }
+    for (constraining_position, issuer) in path.iter().enumerate().skip(1) {
+        let Some(constraints) =
+            issuer
+                .extensions()
+                .iter()
+                .find_map(|extension| match extension.parsed_extension() {
+                    ParsedExtension::NameConstraints(value) => Some(value),
+                    _ => None,
+                })
+        else {
+            continue;
+        };
+        ensure_supported_name_constraints(constraints, constraining_position)?;
+        for (position, subordinate) in path[..constraining_position].iter().enumerate() {
+            // The target certificate is always checked. Self-issued CA rollover
+            // certificates between it and the constraint issuer are exempt.
+            if position != 0 && certificate_names_equal(subordinate.subject(), subordinate.issuer())
+            {
+                continue;
+            }
+            validate_certificate_names(subordinate, constraints, position, constraining_position)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_supported_name_constraints(
+    constraints: &NameConstraints<'_>,
+    position: usize,
+) -> Result<(), X509ChainError> {
+    for subtree in constraints
+        .permitted_subtrees
+        .iter()
+        .flatten()
+        .chain(constraints.excluded_subtrees.iter().flatten())
+    {
+        if matches!(
+            subtree.base,
+            GeneralName::OtherName(..)
+                | GeneralName::X400Address(..)
+                | GeneralName::EDIPartyName(..)
+                | GeneralName::RegisteredID(..)
+                | GeneralName::Invalid(..)
+        ) {
+            return Err(X509ChainError::UnsupportedCriticalExtension {
+                position,
+                oid: "2.5.29.30".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_certificate_names(
+    certificate: &X509Certificate<'_>,
+    constraints: &NameConstraints<'_>,
+    position: usize,
+    constraining_position: usize,
+) -> Result<(), X509ChainError> {
+    let subject = GeneralName::DirectoryName(certificate.subject().clone());
+    validate_general_name(&subject, constraints, position, constraining_position)?;
+    for attribute in certificate.subject().iter_email() {
+        let email = attribute
+            .as_str()
+            .map_err(|error| X509ChainError::InvalidDer {
+                kind: "certificate subject emailAddress",
+                message: error.to_string(),
+            })?;
+        validate_general_name(
+            &GeneralName::RFC822Name(email),
+            constraints,
+            position,
+            constraining_position,
+        )?;
+    }
+    if let Some(names) =
+        certificate
+            .extensions()
+            .iter()
+            .find_map(|extension| match extension.parsed_extension() {
+                ParsedExtension::SubjectAlternativeName(value) => Some(&value.general_names),
+                _ => None,
+            })
+    {
+        for name in names {
+            validate_general_name(name, constraints, position, constraining_position)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_general_name(
+    name: &GeneralName<'_>,
+    constraints: &NameConstraints<'_>,
+    position: usize,
+    constraining_position: usize,
+) -> Result<(), X509ChainError> {
+    let permitted = constraints
+        .permitted_subtrees
+        .iter()
+        .flatten()
+        .filter(|subtree| general_names_have_same_form(name, &subtree.base));
+    let mut has_permitted_form = false;
+    let mut matches_permitted = false;
+    for subtree in permitted {
+        has_permitted_form = true;
+        matches_permitted |= general_name_within_subtree(name, &subtree.base)?;
+    }
+    let excluded = constraints
+        .excluded_subtrees
+        .iter()
+        .flatten()
+        .filter(|subtree| general_names_have_same_form(name, &subtree.base))
+        .try_fold(false, |matched, subtree| {
+            general_name_within_subtree(name, &subtree.base).map(|current| matched || current)
+        })?;
+    if excluded || (has_permitted_form && !matches_permitted) {
+        return Err(X509ChainError::NameConstraintViolation {
+            position,
+            constraining_position,
+        });
+    }
+    Ok(())
+}
+
+fn general_names_have_same_form(left: &GeneralName<'_>, right: &GeneralName<'_>) -> bool {
+    matches!(
+        (left, right),
+        (GeneralName::RFC822Name(_), GeneralName::RFC822Name(_))
+            | (GeneralName::DNSName(_), GeneralName::DNSName(_))
+            | (GeneralName::DirectoryName(_), GeneralName::DirectoryName(_))
+            | (GeneralName::URI(_), GeneralName::URI(_))
+            | (GeneralName::IPAddress(_), GeneralName::IPAddress(_))
+    )
+}
+
+fn general_name_within_subtree(
+    name: &GeneralName<'_>,
+    subtree: &GeneralName<'_>,
+) -> Result<bool, X509ChainError> {
+    Ok(match (name, subtree) {
+        (GeneralName::DNSName(name), GeneralName::DNSName(subtree)) => {
+            dns_name_within_subtree(name, subtree, true)
+        }
+        (GeneralName::RFC822Name(name), GeneralName::RFC822Name(subtree)) => {
+            email_within_subtree(name, subtree)
+        }
+        (GeneralName::DirectoryName(name), GeneralName::DirectoryName(subtree)) => {
+            let name = x509_name_to_rfc4514(name).map_err(|error| X509ChainError::InvalidDer {
+                kind: "certificate name constraint",
+                message: error.to_string(),
+            })?;
+            let subtree =
+                x509_name_to_rfc4514(subtree).map_err(|error| X509ChainError::InvalidDer {
+                    kind: "certificate name constraint",
+                    message: error.to_string(),
+                })?;
+            distinguished_name_within_subtree(&name, &subtree)
+        }
+        (GeneralName::URI(name), GeneralName::URI(subtree)) => {
+            uri_host(name).is_some_and(|host| dns_name_within_subtree(host, subtree, false))
+        }
+        (GeneralName::IPAddress(name), GeneralName::IPAddress(subtree)) => {
+            ip_address_within_subtree(name, subtree)
+        }
+        _ => false,
+    })
+}
+
+fn dns_name_within_subtree(name: &str, subtree: &str, include_subdomains: bool) -> bool {
+    let name = name.trim_end_matches('.');
+    let subtree = subtree.trim_end_matches('.');
+    if let Some(domain) = subtree.strip_prefix('.') {
+        return name.len() > domain.len()
+            && name.as_bytes()[name.len() - domain.len() - 1] == b'.'
+            && name[name.len() - domain.len()..].eq_ignore_ascii_case(domain);
+    }
+    name.eq_ignore_ascii_case(subtree)
+        || (include_subdomains
+            && name.len() > subtree.len()
+            && name.as_bytes()[name.len() - subtree.len() - 1] == b'.'
+            && name[name.len() - subtree.len()..].eq_ignore_ascii_case(subtree))
+}
+
+fn email_within_subtree(name: &str, subtree: &str) -> bool {
+    let Some((local, domain)) = name.rsplit_once('@') else {
+        return false;
+    };
+    if let Some((expected_local, expected_domain)) = subtree.rsplit_once('@') {
+        return local == expected_local && domain.eq_ignore_ascii_case(expected_domain);
+    }
+    dns_name_within_subtree(domain, subtree, false)
+}
+
+fn uri_host(uri: &str) -> Option<&str> {
+    let authority = uri.split_once("://")?.1;
+    let authority = authority.split(['/', '?', '#']).next()?;
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host_port.starts_with('[') {
+        return None;
+    }
+    let host = host_port
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+        .map_or(host_port, |(host, _)| host);
+    (!host.is_empty() && host.parse::<std::net::IpAddr>().is_err()).then_some(host)
+}
+
+fn ip_address_within_subtree(address: &[u8], subtree: &[u8]) -> bool {
+    if subtree.len() != address.len().saturating_mul(2) || !matches!(address.len(), 4 | 16) {
+        return false;
+    }
+    let (network, mask) = subtree.split_at(address.len());
+    if !ip_mask_is_contiguous(mask) {
+        return false;
+    }
+    address
+        .iter()
+        .zip(network)
+        .zip(mask)
+        .all(|((address, network), mask)| address & mask == network & mask)
+}
+
+fn ip_mask_is_contiguous(mask: &[u8]) -> bool {
+    let mut zero_seen = false;
+    for byte in mask {
+        for bit in (0..8).rev() {
+            let set = byte & (1 << bit) != 0;
+            if zero_seen && set {
+                return false;
+            }
+            zero_seen |= !set;
+        }
+    }
+    true
 }
 
 fn verify_crls(
@@ -579,6 +912,40 @@ mod tests {
     use signature::hazmat::PrehashSigner;
     use std::time::Duration;
     use x509_parser::oid_registry::{OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, Oid};
+
+    fn generated_certificate_params(common_name: &str, is_ca: bool) -> rcgen::CertificateParams {
+        let mut params = rcgen::CertificateParams::new(Vec::new())
+            .expect("empty SAN list should produce valid certificate parameters");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        if is_ca {
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        }
+        params
+    }
+
+    fn verify_generated_path(
+        certificates: Vec<Vec<u8>>,
+        trusted_anchor: Vec<u8>,
+    ) -> Result<(), X509ChainError> {
+        let info = X509DataInfo {
+            certificate_chain: (0..certificates.len()).collect(),
+            certificates,
+            ..X509DataInfo::default()
+        };
+        let anchors = vec![trusted_anchor];
+        verify_x509_certificate_chain(
+            &info,
+            &X509ChainOptions {
+                trusted_certs: &anchors,
+                verification_time: SystemTime::now(),
+                max_chain_depth: info.certificate_chain.len(),
+                check_crls: false,
+            },
+        )
+    }
 
     #[test]
     fn x509_ecdsa_hash_oid_does_not_select_the_issuer_curve() {
@@ -807,6 +1174,230 @@ mod tests {
 
         verify_x509_certificate_chain(&info, &options)
             .expect("the stale DSA root must be replaced by the configured anchor");
+    }
+
+    #[test]
+    fn path_length_excludes_self_issued_rollover_certificates() {
+        // RFC 5280 excludes self-issued rollover CAs from pathLenConstraint;
+        // only non-self-issued intermediate CA certificates consume the limit.
+        let mut root_params = generated_certificate_params("rollover path authority", true);
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        let root = rcgen::CertifiedIssuer::self_signed(
+            root_params,
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        let rollover_params = generated_certificate_params("rollover path authority", true);
+        let rollover_key =
+            rcgen::KeyPair::generate().expect("rollover key generation should succeed");
+        let rollover_certificate = rollover_params
+            .signed_by(&rollover_key, &root)
+            .expect("root should sign same-name rollover certificate");
+        let rollover_issuer = rcgen::Issuer::from_params(&rollover_params, &rollover_key);
+        let leaf = generated_certificate_params("rollover path leaf", false)
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &rollover_issuer,
+            )
+            .expect("rollover key should sign leaf certificate");
+
+        verify_generated_path(
+            vec![
+                leaf.der().to_vec(),
+                rollover_certificate.der().to_vec(),
+                root.der().to_vec(),
+            ],
+            root.der().to_vec(),
+        )
+        .expect("self-issued rollover must not consume a zero path-length allowance");
+    }
+
+    #[test]
+    fn ca_name_constraints_reject_disallowed_dns_names() {
+        let mut root_params = generated_certificate_params("constrained authority", true);
+        root_params.name_constraints = Some(rcgen::NameConstraints {
+            permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName("example.com".into())],
+            excluded_subtrees: vec![rcgen::GeneralSubtree::DnsName("blocked.example.com".into())],
+        });
+        let root = rcgen::CertifiedIssuer::self_signed(
+            root_params,
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("constrained root should be self-signable");
+
+        for (dns_name, accepted) in [
+            ("www.example.com", true),
+            ("blocked.example.com", false),
+            ("www.example.net", false),
+        ] {
+            let leaf = rcgen::CertificateParams::new(vec![dns_name.into()])
+                .expect("DNS SAN should be valid")
+                .signed_by(
+                    &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                    &root,
+                )
+                .expect("root should sign leaf certificate");
+            assert_eq!(
+                verify_generated_path(
+                    vec![leaf.der().to_vec(), root.der().to_vec()],
+                    root.der().to_vec(),
+                )
+                .is_ok(),
+                accepted,
+                "unexpected name-constraint result for {dns_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn name_constraint_matchers_cover_email_uri_and_ip_forms() {
+        // RFC 5280 gives each GeneralName form distinct subtree semantics;
+        // exercise those rules directly so a DNS-only implementation cannot pass.
+        assert!(email_within_subtree("ops@example.com", "example.com"));
+        assert!(email_within_subtree("ops@example.com", "ops@example.com"));
+        assert!(!email_within_subtree(
+            "other@example.com",
+            "ops@example.com"
+        ));
+        assert_eq!(
+            uri_host("https://user@api.example.com:8443/path"),
+            Some("api.example.com")
+        );
+        assert!(dns_name_within_subtree(
+            uri_host("https://api.example.com/path").expect("URI must expose a DNS host"),
+            ".example.com",
+            false,
+        ));
+        assert!(ip_address_within_subtree(
+            &[192, 0, 2, 42],
+            &[192, 0, 2, 0, 255, 255, 255, 0],
+        ));
+        assert!(!ip_address_within_subtree(
+            &[192, 0, 3, 42],
+            &[192, 0, 2, 0, 255, 255, 255, 0],
+        ));
+        assert!(!ip_address_within_subtree(
+            &[192, 0, 2, 42],
+            &[192, 0, 2, 0, 255, 0, 255, 0],
+        ));
+    }
+
+    #[test]
+    fn name_constraints_cover_subject_email_and_directory_name() {
+        // RFC 5280 requires subject emailAddress attributes to be checked even
+        // without a SAN, and directoryName constraints compare RDN subtrees.
+        let mut permitted_directory = rcgen::DistinguishedName::new();
+        permitted_directory.push(rcgen::DnType::OrganizationName, "Example Corp");
+        let mut root_params = generated_certificate_params("name authority", true);
+        root_params.name_constraints = Some(rcgen::NameConstraints {
+            permitted_subtrees: vec![
+                rcgen::GeneralSubtree::Rfc822Name("example.com".into()),
+                rcgen::GeneralSubtree::DirectoryName(permitted_directory),
+            ],
+            excluded_subtrees: Vec::new(),
+        });
+        let root = rcgen::CertifiedIssuer::self_signed(
+            root_params,
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("constrained root should be self-signable");
+
+        for (organization, email, accepted) in [
+            ("Example Corp", "ops@example.com", true),
+            ("Other Corp", "ops@example.com", false),
+            ("Example Corp", "ops@example.net", false),
+        ] {
+            let mut leaf_params = generated_certificate_params("name-constrained leaf", false);
+            leaf_params.distinguished_name = rcgen::DistinguishedName::new();
+            leaf_params
+                .distinguished_name
+                .push(rcgen::DnType::OrganizationName, organization);
+            leaf_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "name-constrained leaf");
+            leaf_params.distinguished_name.push(
+                rcgen::DnType::CustomDnType(vec![1, 2, 840, 113549, 1, 9, 1]),
+                rcgen::DnValue::Ia5String(
+                    email
+                        .try_into()
+                        .expect("test email must be a valid IA5String"),
+                ),
+            );
+            let leaf = leaf_params
+                .signed_by(
+                    &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                    &root,
+                )
+                .expect("root should sign leaf certificate");
+            let result = verify_generated_path(
+                vec![leaf.der().to_vec(), root.der().to_vec()],
+                root.der().to_vec(),
+            );
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "unexpected subject constraint result for {organization} / {email}: {result:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_critical_certificate_extension_fails_closed() {
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("critical-extension root", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        let mut leaf_params = generated_certificate_params("critical-extension leaf", false);
+        let mut extension =
+            rcgen::CustomExtension::from_oid_content(&[1, 2, 3, 4], vec![0x05, 0x00]);
+        extension.set_criticality(true);
+        leaf_params.custom_extensions.push(extension);
+        let leaf = leaf_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &root,
+            )
+            .expect("root should sign leaf certificate");
+
+        assert!(
+            verify_generated_path(
+                vec![leaf.der().to_vec(), root.der().to_vec()],
+                root.der().to_vec(),
+            )
+            .is_err(),
+            "an unprocessed critical extension must reject the path"
+        );
+    }
+
+    #[test]
+    fn name_constraints_are_rejected_on_end_entity_certificates() {
+        // RFC 5280 limits NameConstraints to critical CA extensions; merely
+        // parsing the extension on an end entity must not count as processing it.
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("name-placement root", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        let mut leaf_params = generated_certificate_params("name-placement leaf", false);
+        leaf_params.name_constraints = Some(rcgen::NameConstraints {
+            permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName("example.com".into())],
+            excluded_subtrees: Vec::new(),
+        });
+        let leaf = leaf_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &root,
+            )
+            .expect("root should sign leaf certificate");
+
+        assert!(matches!(
+            verify_generated_path(
+                vec![leaf.der().to_vec(), root.der().to_vec()],
+                root.der().to_vec(),
+            ),
+            Err(X509ChainError::InvalidNameConstraints { position: 0 })
+        ));
     }
 
     #[test]
