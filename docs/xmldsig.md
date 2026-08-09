@@ -33,15 +33,19 @@ validation in `sign_with_builder`, digest filling, `SignedInfo` parsing, signatu
 optional `KeyInfo` filling. An internal-DTD opt-in and XML node ceiling therefore cannot be lost
 between stages.
 
-`SignContext::provider` selects both digest primitives and operation randomness. Built-in RSA
-signing routes its blinding randomness through that provider rather than acquiring operating-system
-randomness behind the provider boundary. Custom `SigningKey` implementations whose primitive uses
-randomness must implement `SigningKey::sign_with_provider`; deterministic and externally managed
-keys can use the default implementation.
+`SignContext::provider` selects both digest primitives and operation randomness. Built-in ECDSA
+signing obtains its prehash from that provider, while built-in RSA signing routes its blinding
+randomness through the provider rather than acquiring operating-system randomness behind the
+boundary. Custom `SigningKey` implementations that hash or use randomness inside their primitive
+must implement `SigningKey::sign_with_provider`; externally managed keys can use the default
+implementation only when the provider has no primitive work to observe.
 
 `VerifyContext::provider` covers every verification-time cryptographic operation, including
 reference digests, document signatures, `X509Digest` selector evaluation, X.509 candidate-path
 edges, complete certificate paths, and CRL authentication performed by `DefaultKeyResolver`.
+Certificate authentication uses a separate typed algorithm contract so RSA-PSS parameters and
+Ed25519 are not collapsed into the narrower XMLDSig `SignatureMethod` enum. Unsupported certificate
+OIDs remain typed path errors rather than ordinary signature mismatches.
 Custom resolvers that evaluate cryptographic key metadata should override
 `KeyResolver::resolve_with_policy_and_provider`; source-only resolvers can retain the default hook.
 
@@ -123,5 +127,6 @@ verification selects P-256, P-384, or P-521 from the SPKI independently of the h
 the built-in P-256 and P-384 signing keys support either ECDSA hash identifier.
 DSA-SHA1 and HMAC-SHA1 (including XMLDSig's byte-aligned 80-160-bit truncation range) are
 verify-only legacy algorithms.
-DSA-SHA256, broader HMAC verification/signing, RSA-PSS, and implicit external resource loading are
-not currently supported.
+X.509 path and CRL authentication additionally supports standard RSA-PSS with SHA-256/SHA-384/
+SHA-512 parameters and Ed25519. DSA-SHA256, broader HMAC verification/signing, XMLDSig
+`SignatureMethod` RSA-PSS, and implicit external resource loading are not currently supported.

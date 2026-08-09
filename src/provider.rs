@@ -26,6 +26,8 @@ pub enum ProviderOperation {
     Sign,
     /// Public-key signature verification.
     Verify,
+    /// X.509 certificate or CRL signature verification.
+    VerifyCertificate,
     /// Authenticated or padded symmetric encryption.
     Encrypt,
     /// Authenticated or padded symmetric decryption.
@@ -51,6 +53,54 @@ pub struct CapabilityQuery<'a> {
     pub operation: ProviderOperation,
     /// Standard algorithm URI when one exists.
     pub algorithm: Option<&'a str>,
+}
+
+/// Provider-neutral X.509 certificate and CRL signature parameters.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum X509SignatureAlgorithm {
+    /// DSA with the selected message digest.
+    Dsa(DigestAlgorithm),
+    /// RSASSA-PKCS1-v1_5 with the selected message digest.
+    RsaPkcs1v15(DigestAlgorithm),
+    /// RSASSA-PSS with explicit RFC 4055 parameters.
+    RsaPss {
+        /// Message digest applied to the signed certificate data.
+        digest: DigestAlgorithm,
+        /// Digest used by MGF1.
+        mgf_digest: DigestAlgorithm,
+        /// Salt length in octets.
+        salt_len: usize,
+    },
+    /// ECDSA with the selected message digest; SPKI selects the curve.
+    Ecdsa(DigestAlgorithm),
+    /// Pure Ed25519 as specified by RFC 8410.
+    Ed25519,
+}
+
+#[cfg(feature = "xmldsig")]
+impl X509SignatureAlgorithm {
+    /// Return the standard AlgorithmIdentifier OID used for capability queries.
+    #[must_use]
+    pub const fn oid(self) -> &'static str {
+        match self {
+            Self::Dsa(DigestAlgorithm::Sha1) => "1.2.840.10040.4.3",
+            Self::Dsa(DigestAlgorithm::Sha256) => "2.16.840.1.101.3.4.3.2",
+            Self::Dsa(DigestAlgorithm::Sha384) => "2.16.840.1.101.3.4.3.3",
+            Self::Dsa(DigestAlgorithm::Sha512) => "2.16.840.1.101.3.4.3.4",
+            Self::RsaPkcs1v15(DigestAlgorithm::Sha1) => "1.2.840.113549.1.1.5",
+            Self::RsaPkcs1v15(DigestAlgorithm::Sha256) => "1.2.840.113549.1.1.11",
+            Self::RsaPkcs1v15(DigestAlgorithm::Sha384) => "1.2.840.113549.1.1.12",
+            Self::RsaPkcs1v15(DigestAlgorithm::Sha512) => "1.2.840.113549.1.1.13",
+            Self::RsaPss { .. } => "1.2.840.113549.1.1.10",
+            Self::Ecdsa(DigestAlgorithm::Sha1) => "1.2.840.10045.4.1",
+            Self::Ecdsa(DigestAlgorithm::Sha256) => "1.2.840.10045.4.3.2",
+            Self::Ecdsa(DigestAlgorithm::Sha384) => "1.2.840.10045.4.3.3",
+            Self::Ecdsa(DigestAlgorithm::Sha512) => "1.2.840.10045.4.3.4",
+            Self::Ed25519 => "1.3.101.112",
+        }
+    }
 }
 
 /// Structured invalid-input reasons returned by cryptographic providers.
@@ -155,6 +205,22 @@ pub trait CryptoProvider: Send + Sync {
         data: &[u8],
         signature: &[u8],
     ) -> Result<bool, crate::xmldsig::DsigError>;
+
+    /// Verify an X.509 certificate or CRL signature under its issuer SPKI.
+    #[cfg(feature = "xmldsig")]
+    fn verify_x509_signature(
+        &self,
+        algorithm: X509SignatureAlgorithm,
+        signed_data: &[u8],
+        signature: &[u8],
+        issuer_spki_der: &[u8],
+    ) -> Result<bool, ProviderError> {
+        let _ = (signed_data, signature, issuer_spki_der);
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::VerifyCertificate,
+            algorithm: Some(algorithm.oid().to_owned()),
+        })
+    }
 
     /// Encrypt XMLEnc content bytes, including standard framing.
     #[cfg(feature = "xmlenc")]
@@ -297,6 +363,16 @@ impl CryptoProvider for RustCryptoProvider {
                     false
                 }
             }
+            ProviderOperation::VerifyCertificate => {
+                #[cfg(feature = "xmldsig")]
+                {
+                    query.algorithm.is_none_or(is_supported_x509_signature_oid)
+                }
+                #[cfg(not(feature = "xmldsig"))]
+                {
+                    false
+                }
+            }
             ProviderOperation::Encrypt | ProviderOperation::Decrypt => {
                 #[cfg(feature = "xmlenc")]
                 {
@@ -377,6 +453,18 @@ impl CryptoProvider for RustCryptoProvider {
     ) -> Result<bool, crate::xmldsig::DsigError> {
         self.require(ProviderOperation::Verify, Some(algorithm.uri()))?;
         key.verify(algorithm, data, signature)
+    }
+
+    #[cfg(feature = "xmldsig")]
+    fn verify_x509_signature(
+        &self,
+        algorithm: X509SignatureAlgorithm,
+        signed_data: &[u8],
+        signature: &[u8],
+        issuer_spki_der: &[u8],
+    ) -> Result<bool, ProviderError> {
+        self.require(ProviderOperation::VerifyCertificate, Some(algorithm.oid()))?;
+        rustcrypto_x509::verify_signature(algorithm, signed_data, signature, issuer_spki_der)
     }
 
     #[cfg(feature = "xmlenc")]
@@ -493,6 +581,204 @@ fn is_supported_signing_uri(algorithm: &str) -> bool {
             | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"
             | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384"
     )
+}
+
+#[cfg(feature = "xmldsig")]
+fn is_supported_x509_signature_oid(algorithm: &str) -> bool {
+    matches!(
+        algorithm,
+        "1.2.840.10040.4.3"
+            | "1.2.840.113549.1.1.5"
+            | "1.3.14.3.2.29"
+            | "1.2.840.113549.1.1.10"
+            | "1.2.840.113549.1.1.11"
+            | "1.2.840.113549.1.1.12"
+            | "1.2.840.113549.1.1.13"
+            | "1.2.840.10045.4.3.2"
+            | "1.2.840.10045.4.3.3"
+            | "1.3.101.112"
+    )
+}
+
+#[cfg(feature = "xmldsig")]
+mod rustcrypto_x509 {
+    use der::Decode as _;
+    use ed25519_dalek::pkcs8::DecodePublicKey as _;
+    use rsa::{
+        RsaPublicKey,
+        pkcs1::DecodeRsaPublicKey as _,
+        pss::{Signature as RsaPssSignature, VerifyingKey as RsaPssVerifyingKey},
+    };
+    use sha2::{Sha256, Sha384, Sha512};
+    use signature::Verifier as _;
+    use x509_parser::prelude::FromDer as _;
+
+    use super::{ProviderError, X509SignatureAlgorithm};
+    use crate::xmldsig::{
+        DigestAlgorithm, DsigError, SignatureAlgorithm, VerificationKey, VerifyingKey as _,
+    };
+
+    pub(super) fn verify_signature(
+        algorithm: X509SignatureAlgorithm,
+        signed_data: &[u8],
+        signature: &[u8],
+        issuer_spki_der: &[u8],
+    ) -> Result<bool, ProviderError> {
+        match algorithm {
+            X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1) => {
+                let Some(signature) = dsa_der_to_xmldsig(signature) else {
+                    return Ok(false);
+                };
+                verify_xml_signature(
+                    SignatureAlgorithm::DsaSha1,
+                    signed_data,
+                    &signature,
+                    issuer_spki_der,
+                )
+            }
+            X509SignatureAlgorithm::RsaPkcs1v15(digest) => {
+                let Some(algorithm) = rsa_pkcs1_algorithm(digest) else {
+                    return unsupported(X509SignatureAlgorithm::RsaPkcs1v15(digest));
+                };
+                verify_xml_signature(algorithm, signed_data, signature, issuer_spki_der)
+            }
+            X509SignatureAlgorithm::Ecdsa(digest) => {
+                let Some(algorithm) = ecdsa_algorithm(digest) else {
+                    return unsupported(X509SignatureAlgorithm::Ecdsa(digest));
+                };
+                verify_xml_signature(algorithm, signed_data, signature, issuer_spki_der)
+            }
+            X509SignatureAlgorithm::RsaPss {
+                digest,
+                mgf_digest,
+                salt_len,
+            } if digest == mgf_digest => {
+                verify_rsa_pss(digest, salt_len, signed_data, signature, issuer_spki_der)
+            }
+            X509SignatureAlgorithm::RsaPss { .. } => unsupported(algorithm),
+            X509SignatureAlgorithm::Ed25519 => {
+                let Ok(key) = ed25519_dalek::VerifyingKey::from_public_key_der(issuer_spki_der)
+                else {
+                    return Ok(false);
+                };
+                let Ok(signature) = ed25519_dalek::Signature::try_from(signature) else {
+                    return Ok(false);
+                };
+                Ok(key.verify_strict(signed_data, &signature).is_ok())
+            }
+            _ => unsupported(algorithm),
+        }
+    }
+
+    fn verify_xml_signature(
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature: &[u8],
+        issuer_spki_der: &[u8],
+    ) -> Result<bool, ProviderError> {
+        let key = VerificationKey {
+            algorithm,
+            public_key_bytes: issuer_spki_der.to_vec(),
+            certificate_der: None,
+            name: None,
+        };
+        match key.verify(algorithm, signed_data, signature) {
+            Ok(verified) => Ok(verified),
+            Err(DsigError::Provider(error)) => Err(error),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn verify_rsa_pss(
+        digest: DigestAlgorithm,
+        salt_len: usize,
+        signed_data: &[u8],
+        signature: &[u8],
+        issuer_spki_der: &[u8],
+    ) -> Result<bool, ProviderError> {
+        let Some(key) = rsa_public_key_from_spki(issuer_spki_der) else {
+            return Ok(false);
+        };
+        let Ok(signature) = RsaPssSignature::try_from(signature) else {
+            return Ok(false);
+        };
+        let verified = match digest {
+            DigestAlgorithm::Sha256 => {
+                RsaPssVerifyingKey::<Sha256>::new_with_salt_len(key, salt_len)
+                    .verify(signed_data, &signature)
+            }
+            DigestAlgorithm::Sha384 => {
+                RsaPssVerifyingKey::<Sha384>::new_with_salt_len(key, salt_len)
+                    .verify(signed_data, &signature)
+            }
+            DigestAlgorithm::Sha512 => {
+                RsaPssVerifyingKey::<Sha512>::new_with_salt_len(key, salt_len)
+                    .verify(signed_data, &signature)
+            }
+            DigestAlgorithm::Sha1 => {
+                return unsupported(X509SignatureAlgorithm::RsaPss {
+                    digest,
+                    mgf_digest: digest,
+                    salt_len,
+                });
+            }
+        };
+        Ok(verified.is_ok())
+    }
+
+    fn rsa_public_key_from_spki(spki_der: &[u8]) -> Option<RsaPublicKey> {
+        if let Ok(key) = RsaPublicKey::from_public_key_der(spki_der) {
+            return Some(key);
+        }
+
+        // RFC 4055 permits id-RSASSA-PSS in SubjectPublicKeyInfo. The generic
+        // PKCS#8 decoder accepts rsaEncryption SPKIs, so extract the same
+        // PKCS#1 key payload explicitly when the container carries the PSS OID.
+        let (_, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(spki_der).ok()?;
+        if spki.algorithm.algorithm.to_id_string() != "1.2.840.113549.1.1.10" {
+            return None;
+        }
+        RsaPublicKey::from_pkcs1_der(&spki.subject_public_key.data).ok()
+    }
+
+    fn dsa_der_to_xmldsig(signature: &[u8]) -> Option<Vec<u8>> {
+        let signature = dsa::Signature::from_der(signature).ok()?;
+        let r = signature.r().to_be_bytes();
+        let s = signature.s().to_be_bytes();
+        let r = &r[r.iter().position(|byte| *byte != 0).unwrap_or(r.len())..];
+        let s = &s[s.iter().position(|byte| *byte != 0).unwrap_or(s.len())..];
+        if r.len() > 20 || s.len() > 20 {
+            return None;
+        }
+        let mut fixed = vec![0_u8; 40];
+        fixed[20 - r.len()..20].copy_from_slice(r);
+        fixed[40 - s.len()..].copy_from_slice(s);
+        Some(fixed)
+    }
+
+    const fn rsa_pkcs1_algorithm(digest: DigestAlgorithm) -> Option<SignatureAlgorithm> {
+        match digest {
+            DigestAlgorithm::Sha1 => Some(SignatureAlgorithm::RsaSha1),
+            DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::RsaSha256),
+            DigestAlgorithm::Sha384 => Some(SignatureAlgorithm::RsaSha384),
+            DigestAlgorithm::Sha512 => Some(SignatureAlgorithm::RsaSha512),
+        }
+    }
+
+    const fn ecdsa_algorithm(digest: DigestAlgorithm) -> Option<SignatureAlgorithm> {
+        match digest {
+            DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::EcdsaSha256),
+            DigestAlgorithm::Sha384 => Some(SignatureAlgorithm::EcdsaSha384),
+            DigestAlgorithm::Sha1 | DigestAlgorithm::Sha512 => None,
+        }
+    }
+
+    fn unsupported<T>(algorithm: X509SignatureAlgorithm) -> Result<T, ProviderError> {
+        Err(ProviderError::Unsupported {
+            operation: super::ProviderOperation::VerifyCertificate,
+            algorithm: Some(algorithm.oid().to_owned()),
+        })
+    }
 }
 
 #[cfg(feature = "xmlenc")]
@@ -916,6 +1202,7 @@ mod tests {
     #[cfg(feature = "xmldsig")]
     struct CountingRandomProvider {
         random_calls: AtomicUsize,
+        reject_digest: Option<DigestAlgorithm>,
     }
 
     #[cfg(feature = "xmldsig")]
@@ -938,6 +1225,12 @@ mod tests {
             algorithm: DigestAlgorithm,
             data: &[u8],
         ) -> Result<Vec<u8>, ProviderError> {
+            if self.reject_digest == Some(algorithm) {
+                return Err(ProviderError::Unsupported {
+                    operation: ProviderOperation::Digest,
+                    algorithm: Some(algorithm.uri().to_owned()),
+                });
+            }
             RUST_CRYPTO_PROVIDER.digest(algorithm, data)
         }
 
@@ -1093,6 +1386,7 @@ mod tests {
         .expect("RSA fixture must parse");
         let provider = CountingRandomProvider {
             random_calls: AtomicUsize::new(0),
+            reject_digest: None,
         };
 
         let signature = provider
@@ -1101,6 +1395,127 @@ mod tests {
 
         assert!(!signature.is_empty());
         assert!(provider.random_calls.load(Ordering::Relaxed) > 0);
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn ecdsa_signing_uses_the_selected_providers_digest() {
+        use crate::xmldsig::{
+            EcdsaP256SigningKey, EcdsaP384SigningKey, SignatureAlgorithm, SigningKeyError,
+        };
+
+        // SignatureMethod chooses the hash independently of the EC key curve.
+        // Both built-in ECDSA keys must therefore ask the selected provider for
+        // that digest instead of hashing behind the provider boundary.
+        let cases: [(
+            Box<dyn crate::xmldsig::SigningKey>,
+            SignatureAlgorithm,
+            DigestAlgorithm,
+        ); 2] = [
+            (
+                Box::new(
+                    EcdsaP256SigningKey::from_pkcs8_pem(include_str!(
+                        "../tests/fixtures/keys/ec/ec-prime256v1-key.pem"
+                    ))
+                    .expect("P-256 fixture must parse"),
+                ),
+                SignatureAlgorithm::EcdsaSha384,
+                DigestAlgorithm::Sha384,
+            ),
+            (
+                Box::new(
+                    EcdsaP384SigningKey::from_pkcs8_pem(include_str!(
+                        "../tests/fixtures/keys/ec/ec-prime384v1-key.pem"
+                    ))
+                    .expect("P-384 fixture must parse"),
+                ),
+                SignatureAlgorithm::EcdsaSha256,
+                DigestAlgorithm::Sha256,
+            ),
+        ];
+
+        for (key, signature_algorithm, digest_algorithm) in cases {
+            let provider = CountingRandomProvider {
+                random_calls: AtomicUsize::new(0),
+                reject_digest: Some(digest_algorithm),
+            };
+            let error = provider
+                .sign(key.as_ref(), signature_algorithm, b"signed info")
+                .expect_err("provider digest rejection must stop ECDSA signing");
+
+            assert!(matches!(
+                error,
+                SigningKeyError::Provider(ProviderError::Unsupported {
+                    operation: ProviderOperation::Digest,
+                    algorithm: Some(ref uri),
+                }) if uri == digest_algorithm.uri()
+            ));
+        }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn rustcrypto_provider_verifies_parameterized_rsa_pss_certificates() {
+        use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
+        use rsa::{RsaPrivateKey, pkcs8::EncodePublicKey, pss::SigningKey as RsaPssSigningKey};
+        use sha2::Sha256;
+        use signature::{RandomizedSigner, SignatureEncoding};
+
+        // X.509 RSASSA-PSS carries salt and MGF parameters that cannot be
+        // represented by the XMLDSig SignatureAlgorithm enum.
+        let mut rng = ChaCha20Rng::from_seed([0x5a; 32]);
+        let private_key =
+            RsaPrivateKey::new(&mut rng, 2048).expect("deterministic RSA key generation");
+        let public_key = private_key
+            .to_public_key()
+            .to_public_key_der()
+            .expect("RSA public key must encode as SPKI");
+        let signing_key = RsaPssSigningKey::<Sha256>::new_with_salt_len(private_key, 32);
+        let signed_data = b"certificate tbs bytes";
+        let signature = signing_key
+            .try_sign_with_rng(&mut rng, signed_data)
+            .expect("RSA-PSS signing must succeed")
+            .to_vec();
+
+        assert!(
+            RUST_CRYPTO_PROVIDER
+                .verify_x509_signature(
+                    X509SignatureAlgorithm::RsaPss {
+                        digest: DigestAlgorithm::Sha256,
+                        mgf_digest: DigestAlgorithm::Sha256,
+                        salt_len: 32,
+                    },
+                    signed_data,
+                    &signature,
+                    public_key.as_bytes(),
+                )
+                .expect("standard RSA-PSS parameters must be supported")
+        );
+
+        let mut pss_spki = public_key.as_bytes().to_vec();
+        let rsa_encryption_oid = [
+            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+        ];
+        let oid_offset = pss_spki
+            .windows(rsa_encryption_oid.len())
+            .position(|window| window == rsa_encryption_oid)
+            .expect("RSA SPKI must identify rsaEncryption");
+        pss_spki[oid_offset + rsa_encryption_oid.len() - 1] = 0x0a;
+
+        assert!(
+            RUST_CRYPTO_PROVIDER
+                .verify_x509_signature(
+                    X509SignatureAlgorithm::RsaPss {
+                        digest: DigestAlgorithm::Sha256,
+                        mgf_digest: DigestAlgorithm::Sha256,
+                        salt_len: 32,
+                    },
+                    signed_data,
+                    &signature,
+                    &pss_spki,
+                )
+                .expect("RFC 4055 PSS SubjectPublicKeyInfo must be supported")
+        );
     }
 
     #[cfg(feature = "xmlenc")]

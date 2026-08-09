@@ -362,6 +362,11 @@ impl DefaultKeyResolver {
             X509ChainBuildError::Provider(error) => {
                 KeyResolutionError::Chain(super::X509ChainError::Provider(error))
             }
+            X509ChainBuildError::UnsupportedSignatureAlgorithm { oid } => {
+                KeyResolutionError::Chain(super::X509ChainError::UnsupportedSignatureAlgorithm {
+                    oid,
+                })
+            }
             _ => KeyResolutionError::InvalidCertificate,
         })?;
         let mut first_error = None;
@@ -864,6 +869,33 @@ mod tests {
                 .into());
             }
             crate::provider::default_provider().verify(key, algorithm, data, signature)
+        }
+
+        fn verify_x509_signature(
+            &self,
+            algorithm: crate::provider::X509SignatureAlgorithm,
+            data: &[u8],
+            signature: &[u8],
+            issuer_spki_der: &[u8],
+        ) -> Result<bool, crate::provider::ProviderError> {
+            let call = self.verification_calls.fetch_add(1, Ordering::Relaxed);
+            if self.reject_verification_call == Some(call)
+                || self
+                    .rejected_verification_data
+                    .as_deref()
+                    .is_some_and(|rejected| rejected == data)
+            {
+                return Err(crate::provider::ProviderError::Unsupported {
+                    operation: crate::provider::ProviderOperation::VerifyCertificate,
+                    algorithm: Some(algorithm.oid().to_owned()),
+                });
+            }
+            crate::provider::default_provider().verify_x509_signature(
+                algorithm,
+                data,
+                signature,
+                issuer_spki_der,
+            )
         }
 
         #[cfg(feature = "xmlenc")]
@@ -1597,7 +1629,7 @@ mod tests {
                 DsigError::KeyResolution(KeyResolutionError::Chain(
                     super::super::X509ChainError::Provider(
                         crate::provider::ProviderError::Unsupported {
-                            operation: crate::provider::ProviderOperation::Verify,
+                            operation: crate::provider::ProviderOperation::VerifyCertificate,
                             ..
                         }
                     )

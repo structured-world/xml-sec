@@ -1125,11 +1125,14 @@ fn verify_signature_with_context(
         .map(|node: Node<'_, '_>| node.id())
         .collect();
     let mut canonical_signed_info = Vec::new();
+    let signed_info_limit = canonicalized_data_budget
+        .remaining()
+        .min(execution_budget.remaining_c14n_output());
     canonicalize_bounded_with_xml_base_budget(
         &doc,
         Some(&|node| signed_info_subtree.contains(&node.id())),
         &signed_info.c14n_method,
-        canonicalized_data_budget.remaining(),
+        signed_info_limit,
         execution_budget.xml_base_resolution(),
         &mut canonical_signed_info,
     )
@@ -1144,6 +1147,9 @@ fn verify_signature_with_context(
             SignatureVerificationPipelineError::Canonicalization(error)
         }
     })?;
+    execution_budget
+        .charge_c14n_output(canonical_signed_info.len())
+        .map_err(ReferenceProcessingError::Transform)?;
     canonicalized_data_budget.charge(canonical_signed_info.len())?;
 
     let signature_value = decode_signature_value(signature_children.signature_value_node)?;
@@ -2210,6 +2216,42 @@ mod tests {
             ),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn verification_policy_shares_canonicalization_budget_with_signed_info() {
+        // Reference transforms and SignedInfo canonicalization are one operation.
+        // Each output fits independently, but their aggregate must not receive
+        // two separate copies of the configured canonicalization allowance.
+        let payload_text = "x".repeat(700);
+        let canonical_payload = format!("<payload ID=\"payload\">{payload_text}</payload>");
+        let digest = base64::engine::general_purpose::STANDARD.encode(compute_digest(
+            DigestAlgorithm::Sha256,
+            canonical_payload.as_bytes(),
+        ));
+        let xml = format!(
+            r##"<root xmlns:ds="{XMLDSIG_NS}">{canonical_payload}<ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"##
+        );
+        let policy = crate::policy::VerificationPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_canonicalized_bytes: 1_024,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .verify(&xml)
+            .expect_err("SignedInfo must consume the remaining operation C14N budget");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Reference(
+                ReferenceProcessingError::CanonicalizedDataTooLarge { max_bytes: 1_024 }
+            )
+        ));
     }
 
     #[test]

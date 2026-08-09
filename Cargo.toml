@@ -29,6 +29,7 @@ p256 = { version = "0.14", features = ["ecdsa"], optional = true }
 p384 = { version = "0.14", features = ["ecdsa"], optional = true }
 p521 = { version = "0.14", features = ["ecdsa"], optional = true }
 dsa = { version = "0.7", optional = true }
+ed25519-dalek = { version = "3", features = ["pkcs8"], optional = true }
 hmac = { version = "0.13", optional = true }
 signature = { version = "3", optional = true }
 subtle = { version = "2", optional = true }
@@ -64,6 +65,7 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:der",
     "dep:crypto-bigint",
     "dep:dsa",
+    "dep:ed25519-dalek",
     "dep:getrandom",
     "dep:hmac",
     "dep:p256",

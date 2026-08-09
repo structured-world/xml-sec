@@ -375,7 +375,7 @@ fn ecdsa_curve_and_component_len(
         ("1.2.840.10045.3.1.7", 256) => Ok((EcCurve::P256, 32)),
         ("1.3.132.0.34", 384) => Ok((EcCurve::P384, 48)),
         // x509-parser reports the byte-aligned SEC1 point size for P-521.
-        ("1.3.132.0.35", 521 | 528) => Ok((EcCurve::P521, 66)),
+        ("1.3.132.0.35", 528) => Ok((EcCurve::P521, 66)),
         _ => Err(SignatureVerificationError::InvalidKeyDer),
     }
 }

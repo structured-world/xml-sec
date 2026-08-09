@@ -2,16 +2,16 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use der::Decode;
 use x509_parser::{
     certificate::X509Certificate, extensions::ParsedExtension, prelude::FromDer,
-    revocation_list::CertificateRevocationList, time::ASN1Time,
+    revocation_list::CertificateRevocationList, time::ASN1Time, x509::AlgorithmIdentifier,
 };
 
 use super::{
-    SignatureAlgorithm, VerificationKey, X509DataInfo,
+    X509DataInfo,
     parse::{distinguished_names_equal, x509_name_to_rfc4514},
 };
+use crate::provider::X509SignatureAlgorithm;
 
 /// Inputs controlling X.509 certificate-chain validation.
 #[derive(Debug, Clone)]
@@ -75,6 +75,12 @@ pub enum X509ChainError {
     /// A certificate signature does not verify under its issuer key.
     #[error("certificate signature at chain position {0} is invalid or unsupported")]
     InvalidSignature(usize),
+    /// The certificate or CRL declares an algorithm this build cannot verify.
+    #[error("unsupported X.509 signature algorithm: {oid}")]
+    UnsupportedSignatureAlgorithm {
+        /// AlgorithmIdentifier object identifier.
+        oid: String,
+    },
     /// A CRL is not valid for the selected verification time or issuer.
     #[error("CRL {0} is invalid or cannot be authenticated")]
     InvalidCrl(usize),
@@ -242,7 +248,7 @@ fn verify_certificate_signature_with_provider(
         return Ok(false);
     }
     verify_x509_signature_with_provider(
-        &certificate.signature_algorithm.algorithm.to_id_string(),
+        &certificate.signature_algorithm,
         &certificate.signature_value.data,
         certificate.tbs_certificate.as_ref(),
         issuer.public_key().raw,
@@ -305,7 +311,7 @@ fn verify_crl_signature_with_provider(
         return Ok(false);
     }
     verify_x509_signature_with_provider(
-        &crl.signature_algorithm.algorithm.to_id_string(),
+        &crl.signature_algorithm,
         &crl.signature_value.data,
         crl.tbs_cert_list.as_ref(),
         issuer.public_key().raw,
@@ -314,56 +320,100 @@ fn verify_crl_signature_with_provider(
 }
 
 fn verify_x509_signature_with_provider(
-    algorithm_oid: &str,
+    algorithm_identifier: &AlgorithmIdentifier<'_>,
     signature_der: &[u8],
     signed_data: &[u8],
     issuer_spki_der: &[u8],
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<bool, X509ChainError> {
-    let Some(algorithm) = x509_signature_algorithm(algorithm_oid) else {
-        return Ok(false);
-    };
-    let signature = if algorithm == SignatureAlgorithm::DsaSha1 {
-        let Ok(signature) = dsa::Signature::from_der(signature_der) else {
-            return Ok(false);
-        };
-        let r = signature.r().to_be_bytes();
-        let s = signature.s().to_be_bytes();
-        let r = &r[r.iter().position(|byte| *byte != 0).unwrap_or(r.len())..];
-        let s = &s[s.iter().position(|byte| *byte != 0).unwrap_or(s.len())..];
-        if r.len() > 20 || s.len() > 20 {
-            return Ok(false);
-        }
-        let mut fixed = vec![0_u8; 40];
-        fixed[20 - r.len()..20].copy_from_slice(r);
-        fixed[40 - s.len()..].copy_from_slice(s);
-        fixed
-    } else {
-        signature_der.to_vec()
-    };
-    let key = VerificationKey {
-        algorithm,
-        public_key_bytes: issuer_spki_der.to_vec(),
-        certificate_der: None,
-        name: None,
-    };
-    match provider.verify(&key, algorithm, signed_data, &signature) {
-        Ok(verified) => Ok(verified),
-        Err(super::DsigError::Provider(error)) => Err(error.into()),
-        Err(_) => Ok(false),
-    }
+    let algorithm = x509_signature_algorithm(algorithm_identifier)?;
+    provider
+        .verify_x509_signature(algorithm, signed_data, signature_der, issuer_spki_der)
+        .map_err(Into::into)
 }
 
-fn x509_signature_algorithm(oid: &str) -> Option<SignatureAlgorithm> {
+fn x509_signature_algorithm(
+    identifier: &AlgorithmIdentifier<'_>,
+) -> Result<X509SignatureAlgorithm, X509ChainError> {
+    let oid = identifier.algorithm.to_id_string();
+    let algorithm = match oid.as_str() {
+        "1.2.840.10040.4.3" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha1),
+        "1.2.840.113549.1.1.5" | "1.3.14.3.2.29" => {
+            X509SignatureAlgorithm::RsaPkcs1v15(super::DigestAlgorithm::Sha1)
+        }
+        "1.2.840.113549.1.1.11" => {
+            X509SignatureAlgorithm::RsaPkcs1v15(super::DigestAlgorithm::Sha256)
+        }
+        "1.2.840.113549.1.1.12" => {
+            X509SignatureAlgorithm::RsaPkcs1v15(super::DigestAlgorithm::Sha384)
+        }
+        "1.2.840.113549.1.1.13" => {
+            X509SignatureAlgorithm::RsaPkcs1v15(super::DigestAlgorithm::Sha512)
+        }
+        "1.2.840.113549.1.1.10" => parse_rsa_pss_algorithm(identifier)?,
+        "1.2.840.10045.4.3.2" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha256),
+        "1.2.840.10045.4.3.3" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha384),
+        "1.3.101.112" => X509SignatureAlgorithm::Ed25519,
+        _ => return Err(X509ChainError::UnsupportedSignatureAlgorithm { oid }),
+    };
+    Ok(algorithm)
+}
+
+fn parse_rsa_pss_algorithm(
+    identifier: &AlgorithmIdentifier<'_>,
+) -> Result<X509SignatureAlgorithm, X509ChainError> {
+    let parameters = identifier
+        .parameters
+        .as_ref()
+        .ok_or_else(|| X509ChainError::InvalidDer {
+            kind: "RSASSA-PSS parameters",
+            message: "missing parameters".into(),
+        })?;
+    let parameters = x509_parser::signature_algorithm::RsaSsaPssParams::try_from(parameters)
+        .map_err(|error| X509ChainError::InvalidDer {
+            kind: "RSASSA-PSS parameters",
+            message: error.to_string(),
+        })?;
+    if parameters.trailer_field() != 1 {
+        return Err(X509ChainError::InvalidDer {
+            kind: "RSASSA-PSS parameters",
+            message: "trailerField must be 1".into(),
+        });
+    }
+    let digest = x509_digest_algorithm(&parameters.hash_algorithm_oid().to_id_string())?;
+    let mask = parameters
+        .mask_gen_algorithm()
+        .map_err(|error| X509ChainError::InvalidDer {
+            kind: "RSASSA-PSS parameters",
+            message: error.to_string(),
+        })?;
+    if mask.mgf.to_id_string() != "1.2.840.113549.1.1.8" {
+        return Err(X509ChainError::UnsupportedSignatureAlgorithm {
+            oid: mask.mgf.to_id_string(),
+        });
+    }
+    let mgf_digest = x509_digest_algorithm(&mask.hash.to_id_string())?;
+    let salt_len =
+        usize::try_from(parameters.salt_length()).map_err(|_| X509ChainError::InvalidDer {
+            kind: "RSASSA-PSS parameters",
+            message: "saltLength does not fit this platform".into(),
+        })?;
+    Ok(X509SignatureAlgorithm::RsaPss {
+        digest,
+        mgf_digest,
+        salt_len,
+    })
+}
+
+fn x509_digest_algorithm(oid: &str) -> Result<super::DigestAlgorithm, X509ChainError> {
     match oid {
-        "1.2.840.10040.4.3" => Some(SignatureAlgorithm::DsaSha1),
-        "1.2.840.113549.1.1.5" | "1.3.14.3.2.29" => Some(SignatureAlgorithm::RsaSha1),
-        "1.2.840.113549.1.1.11" => Some(SignatureAlgorithm::RsaSha256),
-        "1.2.840.113549.1.1.12" => Some(SignatureAlgorithm::RsaSha384),
-        "1.2.840.113549.1.1.13" => Some(SignatureAlgorithm::RsaSha512),
-        "1.2.840.10045.4.3.2" => Some(SignatureAlgorithm::EcdsaSha256),
-        "1.2.840.10045.4.3.3" => Some(SignatureAlgorithm::EcdsaSha384),
-        _ => None,
+        "1.3.14.3.2.26" => Ok(super::DigestAlgorithm::Sha1),
+        "2.16.840.1.101.3.4.2.1" => Ok(super::DigestAlgorithm::Sha256),
+        "2.16.840.1.101.3.4.2.2" => Ok(super::DigestAlgorithm::Sha384),
+        "2.16.840.1.101.3.4.2.3" => Ok(super::DigestAlgorithm::Sha512),
+        _ => Err(X509ChainError::UnsupportedSignatureAlgorithm {
+            oid: oid.to_owned(),
+        }),
     }
 }
 
@@ -521,6 +571,9 @@ mod tests {
     use sha2::{Digest, Sha256, Sha384};
     use signature::hazmat::PrehashSigner;
     use std::time::Duration;
+    use x509_parser::oid_registry::{
+        OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, OID_SIG_ECDSA_WITH_SHA512,
+    };
 
     #[test]
     fn x509_ecdsa_hash_oid_does_not_select_the_issuer_curve() {
@@ -541,7 +594,7 @@ mod tests {
             .expect("P-384 SPKI must encode");
         assert!(
             verify_x509_signature_with_provider(
-                "1.2.840.10045.4.3.2",
+                &AlgorithmIdentifier::new(OID_SIG_ECDSA_WITH_SHA256, None),
                 p384_signature.to_der().as_bytes(),
                 data,
                 p384_spki.as_bytes(),
@@ -561,7 +614,7 @@ mod tests {
             .expect("P-256 SPKI must encode");
         assert!(
             verify_x509_signature_with_provider(
-                "1.2.840.10045.4.3.3",
+                &AlgorithmIdentifier::new(OID_SIG_ECDSA_WITH_SHA384, None),
                 p256_signature.to_der().as_bytes(),
                 data,
                 p256_spki.as_bytes(),
@@ -614,6 +667,72 @@ mod tests {
             leaf.der(),
             alternate_issuer.der()
         ));
+    }
+
+    #[test]
+    fn certificate_path_edge_preserves_ed25519_verification() {
+        // Provider routing must preserve the certificate algorithms accepted by
+        // the previous x509-parser verifier rather than narrowing them to the
+        // XMLDSig SignatureMethod enum.
+        let issuer_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+            .expect("Ed25519 issuer key generation should succeed");
+        let mut issuer_params = rcgen::CertificateParams::new(Vec::new())
+            .expect("empty issuer SAN list should be valid");
+        issuer_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Ed25519 issuer");
+        issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        issuer_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let issuer = rcgen::CertifiedIssuer::self_signed(issuer_params, issuer_key)
+            .expect("Ed25519 issuer certificate should be self-signable");
+        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+            .expect("Ed25519 leaf key generation should succeed");
+        let leaf = rcgen::CertificateParams::new(Vec::new())
+            .expect("empty leaf SAN list should be valid")
+            .signed_by(&leaf_key, &issuer)
+            .expect("Ed25519 issuer should sign leaf certificate");
+
+        assert!(certificate_signature_matches(leaf.der(), issuer.der()));
+    }
+
+    #[test]
+    fn unsupported_x509_signature_algorithm_remains_diagnosable() {
+        // ECDSA-with-SHA512 is not implemented by the selected provider yet;
+        // that capability gap is distinct from a cryptographically invalid
+        // certificate signature and must remain visible to the caller.
+        let identifier = AlgorithmIdentifier::new(OID_SIG_ECDSA_WITH_SHA512, None);
+
+        assert_eq!(
+            x509_signature_algorithm(&identifier),
+            Err(X509ChainError::UnsupportedSignatureAlgorithm {
+                oid: "1.2.840.10045.4.3.4".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_rsa_pss_certificate_parameters_without_xml_dsig_loss() {
+        // RFC 4055 carries the digest, MGF digest, and salt length inside the
+        // AlgorithmIdentifier. Preserve all three values at the provider edge.
+        let der = [
+            0x30, 0x41, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a, 0x30,
+            0x34, 0xa0, 0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04,
+            0x02, 0x01, 0x05, 0x00, 0xa1, 0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+            0xf7, 0x0d, 0x01, 0x01, 0x08, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
+            0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0xa2, 0x03, 0x02, 0x01, 0x20,
+        ];
+        let (rest, identifier) = AlgorithmIdentifier::from_der(&der)
+            .expect("standard SHA-256 RSA-PSS AlgorithmIdentifier must parse");
+        assert!(rest.is_empty());
+
+        assert_eq!(
+            x509_signature_algorithm(&identifier),
+            Ok(X509SignatureAlgorithm::RsaPss {
+                digest: super::super::DigestAlgorithm::Sha256,
+                mgf_digest: super::super::DigestAlgorithm::Sha256,
+                salt_len: 32,
+            })
+        );
     }
 
     #[test]

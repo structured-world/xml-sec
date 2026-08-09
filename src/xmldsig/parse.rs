@@ -1205,6 +1205,7 @@ pub(crate) enum X509ChainBuildError {
     Cycle,
     IssuerSignatureMismatch,
     AmbiguousIssuer,
+    UnsupportedSignatureAlgorithm { oid: String },
     Provider(crate::provider::ProviderError),
 }
 
@@ -1223,6 +1224,11 @@ impl From<X509ChainBuildError> for ParseError {
             }
             X509ChainBuildError::AmbiguousIssuer => {
                 "X509Data certificate chain contains ambiguous issuer certificates"
+            }
+            X509ChainBuildError::UnsupportedSignatureAlgorithm { oid } => {
+                return Self::InvalidStructure(format!(
+                    "X509Data certificate chain uses unsupported signature algorithm {oid}"
+                ));
             }
             X509ChainBuildError::Provider(error) => return Self::Provider(error),
         };
@@ -1278,6 +1284,9 @@ pub(crate) fn build_x509_certificate_chain_from(
                         Ok(false) => {}
                         Err(super::X509ChainError::Provider(error)) => {
                             return Err(X509ChainBuildError::Provider(error));
+                        }
+                        Err(super::X509ChainError::UnsupportedSignatureAlgorithm { oid }) => {
+                            return Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { oid });
                         }
                         Err(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
                     }
@@ -1356,6 +1365,9 @@ pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
                     Ok(false) => {}
                     Err(super::X509ChainError::Provider(error)) => {
                         return Err(X509ChainBuildError::Provider(error));
+                    }
+                    Err(super::X509ChainError::UnsupportedSignatureAlgorithm { oid }) => {
+                        return Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { oid });
                     }
                     Err(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
                 }

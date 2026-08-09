@@ -15,7 +15,7 @@ use rsa::pkcs1v15::Signature as RsaPkcs1v15Signature;
 use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use rsa::traits::PublicKeyParts;
-use sha2::{Digest, Sha256, Sha384, Sha512};
+use sha2::{Sha256, Sha384, Sha512};
 use signature::hazmat::PrehashSigner;
 use std::collections::HashSet;
 use x509_parser::prelude::FromDer;
@@ -439,15 +439,29 @@ impl SigningKey for EcdsaP256SigningKey {
         algorithm: SignatureAlgorithm,
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
-        let prehash = match algorithm {
-            SignatureAlgorithm::EcdsaSha256 => Sha256::digest(canonical_signed_info).to_vec(),
-            SignatureAlgorithm::EcdsaSha384 => Sha384::digest(canonical_signed_info).to_vec(),
+        self.sign_with_provider(
+            crate::provider::default_provider(),
+            algorithm,
+            canonical_signed_info,
+        )
+    }
+
+    fn sign_with_provider(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: SignatureAlgorithm,
+        canonical_signed_info: &[u8],
+    ) -> Result<Vec<u8>, SigningKeyError> {
+        let digest_algorithm = match algorithm {
+            SignatureAlgorithm::EcdsaSha256 => DigestAlgorithm::Sha256,
+            SignatureAlgorithm::EcdsaSha384 => DigestAlgorithm::Sha384,
             _ => {
                 return Err(SigningKeyError::UnsupportedAlgorithm {
                     uri: algorithm.uri().to_string(),
                 });
             }
         };
+        let prehash = provider.digest(digest_algorithm, canonical_signed_info)?;
         let signature: P256Signature = self
             .key
             .sign_prehash(&prehash)
@@ -495,15 +509,29 @@ impl SigningKey for EcdsaP384SigningKey {
         algorithm: SignatureAlgorithm,
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
-        let prehash = match algorithm {
-            SignatureAlgorithm::EcdsaSha256 => Sha256::digest(canonical_signed_info).to_vec(),
-            SignatureAlgorithm::EcdsaSha384 => Sha384::digest(canonical_signed_info).to_vec(),
+        self.sign_with_provider(
+            crate::provider::default_provider(),
+            algorithm,
+            canonical_signed_info,
+        )
+    }
+
+    fn sign_with_provider(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: SignatureAlgorithm,
+        canonical_signed_info: &[u8],
+    ) -> Result<Vec<u8>, SigningKeyError> {
+        let digest_algorithm = match algorithm {
+            SignatureAlgorithm::EcdsaSha256 => DigestAlgorithm::Sha256,
+            SignatureAlgorithm::EcdsaSha384 => DigestAlgorithm::Sha384,
             _ => {
                 return Err(SigningKeyError::UnsupportedAlgorithm {
                     uri: algorithm.uri().to_string(),
                 });
             }
         };
+        let prehash = provider.digest(digest_algorithm, canonical_signed_info)?;
         let signature: P384Signature = self
             .key
             .sign_prehash(&prehash)
