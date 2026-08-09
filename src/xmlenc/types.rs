@@ -376,6 +376,54 @@ pub struct EncryptionMethod {
     pub oaep_params: Option<Vec<u8>>,
 }
 
+impl EncryptionMethod {
+    /// Validate invariants imposed by the selected algorithm URI.
+    ///
+    /// Parsed XML and caller-constructed typed values share this check so the
+    /// public typed API cannot express wire structures that XML parsing rejects.
+    pub(crate) fn validate_structure(&self) -> Result<(), XmlEncError> {
+        let is_legacy_oaep = self.algorithm == KeyTransportAlgorithm::RsaOaepMgf1p.uri();
+        let is_oaep11 = self.algorithm == KeyTransportAlgorithm::RsaOaep11.uri();
+        if (self.oaep_params.is_some()
+            || self.oaep_digest.is_some()
+            || self.mgf_algorithm.is_some())
+            && !is_legacy_oaep
+            && !is_oaep11
+        {
+            return Err(XmlEncError::InvalidStructure(
+                "OAEP parameters are only valid for RSA-OAEP EncryptionMethod".into(),
+            ));
+        }
+        if self.mgf_algorithm.is_some() && !is_oaep11 {
+            return Err(XmlEncError::InvalidStructure(
+                "MGF is only valid for XML Encryption 1.1 RSA-OAEP".into(),
+            ));
+        }
+        if let (Some(actual), Some(expected)) =
+            (self.key_size_bits, fixed_aes_key_size(&self.algorithm))
+            && actual != expected
+        {
+            return Err(XmlEncError::InvalidStructure(format!(
+                "EncryptionMethod {} requires KeySize {expected}, got {actual}",
+                self.algorithm
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn fixed_aes_key_size(algorithm: &str) -> Option<usize> {
+    match algorithm {
+        "http://www.w3.org/2001/04/xmlenc#aes128-cbc"
+        | "http://www.w3.org/2009/xmlenc11#aes128-gcm"
+        | "http://www.w3.org/2001/04/xmlenc#kw-aes128" => Some(128),
+        "http://www.w3.org/2001/04/xmlenc#aes256-cbc"
+        | "http://www.w3.org/2009/xmlenc11#aes256-gcm"
+        | "http://www.w3.org/2001/04/xmlenc#kw-aes256" => Some(256),
+        _ => None,
+    }
+}
+
 /// Inline ciphertext data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CipherData {

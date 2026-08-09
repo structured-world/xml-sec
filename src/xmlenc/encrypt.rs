@@ -161,6 +161,13 @@ impl EncryptedDataBuilder {
                     result.encrypted_data_xml.len(),
                     self.policy.resources.max_encryption_document_bytes,
                 )?;
+                validate_replacement_document_nodes(
+                    &document,
+                    selected,
+                    &result.encrypted_data_xml,
+                    ReplacementMode::ReplaceElement,
+                    self.policy.resources.max_xml_nodes,
+                )?;
                 Ok(replace_range(xml, range, &result.encrypted_data_xml))
             }
             EncryptedDataType::Content => {
@@ -189,6 +196,13 @@ impl EncryptedDataBuilder {
                     removed,
                     inserted,
                     self.policy.resources.max_encryption_document_bytes,
+                )?;
+                validate_replacement_document_nodes(
+                    &document,
+                    selected,
+                    &result.encrypted_data_xml,
+                    ReplacementMode::ReplaceContent,
+                    self.policy.resources.max_xml_nodes,
                 )?;
                 replace_element_content(xml, range, source, boundaries, &result.encrypted_data_xml)
             }
@@ -469,6 +483,44 @@ fn validate_replacement_document_len(
         .saturating_sub(removed_len)
         .saturating_add(inserted_len);
     validate_document_len(actual, maximum)
+}
+
+fn validate_replacement_document_nodes(
+    document: &Document<'_>,
+    selected: Node<'_, '_>,
+    inserted_xml: &str,
+    replacement: ReplacementMode,
+    maximum: usize,
+) -> Result<(), XmlEncError> {
+    let inserted = Document::parse_with_options(
+        inserted_xml,
+        ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
+            entity_resolver: None,
+        },
+    )?;
+    let inserted_nodes = inserted.root_element().descendants().count();
+    let selected_nodes = selected.descendants().count();
+    let removed_nodes = match replacement {
+        ReplacementMode::ReplaceElement => selected_nodes,
+        ReplacementMode::ReplaceContent => selected_nodes.saturating_sub(1),
+    };
+    let actual = document
+        .root()
+        .descendants()
+        .count()
+        .saturating_sub(removed_nodes)
+        .saturating_add(inserted_nodes);
+    if actual > maximum {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "encrypted document XML nodes",
+            maximum,
+            actual,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn validate_content_key(algorithm: DataEncryptionAlgorithm, key: &[u8]) -> Result<(), XmlEncError> {
@@ -1111,6 +1163,62 @@ mod tests {
             builder().encrypt_document(xml, DocumentEncryptionOptions::default()),
             Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
         ));
+    }
+
+    #[test]
+    fn document_encryption_bounds_projected_replacement_nodes() {
+        fn policy(max_xml_nodes: usize) -> crate::policy::EncryptionPolicy {
+            crate::policy::EncryptionPolicy {
+                resources: crate::policy::ResourcePolicy {
+                    max_xml_nodes,
+                    ..crate::policy::ResourcePolicy::default()
+                },
+                ..crate::policy::EncryptionPolicy::default()
+            }
+        }
+
+        // The source document fits the low limit, but the generated
+        // EncryptedData tree does not. Capture its exact projected node count.
+        let element_actual = match EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy(2))
+            .encrypt_document("<root/>", DocumentEncryptionOptions::default())
+        {
+            Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "encrypted document XML nodes",
+                maximum: 2,
+                actual,
+            })) if actual > 2 => actual,
+            result => panic!("expected projected element node bound, got {result:?}"),
+        };
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy(element_actual))
+            .encrypt_document("<root/>", DocumentEncryptionOptions::default())
+            .expect("the exact projected element node limit must be accepted");
+
+        // Content replacement retains the selected element. In particular, a
+        // self-closing element expands around EncryptedData without adding an
+        // extra source node to the projection.
+        let content_actual = match EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .encryption_type(EncryptedDataType::Content)
+            .direct_key([0_u8; 16])
+            .policy(policy(2))
+            .encrypt_document("<root/>", DocumentEncryptionOptions::default())
+        {
+            Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "encrypted document XML nodes",
+                maximum: 2,
+                actual,
+            })) if actual > 2 => actual,
+            result => panic!("expected projected content node bound, got {result:?}"),
+        };
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .encryption_type(EncryptedDataType::Content)
+            .direct_key([0_u8; 16])
+            .policy(policy(content_actual))
+            .encrypt_document("<root/>", DocumentEncryptionOptions::default())
+            .expect("the exact projected content node limit must be accepted");
     }
 
     #[test]

@@ -41,6 +41,9 @@ SHA-256/MGF1-SHA-256. XMLEnc 1.1 itself defaults omitted parameters to SHA-1/MGF
 those implicit legacy defaults. SHA-1 OAEP remains available only through explicit parameters.
 The legacy `rsa-oaep-mgf1p` URI fixes MGF1 to SHA-1; configuration validation rejects any other
 MGF digest before provider dispatch because that URI has no wire field capable of representing it.
+The same `EncryptionMethod` structural validation applies to parsed XML and caller-constructed
+typed values: an explicit `xenc11:MGF` is valid only with the XML Encryption 1.1 RSA-OAEP URI and
+is rejected before key resolution on the legacy URI.
 
 `encrypt_document` selects the root or an element by `Id`, `ID`, or `id`, then replaces either
 the complete element or only its child content according to `EncryptedDataType`. See
@@ -101,7 +104,8 @@ default; legacy documents that need an internal DTD can opt in through
 `decrypt_document_with_options` and `DocumentDecryptionOptions`. That API never installs an
 external entity resolver.
 
-`encrypt_document` also checks the exact projected document length after cipher framing, base64,
-and `EncryptedData` serialization but before allocating the replacement document. This keeps
-generated Element and Content output within the same document policy accepted by reciprocal
-decryption.
+`encrypt_document` also checks the exact projected document byte length and XML node count after
+cipher framing, base64, and `EncryptedData` serialization but before allocating the replacement
+document. Element replacement subtracts the complete selected subtree; Content replacement
+retains its selected element and subtracts only its descendants. This keeps generated Element and
+Content output within the same document policy accepted by reciprocal decryption.

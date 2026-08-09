@@ -216,6 +216,7 @@ impl DecryptionKeyResolver for KekDecryptor {
         encrypted_key: Option<&EncryptedKey>,
     ) -> Result<Vec<u8>, XmlEncError> {
         let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
+        encrypted_key.encryption_method.validate_structure()?;
         let wrapped = STANDARD
             .decode(&encrypted_key.cipher_data.value)
             .map_err(|error| XmlEncError::Base64(error.to_string()))?;
@@ -257,6 +258,7 @@ impl DecryptionKeyResolver for PrivateKeyDecryptor {
         encrypted_key: Option<&EncryptedKey>,
     ) -> Result<Vec<u8>, XmlEncError> {
         let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
+        encrypted_key.encryption_method.validate_structure()?;
         let wrapped = STANDARD
             .decode(&encrypted_key.cipher_data.value)
             .map_err(|error| XmlEncError::Base64(error.to_string()))?;
@@ -574,6 +576,7 @@ fn validate_encrypted_key_policy(
     encrypted_key: &EncryptedKey,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<(), XmlEncError> {
+    encrypted_key.encryption_method.validate_structure()?;
     let uri = &encrypted_key.encryption_method.algorithm;
     if let Ok(transport) = KeyTransportAlgorithm::from_uri(uri) {
         if policy
@@ -1496,6 +1499,73 @@ mod tests {
             Err(XmlEncError::InvalidStructure(_))
         ));
         assert_eq!(resolver.candidate_calls.get(), 0);
+    }
+
+    #[test]
+    fn typed_legacy_oaep_mgf_is_rejected_before_key_resolution() {
+        // The legacy RSA-OAEP URI fixes MGF1 to SHA-1 and cannot carry an MGF
+        // child. Typed input must preserve the parser's structural invariant.
+        let key = [0x43_u8; 16];
+        let ciphertext = crate::provider::default_provider()
+            .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
+            .expect("test encryption must succeed");
+        let encrypted = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            key_name: None,
+            encryption_method: super::super::EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            encrypted_keys: vec![EncryptedKey {
+                id: None,
+                recipient: None,
+                key_name: None,
+                encryption_method: super::super::EncryptionMethod {
+                    algorithm: KeyTransportAlgorithm::RsaOaepMgf1p.uri().into(),
+                    key_size_bits: None,
+                    oaep_digest: Some(OaepDigestAlgorithm::Sha256.uri().into()),
+                    mgf_algorithm: Some(OaepDigestAlgorithm::Sha384.mgf_uri().into()),
+                    oaep_params: None,
+                },
+                cipher_data: super::super::CipherData {
+                    value: STANDARD.encode([0_u8; 256]),
+                },
+                reference_list: None,
+                carried_key_name: None,
+            }],
+            cipher_data: super::super::CipherData {
+                value: STANDARD.encode(ciphertext),
+            },
+        };
+        let resolver = CountingResolver {
+            candidate_calls: Cell::new(0),
+            key: key.to_vec(),
+        };
+
+        assert!(matches!(
+            DecryptContext::new(&resolver).decrypt_data(&encrypted),
+            Err(XmlEncError::InvalidStructure(message))
+                if message == "MGF is only valid for XML Encryption 1.1 RSA-OAEP"
+        ));
+        assert_eq!(resolver.candidate_calls.get(), 0);
+
+        let private_key = RsaPrivateKey::from_pkcs8_pem(include_str!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("tracked RSA private key must parse");
+        assert!(matches!(
+            PrivateKeyDecryptor::new(private_key).resolve_key(
+                crate::provider::default_provider(),
+                DataEncryptionAlgorithm::Aes128Gcm,
+                encrypted.encrypted_keys.first(),
+            ),
+            Err(XmlEncError::InvalidStructure(message))
+                if message == "MGF is only valid for XML Encryption 1.1 RSA-OAEP"
+        ));
     }
 
     #[test]

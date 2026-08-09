@@ -357,36 +357,15 @@ fn parse_encryption_method_with_limit(
         }
     }
 
-    let is_legacy_oaep = algorithm == "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p";
-    let is_oaep11 = algorithm == "http://www.w3.org/2009/xmlenc11#rsa-oaep";
-    if (oaep_params.is_some() || oaep_digest.is_some() || mgf_algorithm.is_some())
-        && !is_legacy_oaep
-        && !is_oaep11
-    {
-        return Err(XmlEncError::InvalidStructure(
-            "OAEP parameters are only valid for RSA-OAEP EncryptionMethod".into(),
-        ));
-    }
-    if mgf_algorithm.is_some() && !is_oaep11 {
-        return Err(XmlEncError::InvalidStructure(
-            "MGF is only valid for XML Encryption 1.1 RSA-OAEP".into(),
-        ));
-    }
-    if let (Some(actual), Some(expected)) = (key_size_bits, fixed_aes_key_size(&algorithm))
-        && actual != expected
-    {
-        return Err(XmlEncError::InvalidStructure(format!(
-            "EncryptionMethod {algorithm} requires KeySize {expected}, got {actual}"
-        )));
-    }
-
-    Ok(EncryptionMethod {
+    let method = EncryptionMethod {
         algorithm,
         key_size_bits,
         oaep_digest,
         mgf_algorithm,
         oaep_params,
-    })
+    };
+    method.validate_structure()?;
+    Ok(method)
 }
 
 fn parse_key_size(node: Node<'_, '_>) -> Result<usize, XmlEncError> {
@@ -401,18 +380,6 @@ fn parse_key_size(node: Node<'_, '_>) -> Result<usize, XmlEncError> {
         ));
     }
     Ok(bits)
-}
-
-fn fixed_aes_key_size(algorithm: &str) -> Option<usize> {
-    match algorithm {
-        "http://www.w3.org/2001/04/xmlenc#aes128-cbc"
-        | "http://www.w3.org/2009/xmlenc11#aes128-gcm"
-        | "http://www.w3.org/2001/04/xmlenc#kw-aes128" => Some(128),
-        "http://www.w3.org/2001/04/xmlenc#aes256-cbc"
-        | "http://www.w3.org/2009/xmlenc11#aes256-gcm"
-        | "http://www.w3.org/2001/04/xmlenc#kw-aes256" => Some(256),
-        _ => None,
-    }
 }
 
 fn parse_cipher_data(node: Node<'_, '_>) -> Result<CipherData, XmlEncError> {
