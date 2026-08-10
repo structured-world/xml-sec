@@ -232,6 +232,7 @@ fn validate_path(
         .collect::<Result<Vec<_>, _>>()?;
 
     for (position, cert) in path.iter().enumerate() {
+        validate_certificate_serial(cert)?;
         validate_unique_extensions(cert, position)?;
         if !cert.validity().is_valid_at(verification_time) {
             return Err(X509ChainError::CertificateNotValid(position));
@@ -260,6 +261,24 @@ fn validate_path(
 
     if options.check_crls {
         verify_crls(&path, &info.crls, verification_time, provider)?;
+    }
+    Ok(())
+}
+
+fn validate_certificate_serial(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
+    validate_certificate_serial_bytes(cert.raw_serial())
+}
+
+fn validate_certificate_serial_bytes(serial: &[u8]) -> Result<(), X509ChainError> {
+    if serial.is_empty()
+        || serial.len() > 20
+        || serial[0] & 0x80 != 0
+        || serial.iter().all(|byte| *byte == 0)
+    {
+        return Err(X509ChainError::InvalidDer {
+            kind: "certificate serial number",
+            message: "RFC 5280 requires a positive, non-zero value of at most 20 octets".into(),
+        });
     }
     Ok(())
 }
@@ -303,14 +322,15 @@ fn validate_subject_identity(cert: &X509Certificate<'_>) -> Result<(), X509Chain
             "SubjectAlternativeName could not be parsed",
         ));
     };
-    if names
-        .general_names
-        .iter()
-        .any(|name| matches!(name, GeneralName::Invalid(..)))
-    {
-        return Err(invalid_subject_identity(
-            "SubjectAlternativeName contains a malformed GeneralName",
-        ));
+    for name in &names.general_names {
+        if matches!(name, GeneralName::Invalid(..)) {
+            return Err(invalid_subject_identity(
+                "SubjectAlternativeName contains a malformed GeneralName",
+            ));
+        }
+        if let GeneralName::DNSName(name) = name {
+            validate_presented_dns_name(name)?;
+        }
     }
     if subject_is_empty && (!extension.critical || names.general_names.is_empty()) {
         return Err(invalid_subject_identity(
@@ -821,7 +841,28 @@ fn validate_email_name_constraint(value: &str) -> Result<(), X509ChainError> {
 }
 
 fn validate_dns_name_constraint(value: &str) -> Result<(), X509ChainError> {
-    let domain = value.strip_prefix('.').unwrap_or(value);
+    if !dns_name_has_valid_syntax(value, true) {
+        return Err(invalid_string_name_constraint(value));
+    }
+    Ok(())
+}
+
+fn validate_presented_dns_name(value: &str) -> Result<(), X509ChainError> {
+    if !dns_name_has_valid_syntax(value, false) {
+        return Err(X509ChainError::InvalidDer {
+            kind: "certificate DNS name",
+            message: format!("invalid RFC 5280 dNSName: {value:?}"),
+        });
+    }
+    Ok(())
+}
+
+fn dns_name_has_valid_syntax(value: &str, allow_leading_dot: bool) -> bool {
+    let domain = if allow_leading_dot {
+        value.strip_prefix('.').unwrap_or(value)
+    } else {
+        value
+    };
     if domain.is_empty()
         || domain.len() > 253
         || domain.split('.').any(|label| {
@@ -840,9 +881,9 @@ fn validate_dns_name_constraint(value: &str) -> Result<(), X509ChainError> {
                     .is_some_and(u8::is_ascii_alphanumeric)
         })
     {
-        return Err(invalid_string_name_constraint(value));
+        return false;
     }
-    Ok(())
+    true
 }
 
 fn invalid_string_name_constraint(value: &str) -> X509ChainError {
@@ -1112,6 +1153,39 @@ fn crl_authority_key_matches(
         .map(|(authority, subject)| authority == subject))
 }
 
+fn validate_crl_extensions(
+    crl: &CertificateRevocationList<'_>,
+    crl_index: usize,
+) -> Result<(), X509ChainError> {
+    for extension in crl.extensions() {
+        let oid = extension.oid.to_id_string();
+        // IssuingDistributionPoint changes which certificates and issuers a CRL
+        // covers. It cannot be ignored while revocation entries are matched by serial.
+        if oid == "2.5.29.28" || (extension.critical && oid != "2.5.29.35") {
+            return Err(X509ChainError::InvalidCrl(crl_index));
+        }
+        if oid == "2.5.29.35"
+            && !matches!(
+                extension.parsed_extension(),
+                ParsedExtension::AuthorityKeyIdentifier(_)
+            )
+        {
+            return Err(X509ChainError::InvalidCrl(crl_index));
+        }
+    }
+    for revoked in crl.iter_revoked_certificates() {
+        for extension in revoked.extensions() {
+            let oid = extension.oid.to_id_string();
+            // certificateIssuer carries the issuer identity for indirect CRLs.
+            // No critical entry extension is safe to ignore during serial matching.
+            if oid == "2.5.29.29" || extension.critical {
+                return Err(X509ChainError::InvalidCrl(crl_index));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn verify_crls(
     path: &[X509Certificate<'_>],
     crl_der: &[Vec<u8>],
@@ -1134,6 +1208,7 @@ fn verify_crls(
                     message: "trailing data".into(),
                 });
             }
+            validate_crl_extensions(&crl, idx)?;
             Ok((idx, crl))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1582,6 +1657,53 @@ mod tests {
                 "unexpected name-constraint result for {dns_name}"
             );
         }
+    }
+
+    #[test]
+    fn name_constraints_reject_malformed_presented_dns_names() {
+        let mut root_params = generated_certificate_params("DNS syntax authority", true);
+        root_params.name_constraints = Some(rcgen::NameConstraints {
+            permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName("example.com".into())],
+            excluded_subtrees: Vec::new(),
+        });
+        let root = rcgen::CertifiedIssuer::self_signed(
+            root_params,
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("constrained root should be self-signable");
+
+        let mut leaf_params = generated_certificate_params("malformed DNS leaf", false);
+        let dns_name = b"bad..example.com";
+        let mut san_der = vec![
+            0x30,
+            u8::try_from(dns_name.len() + 2).expect("test SAN must fit short-form DER"),
+            0x82,
+        ];
+        san_der.push(u8::try_from(dns_name.len()).expect("test DNS name must fit short-form DER"));
+        san_der.extend_from_slice(dns_name);
+        leaf_params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[2, 5, 29, 17],
+                san_der,
+            ));
+        let leaf = leaf_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &root,
+            )
+            .expect("root should sign malformed-DNS leaf");
+
+        assert!(matches!(
+            verify_generated_path(
+                vec![leaf.der().to_vec(), root.der().to_vec()],
+                root.der().to_vec(),
+            ),
+            Err(X509ChainError::InvalidDer {
+                kind: "certificate DNS name",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2035,6 +2157,39 @@ mod tests {
                 oid: "1.2.3.4".into(),
             })
         );
+    }
+
+    #[test]
+    fn invalid_certificate_serial_numbers_fail_path_validation() {
+        for serial in [vec![0], vec![1; 21]] {
+            let root = rcgen::CertifiedIssuer::self_signed(
+                generated_certificate_params("serial root", true),
+                rcgen::KeyPair::generate().expect("root key generation should succeed"),
+            )
+            .expect("root should be self-signable");
+            let mut leaf_params = generated_certificate_params("invalid serial leaf", false);
+            leaf_params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial));
+            let leaf = leaf_params
+                .signed_by(
+                    &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                    &root,
+                )
+                .expect("root should sign leaf certificate");
+
+            assert!(matches!(
+                verify_generated_path(
+                    vec![leaf.der().to_vec(), root.der().to_vec()],
+                    root.der().to_vec(),
+                ),
+                Err(X509ChainError::InvalidDer {
+                    kind: "certificate serial number",
+                    ..
+                })
+            ));
+        }
+
+        assert!(validate_certificate_serial_bytes(&[0x80]).is_err());
+        assert!(validate_certificate_serial_bytes(&[1; 20]).is_ok());
     }
 
     #[test]

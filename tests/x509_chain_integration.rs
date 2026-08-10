@@ -6,8 +6,9 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer,
-    KeyIdMethod, KeyPair, KeyUsagePurpose, RevokedCertParams, SerialNumber, date_time_ymd,
+    BasicConstraints, CertificateParams, CertificateRevocationListParams, CrlDistributionPoint,
+    CrlIssuingDistributionPoint, CrlScope, IsCa, Issuer, KeyIdMethod, KeyPair, KeyUsagePurpose,
+    RevokedCertParams, SerialNumber, date_time_ymd,
 };
 use roxmltree::Document;
 use xml_sec::xmldsig::{
@@ -533,6 +534,45 @@ fn rejects_malformed_crl_when_revocation_checking_is_enabled() {
         verify_x509_certificate_chain(&info, &options(&anchors, true)),
         Err(X509ChainError::InvalidDer { kind: "CRL", .. })
     ));
+}
+
+#[test]
+fn rejects_crl_with_unprocessed_critical_scope() {
+    let mut root_params = CertificateParams::new(Vec::new()).unwrap();
+    root_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "scoped CRL root");
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root =
+        rcgen::CertifiedIssuer::self_signed(root_params, KeyPair::generate().unwrap()).unwrap();
+    let leaf = CertificateParams::new(Vec::new())
+        .unwrap()
+        .signed_by(&KeyPair::generate().unwrap(), &root)
+        .unwrap();
+    let crl = CertificateRevocationListParams {
+        this_update: date_time_ymd(2026, 3, 15),
+        next_update: date_time_ymd(2026, 4, 15),
+        crl_number: SerialNumber::from(1_u64),
+        issuing_distribution_point: Some(CrlIssuingDistributionPoint {
+            distribution_point: CrlDistributionPoint {
+                uris: vec!["https://example.test/root.crl".into()],
+            },
+            scope: Some(CrlScope::UserCertsOnly),
+        }),
+        revoked_certs: Vec::new(),
+        key_identifier_method: KeyIdMethod::Sha256,
+    }
+    .signed_by(&root)
+    .unwrap();
+    let mut info = generated_info(vec![leaf.der().to_vec(), root.der().to_vec()]);
+    info.crls.push(crl.der().to_vec());
+    let anchors = [root.der().to_vec()];
+
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&anchors, true)),
+        Err(X509ChainError::InvalidCrl(0))
+    );
 }
 
 #[test]

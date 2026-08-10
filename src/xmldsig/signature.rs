@@ -307,12 +307,20 @@ fn validate_rsa_public_key(
     minimum_modulus_bits: usize,
 ) -> Result<(), SignatureVerificationError> {
     ensure_rsa_signature_algorithm(algorithm)?;
-    let modulus_start = rsa
-        .modulus
+    validate_rsa_key_components(rsa.modulus, rsa.exponent, minimum_modulus_bits)
+}
+
+/// Apply the RSA key-strength invariant shared by XMLDSig and X.509 algorithms.
+pub(crate) fn validate_rsa_key_components(
+    modulus: &[u8],
+    exponent: &[u8],
+    minimum_modulus_bits: usize,
+) -> Result<(), SignatureVerificationError> {
+    let modulus_start = modulus
         .iter()
         .position(|byte| *byte != 0)
         .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-    let modulus = &rsa.modulus[modulus_start..];
+    let modulus = &modulus[modulus_start..];
     if modulus.is_empty() {
         return Err(SignatureVerificationError::InvalidKeyDer);
     }
@@ -327,9 +335,12 @@ fn validate_rsa_public_key(
         return Err(SignatureVerificationError::InvalidKeyDer);
     }
 
-    let exponent = rsa
-        .try_exponent()
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    if exponent.is_empty() || exponent[0] & 0x80 != 0 || exponent.len() > 8 {
+        return Err(SignatureVerificationError::InvalidKeyDer);
+    }
+    let mut exponent_bytes = [0_u8; 8];
+    exponent_bytes[8 - exponent.len()..].copy_from_slice(exponent);
+    let exponent = u64::from_be_bytes(exponent_bytes);
     if !(3..=((1_u64 << 33) - 1)).contains(&exponent) || exponent % 2 == 0 {
         return Err(SignatureVerificationError::InvalidKeyDer);
     }

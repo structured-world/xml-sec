@@ -612,8 +612,10 @@ mod rustcrypto_x509 {
     use sha2::{Sha256, Sha384, Sha512};
     use signature::Verifier as _;
     use x509_parser::prelude::FromDer as _;
+    use x509_parser::public_key::RSAPublicKey as X509RsaPublicKey;
 
     use super::{ProviderError, X509SignatureAlgorithm};
+    use crate::xmldsig::signature::validate_rsa_key_components;
     use crate::xmldsig::{
         DigestAlgorithm, DsigError, SignatureAlgorithm, VerificationKey, VerifyingKey as _,
     };
@@ -737,6 +739,11 @@ mod rustcrypto_x509 {
         signature_algorithm: X509SignatureAlgorithm,
     ) -> Option<RsaPublicKey> {
         let (_, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(spki_der).ok()?;
+        let (rest, raw_key) = X509RsaPublicKey::from_der(&spki.subject_public_key.data).ok()?;
+        if !rest.is_empty() {
+            return None;
+        }
+        validate_rsa_key_components(raw_key.modulus, raw_key.exponent, 2048).ok()?;
         match spki.algorithm.algorithm.to_id_string().as_str() {
             "1.2.840.113549.1.1.1" => RsaPublicKey::from_public_key_der(spki_der).ok(),
             "1.2.840.113549.1.1.10" => {
@@ -1618,6 +1625,43 @@ mod tests {
                     .expect("incompatible PSS key restrictions are invalid, not unsupported")
             );
         }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn rustcrypto_provider_rejects_weak_rsa_pss_issuer_keys() {
+        use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
+        use rsa::{RsaPrivateKey, pkcs8::EncodePublicKey, pss::SigningKey as RsaPssSigningKey};
+        use sha2::Sha256;
+        use signature::{RandomizedSigner, SignatureEncoding};
+
+        let mut rng = ChaCha20Rng::from_seed([0x3c; 32]);
+        let private_key =
+            RsaPrivateKey::new(&mut rng, 1024).expect("deterministic weak RSA key generation");
+        let public_key = private_key
+            .to_public_key()
+            .to_public_key_der()
+            .expect("weak RSA public key must encode as SPKI");
+        let signed_data = b"certificate tbs bytes";
+        let signature = RsaPssSigningKey::<Sha256>::new_with_salt_len(private_key, 32)
+            .try_sign_with_rng(&mut rng, signed_data)
+            .expect("weak RSA-PSS key can still produce a cryptographic signature")
+            .to_vec();
+
+        assert!(
+            !RUST_CRYPTO_PROVIDER
+                .verify_x509_signature(
+                    X509SignatureAlgorithm::RsaPss {
+                        digest: DigestAlgorithm::Sha256,
+                        mgf_digest: DigestAlgorithm::Sha256,
+                        salt_len: 32,
+                    },
+                    signed_data,
+                    &signature,
+                    public_key.as_bytes(),
+                )
+                .expect("weak issuer key is invalid, not an unsupported algorithm")
+        );
     }
 
     #[cfg(feature = "xmlenc")]
