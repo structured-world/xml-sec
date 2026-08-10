@@ -9,6 +9,24 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 prefix="${XMLSEC1_PREFIX:-$repo_root/.tools/xmlsec1-${XMLSEC1_VERSION}-${XMLSEC1_COMMIT:0:12}}"
 marker="$prefix/.xmlsec-source-commit"
 
+xmlsec_version_output() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    DYLD_LIBRARY_PATH="$prefix/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
+      "$prefix/bin/xmlsec1" --version
+  else
+    LD_LIBRARY_PATH="$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+      "$prefix/bin/xmlsec1" --version
+  fi
+}
+
+xmlsec_version_is_expected() {
+  local output="$1"
+  local program=""
+  local version=""
+  read -r program version _ <<< "$output" || true
+  [[ "$program" == "xmlsec1" && "$version" == "$XMLSEC1_VERSION" ]]
+}
+
 if [[ "$prefix" != /* ]]; then
   printf 'XMLSEC1_PREFIX must be an absolute path: %s\n' "$prefix" >&2
   exit 1
@@ -16,8 +34,13 @@ fi
 
 if [[ -x "$prefix/bin/xmlsec1" && -f "$marker" ]] \
   && [[ "$(<"$marker")" == "$XMLSEC1_COMMIT" ]]; then
-  printf 'xmlsec1 %s is already installed at %s\n' "$XMLSEC1_VERSION" "$prefix"
-  exit 0
+  if version_output="$(xmlsec_version_output)" \
+    && xmlsec_version_is_expected "$version_output"; then
+    printf '%s\n' "$version_output"
+    printf 'xmlsec1 %s is already installed at %s\n' "$XMLSEC1_VERSION" "$prefix"
+    exit 0
+  fi
+  printf 'cached xmlsec1 at %s failed version validation; rebuilding\n' "$prefix" >&2
 fi
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/xmlsec1-${XMLSEC1_VERSION}.XXXXXX")"
@@ -91,21 +114,8 @@ fi
 mv "$staged_prefix" "$prefix"
 promoted_install=true
 
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  version_output="$(
-    DYLD_LIBRARY_PATH="$prefix/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
-      "$prefix/bin/xmlsec1" --version
-  )"
-else
-  version_output="$(
-    LD_LIBRARY_PATH="$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-      "$prefix/bin/xmlsec1" --version
-  )"
-fi
-version_program=""
-version_number=""
-read -r version_program version_number _ <<< "$version_output" || true
-if [[ "$version_program" != "xmlsec1" || "$version_number" != "$XMLSEC1_VERSION" ]]; then
+version_output="$(xmlsec_version_output)"
+if ! xmlsec_version_is_expected "$version_output"; then
   printf 'xmlsec1 version mismatch: expected xmlsec1 %s, got %s\n' \
     "$XMLSEC1_VERSION" "${version_output:-<empty output>}" >&2
   exit 1

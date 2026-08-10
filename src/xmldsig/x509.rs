@@ -279,18 +279,19 @@ fn validate_unique_extensions(
 }
 
 fn validate_subject_identity(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
-    if cert.subject().iter().next().is_some() {
-        return Ok(());
-    }
-
+    let subject_is_empty = cert.subject().iter().next().is_none();
     let mut san_extensions = cert
         .extensions()
         .iter()
         .filter(|extension| extension.oid.to_id_string() == "2.5.29.17");
     let Some(extension) = san_extensions.next() else {
-        return Err(invalid_subject_identity(
-            "an empty subject requires a critical SubjectAlternativeName",
-        ));
+        return if subject_is_empty {
+            Err(invalid_subject_identity(
+                "an empty subject requires a critical SubjectAlternativeName",
+            ))
+        } else {
+            Ok(())
+        };
     };
     if san_extensions.next().is_some() {
         return Err(invalid_subject_identity(
@@ -302,7 +303,16 @@ fn validate_subject_identity(cert: &X509Certificate<'_>) -> Result<(), X509Chain
             "SubjectAlternativeName could not be parsed",
         ));
     };
-    if !extension.critical || names.general_names.is_empty() {
+    if names
+        .general_names
+        .iter()
+        .any(|name| matches!(name, GeneralName::Invalid(..)))
+    {
+        return Err(invalid_subject_identity(
+            "SubjectAlternativeName contains a malformed GeneralName",
+        ));
+    }
+    if subject_is_empty && (!extension.critical || names.general_names.is_empty()) {
         return Err(invalid_subject_identity(
             "an empty subject requires a critical, non-empty SubjectAlternativeName",
         ));
@@ -744,8 +754,15 @@ fn ensure_supported_name_constraints(
         .flatten()
         .chain(constraints.excluded_subtrees.iter().flatten())
     {
-        if let GeneralName::IPAddress(bytes) = &subtree.base {
-            validate_ip_name_constraint(bytes)?;
+        match &subtree.base {
+            GeneralName::DNSName(value) | GeneralName::URI(value) => {
+                validate_dns_name_constraint(value)?;
+            }
+            GeneralName::RFC822Name(value) => validate_email_name_constraint(value)?,
+            GeneralName::IPAddress(bytes) => {
+                validate_ip_name_constraint(bytes)?;
+            }
+            _ => {}
         }
         if matches!(
             subtree.base,
@@ -762,6 +779,49 @@ fn ensure_supported_name_constraints(
         }
     }
     Ok(())
+}
+
+fn validate_email_name_constraint(value: &str) -> Result<(), X509ChainError> {
+    if let Some((local, domain)) = value.rsplit_once('@') {
+        if local.is_empty() || local.contains('@') || domain.starts_with('.') {
+            return Err(invalid_string_name_constraint(value));
+        }
+        validate_dns_name_constraint(domain)
+    } else {
+        validate_dns_name_constraint(value)
+    }
+}
+
+fn validate_dns_name_constraint(value: &str) -> Result<(), X509ChainError> {
+    let domain = value.strip_prefix('.').unwrap_or(value);
+    if domain.is_empty()
+        || domain.len() > 253
+        || domain.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || !label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+    {
+        return Err(invalid_string_name_constraint(value));
+    }
+    Ok(())
+}
+
+fn invalid_string_name_constraint(value: &str) -> X509ChainError {
+    X509ChainError::InvalidDer {
+        kind: "string name constraint",
+        message: format!("invalid RFC 5280 DNS-based constraint: {value:?}"),
+    }
 }
 
 fn validate_certificate_names(
@@ -1561,6 +1621,47 @@ mod tests {
     }
 
     #[test]
+    fn malformed_string_name_constraints_fail_before_matching() {
+        use x509_parser::extensions::GeneralSubtree;
+
+        // Matchers assume admitted string constraints have RFC 5280 syntax.
+        // Invalid values must not degrade into ordinary non-matches.
+        for malformed in [
+            GeneralName::DNSName(""),
+            GeneralName::DNSName("example..com"),
+            GeneralName::RFC822Name("@example.com"),
+            GeneralName::URI("https://example.com"),
+        ] {
+            let constraints = NameConstraints {
+                permitted_subtrees: None,
+                excluded_subtrees: Some(vec![GeneralSubtree { base: malformed }]),
+            };
+            assert!(matches!(
+                ensure_supported_name_constraints(&constraints, 1),
+                Err(X509ChainError::InvalidDer {
+                    kind: "string name constraint",
+                    ..
+                })
+            ));
+        }
+
+        for valid in [
+            GeneralName::DNSName("example.com"),
+            GeneralName::DNSName(".example.com"),
+            GeneralName::RFC822Name("ops@example.com"),
+            GeneralName::RFC822Name("example.com"),
+            GeneralName::URI(".example.com"),
+        ] {
+            let constraints = NameConstraints {
+                permitted_subtrees: Some(vec![GeneralSubtree { base: valid }]),
+                excluded_subtrees: None,
+            };
+            ensure_supported_name_constraints(&constraints, 1)
+                .expect("valid string constraints must remain supported");
+        }
+    }
+
+    #[test]
     fn name_constraints_cover_subject_email_and_directory_name() {
         // RFC 5280 requires subject emailAddress attributes to be checked even
         // without a SAN, and directoryName constraints compare RDN subtrees.
@@ -1701,6 +1802,45 @@ mod tests {
             root.der().to_vec(),
         )
         .expect("only present name forms should be constrained");
+    }
+
+    #[test]
+    fn malformed_general_names_in_san_fail_path_validation() {
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("malformed-SAN root", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        for empty_subject in [true, false] {
+            let mut leaf_params = generated_certificate_params("malformed-SAN leaf", false);
+            if empty_subject {
+                leaf_params.distinguished_name = rcgen::DistinguishedName::new();
+            }
+            // GeneralNames ::= SEQUENCE { dNSName [2] <invalid IA5 octet> }.
+            let mut malformed_san = rcgen::CustomExtension::from_oid_content(
+                &[2, 5, 29, 17],
+                vec![0x30, 0x03, 0x82, 0x01, 0xff],
+            );
+            malformed_san.set_criticality(true);
+            leaf_params.custom_extensions.push(malformed_san);
+            let leaf = leaf_params
+                .signed_by(
+                    &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                    &root,
+                )
+                .expect("root should sign malformed-SAN leaf");
+
+            assert!(matches!(
+                verify_generated_path(
+                    vec![leaf.der().to_vec(), root.der().to_vec()],
+                    root.der().to_vec(),
+                ),
+                Err(X509ChainError::InvalidDer {
+                    kind: "certificate subject identity",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

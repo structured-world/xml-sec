@@ -220,3 +220,34 @@ fn exact_version_output_commits_the_new_installation() {
         "5fdd47dc35753438bdc38b6e96c1a3805c67a483\n"
     );
 }
+
+#[test]
+fn cached_installation_is_revalidated_before_reuse() {
+    // A commit marker authenticates the source used at installation time, not
+    // the executable currently occupying the prefix.
+    let harness = InstallHarness::new();
+    let binary = harness.prefix.join("bin/xmlsec1");
+    std::fs::write(&binary, "#!/bin/sh\nprintf 'xmlsec1 1.3.12 (openssl)\\n'\n")
+        .expect("cached test binary must be writable");
+    let mut permissions = std::fs::metadata(&binary)
+        .expect("cached binary metadata must be readable")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&binary, permissions).expect("cached binary must be executable");
+    std::fs::write(
+        harness.prefix.join(".xmlsec-source-commit"),
+        "5fdd47dc35753438bdc38b6e96c1a3805c67a483\n",
+    )
+    .expect("cached source marker must be writable");
+
+    let status = harness.run(None, None, None, None);
+
+    assert!(
+        status.success(),
+        "invalid cache must be rebuilt successfully"
+    );
+    assert!(
+        !harness.prefix.join("sentinel").exists(),
+        "the stale cached prefix must not be reused"
+    );
+}

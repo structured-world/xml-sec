@@ -71,8 +71,10 @@ Path validation excludes self-issued rollover CAs from `pathLenConstraint`, appl
 5280 NameConstraints to every subordinate certificate, and rejects critical extensions whose
 semantics are not implemented. Repeated extension OIDs are rejected certificate-wide before any
 extension-specific interpretation. Empty certificate subjects require exactly one critical, non-empty
-SubjectAlternativeName, and malformed IPv4/IPv6 constraint lengths or non-contiguous CIDR masks
-fail the path rather than behaving as ordinary name mismatches. Processed critical certificate
+SubjectAlternativeName, and malformed GeneralName entries fail path validation regardless of whether
+the subject is empty. Invalid DNS-based constraints, including email-domain and URI-host forms,
+malformed IPv4/IPv6 encodings, and non-contiguous CIDR masks fail the path rather than behaving as
+ordinary name mismatches. Processed critical certificate
 extensions are KeyUsage
 (`2.5.29.15`), SubjectAlternativeName (`2.5.29.17`), BasicConstraints (`2.5.29.19`), and
 NameConstraints (`2.5.29.30`). A chain using critical ExtendedKeyUsage (`2.5.29.37`) or
