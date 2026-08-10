@@ -382,6 +382,11 @@ impl EncryptionMethod {
     /// Parsed XML and caller-constructed typed values share this check so the
     /// public typed API cannot express wire structures that XML parsing rejects.
     pub(crate) fn validate_structure(&self) -> Result<(), XmlEncError> {
+        if self.key_size_bits == Some(0) {
+            return Err(XmlEncError::InvalidStructure(
+                "KeySize must be a positive integer".into(),
+            ));
+        }
         let is_legacy_oaep = self.algorithm == KeyTransportAlgorithm::RsaOaepMgf1p.uri();
         let is_oaep11 = self.algorithm == KeyTransportAlgorithm::RsaOaep11.uri();
         if (self.oaep_params.is_some()

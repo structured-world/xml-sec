@@ -1587,6 +1587,59 @@ mod tests {
     }
 
     #[test]
+    fn typed_zero_key_size_is_rejected_before_key_resolution() {
+        // Parsed KeySize values are positive. Caller-constructed values must
+        // preserve the same invariant for algorithms without a fixed AES width.
+        let key = [0x45_u8; 16];
+        let ciphertext = crate::provider::default_provider()
+            .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
+            .expect("test encryption must succeed");
+        let encrypted = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            key_name: None,
+            encryption_method: super::super::EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            encrypted_keys: vec![EncryptedKey {
+                id: None,
+                recipient: None,
+                key_name: None,
+                encryption_method: super::super::EncryptionMethod {
+                    algorithm: KeyTransportAlgorithm::RsaOaep11.uri().into(),
+                    key_size_bits: Some(0),
+                    oaep_digest: Some(OaepDigestAlgorithm::Sha256.uri().into()),
+                    mgf_algorithm: Some(OaepDigestAlgorithm::Sha256.mgf_uri().into()),
+                    oaep_params: None,
+                },
+                cipher_data: super::super::CipherData {
+                    value: STANDARD.encode([0_u8; 256]),
+                },
+                reference_list: None,
+                carried_key_name: None,
+            }],
+            cipher_data: super::super::CipherData {
+                value: STANDARD.encode(ciphertext),
+            },
+        };
+        let resolver = CountingResolver {
+            candidate_calls: Cell::new(0),
+            key: key.to_vec(),
+        };
+
+        assert!(matches!(
+            DecryptContext::new(&resolver).decrypt_data(&encrypted),
+            Err(XmlEncError::InvalidStructure(message))
+                if message == "KeySize must be a positive integer"
+        ));
+        assert_eq!(resolver.candidate_calls.get(), 0);
+    }
+
+    #[test]
     fn typed_content_method_is_validated_before_key_resolution() {
         // Caller-constructed values bypass XML parsing, so a fixed-size AES
         // KeySize mismatch must fail at the operation boundary.

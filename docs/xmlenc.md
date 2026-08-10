@@ -43,7 +43,8 @@ The legacy `rsa-oaep-mgf1p` URI fixes MGF1 to SHA-1; configuration validation re
 MGF digest before provider dispatch because that URI has no wire field capable of representing it.
 The same `EncryptionMethod` structural validation applies to parsed XML and caller-constructed
 typed values: an explicit `xenc11:MGF` is valid only with the XML Encryption 1.1 RSA-OAEP URI and
-is rejected before key resolution on the legacy URI.
+is rejected before key resolution on the legacy URI. Every supplied `KeySize` must be positive;
+fixed-width AES methods additionally require it to match the selected algorithm.
 
 `encrypt_document` selects the root or an element by `Id`, `ID`, or `id`, then replaces either
 the complete element or only its child content according to `EncryptedDataType`. See

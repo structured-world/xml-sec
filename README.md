@@ -46,7 +46,7 @@ Currently implemented (core paths):
 - ECDSA SHA-256/SHA-384 verification for P-256, P-384, and P-521 keys
 - Legacy DSA-SHA1 and HMAC-SHA1 verification, including truncated HMAC output
 - RSA PKCS#1 v1.5 and ECDSA SHA-256/SHA-384 signing with P-256/P-384 PKCS#8 keys
-- Opt-in X.509 certificate-chain validation with explicit trust anchors, validity and path-length checks, NameConstraints, authenticated CRLs, and typed RSA-PSS/Ed25519 certificate-signature support. Critical KeyUsage, SubjectAlternativeName, BasicConstraints, and NameConstraints are processed; every other critical extension fails closed.
+- Opt-in X.509 certificate-chain validation with explicit trust anchors, validity and path-length checks, NameConstraints, authenticated CRLs, and typed RSA-PSS/Ed25519 certificate-signature support. Duplicate extension OIDs are rejected; critical KeyUsage, SubjectAlternativeName, BasicConstraints, and NameConstraints are processed, while every other critical extension fails closed.
 - Caller-supplied external references and X.509 `RetrievalMethod` resolution with bounded RFC 3986 `xml:base` processing and no implicit I/O
 - XMLEnc AES-128/256-CBC and AES-128/256-GCM encryption/decryption with direct
   keys, RSA-OAEP key transport, AES-128/256-KW, multiple recipients, and

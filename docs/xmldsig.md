@@ -69,7 +69,8 @@ self-issued rollover certificates continue toward a distinct same-name issuer wh
 validates; neither condition can bypass the configured work bounds or trust anchor requirement.
 Path validation excludes self-issued rollover CAs from `pathLenConstraint`, applies supported RFC
 5280 NameConstraints to every subordinate certificate, and rejects critical extensions whose
-semantics are not implemented. Empty certificate subjects require exactly one critical, non-empty
+semantics are not implemented. Repeated extension OIDs are rejected certificate-wide before any
+extension-specific interpretation. Empty certificate subjects require exactly one critical, non-empty
 SubjectAlternativeName, and malformed IPv4/IPv6 constraint lengths or non-contiguous CIDR masks
 fail the path rather than behaving as ordinary name mismatches. Processed critical certificate
 extensions are KeyUsage

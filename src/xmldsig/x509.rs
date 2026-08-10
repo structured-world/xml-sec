@@ -48,6 +48,14 @@ pub enum X509ChainError {
         /// Parser diagnostic.
         message: String,
     },
+    /// A certificate repeats an extension OID, which RFC 5280 forbids.
+    #[error("certificate at chain position {position} repeats extension {oid}")]
+    DuplicateExtension {
+        /// Position of the malformed certificate in the candidate path.
+        position: usize,
+        /// Repeated extension object identifier.
+        oid: String,
+    },
     /// The ordered embedded path cannot be completed to a configured anchor.
     #[error("certificate chain does not terminate at a trusted certificate")]
     UntrustedRoot,
@@ -224,6 +232,7 @@ fn validate_path(
         .collect::<Result<Vec<_>, _>>()?;
 
     for (position, cert) in path.iter().enumerate() {
+        validate_unique_extensions(cert, position)?;
         if !cert.validity().is_valid_at(verification_time) {
             return Err(X509ChainError::CertificateNotValid(position));
         }
@@ -251,6 +260,20 @@ fn validate_path(
 
     if options.check_crls {
         verify_crls(&path, &info.crls, verification_time, provider)?;
+    }
+    Ok(())
+}
+
+fn validate_unique_extensions(
+    cert: &X509Certificate<'_>,
+    position: usize,
+) -> Result<(), X509ChainError> {
+    let mut seen = std::collections::HashSet::with_capacity(cert.extensions().len());
+    for extension in cert.extensions() {
+        let oid = extension.oid.to_id_string();
+        if !seen.insert(oid.clone()) {
+            return Err(X509ChainError::DuplicateExtension { position, oid });
+        }
     }
     Ok(())
 }
@@ -1736,6 +1759,43 @@ mod tests {
                 root.der().to_vec(),
             ),
             Err(X509ChainError::UnsupportedCriticalExtension {
+                position: 0,
+                oid: "1.2.3.4".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_certificate_extension_oids_fail_closed() {
+        // RFC 5280 forbids repeated extension OIDs. Enforce that certificate-wide
+        // invariant before individual extension consumers select a first match.
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("duplicate-extension root", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        let mut leaf_params = generated_certificate_params("duplicate-extension leaf", false);
+        for _ in 0..2 {
+            leaf_params
+                .custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    &[1, 2, 3, 4],
+                    vec![0x05, 0x00],
+                ));
+        }
+        let leaf = leaf_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &root,
+            )
+            .expect("root should sign leaf certificate");
+
+        assert_eq!(
+            verify_generated_path(
+                vec![leaf.der().to_vec(), root.der().to_vec()],
+                root.der().to_vec(),
+            ),
+            Err(X509ChainError::DuplicateExtension {
                 position: 0,
                 oid: "1.2.3.4".into(),
             })
