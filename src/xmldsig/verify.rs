@@ -1478,6 +1478,14 @@ fn process_manifest_references(
     }
     results.reserve(manifest_references.len());
     for (index, reference, reference_node_id) in &manifest_references {
+        if execution.transform_budget.remaining_c14n_output() == 0 {
+            results.push(manifest_reference_invalid_result(
+                reference,
+                *index,
+                FailureReason::ReferenceProcessingFailure { ref_index: *index },
+            ));
+            continue;
+        }
         if reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference {
             results.push(manifest_reference_invalid_result(
                 reference,
@@ -2252,6 +2260,60 @@ mod tests {
                 ReferenceProcessingError::CanonicalizedDataTooLarge { max_bytes: 1_024 }
             )
         ));
+    }
+
+    #[test]
+    fn manifest_processing_stops_after_c14n_budget_exhaustion() {
+        // A failed bounded render consumes the remaining operation allowance.
+        // Later Manifest references, including cheap binary ones, must not run.
+        let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+        let xml = format!(
+            r##"<root xmlns:ds="{XMLDSIG_NS}"><payload Id="payload">too large</payload><ds:Signature><ds:Object Id="signed-object"><ds:Manifest><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference><ds:Reference URI="urn:small"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##
+        );
+        let document = Document::parse(&xml).expect("test signature must parse");
+        let signature = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
+            .expect("test signature must contain Signature");
+        let object = signature
+            .children()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "Object")))
+            .expect("test signature must contain Object");
+        let resources = HashMap::from([("urn:small".to_owned(), b"small".to_vec())]);
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+        let transform_budget = TransformExecutionBudget::with_c14n_limit(8);
+        let canonicalized_data_budget = CanonicalizedDataBudget::default();
+        let execution = ReferenceExecutionContext {
+            store_pre_digest: false,
+            transform_options: TransformOptions::default(),
+            transform_budget: &transform_budget,
+            canonicalized_data_budget: &canonicalized_data_budget,
+            provider: crate::provider::default_provider(),
+        };
+        let ctx = VerifyContext::new()
+            .allowed_uri_types(UriTypeSet::ALL)
+            .external_resources(&resources);
+        let authenticated = HashSet::from([object.id()]);
+        let mut xpath_budget = XPathSignatureParseBudget::default();
+
+        let results = process_manifest_references(
+            signature,
+            &resolver,
+            &ctx,
+            &authenticated,
+            2,
+            &execution,
+            &mut xpath_budget,
+        )
+        .expect("resource exhaustion is reported per Manifest reference");
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| {
+            matches!(
+                result.status,
+                DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { .. })
+            )
+        }));
     }
 
     #[test]

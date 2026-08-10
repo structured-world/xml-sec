@@ -545,30 +545,92 @@ fn uri_scheme_specific_part_has_valid_syntax(value: &str) -> bool {
 }
 
 fn uri_authority_has_rfc5280_host(authority: &str) -> bool {
-    let host_port = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
+    parse_uri_authority_host(authority).is_some()
+}
+
+#[derive(Clone, Copy)]
+enum UriAuthorityHost<'a> {
+    Dns(&'a str),
+    Ip,
+}
+
+fn parse_uri_authority_host(authority: &str) -> Option<UriAuthorityHost<'_>> {
+    let host_port = match authority.split_once('@') {
+        Some((userinfo, host_port))
+            if !host_port.contains('@') && uri_userinfo_has_valid_syntax(userinfo) =>
+        {
+            host_port
+        }
+        Some(_) => return None,
+        None => authority,
+    };
     if let Some(bracketed) = host_port.strip_prefix('[') {
-        let Some((host, port)) = bracketed.split_once(']') else {
-            return false;
-        };
-        return host.parse::<std::net::Ipv6Addr>().is_ok()
-            && (port.is_empty()
-                || port
-                    .strip_prefix(':')
-                    .is_some_and(|value| value.bytes().all(|byte| byte.is_ascii_digit())));
+        let (host, port) = bracketed.split_once(']')?;
+        return (host.parse::<std::net::Ipv6Addr>().is_ok() && uri_port_has_valid_syntax(port))
+            .then_some(UriAuthorityHost::Ip);
     }
-    let (host, port_is_valid) =
-        host_port
-            .rsplit_once(':')
-            .map_or((host_port, true), |(host, port)| {
-                (
-                    host,
-                    !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()),
-                )
-            });
-    port_is_valid
-        && (host.parse::<std::net::Ipv4Addr>().is_ok() || dns_name_has_valid_syntax(host, false))
+    let (host, port) = host_port
+        .split_once(':')
+        .map_or((host_port, None), |(host, port)| (host, Some(port)));
+    if port.is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit())) {
+        return None;
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        Some(UriAuthorityHost::Ip)
+    } else if dns_name_has_valid_syntax(host, false) {
+        Some(UriAuthorityHost::Dns(host))
+    } else {
+        None
+    }
+}
+
+fn uri_port_has_valid_syntax(suffix: &str) -> bool {
+    suffix.is_empty()
+        || suffix
+            .strip_prefix(':')
+            .is_some_and(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn uri_userinfo_has_valid_syntax(userinfo: &str) -> bool {
+    let bytes = userinfo.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        if !(byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+            ))
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 fn invalid_subject_identity(message: &str) -> X509ChainError {
@@ -1286,17 +1348,10 @@ fn email_within_subtree(name: &str, subtree: &str) -> bool {
 fn uri_host(uri: &str) -> Option<&str> {
     let authority = uri.split_once("://")?.1;
     let authority = authority.split(['/', '?', '#']).next()?;
-    let host_port = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    if host_port.starts_with('[') {
-        return None;
+    match parse_uri_authority_host(authority)? {
+        UriAuthorityHost::Dns(host) => Some(host),
+        UriAuthorityHost::Ip => None,
     }
-    let host = host_port
-        .rsplit_once(':')
-        .filter(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
-        .map_or(host_port, |(host, _)| host);
-    (!host.is_empty() && host.parse::<std::net::IpAddr>().is_err()).then_some(host)
 }
 
 fn ip_address_within_subtree(address: &[u8], subtree: &[u8]) -> Result<bool, X509ChainError> {
@@ -1388,11 +1443,37 @@ fn validate_crl_extensions(
     crl: &CertificateRevocationList<'_>,
     crl_index: usize,
 ) -> Result<(), X509ChainError> {
+    validate_crl_extension_uniqueness(crl, crl_index)?;
+    validate_crl_extension_semantics(crl, crl_index)
+}
+
+fn validate_crl_extension_uniqueness(
+    crl: &CertificateRevocationList<'_>,
+    crl_index: usize,
+) -> Result<(), X509ChainError> {
+    crl.tbs_cert_list
+        .extensions_map()
+        .map_err(|_| X509ChainError::InvalidCrl(crl_index))?;
+    for revoked in crl.iter_revoked_certificates() {
+        revoked
+            .extensions_map()
+            .map_err(|_| X509ChainError::InvalidCrl(crl_index))?;
+    }
+    Ok(())
+}
+
+fn validate_crl_extension_semantics(
+    crl: &CertificateRevocationList<'_>,
+    crl_index: usize,
+) -> Result<(), X509ChainError> {
     for extension in crl.extensions() {
         let oid = extension.oid.to_id_string();
         // IssuingDistributionPoint changes which certificates and issuers a CRL
-        // covers. It cannot be ignored while revocation entries are matched by serial.
-        if oid == "2.5.29.28" || (extension.critical && oid != "2.5.29.35") {
+        // covers. Delta CRLs also cannot be treated as complete CRLs: in particular,
+        // removeFromCRL has the opposite meaning from a complete-list revocation.
+        if matches!(oid.as_str(), "2.5.29.27" | "2.5.29.28")
+            || (extension.critical && oid != "2.5.29.35")
+        {
             return Err(X509ChainError::InvalidCrl(crl_index));
         }
         if oid == "2.5.29.35"
@@ -1449,6 +1530,9 @@ fn verify_crls(
             .iter()
             .filter(|(_, crl)| certificate_names_equal(crl.issuer(), cert.issuer()))
         {
+            // Duplicate OIDs make first-match AKI filtering ambiguous, so this
+            // structural invariant must hold before key applicability is tested.
+            validate_crl_extension_uniqueness(crl, *crl_index)?;
             let authority_key_match = crl_authority_key_matches(crl, issuer)?;
             if authority_key_match == Some(false) {
                 continue;
@@ -1957,6 +2041,11 @@ mod tests {
             uri_host("https://user@api.example.com:8443/path"),
             Some("api.example.com")
         );
+        assert_eq!(
+            uri_host("https://user@other@example.com/path"),
+            None,
+            "a second userinfo delimiter must not expose a constraint-matchable host"
+        );
         assert!(dns_name_within_subtree(
             uri_host("https://api.example.com/path").expect("URI must expose a DNS host"),
             ".example.com",
@@ -2312,6 +2401,7 @@ mod tests {
             (0x81, b"first..last@example.com".as_slice()),
             (0x86, b"relative/path".as_slice()),
             (0x86, b"https://example.com/%zz".as_slice()),
+            (0x86, b"https://user@other@example.com/path".as_slice()),
             (0x86, b"file:///path".as_slice()),
             (0x87, &[192, 0, 2][..]),
         ] {
@@ -2391,6 +2481,105 @@ mod tests {
                 root.der().to_vec(),
             )
             .expect("valid typed SAN identity must satisfy an empty subject");
+        }
+    }
+
+    fn parsed_merlin_crl(der: &[u8]) -> CertificateRevocationList<'_> {
+        CertificateRevocationList::from_der(der)
+            .expect("modified Merlin CRL must remain parseable")
+            .1
+    }
+
+    fn merlin_crl_der() -> Vec<u8> {
+        let xml = include_str!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-x509-crt-crl.xml"
+        );
+        let document = Document::parse(xml).expect("tracked Merlin document must parse");
+        let key_info_node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .expect("tracked Merlin document contains KeyInfo");
+        let key_info = parse_key_info(key_info_node).expect("tracked Merlin KeyInfo must parse");
+        let KeyInfoSource::X509Data(info) = &key_info.sources[0] else {
+            panic!("expected X509Data")
+        };
+        info.crls[0].clone()
+    }
+
+    #[test]
+    fn duplicate_crl_and_entry_extension_oids_fail_closed() {
+        use der::{Decode as _, Encode as _};
+        use x509_cert::crl::CertificateList;
+
+        let original = merlin_crl_der();
+        let mut duplicate_crl: CertificateList =
+            CertificateList::from_der(&original).expect("tracked Merlin CRL must decode");
+        let extensions = duplicate_crl
+            .tbs_cert_list
+            .crl_extensions
+            .as_mut()
+            .expect("tracked Merlin CRL must contain extensions");
+        extensions.push(extensions[0].clone());
+        let duplicate_crl = duplicate_crl
+            .to_der()
+            .expect("duplicate CRL extension test vector must encode");
+        assert_eq!(
+            validate_crl_extensions(&parsed_merlin_crl(&duplicate_crl), 0),
+            Err(X509ChainError::InvalidCrl(0))
+        );
+
+        let mut duplicate_entry: CertificateList =
+            CertificateList::from_der(&original).expect("tracked Merlin CRL must decode");
+        let duplicate = duplicate_entry
+            .tbs_cert_list
+            .crl_extensions
+            .as_ref()
+            .and_then(|extensions| extensions.first())
+            .expect("tracked Merlin CRL must contain an extension")
+            .clone();
+        let revoked = duplicate_entry
+            .tbs_cert_list
+            .revoked_certificates
+            .as_mut()
+            .and_then(|entries| entries.first_mut())
+            .expect("tracked Merlin CRL must contain a revoked entry");
+        revoked.crl_entry_extensions = Some(vec![duplicate.clone(), duplicate]);
+        let duplicate_entry = duplicate_entry
+            .to_der()
+            .expect("duplicate entry extension test vector must encode");
+        assert_eq!(
+            validate_crl_extensions(&parsed_merlin_crl(&duplicate_entry), 0),
+            Err(X509ChainError::InvalidCrl(0))
+        );
+    }
+
+    #[test]
+    fn delta_crl_indicator_is_rejected_regardless_of_criticality() {
+        use der::{Decode as _, Encode as _, asn1::OctetString};
+        use x509_cert::{crl::CertificateList, ext::Extension};
+
+        let original = merlin_crl_der();
+        for critical in [false, true] {
+            let mut encoded: CertificateList =
+                CertificateList::from_der(&original).expect("tracked Merlin CRL must decode");
+            encoded
+                .tbs_cert_list
+                .crl_extensions
+                .get_or_insert_default()
+                .push(Extension {
+                    extn_id: der::asn1::ObjectIdentifier::new_unwrap("2.5.29.27"),
+                    critical,
+                    extn_value: OctetString::new([0x02, 0x01, 0x01])
+                        .expect("DER INTEGER extension payload must be valid"),
+                });
+            let encoded = encoded
+                .to_der()
+                .expect("delta CRL indicator test vector must encode");
+            assert_eq!(
+                validate_crl_extensions(&parsed_merlin_crl(&encoded), 0),
+                Err(X509ChainError::InvalidCrl(0)),
+                "delta CRL indicator criticality must not change unsupported semantics"
+            );
         }
     }
 

@@ -191,6 +191,47 @@ impl C14nOutputBudget {
         }
         Ok(())
     }
+
+    fn exhaust(&self) {
+        self.remaining.set(0);
+    }
+}
+
+#[cfg(test)]
+mod c14n_budget_regression_tests {
+    use super::*;
+    use crate::c14n::C14nMode;
+    use crate::xmldsig::types::NodeSet;
+    use roxmltree::Document;
+
+    #[test]
+    fn bounded_c14n_failure_exhausts_the_shared_budget() {
+        let document = Document::parse("<root><payload>more than eight bytes</payload></root>")
+            .expect("test XML must parse");
+        let budget = TransformExecutionBudget::with_c14n_limit(8);
+
+        let error = execute_transforms_with_options_and_budget(
+            document.root_element(),
+            TransformData::NodeSet(
+                NodeSet::entire_document_without_comments(&document)
+                    .expect("test document must fit the node-set ceiling"),
+            ),
+            &[Transform::C14n(C14nAlgorithm::new(
+                C14nMode::Inclusive1_0,
+                false,
+            ))],
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect_err("canonicalized output must exceed the shared budget");
+
+        assert!(matches!(error, TransformError::C14nOutputTooLarge { .. }));
+        assert_eq!(
+            budget.remaining_c14n_output(),
+            0,
+            "a failed bounded render must not leave the same allowance reusable"
+        );
+    }
 }
 
 impl Default for Base64WorkBudget {
@@ -660,7 +701,7 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                 budget.xml_base_resolution(),
                 &mut output,
             )
-            .map_err(|error| map_c14n_limit_error(error, budget.c14n.max_bytes))?;
+            .map_err(|error| map_c14n_limit_error(error, &budget.c14n))?;
             budget.c14n.charge(output.len())?;
             Ok(TransformData::Binary(output))
         }
@@ -933,7 +974,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 context.budget.xml_base_resolution(),
                 &mut output,
             )
-            .map_err(|error| map_c14n_limit_error(error, context.budget.c14n.max_bytes))?;
+            .map_err(|error| map_c14n_limit_error(error, &context.budget.c14n))?;
         context.budget.c14n.charge(output.len())?;
         return execute_transform_chain(
             source_signature,
@@ -1049,17 +1090,22 @@ fn finalize_transform_data(
                 budget.xml_base_resolution(),
                 &mut output,
             )
-            .map_err(|error| map_c14n_limit_error(error, budget.c14n.max_bytes))?;
+            .map_err(|error| map_c14n_limit_error(error, &budget.c14n))?;
             budget.c14n.charge(output.len())?;
             Ok(output)
         }
     }
 }
 
-fn map_c14n_limit_error(error: c14n::C14nError, max_bytes: usize) -> TransformError {
+fn map_c14n_limit_error(error: c14n::C14nError, budget: &C14nOutputBudget) -> TransformError {
     match error {
         error if c14n::is_output_limit_error(&error) => {
-            TransformError::C14nOutputTooLarge { max_bytes }
+            // Rendering already spent work up to the remaining allowance. Mark
+            // it consumed so another Reference cannot spend the same budget.
+            budget.exhaust();
+            TransformError::C14nOutputTooLarge {
+                max_bytes: budget.max_bytes,
+            }
         }
         c14n::C14nError::XmlBaseComponentsTooLarge { max, actual } => {
             TransformError::XmlBaseComponentsTooLarge { max, actual }

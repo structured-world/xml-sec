@@ -320,10 +320,10 @@ impl EncryptedDataBuilder {
                     self.validate_metadata_len("OAEPparams", parameters.label.len())?;
                 }
                 EncryptionRecipient::AesKeyWrap {
+                    kek,
                     algorithm,
                     recipient,
                     key_name,
-                    ..
                 } => {
                     if self
                         .policy
@@ -336,6 +336,14 @@ impl EncryptedDataBuilder {
                             algorithm: algorithm.uri().to_string(),
                         }
                         .into());
+                    }
+                    if kek.len() != algorithm.key_len() {
+                        return Err(XmlEncError::InvalidEncryptionConfig(format!(
+                            "{} requires a {}-byte key-encryption key, got {} bytes",
+                            algorithm.uri(),
+                            algorithm.key_len(),
+                            kek.len()
+                        )));
                     }
                     self.validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
                     self.validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
@@ -934,6 +942,19 @@ mod tests {
                 .expect("wrapped key must decrypt"),
             super::super::DecryptedContent::Xml("<secret>value</secret>".into())
         );
+    }
+
+    #[test]
+    fn aes_key_wrap_rejects_mismatched_kek_before_provider_dispatch() {
+        // Algorithm URIs define the KEK size. Provider implementations are
+        // capabilities, not authorities allowed to reinterpret wire semantics.
+        let builder = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .recipient_aes_kw([0x44; 32], KeyWrapAlgorithm::AesKw128);
+
+        assert!(matches!(
+            builder.validate_configuration(),
+            Err(XmlEncError::InvalidEncryptionConfig(_))
+        ));
     }
 
     #[test]

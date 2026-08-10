@@ -133,6 +133,11 @@ Merlin X509Data retrieval selector; omitting XPath rejects that key-retrieval pa
 CRL checking is meaningful only inside authenticated X.509 path validation. A policy that enables
 CRLs without enabling certificate-chain validation is rejected during context construction rather
 than silently accepting a control the resolver cannot enforce.
+CRL structure is validated before authority-key applicability is selected: duplicate CRL or
+CRL-entry extension OIDs fail closed, and `deltaCRLIndicator` is rejected regardless of criticality
+because delta and `removeFromCRL` semantics are not implemented. URI subject alternative names
+likewise require one RFC 3986 authority, including syntactically valid userinfo, before their host
+can participate in NameConstraints matching.
 
 Internal DTD declarations are disabled by default. Verification requires the operation's
 `VerificationPolicy::xml.allow_internal_dtd` decision; the

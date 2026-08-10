@@ -41,6 +41,9 @@ SHA-256/MGF1-SHA-256. XMLEnc 1.1 itself defaults omitted parameters to SHA-1/MGF
 those implicit legacy defaults. SHA-1 OAEP remains available only through explicit parameters.
 The legacy `rsa-oaep-mgf1p` URI fixes MGF1 to SHA-1; configuration validation rejects any other
 MGF digest before provider dispatch because that URI has no wire field capable of representing it.
+AES-KW configuration similarly validates the KEK size fixed by its algorithm URI before provider
+dispatch, so custom providers cannot reinterpret `kw-aes128` with a 256-bit KEK or `kw-aes256`
+with a 128-bit KEK.
 The same `EncryptionMethod` structural validation applies to parsed XML and caller-constructed
 typed values: an explicit `xenc11:MGF` is valid only with the XML Encryption 1.1 RSA-OAEP URI and
 is rejected before key resolution on the legacy URI. Every supplied `KeySize` must be positive;
