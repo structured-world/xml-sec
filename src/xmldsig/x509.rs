@@ -270,10 +270,12 @@ fn validate_certificate_serial(cert: &X509Certificate<'_>) -> Result<(), X509Cha
 }
 
 fn validate_certificate_serial_bytes(serial: &[u8]) -> Result<(), X509ChainError> {
+    let magnitude = serial.strip_prefix(&[0]).unwrap_or(serial);
     if serial.is_empty()
-        || serial.len() > 20
         || serial[0] & 0x80 != 0
-        || serial.iter().all(|byte| *byte == 0)
+        || magnitude.is_empty()
+        || magnitude.len() > 20
+        || magnitude.iter().all(|byte| *byte == 0)
     {
         return Err(X509ChainError::InvalidDer {
             kind: "certificate serial number",
@@ -323,14 +325,7 @@ fn validate_subject_identity(cert: &X509Certificate<'_>) -> Result<(), X509Chain
         ));
     };
     for name in &names.general_names {
-        if matches!(name, GeneralName::Invalid(..)) {
-            return Err(invalid_subject_identity(
-                "SubjectAlternativeName contains a malformed GeneralName",
-            ));
-        }
-        if let GeneralName::DNSName(name) = name {
-            validate_presented_dns_name(name)?;
-        }
+        validate_subject_alternative_name(name)?;
     }
     if subject_is_empty && (!extension.critical || names.general_names.is_empty()) {
         return Err(invalid_subject_identity(
@@ -338,6 +333,209 @@ fn validate_subject_identity(cert: &X509Certificate<'_>) -> Result<(), X509Chain
         ));
     }
     Ok(())
+}
+
+fn validate_subject_alternative_name(name: &GeneralName<'_>) -> Result<(), X509ChainError> {
+    match name {
+        GeneralName::RFC822Name(value) => validate_rfc5280_mailbox(value),
+        GeneralName::DNSName(value) => {
+            // RFC 5280 section 4.2.1.6 requires RFC 1034/1123 preferred-name
+            // syntax here. RFC 9525 wildcard matching is an application-level
+            // TLS identity rule, not certificate-path profile validation.
+            validate_rfc5280_dns_name(value)
+        }
+        GeneralName::URI(value) => validate_rfc5280_uri(value),
+        GeneralName::IPAddress(value) if !matches!(value.len(), 4 | 16) => {
+            Err(invalid_subject_identity(
+                "SubjectAlternativeName iPAddress must contain 4 or 16 octets",
+            ))
+        }
+        GeneralName::Invalid(..) => Err(invalid_subject_identity(
+            "SubjectAlternativeName contains a malformed GeneralName",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_rfc5280_mailbox(value: &str) -> Result<(), X509ChainError> {
+    let Some((local, domain)) = value.rsplit_once('@') else {
+        return Err(invalid_subject_identity(
+            "SubjectAlternativeName rfc822Name must contain a mailbox domain",
+        ));
+    };
+    if !mailbox_local_part_has_valid_syntax(local) || !dns_name_has_valid_syntax(domain, false) {
+        return Err(invalid_subject_identity(
+            "SubjectAlternativeName rfc822Name has invalid RFC 5280 mailbox syntax",
+        ));
+    }
+    Ok(())
+}
+
+fn mailbox_local_part_has_valid_syntax(local: &str) -> bool {
+    if let Some(quoted) = local
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        if quoted.is_empty() {
+            return false;
+        }
+        let mut escaped = false;
+        for byte in quoted.bytes() {
+            if escaped {
+                if !(0x20..=0x7e).contains(&byte) {
+                    return false;
+                }
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' || !(0x20..=0x7e).contains(&byte) {
+                return false;
+            }
+        }
+        return !escaped;
+    }
+
+    local.split('.').all(|atom| {
+        !atom.is_empty()
+            && atom.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'/'
+                            | b'='
+                            | b'?'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'{'
+                            | b'|'
+                            | b'}'
+                            | b'~'
+                    )
+            })
+    })
+}
+
+fn validate_rfc5280_uri(value: &str) -> Result<(), X509ChainError> {
+    let Some((scheme, scheme_specific)) = value.split_once(':') else {
+        return Err(invalid_subject_identity(
+            "SubjectAlternativeName URI must be absolute",
+        ));
+    };
+    if scheme.is_empty()
+        || !scheme.as_bytes()[0].is_ascii_alphabetic()
+        || !scheme
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+        || scheme_specific.is_empty()
+        || !uri_scheme_specific_part_has_valid_syntax(scheme_specific)
+    {
+        return Err(invalid_subject_identity(
+            "SubjectAlternativeName URI has invalid RFC 3986 syntax",
+        ));
+    }
+
+    if let Some(authority_and_path) = scheme_specific.strip_prefix("//") {
+        let authority = authority_and_path
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        if !uri_authority_has_rfc5280_host(authority) {
+            return Err(invalid_subject_identity(
+                "SubjectAlternativeName URI authority requires a fully qualified host",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn uri_scheme_specific_part_has_valid_syntax(value: &str) -> bool {
+    if value.bytes().any(|byte| {
+        !byte.is_ascii()
+            || byte.is_ascii_control()
+            || byte == b' '
+            || !matches!(
+                byte,
+                b'A'..=b'Z'
+                    | b'a'..=b'z'
+                    | b'0'..=b'9'
+                    | b'-'
+                    | b'.'
+                    | b'_'
+                    | b'~'
+                    | b':'
+                    | b'/'
+                    | b'?'
+                    | b'#'
+                    | b'['
+                    | b']'
+                    | b'@'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b'%'
+            )
+    }) || value.matches('#').count() > 1
+    {
+        return false;
+    }
+
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && (index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit())
+        {
+            return false;
+        }
+        index += if bytes[index] == b'%' { 3 } else { 1 };
+    }
+    true
+}
+
+fn uri_authority_has_rfc5280_host(authority: &str) -> bool {
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        let Some((host, port)) = bracketed.split_once(']') else {
+            return false;
+        };
+        return host.parse::<std::net::Ipv6Addr>().is_ok()
+            && (port.is_empty()
+                || port
+                    .strip_prefix(':')
+                    .is_some_and(|value| value.bytes().all(|byte| byte.is_ascii_digit())));
+    }
+    let (host, port_is_valid) =
+        host_port
+            .rsplit_once(':')
+            .map_or((host_port, true), |(host, port)| {
+                (
+                    host,
+                    !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()),
+                )
+            });
+    port_is_valid
+        && (host.parse::<std::net::Ipv4Addr>().is_ok() || dns_name_has_valid_syntax(host, false))
 }
 
 fn invalid_subject_identity(message: &str) -> X509ChainError {
@@ -847,7 +1045,7 @@ fn validate_dns_name_constraint(value: &str) -> Result<(), X509ChainError> {
     Ok(())
 }
 
-fn validate_presented_dns_name(value: &str) -> Result<(), X509ChainError> {
+fn validate_rfc5280_dns_name(value: &str) -> Result<(), X509ChainError> {
     if !dns_name_has_valid_syntax(value, false) {
         return Err(X509ChainError::InvalidDer {
             kind: "certificate DNS name",
@@ -1660,7 +1858,7 @@ mod tests {
     }
 
     #[test]
-    fn name_constraints_reject_malformed_presented_dns_names() {
+    fn rfc5280_dns_names_require_preferred_name_syntax() {
         let mut root_params = generated_certificate_params("DNS syntax authority", true);
         root_params.name_constraints = Some(rcgen::NameConstraints {
             permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName("example.com".into())],
@@ -1704,6 +1902,10 @@ mod tests {
                 ..
             })
         ));
+
+        for dns_name in ["*.example.com", "_signing.example.com"] {
+            assert!(validate_rfc5280_dns_name(dns_name).is_err(), "{dns_name}");
+        }
     }
 
     #[test]
@@ -2061,6 +2263,98 @@ mod tests {
     }
 
     #[test]
+    fn typed_subject_alternative_names_require_rfc5280_syntax() {
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("typed-SAN root", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+
+        for (tag, value) in [
+            (0x81, b"operator@".as_slice()),
+            (0x81, b"first..last@example.com".as_slice()),
+            (0x86, b"relative/path".as_slice()),
+            (0x86, b"https://example.com/%zz".as_slice()),
+            (0x87, &[192, 0, 2][..]),
+        ] {
+            for empty_subject in [false, true] {
+                let mut leaf_params = generated_certificate_params("typed-SAN leaf", false);
+                if empty_subject {
+                    leaf_params.distinguished_name = rcgen::DistinguishedName::new();
+                }
+                let mut san_der = vec![
+                    0x30,
+                    u8::try_from(value.len() + 2).expect("test SAN must fit short-form DER"),
+                    tag,
+                    u8::try_from(value.len()).expect("test GeneralName must fit short-form DER"),
+                ];
+                san_der.extend_from_slice(value);
+                let mut san = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 17], san_der);
+                san.set_criticality(true);
+                leaf_params.custom_extensions.push(san);
+                let leaf = leaf_params
+                    .signed_by(
+                        &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                        &root,
+                    )
+                    .expect("root should sign typed-SAN leaf");
+
+                assert!(matches!(
+                    verify_generated_path(
+                        vec![leaf.der().to_vec(), root.der().to_vec()],
+                        root.der().to_vec(),
+                    ),
+                    Err(X509ChainError::InvalidDer {
+                        kind: "certificate subject identity",
+                        ..
+                    })
+                ));
+            }
+        }
+
+        for (tag, value) in [
+            (0x81, b"operator@example.com".as_slice()),
+            (0x81, br#""operator desk"@example.com"#.as_slice()),
+            (0x86, b"urn:example:operator".as_slice()),
+            (
+                0x86,
+                b"https://operator@example.com:8443/path?q=1#id".as_slice(),
+            ),
+            (0x87, &[192, 0, 2, 1][..]),
+            (
+                0x87,
+                &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1][..],
+            ),
+        ] {
+            let mut leaf_params = rcgen::CertificateParams::new(Vec::new())
+                .expect("empty SAN list should produce certificate parameters");
+            leaf_params.distinguished_name = rcgen::DistinguishedName::new();
+            let mut san_der = vec![
+                0x30,
+                u8::try_from(value.len() + 2).expect("test SAN must fit short-form DER"),
+                tag,
+                u8::try_from(value.len()).expect("test GeneralName must fit short-form DER"),
+            ];
+            san_der.extend_from_slice(value);
+            let mut san = rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 17], san_der);
+            san.set_criticality(true);
+            leaf_params.custom_extensions.push(san);
+            let leaf = leaf_params
+                .signed_by(
+                    &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                    &root,
+                )
+                .expect("root should sign typed-SAN leaf");
+
+            verify_generated_path(
+                vec![leaf.der().to_vec(), root.der().to_vec()],
+                root.der().to_vec(),
+            )
+            .expect("valid typed SAN identity must satisfy an empty subject");
+        }
+    }
+
+    #[test]
     fn unevaluable_uri_names_fail_closed_for_both_constraint_forms() {
         use x509_parser::extensions::GeneralSubtree;
 
@@ -2190,6 +2484,26 @@ mod tests {
 
         assert!(validate_certificate_serial_bytes(&[0x80]).is_err());
         assert!(validate_certificate_serial_bytes(&[1; 20]).is_ok());
+
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("serial-padding root", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        let mut leaf_params = generated_certificate_params("serial-padding leaf", false);
+        leaf_params.serial_number = Some(rcgen::SerialNumber::from_slice(&[0x80; 20]));
+        let leaf = leaf_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &root,
+            )
+            .expect("root should sign a maximum-magnitude serial");
+
+        verify_generated_path(
+            vec![leaf.der().to_vec(), root.der().to_vec()],
+            root.der().to_vec(),
+        )
+        .expect("a 20-octet magnitude may require a DER sign-padding octet");
     }
 
     #[test]
