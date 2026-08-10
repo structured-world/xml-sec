@@ -260,7 +260,8 @@ impl KeyTrustPolicy {
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default)]
 pub struct VerificationPolicy {
-    /// Allowed signature methods; `None` accepts every implemented method.
+    /// Allowed signature methods; `None` accepts every implemented method subject to
+    /// independent gates such as [`KeyTrustPolicy::allow_legacy_rsa_sha1`].
     pub signature_algorithms: Option<HashSet<SignatureAlgorithm>>,
     /// Allowed reference digest methods; `None` accepts every implemented method.
     pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,

@@ -154,11 +154,12 @@ the built-in P-256 and P-384 signing keys support either ECDSA hash identifier.
 DSA-SHA1 and HMAC-SHA1 (including XMLDSig's byte-aligned 80-160-bit truncation range) are
 verify-only legacy algorithms. They follow the general
 `VerificationPolicy::signature_algorithms` allowlist: the default `None` accepts every implemented
-method, while deployments that require explicit legacy opt-in should supply a modern-only allowlist
-and add these methods only for operations that need them.
-RSA-SHA1 verification is default-deny: callers must explicitly enable
-`VerificationPolicy::key_trust.allow_legacy_rsa_sha1`; selecting the algorithm in untrusted XML
-does not opt the operation into legacy cryptography, and this gate runs before key resolution.
+method subject to its other policy gates, while deployments that require explicit legacy opt-in
+should supply a modern-only allowlist and add these methods only for operations that need them.
+RSA-SHA1 verification is independently default-deny: `None` in the general allowlist does not
+bypass `VerificationPolicy::key_trust.allow_legacy_rsa_sha1`, which callers must explicitly enable.
+Selecting the algorithm in untrusted XML does not opt the operation into legacy cryptography, and
+this gate runs before key resolution.
 RSA-SHA1 signing remains unsupported.
 X.509 path and CRL authentication additionally supports standard RSA-PSS with SHA-256/SHA-384/
 SHA-512 parameters, including RFC 4055 issuer-key restrictions, and Ed25519. Signature
