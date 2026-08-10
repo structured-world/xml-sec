@@ -300,6 +300,21 @@ fn validate_unique_extensions(
 }
 
 fn validate_subject_identity(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
+    for attribute in cert.subject().iter_email() {
+        let email = attribute
+            .as_str()
+            .map_err(|error| X509ChainError::InvalidDer {
+                kind: "certificate subject emailAddress",
+                message: error.to_string(),
+            })?;
+        if !mailbox_has_valid_syntax(email) {
+            return Err(X509ChainError::InvalidDer {
+                kind: "certificate subject emailAddress",
+                message: format!("invalid RFC 5280 mailbox syntax: {email:?}"),
+            });
+        }
+    }
+
     let subject_is_empty = cert.subject().iter().next().is_none();
     let mut san_extensions = cert
         .extensions()
@@ -358,17 +373,35 @@ fn validate_subject_alternative_name(name: &GeneralName<'_>) -> Result<(), X509C
 }
 
 fn validate_rfc5280_mailbox(value: &str) -> Result<(), X509ChainError> {
-    let Some((local, domain)) = value.rsplit_once('@') else {
-        return Err(invalid_subject_identity(
-            "SubjectAlternativeName rfc822Name must contain a mailbox domain",
-        ));
-    };
-    if !mailbox_local_part_has_valid_syntax(local) || !dns_name_has_valid_syntax(domain, false) {
+    if !mailbox_has_valid_syntax(value) {
         return Err(invalid_subject_identity(
             "SubjectAlternativeName rfc822Name has invalid RFC 5280 mailbox syntax",
         ));
     }
     Ok(())
+}
+
+fn mailbox_has_valid_syntax(value: &str) -> bool {
+    value.rsplit_once('@').is_some_and(|(local, domain)| {
+        mailbox_local_part_has_valid_syntax(local) && mailbox_domain_has_valid_syntax(domain)
+    })
+}
+
+fn mailbox_domain_has_valid_syntax(domain: &str) -> bool {
+    let Some(literal) = domain
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return dns_name_has_valid_syntax(domain, false);
+    };
+    if literal
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("IPv6:"))
+    {
+        literal[5..].parse::<std::net::Ipv6Addr>().is_ok()
+    } else {
+        literal.parse::<std::net::Ipv4Addr>().is_ok()
+    }
 }
 
 fn mailbox_local_part_has_valid_syntax(local: &str) -> bool {
@@ -1028,11 +1061,11 @@ fn ensure_supported_name_constraints(
 }
 
 fn validate_email_name_constraint(value: &str) -> Result<(), X509ChainError> {
-    if let Some((local, domain)) = value.rsplit_once('@') {
-        if local.is_empty() || local.contains('@') || domain.starts_with('.') {
+    if value.contains('@') {
+        if !mailbox_has_valid_syntax(value) {
             return Err(invalid_string_name_constraint(value));
         }
-        validate_dns_name_constraint(domain)
+        Ok(())
     } else {
         validate_dns_name_constraint(value)
     }
@@ -1087,7 +1120,7 @@ fn dns_name_has_valid_syntax(value: &str, allow_leading_dot: bool) -> bool {
 fn invalid_string_name_constraint(value: &str) -> X509ChainError {
     X509ChainError::InvalidDer {
         kind: "string name constraint",
-        message: format!("invalid RFC 5280 DNS-based constraint: {value:?}"),
+        message: format!("invalid RFC 5280 string name constraint: {value:?}"),
     }
 }
 
@@ -1406,7 +1439,6 @@ fn verify_crls(
                     message: "trailing data".into(),
                 });
             }
-            validate_crl_extensions(&crl, idx)?;
             Ok((idx, crl))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1427,6 +1459,9 @@ fn verify_crls(
                 }
                 continue;
             }
+            // Extension semantics can reject an applicable CRL, but unrelated
+            // untrusted CRL material must not influence the selected path.
+            validate_crl_extensions(crl, *crl_index)?;
             if issuer
                 .key_usage()
                 .map_err(|error| X509ChainError::InvalidDer {
@@ -1982,6 +2017,7 @@ mod tests {
             GeneralName::DNSName(""),
             GeneralName::DNSName("example..com"),
             GeneralName::RFC822Name("@example.com"),
+            GeneralName::RFC822Name("bad..local@example.com"),
             GeneralName::URI("https://example.com"),
         ] {
             let constraints = NameConstraints {
@@ -2104,6 +2140,7 @@ mod tests {
             ("Example Corp", "ops@example.com", true),
             ("Other Corp", "ops@example.com", false),
             ("Example Corp", "ops@example.net", false),
+            ("Example Corp", "bad..local@example.com", false),
         ] {
             let mut leaf_params = generated_certificate_params("name-constrained leaf", false);
             leaf_params.distinguished_name = rcgen::DistinguishedName::new();
@@ -2275,6 +2312,7 @@ mod tests {
             (0x81, b"first..last@example.com".as_slice()),
             (0x86, b"relative/path".as_slice()),
             (0x86, b"https://example.com/%zz".as_slice()),
+            (0x86, b"file:///path".as_slice()),
             (0x87, &[192, 0, 2][..]),
         ] {
             for empty_subject in [false, true] {
@@ -2314,6 +2352,8 @@ mod tests {
 
         for (tag, value) in [
             (0x81, b"operator@example.com".as_slice()),
+            (0x81, b"operator@[192.0.2.1]".as_slice()),
+            (0x81, b"operator@[IPv6:2001:db8::1]".as_slice()),
             (0x81, br#""operator desk"@example.com"#.as_slice()),
             (0x86, b"urn:example:operator".as_slice()),
             (

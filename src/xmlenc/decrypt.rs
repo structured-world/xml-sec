@@ -104,6 +104,7 @@ impl<'a> DecryptContext<'a> {
             encrypted,
             algorithm,
             self.policy.resources.max_encryption_plaintext_bytes,
+            self.policy.resources.max_encryption_document_bytes,
         )?;
         let ciphertext = STANDARD
             .decode(&encrypted.cipher_data.value)
@@ -631,6 +632,7 @@ fn validate_typed_cipher_values(
     encrypted: &EncryptedData,
     algorithm: DataEncryptionAlgorithm,
     maximum_plaintext: usize,
+    maximum_cipher_values: usize,
 ) -> Result<(), XmlEncError> {
     let maximum_ciphertext = match algorithm {
         DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => {
@@ -651,9 +653,28 @@ fn validate_typed_cipher_values(
         });
     }
 
+    let mut aggregate_encoded = encrypted.cipher_data.value.len();
+    if aggregate_encoded > maximum_cipher_values {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "aggregate encryption CipherValue bytes",
+            maximum: maximum_cipher_values,
+            actual: aggregate_encoded,
+        }
+        .into());
+    }
+
     let maximum_wrapped_key = projected_decoded_len_for_encoded_len(MAX_CIPHER_VALUE_BASE64_LEN);
     for encrypted_key in &encrypted.encrypted_keys {
         validate_cipher_value_len(&encrypted_key.cipher_data.value, maximum_wrapped_key)?;
+        aggregate_encoded = aggregate_encoded.saturating_add(encrypted_key.cipher_data.value.len());
+        if aggregate_encoded > maximum_cipher_values {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "aggregate encryption CipherValue bytes",
+                maximum: maximum_cipher_values,
+                actual: aggregate_encoded,
+            }
+            .into());
+        }
     }
     Ok(())
 }
@@ -1515,6 +1536,35 @@ mod tests {
         assert!(matches!(
             DecryptContext::new(&resolver).decrypt_data(&encrypted),
             Err(XmlEncError::InvalidStructure(_))
+        ));
+        assert_eq!(resolver.candidate_calls.get(), 0);
+
+        encrypted.encrypted_keys[0].cipher_data.value = "AAAA".into();
+        let aggregate_encoded_len =
+            encrypted.cipher_data.value.len() + encrypted.encrypted_keys[0].cipher_data.value.len();
+        let policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_encryption_plaintext_bytes: 4,
+                max_encryption_document_bytes: aggregate_encoded_len - 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        let resolver = CountingResolver {
+            candidate_calls: Cell::new(0),
+            key: key.to_vec(),
+        };
+        assert!(matches!(
+            DecryptContext::new(&resolver)
+                .policy(policy)
+                .decrypt_data(&encrypted),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "aggregate encryption CipherValue bytes",
+                    maximum,
+                    actual,
+                }
+            )) if maximum == aggregate_encoded_len - 1 && actual == aggregate_encoded_len
         ));
         assert_eq!(resolver.candidate_calls.get(), 0);
     }
