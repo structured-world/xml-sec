@@ -740,9 +740,8 @@ mod rustcrypto_x509 {
         match spki.algorithm.algorithm.to_id_string().as_str() {
             "1.2.840.113549.1.1.1" => RsaPublicKey::from_public_key_der(spki_der).ok(),
             "1.2.840.113549.1.1.10" => {
-                if let Some(parameters) = spki.algorithm.parameters.as_ref()
-                    && !rsa_pss_key_parameters_allow(parameters, signature_algorithm)
-                {
+                let parameters = spki.algorithm.parameters.as_ref()?;
+                if !rsa_pss_key_parameters_allow(parameters, signature_algorithm) {
                     return None;
                 }
                 RsaPublicKey::from_pkcs1_der(&spki.subject_public_key.data).ok()
@@ -1539,6 +1538,31 @@ mod tests {
                     public_key.as_bytes(),
                 )
                 .expect("standard RSA-PSS parameters must be supported")
+        );
+
+        let mut parameterless_pss_spki =
+            x509_cert::SubjectPublicKeyInfo::from_der(public_key.as_bytes())
+                .expect("RSA SPKI must decode");
+        parameterless_pss_spki.algorithm = AlgorithmIdentifierOwned {
+            oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10"),
+            parameters: None,
+        };
+        let parameterless_pss_spki = parameterless_pss_spki
+            .to_der()
+            .expect("parameterless PSS SPKI must encode");
+        assert!(
+            !RUST_CRYPTO_PROVIDER
+                .verify_x509_signature(
+                    X509SignatureAlgorithm::RsaPss {
+                        digest: DigestAlgorithm::Sha256,
+                        mgf_digest: DigestAlgorithm::Sha256,
+                        salt_len: 32,
+                    },
+                    signed_data,
+                    &signature,
+                    &parameterless_pss_spki,
+                )
+                .expect("malformed PSS key parameters are invalid, not unsupported")
         );
 
         let mut pss_spki = x509_cert::SubjectPublicKeyInfo::from_der(public_key.as_bytes())

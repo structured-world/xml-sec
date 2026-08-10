@@ -48,8 +48,8 @@ Ed25519 are not collapsed into the narrower XMLDSig `SignatureMethod` enum. Unsu
 OIDs remain typed path errors rather than ordinary signature mismatches. Every certificate OID
 represented by that contract reaches the selected provider; the built-in provider may reject a
 capability such as ECDSA-SHA512 while a custom provider can implement it. For an
-`id-RSASSA-PSS` issuer key, the built-in provider also enforces the SPKI hash, MGF, minimum salt,
-and trailer-field restrictions before verifying a certificate signature.
+`id-RSASSA-PSS` issuer key, the built-in provider requires typed SPKI parameters and enforces their
+hash, MGF, minimum salt, and trailer-field restrictions before verifying a certificate signature.
 Custom resolvers that evaluate cryptographic key metadata should override
 `KeyResolver::resolve_with_policy_and_provider`; source-only resolvers can retain the default hook.
 
@@ -73,8 +73,8 @@ semantics are not implemented. Repeated extension OIDs are rejected certificate-
 extension-specific interpretation. Empty certificate subjects require exactly one critical, non-empty
 SubjectAlternativeName, and malformed GeneralName entries fail path validation regardless of whether
 the subject is empty. Invalid DNS-based constraints, including email-domain and URI-host forms,
-malformed IPv4/IPv6 encodings, and non-contiguous CIDR masks fail the path rather than behaving as
-ordinary name mismatches. Processed critical certificate
+malformed IPv4/IPv6 encodings, non-contiguous CIDR masks, nonzero `minimum`, and any `maximum`
+distance fail the path rather than behaving as ordinary name mismatches. Processed critical certificate
 extensions are KeyUsage
 (`2.5.29.15`), SubjectAlternativeName (`2.5.29.17`), BasicConstraints (`2.5.29.19`), and
 NameConstraints (`2.5.29.30`). A chain using critical ExtendedKeyUsage (`2.5.29.37`) or

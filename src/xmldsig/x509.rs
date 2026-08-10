@@ -719,17 +719,17 @@ fn validate_name_constraints(path: &[X509Certificate<'_>]) -> Result<(), X509Cha
         }
     }
     for (constraining_position, issuer) in path.iter().enumerate().skip(1) {
-        let Some(constraints) =
-            issuer
-                .extensions()
-                .iter()
-                .find_map(|extension| match extension.parsed_extension() {
-                    ParsedExtension::NameConstraints(value) => Some(value),
-                    _ => None,
-                })
+        let Some(extension) = issuer
+            .extensions()
+            .iter()
+            .find(|extension| extension.oid.to_id_string() == "2.5.29.30")
         else {
             continue;
         };
+        let ParsedExtension::NameConstraints(constraints) = extension.parsed_extension() else {
+            continue;
+        };
+        validate_name_constraint_distances(extension.value, constraining_position)?;
         ensure_supported_name_constraints(constraints, constraining_position)?;
         for (position, subordinate) in path[..constraining_position].iter().enumerate() {
             // The target certificate is always checked. Self-issued CA rollover
@@ -740,6 +740,34 @@ fn validate_name_constraints(path: &[X509Certificate<'_>]) -> Result<(), X509Cha
             }
             validate_certificate_names(subordinate, constraints, position, constraining_position)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_name_constraint_distances(
+    extension_der: &[u8],
+    position: usize,
+) -> Result<(), X509ChainError> {
+    use der::Decode as _;
+
+    // x509-parser intentionally omits GeneralSubtree distance fields from its
+    // public model. Decode the raw extension as well so they cannot silently
+    // acquire the zero-minimum, unbounded semantics implemented below.
+    let constraints =
+        x509_cert::ext::pkix::NameConstraints::from_der(extension_der).map_err(|error| {
+            X509ChainError::InvalidDer {
+                kind: "NameConstraints",
+                message: error.to_string(),
+            }
+        })?;
+    let unsupported = constraints
+        .permitted_subtrees
+        .iter()
+        .flatten()
+        .chain(constraints.excluded_subtrees.iter().flatten())
+        .any(|subtree| subtree.minimum != 0 || subtree.maximum.is_some());
+    if unsupported {
+        return Err(X509ChainError::InvalidNameConstraints { position });
     }
     Ok(())
 }
@@ -1658,6 +1686,73 @@ mod tests {
             };
             ensure_supported_name_constraints(&constraints, 1)
                 .expect("valid string constraints must remain supported");
+        }
+    }
+
+    #[test]
+    fn unsupported_name_constraint_distances_fail_path_validation() {
+        use der::{Encode as _, asn1::Ia5String};
+        use x509_cert::ext::pkix::{
+            NameConstraints as EncodedNameConstraints,
+            constraints::name::GeneralSubtree as EncodedGeneralSubtree,
+            name::GeneralName as EncodedGeneralName,
+        };
+
+        // x509-parser exposes only GeneralSubtree::base. Exercise the complete
+        // extension DER so unsupported distance fields cannot disappear before
+        // RFC 5280 path validation sees them.
+        for (permitted, minimum, maximum) in [
+            (true, 1, None),
+            (false, 1, None),
+            (true, 0, Some(1)),
+            (false, 0, Some(1)),
+        ] {
+            let dns_name = if permitted {
+                "example.com"
+            } else {
+                "blocked.example.com"
+            };
+            let subtree = EncodedGeneralSubtree {
+                base: EncodedGeneralName::DnsName(
+                    Ia5String::new(dns_name.as_bytes()).expect("valid DNS IA5String"),
+                ),
+                minimum,
+                maximum,
+            };
+            let constraints = EncodedNameConstraints {
+                permitted_subtrees: permitted.then(|| vec![subtree.clone()]),
+                excluded_subtrees: (!permitted).then(|| vec![subtree]),
+            };
+            let mut extension = rcgen::CustomExtension::from_oid_content(
+                &[2, 5, 29, 30],
+                constraints
+                    .to_der()
+                    .expect("NameConstraints must encode as DER"),
+            );
+            extension.set_criticality(true);
+
+            let mut root_params = generated_certificate_params("distance authority", true);
+            root_params.custom_extensions.push(extension);
+            let root = rcgen::CertifiedIssuer::self_signed(
+                root_params,
+                rcgen::KeyPair::generate().expect("root key generation should succeed"),
+            )
+            .expect("constrained root should be self-signable");
+            let leaf = rcgen::CertificateParams::new(vec!["www.example.com".into()])
+                .expect("leaf DNS SAN should be valid")
+                .signed_by(
+                    &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                    &root,
+                )
+                .expect("root should sign leaf certificate");
+
+            assert!(matches!(
+                verify_generated_path(
+                    vec![leaf.der().to_vec(), root.der().to_vec()],
+                    root.der().to_vec(),
+                ),
+                Err(X509ChainError::InvalidNameConstraints { position: 1 })
+            ));
         }
     }
 
