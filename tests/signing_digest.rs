@@ -159,6 +159,74 @@ fn signing_keys_reject_unsupported_signature_algorithms() {
 }
 
 #[test]
+fn signing_facade_rejects_malformed_key_specific_signature_output() {
+    // Custom signing keys cannot bypass fixed-width RSA and XMLDSig ECDSA
+    // output framing before SignatureValue serialization.
+    struct FixedOutputSigningKey {
+        output: Vec<u8>,
+        public_key: SigningPublicKeyInfo,
+    }
+
+    impl SigningKey for FixedOutputSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            Ok(self.output.clone())
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Ok(self.public_key.clone())
+        }
+    }
+
+    let xml = "<root><payload ID=\"payload\">hello</payload></root>";
+    let cases = [
+        (
+            SignatureAlgorithm::RsaSha256,
+            SigningPublicKeyInfo::Rsa {
+                spki_der: Vec::new(),
+                modulus: vec![1_u8; 256],
+                exponent: vec![1, 0, 1],
+            },
+            255,
+            256,
+        ),
+        (
+            SignatureAlgorithm::EcdsaSha256,
+            SigningPublicKeyInfo::Ec {
+                spki_der: Vec::new(),
+                curve_oid: "1.2.840.10045.3.1.7",
+                public_key: [vec![4], vec![1_u8; 64]].concat(),
+            },
+            63,
+            64,
+        ),
+    ];
+
+    for (algorithm, public_key, actual, expected) in cases {
+        let key = FixedOutputSigningKey {
+            output: vec![1_u8; actual],
+            public_key,
+        };
+        let builder = SignatureBuilder::new(exclusive_c14n(), algorithm).add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+
+        assert!(matches!(
+            SignContext::new(&key).sign_with_builder(xml, &builder),
+            Err(SigningError::InvalidSignatureOutputLength {
+                expected: expected_len,
+                actual: actual_len,
+            }) if expected_len == expected && actual_len == actual
+        ));
+    }
+}
+
+#[test]
 fn x509_key_info_writer_uses_structured_public_key_info() {
     struct PublicInfoFailingKey;
 

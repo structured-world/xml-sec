@@ -143,8 +143,9 @@ CRL checking is meaningful only inside authenticated X.509 path validation. A po
 CRLs without enabling certificate-chain validation is rejected during context construction rather
 than silently accepting a control the resolver cannot enforce.
 CRL structure is validated before authority-key applicability is selected: duplicate CRL or
-CRL-entry extension OIDs fail closed, and `deltaCRLIndicator` is rejected regardless of criticality
-because delta and `removeFromCRL` semantics are not implemented. URI subject alternative names
+CRL-entry extension OIDs fail closed, and `deltaCRLIndicator` is rejected regardless of criticality.
+The `removeFromCRL` reason is rejected in complete CRLs because it is meaningful only in a delta
+CRL. URI subject alternative names
 likewise require one RFC 3986 authority, including syntactically valid userinfo, before their host
 can participate in NameConstraints matching.
 Critical `NameConstraints` also retain their DER structure during validation: the extension must

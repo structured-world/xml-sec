@@ -4,13 +4,13 @@ use std::fmt;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use roxmltree::{Document, ParsingOptions};
-use rsa::RsaPrivateKey;
+use rsa::{RsaPrivateKey, traits::PublicKeyParts as _};
 
 use super::parse::{
     parse_encrypted_data_node_with_policy, parse_encrypted_data_with_policy,
     validate_encrypted_data_metadata,
 };
-use super::types::{MAX_CIPHER_VALUE_BASE64_LEN, XMLENC_NS};
+use super::types::{MAX_CIPHER_VALUE_BASE64_LEN, XMLENC_NS, validate_ciphertext_framing};
 use super::{
     DataEncryptionAlgorithm, DecryptedContent, EncryptedData, EncryptedDataType, EncryptedKey,
     KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm, RsaOaepParameters, XmlEncError,
@@ -109,6 +109,12 @@ impl<'a> DecryptContext<'a> {
         let ciphertext = STANDARD
             .decode(&encrypted.cipher_data.value)
             .map_err(|error| XmlEncError::Base64(error.to_string()))?;
+        validate_content_framing_before_resolution(
+            algorithm,
+            ciphertext.len(),
+            &encrypted.encrypted_keys,
+            &self.policy,
+        )?;
         validate_possible_plaintext_len(
             algorithm,
             ciphertext.len(),
@@ -230,6 +236,13 @@ impl DecryptionKeyResolver for KekDecryptor {
                 algorithm: wrap_algorithm,
                 expected: expected_kek_len,
                 actual: self.kek.len(),
+            });
+        }
+        let expected_wrapped_len = algorithm.key_len() + 8;
+        if wrapped.len() != expected_wrapped_len {
+            return Err(XmlEncError::InvalidWrappedKeyLength {
+                expected: expected_wrapped_len,
+                actual: wrapped.len(),
             });
         }
         let key = provider
@@ -361,6 +374,13 @@ fn recover_rsa_oaep(
     parameters: &RsaOaepParameters,
     wrapped: &[u8],
 ) -> Result<Vec<u8>, XmlEncError> {
+    let expected = key.size();
+    if wrapped.len() != expected {
+        return Err(XmlEncError::InvalidWrappedKeyLength {
+            expected,
+            actual: wrapped.len(),
+        });
+    }
     provider
         .recover_key(key, parameters, wrapped)
         .map_err(|error| match error {
@@ -636,6 +656,35 @@ fn validate_encrypted_key_policy(
     Ok(())
 }
 
+fn validate_content_framing_before_resolution(
+    algorithm: DataEncryptionAlgorithm,
+    ciphertext_len: usize,
+    encrypted_keys: &[EncryptedKey],
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<(), XmlEncError> {
+    let Err(framing_error) = validate_ciphertext_framing(algorithm, ciphertext_len) else {
+        return Ok(());
+    };
+
+    // If no embedded key uses a supported transport, that envelope error is
+    // more specific than content framing: the ciphertext cannot be interpreted
+    // under any supported key path. This inspection performs no key resolution
+    // and never dispatches malformed content to a cryptographic provider.
+    if !encrypted_keys.is_empty() {
+        let mut last_key_error = None;
+        for encrypted_key in encrypted_keys {
+            match validate_encrypted_key_policy(encrypted_key, policy) {
+                Ok(()) => return Err(framing_error),
+                Err(error) => last_key_error = Some(error),
+            }
+        }
+        if let Some(error) = last_key_error {
+            return Err(error);
+        }
+    }
+    Err(framing_error)
+}
+
 fn validate_typed_cipher_values(
     encrypted: &EncryptedData,
     algorithm: DataEncryptionAlgorithm,
@@ -821,7 +870,9 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct PermissiveUnwrapProvider {
+        decrypt_calls: AtomicUsize,
         unwrap_calls: AtomicUsize,
+        recover_calls: AtomicUsize,
     }
 
     impl crate::provider::CryptoProvider for PermissiveUnwrapProvider {
@@ -901,16 +952,12 @@ mod tests {
 
         fn decrypt_data(
             &self,
-            algorithm: DataEncryptionAlgorithm,
-            key: &[u8],
-            ciphertext: &[u8],
+            _algorithm: DataEncryptionAlgorithm,
+            _key: &[u8],
+            _ciphertext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
-            crate::provider::CryptoProvider::decrypt_data(
-                &crate::provider::RustCryptoProvider,
-                algorithm,
-                key,
-                ciphertext,
-            )
+            self.decrypt_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(b"provider plaintext".to_vec())
         }
 
         fn wrap_key(
@@ -953,16 +1000,12 @@ mod tests {
 
         fn recover_key(
             &self,
-            key: &rsa::RsaPrivateKey,
-            parameters: &RsaOaepParameters,
-            ciphertext: &[u8],
+            _key: &rsa::RsaPrivateKey,
+            _parameters: &RsaOaepParameters,
+            _ciphertext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
-            crate::provider::CryptoProvider::recover_key(
-                &crate::provider::RustCryptoProvider,
-                key,
-                parameters,
-                ciphertext,
-            )
+            self.recover_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![0_u8; 16])
         }
     }
 
@@ -1239,6 +1282,111 @@ mod tests {
             })
         ));
         assert_eq!(provider.unwrap_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rejects_content_ciphertext_framing_before_resolution_or_provider_dispatch() {
+        // Algorithm framing belongs to the XMLEnc facade. A permissive provider
+        // and resolver must never observe malformed standard CipherValue bytes.
+        for (algorithm, ciphertext_len) in [
+            (DataEncryptionAlgorithm::Aes128Gcm, 27),
+            (DataEncryptionAlgorithm::Aes128Cbc, 33),
+        ] {
+            let resolver = AllCallsResolver {
+                calls: Cell::new(0),
+                key: vec![0_u8; algorithm.key_len()],
+            };
+            let provider = PermissiveUnwrapProvider::default();
+            let encrypted = EncryptedData {
+                id: None,
+                encrypted_type: None,
+                key_name: None,
+                encryption_method: super::super::EncryptionMethod {
+                    algorithm: algorithm.uri().into(),
+                    key_size_bits: None,
+                    oaep_digest: None,
+                    mgf_algorithm: None,
+                    oaep_params: None,
+                },
+                encrypted_keys: Vec::new(),
+                cipher_data: super::super::CipherData {
+                    value: STANDARD.encode(vec![0_u8; ciphertext_len]),
+                },
+            };
+
+            assert!(
+                DecryptContext::new(&resolver)
+                    .provider(&provider)
+                    .decrypt_data(&encrypted)
+                    .is_err()
+            );
+            assert_eq!(resolver.calls.get(), 0);
+            assert_eq!(provider.decrypt_calls.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_aes_kw_before_custom_provider_dispatch() {
+        // RFC 3394 adds exactly eight bytes to the transported content key;
+        // permissive custom providers must not redefine that wire contract.
+        let provider = PermissiveUnwrapProvider::default();
+        for actual in [0, 23, 25] {
+            let encrypted_key = EncryptedKey {
+                id: None,
+                recipient: None,
+                key_name: None,
+                encryption_method: super::super::EncryptionMethod {
+                    algorithm: KeyWrapAlgorithm::AesKw128.uri().into(),
+                    key_size_bits: None,
+                    oaep_digest: None,
+                    mgf_algorithm: None,
+                    oaep_params: None,
+                },
+                cipher_data: super::super::CipherData {
+                    value: STANDARD.encode(vec![0_u8; actual]),
+                },
+                reference_list: None,
+                carried_key_name: None,
+            };
+            assert!(matches!(
+                KekDecryptor::new([0_u8; 16]).resolve_key(
+                    &provider,
+                    DataEncryptionAlgorithm::Aes128Gcm,
+                    Some(&encrypted_key),
+                ),
+                Err(XmlEncError::InvalidWrappedKeyLength {
+                    expected: 24,
+                    actual: output_len,
+                }) if output_len == actual
+            ));
+        }
+        assert_eq!(provider.unwrap_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rejects_malformed_rsa_oaep_before_custom_provider_dispatch() {
+        // RSA ciphertext width is the private modulus width, so malformed
+        // transport bytes must be rejected before provider-owned recovery.
+        let private_key = RsaPrivateKey::from_pkcs8_pem(include_str!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("RSA donor private key must parse");
+        let provider = PermissiveUnwrapProvider::default();
+        for actual in [0, 255, 257] {
+            assert!(matches!(
+                recover_rsa_oaep(
+                    &provider,
+                    &private_key,
+                    &RsaOaepParameters::default(),
+                    &vec![0_u8; actual],
+                ),
+                Err(XmlEncError::InvalidWrappedKeyLength {
+                    expected: 256,
+                    actual: output_len,
+                }) if output_len == actual
+            ));
+        }
+        assert_eq!(provider.recover_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

@@ -126,6 +126,15 @@ pub enum SigningError {
     #[error("signing key error: {0}")]
     Key(#[from] SigningKeyError),
 
+    /// A signing provider returned bytes that cannot encode this key's signature.
+    #[error("signature output must be {expected} bytes, got {actual}")]
+    InvalidSignatureOutputLength {
+        /// Exact XMLDSig wire length implied by the signing public key.
+        expected: usize,
+        /// Actual provider output length.
+        actual: usize,
+    },
+
     /// Writing `<SignatureValue>` failed.
     #[error("XML mutation error: {0}")]
     XmlMutation(#[from] XmlMutationError),
@@ -176,6 +185,10 @@ pub enum SigningKeyError {
     /// Public-key encoding failed for a supported signing key.
     #[error("failed to encode signing public key as SPKI DER")]
     PublicKeyEncodingFailed,
+
+    /// Public-key metadata cannot determine the XMLDSig signature framing.
+    #[error("invalid signing public-key metadata")]
+    InvalidPublicKeyInfo,
 }
 
 /// Public key material corresponding to a private XMLDSig signing key.
@@ -210,6 +223,58 @@ impl SigningPublicKeyInfo {
             Self::Rsa { spki_der, .. } | Self::Ec { spki_der, .. } => spki_der,
         }
     }
+}
+
+fn validate_signature_output(
+    key: &dyn SigningKey,
+    algorithm: SignatureAlgorithm,
+    signature: &[u8],
+) -> Result<(), SigningError> {
+    let public_key = key.public_key_info()?;
+    let expected = match (algorithm, public_key) {
+        (
+            SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha256
+            | SignatureAlgorithm::RsaSha384
+            | SignatureAlgorithm::RsaSha512,
+            SigningPublicKeyInfo::Rsa { modulus, .. },
+        ) if !modulus.is_empty() => modulus.len(),
+        (
+            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384,
+            SigningPublicKeyInfo::Ec { public_key, .. },
+        ) if public_key.first() == Some(&0x04)
+            && public_key.len() > 1
+            && (public_key.len() - 1).is_multiple_of(2) =>
+        {
+            // XMLDSig serializes ECDSA as fixed-width r || s. An uncompressed
+            // SEC1 public point is 0x04 || x || y with the same field width.
+            public_key.len() - 1
+        }
+        (
+            SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha256
+            | SignatureAlgorithm::RsaSha384
+            | SignatureAlgorithm::RsaSha512,
+            SigningPublicKeyInfo::Ec { .. },
+        )
+        | (
+            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384,
+            SigningPublicKeyInfo::Rsa { .. },
+        ) => {
+            return Err(SigningKeyError::UnsupportedAlgorithm {
+                uri: algorithm.uri().to_owned(),
+            }
+            .into());
+        }
+        _ => return Err(SigningKeyError::InvalidPublicKeyInfo.into()),
+    };
+    if signature.len() != expected {
+        return Err(SigningError::InvalidSignatureOutputLength {
+            expected,
+            actual: signature.len(),
+        });
+    }
+    Ok(())
 }
 
 /// Private key abstraction used by [`SignContext`].
@@ -644,6 +709,7 @@ impl<'a> SignContext<'a> {
         let signature_value =
             self.provider
                 .sign(self.signing_key, algorithm, &canonical_signed_info)?;
+        validate_signature_output(self.signing_key, algorithm, &signature_value)?;
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature_value);
         let signed =
             fill_signature_value_with_options(&with_digests, &signature_b64, Some(&self.policy))?;

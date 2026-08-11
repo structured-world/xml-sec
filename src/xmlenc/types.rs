@@ -589,12 +589,12 @@ pub enum XmlEncError {
         /// Actual KEK size.
         actual: usize,
     },
-    /// A provider returned a transported key with invalid algorithm framing.
-    #[error("wrapped-key output must be {expected} bytes, got {actual}")]
+    /// A wrapped-key input or provider output has invalid algorithm framing.
+    #[error("wrapped-key value must be {expected} bytes, got {actual}")]
     InvalidWrappedKeyLength {
-        /// Exact wrapped length required for the supplied content key.
+        /// Exact wrapped length required by the algorithm and key context.
         expected: usize,
-        /// Actual provider output length.
+        /// Actual input or provider output length.
         actual: usize,
     },
     /// Plaintext exceeds the bounded encryption input size.
