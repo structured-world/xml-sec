@@ -81,11 +81,14 @@ distance fail the path rather than behaving as ordinary name mismatches. Process
 extensions are KeyUsage
 (`2.5.29.15`), SubjectAlternativeName (`2.5.29.17`), BasicConstraints (`2.5.29.19`), and
 NameConstraints (`2.5.29.30`). ExtendedKeyUsage (`2.5.29.37`) is processed whether critical or
-non-critical: a leaf without EKU, or with `anyExtendedKeyUsage`, remains unrestricted, while every
-other EKU must intersect `KeyTrustPolicy::allowed_leaf_extended_key_usages`. The default empty set
-therefore rejects TLS-, code-signing-, and other purpose-restricted leaves unless the deployment
-explicitly approves that typed purpose. Critical CertificatePolicies (`2.5.29.32`) still fails closed
-because policy-tree processing is not implemented.
+non-critical on every certificate in the path: absent EKU and `anyExtendedKeyUsage` remain
+unrestricted, while every other EKU must intersect
+`KeyTrustPolicy::allowed_extended_key_usages`. The resolver-local and operation policy sets are
+independent approvals, so a purpose must appear in both when `VerifyContext` composes them. Their
+default empty sets therefore reject TLS-, code-signing-, and other purpose-restricted paths unless
+the deployment explicitly approves that typed purpose at both boundaries. Critical
+CertificatePolicies (`2.5.29.32`) still fails closed because policy-tree processing is not
+implemented.
 When `X509Data` supplies multiple selector categories, every
 category must match certificates on the same selected, policy-valid path rather than unrelated
 certificates from the lookup pool.

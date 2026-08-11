@@ -243,12 +243,12 @@ pub struct KeyTrustPolicy {
     pub max_x509_candidate_paths: usize,
     /// Permit legacy RSA-SHA1 verification after key resolution.
     pub allow_legacy_rsa_sha1: bool,
-    /// Purposes accepted when a leaf certificate restricts itself with ExtendedKeyUsage.
+    /// Purposes accepted when any certificate in a path carries ExtendedKeyUsage.
     ///
-    /// An empty set accepts only leaves without ExtendedKeyUsage or with
-    /// `anyExtendedKeyUsage`; it does not treat TLS/code-signing purposes as a
-    /// generic authorization for XML signatures.
-    pub allowed_leaf_extended_key_usages: HashSet<ExtendedKeyPurpose>,
+    /// An empty set accepts only paths whose certificates omit ExtendedKeyUsage
+    /// or use `anyExtendedKeyUsage`; it does not treat TLS/code-signing purposes
+    /// as a generic authorization for XML signatures.
+    pub allowed_extended_key_usages: HashSet<ExtendedKeyPurpose>,
     /// Authenticate and enforce embedded CRLs during path validation.
     /// Requires [`Self::verify_x509_chains`].
     pub check_crls: bool,
@@ -264,7 +264,7 @@ impl Default for KeyTrustPolicy {
             max_x509_chain_depth: 9,
             max_x509_candidate_paths: 64,
             allow_legacy_rsa_sha1: false,
-            allowed_leaf_extended_key_usages: HashSet::new(),
+            allowed_extended_key_usages: HashSet::new(),
             check_crls: false,
             verification_time: None,
         }
@@ -280,7 +280,7 @@ impl KeyTrustPolicy {
             });
         }
         if self
-            .allowed_leaf_extended_key_usages
+            .allowed_extended_key_usages
             .iter()
             .any(|purpose| match purpose {
                 ExtendedKeyPurpose::Other(arcs) => {
@@ -499,7 +499,7 @@ mod tests {
         // is validated instead of silently making the purpose unmatchable.
         let mut policy = KeyTrustPolicy::default();
         policy
-            .allowed_leaf_extended_key_usages
+            .allowed_extended_key_usages
             .insert(ExtendedKeyPurpose::Other(vec![1, 40, 7]));
 
         assert!(matches!(

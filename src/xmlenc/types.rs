@@ -589,8 +589,8 @@ pub enum XmlEncError {
         /// Actual KEK size.
         actual: usize,
     },
-    /// A provider returned an AES-KW value with invalid RFC 3394 framing.
-    #[error("AES-KW output must be {expected} bytes, got {actual}")]
+    /// A provider returned a transported key with invalid algorithm framing.
+    #[error("wrapped-key output must be {expected} bytes, got {actual}")]
     InvalidWrappedKeyLength {
         /// Exact wrapped length required for the supplied content key.
         expected: usize,

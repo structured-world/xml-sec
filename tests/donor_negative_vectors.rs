@@ -138,7 +138,7 @@ fn phaos_certificate_chain_is_expired_at_a_modern_verification_time() {
         verification_time: UNIX_EPOCH + Duration::from_secs(1_767_225_600),
         max_chain_depth: 2,
         check_crls: false,
-        allowed_leaf_extended_key_usages: None,
+        allowed_extended_key_usages: None,
     };
 
     assert_eq!(

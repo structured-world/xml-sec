@@ -277,7 +277,7 @@ impl DefaultKeyResolver {
             verification_time: trust.verification_time.unwrap_or_else(SystemTime::now),
             max_chain_depth: trust.max_x509_chain_depth,
             check_crls: trust.check_crls,
-            allowed_leaf_extended_key_usages: Some(&trust.allowed_leaf_extended_key_usages),
+            allowed_extended_key_usages: Some(&trust.allowed_extended_key_usages),
         };
         verify_x509_certificate_chain_with_provider(info, &options, provider)?;
         Ok(())
@@ -749,10 +749,12 @@ impl KeyResolver for DefaultKeyResolver {
                 .max_x509_candidate_paths
                 .min(self.config.trust.max_x509_candidate_paths),
             allow_legacy_rsa_sha1: policy.key_trust.allow_legacy_rsa_sha1,
-            allowed_leaf_extended_key_usages: policy
+            allowed_extended_key_usages: policy
                 .key_trust
-                .allowed_leaf_extended_key_usages
-                .clone(),
+                .allowed_extended_key_usages
+                .intersection(&self.config.trust.allowed_extended_key_usages)
+                .cloned()
+                .collect(),
             check_crls: policy.key_trust.check_crls || self.config.trust.check_crls,
             verification_time: policy
                 .key_trust
@@ -1272,8 +1274,28 @@ mod tests {
 
         policy
             .key_trust
-            .allowed_leaf_extended_key_usages
+            .allowed_extended_key_usages
             .insert(crate::policy::ExtendedKeyPurpose::ServerAuth);
+        assert!(matches!(
+            resolver
+                .resolve_with_policy(Some(&key_info), SignatureAlgorithm::EcdsaSha256, &policy,),
+            Err(DsigError::KeyResolution(KeyResolutionError::Chain(
+                super::super::X509ChainError::InvalidKeyUsage {
+                    position: 0,
+                    required: "an approved extended key usage",
+                }
+            )))
+        ));
+
+        let mut resolver_trust = crate::policy::KeyTrustPolicy::default();
+        resolver_trust
+            .allowed_extended_key_usages
+            .insert(crate::policy::ExtendedKeyPurpose::ServerAuth);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![root.der().to_vec()],
+            trust: resolver_trust,
+            ..KeyResolverConfig::default()
+        });
         assert!(
             resolver
                 .resolve_with_policy(Some(&key_info), SignatureAlgorithm::EcdsaSha256, &policy,)

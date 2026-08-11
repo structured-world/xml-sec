@@ -31,8 +31,8 @@ pub struct X509ChainOptions<'a> {
     pub max_chain_depth: usize,
     /// Whether parsed `<X509CRL>` entries are enforced.
     pub check_crls: bool,
-    /// Purposes accepted when the leaf carries a restrictive ExtendedKeyUsage.
-    pub allowed_leaf_extended_key_usages: Option<&'a HashSet<ExtendedKeyPurpose>>,
+    /// Purposes accepted when any path certificate carries ExtendedKeyUsage.
+    pub allowed_extended_key_usages: Option<&'a HashSet<ExtendedKeyPurpose>>,
 }
 
 /// Certificate-chain validation failure.
@@ -243,10 +243,11 @@ fn validate_path(
             return Err(X509ChainError::CertificateNotValid(position));
         }
         if position == 0 {
-            validate_leaf_key_usage(cert, options.allowed_leaf_extended_key_usages)?;
+            validate_leaf_key_usage(cert)?;
         } else {
             validate_ca_constraints(cert, position)?;
         }
+        validate_extended_key_usage(cert, position, options.allowed_extended_key_usages)?;
         validate_subject_identity(cert)?;
         validate_critical_extensions(cert, position)?;
     }
@@ -891,10 +892,7 @@ fn x509_digest_algorithm(oid: &str) -> Result<super::DigestAlgorithm, X509ChainE
     }
 }
 
-fn validate_leaf_key_usage(
-    cert: &X509Certificate<'_>,
-    allowed_extended_key_usages: Option<&HashSet<ExtendedKeyPurpose>>,
-) -> Result<(), X509ChainError> {
+fn validate_leaf_key_usage(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
     // RFC 5280 section 4.2.1.3 restricts key purpose only when KeyUsage is present.
     if cert
         .key_usage()
@@ -909,6 +907,14 @@ fn validate_leaf_key_usage(
             required: "digitalSignature or nonRepudiation",
         });
     }
+    Ok(())
+}
+
+fn validate_extended_key_usage(
+    cert: &X509Certificate<'_>,
+    position: usize,
+    allowed_extended_key_usages: Option<&HashSet<ExtendedKeyPurpose>>,
+) -> Result<(), X509ChainError> {
     let Some(usage) = cert
         .extended_key_usage()
         .map_err(|error| X509ChainError::InvalidDer {
@@ -925,7 +931,7 @@ fn validate_leaf_key_usage(
         return Ok(());
     }
     Err(X509ChainError::InvalidKeyUsage {
-        position: 0,
+        position,
         required: "an approved extended key usage",
     })
 }
@@ -1564,8 +1570,15 @@ fn validate_crl_extension_semantics(
         for extension in revoked.extensions() {
             let oid = extension.oid.to_id_string();
             // certificateIssuer carries the issuer identity for indirect CRLs.
-            // No critical entry extension is safe to ignore during serial matching.
-            if oid == "2.5.29.29" || extension.critical {
+            // removeFromCRL is meaningful only in a delta CRL, which this
+            // complete-CRL validator rejects above.
+            let invalid_reason = oid == "2.5.29.21"
+                && !matches!(
+                    extension.parsed_extension(),
+                    ParsedExtension::ReasonCode(code)
+                        if *code != x509_parser::x509::ReasonCode::RemoveFromCRL
+                );
+            if oid == "2.5.29.29" || extension.critical || invalid_reason {
                 return Err(X509ChainError::InvalidCrl(crl_index));
             }
         }
@@ -1688,7 +1701,7 @@ mod tests {
     fn verify_generated_path_with_eku(
         certificates: Vec<Vec<u8>>,
         trusted_anchor: Vec<u8>,
-        allowed_leaf_extended_key_usages: Option<&HashSet<ExtendedKeyPurpose>>,
+        allowed_extended_key_usages: Option<&HashSet<ExtendedKeyPurpose>>,
     ) -> Result<(), X509ChainError> {
         let info = X509DataInfo {
             certificate_chain: (0..certificates.len()).collect(),
@@ -1703,7 +1716,7 @@ mod tests {
                 verification_time: SystemTime::now(),
                 max_chain_depth: info.certificate_chain.len(),
                 check_crls: false,
-                allowed_leaf_extended_key_usages,
+                allowed_extended_key_usages,
             },
         )
     }
@@ -1795,6 +1808,65 @@ mod tests {
             Some(&allowed),
         )
         .expect("approved critical EKU must be processed rather than rejected as unknown");
+    }
+
+    #[test]
+    fn issuer_eku_restricts_the_entire_certificate_path() {
+        // RFC 5280 applies an issuer EKU as a path-wide purpose constraint. A
+        // leaf approval cannot override an incompatible critical CA authorization.
+        for (issuer_purpose_der, accepted) in [
+            (
+                vec![
+                    0x30, 0x0a, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02,
+                ],
+                false,
+            ),
+            (
+                vec![
+                    0x30, 0x0a, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01,
+                ],
+                true,
+            ),
+        ] {
+            let mut root_params =
+                generated_certificate_params("purpose-constrained authority", true);
+            let mut extension =
+                rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 37], issuer_purpose_der);
+            extension.set_criticality(true);
+            root_params.custom_extensions.push(extension);
+            let root = rcgen::CertifiedIssuer::self_signed(
+                root_params,
+                rcgen::KeyPair::generate().expect("root key generation should succeed"),
+            )
+            .expect("root should be self-signable");
+            let mut leaf_params = generated_certificate_params("TLS server signer", false);
+            leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+            leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+            let leaf = leaf_params
+                .signed_by(
+                    &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                    &root,
+                )
+                .expect("root should sign leaf certificate");
+            let allowed = HashSet::from([ExtendedKeyPurpose::ServerAuth]);
+            let result = verify_generated_path_with_eku(
+                vec![leaf.der().to_vec(), root.der().to_vec()],
+                root.der().to_vec(),
+                Some(&allowed),
+            );
+
+            if accepted {
+                result.expect("a shared allowed purpose must satisfy the complete path");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(X509ChainError::InvalidKeyUsage {
+                        position: 1,
+                        required: "an approved extended key usage",
+                    })
+                ));
+            }
+        }
     }
 
     #[test]
@@ -2096,7 +2168,7 @@ mod tests {
             verification_time: UNIX_EPOCH + Duration::from_secs(1_104_580_800),
             max_chain_depth: 2,
             check_crls: false,
-            allowed_leaf_extended_key_usages: None,
+            allowed_extended_key_usages: None,
         };
 
         verify_x509_certificate_chain(&info, &options)
@@ -2811,6 +2883,42 @@ mod tests {
                 Err(X509ChainError::InvalidCrl(0)),
                 "delta CRL indicator criticality must not change unsupported semantics"
             );
+        }
+    }
+
+    #[test]
+    fn remove_from_crl_is_rejected_in_a_complete_crl() {
+        use der::{Decode as _, Encode as _, asn1::OctetString};
+        use x509_cert::{crl::CertificateList, ext::Extension};
+
+        let original = merlin_crl_der();
+        for (reason, accepted) in [(1_u8, true), (8_u8, false)] {
+            let mut encoded: CertificateList =
+                CertificateList::from_der(&original).expect("tracked Merlin CRL must decode");
+            let revoked = encoded
+                .tbs_cert_list
+                .revoked_certificates
+                .as_mut()
+                .and_then(|entries| entries.first_mut())
+                .expect("tracked Merlin CRL must contain a revoked entry");
+            revoked
+                .crl_entry_extensions
+                .get_or_insert_default()
+                .push(Extension {
+                    extn_id: der::asn1::ObjectIdentifier::new_unwrap("2.5.29.21"),
+                    critical: false,
+                    extn_value: OctetString::new([0x0a, 0x01, reason])
+                        .expect("DER ENUMERATED extension payload must be valid"),
+                });
+            let encoded = encoded
+                .to_der()
+                .expect("reason-code CRL test vector must encode");
+            let result = validate_crl_extensions(&parsed_merlin_crl(&encoded), 0);
+            if accepted {
+                assert_eq!(result, Ok(()), "ordinary revocation reasons remain valid");
+            } else {
+                assert_eq!(result, Err(X509ChainError::InvalidCrl(0)));
+            }
         }
     }
 

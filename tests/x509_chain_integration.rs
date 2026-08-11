@@ -82,7 +82,7 @@ fn options<'a>(trusted_certs: &'a [Vec<u8>], check_crls: bool) -> X509ChainOptio
         verification_time: UNIX_EPOCH + Duration::from_secs(VERIFICATION_TIME),
         max_chain_depth: 3,
         check_crls,
-        allowed_leaf_extended_key_usages: None,
+        allowed_extended_key_usages: None,
     }
 }
 

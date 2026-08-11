@@ -8,7 +8,7 @@ use quick_xml::{
     events::{BytesEnd, BytesStart, BytesText, Event},
 };
 use roxmltree::{Document, Node, ParsingOptions};
-use rsa::RsaPublicKey;
+use rsa::{RsaPublicKey, traits::PublicKeyParts as _};
 
 use crate::xml::{is_xml_1_0_character, is_xml_ncname};
 
@@ -618,7 +618,7 @@ fn wrap_rsa_oaep(
     parameters: &RsaOaepParameters,
     content_key: &[u8],
 ) -> Result<Vec<u8>, XmlEncError> {
-    provider
+    let ciphertext = provider
         .transport_key(public_key, parameters, content_key)
         .map_err(|error| match error {
             crate::provider::ProviderError::Random(message) => XmlEncError::Rng(message),
@@ -626,7 +626,15 @@ fn wrap_rsa_oaep(
                 XmlEncError::InvalidEncryptionConfig(reason.to_string())
             }
             error => XmlEncError::RsaEncrypt(error.to_string()),
-        })
+        })?;
+    let expected = public_key.size();
+    if ciphertext.len() != expected {
+        return Err(XmlEncError::InvalidWrappedKeyLength {
+            expected,
+            actual: ciphertext.len(),
+        });
+    }
+    Ok(ciphertext)
 }
 
 fn render_encrypted_data(
@@ -908,6 +916,7 @@ mod tests {
     struct OverridingOutputProvider {
         ciphertext: Option<Vec<u8>>,
         wrapped_key: Option<Vec<u8>>,
+        transported_key: Option<Vec<u8>>,
     }
 
     impl crate::provider::CryptoProvider for OverridingOutputProvider {
@@ -1039,6 +1048,9 @@ mod tests {
             parameters: &RsaOaepParameters,
             plaintext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            if let Some(transported_key) = &self.transported_key {
+                return Ok(transported_key.clone());
+            }
             crate::provider::CryptoProvider::transport_key(
                 &crate::provider::RustCryptoProvider,
                 key,
@@ -1687,6 +1699,7 @@ mod tests {
                 .provider(Arc::new(OverridingOutputProvider {
                     ciphertext: Some(ciphertext),
                     wrapped_key: None,
+                    transported_key: None,
                 }))
                 .direct_key(vec![0_u8; algorithm.key_len()])
                 .encrypt_binary(b"data")
@@ -1707,6 +1720,7 @@ mod tests {
                 .provider(Arc::new(OverridingOutputProvider {
                     ciphertext: None,
                     wrapped_key: Some(wrapped_key),
+                    transported_key: None,
                 }))
                 .recipient_aes_kw([0_u8; 16], KeyWrapAlgorithm::AesKw128)
                 .encrypt_binary(b"data");
@@ -1721,10 +1735,47 @@ mod tests {
             .provider(Arc::new(OverridingOutputProvider {
                 ciphertext: None,
                 wrapped_key: Some(vec![0_u8; 24]),
+                transported_key: None,
             }))
             .recipient_aes_kw([0_u8; 16], KeyWrapAlgorithm::AesKw128)
             .encrypt_binary(b"data")
             .expect("exact RFC 3394 wrapped-key length must remain accepted");
+    }
+
+    #[test]
+    fn rejects_malformed_custom_provider_rsa_transport_before_serialization() {
+        // RSA ciphertext is exactly one modulus wide. Enforcing that invariant
+        // here prevents custom providers from emitting undecryptable XML.
+        let private_key = RsaPrivateKey::new(&mut UnwrapErr(SysRng), 2048)
+            .expect("RSA key generation should succeed");
+        let public_key = RsaPublicKey::from(&private_key);
+        for transported_key in [vec![], vec![0_u8; 255], vec![0_u8; 257]] {
+            let result = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .provider(Arc::new(OverridingOutputProvider {
+                    ciphertext: None,
+                    wrapped_key: None,
+                    transported_key: Some(transported_key),
+                }))
+                .recipient_rsa_oaep(public_key.clone())
+                .encrypt_binary(b"data");
+            assert!(matches!(
+                result,
+                Err(XmlEncError::InvalidWrappedKeyLength {
+                    expected: 256,
+                    actual,
+                }) if actual != 256
+            ));
+        }
+
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .provider(Arc::new(OverridingOutputProvider {
+                ciphertext: None,
+                wrapped_key: None,
+                transported_key: Some(vec![0_u8; 256]),
+            }))
+            .recipient_rsa_oaep(public_key)
+            .encrypt_binary(b"data")
+            .expect("modulus-sized RSA transport output must remain accepted");
     }
 
     #[test]

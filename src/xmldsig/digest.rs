@@ -89,7 +89,16 @@ pub fn compute_digest_with_provider(
     algorithm: DigestAlgorithm,
     data: &[u8],
 ) -> Result<Vec<u8>, crate::provider::ProviderError> {
-    provider.digest(algorithm, data)
+    let digest = provider.digest(algorithm, data)?;
+    let expected = algorithm.output_len();
+    if digest.len() != expected {
+        return Err(crate::provider::ProviderError::InvalidOutputSize {
+            operation: crate::provider::ProviderOperation::Digest,
+            expected,
+            actual: digest.len(),
+        });
+    }
+    Ok(digest)
 }
 
 /// Constant-time comparison of two byte slices.
@@ -108,7 +117,9 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    struct RejectingDigestProvider;
+    struct RejectingDigestProvider {
+        output: Option<Vec<u8>>,
+    }
 
     impl crate::provider::CryptoProvider for RejectingDigestProvider {
         fn name(&self) -> &'static str {
@@ -128,6 +139,9 @@ mod tests {
             algorithm: DigestAlgorithm,
             _data: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            if let Some(output) = &self.output {
+                return Ok(output.clone());
+            }
             Err(crate::provider::ProviderError::Unsupported {
                 operation: crate::provider::ProviderOperation::Digest,
                 algorithm: Some(algorithm.uri().to_owned()),
@@ -219,9 +233,46 @@ mod tests {
         // A restricted provider is caller-controlled and must never turn an
         // unsupported document-selected digest into a process panic.
         assert!(matches!(
-            compute_digest_with_provider(&RejectingDigestProvider, DigestAlgorithm::Sha256, b"x"),
+            compute_digest_with_provider(
+                &RejectingDigestProvider { output: None },
+                DigestAlgorithm::Sha256,
+                b"x"
+            ),
             Err(crate::provider::ProviderError::Unsupported { .. })
         ));
+    }
+
+    #[test]
+    fn explicit_provider_digest_output_must_match_the_algorithm() {
+        // The facade, rather than an interchangeable provider, owns the XMLDSig
+        // algorithm contract and must reject bytes its own parser cannot accept.
+        for actual in [0, 31, 33] {
+            assert!(matches!(
+                compute_digest_with_provider(
+                    &RejectingDigestProvider {
+                        output: Some(vec![0_u8; actual]),
+                    },
+                    DigestAlgorithm::Sha256,
+                    b"x",
+                ),
+                Err(crate::provider::ProviderError::InvalidOutputSize {
+                    operation: crate::provider::ProviderOperation::Digest,
+                    expected: 32,
+                    actual: output_len,
+                }) if output_len == actual
+            ));
+        }
+
+        assert_eq!(
+            compute_digest_with_provider(
+                &RejectingDigestProvider {
+                    output: Some(vec![7_u8; 32]),
+                },
+                DigestAlgorithm::Sha256,
+                b"x",
+            ),
+            Ok(vec![7_u8; 32]),
+        );
     }
 
     // ── from_uri / uri round-trip ────────────────────────────────────
