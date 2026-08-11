@@ -138,6 +138,9 @@ CRL-entry extension OIDs fail closed, and `deltaCRLIndicator` is rejected regard
 because delta and `removeFromCRL` semantics are not implemented. URI subject alternative names
 likewise require one RFC 3986 authority, including syntactically valid userinfo, before their host
 can participate in NameConstraints matching.
+Critical `NameConstraints` also retain their DER structure during validation: the extension must
+contain at least one permitted or excluded subtree, every present subtree collection must be
+non-empty, and unsupported minimum/maximum distance fields fail closed.
 
 Internal DTD declarations are disabled by default. Verification requires the operation's
 `VerificationPolicy::xml.allow_internal_dtd` decision; the

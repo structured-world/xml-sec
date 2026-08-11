@@ -245,6 +245,7 @@ impl EncryptedDataBuilder {
             &encrypted_keys,
             &ciphertext,
         )?;
+        self.validate_document_len(encrypted_data_xml.len())?;
         let replacement = match encrypted_type {
             Some(EncryptedDataType::Content) => ReplacementMode::ReplaceContent,
             Some(EncryptedDataType::Element | EncryptedDataType::Other(_)) | None => {
@@ -1461,6 +1462,59 @@ mod tests {
             builder().encrypt_document("<broken>", DocumentEncryptionOptions::default()),
             Err(XmlEncError::Policy(_))
         ));
+    }
+
+    #[test]
+    fn standalone_encrypted_output_obeys_document_byte_ceiling() {
+        // The returned fragment must remain admissible to the reciprocal parser;
+        // plaintext bounds alone do not account for framing, base64, or markup.
+        let policy = |maximum| crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_encryption_document_bytes: maximum,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+
+        let binary_len = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .encrypt_binary(b"bounded binary")
+            .expect("baseline binary encryption must succeed")
+            .encrypted_data_xml
+            .len();
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy(binary_len - 1))
+                .encrypt_binary(b"bounded binary"),
+            Err(XmlEncError::DocumentTooLarge { maximum, actual })
+                if maximum == binary_len - 1 && actual == binary_len
+        ));
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy(binary_len))
+            .encrypt_binary(b"bounded binary")
+            .expect("the exact standalone binary output bound must be accepted");
+
+        let xml_len = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .encrypt_xml("<secret>bounded XML</secret>")
+            .expect("baseline XML encryption must succeed")
+            .encrypted_data_xml
+            .len();
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy(xml_len - 1))
+                .encrypt_xml("<secret>bounded XML</secret>"),
+            Err(XmlEncError::DocumentTooLarge { maximum, actual })
+                if maximum == xml_len - 1 && actual == xml_len
+        ));
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy(xml_len))
+            .encrypt_xml("<secret>bounded XML</secret>")
+            .expect("the exact standalone XML output bound must be accepted");
     }
 
     #[test]

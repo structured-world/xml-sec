@@ -1042,7 +1042,7 @@ fn validate_name_constraints(path: &[X509Certificate<'_>]) -> Result<(), X509Cha
         let ParsedExtension::NameConstraints(constraints) = extension.parsed_extension() else {
             continue;
         };
-        validate_name_constraint_distances(extension.value, constraining_position)?;
+        validate_name_constraints_der(extension.value, constraining_position)?;
         ensure_supported_name_constraints(constraints, constraining_position)?;
         for (position, subordinate) in path[..constraining_position].iter().enumerate() {
             // The target certificate is always checked. Self-issued CA rollover
@@ -1057,7 +1057,7 @@ fn validate_name_constraints(path: &[X509Certificate<'_>]) -> Result<(), X509Cha
     Ok(())
 }
 
-fn validate_name_constraint_distances(
+fn validate_name_constraints_der(
     extension_der: &[u8],
     position: usize,
 ) -> Result<(), X509ChainError> {
@@ -1073,6 +1073,18 @@ fn validate_name_constraint_distances(
                 message: error.to_string(),
             }
         })?;
+    if constraints.permitted_subtrees.is_none() && constraints.excluded_subtrees.is_none()
+        || constraints
+            .permitted_subtrees
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        || constraints
+            .excluded_subtrees
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+    {
+        return Err(X509ChainError::InvalidNameConstraints { position });
+    }
     let unsupported = constraints
         .permitted_subtrees
         .iter()
@@ -2135,6 +2147,37 @@ mod tests {
             };
             ensure_supported_name_constraints(&constraints, 1)
                 .expect("valid string constraints must remain supported");
+        }
+    }
+
+    #[test]
+    fn empty_name_constraint_collections_are_rejected() {
+        use der::Encode as _;
+        use x509_cert::ext::pkix::NameConstraints as EncodedNameConstraints;
+
+        // RFC 5280 requires at least one subtree overall and at least one entry
+        // in every explicitly present GeneralSubtrees collection.
+        for constraints in [
+            EncodedNameConstraints {
+                permitted_subtrees: None,
+                excluded_subtrees: None,
+            },
+            EncodedNameConstraints {
+                permitted_subtrees: Some(Vec::new()),
+                excluded_subtrees: None,
+            },
+            EncodedNameConstraints {
+                permitted_subtrees: None,
+                excluded_subtrees: Some(Vec::new()),
+            },
+        ] {
+            let der = constraints
+                .to_der()
+                .expect("malformed NameConstraints test input must encode");
+            assert!(matches!(
+                validate_name_constraints_der(&der, 1),
+                Err(X509ChainError::InvalidNameConstraints { position: 1 })
+            ));
         }
     }
 

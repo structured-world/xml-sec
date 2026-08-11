@@ -80,10 +80,11 @@ fn example(encrypted_xml: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 `PrivateKeyDecryptor` unwraps embedded RSA-OAEP `EncryptedKey` values and `KekDecryptor`
 unwraps AES-KW values. RSA PKCS#1 v1.5 transport, `CipherReference`, and unauthenticated external
-resource loading are rejected; only inline `CipherValue` is accepted. Encryption inputs and
-recipient counts are bounded before allocation. Decryption applies the same aggregate recipient
-ceiling while parsing, bounds each retained identifier, algorithm URI, key name, OAEP label, and
-reference URI, and rechecks caller-constructed `EncryptedData` before decoding or key resolution.
+resource loading are rejected; only inline `CipherValue` is accepted. Encryption plaintext,
+recipient counts, and the complete serialized `EncryptedData` fragment are bounded. Decryption
+applies the same aggregate recipient ceiling while parsing, bounds each retained identifier,
+algorithm URI, key name, OAEP label, and reference URI, and rechecks caller-constructed
+`EncryptedData` before decoding or key resolution.
 That typed-input check validates the top-level content `EncryptionMethod` and every embedded key
 method before resolver dispatch, and bounds both encoded and projected decoded `CipherValue`
 sizes. Callers therefore cannot bypass parser structural or allocation limits by constructing the
