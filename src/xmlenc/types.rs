@@ -589,6 +589,14 @@ pub enum XmlEncError {
         /// Actual KEK size.
         actual: usize,
     },
+    /// A provider returned an AES-KW value with invalid RFC 3394 framing.
+    #[error("AES-KW output must be {expected} bytes, got {actual}")]
+    InvalidWrappedKeyLength {
+        /// Exact wrapped length required for the supplied content key.
+        expected: usize,
+        /// Actual provider output length.
+        actual: usize,
+    },
     /// Plaintext exceeds the bounded encryption input size.
     #[error("encryption plaintext exceeds {maximum}-byte limit: got {actual} bytes")]
     PlaintextTooLarge {

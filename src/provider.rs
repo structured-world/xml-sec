@@ -241,6 +241,10 @@ pub trait CryptoProvider: Send + Sync {
     ) -> Result<Vec<u8>, ProviderError>;
 
     /// Wrap a content key with RFC 3394 AES Key Wrap.
+    ///
+    /// Successful output contains the complete RFC 3394 value and is exactly
+    /// eight bytes longer than `key`. The XMLEnc facade validates that framing
+    /// before serializing provider output.
     #[cfg(feature = "xmlenc")]
     fn wrap_key(
         &self,

@@ -45,7 +45,9 @@ The legacy `rsa-oaep-mgf1p` URI fixes MGF1 to SHA-1; configuration validation re
 MGF digest before provider dispatch because that URI has no wire field capable of representing it.
 AES-KW configuration similarly validates the KEK size fixed by its algorithm URI before provider
 dispatch, so custom providers cannot reinterpret `kw-aes128` with a 256-bit KEK or `kw-aes256`
-with a 128-bit KEK.
+with a 128-bit KEK. A custom provider's wrapped-key output must contain the complete RFC 3394 value,
+which is exactly eight bytes longer than the content key; the facade validates that framing before
+serializing `EncryptedKey`.
 The same `EncryptionMethod` structural validation applies to parsed XML and caller-constructed
 typed values: an explicit `xenc11:MGF` is valid only with the XML Encryption 1.1 RSA-OAEP URI and
 is rejected before key resolution on the legacy URI. Every supplied `KeySize` must be positive;

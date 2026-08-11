@@ -594,6 +594,13 @@ fn wrap_content_key(
             key_name,
         } => {
             let wrapped = provider.wrap_key(*algorithm, kek, content_key)?;
+            let expected = content_key.len() + 8;
+            if wrapped.len() != expected {
+                return Err(XmlEncError::InvalidWrappedKeyLength {
+                    expected,
+                    actual: wrapped.len(),
+                });
+            }
             Ok(WrappedKey {
                 algorithm_uri: algorithm.uri(),
                 oaep: None,
@@ -898,13 +905,14 @@ mod tests {
     };
 
     #[derive(Debug)]
-    struct MalformedCiphertextProvider {
-        ciphertext: Vec<u8>,
+    struct OverridingOutputProvider {
+        ciphertext: Option<Vec<u8>>,
+        wrapped_key: Option<Vec<u8>>,
     }
 
-    impl crate::provider::CryptoProvider for MalformedCiphertextProvider {
+    impl crate::provider::CryptoProvider for OverridingOutputProvider {
         fn name(&self) -> &'static str {
-            "malformed-ciphertext-test"
+            "overriding-output-test"
         }
 
         fn supports(&self, query: crate::provider::CapabilityQuery<'_>) -> bool {
@@ -965,11 +973,19 @@ mod tests {
 
         fn encrypt_data(
             &self,
-            _algorithm: DataEncryptionAlgorithm,
-            _key: &[u8],
-            _plaintext: &[u8],
+            algorithm: DataEncryptionAlgorithm,
+            key: &[u8],
+            plaintext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
-            Ok(self.ciphertext.clone())
+            if let Some(ciphertext) = &self.ciphertext {
+                return Ok(ciphertext.clone());
+            }
+            crate::provider::CryptoProvider::encrypt_data(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                key,
+                plaintext,
+            )
         }
 
         fn decrypt_data(
@@ -992,6 +1008,9 @@ mod tests {
             kek: &[u8],
             key: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            if let Some(wrapped_key) = &self.wrapped_key {
+                return Ok(wrapped_key.clone());
+            }
             crate::provider::CryptoProvider::wrap_key(
                 &crate::provider::RustCryptoProvider,
                 algorithm,
@@ -1665,7 +1684,10 @@ mod tests {
             (DataEncryptionAlgorithm::Aes256Cbc, vec![0_u8; 33]),
         ] {
             let error = EncryptedDataBuilder::new(algorithm)
-                .provider(Arc::new(MalformedCiphertextProvider { ciphertext }))
+                .provider(Arc::new(OverridingOutputProvider {
+                    ciphertext: Some(ciphertext),
+                    wrapped_key: None,
+                }))
                 .direct_key(vec![0_u8; algorithm.key_len()])
                 .encrypt_binary(b"data")
                 .expect_err("malformed provider output must fail before XML serialization");
@@ -1674,6 +1696,35 @@ mod tests {
                 XmlEncError::DataTooShort { .. } | XmlEncError::InvalidCbcCiphertextLength(_)
             ));
         }
+    }
+
+    #[test]
+    fn rejects_malformed_custom_provider_wrapped_keys_before_serialization() {
+        // RFC 3394 adds exactly one 64-bit integrity block. Accepting any other
+        // provider output would emit EncryptedKey data no recipient can unwrap.
+        for wrapped_key in [vec![], vec![0_u8; 23], vec![0_u8; 25]] {
+            let result = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .provider(Arc::new(OverridingOutputProvider {
+                    ciphertext: None,
+                    wrapped_key: Some(wrapped_key),
+                }))
+                .recipient_aes_kw([0_u8; 16], KeyWrapAlgorithm::AesKw128)
+                .encrypt_binary(b"data");
+            assert!(matches!(
+                result,
+                Err(XmlEncError::InvalidWrappedKeyLength { expected: 24, actual })
+                    if actual != 24
+            ));
+        }
+
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .provider(Arc::new(OverridingOutputProvider {
+                ciphertext: None,
+                wrapped_key: Some(vec![0_u8; 24]),
+            }))
+            .recipient_aes_kw([0_u8; 16], KeyWrapAlgorithm::AesKw128)
+            .encrypt_binary(b"data")
+            .expect("exact RFC 3394 wrapped-key length must remain accepted");
     }
 
     #[test]
