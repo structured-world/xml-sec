@@ -10,7 +10,7 @@ use quick_xml::{
 use roxmltree::{Document, Node, ParsingOptions};
 use rsa::RsaPublicKey;
 
-use crate::xml::is_xml_1_0_character;
+use crate::xml::{is_xml_1_0_character, is_xml_ncname};
 
 use super::types::{XMLDSIG_NS, XMLENC_NS, XMLENC11_NS};
 use super::{
@@ -283,6 +283,11 @@ impl EncryptedDataBuilder {
             });
         }
         self.validate_metadata("EncryptedData Id", self.id.as_deref())?;
+        if self.id.as_deref().is_some_and(|id| !is_xml_ncname(id)) {
+            return Err(XmlEncError::InvalidEncryptionConfig(
+                "EncryptedData Id must be an XML NCName".into(),
+            ));
+        }
         self.validate_key_name("direct KeyName", self.direct_key_name.as_deref())?;
         for recipient in &self.recipients {
             match recipient {
@@ -558,7 +563,9 @@ fn encrypt_content(
     key: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, XmlEncError> {
-    Ok(provider.encrypt_data(algorithm, key, plaintext)?)
+    let ciphertext = provider.encrypt_data(algorithm, key, plaintext)?;
+    super::types::validate_ciphertext_framing(algorithm, ciphertext.len())?;
+    Ok(ciphertext)
 }
 
 fn wrap_content_key(
@@ -870,6 +877,8 @@ fn replace_range(xml: &str, range: std::ops::Range<usize>, replacement: &str) ->
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use getrandom::SysRng;
     use getrandom::rand_core::UnwrapErr;
     use rsa::pkcs8::DecodePublicKey as _;
@@ -886,6 +895,152 @@ mod tests {
         KekDecryptor, OaepDigestAlgorithm, PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt,
         decrypt_document, parse_encrypted_data,
     };
+
+    #[derive(Debug)]
+    struct MalformedCiphertextProvider {
+        ciphertext: Vec<u8>,
+    }
+
+    impl crate::provider::CryptoProvider for MalformedCiphertextProvider {
+        fn name(&self) -> &'static str {
+            "malformed-ciphertext-test"
+        }
+
+        fn supports(&self, query: crate::provider::CapabilityQuery<'_>) -> bool {
+            crate::provider::CryptoProvider::supports(&crate::provider::RustCryptoProvider, query)
+        }
+
+        fn fill_random(&self, output: &mut [u8]) -> Result<(), crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::fill_random(
+                &crate::provider::RustCryptoProvider,
+                output,
+            )
+        }
+
+        #[cfg(feature = "xmldsig")]
+        fn digest(
+            &self,
+            algorithm: crate::xmldsig::DigestAlgorithm,
+            data: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::digest(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                data,
+            )
+        }
+
+        #[cfg(feature = "xmldsig")]
+        fn sign(
+            &self,
+            key: &dyn crate::xmldsig::SigningKey,
+            algorithm: crate::xmldsig::SignatureAlgorithm,
+            data: &[u8],
+        ) -> Result<Vec<u8>, crate::xmldsig::SigningKeyError> {
+            crate::provider::CryptoProvider::sign(
+                &crate::provider::RustCryptoProvider,
+                key,
+                algorithm,
+                data,
+            )
+        }
+
+        #[cfg(feature = "xmldsig")]
+        fn verify(
+            &self,
+            key: &dyn crate::xmldsig::VerifyingKey,
+            algorithm: crate::xmldsig::SignatureAlgorithm,
+            data: &[u8],
+            signature: &[u8],
+        ) -> Result<bool, crate::xmldsig::DsigError> {
+            crate::provider::CryptoProvider::verify(
+                &crate::provider::RustCryptoProvider,
+                key,
+                algorithm,
+                data,
+                signature,
+            )
+        }
+
+        fn encrypt_data(
+            &self,
+            _algorithm: DataEncryptionAlgorithm,
+            _key: &[u8],
+            _plaintext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            Ok(self.ciphertext.clone())
+        }
+
+        fn decrypt_data(
+            &self,
+            algorithm: DataEncryptionAlgorithm,
+            key: &[u8],
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::decrypt_data(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                key,
+                ciphertext,
+            )
+        }
+
+        fn wrap_key(
+            &self,
+            algorithm: KeyWrapAlgorithm,
+            kek: &[u8],
+            key: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::wrap_key(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                kek,
+                key,
+            )
+        }
+
+        fn unwrap_key(
+            &self,
+            algorithm: KeyWrapAlgorithm,
+            kek: &[u8],
+            wrapped: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::unwrap_key(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                kek,
+                wrapped,
+            )
+        }
+
+        fn transport_key(
+            &self,
+            key: &RsaPublicKey,
+            parameters: &RsaOaepParameters,
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::transport_key(
+                &crate::provider::RustCryptoProvider,
+                key,
+                parameters,
+                plaintext,
+            )
+        }
+
+        fn recover_key(
+            &self,
+            key: &RsaPrivateKey,
+            parameters: &RsaOaepParameters,
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::recover_key(
+                &crate::provider::RustCryptoProvider,
+                key,
+                parameters,
+                ciphertext,
+            )
+        }
+    }
 
     #[test]
     fn direct_key_round_trips_every_content_algorithm() {
@@ -1423,6 +1578,48 @@ mod tests {
                 .encrypt_binary(b"data"),
             Err(XmlEncError::InvalidEncryptionConfig(_))
         ));
+    }
+
+    #[test]
+    fn encrypted_data_id_must_be_an_xml_ncname() {
+        // xsd:ID derives from NCName; escaping arbitrary attribute text cannot
+        // make whitespace, a leading digit, or a colon schema-valid.
+        for invalid in ["bad id", "1leading", "qualified:name", ""] {
+            assert!(matches!(
+                EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                    .direct_key([0_u8; 16])
+                    .id(invalid)
+                    .encrypt_binary(b"data"),
+                Err(XmlEncError::InvalidEncryptionConfig(_))
+            ));
+        }
+
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .id("Δοκιμή")
+            .encrypt_binary(b"data")
+            .expect("Unicode XML NCNames must remain valid identifiers");
+    }
+
+    #[test]
+    fn rejects_malformed_custom_provider_ciphertext_before_serialization() {
+        // Providers supply primitives, but the facade owns the standard wire
+        // contract and must not serialize output its own decryptor rejects.
+        for (algorithm, ciphertext) in [
+            (DataEncryptionAlgorithm::Aes128Gcm, vec![0_u8; 27]),
+            (DataEncryptionAlgorithm::Aes128Cbc, vec![0_u8; 31]),
+            (DataEncryptionAlgorithm::Aes256Cbc, vec![0_u8; 33]),
+        ] {
+            let error = EncryptedDataBuilder::new(algorithm)
+                .provider(Arc::new(MalformedCiphertextProvider { ciphertext }))
+                .direct_key(vec![0_u8; algorithm.key_len()])
+                .encrypt_binary(b"data")
+                .expect_err("malformed provider output must fail before XML serialization");
+            assert!(matches!(
+                error,
+                XmlEncError::DataTooShort { .. } | XmlEncError::InvalidCbcCiphertextLength(_)
+            ));
+        }
     }
 
     #[test]

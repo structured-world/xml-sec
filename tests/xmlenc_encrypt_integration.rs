@@ -542,10 +542,11 @@ fn tampered_generated_gcm_ciphertext_fails_authentication() {
 
 #[test]
 fn generated_metadata_is_xml_escaped_and_legacy_mgf_is_restricted() {
-    // Caller metadata must remain data after serialization, and the legacy
-    // OAEP URI cannot falsely advertise a configurable non-SHA1 MGF.
+    // Free-form caller metadata must remain data after serialization while the
+    // schema-constrained XML ID remains an NCName. The legacy OAEP URI cannot
+    // falsely advertise a configurable non-SHA1 MGF.
     let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
-        .id("encrypted<&\"")
+        .id("encrypted-id")
         .add_recipient(
             EncryptionRecipient::aes_key_wrap([0xe5; 16], KeyWrapAlgorithm::AesKw128)
                 .recipient("recipient<&\"")
@@ -555,7 +556,7 @@ fn generated_metadata_is_xml_escaped_and_legacy_mgf_is_restricted() {
         .expect("metadata must serialize safely");
     let parsed =
         parse_encrypted_data(&encrypted.encrypted_data_xml).expect("escaped metadata must parse");
-    assert_eq!(parsed.id.as_deref(), Some("encrypted<&\""));
+    assert_eq!(parsed.id.as_deref(), Some("encrypted-id"));
     assert_eq!(
         parsed.encrypted_keys[0].recipient.as_deref(),
         Some("recipient<&\"")

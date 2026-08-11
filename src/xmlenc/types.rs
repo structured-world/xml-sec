@@ -67,6 +67,40 @@ impl DataEncryptionAlgorithm {
             Self::Aes256Gcm => "http://www.w3.org/2009/xmlenc11#aes256-gcm",
         }
     }
+
+    /// Minimum standard wire length for ciphertext produced by this algorithm.
+    pub(crate) const fn minimum_ciphertext_len(self) -> usize {
+        match self {
+            Self::Aes128Cbc | Self::Aes256Cbc => 32,
+            Self::Aes128Gcm | Self::Aes256Gcm => 28,
+        }
+    }
+}
+
+pub(crate) fn validate_ciphertext_framing(
+    algorithm: DataEncryptionAlgorithm,
+    ciphertext_len: usize,
+) -> Result<(), XmlEncError> {
+    let minimum = algorithm.minimum_ciphertext_len();
+    if ciphertext_len < minimum {
+        let algorithm_name = match algorithm {
+            DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => "AES-CBC",
+            DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => "AES-GCM",
+        };
+        return Err(XmlEncError::DataTooShort {
+            algorithm: algorithm_name,
+            minimum,
+            actual: ciphertext_len,
+        });
+    }
+    if matches!(
+        algorithm,
+        DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc
+    ) && !(ciphertext_len - 16).is_multiple_of(16)
+    {
+        return Err(XmlEncError::InvalidCbcCiphertextLength(ciphertext_len - 16));
+    }
+    Ok(())
 }
 
 impl KeyTransportAlgorithm {

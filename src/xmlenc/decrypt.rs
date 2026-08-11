@@ -649,7 +649,7 @@ fn validate_typed_cipher_values(
     if projected > maximum_ciphertext {
         return Err(XmlEncError::PlaintextTooLarge {
             maximum: maximum_plaintext,
-            actual: projected.saturating_sub(ciphertext_framing_len(algorithm)),
+            actual: projected.saturating_sub(algorithm.minimum_ciphertext_len()),
         });
     }
 
@@ -707,13 +707,6 @@ fn projected_decoded_len_for_encoded_len(encoded_len: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-const fn ciphertext_framing_len(algorithm: DataEncryptionAlgorithm) -> usize {
-    match algorithm {
-        DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => 32,
-        DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => 28,
-    }
-}
-
 fn validate_key_len(algorithm: DataEncryptionAlgorithm, key: &[u8]) -> Result<(), XmlEncError> {
     if key.len() == algorithm.key_len() {
         Ok(())
@@ -731,14 +724,9 @@ fn validate_possible_plaintext_len(
     ciphertext_len: usize,
     maximum: usize,
 ) -> Result<(), XmlEncError> {
-    let framing = match algorithm {
-        // CBC contains a 16-byte IV and 1 to 16 padding bytes. Assuming the
-        // largest padding yields the smallest plaintext possible on success,
-        // which is the safe pre-decryption lower bound checked here. The exact
-        // plaintext length is checked after decryption.
-        DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => 32,
-        DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => 28,
-    };
+    // CBC's minimum includes a 16-byte IV and one padded block; using that
+    // maximum-padding case yields the safe pre-decryption plaintext lower bound.
+    let framing = algorithm.minimum_ciphertext_len();
     validate_plaintext_len(ciphertext_len.saturating_sub(framing), maximum)
 }
 

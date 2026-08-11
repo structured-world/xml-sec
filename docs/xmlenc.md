@@ -34,8 +34,10 @@ fn example() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 For recipient transport, add one or more `EncryptionRecipient::rsa_oaep` entries with recipient
-public keys, or use `recipient_aes_kw` with a shared KEK. A fresh content key is generated from
-the operating-system RNG and wrapped once per recipient. The crate's secure RSA-OAEP default is
+public keys, or use `recipient_aes_kw` with a shared KEK. `EncryptedDataBuilder` obtains each fresh
+content key through `CryptoProvider::fill_random` and wraps it once per recipient. The default
+`RustCryptoProvider` uses the operating-system RNG; `.provider(...)` can replace that behavior
+together with the cryptographic primitives. The crate's secure RSA-OAEP default is
 SHA-256/MGF1-SHA-256. XMLEnc 1.1 itself defaults omitted parameters to SHA-1/MGF1-SHA-1, so
 `xml-sec` always emits explicit `ds:DigestMethod` and `xenc11:MGF` values rather than relying on
 those implicit legacy defaults. SHA-1 OAEP remains available only through explicit parameters.
