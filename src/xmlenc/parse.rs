@@ -327,7 +327,7 @@ fn parse_encryption_method_with_limit(
                     && oaep_digest.is_none()
                     && mgf_algorithm.is_none() =>
             {
-                key_size_bits = Some(parse_key_size(child)?);
+                key_size_bits = Some(parse_key_size(child, metadata_limit)?);
             }
             (Some(XMLENC_NS), "OAEPparams") if oaep_params.is_none() => {
                 oaep_params = Some(decode_bounded_base64_text(child, metadata_limit)?);
@@ -368,8 +368,8 @@ fn parse_encryption_method_with_limit(
     Ok(method)
 }
 
-fn parse_key_size(node: Node<'_, '_>) -> Result<usize, XmlEncError> {
-    let value = simple_text(node, "KeySize")?;
+fn parse_key_size(node: Node<'_, '_>, metadata_limit: usize) -> Result<usize, XmlEncError> {
+    let value = bounded_simple_text_with_limit(node, "KeySize", metadata_limit)?;
     let value = value.trim();
     let bits = value
         .parse::<usize>()
@@ -415,12 +415,19 @@ fn bounded_simple_text(
     field: &'static str,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<String, XmlEncError> {
+    bounded_simple_text_with_limit(node, field, policy.resources.max_encryption_metadata_bytes)
+}
+
+fn bounded_simple_text_with_limit(
+    node: Node<'_, '_>,
+    field: &'static str,
+    maximum: usize,
+) -> Result<String, XmlEncError> {
     if node.children().any(|child| child.is_element()) {
         return Err(XmlEncError::InvalidStructure(format!(
             "{field} must not contain element children"
         )));
     }
-    let maximum = policy.resources.max_encryption_metadata_bytes;
     let mut value = String::new();
     for text in node
         .children()
@@ -857,6 +864,26 @@ mod tests {
                 Err(XmlEncError::InvalidStructure(_))
             ));
         }
+    }
+
+    #[test]
+    fn key_size_text_is_bounded_before_integer_parsing() {
+        // Leading zeroes keep the numeric value valid while making the lexical
+        // form arbitrarily large; enforce the metadata budget before parsing.
+        let key_size = format!("{}128", "0".repeat(65));
+        let xml = format!(
+            "<xenc:EncryptionMethod xmlns:xenc=\"{XMLENC_NS}\" Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"><xenc:KeySize>{key_size}</xenc:KeySize></xenc:EncryptionMethod>"
+        );
+        let document = Document::parse(&xml).expect("test method must be XML");
+
+        assert!(matches!(
+            parse_encryption_method_with_limit(document.root_element(), 64),
+            Err(XmlEncError::EncryptionMetadataTooLarge {
+                field: "KeySize",
+                maximum: 64,
+                actual: 68,
+            })
+        ));
     }
 
     #[test]

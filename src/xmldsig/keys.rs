@@ -277,6 +277,7 @@ impl DefaultKeyResolver {
             verification_time: trust.verification_time.unwrap_or_else(SystemTime::now),
             max_chain_depth: trust.max_x509_chain_depth,
             check_crls: trust.check_crls,
+            allowed_leaf_extended_key_usages: Some(&trust.allowed_leaf_extended_key_usages),
         };
         verify_x509_certificate_chain_with_provider(info, &options, provider)?;
         Ok(())
@@ -748,6 +749,10 @@ impl KeyResolver for DefaultKeyResolver {
                 .max_x509_candidate_paths
                 .min(self.config.trust.max_x509_candidate_paths),
             allow_legacy_rsa_sha1: policy.key_trust.allow_legacy_rsa_sha1,
+            allowed_leaf_extended_key_usages: policy
+                .key_trust
+                .allowed_leaf_extended_key_usages
+                .clone(),
             check_crls: policy.key_trust.check_crls || self.config.trust.check_crls,
             verification_time: policy
                 .key_trust
@@ -1214,6 +1219,67 @@ mod tests {
         assert!(!config.trust.check_crls);
         assert_eq!(config.trust.verification_time, None);
         assert_eq!(config.trust.max_x509_chain_depth, 9);
+    }
+
+    #[test]
+    fn verification_policy_controls_leaf_extended_key_usage() {
+        // The immutable operation snapshot must reach certificate-path
+        // validation; resolver-local trust defaults cannot bypass EKU policy.
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("EKU policy root", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        let mut leaf_params = generated_certificate_params("TLS-only XML signer", false);
+        leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf = leaf_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &root,
+            )
+            .expect("root should sign leaf certificate");
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(x509_info(
+                vec![leaf.der().to_vec(), root.der().to_vec()],
+                0,
+            ))],
+        };
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trusted_certs: vec![root.der().to_vec()],
+            ..KeyResolverConfig::default()
+        });
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_trust.verify_x509_chains = true;
+
+        let error = match resolver.resolve_with_policy(
+            Some(&key_info),
+            SignatureAlgorithm::EcdsaSha256,
+            &policy,
+        ) {
+            Ok(_) => panic!("unapproved restricted EKU must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            DsigError::KeyResolution(KeyResolutionError::Chain(
+                super::super::X509ChainError::InvalidKeyUsage {
+                    position: 0,
+                    required: "an approved extended key usage",
+                }
+            ))
+        ));
+
+        policy
+            .key_trust
+            .allowed_leaf_extended_key_usages
+            .insert(crate::policy::ExtendedKeyPurpose::ServerAuth);
+        assert!(
+            resolver
+                .resolve_with_policy(Some(&key_info), SignatureAlgorithm::EcdsaSha256, &policy,)
+                .expect("approved restricted EKU must pass path validation")
+                .is_some()
+        );
     }
 
     #[test]

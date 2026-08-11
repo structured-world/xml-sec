@@ -224,6 +224,14 @@ impl DecryptionKeyResolver for KekDecryptor {
             .map_err(|error| XmlEncError::Base64(error.to_string()))?;
         let wrap_algorithm =
             KeyWrapAlgorithm::from_uri(&encrypted_key.encryption_method.algorithm)?;
+        let expected_kek_len = wrap_algorithm.key_len();
+        if self.kek.len() != expected_kek_len {
+            return Err(XmlEncError::InvalidKekSize {
+                algorithm: wrap_algorithm,
+                expected: expected_kek_len,
+                actual: self.kek.len(),
+            });
+        }
         let key = provider
             .unwrap_key(wrap_algorithm, &self.kek, &wrapped)
             .map_err(|error| match error {
@@ -781,6 +789,7 @@ fn map_data_decryption_error(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use aes_gcm::{
         Aes128Gcm,
@@ -808,6 +817,153 @@ mod tests {
     struct AllCallsResolver {
         calls: Cell<usize>,
         key: Vec<u8>,
+    }
+
+    #[derive(Debug, Default)]
+    struct PermissiveUnwrapProvider {
+        unwrap_calls: AtomicUsize,
+    }
+
+    impl crate::provider::CryptoProvider for PermissiveUnwrapProvider {
+        fn name(&self) -> &'static str {
+            "permissive-unwrap-test"
+        }
+
+        fn supports(&self, query: crate::provider::CapabilityQuery<'_>) -> bool {
+            crate::provider::CryptoProvider::supports(&crate::provider::RustCryptoProvider, query)
+        }
+
+        fn fill_random(&self, output: &mut [u8]) -> Result<(), crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::fill_random(
+                &crate::provider::RustCryptoProvider,
+                output,
+            )
+        }
+
+        #[cfg(feature = "xmldsig")]
+        fn digest(
+            &self,
+            algorithm: crate::xmldsig::DigestAlgorithm,
+            data: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::digest(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                data,
+            )
+        }
+
+        #[cfg(feature = "xmldsig")]
+        fn sign(
+            &self,
+            key: &dyn crate::xmldsig::SigningKey,
+            algorithm: crate::xmldsig::SignatureAlgorithm,
+            data: &[u8],
+        ) -> Result<Vec<u8>, crate::xmldsig::SigningKeyError> {
+            crate::provider::CryptoProvider::sign(
+                &crate::provider::RustCryptoProvider,
+                key,
+                algorithm,
+                data,
+            )
+        }
+
+        #[cfg(feature = "xmldsig")]
+        fn verify(
+            &self,
+            key: &dyn crate::xmldsig::VerifyingKey,
+            algorithm: crate::xmldsig::SignatureAlgorithm,
+            data: &[u8],
+            signature: &[u8],
+        ) -> Result<bool, crate::xmldsig::DsigError> {
+            crate::provider::CryptoProvider::verify(
+                &crate::provider::RustCryptoProvider,
+                key,
+                algorithm,
+                data,
+                signature,
+            )
+        }
+
+        fn encrypt_data(
+            &self,
+            algorithm: DataEncryptionAlgorithm,
+            key: &[u8],
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::encrypt_data(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                key,
+                plaintext,
+            )
+        }
+
+        fn decrypt_data(
+            &self,
+            algorithm: DataEncryptionAlgorithm,
+            key: &[u8],
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::decrypt_data(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                key,
+                ciphertext,
+            )
+        }
+
+        fn wrap_key(
+            &self,
+            algorithm: KeyWrapAlgorithm,
+            kek: &[u8],
+            key: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::wrap_key(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                kek,
+                key,
+            )
+        }
+
+        fn unwrap_key(
+            &self,
+            _algorithm: KeyWrapAlgorithm,
+            _kek: &[u8],
+            _wrapped: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            self.unwrap_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![0_u8; 16])
+        }
+
+        fn transport_key(
+            &self,
+            key: &RsaPublicKey,
+            parameters: &RsaOaepParameters,
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::transport_key(
+                &crate::provider::RustCryptoProvider,
+                key,
+                parameters,
+                plaintext,
+            )
+        }
+
+        fn recover_key(
+            &self,
+            key: &rsa::RsaPrivateKey,
+            parameters: &RsaOaepParameters,
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::recover_key(
+                &crate::provider::RustCryptoProvider,
+                key,
+                parameters,
+                ciphertext,
+            )
+        }
     }
 
     impl DecryptionKeyResolver for CountingResolver {
@@ -1045,6 +1201,44 @@ mod tests {
             )
             .expect("wrapped session key must resolve");
         assert_eq!(resolved, session_key);
+    }
+
+    #[test]
+    fn rejects_invalid_kek_before_custom_provider_dispatch() {
+        // KEK length is part of the XMLEnc algorithm contract, not a provider
+        // preference. A permissive provider must not bypass facade validation.
+        let encrypted_key = EncryptedKey {
+            id: None,
+            recipient: None,
+            key_name: None,
+            encryption_method: super::super::EncryptionMethod {
+                algorithm: KeyWrapAlgorithm::AesKw128.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            cipher_data: super::super::CipherData {
+                value: STANDARD.encode([0_u8; 24]),
+            },
+            reference_list: None,
+            carried_key_name: None,
+        };
+        let provider = PermissiveUnwrapProvider::default();
+
+        assert!(matches!(
+            KekDecryptor::new([0_u8; 32]).resolve_key(
+                &provider,
+                DataEncryptionAlgorithm::Aes128Gcm,
+                Some(&encrypted_key),
+            ),
+            Err(XmlEncError::InvalidKekSize {
+                algorithm: KeyWrapAlgorithm::AesKw128,
+                expected: 16,
+                actual: 32,
+            })
+        ));
+        assert_eq!(provider.unwrap_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

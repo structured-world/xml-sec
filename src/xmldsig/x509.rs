@@ -1,6 +1,9 @@
 //! X.509 certificate path and revocation validation.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use x509_parser::{
     certificate::X509Certificate,
@@ -15,7 +18,7 @@ use super::{
     X509DataInfo,
     parse::{distinguished_name_within_subtree, distinguished_names_equal, x509_name_to_rfc4514},
 };
-use crate::provider::X509SignatureAlgorithm;
+use crate::{policy::ExtendedKeyPurpose, provider::X509SignatureAlgorithm};
 
 /// Inputs controlling X.509 certificate-chain validation.
 #[derive(Debug, Clone)]
@@ -28,6 +31,8 @@ pub struct X509ChainOptions<'a> {
     pub max_chain_depth: usize,
     /// Whether parsed `<X509CRL>` entries are enforced.
     pub check_crls: bool,
+    /// Purposes accepted when the leaf carries a restrictive ExtendedKeyUsage.
+    pub allowed_leaf_extended_key_usages: Option<&'a HashSet<ExtendedKeyPurpose>>,
 }
 
 /// Certificate-chain validation failure.
@@ -238,7 +243,7 @@ fn validate_path(
             return Err(X509ChainError::CertificateNotValid(position));
         }
         if position == 0 {
-            validate_leaf_key_usage(cert)?;
+            validate_leaf_key_usage(cert, options.allowed_leaf_extended_key_usages)?;
         } else {
             validate_ca_constraints(cert, position)?;
         }
@@ -886,7 +891,10 @@ fn x509_digest_algorithm(oid: &str) -> Result<super::DigestAlgorithm, X509ChainE
     }
 }
 
-fn validate_leaf_key_usage(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
+fn validate_leaf_key_usage(
+    cert: &X509Certificate<'_>,
+    allowed_extended_key_usages: Option<&HashSet<ExtendedKeyPurpose>>,
+) -> Result<(), X509ChainError> {
     // RFC 5280 section 4.2.1.3 restricts key purpose only when KeyUsage is present.
     if cert
         .key_usage()
@@ -901,7 +909,50 @@ fn validate_leaf_key_usage(cert: &X509Certificate<'_>) -> Result<(), X509ChainEr
             required: "digitalSignature or nonRepudiation",
         });
     }
-    Ok(())
+    let Some(usage) = cert
+        .extended_key_usage()
+        .map_err(|error| X509ChainError::InvalidDer {
+            kind: "certificate ExtendedKeyUsage",
+            message: error.to_string(),
+        })?
+    else {
+        return Ok(());
+    };
+    if usage.value.any
+        || allowed_extended_key_usages
+            .is_some_and(|allowed| extended_key_usage_is_allowed(usage.value, allowed))
+    {
+        return Ok(());
+    }
+    Err(X509ChainError::InvalidKeyUsage {
+        position: 0,
+        required: "an approved extended key usage",
+    })
+}
+
+fn extended_key_usage_is_allowed(
+    usage: &x509_parser::extensions::ExtendedKeyUsage<'_>,
+    allowed: &HashSet<ExtendedKeyPurpose>,
+) -> bool {
+    (usage.server_auth && allowed.contains(&ExtendedKeyPurpose::ServerAuth))
+        || (usage.client_auth && allowed.contains(&ExtendedKeyPurpose::ClientAuth))
+        || (usage.code_signing && allowed.contains(&ExtendedKeyPurpose::CodeSigning))
+        || (usage.email_protection && allowed.contains(&ExtendedKeyPurpose::EmailProtection))
+        || (usage.time_stamping && allowed.contains(&ExtendedKeyPurpose::TimeStamping))
+        || (usage.ocsp_signing && allowed.contains(&ExtendedKeyPurpose::OcspSigning))
+        || usage.other.iter().any(|oid| {
+            let oid = oid.to_id_string();
+            allowed.iter().any(|purpose| match purpose {
+                ExtendedKeyPurpose::Other(arcs) => {
+                    arcs.iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(".")
+                        == oid
+                }
+                _ => false,
+            })
+        })
 }
 
 fn parse_certificate(der: &[u8]) -> Result<X509Certificate<'_>, X509ChainError> {
@@ -935,14 +986,26 @@ fn validate_ca_constraints(
     cert: &X509Certificate<'_>,
     position: usize,
 ) -> Result<(), X509ChainError> {
-    cert.extensions()
+    let extension = cert
+        .extensions()
         .iter()
-        .find_map(|extension| match extension.parsed_extension() {
-            ParsedExtension::BasicConstraints(value) => Some(value),
-            _ => None,
+        .find(|extension| {
+            matches!(
+                extension.parsed_extension(),
+                ParsedExtension::BasicConstraints(_)
+            )
         })
-        .filter(|constraints| constraints.ca)
         .ok_or(X509ChainError::IssuerNotCa(position))?;
+    let ParsedExtension::BasicConstraints(constraints) = extension.parsed_extension() else {
+        unreachable!("extension was selected by parsed type")
+    };
+    if !constraints.ca {
+        return Err(X509ChainError::IssuerNotCa(position));
+    }
+    // RFC 5280 section 4.2.1.9 requires conforming issuers to mark CA
+    // BasicConstraints critical, but the path-validation algorithm requires
+    // the cA assertion and does not turn issuer non-conformance into a path
+    // failure. OpenSSL/xmlsec1 accepts historical non-critical CA extensions.
 
     if cert
         .key_usage()
@@ -1004,7 +1067,7 @@ fn validate_critical_extensions(
         let oid = extension.oid.to_id_string();
         if !matches!(
             oid.as_str(),
-            "2.5.29.15" | "2.5.29.17" | "2.5.29.19" | "2.5.29.30"
+            "2.5.29.15" | "2.5.29.17" | "2.5.29.19" | "2.5.29.30" | "2.5.29.37"
         ) {
             return Err(X509ChainError::UnsupportedCriticalExtension { position, oid });
         }
@@ -1619,6 +1682,14 @@ mod tests {
         certificates: Vec<Vec<u8>>,
         trusted_anchor: Vec<u8>,
     ) -> Result<(), X509ChainError> {
+        verify_generated_path_with_eku(certificates, trusted_anchor, None)
+    }
+
+    fn verify_generated_path_with_eku(
+        certificates: Vec<Vec<u8>>,
+        trusted_anchor: Vec<u8>,
+        allowed_leaf_extended_key_usages: Option<&HashSet<ExtendedKeyPurpose>>,
+    ) -> Result<(), X509ChainError> {
         let info = X509DataInfo {
             certificate_chain: (0..certificates.len()).collect(),
             certificates,
@@ -1632,8 +1703,124 @@ mod tests {
                 verification_time: SystemTime::now(),
                 max_chain_depth: info.certificate_chain.len(),
                 check_crls: false,
+                allowed_leaf_extended_key_usages,
             },
         )
+    }
+
+    #[test]
+    fn noncritical_ca_basic_constraints_remain_path_compatible() {
+        // Criticality is an issuer conformance requirement, not an additional
+        // relying-party path gate; historical xmlsec1 chains depend on this.
+        let mut params = generated_certificate_params("non-critical authority", false);
+        params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[2, 5, 29, 19],
+                vec![0x30, 0x03, 0x01, 0x01, 0xff],
+            ));
+        let certificate = params
+            .self_signed(&rcgen::KeyPair::generate().expect("CA key generation should succeed"))
+            .expect("test CA should be self-signable");
+        let parsed = parse_certificate(certificate.der()).expect("test CA DER should parse");
+
+        assert_eq!(validate_ca_constraints(&parsed, 1), Ok(()));
+    }
+
+    #[test]
+    fn restricted_leaf_eku_requires_an_approved_purpose() {
+        // A server-authentication certificate is not implicitly authorized for
+        // XML signatures merely because its key permits digital signatures.
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("EKU authority", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        let mut leaf_params = generated_certificate_params("TLS-only signer", false);
+        leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf = leaf_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &root,
+            )
+            .expect("root should sign leaf certificate");
+        let leaf_der = leaf.der().to_vec();
+        let root_der = root.der().to_vec();
+
+        assert!(matches!(
+            verify_generated_path(vec![leaf_der.clone(), root_der.clone()], root_der.clone(),),
+            Err(X509ChainError::InvalidKeyUsage {
+                position: 0,
+                required: "an approved extended key usage",
+            })
+        ));
+
+        let allowed = HashSet::from([ExtendedKeyPurpose::ServerAuth]);
+        verify_generated_path_with_eku(vec![leaf_der, root_der.clone()], root_der, Some(&allowed))
+            .expect("an explicitly approved leaf purpose must be accepted");
+    }
+
+    #[test]
+    fn critical_leaf_eku_uses_the_same_purpose_policy() {
+        // Criticality changes whether an unknown extension may be ignored, not
+        // the authorization semantics of an EKU that this validator implements.
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("critical EKU authority", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        let mut leaf_params = generated_certificate_params("critical TLS signer", false);
+        leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        let mut extension = rcgen::CustomExtension::from_oid_content(
+            &[2, 5, 29, 37],
+            vec![
+                0x30, 0x0a, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01,
+            ],
+        );
+        extension.set_criticality(true);
+        leaf_params.custom_extensions.push(extension);
+        let leaf = leaf_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &root,
+            )
+            .expect("root should sign leaf certificate");
+        let allowed = HashSet::from([ExtendedKeyPurpose::ServerAuth]);
+
+        verify_generated_path_with_eku(
+            vec![leaf.der().to_vec(), root.der().to_vec()],
+            root.der().to_vec(),
+            Some(&allowed),
+        )
+        .expect("approved critical EKU must be processed rather than rejected as unknown");
+    }
+
+    #[test]
+    fn any_extended_key_usage_does_not_restrict_xml_signing() {
+        // RFC 5280 anyExtendedKeyUsage explicitly leaves the key unrestricted,
+        // so it does not require a deployment-specific purpose allowlist entry.
+        let root = rcgen::CertifiedIssuer::self_signed(
+            generated_certificate_params("any EKU authority", true),
+            rcgen::KeyPair::generate().expect("root key generation should succeed"),
+        )
+        .expect("root should be self-signable");
+        let mut leaf_params = generated_certificate_params("unrestricted signer", false);
+        leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::Any];
+        let leaf = leaf_params
+            .signed_by(
+                &rcgen::KeyPair::generate().expect("leaf key generation should succeed"),
+                &root,
+            )
+            .expect("root should sign leaf certificate");
+
+        verify_generated_path(
+            vec![leaf.der().to_vec(), root.der().to_vec()],
+            root.der().to_vec(),
+        )
+        .expect("anyExtendedKeyUsage must remain unrestricted");
     }
 
     #[test]
@@ -1909,6 +2096,7 @@ mod tests {
             verification_time: UNIX_EPOCH + Duration::from_secs(1_104_580_800),
             max_chain_depth: 2,
             check_crls: false,
+            allowed_leaf_extended_key_usages: None,
         };
 
         verify_x509_certificate_chain(&info, &options)

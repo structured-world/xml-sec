@@ -70,16 +70,22 @@ validates; neither condition can bypass the configured work bounds or trust anch
 Path validation excludes self-issued rollover CAs from `pathLenConstraint`, applies supported RFC
 5280 NameConstraints to every subordinate certificate, and rejects critical extensions whose
 semantics are not implemented. Repeated extension OIDs are rejected certificate-wide before any
-extension-specific interpretation. Empty certificate subjects require exactly one critical, non-empty
+extension-specific interpretation. Issuing certificates must assert BasicConstraints `cA=true`
+and, when KeyUsage is present, `keyCertSign`. RFC 5280 requires conforming issuers to encode CA
+BasicConstraints as critical, but path validation retains OpenSSL/xmlsec1 compatibility with
+historical non-critical encodings. Empty certificate subjects require exactly one critical, non-empty
 SubjectAlternativeName, and malformed GeneralName entries fail path validation regardless of whether
 the subject is empty. Invalid DNS-based constraints, including email-domain and URI-host forms,
 malformed IPv4/IPv6 encodings, non-contiguous CIDR masks, nonzero `minimum`, and any `maximum`
 distance fail the path rather than behaving as ordinary name mismatches. Processed critical certificate
 extensions are KeyUsage
 (`2.5.29.15`), SubjectAlternativeName (`2.5.29.17`), BasicConstraints (`2.5.29.19`), and
-NameConstraints (`2.5.29.30`). A chain using critical ExtendedKeyUsage (`2.5.29.37`) or
-CertificatePolicies (`2.5.29.32`) therefore fails closed until those semantics are implemented;
-encode them as non-critical only when that matches the issuing PKI's security contract.
+NameConstraints (`2.5.29.30`). ExtendedKeyUsage (`2.5.29.37`) is processed whether critical or
+non-critical: a leaf without EKU, or with `anyExtendedKeyUsage`, remains unrestricted, while every
+other EKU must intersect `KeyTrustPolicy::allowed_leaf_extended_key_usages`. The default empty set
+therefore rejects TLS-, code-signing-, and other purpose-restricted leaves unless the deployment
+explicitly approves that typed purpose. Critical CertificatePolicies (`2.5.29.32`) still fails closed
+because policy-tree processing is not implemented.
 When `X509Data` supplies multiple selector categories, every
 category must match certificates on the same selected, policy-valid path rather than unrelated
 certificates from the lookup pool.

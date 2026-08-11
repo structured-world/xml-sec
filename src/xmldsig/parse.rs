@@ -187,7 +187,7 @@ pub enum KeyInfoSource {
     DerEncodedKeyValue(Vec<u8>),
     /// `<RetrievalMethod>` URI and optional type URI.
     RetrievalMethod {
-        /// Resource URI.
+        /// RFC 3986-resolved resource identity. Same-document fragments remain unchanged.
         uri: String,
         /// Declared resource type.
         resource_type: Option<String>,

@@ -210,6 +210,27 @@ pub struct XmlInputPolicy {
     pub allow_internal_dtd: bool,
 }
 
+/// An RFC 5280 extended-key-purpose identifier accepted for XML signing.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ExtendedKeyPurpose {
+    /// TLS server authentication (`id-kp-serverAuth`).
+    ServerAuth,
+    /// TLS client authentication (`id-kp-clientAuth`).
+    ClientAuth,
+    /// Executable code signing (`id-kp-codeSigning`).
+    CodeSigning,
+    /// Email protection (`id-kp-emailProtection`).
+    EmailProtection,
+    /// Trusted timestamping (`id-kp-timeStamping`).
+    TimeStamping,
+    /// OCSP response signing (`id-kp-OCSPSigning`).
+    OcspSigning,
+    /// Application-defined purpose represented as OID arcs.
+    Other(Vec<u64>),
+}
+
 /// X.509 and key-resolution decisions for verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +243,12 @@ pub struct KeyTrustPolicy {
     pub max_x509_candidate_paths: usize,
     /// Permit legacy RSA-SHA1 verification after key resolution.
     pub allow_legacy_rsa_sha1: bool,
+    /// Purposes accepted when a leaf certificate restricts itself with ExtendedKeyUsage.
+    ///
+    /// An empty set accepts only leaves without ExtendedKeyUsage or with
+    /// `anyExtendedKeyUsage`; it does not treat TLS/code-signing purposes as a
+    /// generic authorization for XML signatures.
+    pub allowed_leaf_extended_key_usages: HashSet<ExtendedKeyPurpose>,
     /// Authenticate and enforce embedded CRLs during path validation.
     /// Requires [`Self::verify_x509_chains`].
     pub check_crls: bool,
@@ -237,6 +264,7 @@ impl Default for KeyTrustPolicy {
             max_x509_chain_depth: 9,
             max_x509_candidate_paths: 64,
             allow_legacy_rsa_sha1: false,
+            allowed_leaf_extended_key_usages: HashSet::new(),
             check_crls: false,
             verification_time: None,
         }
@@ -249,6 +277,20 @@ impl KeyTrustPolicy {
         if self.check_crls && !self.verify_x509_chains {
             return Err(PolicyViolation::KeyTrust {
                 reason: "CRL checking requires X.509 chain validation",
+            });
+        }
+        if self
+            .allowed_leaf_extended_key_usages
+            .iter()
+            .any(|purpose| match purpose {
+                ExtendedKeyPurpose::Other(arcs) => {
+                    arcs.len() < 2 || arcs[0] > 2 || (arcs[0] < 2 && arcs[1] > 39)
+                }
+                _ => false,
+            })
+        {
+            return Err(PolicyViolation::KeyTrust {
+                reason: "custom extended key purposes must contain valid OID arcs",
             });
         }
         ResourcePolicy::nonzero_within("X.509 chain depth", self.max_x509_chain_depth, 9)?;
@@ -448,6 +490,24 @@ mod tests {
             error.to_string().contains("must be nonzero"),
             "unexpected lower-bound diagnostic: {error}"
         );
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn custom_extended_key_purposes_require_valid_oid_arcs() {
+        // The typed policy rejects impossible OIDs when the immutable snapshot
+        // is validated instead of silently making the purpose unmatchable.
+        let mut policy = KeyTrustPolicy::default();
+        policy
+            .allowed_leaf_extended_key_usages
+            .insert(ExtendedKeyPurpose::Other(vec![1, 40, 7]));
+
+        assert!(matches!(
+            policy.validate(),
+            Err(PolicyViolation::KeyTrust {
+                reason: "custom extended key purposes must contain valid OID arcs",
+            })
+        ));
     }
 
     #[cfg(feature = "xmldsig")]

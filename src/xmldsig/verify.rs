@@ -1264,7 +1264,7 @@ fn materialize_retrieval_methods(
     let mut outcome = RetrievalMaterialization::default();
     for source in std::mem::take(&mut key_info.sources) {
         let super::parse::KeyInfoSource::RetrievalMethod {
-            uri,
+            uri: resolved_uri,
             resource_type,
             transforms,
         } = source
@@ -1273,7 +1273,7 @@ fn materialize_retrieval_methods(
             continue;
         };
 
-        let identity = (uri.clone(), resource_type.clone(), transforms);
+        let identity = (resolved_uri.clone(), resource_type.clone(), transforms);
         if !seen.insert(identity) {
             continue;
         }
@@ -1281,16 +1281,18 @@ fn materialize_retrieval_methods(
         if resource_type.as_deref() == Some("http://www.w3.org/2000/09/xmldsig#rawX509Certificate")
         {
             if transforms != RetrievalMethodTransforms::None
-                || classify_uri(&uri) != UriClass::External
+                || classify_uri(&resolved_uri) != UriClass::External
             {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "raw X509 RetrievalMethod requires an untransformed external URI",
                 });
             }
-            if !allowed_uri_types.allows(&uri) {
-                return Err(SignatureVerificationPipelineError::DisallowedUri { uri });
+            if !allowed_uri_types.allows(&resolved_uri) {
+                return Err(SignatureVerificationPipelineError::DisallowedUri {
+                    uri: resolved_uri,
+                });
             }
-            let certificate = resolver.external_resource(&uri).map_err(|error| {
+            let certificate = resolver.external_resource(&resolved_uri).map_err(|error| {
                 SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
                     error,
                 ))
@@ -1299,12 +1301,12 @@ fn materialize_retrieval_methods(
                 outcome.deferred_error.get_or_insert_with(|| {
                     SignatureVerificationPipelineError::Reference(
                         ReferenceProcessingError::Transform(super::TransformError::UnsupportedUri(
-                            uri.clone(),
+                            resolved_uri.clone(),
                         )),
                     )
                 });
                 materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
-                    uri,
+                    uri: resolved_uri,
                     resource_type,
                     transforms,
                 });
@@ -1323,7 +1325,7 @@ fn materialize_retrieval_methods(
                         .deferred_error
                         .get_or_insert(SignatureVerificationPipelineError::ParseKeyInfo(error));
                     materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
-                        uri,
+                        uri: resolved_uri,
                         resource_type,
                         transforms,
                     });
@@ -1339,10 +1341,12 @@ fn materialize_retrieval_methods(
                 },
             ));
         } else if resource_type.as_deref() == Some("http://www.w3.org/2000/09/xmldsig#X509Data") {
-            if !allowed_uri_types.allows(&uri) {
-                return Err(SignatureVerificationPipelineError::DisallowedUri { uri });
+            if !allowed_uri_types.allows(&resolved_uri) {
+                return Err(SignatureVerificationPipelineError::DisallowedUri {
+                    uri: resolved_uri,
+                });
             }
-            let id = same_document_reference_id(&uri).ok_or(
+            let id = same_document_reference_id(&resolved_uri).ok_or(
                 SignatureVerificationPipelineError::InvalidStructure {
                     reason: "X509Data RetrievalMethod requires a same-document URI",
                 },
@@ -1382,7 +1386,7 @@ fn materialize_retrieval_methods(
             materialized.push(super::parse::KeyInfoSource::X509Data(data));
         } else {
             materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
-                uri,
+                uri: resolved_uri,
                 resource_type,
                 transforms,
             });
@@ -3742,8 +3746,8 @@ mod tests {
         // the effective base of the element bearing that attribute.
         const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
         let xml = format!(
-            r#"<root xml:base="https://example.test/keys/" xmlns:ds="{XMLDSIG_NS}">
-                <ds:KeyInfo><ds:RetrievalMethod URI="signer.der" Type="{RAW_X509_TYPE}"/></ds:KeyInfo>
+            r#"<root xml:base="https://example.test/keys/nested/" xmlns:ds="{XMLDSIG_NS}">
+                <ds:KeyInfo><ds:RetrievalMethod URI="../signer.der" Type="{RAW_X509_TYPE}"/></ds:KeyInfo>
             </root>"#
         );
         let document = Document::parse(&xml).unwrap();
