@@ -85,6 +85,7 @@ fn options<'a>(trusted_certs: &'a [Vec<u8>], check_crls: bool) -> X509ChainOptio
         max_chain_depth: 3,
         check_crls,
         allowed_extended_key_usages: None,
+        rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
     }
 }
 

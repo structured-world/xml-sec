@@ -94,6 +94,13 @@ fixed modern verification time without modifying the donor artifacts.
 
 ## Test Contract
 
+Merlin `.tmpl` files are byte-preserved donor templates whose relative URIs are
+interpreted from the upstream xmlsec runner working directory. Their paths are
+not rewritten to the repository fixture layout. The corresponding signed `.xml`
+files contain the materialized URI identities exercised by `VerifyContext` and
+the caller-provided resource map. This distinction is part of fixture provenance,
+not a missing local file reference.
+
 Positive fixtures must be validated end-to-end through `VerifyContext`; a
 successful XML parse alone is never sufficient. Negative fixtures must assert
 the specific processing or validation boundary that rejects them where the

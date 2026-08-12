@@ -56,7 +56,13 @@ normalize_imported_snapshot() {
           "${donor##*/}" >&2
         return 1
       fi
-      if ! mv "$donor" "$staging/signature-enveloping-hmac-sha1-80.$extension"; then
+      normalized="$staging/signature-enveloping-hmac-sha1-80.$extension"
+      if [[ -e "$normalized" ]]; then
+        printf 'donor snapshot provides both historical and normalized HMAC fixtures: %s\n' \
+          "${normalized##*/}" >&2
+        return 1
+      fi
+      if ! mv "$donor" "$normalized"; then
         printf 'failed to normalize donor fixture: %s\n' "${donor##*/}" >&2
         return 1
       fi

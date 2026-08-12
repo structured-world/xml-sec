@@ -91,7 +91,7 @@ fn xmlsec1_decrypts_direct_aes_gcm_from_xml_sec() {
     // This validates nonce/tag framing and direct KeyName XML against an
     // independent implementation rather than our reciprocal decrypt path.
     if !xmlsec1::is_available() {
-        eprintln!("skipping XMLEnc interop: xmlsec1 >= 1.3.13 is not installed");
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
     let key = [0x4a; 16];
@@ -118,7 +118,7 @@ fn xmlsec1_decrypts_rsa_oaep_wrapped_aes_cbc_from_xml_sec() {
     // This covers generated session-key transport, OAEP digest/MGF metadata,
     // nested EncryptedKey lookup, and XMLEnc CBC random-padding framing.
     if !xmlsec1::is_available() {
-        eprintln!("skipping XMLEnc interop: xmlsec1 >= 1.3.13 is not installed");
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
     let public_key_path = Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");

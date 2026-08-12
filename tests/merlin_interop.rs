@@ -27,6 +27,18 @@ fn chain_policy(check_crls: bool) -> KeyTrustPolicy {
     }
 }
 
+fn legacy_policy(algorithm: SignatureAlgorithm) -> xml_sec::policy::VerificationPolicy {
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(algorithm);
+    if algorithm == SignatureAlgorithm::DsaSha1 {
+        policy.key_trust.dsa_keys.minimum_modulus_bits = 1024;
+    }
+    policy
+}
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -106,17 +118,22 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         assert_valid(
             name,
             VerifyContext::new()
+                .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
                 .key_resolver(&default)
                 .verify(&xml(name)),
         );
     }
     let legacy_rsa = DefaultKeyResolver::default();
-    let mut legacy_policy = xml_sec::policy::VerificationPolicy::default();
-    legacy_policy.key_trust.allow_legacy_rsa_sha1 = true;
+    let mut rsa_policy = xml_sec::policy::VerificationPolicy::default();
+    rsa_policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(SignatureAlgorithm::RsaSha1);
+    rsa_policy.key_trust.rsa_keys.minimum_modulus_bits = 1024;
     assert_valid(
         "signature-enveloping-rsa",
         VerifyContext::new()
-            .policy(legacy_policy)
+            .policy(rsa_policy)
             .key_resolver(&legacy_rsa)
             .verify(&xml("signature-enveloping-rsa")),
     );
@@ -125,6 +142,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
     assert_valid(
         "signature-enveloping-hmac-sha1",
         VerifyContext::new()
+            .policy(legacy_policy(SignatureAlgorithm::HmacSha1))
             .key(&hmac)
             .verify(&xml("signature-enveloping-hmac-sha1")),
     );
@@ -135,6 +153,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
     assert_valid(
         "signature-enveloping-hmac-sha1-80",
         VerifyContext::new()
+            .policy(legacy_policy(SignatureAlgorithm::HmacSha1))
             .key(&truncated_hmac)
             .verify(&xml("signature-enveloping-hmac-sha1-80")),
     );
@@ -144,6 +163,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         assert_valid(
             name,
             VerifyContext::new()
+                .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
                 .key_resolver(&default)
                 .allowed_uri_types(UriTypeSet::ALL)
                 .external_resources(&resources)
@@ -160,6 +180,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
     assert_valid(
         "signature-keyname",
         VerifyContext::new()
+            .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
             .key_resolver(&named)
             .allowed_uri_types(UriTypeSet::ALL)
             .external_resources(&resources)
@@ -182,6 +203,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         assert_valid(
             name,
             VerifyContext::new()
+                .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
                 .key_resolver(&resolver)
                 .allowed_uri_types(UriTypeSet::ALL)
                 .external_resources(&resources)
@@ -198,6 +220,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
     assert_valid(
         "signature-retrievalmethod-rawx509crt",
         VerifyContext::new()
+            .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
             .key_resolver(&retrieval)
             .allowed_uri_types(UriTypeSet::ALL)
             .allowed_retrieval_method_uri_types(UriTypeSet::ALL)
@@ -215,6 +238,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         ..KeyResolverConfig::default()
     });
     let revoked_error = VerifyContext::new()
+        .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
         .key_resolver(&revoked)
         .allowed_uri_types(UriTypeSet::ALL)
         .external_resources(&revoked_resources)
@@ -243,6 +267,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         ..KeyResolverConfig::default()
     });
     let result = VerifyContext::new()
+        .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
         .key_resolver(&complex)
         .allowed_uri_types(UriTypeSet::ALL)
         .external_resources(&resources)
@@ -311,14 +336,19 @@ fn rejects_missing_or_tampered_external_resources() {
     let default = DefaultKeyResolver::default();
     let document = xml("signature-external-dsa");
     let missing = HashMap::new();
-    assert!(
+    assert!(matches!(
         VerifyContext::new()
+            .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
             .key_resolver(&default)
             .allowed_uri_types(UriTypeSet::ALL)
             .external_resources(&missing)
-            .verify(&document)
-            .is_err()
-    );
+            .verify(&document),
+        Err(DsigError::Reference(
+            xml_sec::xmldsig::ReferenceProcessingError::UriDereference(
+                xml_sec::xmldsig::TransformError::UnsupportedUri(uri)
+            )
+        )) if uri == "http://www.w3.org/TR/xml-stylesheet"
+    ));
 
     let mut tampered = external_resources();
     tampered.insert(
@@ -326,6 +356,7 @@ fn rejects_missing_or_tampered_external_resources() {
         b"tampered".to_vec(),
     );
     let result = VerifyContext::new()
+        .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
         .key_resolver(&default)
         .allowed_uri_types(UriTypeSet::ALL)
         .external_resources(&tampered)
@@ -342,6 +373,7 @@ fn bounds_external_resources_before_dereference() {
     oversized.insert("urn:oversized".into(), vec![0; 8 * 1024 * 1024 + 1]);
     assert!(matches!(
         VerifyContext::new()
+            .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
             .key_resolver(&default)
             .allowed_uri_types(UriTypeSet::ALL)
             .external_resources(&oversized)
@@ -359,6 +391,7 @@ fn bounds_external_resources_before_dereference() {
         .extend((0..5).map(|index| (format!("urn:aggregate:{index}"), vec![0; 7 * 1024 * 1024])));
     assert!(matches!(
         VerifyContext::new()
+            .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
             .key_resolver(&default)
             .allowed_uri_types(UriTypeSet::ALL)
             .external_resources(&aggregate)
@@ -377,6 +410,7 @@ fn rejects_wrong_hmac_key_and_invalid_output_length() {
     // MAC mismatch is an invalid status; malformed truncation is a processing error.
     let wrong = HmacSha1VerificationKey::new(b"wrong".to_vec()).expect("valid HMAC key");
     let result = VerifyContext::new()
+        .policy(legacy_policy(SignatureAlgorithm::HmacSha1))
         .key(&wrong)
         .verify(&xml("signature-enveloping-hmac-sha1"))
         .expect("wrong MAC is a validation result");
@@ -388,19 +422,29 @@ fn rejects_wrong_hmac_key_and_invalid_output_length() {
         1,
     );
     assert!(malformed.contains("<HMACOutputLength>72</HMACOutputLength>"));
-    assert!(VerifyContext::new().key(&wrong).verify(&malformed).is_err());
+    assert!(matches!(
+        VerifyContext::new()
+            .policy(legacy_policy(SignatureAlgorithm::HmacSha1))
+            .key(&wrong)
+            .verify(&malformed),
+        Err(DsigError::ParseSignedInfo(ParseError::InvalidStructure(reason)))
+            if reason == "HMACOutputLength must be a byte-aligned value from 80 through 160"
+    ));
 
     let implicit_full_length = xml("signature-enveloping-hmac-sha1-80").replacen(
         "<HMACOutputLength>80</HMACOutputLength>",
         "",
         1,
     );
-    assert!(
+    assert!(matches!(
         VerifyContext::new()
+            .policy(legacy_policy(SignatureAlgorithm::HmacSha1))
             .key(&wrong)
-            .verify(&implicit_full_length)
-            .is_err()
-    );
+            .verify(&implicit_full_length),
+        Err(DsigError::InvalidStructure {
+            reason: "SignatureValue length does not match HMACOutputLength"
+        })
+    ));
 }
 
 #[test]
@@ -408,12 +452,13 @@ fn rejects_malformed_dsa_key_value() {
     // Invalid CryptoBinary input must be rejected before DSA key construction.
     let malformed = xml("signature-enveloped-dsa").replacen("cfYpihpAQeep", "!!!!ihpAQeep", 1);
     assert!(malformed.contains("!!!!ihpAQeep"));
-    assert!(
+    assert!(matches!(
         VerifyContext::new()
+            .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
             .key_resolver(&DefaultKeyResolver::default())
-            .verify(&malformed)
-            .is_err()
-    );
+            .verify(&malformed),
+        Err(DsigError::ParseKeyInfo(ParseError::Base64(_)))
+    ));
 }
 
 #[test]
@@ -430,6 +475,7 @@ fn partial_dsa_key_value_falls_back_to_later_complete_key() {
     assert_valid(
         "partial DSAKeyValue fallback",
         VerifyContext::new()
+            .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
             .key_resolver(&DefaultKeyResolver::default())
             .verify(&document),
     );
@@ -440,6 +486,7 @@ fn rejects_missing_ambiguous_and_weak_key_resolution() {
     // KeyName, RetrievalMethod IDs, and legacy RSA policy each fail closed.
     let resources = external_resources();
     let missing = VerifyContext::new()
+        .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
         .key_resolver(&DefaultKeyResolver::default())
         .allowed_uri_types(UriTypeSet::ALL)
         .external_resources(&resources)
@@ -455,6 +502,7 @@ fn rejects_missing_ambiguous_and_weak_key_resolution() {
         1,
     );
     let ambiguous_error = VerifyContext::new()
+        .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
         .key_resolver(&DefaultKeyResolver::default())
         .allow_internal_dtd(true)
         .allowed_uri_types(UriTypeSet::ALL)
@@ -490,6 +538,7 @@ fn rejects_dtd_and_unsupported_retrieval_defaults() {
     // Internal DTD parsing and RetrievalMethod transform compatibility require exact opt-ins.
     assert!(matches!(
         VerifyContext::new()
+            .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
             .key_resolver(&DefaultKeyResolver::default())
             .verify(&xml("signature")),
         Err(DsigError::XmlParse(_))
@@ -502,6 +551,7 @@ fn rejects_dtd_and_unsupported_retrieval_defaults() {
     );
     let resources = external_resources();
     let unsupported_error = VerifyContext::new()
+        .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
         .key_resolver(&DefaultKeyResolver::default())
         .allow_internal_dtd(true)
         .allowed_uri_types(UriTypeSet::ALL)
@@ -521,6 +571,7 @@ fn rejects_dtd_and_unsupported_retrieval_defaults() {
         ..KeyResolverConfig::default()
     });
     let reference_error = VerifyContext::new()
+        .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
         .key_resolver(&retrieval)
         .external_resources(&resources)
         .verify(&xml("signature-retrievalmethod-rawx509crt"))
@@ -532,6 +583,7 @@ fn rejects_dtd_and_unsupported_retrieval_defaults() {
     ));
 
     let retrieval_error = VerifyContext::new()
+        .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
         .key_resolver(&retrieval)
         .allowed_uri_types(UriTypeSet::ALL)
         .external_resources(&resources)

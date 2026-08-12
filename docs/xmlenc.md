@@ -110,7 +110,7 @@ Successful custom-provider output is also checked against the wire-derived contr
 one exact plaintext length, while AES-CBC output must fit the range permitted by one padding block.
 That uniform diagnostic does not authenticate CBC or remove the success-versus-failure signal.
 Applications processing attacker-controlled ciphertext must authenticate the enclosing protocol
-before acting on plaintext, or exclude AES-CBC with `EncryptionPolicy::data_algorithms` and use
+before acting on plaintext, or exclude AES-CBC with `DecryptionPolicy::data_algorithms` and use
 AES-GCM.
 
 Use `decrypt_document` to replace one typed `EncryptedData` in a complete XML string. Pass its
@@ -120,7 +120,7 @@ XML node ceiling to
 the initial document, replacement-boundary validation, and final output reparse. The projected
 output byte length is checked before constructing the replacement. DTD parsing remains disabled by
 default; legacy documents that need an internal DTD can opt in only when both
-`EncryptionPolicy::xml.allow_internal_dtd` and `DocumentDecryptionOptions::allow_dtd` are enabled.
+`DecryptionPolicy::xml.allow_internal_dtd` and `DocumentDecryptionOptions::allow_dtd` are enabled.
 The per-call option cannot weaken the operation policy, and the API never installs an external
 entity resolver.
 

@@ -3,6 +3,13 @@ use std::process::Command;
 
 pub const REQUIRED_VERSION: (u16, u16, u16) = (1, 3, 13);
 
+pub fn skip_reason() -> String {
+    let (major, minor, patch) = REQUIRED_VERSION;
+    format!(
+        "skipping xmlsec1 interoperability test: xmlsec1 >= {major}.{minor}.{patch} is not installed"
+    )
+}
+
 pub fn command() -> Command {
     let binary = std::env::var_os("XMLSEC1_BIN").unwrap_or_else(|| OsString::from("xmlsec1"));
     Command::new(binary)

@@ -587,16 +587,5 @@ fn qualified_name(prefix: Option<&str>, local_name: &str) -> String {
 
 fn is_namespace_prefix(value: &str) -> bool {
     // Namespaces in XML reserves these names regardless of the URI being bound.
-    // Keep the invariant explicit instead of depending on parser rejection of a
-    // synthetic declaration assembled below.
-    if matches!(value, "xml" | "xmlns") || !is_xml_ncname(value) {
-        return false;
-    }
-
-    // Parsing delegates the complete Unicode XML Name grammar to the same parser
-    // used by the rest of the crate.
-    roxmltree::Document::parse(&format!(
-        "<{value}:n xmlns:{value}=\"urn:xml-sec:prefix-validation\"/>"
-    ))
-    .is_ok()
+    !matches!(value, "xml" | "xmlns") && is_xml_ncname(value)
 }

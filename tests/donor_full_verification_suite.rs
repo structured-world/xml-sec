@@ -128,7 +128,10 @@ fn donor_full_verification_suite_accepts_every_supported_case() {
     let mut passed = 0usize;
     let mut failed = Vec::<String>::new();
     let mut compatibility_policy = VerificationPolicy::default();
-    compatibility_policy.key_trust.allow_legacy_rsa_sha1 = true;
+    compatibility_policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(SignatureAlgorithm::RsaSha1);
 
     for case in cases() {
         let mut operation_policy = compatibility_policy.clone();

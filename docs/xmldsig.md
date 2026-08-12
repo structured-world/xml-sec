@@ -1,5 +1,14 @@
 # XML Digital Signatures
 
+## Migrating from 0.1.10
+
+`SignatureAlgorithm::EcdsaP256Sha256` and `EcdsaP384Sha384` are now
+`EcdsaSha256` and `EcdsaSha384`, because the signature URI selects a digest while
+the key selects P-256, P-384, or P-521. The enum also includes `DsaSha1` and
+`HmacSha1`. `SignedInfo` now reports optional HMAC truncation through
+`hmac_output_length_bits`. Both public types are non-exhaustive; consumers should
+use wildcard match arms and obtain `SignedInfo` through the parser.
+
 The `xmldsig` feature provides signing and verification pipelines for same-document XML
 signatures and detached references whose payloads the caller supplies. It supports inclusive and
 exclusive canonicalization, enveloped signatures,
@@ -183,13 +192,14 @@ Implemented algorithms include RSA PKCS#1 v1.5 with SHA-1/SHA-256/SHA-384/SHA-51
 verification, SHA-256/SHA-384/SHA-512 for signing, and ECDSA with SHA-256 or SHA-384. ECDSA
 verification selects P-256, P-384, or P-521 from the SPKI independently of the hash identifier;
 the built-in P-256 and P-384 signing keys support either ECDSA hash identifier.
-DSA-SHA1 and HMAC-SHA1 (including XMLDSig's byte-aligned 80-160-bit truncation range) are
-verify-only legacy algorithms. They follow the general
-`VerificationPolicy::signature_algorithms` allowlist: the default `None` accepts every implemented
-method subject to its other policy gates, while deployments that require explicit legacy opt-in
-should supply a modern-only allowlist and add these methods only for operations that need them.
-RSA-SHA1 verification is independently default-deny: `None` in the general allowlist does not
-bypass `VerificationPolicy::key_trust.allow_legacy_rsa_sha1`, which callers must explicitly enable.
+RSA-SHA1, DSA-SHA1, and HMAC-SHA1 (including XMLDSig's byte-aligned 80-160-bit truncation range)
+are verify-only legacy algorithms. Every one is independently default-deny: `None` in the general
+`VerificationPolicy::signature_algorithms` allowlist does not bypass
+`VerificationPolicy::key_trust.allowed_legacy_signature_algorithms`, where callers must explicitly
+opt in to each legacy method needed by that operation. `KeyTrustPolicy::rsa_keys` and
+`KeyTrustPolicy::dsa_keys` separately enforce key-strength minima on resolved verification keys;
+their secure defaults are 2048 bits. Compatibility operations may lower the DSA minimum to 1024
+bits, but the non-configurable DSA implementation ceiling remains 3072 bits.
 Selecting the algorithm in untrusted XML does not opt the operation into legacy cryptography, and
 this gate runs before key resolution.
 RSA-SHA1 signing remains unsupported.

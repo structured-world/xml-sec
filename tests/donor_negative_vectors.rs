@@ -75,7 +75,10 @@ fn phaos_bad_digest_reports_reference_mismatch_before_key_use() {
     // validation fails first, proving the exact fail-fast boundary.
     let xml = read_vector("signature-rsa-enveloped-bad-digest-val.xml");
     let mut policy = xml_sec::policy::VerificationPolicy::default();
-    policy.key_trust.allow_legacy_rsa_sha1 = true;
+    policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(SignatureAlgorithm::RsaSha1);
     let key = phaos_verification_key();
     let result = VerifyContext::new()
         .policy(policy)
@@ -139,10 +142,39 @@ fn phaos_certificate_chain_is_expired_at_a_modern_verification_time() {
         max_chain_depth: 2,
         check_crls: false,
         allowed_extended_key_usages: None,
+        rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
     };
 
     assert_eq!(
         verify_x509_certificate_chain(&info, &options),
         Err(X509ChainError::CertificateNotValid(0))
     );
+}
+
+#[test]
+fn x509_path_enforces_configured_issuer_rsa_minimum() {
+    // Cryptographic providers authenticate signatures; deployment key strength
+    // belongs to the compiled path policy and must reject this historical CA.
+    let info = phaos_x509_data();
+    let trusted = vec![PHAOS_RSA_CA_CERTIFICATE.to_vec()];
+    let options = X509ChainOptions {
+        trusted_certs: &trusted,
+        verification_time: UNIX_EPOCH + Duration::from_secs(1_104_580_800),
+        max_chain_depth: 2,
+        check_crls: false,
+        allowed_extended_key_usages: None,
+        rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
+    };
+
+    assert!(matches!(
+        verify_x509_certificate_chain(&info, &options),
+        Err(X509ChainError::KeyPolicy {
+            position: 1,
+            source: PolicyViolation::KeySize {
+                key_type: "RSA",
+                minimum_bits: 2048,
+                ..
+            }
+        })
+    ));
 }

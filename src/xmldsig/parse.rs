@@ -40,6 +40,10 @@ use super::x509::certificate_signature_matches_with_provider;
 use crate::c14n::C14nAlgorithm;
 use crate::c14n::xml_base::{XmlBaseResolutionBudget, resolve_uri_from_node_with_budget};
 
+pub(crate) use crate::hard_limits::SIGNATURE_REFERENCE_CEILING as MAX_REFERENCES_PER_SIGNATURE;
+#[cfg(test)]
+use crate::hard_limits::X509_CHAIN_DEPTH_CEILING as MAX_X509_CHAIN_DEPTH;
+
 /// XMLDSig namespace URI.
 pub(crate) const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 /// XMLDSig 1.1 namespace URI.
@@ -70,11 +74,10 @@ const MAX_X509_SERIAL_NUMBER_VALUE_DIGITS: usize = 49;
 const MAX_X509_SERIAL_NUMBER_BYTES: usize = 20;
 const MAX_X509_DATA_ENTRY_COUNT: usize = 64;
 pub(crate) const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
-const MAX_X509_CHAIN_DEPTH: usize = 9;
-pub(crate) const MAX_REFERENCES_PER_SIGNATURE: usize = 64;
 
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SignatureAlgorithm {
     /// DSA with SHA-1. Verify-only legacy XMLDSig algorithm.
     DsaSha1,
@@ -135,6 +138,7 @@ impl SignatureAlgorithm {
 
 /// Parsed `<SignedInfo>` element.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct SignedInfo {
     /// Canonicalization method for SignedInfo itself.
     pub c14n_method: C14nAlgorithm,
@@ -437,9 +441,9 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
     let mut references = Vec::new();
     for child in children {
         verify_ds_element(child, "Reference")?;
-        if references.len() == MAX_REFERENCES_PER_SIGNATURE {
+        if references.len() == crate::hard_limits::SIGNATURE_REFERENCE_CEILING {
             return Err(ParseError::TooManyReferences {
-                max: MAX_REFERENCES_PER_SIGNATURE,
+                max: crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
             });
         }
         references.push(parse_reference_with_xpath_budget(child, xpath_budget)?);
@@ -1310,7 +1314,7 @@ pub(crate) fn build_x509_certificate_chain_from(
         if chain.contains(&issuer_idx) {
             return Err(X509ChainBuildError::Cycle);
         }
-        if chain.len() == MAX_X509_CHAIN_DEPTH {
+        if chain.len() == crate::hard_limits::X509_CHAIN_DEPTH_CEILING {
             return Err(X509ChainBuildError::DepthExceeded);
         }
         chain.push(issuer_idx);
@@ -1733,9 +1737,12 @@ fn x509_rdns_equal(
 }
 
 fn trailing_whitespace_is_escaped(value: &str) -> bool {
-    let Some(prefix) = value.as_bytes().strip_suffix(b" ") else {
+    let Some((&last, prefix)) = value.as_bytes().split_last() else {
         return false;
     };
+    if !matches!(last, b' ' | b'\t' | b'\r' | b'\n') {
+        return false;
+    }
     prefix
         .iter()
         .rev()
@@ -3458,6 +3465,20 @@ BA== </Modulus>
             "\n  CN=\\ leading\\,plus\\+equals=slash\\\\trailing\\ \n",
             &parsed.subject_dn
         ));
+    }
+
+    #[test]
+    fn distinguished_name_trailing_escape_covers_all_xml_whitespace() {
+        // The normalizer strips all four XML whitespace characters, so escape
+        // detection must preserve each one consistently at RDN boundaries.
+        for whitespace in [' ', '\t', '\r', '\n'] {
+            assert!(trailing_whitespace_is_escaped(&format!(
+                "CN=value\\{whitespace}"
+            )));
+            assert!(!trailing_whitespace_is_escaped(&format!(
+                "CN=value{whitespace}"
+            )));
+        }
     }
 
     #[test]

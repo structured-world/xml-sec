@@ -22,7 +22,7 @@ roxmltree = { version = "0.21", features = ["positions"] }
 quick-xml = "0.41"
 
 # Crypto
-rsa = { version = "0.10.0-rc.18", optional = true }
+rsa = { package = "sad-rsa", version = "0.2.3", features = ["sha1", "sha2"], optional = true }
 sha1 = { version = "0.11", features = ["oid"], optional = true }
 sha2 = { version = "0.11", features = ["oid"], optional = true }
 p256 = { version = "0.14", features = ["ecdsa"], optional = true }

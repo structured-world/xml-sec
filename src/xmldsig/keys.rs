@@ -11,7 +11,10 @@ use x509_parser::{
     x509::SubjectPublicKeyInfo,
 };
 
-use super::signature::{signature_value_matches_spki, verify_rsa_signature_spki_with_minimum};
+use super::signature::{
+    signature_value_matches_spki, verify_dsa_signature_spki_with_minimum,
+    verify_rsa_signature_spki_with_minimum,
+};
 use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
     X509ChainOptions, X509DataInfo,
@@ -173,6 +176,55 @@ impl VerifyingKey for VerificationKey {
     }
 }
 
+struct PolicyBoundVerificationKey {
+    key: VerificationKey,
+    rsa_minimum_bits: usize,
+    dsa_minimum_bits: usize,
+}
+
+impl VerifyingKey for PolicyBoundVerificationKey {
+    fn validate_signature_value(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.key
+            .validate_signature_value(algorithm, signature_value)
+    }
+
+    fn verify(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        if algorithm != self.key.algorithm {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        let result = match algorithm {
+            SignatureAlgorithm::DsaSha1 => verify_dsa_signature_spki_with_minimum(
+                algorithm,
+                &self.key.public_key_bytes,
+                signed_data,
+                signature_value,
+                self.dsa_minimum_bits,
+            ),
+            SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha256
+            | SignatureAlgorithm::RsaSha384
+            | SignatureAlgorithm::RsaSha512 => verify_rsa_signature_spki_with_minimum(
+                algorithm,
+                &self.key.public_key_bytes,
+                signed_data,
+                signature_value,
+                self.rsa_minimum_bits,
+            ),
+            _ => return self.key.verify(algorithm, signed_data, signature_value),
+        };
+        result.map_err(DsigError::Crypto)
+    }
+}
+
 /// Failures while applying [`KeyResolverConfig`] to parsed key material.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -301,6 +353,7 @@ impl DefaultKeyResolver {
             max_chain_depth: trust.max_x509_chain_depth,
             check_crls: trust.check_crls,
             allowed_extended_key_usages: Some(&trust.allowed_extended_key_usages),
+            rsa_keys: trust.rsa_keys,
         };
         verify_x509_certificate_chain_with_provider(info, &options, provider)?;
         Ok(())
@@ -711,7 +764,11 @@ impl DefaultKeyResolver {
                 KeyInfoSource::RetrievalMethod { .. } => None,
             };
             if let Some(key) = resolved {
-                return Ok(Some(Box::new(key)));
+                return Ok(Some(Box::new(PolicyBoundVerificationKey {
+                    key,
+                    rsa_minimum_bits: trust.rsa_keys.minimum_modulus_bits,
+                    dsa_minimum_bits: trust.dsa_keys.minimum_modulus_bits,
+                })));
             }
         }
         if let Some(error) = deferred_key_value_error {
@@ -757,9 +814,10 @@ impl KeyResolver for DefaultKeyResolver {
         provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
         // Resolver defaults and operation policy compose fail-closed. X.509
-        // validation requirements can only become stricter, while the legacy
-        // algorithm opt-in remains exclusively context-owned and is enforced
-        // before key resolution.
+        // validation requirements can only become stricter. Legacy algorithm
+        // and key-strength compatibility remain exclusively operation-owned:
+        // direct resolver calls use `config.trust`, while VerifyContext must
+        // opt in explicitly for each operation and enforces before dispatch.
         let verification_time = match (
             policy.key_trust.verification_time,
             self.config.trust.verification_time,
@@ -784,7 +842,16 @@ impl KeyResolver for DefaultKeyResolver {
                 .key_trust
                 .max_x509_candidate_paths
                 .min(self.config.trust.max_x509_candidate_paths),
-            allow_legacy_rsa_sha1: policy.key_trust.allow_legacy_rsa_sha1,
+            allowed_legacy_signature_algorithms: policy
+                .key_trust
+                .allowed_legacy_signature_algorithms
+                .clone(),
+            rsa_keys: crate::policy::RsaKeyPolicy {
+                minimum_modulus_bits: policy.key_trust.rsa_keys.minimum_modulus_bits,
+            },
+            dsa_keys: crate::policy::DsaKeyPolicy {
+                minimum_modulus_bits: policy.key_trust.dsa_keys.minimum_modulus_bits,
+            },
             allowed_extended_key_usages: policy
                 .key_trust
                 .allowed_extended_key_usages
@@ -2716,7 +2783,9 @@ mod tests {
         // the capable key came from RSAKeyValue, DER, X.509, or KeyName.
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             trust: crate::policy::KeyTrustPolicy {
-                allow_legacy_rsa_sha1: true,
+                allowed_legacy_signature_algorithms: std::collections::HashSet::from([
+                    SignatureAlgorithm::RsaSha1,
+                ]),
                 ..crate::policy::KeyTrustPolicy::default()
             },
             ..KeyResolverConfig::default()
@@ -2814,6 +2883,12 @@ mod tests {
         ];
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             named_keys: HashMap::from([("legacy".into(), named_key.clone())]),
+            trust: crate::policy::KeyTrustPolicy {
+                rsa_keys: crate::policy::RsaKeyPolicy {
+                    minimum_modulus_bits: 1024,
+                },
+                ..crate::policy::KeyTrustPolicy::default()
+            },
             ..KeyResolverConfig::default()
         });
 

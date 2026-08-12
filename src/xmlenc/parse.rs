@@ -28,8 +28,7 @@ pub(super) fn parse_encrypted_data_with_policy(
         xml,
         ParsingOptions {
             allow_dtd: policy.xml.allow_internal_dtd,
-            nodes_limit: u32::try_from(policy.resources.max_xml_nodes)
-                .unwrap_or(crate::hard_limits::XML_DOCUMENT_NODE_CEILING),
+            nodes_limit: policy.resources.effective_xml_nodes(),
             entity_resolver: None,
         },
     )?;

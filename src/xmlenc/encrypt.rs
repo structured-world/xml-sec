@@ -174,7 +174,7 @@ impl EncryptedDataBuilder {
                     selected,
                     generated.xml_nodes,
                     ReplacementMode::ReplaceElement,
-                    self.policy.resources.max_xml_nodes,
+                    self.policy.resources.effective_xml_nodes() as usize,
                 )?;
                 Ok(replace_range(xml, range, &result.encrypted_data_xml))
             }
@@ -211,7 +211,7 @@ impl EncryptedDataBuilder {
                     selected,
                     generated.xml_nodes,
                     ReplacementMode::ReplaceContent,
-                    self.policy.resources.max_xml_nodes,
+                    self.policy.resources.effective_xml_nodes() as usize,
                 )?;
                 replace_element_content(xml, range, source, boundaries, &result.encrypted_data_xml)
             }
@@ -257,7 +257,7 @@ impl EncryptedDataBuilder {
         self.validate_document_len(encrypted_data_xml.len())?;
         let xml_nodes = validate_generated_encrypted_data_nodes(
             &encrypted_data_xml,
-            self.policy.resources.max_xml_nodes,
+            self.policy.resources.effective_xml_nodes() as usize,
         )?;
         let replacement = match encrypted_type {
             Some(EncryptedDataType::Content) => ReplacementMode::ReplaceContent,
@@ -839,8 +839,7 @@ fn encryption_parsing_options<'a>(
 ) -> ParsingOptions<'a> {
     ParsingOptions {
         allow_dtd,
-        nodes_limit: u32::try_from(policy.resources.max_xml_nodes)
-            .unwrap_or(crate::hard_limits::XML_DOCUMENT_NODE_CEILING),
+        nodes_limit: policy.resources.effective_xml_nodes(),
         entity_resolver: None,
     }
 }

@@ -636,7 +636,10 @@ fn signing_policy_covers_implicit_and_signed_info_canonicalization() {
         SignContext::new(&private_key)
             .policy(signed_info_disallowed)
             .sign_template(&xml),
-        Err(SigningError::Policy(_))
+        Err(SigningError::Policy(xml_sec::policy::PolicyViolation::Algorithm {
+            operation: "SignedInfo canonicalization",
+            algorithm,
+        })) if algorithm == exclusive_c14n().uri()
     ));
 }
 

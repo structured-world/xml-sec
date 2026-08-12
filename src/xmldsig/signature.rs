@@ -122,6 +122,10 @@ pub enum SignatureVerificationError {
     #[error("invalid SubjectPublicKeyInfo DER")]
     InvalidKeyDer,
 
+    /// A structurally valid key violates the active key-strength policy.
+    #[error("verification key rejected by policy: {0}")]
+    KeyPolicy(#[from] crate::policy::PolicyViolation),
+
     /// The provided public key does not match the signature algorithm.
     #[error("public key does not match signature algorithm: {uri}")]
     KeyAlgorithmMismatch {
@@ -282,6 +286,22 @@ pub fn verify_dsa_signature_spki(
     signed_data: &[u8],
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
+    verify_dsa_signature_spki_with_minimum(
+        algorithm,
+        public_key_spki_der,
+        signed_data,
+        signature_value,
+        crate::policy::DsaKeyPolicy::default().minimum_modulus_bits,
+    )
+}
+
+pub(crate) fn verify_dsa_signature_spki_with_minimum(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+    minimum_modulus_bits: usize,
+) -> Result<bool, SignatureVerificationError> {
     if algorithm != SignatureAlgorithm::DsaSha1 {
         return Err(SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_string(),
@@ -292,6 +312,12 @@ pub fn verify_dsa_signature_spki(
     }
     let key = dsa::VerifyingKey::from_public_key_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let modulus_bits = usize::try_from(key.components().p().bits_vartime())
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    crate::policy::DsaKeyPolicy {
+        minimum_modulus_bits,
+    }
+    .validate_modulus_bits(modulus_bits)?;
     let Some(signature) = dsa::Signature::from_components(
         crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[..20]),
         crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[20..]),
@@ -392,7 +418,7 @@ pub(crate) fn validate_rsa_key_components(
     }
     .validate_components("verification", modulus, exponent)
     .map(|_| ())
-    .map_err(|_| SignatureVerificationError::InvalidKeyDer)
+    .map_err(SignatureVerificationError::KeyPolicy)
 }
 
 fn ensure_rsa_signature_algorithm(
@@ -748,11 +774,12 @@ mod tests {
         let signature = [0_u8; 40];
 
         assert!(matches!(
-            verify_dsa_signature_spki(
+            verify_dsa_signature_spki_with_minimum(
                 SignatureAlgorithm::DsaSha1,
                 public_key,
                 b"signed",
                 &signature,
+                1024,
             ),
             Ok(false)
         ));

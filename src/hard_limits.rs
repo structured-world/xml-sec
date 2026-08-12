@@ -36,3 +36,14 @@ pub(crate) const ENCRYPTION_METADATA_BYTE_CEILING: usize = 4 * 1024;
 /// Largest RSA modulus accepted by built-in operation paths.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const RSA_MODULUS_BIT_CEILING: usize = 8192;
+/// Largest DSA prime modulus accepted by built-in verification paths.
+#[cfg(feature = "xmldsig")]
+pub(crate) const DSA_MODULUS_BIT_CEILING: usize = 3072;
+#[cfg(feature = "xmldsig")]
+pub(crate) const SIGNATURE_REFERENCE_CEILING: usize = 64;
+#[cfg(feature = "xmldsig")]
+pub(crate) const REFERENCE_TRANSFORM_CEILING: usize = 64;
+#[cfg(feature = "xmldsig")]
+pub(crate) const X509_CHAIN_DEPTH_CEILING: usize = 9;
+#[cfg(feature = "xmldsig")]
+pub(crate) const X509_CANDIDATE_PATH_CEILING: usize = 64;

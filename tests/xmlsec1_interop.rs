@@ -239,7 +239,7 @@ fn xmlsec1_verifies_rsa_sha256_signature_from_xml_sec() {
     // A separate implementation must accept the generated enveloped signature,
     // including its reference digest, exclusive C14N, and RSA SignatureValue.
     if !xmlsec1::is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 
@@ -262,7 +262,7 @@ fn xmlsec1_verifies_base64_reference_signature_from_xml_sec() {
     // The donor implementation must derive the same decoded octets from a
     // node set containing nested elements and comments.
     if !xmlsec1::is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 
@@ -283,7 +283,7 @@ fn xml_sec_verifies_base64_reference_signature_from_xmlsec1() {
     // Reciprocal generation proves our parser and text-node conversion accept
     // the transform representation emitted and digested by xmlsec1.
     if !xmlsec1::is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 
@@ -324,7 +324,7 @@ fn xmlsec1_verifies_xpath_filter2_signature_from_xml_sec() {
     // xmlsec1 must derive the same subtree set after ordered intersect and
     // subtract operations and accept our resulting RSA signature.
     if !xmlsec1::is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
     let key = RsaSigningKey::from_pkcs8_pem(
@@ -347,7 +347,7 @@ fn xml_sec_verifies_xpath_filter2_signature_from_xmlsec1() {
     // Reciprocal signing proves the parser and evaluator accept Filter 2.0 XML
     // and digest octets produced independently by xmlsec1.
     if !xmlsec1::is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
     let template = xpath_filter2_signing_builder()
@@ -383,7 +383,7 @@ fn xmlsec1_verifies_selected_axes_without_their_owner_from_xml_sec() {
     // when their owner element is absent, producing valid digest octets that
     // are intentionally not a well-balanced XML fragment.
     if !xmlsec1::is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
     let key = RsaSigningKey::from_pkcs8_pem(
@@ -406,7 +406,7 @@ fn xml_sec_verifies_selected_axes_without_their_owner_from_xmlsec1() {
     // Reciprocal signing proves xmlsec1 independently canonicalizes the same
     // esoteric node-set to the octets consumed by xml-sec.
     if !xmlsec1::is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
     let template = omitted_owner_axes_signing_builder()
@@ -441,7 +441,7 @@ fn xmlsec1_verifies_ecdsa_signatures_from_xml_sec() {
     // P-256 and P-384 prove that xml-sec emits XMLDSig raw r||s values that
     // xmlsec1 accepts for both supported ECDSA curve widths.
     if !xmlsec1::is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 
@@ -480,7 +480,7 @@ fn xmlsec1_rejects_tampered_signature_from_xml_sec() {
     // The external verifier must reject a changed signed payload, proving the
     // test is exercising validation rather than merely command invocation.
     if !xmlsec1::is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 
@@ -512,7 +512,7 @@ fn xml_sec_verifies_xmlsec1_signatures_with_embedded_certificates() {
     // xmlsec1 must create signatures that our full pipeline accepts through
     // the embedded X509Data resolver, not through a separately injected key.
     if !xmlsec1::is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 
@@ -557,7 +557,7 @@ fn xml_sec_rejects_tampered_xmlsec1_signature_before_crypto_verification() {
     // Mutating the signed Object must fail reference validation before the
     // verifier reaches SignatureValue cryptography, matching XMLDSig fail-fast.
     if !xmlsec1::is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 

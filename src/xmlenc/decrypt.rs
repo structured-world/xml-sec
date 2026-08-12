@@ -549,8 +549,9 @@ fn decryption_parsing_options_with_internal_nodes<'input>(
         allow_dtd: policy.xml.allow_internal_dtd,
         // The temporary wrapper proves fragment boundaries but is not part of
         // either caller-owned input or the final decrypted document.
-        nodes_limit: u32::try_from(policy.resources.max_xml_nodes)
-            .unwrap_or(crate::hard_limits::XML_DOCUMENT_NODE_CEILING)
+        nodes_limit: policy
+            .resources
+            .effective_xml_nodes()
             .saturating_add(internal_nodes),
         entity_resolver: None,
     }
@@ -875,7 +876,7 @@ fn map_data_decryption_error(
         ) => XmlEncError::InvalidCbcCiphertextLength(ciphertext_len.saturating_sub(16)),
         (
             DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc,
-            ProviderError::InvalidInput(crate::provider::ProviderInputError::XmlEncCbcPadding),
+            ProviderError::InvalidInput(crate::provider::ProviderInputError::AesCbcCiphertext),
         ) => XmlEncError::InvalidPadding,
         (_, error) => XmlEncError::Provider(error),
     }
@@ -2224,7 +2225,7 @@ mod tests {
             DataEncryptionAlgorithm::Aes128Cbc,
             32,
             crate::provider::ProviderError::InvalidInput(
-                crate::provider::ProviderInputError::XmlEncCbcPadding,
+                crate::provider::ProviderInputError::AesCbcCiphertext,
             ),
         );
 

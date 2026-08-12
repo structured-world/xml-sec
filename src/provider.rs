@@ -116,16 +116,6 @@ pub enum ProviderInputError {
     /// AES-CBC block decryption failed.
     #[error("invalid AES-CBC ciphertext")]
     AesCbcCiphertext,
-    /// AES-CBC produced no plaintext block.
-    #[error("empty AES-CBC plaintext")]
-    AesCbcPlaintext,
-    /// XMLEnc CBC padding length is outside the valid block range.
-    ///
-    /// This variant deliberately carries no decrypted bytes or padding length.
-    /// CBC remains unauthenticated, so callers must authenticate ciphertexts
-    /// before acting on decryption results or reject CBC through operation policy.
-    #[error("invalid XMLEnc CBC padding")]
-    XmlEncCbcPadding,
     /// AES-GCM input does not contain a nonce and authentication tag.
     #[error("invalid AES-GCM framing")]
     AesGcmFraming,
@@ -647,10 +637,8 @@ mod rustcrypto_x509 {
     use sha2::{Sha256, Sha384, Sha512};
     use signature::Verifier as _;
     use x509_parser::prelude::FromDer as _;
-    use x509_parser::public_key::RSAPublicKey as X509RsaPublicKey;
 
     use super::{ProviderError, X509SignatureAlgorithm};
-    use crate::xmldsig::signature::validate_rsa_key_components;
     use crate::xmldsig::{
         DigestAlgorithm, DsigError, SignatureAlgorithm, VerificationKey, VerifyingKey as _,
     };
@@ -666,11 +654,15 @@ mod rustcrypto_x509 {
                 let Some(signature) = dsa_der_to_xmldsig(signature) else {
                     return Ok(false);
                 };
-                verify_xml_signature(
-                    SignatureAlgorithm::DsaSha1,
-                    signed_data,
-                    &signature,
-                    issuer_spki_der,
+                Ok(
+                    crate::xmldsig::signature::verify_dsa_signature_spki_with_minimum(
+                        SignatureAlgorithm::DsaSha1,
+                        issuer_spki_der,
+                        signed_data,
+                        &signature,
+                        1024,
+                    )
+                    .unwrap_or(false),
                 )
             }
             X509SignatureAlgorithm::RsaPkcs1v15(digest) => {
@@ -774,11 +766,6 @@ mod rustcrypto_x509 {
         signature_algorithm: X509SignatureAlgorithm,
     ) -> Option<RsaPublicKey> {
         let (_, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(spki_der).ok()?;
-        let (rest, raw_key) = X509RsaPublicKey::from_der(&spki.subject_public_key.data).ok()?;
-        if !rest.is_empty() {
-            return None;
-        }
-        validate_rsa_key_components(raw_key.modulus, raw_key.exponent, 2048).ok()?;
         match spki.algorithm.algorithm.to_id_string().as_str() {
             "1.2.840.113549.1.1.1" => RsaPublicKey::from_public_key_der(spki_der).ok(),
             "1.2.840.113549.1.1.10" => {
@@ -1006,12 +993,12 @@ mod rustcrypto {
             .decrypt_padded::<NoPadding>(&mut plaintext)
             .map_err(|_| ProviderError::InvalidInput(ProviderInputError::AesCbcCiphertext))?;
         let pad_len = *plaintext.last().ok_or(ProviderError::InvalidInput(
-            ProviderInputError::AesCbcPlaintext,
+            ProviderInputError::AesCbcCiphertext,
         ))?;
         let padding_bytes = usize::from(pad_len);
         if !(1..=16).contains(&padding_bytes) || padding_bytes > plaintext.len() {
             return Err(ProviderError::InvalidInput(
-                ProviderInputError::XmlEncCbcPadding,
+                ProviderInputError::AesCbcCiphertext,
             ));
         }
         plaintext.truncate(plaintext.len() - padding_bytes);
@@ -1615,7 +1602,9 @@ mod tests {
     #[cfg(feature = "xmldsig")]
     #[test]
     fn verification_facade_rejects_malformed_dsa_before_provider_dispatch() {
-        use crate::xmldsig::{DefaultKeyResolver, DsigStatus, FailureReason, VerifyContext};
+        use crate::xmldsig::{
+            DefaultKeyResolver, DsigStatus, FailureReason, SignatureAlgorithm, VerifyContext,
+        };
 
         let original = include_str!(
             "../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-dsa.xml"
@@ -1637,7 +1626,14 @@ mod tests {
             accept_signatures: true,
         };
 
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy
+            .key_trust
+            .allowed_legacy_signature_algorithms
+            .insert(SignatureAlgorithm::DsaSha1);
+        policy.key_trust.dsa_keys.minimum_modulus_bits = 1024;
         let result = VerifyContext::new()
+            .policy(policy)
             .provider(&provider)
             .key_resolver(&DefaultKeyResolver::default())
             .verify(&malformed)
@@ -1772,7 +1768,7 @@ mod tests {
 
     #[cfg(feature = "xmldsig")]
     #[test]
-    fn rustcrypto_provider_rejects_weak_rsa_pss_issuer_keys() {
+    fn primitive_provider_does_not_embed_rsa_strength_policy() {
         use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
         use rsa::{RsaPrivateKey, pkcs8::EncodePublicKey, pss::SigningKey as RsaPssSigningKey};
         use sha2::Sha256;
@@ -1792,7 +1788,7 @@ mod tests {
             .to_vec();
 
         assert!(
-            !RUST_CRYPTO_PROVIDER
+            RUST_CRYPTO_PROVIDER
                 .verify_x509_signature(
                     X509SignatureAlgorithm::RsaPss {
                         digest: DigestAlgorithm::Sha256,
@@ -1803,7 +1799,9 @@ mod tests {
                     &signature,
                     public_key.as_bytes(),
                 )
-                .expect("weak issuer key is invalid, not an unsupported algorithm")
+                .expect(
+                    "provider must evaluate structurally valid RSA-PSS independently of policy"
+                )
         );
     }
 

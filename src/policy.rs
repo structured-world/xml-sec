@@ -96,6 +96,58 @@ pub struct RsaKeyPolicy {
     pub minimum_modulus_bits: usize,
 }
 
+/// DSA strength requirements for legacy signature verification.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DsaKeyPolicy {
+    /// Minimum prime-modulus width accepted for DSA verification.
+    pub minimum_modulus_bits: usize,
+}
+
+#[cfg(feature = "xmldsig")]
+impl Default for DsaKeyPolicy {
+    fn default() -> Self {
+        Self {
+            minimum_modulus_bits: 2048,
+        }
+    }
+}
+
+#[cfg(feature = "xmldsig")]
+impl DsaKeyPolicy {
+    /// Validate the configured minimum against the implementation ceiling.
+    pub fn validate(&self) -> Result<(), PolicyViolation> {
+        if self.minimum_modulus_bits == 0 || !self.minimum_modulus_bits.is_multiple_of(64) {
+            return Err(PolicyViolation::InvalidResourceLimit {
+                resource: "minimum DSA modulus bits",
+                requirement: "minimum must be a nonzero multiple of 64 bits",
+                actual: self.minimum_modulus_bits,
+            });
+        }
+        ResourcePolicy::within(
+            "minimum DSA modulus bits",
+            self.minimum_modulus_bits,
+            crate::hard_limits::DSA_MODULUS_BIT_CEILING,
+        )
+    }
+
+    pub(crate) fn validate_modulus_bits(&self, actual_bits: usize) -> Result<(), PolicyViolation> {
+        self.validate()?;
+        if !(self.minimum_modulus_bits..=crate::hard_limits::DSA_MODULUS_BIT_CEILING)
+            .contains(&actual_bits)
+        {
+            return Err(PolicyViolation::KeySize {
+                operation: "verification",
+                key_type: "DSA",
+                minimum_bits: self.minimum_modulus_bits,
+                maximum_bits: crate::hard_limits::DSA_MODULUS_BIT_CEILING,
+                actual_bits,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 impl Default for RsaKeyPolicy {
     fn default() -> Self {
@@ -213,8 +265,8 @@ impl Default for ResourcePolicy {
     fn default() -> Self {
         Self {
             max_xml_nodes: crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
-            max_references: 64,
-            max_transforms_per_reference: 64,
+            max_references: crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
+            max_transforms_per_reference: crate::hard_limits::REFERENCE_TRANSFORM_CEILING,
             max_xml_base_components: crate::hard_limits::XML_BASE_COMPONENT_CEILING,
             max_xml_base_resolution_bytes: crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING,
             max_canonicalized_bytes: crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING,
@@ -242,11 +294,15 @@ impl ResourcePolicy {
             self.max_canonicalized_bytes,
             crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING,
         )?;
-        Self::within("signature references", self.max_references, 64)?;
+        Self::within(
+            "signature references",
+            self.max_references,
+            crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
+        )?;
         Self::within(
             "reference transforms",
             self.max_transforms_per_reference,
-            64,
+            crate::hard_limits::REFERENCE_TRANSFORM_CEILING,
         )?;
         Self::within(
             "XML Base components",
@@ -299,6 +355,27 @@ impl ResourcePolicy {
             });
         }
         Ok(())
+    }
+
+    pub(crate) fn effective_xml_nodes(&self) -> u32 {
+        u32::try_from(self.max_xml_nodes)
+            .unwrap_or(crate::hard_limits::XML_DOCUMENT_NODE_CEILING)
+            .min(crate::hard_limits::XML_DOCUMENT_NODE_CEILING)
+    }
+
+    pub(crate) fn effective_canonicalized_bytes(&self) -> usize {
+        self.max_canonicalized_bytes
+            .min(crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING)
+    }
+
+    pub(crate) fn effective_xml_base_components(&self) -> usize {
+        self.max_xml_base_components
+            .min(crate::hard_limits::XML_BASE_COMPONENT_CEILING)
+    }
+
+    pub(crate) fn effective_xml_base_resolution_bytes(&self) -> usize {
+        self.max_xml_base_resolution_bytes
+            .min(crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING)
     }
 
     fn within(
@@ -371,8 +448,12 @@ pub struct KeyTrustPolicy {
     pub max_x509_chain_depth: usize,
     /// Maximum complete or partial signature-valid path states generated.
     pub max_x509_candidate_paths: usize,
-    /// Permit legacy RSA-SHA1 verification after key resolution.
-    pub allow_legacy_rsa_sha1: bool,
+    /// Legacy signature algorithms explicitly permitted for verification.
+    pub allowed_legacy_signature_algorithms: HashSet<SignatureAlgorithm>,
+    /// RSA requirements enforced for resolved verification keys and issuer keys.
+    pub rsa_keys: RsaKeyPolicy,
+    /// DSA requirements enforced for resolved verification keys.
+    pub dsa_keys: DsaKeyPolicy,
     /// Purposes accepted when any certificate in a path carries ExtendedKeyUsage.
     ///
     /// An empty set accepts only paths whose certificates omit ExtendedKeyUsage
@@ -391,9 +472,11 @@ impl Default for KeyTrustPolicy {
     fn default() -> Self {
         Self {
             verify_x509_chains: false,
-            max_x509_chain_depth: 9,
-            max_x509_candidate_paths: 64,
-            allow_legacy_rsa_sha1: false,
+            max_x509_chain_depth: crate::hard_limits::X509_CHAIN_DEPTH_CEILING,
+            max_x509_candidate_paths: crate::hard_limits::X509_CANDIDATE_PATH_CEILING,
+            allowed_legacy_signature_algorithms: HashSet::new(),
+            rsa_keys: RsaKeyPolicy::default(),
+            dsa_keys: DsaKeyPolicy::default(),
             allowed_extended_key_usages: HashSet::new(),
             check_crls: false,
             verification_time: None,
@@ -423,8 +506,18 @@ impl KeyTrustPolicy {
                 reason: "custom extended key purposes must contain valid OID arcs",
             });
         }
-        ResourcePolicy::nonzero_within("X.509 chain depth", self.max_x509_chain_depth, 9)?;
-        ResourcePolicy::nonzero_within("X.509 candidate paths", self.max_x509_candidate_paths, 64)
+        self.rsa_keys.validate()?;
+        self.dsa_keys.validate()?;
+        ResourcePolicy::nonzero_within(
+            "X.509 chain depth",
+            self.max_x509_chain_depth,
+            crate::hard_limits::X509_CHAIN_DEPTH_CEILING,
+        )?;
+        ResourcePolicy::nonzero_within(
+            "X.509 candidate paths",
+            self.max_x509_candidate_paths,
+            crate::hard_limits::X509_CANDIDATE_PATH_CEILING,
+        )
     }
 }
 
@@ -433,7 +526,7 @@ impl KeyTrustPolicy {
 #[derive(Debug, Clone, Default)]
 pub struct VerificationPolicy {
     /// Allowed signature methods; `None` accepts every implemented method subject to
-    /// independent gates such as [`KeyTrustPolicy::allow_legacy_rsa_sha1`].
+    /// independent gates such as [`KeyTrustPolicy::allowed_legacy_signature_algorithms`].
     pub signature_algorithms: Option<HashSet<SignatureAlgorithm>>,
     /// Allowed reference digest methods; `None` accepts every implemented method.
     pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
@@ -468,7 +561,16 @@ impl VerificationPolicy {
         &self,
         algorithm: SignatureAlgorithm,
     ) -> Result<(), PolicyViolation> {
-        if algorithm == SignatureAlgorithm::RsaSha1 && !self.key_trust.allow_legacy_rsa_sha1 {
+        if matches!(
+            algorithm,
+            SignatureAlgorithm::RsaSha1
+                | SignatureAlgorithm::DsaSha1
+                | SignatureAlgorithm::HmacSha1
+        ) && !self
+            .key_trust
+            .allowed_legacy_signature_algorithms
+            .contains(&algorithm)
+        {
             return Err(PolicyViolation::Algorithm {
                 operation: "verification",
                 algorithm: algorithm.uri().to_string(),
@@ -741,18 +843,78 @@ mod tests {
 
     #[cfg(feature = "xmldsig")]
     #[test]
-    fn rsa_sha1_requires_legacy_verification_policy() {
+    fn legacy_signature_algorithms_require_independent_policy_opt_ins() {
+        let legacy = [
+            SignatureAlgorithm::RsaSha1,
+            SignatureAlgorithm::DsaSha1,
+            SignatureAlgorithm::HmacSha1,
+        ];
         let mut policy = VerificationPolicy::default();
-        assert!(
+
+        for algorithm in legacy {
+            assert!(matches!(
+                policy.check_signature_algorithm(algorithm),
+                Err(PolicyViolation::Algorithm { .. })
+            ));
             policy
-                .check_signature_algorithm(SignatureAlgorithm::RsaSha1)
-                .is_err()
-        );
-        policy.key_trust.allow_legacy_rsa_sha1 = true;
-        assert!(
+                .key_trust
+                .allowed_legacy_signature_algorithms
+                .insert(algorithm);
+            assert_eq!(policy.check_signature_algorithm(algorithm), Ok(()));
             policy
-                .check_signature_algorithm(SignatureAlgorithm::RsaSha1)
-                .is_ok()
-        );
+                .key_trust
+                .allowed_legacy_signature_algorithms
+                .remove(&algorithm);
+        }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn dsa_key_policy_enforces_configured_minimum_and_hard_ceiling() {
+        let policy = DsaKeyPolicy::default();
+
+        assert!(matches!(
+            policy.validate_modulus_bits(1024),
+            Err(PolicyViolation::KeySize {
+                key_type: "DSA",
+                minimum_bits: 2048,
+                maximum_bits: 3072,
+                actual_bits: 1024,
+                ..
+            })
+        ));
+        assert_eq!(policy.validate_modulus_bits(2048), Ok(()));
+        assert!(matches!(
+            policy.validate_modulus_bits(4096),
+            Err(PolicyViolation::KeySize {
+                key_type: "DSA",
+                minimum_bits: 2048,
+                maximum_bits: 3072,
+                actual_bits: 4096,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn documented_xmldsig_limits_match_hard_limits() {
+        // Public deployment guidance must change in the same commit as the
+        // implementation ceilings from which these values are derived.
+        let docs = include_str!("../docs/xmldsig.md");
+        let mib = 1024 * 1024;
+        assert!(docs.contains(&format!(
+            "Individual resources are limited to {} MiB",
+            crate::hard_limits::EXTERNAL_RESOURCE_BYTE_CEILING / mib
+        )));
+        assert!(docs.contains(&format!(
+            "complete map to {} MiB",
+            crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING / mib
+        )));
+        assert!(docs.contains(&format!(
+            "ceilings are {} components and {} MiB per operation",
+            crate::hard_limits::XML_BASE_COMPONENT_CEILING,
+            crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING / mib
+        )));
     }
 }

@@ -304,13 +304,12 @@ impl TransformExecutionBudget {
 impl TransformExecutionBudget {
     pub(crate) fn from_resources(resources: &crate::policy::ResourcePolicy) -> Self {
         Self {
-            c14n: C14nOutputBudget::with_limit(resources.max_canonicalized_bytes),
+            c14n: C14nOutputBudget::with_limit(resources.effective_canonicalized_bytes()),
             xml_base_resolution: XmlBaseResolutionBudget::with_limits(
-                resources.max_xml_base_components,
-                resources.max_xml_base_resolution_bytes,
+                resources.effective_xml_base_components(),
+                resources.effective_xml_base_resolution_bytes(),
             ),
-            xml_node_limit: u32::try_from(resources.max_xml_nodes)
-                .unwrap_or(XML_DOCUMENT_NODE_CEILING),
+            xml_node_limit: resources.effective_xml_nodes(),
             ..Self::default()
         }
     }

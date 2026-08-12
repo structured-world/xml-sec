@@ -18,7 +18,10 @@ use super::{
     X509DataInfo,
     parse::{distinguished_name_within_subtree, distinguished_names_equal, x509_name_to_rfc4514},
 };
-use crate::{policy::ExtendedKeyPurpose, provider::X509SignatureAlgorithm};
+use crate::{
+    policy::{ExtendedKeyPurpose, RsaKeyPolicy},
+    provider::X509SignatureAlgorithm,
+};
 
 /// Inputs controlling X.509 certificate-chain validation.
 #[derive(Debug, Clone)]
@@ -33,6 +36,8 @@ pub struct X509ChainOptions<'a> {
     pub check_crls: bool,
     /// Purposes accepted when any path certificate carries ExtendedKeyUsage.
     pub allowed_extended_key_usages: Option<&'a HashSet<ExtendedKeyPurpose>>,
+    /// RSA strength requirements for every issuer key used by the path.
+    pub rsa_keys: RsaKeyPolicy,
 }
 
 /// Certificate-chain validation failure.
@@ -116,6 +121,14 @@ pub enum X509ChainError {
     /// A certificate signature does not verify under its issuer key.
     #[error("certificate signature at chain position {0} is invalid or unsupported")]
     InvalidSignature(usize),
+    /// An issuer key violates the active key-strength policy.
+    #[error("certificate issuer key at chain position {position} is rejected by policy: {source}")]
+    KeyPolicy {
+        /// Position of the issuer certificate in the candidate path.
+        position: usize,
+        /// Typed key-policy rejection.
+        source: crate::policy::PolicyViolation,
+    },
     /// The certificate or CRL declares an algorithm this build cannot verify.
     #[error("unsupported X.509 signature algorithm: {oid}")]
     UnsupportedSignatureAlgorithm {
@@ -235,6 +248,7 @@ fn validate_path(
         .iter()
         .map(|der| parse_certificate(der))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut effective_extended_key_usages = options.allowed_extended_key_usages.cloned();
 
     for (position, cert) in path.iter().enumerate() {
         validate_certificate_serial(cert)?;
@@ -247,7 +261,7 @@ fn validate_path(
         } else {
             validate_ca_constraints(cert, position)?;
         }
-        validate_extended_key_usage(cert, position, options.allowed_extended_key_usages)?;
+        validate_extended_key_usage(cert, position, &mut effective_extended_key_usages)?;
         validate_subject_identity(cert)?;
         validate_critical_extensions(cert, position)?;
     }
@@ -258,6 +272,7 @@ fn validate_path(
         let [child, issuer] = pair else {
             unreachable!()
         };
+        validate_issuer_key_policy(issuer, position + 1, options.rsa_keys)?;
         if !certificate_names_equal(child.issuer(), issuer.subject())
             || !verify_certificate_signature_with_provider(child, issuer, provider)?
         {
@@ -269,6 +284,20 @@ fn validate_path(
         verify_crls(&path, &info.crls, verification_time, provider)?;
     }
     Ok(())
+}
+
+fn validate_issuer_key_policy(
+    issuer: &X509Certificate<'_>,
+    position: usize,
+    rsa_keys: RsaKeyPolicy,
+) -> Result<(), X509ChainError> {
+    let Ok(x509_parser::public_key::PublicKey::RSA(key)) = issuer.public_key().parsed() else {
+        return Ok(());
+    };
+    rsa_keys
+        .validate_components("X.509 issuer verification", key.modulus, key.exponent)
+        .map(|_| ())
+        .map_err(|source| X509ChainError::KeyPolicy { position, source })
 }
 
 fn validate_certificate_serial(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
@@ -913,7 +942,7 @@ fn validate_leaf_key_usage(cert: &X509Certificate<'_>) -> Result<(), X509ChainEr
 fn validate_extended_key_usage(
     cert: &X509Certificate<'_>,
     position: usize,
-    allowed_extended_key_usages: Option<&HashSet<ExtendedKeyPurpose>>,
+    effective_extended_key_usages: &mut Option<HashSet<ExtendedKeyPurpose>>,
 ) -> Result<(), X509ChainError> {
     let Some(usage) = cert
         .extended_key_usage()
@@ -924,11 +953,14 @@ fn validate_extended_key_usage(
     else {
         return Ok(());
     };
-    if usage.value.any
-        || allowed_extended_key_usages
-            .is_some_and(|allowed| extended_key_usage_is_allowed(usage.value, allowed))
-    {
+    if usage.value.any {
         return Ok(());
+    }
+    if let Some(effective) = effective_extended_key_usages {
+        effective.retain(|purpose| extended_key_usage_contains(usage.value, purpose));
+        if !effective.is_empty() {
+            return Ok(());
+        }
     }
     Err(X509ChainError::InvalidKeyUsage {
         position,
@@ -936,29 +968,26 @@ fn validate_extended_key_usage(
     })
 }
 
-fn extended_key_usage_is_allowed(
+fn extended_key_usage_contains(
     usage: &x509_parser::extensions::ExtendedKeyUsage<'_>,
-    allowed: &HashSet<ExtendedKeyPurpose>,
+    purpose: &ExtendedKeyPurpose,
 ) -> bool {
-    (usage.server_auth && allowed.contains(&ExtendedKeyPurpose::ServerAuth))
-        || (usage.client_auth && allowed.contains(&ExtendedKeyPurpose::ClientAuth))
-        || (usage.code_signing && allowed.contains(&ExtendedKeyPurpose::CodeSigning))
-        || (usage.email_protection && allowed.contains(&ExtendedKeyPurpose::EmailProtection))
-        || (usage.time_stamping && allowed.contains(&ExtendedKeyPurpose::TimeStamping))
-        || (usage.ocsp_signing && allowed.contains(&ExtendedKeyPurpose::OcspSigning))
-        || usage.other.iter().any(|oid| {
+    match purpose {
+        ExtendedKeyPurpose::ServerAuth => usage.server_auth,
+        ExtendedKeyPurpose::ClientAuth => usage.client_auth,
+        ExtendedKeyPurpose::CodeSigning => usage.code_signing,
+        ExtendedKeyPurpose::EmailProtection => usage.email_protection,
+        ExtendedKeyPurpose::TimeStamping => usage.time_stamping,
+        ExtendedKeyPurpose::OcspSigning => usage.ocsp_signing,
+        ExtendedKeyPurpose::Other(arcs) => usage.other.iter().any(|oid| {
             let oid = oid.to_id_string();
-            allowed.iter().any(|purpose| match purpose {
-                ExtendedKeyPurpose::Other(arcs) => {
-                    arcs.iter()
-                        .map(u64::to_string)
-                        .collect::<Vec<_>>()
-                        .join(".")
-                        == oid
-                }
-                _ => false,
-            })
-        })
+            arcs.iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(".")
+                == oid
+        }),
+    }
 }
 
 fn parse_certificate(der: &[u8]) -> Result<X509Certificate<'_>, X509ChainError> {
@@ -1720,6 +1749,7 @@ mod tests {
                 max_chain_depth: info.certificate_chain.len(),
                 check_crls: false,
                 allowed_extended_key_usages,
+                rsa_keys: RsaKeyPolicy::default(),
             },
         )
     }
@@ -1851,7 +1881,10 @@ mod tests {
                     &root,
                 )
                 .expect("root should sign leaf certificate");
-            let allowed = HashSet::from([ExtendedKeyPurpose::ServerAuth]);
+            let allowed = HashSet::from([
+                ExtendedKeyPurpose::ServerAuth,
+                ExtendedKeyPurpose::ClientAuth,
+            ]);
             let result = verify_generated_path_with_eku(
                 vec![leaf.der().to_vec(), root.der().to_vec()],
                 root.der().to_vec(),
@@ -2172,6 +2205,7 @@ mod tests {
             max_chain_depth: 2,
             check_crls: false,
             allowed_extended_key_usages: None,
+            rsa_keys: RsaKeyPolicy::default(),
         };
 
         verify_x509_certificate_chain(&info, &options)

@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::c14n::{canonicalize_bounded_with_xml_base_budget, is_output_limit_error};
-use crate::hard_limits::{CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING, XML_DOCUMENT_NODE_CEILING};
+use crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING;
 
 #[cfg(test)]
 use super::digest::compute_digest;
@@ -974,8 +974,7 @@ fn verify_signature_with_context(
         xml,
         roxmltree::ParsingOptions {
             allow_dtd: ctx.policy.xml.allow_internal_dtd,
-            nodes_limit: u32::try_from(ctx.policy.resources.max_xml_nodes)
-                .unwrap_or(XML_DOCUMENT_NODE_CEILING),
+            nodes_limit: ctx.policy.resources.effective_xml_nodes(),
             entity_resolver: None,
         },
     )?;
@@ -1112,7 +1111,7 @@ fn verify_signature_with_context(
         RetrievalMaterialization::default()
     };
     let canonicalized_data_budget =
-        CanonicalizedDataBudget::with_limit(ctx.policy.resources.max_canonicalized_bytes);
+        CanonicalizedDataBudget::with_limit(ctx.policy.resources.effective_canonicalized_bytes());
     let execution = ReferenceExecutionContext {
         store_pre_digest: ctx.store_pre_digest,
         transform_options: ctx.transform_options(),
