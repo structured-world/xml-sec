@@ -716,6 +716,14 @@ impl<'d> Mirror<'d> {
                     match namespace.name() {
                         Some(prefix) => element.register_prefix(prefix, namespace.uri()),
                         None => {
+                            // XPath 1.0's namespace axis does not expose an
+                            // `xmlns=""` undeclaration as a namespace node.
+                            // Registering it in SXD changes canonicalized
+                            // node-sets compared with libxml2/xmlsec.
+                            if namespace.uri().is_empty() {
+                                element.set_default_namespace_uri(None);
+                                continue;
+                            }
                             element.set_default_namespace_uri(Some(namespace.uri()));
                             // SXD's namespace axis enumerates only registered
                             // prefixes and otherwise omits the default binding.

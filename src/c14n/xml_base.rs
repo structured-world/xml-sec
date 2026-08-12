@@ -9,12 +9,73 @@
 //! This module provides a minimal RFC 3986 relative URI resolver — just
 //! enough for `xml:base` fixup. It is NOT a general-purpose URI library.
 
+use std::cell::Cell;
+
 use roxmltree::Node;
 
 use super::NodeVisibility;
 
 /// The XML namespace URI.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+
+/// Deterministic limits shared by XML Base consumers in one operation.
+pub(crate) struct XmlBaseResolutionBudget {
+    remaining_bytes: Cell<usize>,
+    max_bytes: usize,
+    max_components: usize,
+}
+
+impl Default for XmlBaseResolutionBudget {
+    fn default() -> Self {
+        Self::with_limits(
+            crate::hard_limits::XML_BASE_COMPONENT_CEILING,
+            crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING,
+        )
+    }
+}
+
+impl XmlBaseResolutionBudget {
+    pub(crate) fn with_limits(max_components: usize, max_bytes: usize) -> Self {
+        Self {
+            remaining_bytes: Cell::new(max_bytes),
+            max_bytes,
+            max_components,
+        }
+    }
+
+    fn check_components(&self, actual: usize) -> Result<(), XmlBaseResolutionError> {
+        if actual > self.max_components {
+            return Err(XmlBaseResolutionError::Components {
+                maximum: self.max_components,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    fn charge_bytes(&self, bytes: usize) -> Result<(), XmlBaseResolutionError> {
+        let remaining = self.remaining_bytes.get();
+        let Some(next) = remaining.checked_sub(bytes) else {
+            self.remaining_bytes.set(0);
+            return Err(XmlBaseResolutionError::Bytes {
+                maximum: self.max_bytes,
+                actual: self
+                    .max_bytes
+                    .saturating_add(bytes.saturating_sub(remaining)),
+            });
+        };
+        self.remaining_bytes.set(next);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum XmlBaseResolutionError {
+    #[error("XML Base resolution exceeds maximum of {maximum} inherited components: got {actual}")]
+    Components { maximum: usize, actual: usize },
+    #[error("XML Base resolution exceeds cumulative maximum of {maximum} bytes: got {actual}")]
+    Bytes { maximum: usize, actual: usize },
+}
 
 /// Compute the effective `xml:base` for an element by resolving the ancestor
 /// chain per [RFC 3986 §5](https://www.rfc-editor.org/rfc/rfc3986#section-5).
@@ -34,41 +95,86 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 ///
 /// Returns `None` if the considered ancestor chain has no non-empty
 /// `xml:base` attribute.
+#[cfg(test)]
 pub(crate) fn compute_effective_xml_base(
     start: Node<'_, '_>,
     visibility: Option<&dyn NodeVisibility>,
 ) -> Option<String> {
+    compute_effective_xml_base_with_budget(start, visibility, &XmlBaseResolutionBudget::default())
+        .expect("test XML Base fixtures stay within implementation ceilings")
+}
+
+/// Budgeted form used for attacker-controlled XMLDSig URI resolution.
+pub(crate) fn compute_effective_xml_base_with_budget(
+    start: Node<'_, '_>,
+    visibility: Option<&dyn NodeVisibility>,
+    budget: &XmlBaseResolutionBudget,
+) -> Result<Option<String>, XmlBaseResolutionError> {
     let mut bases: Vec<&str> = Vec::new();
     let mut current = Some(start);
-    while let Some(n) = current {
-        if n.is_element() {
-            let base = xml_base_value(n);
+    while let Some(node) = current {
+        if node.is_element() {
+            let base = xml_base_value(node);
             if let Some(set) = visibility
-                && preserves_xml_base_context(n, set)
+                && preserves_xml_base_context(node, set)
             {
-                // A visible non-empty base establishes the context that
-                // descendants inherit in the canonical output. Reapplying
-                // ancestors above that boundary would duplicate the context.
                 break;
             }
             if let Some(base) = base {
+                let component_count = bases.len().saturating_add(1);
+                budget.check_components(component_count)?;
+                budget.charge_bytes(base.len())?;
                 bases.push(base);
             }
         }
-        current = n.parent();
+        current = node.parent();
     }
 
-    if bases.is_empty() {
-        return None;
+    let Some(first) = bases.pop() else {
+        return Ok(None);
+    };
+    budget.charge_bytes(first.len())?;
+    let mut effective = first.to_owned();
+    for relative in bases.into_iter().rev() {
+        effective = resolve_uri_with_budget(&effective, relative, budget)?;
     }
+    Ok(Some(effective))
+}
 
-    // bases is closest-first, root-last. Reverse to resolve root→closest.
-    bases.reverse();
-    let mut effective = bases[0].to_string();
-    for &relative in &bases[1..] {
-        effective = resolve_uri(&effective, relative);
+pub(crate) fn resolve_uri_with_budget(
+    base: &str,
+    reference: &str,
+    budget: &XmlBaseResolutionBudget,
+) -> Result<String, XmlBaseResolutionError> {
+    let input_bytes = base
+        .len()
+        .checked_add(reference.len())
+        .and_then(|bytes| bytes.checked_add(1))
+        .ok_or(XmlBaseResolutionError::Bytes {
+            maximum: budget.max_bytes,
+            actual: usize::MAX,
+        })?;
+    budget.charge_bytes(input_bytes)?;
+    let resolved = resolve_uri(base, reference);
+    budget.charge_bytes(resolved.len())?;
+    Ok(resolved)
+}
+
+/// Resolve a reference against inherited XML Base without traversing ancestors
+/// when the reference already supplies an RFC 3986 scheme.
+#[cfg(feature = "xmldsig")]
+pub(crate) fn resolve_uri_from_node_with_budget(
+    origin: Node<'_, '_>,
+    reference: &str,
+    budget: &XmlBaseResolutionBudget,
+) -> Result<String, XmlBaseResolutionError> {
+    if has_scheme(reference) {
+        return resolve_uri_with_budget("", reference, budget);
     }
-    Some(effective)
+    match compute_effective_xml_base_with_budget(origin, None, budget)? {
+        Some(base) => resolve_uri_with_budget(&base, reference, budget),
+        None => resolve_uri_with_budget("", reference, budget),
+    }
 }
 
 /// Whether a selected element establishes its source `xml:base` context in the
@@ -118,44 +224,62 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
         return base.to_string();
     }
 
-    // Reference with scheme → use as-is (already absolute)
+    // A scheme-bearing reference supplies every target component, but RFC 3986
+    // section 5.2.2 still requires dot-segment removal from its path.
     if has_scheme(reference) {
-        return reference.to_string();
+        let (absolute, suffix) = split_path_suffix(reference);
+        let parts = parse_base(absolute).expect("has_scheme accepted the absolute reference");
+        let path = remove_dot_segments_from_absolute_reference(parts.path);
+        let mut result = recompose(parts.scheme, parts.authority, &path);
+        result.push_str(suffix);
+        return result;
+    }
+
+    // Query- and fragment-only references preserve the complete base path for
+    // both absolute and relative bases (RFC 3986 section 5.2.2).
+    if reference.starts_with('?') {
+        return format!("{}{reference}", strip_query_fragment(base));
+    }
+    if reference.starts_with('#') {
+        return format!("{}{reference}", base.split('#').next().unwrap_or(base));
     }
 
     // Parse base URI components
     let base_parts = match parse_base(base) {
         Some(parts) => parts,
         None => {
-            // Schemeless/relative base. Still perform path-merge and
-            // dot-segment removal so that a chain of relative xml:base
-            // values is correctly collapsed (e.g. "a/b/" + "c/" → "a/b/c/").
-            if reference.starts_with("//") || reference.starts_with('/') {
-                return reference.to_string();
-            }
+            // Schemeless bases include both ordinary relative paths and
+            // network-path references. Preserve the latter's authority while
+            // applying the same RFC 3986 path merge and normalization rules.
             let (ref_path, ref_suffix) = split_path_suffix(reference);
-            let base_path_only = strip_query_fragment(base);
-            let merged = merge_paths(base_path_only, ref_path);
+            if let Some((authority, path)) = parse_network_path(ref_path) {
+                let path = remove_dot_segments(path);
+                return format!("//{authority}{path}{ref_suffix}");
+            }
+            let (base_path_with_authority, _) = split_path_suffix(base);
+            let network_base = parse_network_path(base_path_with_authority);
+            if ref_path.starts_with('/') {
+                let path = remove_dot_segments(ref_path);
+                return match network_base {
+                    Some((authority, _)) => format!("//{authority}{path}{ref_suffix}"),
+                    None => format!("{path}{ref_suffix}"),
+                };
+            }
+            let (base_path, authority) = match network_base {
+                Some((authority, path)) => (path, Some(authority)),
+                None => (base_path_with_authority, None),
+            };
+            let merged = merge_paths(base_path, ref_path, authority.is_some());
             let cleaned = remove_dot_segments(&merged);
-            return format!("{cleaned}{ref_suffix}");
+            return match authority {
+                Some(authority) => format!("//{authority}{cleaned}{ref_suffix}"),
+                None => format!("{cleaned}{ref_suffix}"),
+            };
         }
     };
     let scheme = base_parts.scheme;
     let authority = base_parts.authority;
     let base_path = base_parts.path;
-
-    // Reference starts with ? → query-only: keep base scheme+authority+path.
-    // Reference starts with # → fragment-only: keep base scheme+authority+path+query.
-    // Per RFC 3986 §5.2.2, these replace only the query/fragment components.
-    if reference.starts_with('?') || reference.starts_with('#') {
-        let base_no_qf = strip_query_fragment(base);
-        if reference.starts_with('?') {
-            return format!("{base_no_qf}{reference}");
-        }
-        // Fragment-only: keep query too
-        let base_no_frag = base.split('#').next().unwrap_or(base);
-        return format!("{base_no_frag}{reference}");
-    }
 
     // Split reference into path and query/fragment suffix. We apply
     // remove_dot_segments only to the path portion, then reattach the
@@ -191,7 +315,7 @@ pub(crate) fn resolve_uri(base: &str, reference: &str) -> String {
     // Relative path — merge with base path (strip query/fragment from
     // base_path first, since merge operates on the path component only).
     let clean_base_path = strip_query_fragment(base_path);
-    let merged = merge_paths(clean_base_path, ref_path);
+    let merged = merge_paths(clean_base_path, ref_path, authority.is_some());
     let cleaned = remove_dot_segments(&merged);
     let mut result = recompose(scheme, authority, &cleaned);
     result.push_str(ref_suffix);
@@ -262,6 +386,14 @@ fn parse_base(base: &str) -> Option<BaseParts<'_>> {
     })
 }
 
+/// Split a schemeless network-path reference into authority and path.
+/// Query and fragment components must already have been removed.
+fn parse_network_path(reference: &str) -> Option<(&str, &str)> {
+    let rest = reference.strip_prefix("//")?;
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    Some((&rest[..authority_end], &rest[authority_end..]))
+}
+
 /// Recompose a URI from scheme, optional authority, and path per RFC 3986 §5.3.
 ///
 /// `authority = Some("")` → `scheme:///path` (empty authority, e.g. `file:///`).
@@ -278,16 +410,14 @@ fn recompose(scheme: &str, authority: Option<&str>, path: &str) -> String {
 /// first character to preserve leading `?`/`#` semantics (those are handled
 /// separately as query-only / fragment-only references).
 fn split_path_suffix(reference: &str) -> (&str, &str) {
-    // Find the earliest '?' or '#' after position 0
-    let mut split_at = reference.len();
-    for ch in ['?', '#'] {
-        if let Some(pos) = reference[1..].find(ch) {
-            let abs_pos = pos + 1;
-            if abs_pos < split_at {
-                split_at = abs_pos;
-            }
-        }
-    }
+    // Character indices remain valid UTF-8 slice boundaries for untrusted XML
+    // attribute values. The first scalar is intentionally skipped because
+    // leading query/fragment references are handled before this helper.
+    let split_at = reference
+        .char_indices()
+        .skip(1)
+        .find_map(|(index, ch)| matches!(ch, '?' | '#').then_some(index))
+        .unwrap_or(reference.len());
     (&reference[..split_at], &reference[split_at..])
 }
 
@@ -301,8 +431,12 @@ fn strip_query_fragment(s: &str) -> &str {
 }
 
 /// Merge a relative reference with a base path per RFC 3986 §5.2.3.
-fn merge_paths(base_path: &str, reference: &str) -> String {
-    if base_path.is_empty() {
+///
+/// An authority with an empty path contributes the leading `/`; an empty
+/// schemeless base does not. Keeping that distinction explicit prevents a
+/// relative XML Base from changing the reference kind.
+fn merge_paths(base_path: &str, reference: &str, base_has_authority: bool) -> String {
+    if base_has_authority && base_path.is_empty() {
         format!("/{reference}")
     } else {
         // Remove everything after the last segment of base path.
@@ -323,7 +457,7 @@ mod merge_tests {
     /// Non-hierarchical base path (no '/') should return reference as-is.
     #[test]
     fn non_hierarchical_base_does_not_add_slash() {
-        assert_eq!(merge_paths("foo:bar", "baz"), "baz");
+        assert_eq!(merge_paths("foo:bar", "baz", false), "baz");
     }
 }
 
@@ -332,6 +466,20 @@ mod merge_tests {
 /// For absolute paths (starting with `/`), `..` at the root is a no-op.
 /// For relative paths, unresolved leading `..` segments are preserved.
 fn remove_dot_segments(path: &str) -> String {
+    remove_dot_segments_with_unmatched_parents(path, true)
+}
+
+/// Apply RFC 3986 section 5.2.4 to a reference that already supplied a scheme.
+/// Such a reference is the final target, so unresolved leading parents are
+/// discarded rather than retained for a later base-path merge.
+fn remove_dot_segments_from_absolute_reference(path: &str) -> String {
+    remove_dot_segments_with_unmatched_parents(path, false)
+}
+
+fn remove_dot_segments_with_unmatched_parents(
+    path: &str,
+    preserve_unmatched_parents: bool,
+) -> String {
     let is_absolute = path.starts_with('/');
     let mut segments: Vec<&str> = Vec::new();
 
@@ -345,15 +493,12 @@ fn remove_dot_segments(path: &str) -> String {
                 // - For absolute paths, do not traverse above root (the
                 //   leading "" segment from the initial '/' is preserved).
                 // - For relative paths, preserve unmatched ".." segments.
-                let can_pop = match segments.last() {
-                    Some(&"") => false,   // root segment of absolute path
-                    Some(&"..") => false, // already an unmatched ".."
-                    Some(_) => true,
-                    None => false,
-                };
+                let root_segments = usize::from(is_absolute);
+                let can_pop =
+                    segments.len() > root_segments && !matches!(segments.last(), Some(&".."));
                 if can_pop {
                     segments.pop();
-                } else if !is_absolute {
+                } else if !is_absolute && preserve_unmatched_parents {
                     segments.push("..");
                 }
             }
@@ -384,6 +529,33 @@ mod tests {
         assert_eq!(
             resolve_uri("http://a.com/b", "http://other.com/c"),
             "http://other.com/c"
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_reference_removes_dot_segments() {
+        // RFC 3986 applies dot-segment removal to an absolute reference too;
+        // its existing scheme only prevents inheritance from the base URI.
+        assert_eq!(
+            resolve_uri(
+                "https://base.example/ignored/",
+                "https://example.test/a/../data.bin?version=1#payload"
+            ),
+            "https://example.test/data.bin?version=1#payload"
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_reference_consumes_interior_empty_segment() {
+        // RFC 3986 treats the empty segment introduced by the second slash as
+        // an ordinary path segment. The following parent segment removes it;
+        // only the leading empty segment represents the absolute-path root.
+        assert_eq!(
+            resolve_uri(
+                "https://base.example/ignored/",
+                "https://example.test/a//../b"
+            ),
+            "https://example.test/a/b"
         );
     }
 
@@ -464,11 +636,79 @@ mod tests {
     }
 
     #[test]
+    fn resolve_absolute_path_normalizes_against_schemeless_base() {
+        assert_eq!(resolve_uri("a/b", "/x/../data.bin"), "/data.bin");
+    }
+
+    #[test]
+    fn resolve_network_path_normalizes_against_schemeless_base() {
+        assert_eq!(
+            resolve_uri("a/b", "//cdn.example/x/../data.bin?version=1"),
+            "//cdn.example/data.bin?version=1"
+        );
+    }
+
+    #[test]
+    fn resolve_against_network_path_base_preserves_authority() {
+        // A network-path base has an authority even without a scheme. RFC 3986
+        // resolution must not collapse it into an ordinary absolute path.
+        assert_eq!(
+            resolve_uri("//cdn.example/a/b/", "/x/../data.bin?version=1"),
+            "//cdn.example/data.bin?version=1"
+        );
+        assert_eq!(
+            resolve_uri("//cdn.example/a/b/", "../data.bin"),
+            "//cdn.example/a/data.bin"
+        );
+        assert_eq!(
+            resolve_uri("//cdn.example/a/b?old#fragment", "?new"),
+            "//cdn.example/a/b?new"
+        );
+        assert_eq!(
+            resolve_uri("//cdn.example/a/b?old#fragment", "#new"),
+            "//cdn.example/a/b?old#new"
+        );
+        assert_eq!(
+            resolve_uri("//cdn.example/a/b/", "//other.example/x/../data.bin"),
+            "//other.example/data.bin"
+        );
+    }
+
+    #[test]
+    fn resolve_pathless_schemeless_base_preserves_relative_reference() {
+        // A query-only relative base has no authority. RFC 3986 therefore
+        // preserves a relative reference instead of introducing a root slash.
+        assert_eq!(resolve_uri("?old", "data.bin"), "data.bin");
+    }
+
+    #[test]
+    fn resolve_query_and_fragment_against_schemeless_base() {
+        // RFC 3986 replaces only the query or fragment even when the effective
+        // XML Base is itself relative rather than scheme-bearing.
+        assert_eq!(resolve_uri("a/b?old#frag", "?new"), "a/b?new");
+        assert_eq!(resolve_uri("a/b?old#frag", "#new"), "a/b?old#new");
+    }
+
+    #[test]
     fn resolve_urn_reference() {
         // URN has a scheme, should be returned as-is
         assert_eq!(
             resolve_uri("http://example.com/a", "urn:foo:bar"),
             "urn:foo:bar"
+        );
+    }
+
+    #[test]
+    fn resolve_rootless_absolute_uri_removes_leading_dot_segments() {
+        // Once a reference supplies its own scheme, RFC 3986 section 5.2.4
+        // discards unresolved leading dot segments from the final target path.
+        assert_eq!(
+            resolve_uri("https://example.test/base", "urn:../payload?version=1"),
+            "urn:payload?version=1"
+        );
+        assert_eq!(
+            resolve_uri("https://example.test/base", "urn:./payload"),
+            "urn:payload"
         );
     }
 
@@ -505,6 +745,16 @@ mod tests {
         assert_eq!(
             resolve_uri("http://example.com/a/b", "c?x=1"),
             "http://example.com/a/c?x=1"
+        );
+    }
+
+    #[test]
+    fn resolve_unicode_reference_with_query_uses_utf8_boundaries() {
+        // XML attributes are Unicode strings. URI component splitting must not
+        // index through the first multibyte scalar as if it were one byte.
+        assert_eq!(
+            resolve_uri("https://example.test/base/", "é?x"),
+            "https://example.test/base/é?x"
         );
     }
 

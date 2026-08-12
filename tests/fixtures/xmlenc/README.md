@@ -4,6 +4,9 @@ These fixtures are tracked so decryption interoperability tests do not depend
 on network access or a local xmlsec1 checkout. They were imported from the
 `xmlsec_1_3_12` tag of
 [lsh123/xmlsec](https://github.com/lsh123/xmlsec/tree/xmlsec_1_3_12/tests).
+The pinned 1.3.13 development snapshot at commit
+`5fdd47dc35753438bdc38b6e96c1a3805c67a483` contains no changes to these
+fixture bytes; reciprocal CLI tests run against that newer snapshot.
 
 Imported donor artifacts are kept byte-for-byte, including upstream wording
 and spelling. Repository-specific clarifications belong in this wrapper rather
@@ -57,8 +60,9 @@ algorithms, Diffie-Hellman agreement, or deliberately malformed metadata.
 
 ## Importing Vectors
 
-Point the repository helper at an xmlsec1 1.3.12 test checkout and pass paths
-under the destination corpus. A directory argument imports its complete tree:
+Point the repository helper at the pinned xmlsec1 1.3.13 development checkout
+and pass paths under the destination corpus. A directory argument imports its
+complete tree:
 
 ```sh
 XMLSEC_DONOR_ROOT=/path/to/xmlsec/tests \

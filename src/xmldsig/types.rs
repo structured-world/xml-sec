@@ -202,6 +202,37 @@ impl<'a> NodeSet<'a> {
         Ok(Self::collect_subtree(element))
     }
 
+    /// Create a bare-name same-document fragment node-set, which excludes
+    /// comment nodes before any transforms are applied.
+    pub(crate) fn subtree_without_comments_with_budget(
+        element: Node<'a, 'a>,
+        budget: Option<&NodeSetMaterializationBudget>,
+    ) -> Result<Self, TransformError> {
+        match budget {
+            Some(budget) => Self::charge_subtree_materialization(element, budget)?,
+            None => {
+                Self::ensure_subtree_materialization_fits(element)?;
+            }
+        }
+        let mut set = Self {
+            doc: element.document(),
+            nodes: HashSet::new(),
+            with_comments: false,
+        };
+        for node in element.descendants().filter(|node| !node.is_comment()) {
+            set.insert_node(node);
+            if node.is_element() {
+                for attribute in node.attributes() {
+                    set.insert_attribute(node, attribute.namespace(), attribute.name());
+                }
+                for namespace in node.namespaces() {
+                    set.insert_namespace(node, namespace.name().unwrap_or(""), namespace.uri());
+                }
+            }
+        }
+        Ok(set)
+    }
+
     pub(crate) fn subtree_with_budget(
         element: Node<'a, 'a>,
         budget: &NodeSetMaterializationBudget,
@@ -678,6 +709,46 @@ pub enum TransformError {
     /// to the node-set required by a subsequent transform.
     #[error("XML transform input parse error: {0}")]
     XmlParse(String),
+
+    /// XML octets exceeded the operation policy's document node ceiling.
+    #[error("XML transform input exceeds the configured node limit")]
+    XmlNodeLimit,
+
+    /// Effective XML Base resolution crossed too many inherited attributes.
+    #[error("XML Base resolution exceeds maximum of {max} inherited components: got {actual}")]
+    XmlBaseComponentsTooLarge {
+        /// Maximum inherited components permitted by the operation policy.
+        max: usize,
+        /// Number of inherited components encountered.
+        actual: usize,
+    },
+
+    /// Effective XML Base resolution exhausted its cumulative byte budget.
+    #[error("XML Base resolution exceeds cumulative maximum of {max_bytes} bytes: got {actual}")]
+    XmlBaseResolutionTooLarge {
+        /// Maximum cumulative bytes permitted by the operation policy.
+        max_bytes: usize,
+        /// Conservatively charged cumulative byte count.
+        actual: usize,
+    },
+
+    /// One external resource exceeds the operation's per-resource byte limit.
+    #[error("external resource bytes exceed maximum of {max_bytes}: got {actual}")]
+    ExternalResourceTooLarge {
+        /// Maximum bytes permitted for one external resource.
+        max_bytes: usize,
+        /// Bytes in the selected external resource.
+        actual: usize,
+    },
+
+    /// Repeated external dereferences exhausted the operation-wide byte budget.
+    #[error("aggregate external resource bytes exceed maximum of {max_bytes}: got {actual}")]
+    ExternalResourceTotalTooLarge {
+        /// Maximum cumulative bytes permitted across dereferences.
+        max_bytes: usize,
+        /// Cumulative dereferenced bytes that exceeded the maximum.
+        actual: usize,
+    },
 
     /// The Signature node passed to the enveloped transform belongs to a
     /// different `Document` than the input `NodeSet`.

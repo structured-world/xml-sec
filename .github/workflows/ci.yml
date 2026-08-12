@@ -5,11 +5,15 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
-  XMLSEC1_VERSION: 1.3.12
-  XMLSEC1_SHA256: 24045199af12d93fe5fdbbbf7e386e823e4842071e9432e2b90ac108b889a923
+  XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-1.3.13-5fdd47dc3575
+  XMLSEC1_BIN: ${{ github.workspace }}/.tools/xmlsec1-1.3.13-5fdd47dc3575/bin/xmlsec1
+  LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-1.3.13-5fdd47dc3575/lib
 
 jobs:
   build-matrix:
@@ -21,6 +25,8 @@ jobs:
         rust: [stable, "1.92.0"]
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.rust }}
@@ -43,6 +49,8 @@ jobs:
         rust: [stable, "1.92.0"]
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.rust }}
@@ -51,17 +59,9 @@ jobs:
         run: sudo apt-get update
       - name: Build pinned xmlsec1 for XMLDSig interop tests
         run: |
-          sudo apt-get install --yes build-essential libltdl-dev libssl-dev libxml2-dev pkg-config
-          curl --fail --location --retry 3 --output xmlsec1.tar.gz "https://github.com/lsh123/xmlsec/releases/download/${XMLSEC1_VERSION}/xmlsec1-${XMLSEC1_VERSION}.tar.gz"
-          echo "${XMLSEC1_SHA256}  xmlsec1.tar.gz" | sha256sum --check --strict
-          tar --extract --file xmlsec1.tar.gz
-          pushd "xmlsec1-${XMLSEC1_VERSION}"
-          ./configure --disable-static --with-openssl
-          make --jobs "$(nproc)"
-          sudo make install
-          popd
-          sudo ldconfig
-          xmlsec1 --version
+          sudo apt-get install --yes autoconf automake build-essential libltdl-dev libssl-dev libtool libxml2-dev pkg-config
+          scripts/install-xmlsec1.sh
+          "$XMLSEC1_BIN" --version
       - uses: Swatinem/rust-cache@v2
       - run: cargo nextest run --all-features
       - run: cargo test --doc --all-features
@@ -77,6 +77,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -87,7 +89,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+
+  fuzz-smoke:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+      # cargo-fuzz 0.13.1's published lockfile pins rustix 0.36.5, which no
+      # longer compiles on current nightly. Keep the tool version pinned while
+      # allowing compatible patch-level transitive dependencies.
+      - run: cargo +nightly install cargo-fuzz --version 0.13.1
+      - run: cargo +nightly fuzz run xmldsig_verify -- -runs=256 -max_len=65536

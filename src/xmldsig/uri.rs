@@ -4,17 +4,23 @@
 //! [XMLDSig §4.3.3.2](https://www.w3.org/TR/xmldsig-core1/#sec-Same-Document):
 //!
 //! - **Empty URI** (`""` or absent): the entire document, excluding comments.
-//! - **Bare-name `#id`**: the element whose ID attribute matches `id`, as a subtree.
+//! - **Bare-name `#id`**: the element whose ID attribute matches `id`, as a subtree
+//!   with comments removed by the XMLDSig same-document dereference rule.
 //! - **`#xpointer(/)`**: the entire document, including comments.
-//! - **`#xpointer(id('id'))` / `#xpointer(id("id"))`**: element by ID (equivalent to bare-name).
+//! - **`#xpointer(id('id'))` / `#xpointer(id("id"))`**: element by ID, with comments retained.
 //!
-//! External URIs (http://, file://, etc.) are not supported — only same-document
-//! references are needed for SAML signature verification.
+//! External URI bytes are resolved only from an explicit caller-owned map; this
+//! module never performs network or filesystem I/O.
 
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use roxmltree::{Document, Node, NodeId};
+
+use crate::c14n::xml_base::{
+    XmlBaseResolutionBudget, XmlBaseResolutionError, resolve_uri_from_node_with_budget,
+};
 
 use super::types::{NodeSet, NodeSetMaterializationBudget, TransformData, TransformError};
 
@@ -25,6 +31,52 @@ use super::types::{NodeSet, NodeSetMaterializationBudget, TransformData, Transfo
 /// - `Id` — XMLDSig (`<ds:Signature Id="...">`)
 /// - `id` — general XML
 const DEFAULT_ID_ATTRS: &[&str] = &["ID", "Id", "id"];
+
+struct ExternalResourceBudget {
+    remaining_total_bytes: Cell<usize>,
+    max_resource_bytes: usize,
+    max_total_bytes: usize,
+}
+
+impl Default for ExternalResourceBudget {
+    fn default() -> Self {
+        Self::with_limits(
+            crate::hard_limits::EXTERNAL_RESOURCE_BYTE_CEILING,
+            crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING,
+        )
+    }
+}
+
+impl ExternalResourceBudget {
+    fn with_limits(max_resource_bytes: usize, max_total_bytes: usize) -> Self {
+        Self {
+            remaining_total_bytes: Cell::new(max_total_bytes),
+            max_resource_bytes,
+            max_total_bytes,
+        }
+    }
+
+    fn charge(&self, bytes: usize) -> Result<(), TransformError> {
+        if bytes > self.max_resource_bytes {
+            return Err(TransformError::ExternalResourceTooLarge {
+                max_bytes: self.max_resource_bytes,
+                actual: bytes,
+            });
+        }
+        let remaining = self.remaining_total_bytes.get();
+        let Some(next) = remaining.checked_sub(bytes) else {
+            self.remaining_total_bytes.set(0);
+            return Err(TransformError::ExternalResourceTotalTooLarge {
+                max_bytes: self.max_total_bytes,
+                actual: self
+                    .max_total_bytes
+                    .saturating_add(bytes.saturating_sub(remaining)),
+            });
+        };
+        self.remaining_total_bytes.set(next);
+        Ok(())
+    }
+}
 
 /// Resolves same-document URI references against a parsed XML document.
 ///
@@ -51,6 +103,8 @@ pub struct UriReferenceResolver<'a> {
     doc: &'a Document<'a>,
     /// ID → element node mapping for O(1) fragment lookups.
     id_map: HashMap<&'a str, Node<'a, 'a>>,
+    external_resources: Option<&'a HashMap<String, Vec<u8>>>,
+    external_resource_budget: ExternalResourceBudget,
 }
 
 impl<'a> UriReferenceResolver<'a> {
@@ -117,7 +171,43 @@ impl<'a> UriReferenceResolver<'a> {
             }
         }
 
-        Self { doc, id_map }
+        Self {
+            doc,
+            id_map,
+            external_resources: None,
+            external_resource_budget: ExternalResourceBudget::default(),
+        }
+    }
+
+    /// Attach an explicit caller-owned external-resource map.
+    ///
+    /// No network or filesystem access is performed by this resolver. Keys are
+    /// RFC 3986 resolved URI identities: paths have dot segments removed while
+    /// query and fragment suffixes are retained.
+    pub fn with_external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
+        self.external_resources = Some(resources);
+        self
+    }
+
+    pub(crate) fn with_external_resource_limits(
+        mut self,
+        max_resource_bytes: usize,
+        max_total_bytes: usize,
+    ) -> Self {
+        self.external_resource_budget =
+            ExternalResourceBudget::with_limits(max_resource_bytes, max_total_bytes);
+        self
+    }
+
+    pub(crate) fn external_resource(&self, uri: &str) -> Result<Option<&'a [u8]>, TransformError> {
+        let Some(bytes) = self
+            .external_resources
+            .and_then(|resources| resources.get(uri))
+        else {
+            return Ok(None);
+        };
+        self.external_resource_budget.charge(bytes.len())?;
+        Ok(Some(bytes))
     }
 
     /// Dereference a URI string to a [`TransformData`].
@@ -127,9 +217,10 @@ impl<'a> UriReferenceResolver<'a> {
     /// | URI | Result |
     /// |-----|--------|
     /// | `""` (empty) | Entire document, comments excluded |
-    /// | `"#foo"` | Subtree rooted at element with ID `foo` |
+    /// | `"#foo"` | Subtree rooted at element with ID `foo`, comments excluded |
     /// | `"#xpointer(/)"` | Entire document, comments included |
-    /// | `"#xpointer(id('foo'))"` | Subtree rooted at element with ID `foo` |
+    /// | `"#xpointer(id('foo'))"` | Subtree rooted at element with ID `foo`, comments included |
+    /// | external URI in caller map | A copy of the mapped bytes |
     /// | other | `Err(UnsupportedUri)` |
     pub fn dereference(&self, uri: &str) -> Result<TransformData<'a>, TransformError> {
         self.dereference_with_optional_budget(uri, None)
@@ -141,6 +232,23 @@ impl<'a> UriReferenceResolver<'a> {
         budget: &NodeSetMaterializationBudget,
     ) -> Result<TransformData<'a>, TransformError> {
         self.dereference_with_optional_budget(uri, Some(budget))
+    }
+
+    pub(crate) fn dereference_from_with_budget(
+        &self,
+        uri: &str,
+        origin: Node<'_, '_>,
+        budget: &NodeSetMaterializationBudget,
+        xml_base_budget: &XmlBaseResolutionBudget,
+    ) -> Result<TransformData<'a>, TransformError> {
+        // XMLDSig assigns special dereference semantics to lexical empty and
+        // fragment-only references. Only external references use XML Base.
+        if uri.is_empty() || uri.starts_with('#') {
+            return self.dereference_with_budget(uri, budget);
+        }
+        let resolved = resolve_uri_from_node_with_budget(origin, uri, xml_base_budget)
+            .map_err(map_xml_base_resolution_error)?;
+        self.dereference_with_budget(&resolved, budget)
     }
 
     fn dereference_with_optional_budget(
@@ -166,7 +274,9 @@ impl<'a> UriReferenceResolver<'a> {
             // xmlsec1 also passes fragments through without decoding.
             self.dereference_fragment(fragment, budget)
         } else {
-            Err(TransformError::UnsupportedUri(uri.to_string()))
+            self.external_resource(uri)?
+                .map(|bytes| TransformData::Binary(bytes.to_vec()))
+                .ok_or_else(|| TransformError::UnsupportedUri(uri.to_string()))
         }
     }
 
@@ -174,7 +284,7 @@ impl<'a> UriReferenceResolver<'a> {
     ///
     /// Handles:
     /// - `xpointer(/)` → entire document (with comments, per XPointer spec)
-    /// - `xpointer(id('foo'))` → element by ID (equivalent to bare-name `#foo`)
+    /// - `xpointer(id('foo'))` → element by ID, retaining comments
     /// - bare name `foo` → element by ID attribute
     fn dereference_fragment(
         &self,
@@ -198,18 +308,18 @@ impl<'a> UriReferenceResolver<'a> {
             };
             Ok(TransformData::NodeSet(nodes))
         } else if let Some(id) = parse_xpointer_id_fragment(fragment) {
-            // xpointer(id('foo')) → same as bare-name #foo
+            // XPointer dereference retains comments, unlike a bare-name fragment.
             // Reject empty parsed ID (e.g., xpointer(id(''))) — not a valid XML Name
             if id.is_empty() {
                 return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
             }
-            self.resolve_id(id, budget)
+            self.resolve_id(id, budget, true)
         } else if fragment.starts_with("xpointer(") {
             // Any other XPointer expression is unsupported
             Err(TransformError::UnsupportedUri(format!("#{fragment}")))
         } else {
             // Bare-name fragment: #foo → element by ID
-            self.resolve_id(fragment, budget)
+            self.resolve_id(fragment, budget, false)
         }
     }
 
@@ -218,12 +328,17 @@ impl<'a> UriReferenceResolver<'a> {
         &self,
         id: &str,
         budget: Option<&NodeSetMaterializationBudget>,
+        with_comments: bool,
     ) -> Result<TransformData<'a>, TransformError> {
         match self.id_map.get(id) {
             Some(&element) => {
-                let nodes = match budget {
-                    Some(budget) => NodeSet::subtree_with_budget(element, budget)?,
-                    None => NodeSet::subtree(element)?,
+                let nodes = if with_comments {
+                    match budget {
+                        Some(budget) => NodeSet::subtree_with_budget(element, budget)?,
+                        None => NodeSet::subtree(element)?,
+                    }
+                } else {
+                    NodeSet::subtree_without_comments_with_budget(element, budget)?
                 };
                 Ok(TransformData::NodeSet(nodes))
             }
@@ -244,9 +359,34 @@ impl<'a> UriReferenceResolver<'a> {
         self.id_map.get(id).map(|node| node.id())
     }
 
+    pub(crate) fn node_for_id(&self, id: &str) -> Option<Node<'a, 'a>> {
+        self.id_map.get(id).copied()
+    }
+
+    pub(crate) fn node_for_node_id(&self, id: NodeId) -> Option<Node<'a, 'a>> {
+        self.doc.get_node(id)
+    }
+
     /// Get the number of registered IDs.
     pub fn id_count(&self) -> usize {
         self.id_map.len()
+    }
+}
+
+fn map_xml_base_resolution_error(error: XmlBaseResolutionError) -> TransformError {
+    match error {
+        XmlBaseResolutionError::Components { maximum, actual } => {
+            TransformError::XmlBaseComponentsTooLarge {
+                max: maximum,
+                actual,
+            }
+        }
+        XmlBaseResolutionError::Bytes { maximum, actual } => {
+            TransformError::XmlBaseResolutionTooLarge {
+                max_bytes: maximum,
+                actual,
+            }
+        }
     }
 }
 
@@ -264,6 +404,21 @@ pub(crate) fn parse_xpointer_id_fragment(fragment: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// Extract the ID selected by a supported same-document URI.
+///
+/// This keeps secondary consumers such as KeyInfo and Manifest processing in
+/// lockstep with the resolver's bare-fragment and XPointer ID semantics.
+pub(crate) fn same_document_reference_id(uri: &str) -> Option<&str> {
+    let fragment = uri.strip_prefix('#')?;
+    if fragment.is_empty() || fragment == "xpointer(/)" {
+        return None;
+    }
+    if let Some(id) = parse_xpointer_id_fragment(fragment) {
+        return (!id.is_empty()).then_some(id);
+    }
+    (!fragment.starts_with("xpointer(")).then_some(fragment)
 }
 
 #[cfg(test)]
@@ -481,6 +636,242 @@ mod tests {
     }
 
     #[test]
+    fn absolute_external_uri_uses_normalized_resource_identity() {
+        // Caller maps are keyed by the resolved RFC 3986 identity, not by an
+        // unnormalized spelling embedded in an untrusted Signature document.
+        let xml = r#"<root xml:base="https://base.example/ignored/">
+            <reference URI="https://example.test/a/../data.bin"/>
+        </root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([(
+            "https://example.test/data.bin".to_owned(),
+            b"payload".to_vec(),
+        )]);
+        let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
+            .unwrap();
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
+    fn absolute_external_uri_does_not_consume_xml_base_components() {
+        // A scheme-bearing reference supplies its own base and must remain
+        // resolvable even when inherited XML Base components are disallowed.
+        let xml = r#"<root xml:base="ignored/"><reference URI="https://example.test/a/../data.bin"/></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([(
+            "https://example.test/data.bin".to_owned(),
+            b"payload".to_vec(),
+        )]);
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &NodeSetMaterializationBudget::default(),
+                &XmlBaseResolutionBudget::with_limits(0, 1_024),
+            )
+            .expect("absolute references must bypass inherited XML Base traversal");
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
+    fn external_uri_without_xml_base_uses_normalized_resource_identity() {
+        // RFC 3986 normalization defines the caller map key even when the
+        // document does not provide an explicit XML Base ancestor.
+        let xml = r#"<root><reference URI="https://example.test/a/../data.bin"/></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([(
+            "https://example.test/data.bin".to_owned(),
+            b"payload".to_vec(),
+        )]);
+        let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
+            .expect("the normalized resource key must resolve without xml:base");
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
+    fn pathless_relative_xml_base_preserves_relative_resource_identity() {
+        // Query-only xml:base values do not turn a relative URI into an
+        // absolute-path reference when resolving caller-owned resources.
+        let xml = r#"<root xml:base="?old">
+            <reference URI="data.bin"/>
+        </root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([("data.bin".to_owned(), b"payload".to_vec())]);
+        let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
+            .unwrap();
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
+    fn relative_xml_base_normalizes_absolute_external_path() {
+        // An absolute-path reference replaces a relative base path, but RFC
+        // 3986 dot-segment removal still defines the caller resource identity.
+        let xml = r#"<root xml:base="a/b">
+            <reference URI="/x/../data.bin"/>
+        </root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([("/data.bin".to_owned(), b"payload".to_vec())]);
+        let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
+            .unwrap();
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
+    fn network_path_xml_base_preserves_external_resource_authority() {
+        // A schemeless authority remains part of the resolved caller-owned
+        // resource identity when an absolute-path URI replaces the base path.
+        let xml = r#"<root xml:base="//cdn.example/a/b/">
+            <reference URI="/x/../data.bin"/>
+        </root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([("//cdn.example/data.bin".to_owned(), b"payload".to_vec())]);
+        let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
+            .unwrap();
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
+    fn unicode_external_uri_resolves_without_panicking() {
+        // Untrusted XML may start a relative URI with a multibyte scalar; the
+        // resolver must produce its UTF-8 resource identity without panicking.
+        let xml = r#"<root xml:base="https://example.test/base/">
+            <reference URI="é?x"/>
+        </root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([(
+            "https://example.test/base/é?x".to_owned(),
+            b"payload".to_vec(),
+        )]);
+        let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
+            .unwrap();
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
+    fn absolute_rootless_external_uri_discards_leading_parent_segment() {
+        let xml = r#"<root xml:base="https://example.test/base/">
+            <reference URI="urn:../payload"/>
+        </root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([("urn:payload".to_owned(), b"payload".to_vec())]);
+        let budget = NodeSetMaterializationBudget::default();
+        let xml_base_budget = XmlBaseResolutionBudget::default();
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &budget,
+                &xml_base_budget,
+            )
+            .unwrap();
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
     fn namespaced_id_attr_found_by_local_name() {
         // roxmltree strips prefix: `wsu:Id` → local name "Id", which is in DEFAULT_ID_ATTRS
         let xml =
@@ -564,8 +955,8 @@ mod tests {
     }
 
     #[test]
-    fn subtree_includes_comments() {
-        // Subtree dereference (via #id) includes comments, unlike empty URI
+    fn bare_name_subtree_excludes_comments() {
+        // XMLDSig's bare-name same-document shortcut removes comment nodes.
         let xml = r#"<root><item ID="x"><!-- comment --><child/></item></root>"#;
         let doc = Document::parse(xml).unwrap();
         let resolver = UriReferenceResolver::new(&doc);
@@ -576,8 +967,8 @@ mod tests {
         for node in doc.descendants() {
             if node.is_comment() {
                 assert!(
-                    node_set.contains(node),
-                    "comment should be included in #id subtree"
+                    !node_set.contains(node),
+                    "comment must be excluded from #id"
                 );
             }
         }
@@ -606,7 +997,8 @@ mod tests {
 
     #[test]
     fn xpointer_id_single_quotes() {
-        let xml = r#"<root><item ID="abc">content</item></root>"#;
+        // XPointer ID dereference retains comments, unlike bare-name fragments.
+        let xml = r#"<root><item ID="abc"><!-- retained -->content</item></root>"#;
         let doc = Document::parse(xml).unwrap();
         let resolver = UriReferenceResolver::new(&doc);
 
@@ -618,6 +1010,10 @@ mod tests {
             .find(|n| n.attribute("ID") == Some("abc"))
             .unwrap();
         assert!(node_set.contains(elem));
+        assert!(
+            elem.children()
+                .any(|node| node.is_comment() && node_set.contains(node))
+        );
     }
 
     #[test]
@@ -689,6 +1085,29 @@ mod tests {
             super::parse_xpointer_id_fragment(r#"xpointer(id("))"#),
             None
         );
+    }
+
+    #[test]
+    fn same_document_reference_id_rejects_non_id_fragments() {
+        assert_eq!(super::same_document_reference_id("#target"), Some("target"));
+        assert_eq!(
+            super::same_document_reference_id("#xpointer(id('target'))"),
+            Some("target")
+        );
+        assert_eq!(
+            super::same_document_reference_id(r#"#xpointer(id("target"))"#),
+            Some("target")
+        );
+        for uri in [
+            "",
+            "target",
+            "#",
+            "#xpointer(/)",
+            "#xpointer(id(''))",
+            "#xpointer(id(target))",
+        ] {
+            assert_eq!(super::same_document_reference_id(uri), None, "{uri}");
+        }
     }
 
     #[test]

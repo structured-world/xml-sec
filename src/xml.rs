@@ -15,9 +15,21 @@ pub(crate) fn is_xml_1_0_character(character: char) -> bool {
     )
 }
 
+/// Return whether a string is an XML 1.0 NCName.
+pub(crate) fn is_xml_ncname(value: &str) -> bool {
+    if value.is_empty() || value.contains(':') {
+        return false;
+    }
+
+    // Delegate the complete Unicode Name grammar to the parser used by the
+    // rest of the crate instead of maintaining a partial ASCII approximation.
+    roxmltree::Document::parse(&format!("<{value}/>"))
+        .is_ok_and(|document| document.root_element().tag_name().name() == value)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_xml_1_0_character;
+    use super::{is_xml_1_0_character, is_xml_ncname};
 
     #[test]
     fn xml_1_0_character_boundaries_match_production_two() {
@@ -39,6 +51,16 @@ mod tests {
             '\0', '\u{1}', '\u{B}', '\u{C}', '\u{E}', '\u{1F}', '\u{FFFE}', '\u{FFFF}',
         ] {
             assert!(!is_xml_1_0_character(character), "{character:?}");
+        }
+    }
+
+    #[test]
+    fn ncname_validation_uses_the_xml_unicode_grammar() {
+        for valid in ["id", "_private", "Δοκιμή"] {
+            assert!(is_xml_ncname(valid), "{valid:?}");
+        }
+        for invalid in ["", "1leading", "bad id", "qualified:name"] {
+            assert!(!is_xml_ncname(invalid), "{invalid:?}");
         }
     }
 }

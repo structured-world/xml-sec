@@ -1,4 +1,9 @@
 /target
+/.tools
+/fuzz/artifacts
+/fuzz/corpus/*/*
+!/fuzz/corpus/xmldsig_verify/signature.xml
+/fuzz/target
 Cargo.lock
 *.swp
 *.swo
