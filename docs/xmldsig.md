@@ -32,6 +32,9 @@ The same immutable policy controls every signing parse and mutation reparse, inc
 validation in `sign_with_builder`, digest filling, `SignedInfo` parsing, signature filling, and
 optional `KeyInfo` filling. An internal-DTD opt-in and XML node ceiling therefore cannot be lost
 between stages.
+`SigningPolicy::rsa_keys` validates normalized modulus width and public exponent before provider
+dispatch. The default accepts 2048-8192-bit RSA keys for new signatures; compatibility callers can
+raise or lower the minimum explicitly, while the 8192-bit implementation ceiling cannot be relaxed.
 
 `SignContext::provider` selects both digest primitives and operation randomness. Built-in ECDSA
 signing obtains its prehash from that provider, while built-in RSA signing routes its blinding

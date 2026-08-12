@@ -122,7 +122,7 @@ impl EncryptedDataBuilder {
 
     /// Encrypt one complete XML element or an XML content fragment.
     pub fn encrypt_xml(&self, xml: &str) -> Result<EncryptionResult, XmlEncError> {
-        self.policy.resources.validate()?;
+        self.policy.validate()?;
         self.validate_plaintext_len(xml.len())?;
         validate_xml_plaintext(xml, &self.encrypted_type, &self.policy)?;
         self.encrypt_payload(xml.as_bytes(), Some(self.encrypted_type.clone()))
@@ -130,7 +130,7 @@ impl EncryptedDataBuilder {
 
     /// Encrypt opaque bytes without an XML `Type` attribute.
     pub fn encrypt_binary(&self, data: &[u8]) -> Result<EncryptionResult, XmlEncError> {
-        self.policy.resources.validate()?;
+        self.policy.validate()?;
         self.encrypt_payload(data, None)
     }
 
@@ -140,7 +140,7 @@ impl EncryptedDataBuilder {
         xml: &str,
         options: DocumentEncryptionOptions<'_>,
     ) -> Result<String, XmlEncError> {
-        self.policy.resources.validate()?;
+        self.policy.validate()?;
         self.validate_document_len(xml.len())?;
         let parsing_options = encryption_parsing_options(
             &self.policy,
@@ -259,7 +259,7 @@ impl EncryptedDataBuilder {
     }
 
     fn validate_configuration(&self) -> Result<(), XmlEncError> {
-        self.policy.resources.validate()?;
+        self.policy.validate()?;
         if self
             .policy
             .data_algorithms
@@ -293,11 +293,16 @@ impl EncryptedDataBuilder {
         for recipient in &self.recipients {
             match recipient {
                 EncryptionRecipient::RsaOaep {
+                    public_key,
                     parameters,
                     recipient,
                     key_name,
-                    ..
                 } => {
+                    self.policy.rsa_keys.validate_components(
+                        "encryption",
+                        &public_key.n().to_be_bytes_trimmed_vartime(),
+                        &public_key.e().to_be_bytes_trimmed_vartime(),
+                    )?;
                     if parameters.algorithm == super::KeyTransportAlgorithm::RsaOaepMgf1p
                         && parameters.mgf_digest != super::OaepDigestAlgorithm::Sha1
                     {
@@ -893,6 +898,8 @@ fn replace_range(xml: &str, range: std::ops::Range<usize>, replacement: &str) ->
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use std::sync::Arc;
 
     use getrandom::SysRng;
@@ -917,6 +924,7 @@ mod tests {
         ciphertext: Option<Vec<u8>>,
         wrapped_key: Option<Vec<u8>>,
         transported_key: Option<Vec<u8>>,
+        transport_calls: AtomicUsize,
     }
 
     impl crate::provider::CryptoProvider for OverridingOutputProvider {
@@ -1048,6 +1056,7 @@ mod tests {
             parameters: &RsaOaepParameters,
             plaintext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            self.transport_calls.fetch_add(1, Ordering::Relaxed);
             if let Some(transported_key) = &self.transported_key {
                 return Ok(transported_key.clone());
             }
@@ -1700,6 +1709,7 @@ mod tests {
                     ciphertext: Some(ciphertext),
                     wrapped_key: None,
                     transported_key: None,
+                    transport_calls: AtomicUsize::new(0),
                 }))
                 .direct_key(vec![0_u8; algorithm.key_len()])
                 .encrypt_binary(b"data")
@@ -1721,6 +1731,7 @@ mod tests {
                     ciphertext: None,
                     wrapped_key: Some(wrapped_key),
                     transported_key: None,
+                    transport_calls: AtomicUsize::new(0),
                 }))
                 .recipient_aes_kw([0_u8; 16], KeyWrapAlgorithm::AesKw128)
                 .encrypt_binary(b"data");
@@ -1736,6 +1747,7 @@ mod tests {
                 ciphertext: None,
                 wrapped_key: Some(vec![0_u8; 24]),
                 transported_key: None,
+                transport_calls: AtomicUsize::new(0),
             }))
             .recipient_aes_kw([0_u8; 16], KeyWrapAlgorithm::AesKw128)
             .encrypt_binary(b"data")
@@ -1755,6 +1767,7 @@ mod tests {
                     ciphertext: None,
                     wrapped_key: None,
                     transported_key: Some(transported_key),
+                    transport_calls: AtomicUsize::new(0),
                 }))
                 .recipient_rsa_oaep(public_key.clone())
                 .encrypt_binary(b"data");
@@ -1772,10 +1785,43 @@ mod tests {
                 ciphertext: None,
                 wrapped_key: None,
                 transported_key: Some(vec![0_u8; 256]),
+                transport_calls: AtomicUsize::new(0),
             }))
             .recipient_rsa_oaep(public_key)
             .encrypt_binary(b"data")
             .expect("modulus-sized RSA transport output must remain accepted");
+    }
+
+    #[test]
+    fn encryption_policy_rejects_weak_rsa_recipient_before_provider_dispatch() {
+        // Provider capability cannot weaken the outbound recipient-key policy.
+        let private_key = RsaPrivateKey::new(&mut UnwrapErr(SysRng), 1024)
+            .expect("test RSA key generation should succeed");
+        let provider = Arc::new(OverridingOutputProvider {
+            ciphertext: None,
+            wrapped_key: None,
+            transported_key: Some(vec![0_u8; 128]),
+            transport_calls: AtomicUsize::new(0),
+        });
+
+        let result = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .provider(provider.clone())
+            .recipient_rsa_oaep(RsaPublicKey::from(&private_key))
+            .encrypt_binary(b"data");
+
+        assert!(matches!(
+            result,
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::KeySize {
+                    operation: "encryption",
+                    minimum_bits: 2048,
+                    maximum_bits: 8192,
+                    actual_bits: 1024,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(provider.transport_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

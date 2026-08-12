@@ -316,36 +316,12 @@ pub(crate) fn validate_rsa_key_components(
     exponent: &[u8],
     minimum_modulus_bits: usize,
 ) -> Result<(), SignatureVerificationError> {
-    let modulus_start = modulus
-        .iter()
-        .position(|byte| *byte != 0)
-        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-    let modulus = &modulus[modulus_start..];
-    if modulus.is_empty() {
-        return Err(SignatureVerificationError::InvalidKeyDer);
+    crate::policy::RsaKeyPolicy {
+        minimum_modulus_bits,
     }
-    // Match ring's RSA parameter checks: modulus length is evaluated after
-    // rounding up to the nearest whole byte, not by exact significant-bit
-    // length of the highest non-zero byte.
-    let modulus_bits = modulus
-        .len()
-        .checked_mul(8)
-        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-    if !(minimum_modulus_bits..=8192).contains(&modulus_bits) {
-        return Err(SignatureVerificationError::InvalidKeyDer);
-    }
-
-    if exponent.is_empty() || exponent[0] & 0x80 != 0 || exponent.len() > 8 {
-        return Err(SignatureVerificationError::InvalidKeyDer);
-    }
-    let mut exponent_bytes = [0_u8; 8];
-    exponent_bytes[8 - exponent.len()..].copy_from_slice(exponent);
-    let exponent = u64::from_be_bytes(exponent_bytes);
-    if !(3..=((1_u64 << 33) - 1)).contains(&exponent) || exponent % 2 == 0 {
-        return Err(SignatureVerificationError::InvalidKeyDer);
-    }
-
-    Ok(())
+    .validate_components("verification", modulus, exponent)
+    .map(|_| ())
+    .map_err(|_| SignatureVerificationError::InvalidKeyDer)
 }
 
 fn ensure_rsa_signature_algorithm(

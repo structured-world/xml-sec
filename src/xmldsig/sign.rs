@@ -225,11 +225,11 @@ impl SigningPublicKeyInfo {
     }
 }
 
-fn validate_signature_output(
+fn expected_signature_output_len(
     key: &dyn SigningKey,
     algorithm: SignatureAlgorithm,
-    signature: &[u8],
-) -> Result<(), SigningError> {
+    policy: &crate::policy::SigningPolicy,
+) -> Result<usize, SigningError> {
     let public_key = key.public_key_info()?;
     let expected = match (algorithm, public_key) {
         (
@@ -237,8 +237,12 @@ fn validate_signature_output(
             | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
             | SignatureAlgorithm::RsaSha512,
-            SigningPublicKeyInfo::Rsa { modulus, .. },
-        ) if !modulus.is_empty() => modulus.len(),
+            SigningPublicKeyInfo::Rsa {
+                modulus, exponent, ..
+            },
+        ) => policy
+            .rsa_keys
+            .validate_components("signing", &modulus, &exponent)?,
         (
             SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384,
             SigningPublicKeyInfo::Ec { public_key, .. },
@@ -268,6 +272,10 @@ fn validate_signature_output(
         }
         _ => return Err(SigningKeyError::InvalidPublicKeyInfo.into()),
     };
+    Ok(expected)
+}
+
+fn validate_signature_output(expected: usize, signature: &[u8]) -> Result<(), SigningError> {
     if signature.len() != expected {
         return Err(SigningError::InvalidSignatureOutputLength {
             expected,
@@ -676,7 +684,7 @@ impl<'a> SignContext<'a> {
     /// canonicalizes `<SignedInfo>`, signs those canonical bytes, and fills the
     /// base64 `<SignatureValue>`.
     pub fn sign_template(&self, xml: &str) -> Result<String, SigningError> {
-        self.policy.resources.validate()?;
+        self.policy.validate()?;
         let execution_budget = TransformExecutionBudget::from_resources(&self.policy.resources);
         let transform_options = TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
@@ -706,10 +714,12 @@ impl<'a> SignContext<'a> {
             }
             .into());
         }
+        let expected_signature_len =
+            expected_signature_output_len(self.signing_key, algorithm, &self.policy)?;
         let signature_value =
             self.provider
                 .sign(self.signing_key, algorithm, &canonical_signed_info)?;
-        validate_signature_output(self.signing_key, algorithm, &signature_value)?;
+        validate_signature_output(expected_signature_len, &signature_value)?;
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature_value);
         let signed =
             fill_signature_value_with_options(&with_digests, &signature_b64, Some(&self.policy))?;
@@ -731,7 +741,7 @@ impl<'a> SignContext<'a> {
         xml: &str,
         builder: &SignatureBuilder,
     ) -> Result<String, SigningError> {
-        self.policy.resources.validate()?;
+        self.policy.validate()?;
         let template = builder.build_template()?;
         let templated = append_signature_to_root_with_options(xml, &template, Some(&self.policy))?;
         self.sign_template(&templated)

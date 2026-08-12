@@ -41,6 +41,9 @@ together with the cryptographic primitives. The crate's secure RSA-OAEP default 
 SHA-256/MGF1-SHA-256. XMLEnc 1.1 itself defaults omitted parameters to SHA-1/MGF1-SHA-1, so
 `xml-sec` always emits explicit `ds:DigestMethod` and `xenc11:MGF` values rather than relying on
 those implicit legacy defaults. SHA-1 OAEP remains available only through explicit parameters.
+`EncryptionPolicy::rsa_keys` validates every recipient modulus and exponent before provider
+dispatch. New output defaults to 2048-8192-bit RSA keys; callers can explicitly tighten or relax
+the minimum for a deployment profile, but cannot exceed the implementation ceiling.
 The legacy `rsa-oaep-mgf1p` URI fixes MGF1 to SHA-1; configuration validation rejects any other
 MGF digest before provider dispatch because that URI has no wire field capable of representing it.
 AES-KW configuration similarly validates the KEK size fixed by its algorithm URI before provider

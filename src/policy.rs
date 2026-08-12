@@ -60,6 +60,124 @@ pub enum PolicyViolation {
         /// Non-secret reason suitable for diagnostics.
         reason: &'static str,
     },
+    /// An RSA key falls outside the operation's configured strength range.
+    #[error(
+        "{operation} policy requires {key_type} keys between {minimum_bits} and {maximum_bits} bits: got {actual_bits}"
+    )]
+    KeySize {
+        /// Operation evaluating the key.
+        operation: &'static str,
+        /// Stable key-family diagnostic.
+        key_type: &'static str,
+        /// Configured minimum modulus width.
+        minimum_bits: usize,
+        /// Non-configurable implementation ceiling.
+        maximum_bits: usize,
+        /// Observed normalized modulus width.
+        actual_bits: usize,
+    },
+    /// RSA key material is structurally invalid.
+    #[error("{operation} policy rejects invalid {key_type} key material: {reason}")]
+    InvalidKeyMaterial {
+        /// Operation evaluating the key.
+        operation: &'static str,
+        /// Stable key-family diagnostic.
+        key_type: &'static str,
+        /// Non-secret structural rejection reason.
+        reason: &'static str,
+    },
+}
+
+/// RSA strength and structural requirements for outbound cryptographic operations.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RsaKeyPolicy {
+    /// Minimum normalized RSA modulus width accepted for new output.
+    pub minimum_modulus_bits: usize,
+}
+
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+impl Default for RsaKeyPolicy {
+    fn default() -> Self {
+        Self {
+            minimum_modulus_bits: 2048,
+        }
+    }
+}
+
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+impl RsaKeyPolicy {
+    /// Validate the configured minimum against the implementation ceiling.
+    pub fn validate(&self) -> Result<(), PolicyViolation> {
+        if self.minimum_modulus_bits == 0 || !self.minimum_modulus_bits.is_multiple_of(8) {
+            return Err(PolicyViolation::InvalidResourceLimit {
+                resource: "minimum RSA modulus bits",
+                requirement: "minimum must be a nonzero whole-byte width",
+                actual: self.minimum_modulus_bits,
+            });
+        }
+        ResourcePolicy::within(
+            "minimum RSA modulus bits",
+            self.minimum_modulus_bits,
+            crate::hard_limits::RSA_MODULUS_BIT_CEILING,
+        )
+    }
+
+    pub(crate) fn validate_components(
+        &self,
+        operation: &'static str,
+        modulus: &[u8],
+        exponent: &[u8],
+    ) -> Result<usize, PolicyViolation> {
+        self.validate()?;
+        let modulus = modulus
+            .iter()
+            .position(|byte| *byte != 0)
+            .map(|start| &modulus[start..])
+            .ok_or(PolicyViolation::InvalidKeyMaterial {
+                operation,
+                key_type: "RSA",
+                reason: "modulus is zero",
+            })?;
+        let modulus_bits =
+            modulus
+                .len()
+                .checked_mul(8)
+                .ok_or(PolicyViolation::InvalidKeyMaterial {
+                    operation,
+                    key_type: "RSA",
+                    reason: "modulus width overflows",
+                })?;
+        if !(self.minimum_modulus_bits..=crate::hard_limits::RSA_MODULUS_BIT_CEILING)
+            .contains(&modulus_bits)
+        {
+            return Err(PolicyViolation::KeySize {
+                operation,
+                key_type: "RSA",
+                minimum_bits: self.minimum_modulus_bits,
+                maximum_bits: crate::hard_limits::RSA_MODULUS_BIT_CEILING,
+                actual_bits: modulus_bits,
+            });
+        }
+        if exponent.is_empty() || exponent[0] & 0x80 != 0 || exponent.len() > 8 {
+            return Err(PolicyViolation::InvalidKeyMaterial {
+                operation,
+                key_type: "RSA",
+                reason: "public exponent has invalid encoding",
+            });
+        }
+        let mut exponent_bytes = [0_u8; 8];
+        exponent_bytes[8 - exponent.len()..].copy_from_slice(exponent);
+        let exponent = u64::from_be_bytes(exponent_bytes);
+        if !(3..=((1_u64 << 33) - 1)).contains(&exponent) || exponent % 2 == 0 {
+            return Err(PolicyViolation::InvalidKeyMaterial {
+                operation,
+                key_type: "RSA",
+                reason: "public exponent is outside the supported odd range",
+            });
+        }
+        Ok(modulus.len())
+    }
 }
 
 /// Resource ceilings shared by parsing, transforms, and cryptographic output.
@@ -187,6 +305,7 @@ impl ResourcePolicy {
         Ok(())
     }
 
+    #[cfg(feature = "xmldsig")]
     fn nonzero_within(
         resource: &'static str,
         selected: usize,
@@ -366,6 +485,8 @@ pub struct SigningPolicy {
     pub signature_algorithms: Option<HashSet<SignatureAlgorithm>>,
     /// Allowed reference digest methods; `None` uses the implemented secure defaults.
     pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
+    /// RSA requirements enforced before producing a signature.
+    pub rsa_keys: RsaKeyPolicy,
     /// Allowed transform URIs; `None` accepts every implemented transform.
     pub transforms: Option<HashSet<String>>,
     /// XML parser rules.
@@ -374,6 +495,15 @@ pub struct SigningPolicy {
     pub xpath_here_semantics: XPathHereSemantics,
     /// Resource ceilings.
     pub resources: ResourcePolicy,
+}
+
+#[cfg(feature = "xmldsig")]
+impl SigningPolicy {
+    /// Validate the complete snapshot before signing work begins.
+    pub fn validate(&self) -> Result<(), PolicyViolation> {
+        self.resources.validate()?;
+        self.rsa_keys.validate()
+    }
 }
 
 /// Immutable policy snapshot for XMLEnc encryption.
@@ -388,10 +518,21 @@ pub struct EncryptionPolicy {
     pub key_wrap_algorithms: Option<HashSet<KeyWrapAlgorithm>>,
     /// Allowed OAEP digest algorithms.
     pub oaep_digests: Option<HashSet<OaepDigestAlgorithm>>,
+    /// RSA requirements enforced when producing OAEP key transport.
+    pub rsa_keys: RsaKeyPolicy,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
     /// Resource ceilings.
     pub resources: ResourcePolicy,
+}
+
+#[cfg(feature = "xmlenc")]
+impl EncryptionPolicy {
+    /// Validate the complete snapshot before outbound encryption work begins.
+    pub fn validate(&self) -> Result<(), PolicyViolation> {
+        self.resources.validate()?;
+        self.rsa_keys.validate()
+    }
 }
 
 /// Immutable policy snapshot for XMLEnc decryption.
@@ -473,6 +614,47 @@ mod tests {
         };
 
         assert_eq!(policy.validate(), Ok(()));
+    }
+
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    #[test]
+    fn rsa_key_policy_enforces_structure_range_and_explicit_relaxation() {
+        let secure = RsaKeyPolicy::default();
+        assert!(matches!(
+            secure.validate_components("test", &[1; 128], &[1, 0, 1]),
+            Err(PolicyViolation::KeySize {
+                minimum_bits: 2048,
+                maximum_bits: 8192,
+                actual_bits: 1024,
+                ..
+            })
+        ));
+        assert!(matches!(
+            secure.validate_components("test", &[1; 1025], &[1, 0, 1]),
+            Err(PolicyViolation::KeySize {
+                actual_bits: 8200,
+                ..
+            })
+        ));
+        assert!(matches!(
+            secure.validate_components("test", &[1; 256], &[2]),
+            Err(PolicyViolation::InvalidKeyMaterial { .. })
+        ));
+
+        let compatibility = RsaKeyPolicy {
+            minimum_modulus_bits: 1024,
+        };
+        assert_eq!(
+            compatibility.validate_components("test", &[1; 128], &[1, 0, 1]),
+            Ok(128)
+        );
+        assert!(
+            RsaKeyPolicy {
+                minimum_modulus_bits: 2047,
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[cfg(feature = "xmldsig")]

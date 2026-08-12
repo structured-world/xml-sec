@@ -33,3 +33,7 @@ pub(crate) const ENCRYPTION_DOCUMENT_BYTE_CEILING: usize =
 pub(crate) const ENCRYPTION_RECIPIENT_CEILING: usize = 64;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const ENCRYPTION_METADATA_BYTE_CEILING: usize = 4 * 1024;
+
+/// Largest RSA modulus accepted by built-in operation paths.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const RSA_MODULUS_BIT_CEILING: usize = 8192;

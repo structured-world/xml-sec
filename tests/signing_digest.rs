@@ -1,4 +1,8 @@
 use std::collections::HashSet;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::SigningPolicy;
@@ -224,6 +228,86 @@ fn signing_facade_rejects_malformed_key_specific_signature_output() {
             }) if expected_len == expected && actual_len == actual
         ));
     }
+}
+
+#[test]
+fn signing_policy_rejects_weak_rsa_key_before_provider_dispatch() {
+    struct CountingSigningKey {
+        calls: Arc<AtomicUsize>,
+        modulus: Vec<u8>,
+        exponent: Vec<u8>,
+    }
+
+    impl SigningKey for CountingSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1_u8; self.modulus.len()])
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Ok(SigningPublicKeyInfo::Rsa {
+                spki_der: Vec::new(),
+                modulus: self.modulus.clone(),
+                exponent: self.exponent.clone(),
+            })
+        }
+    }
+
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+
+    for (modulus_bytes, actual_bits) in [(128, 1024), (1025, 8200)] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = CountingSigningKey {
+            calls: Arc::clone(&calls),
+            modulus: vec![1_u8; modulus_bytes],
+            exponent: vec![1, 0, 1],
+        };
+        assert!(matches!(
+            SignContext::new(&key).sign_with_builder(
+                "<root><payload ID=\"payload\">hello</payload></root>",
+                &builder
+            ),
+            Err(SigningError::Policy(
+                xml_sec::policy::PolicyViolation::KeySize {
+                    operation: "signing",
+                    minimum_bits: 2048,
+                    maximum_bits: 8192,
+                    actual_bits: observed_bits,
+                    ..
+                }
+            )) if observed_bits == actual_bits
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let key = CountingSigningKey {
+        calls: Arc::clone(&calls),
+        modulus: vec![1_u8; 256],
+        exponent: vec![2],
+    };
+    assert!(matches!(
+        SignContext::new(&key).sign_with_builder(
+            "<root><payload ID=\"payload\">hello</payload></root>",
+            &builder
+        ),
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::InvalidKeyMaterial {
+                operation: "signing",
+                ..
+            }
+        ))
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]
