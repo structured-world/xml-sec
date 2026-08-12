@@ -19,8 +19,7 @@ use std::collections::{HashMap, HashSet};
 use roxmltree::{Document, Node, NodeId};
 
 use crate::c14n::xml_base::{
-    XmlBaseResolutionBudget, XmlBaseResolutionError, compute_effective_xml_base_with_budget,
-    resolve_uri_with_budget,
+    XmlBaseResolutionBudget, XmlBaseResolutionError, resolve_uri_from_node_with_budget,
 };
 
 use super::types::{NodeSet, NodeSetMaterializationBudget, TransformData, TransformError};
@@ -247,14 +246,8 @@ impl<'a> UriReferenceResolver<'a> {
         if uri.is_empty() || uri.starts_with('#') {
             return self.dereference_with_budget(uri, budget);
         }
-        let resolved = match compute_effective_xml_base_with_budget(origin, None, xml_base_budget)
-            .map_err(map_xml_base_resolution_error)?
-        {
-            Some(base) => resolve_uri_with_budget(&base, uri, xml_base_budget)
-                .map_err(map_xml_base_resolution_error)?,
-            None => resolve_uri_with_budget("", uri, xml_base_budget)
-                .map_err(map_xml_base_resolution_error)?,
-        };
+        let resolved = resolve_uri_from_node_with_budget(origin, uri, xml_base_budget)
+            .map_err(map_xml_base_resolution_error)?;
         self.dereference_with_budget(&resolved, budget)
     }
 
@@ -670,6 +663,34 @@ mod tests {
                 &xml_base_budget,
             )
             .unwrap();
+
+        assert_eq!(data.into_binary().unwrap(), b"payload");
+    }
+
+    #[test]
+    fn absolute_external_uri_does_not_consume_xml_base_components() {
+        // A scheme-bearing reference supplies its own base and must remain
+        // resolvable even when inherited XML Base components are disallowed.
+        let xml = r#"<root xml:base="ignored/"><reference URI="https://example.test/a/../data.bin"/></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let reference = doc
+            .descendants()
+            .find(|node| node.has_tag_name("reference"))
+            .unwrap();
+        let resources = HashMap::from([(
+            "https://example.test/data.bin".to_owned(),
+            b"payload".to_vec(),
+        )]);
+        let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
+
+        let data = resolver
+            .dereference_from_with_budget(
+                reference.attribute("URI").unwrap(),
+                reference,
+                &NodeSetMaterializationBudget::default(),
+                &XmlBaseResolutionBudget::with_limits(0, 1_024),
+            )
+            .expect("absolute references must bypass inherited XML Base traversal");
 
         assert_eq!(data.into_binary().unwrap(), b"payload");
     }

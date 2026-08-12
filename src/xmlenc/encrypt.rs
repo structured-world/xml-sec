@@ -167,7 +167,7 @@ impl EncryptedDataBuilder {
                     xml.len(),
                     range.len(),
                     result.encrypted_data_xml.len(),
-                    self.policy.resources.max_encryption_document_bytes,
+                    self.policy.resources.max_xml_document_bytes,
                 )?;
                 validate_replacement_document_nodes(
                     &document,
@@ -204,7 +204,7 @@ impl EncryptedDataBuilder {
                     xml.len(),
                     removed,
                     inserted,
-                    self.policy.resources.max_encryption_document_bytes,
+                    self.policy.resources.max_xml_document_bytes,
                 )?;
                 validate_replacement_document_nodes(
                     &document,
@@ -430,7 +430,7 @@ impl EncryptedDataBuilder {
     }
 
     fn validate_document_len(&self, actual: usize) -> Result<(), XmlEncError> {
-        validate_document_len(actual, self.policy.resources.max_encryption_document_bytes)
+        validate_document_len(actual, self.policy.resources.max_xml_document_bytes)
     }
 }
 
@@ -954,10 +954,10 @@ mod tests {
 
     use super::*;
     use crate::hard_limits::{
-        ENCRYPTION_DOCUMENT_BYTE_CEILING as MAX_ENCRYPTION_DOCUMENT_LEN,
         ENCRYPTION_METADATA_BYTE_CEILING as MAX_ENCRYPTION_METADATA_LEN,
         ENCRYPTION_PLAINTEXT_BYTE_CEILING as MAX_ENCRYPTION_PLAINTEXT_LEN,
         ENCRYPTION_RECIPIENT_CEILING as MAX_ENCRYPTION_RECIPIENTS,
+        XML_DOCUMENT_BYTE_CEILING as MAX_ENCRYPTION_DOCUMENT_LEN,
     };
     use crate::xmlenc::{
         KekDecryptor, OaepDigestAlgorithm, PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt,
@@ -1376,7 +1376,7 @@ mod tests {
             let document = "<root><target ID=\"selected\">x</target></root>";
             let policy = crate::policy::EncryptionPolicy {
                 resources: crate::policy::ResourcePolicy {
-                    max_encryption_document_bytes: document.len(),
+                    max_xml_document_bytes: document.len(),
                     ..crate::policy::ResourcePolicy::default()
                 },
                 ..crate::policy::EncryptionPolicy::default()
@@ -1610,7 +1610,7 @@ mod tests {
         // plaintext bounds alone do not account for framing, base64, or markup.
         let policy = |maximum| crate::policy::EncryptionPolicy {
             resources: crate::policy::ResourcePolicy {
-                max_encryption_document_bytes: maximum,
+                max_xml_document_bytes: maximum,
                 ..crate::policy::ResourcePolicy::default()
             },
             ..crate::policy::EncryptionPolicy::default()

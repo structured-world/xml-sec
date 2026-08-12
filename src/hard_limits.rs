@@ -27,8 +27,7 @@ pub(crate) const ENCRYPTION_CIPHER_VALUE_BASE64_BYTE_CEILING: usize = 16 * 1024 
 pub(crate) const ENCRYPTION_PLAINTEXT_BYTE_CEILING: usize =
     (ENCRYPTION_CIPHER_VALUE_BASE64_BYTE_CEILING / 4 * 3) - 32;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-pub(crate) const ENCRYPTION_DOCUMENT_BYTE_CEILING: usize =
-    ENCRYPTION_CIPHER_VALUE_BASE64_BYTE_CEILING;
+pub(crate) const XML_DOCUMENT_BYTE_CEILING: usize = ENCRYPTION_CIPHER_VALUE_BASE64_BYTE_CEILING;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const ENCRYPTION_RECIPIENT_CEILING: usize = 64;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]

@@ -23,14 +23,7 @@ pub(super) fn parse_encrypted_data_with_policy(
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
     policy.resources.validate()?;
-    if xml.len() > policy.resources.max_encryption_document_bytes {
-        return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "encryption document",
-            maximum: policy.resources.max_encryption_document_bytes,
-            actual: xml.len(),
-        }
-        .into());
-    }
+    policy.resources.validate_xml_document_len(xml.len())?;
     let document = Document::parse_with_options(
         xml,
         ParsingOptions {

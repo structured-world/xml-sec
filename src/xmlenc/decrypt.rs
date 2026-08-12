@@ -104,7 +104,7 @@ impl<'a> DecryptContext<'a> {
             encrypted,
             algorithm,
             self.policy.resources.max_encryption_plaintext_bytes,
-            self.policy.resources.max_encryption_document_bytes,
+            self.policy.resources.max_xml_document_bytes,
         )?;
         let ciphertext = STANDARD
             .decode(&encrypted.cipher_data.value)
@@ -505,7 +505,10 @@ fn validate_plaintext_fragment(
     wrapped.push_str(WRAPPER_END);
     wrapped.push_str(&xml[replacement_end..]);
 
-    let document = Document::parse_with_options(&wrapped, decryption_parsing_options(policy))?;
+    let document = Document::parse_with_options(
+        &wrapped,
+        decryption_parsing_options_with_internal_nodes(policy, 1),
+    )?;
     let wrapper = document
         .descendants()
         .find(|node| {
@@ -532,11 +535,23 @@ fn validate_plaintext_fragment(
     Ok(())
 }
 
-fn decryption_parsing_options<'a>(policy: &crate::policy::DecryptionPolicy) -> ParsingOptions<'a> {
+fn decryption_parsing_options<'input>(
+    policy: &crate::policy::DecryptionPolicy,
+) -> ParsingOptions<'input> {
+    decryption_parsing_options_with_internal_nodes(policy, 0)
+}
+
+fn decryption_parsing_options_with_internal_nodes<'input>(
+    policy: &crate::policy::DecryptionPolicy,
+    internal_nodes: u32,
+) -> ParsingOptions<'input> {
     ParsingOptions {
         allow_dtd: policy.xml.allow_internal_dtd,
+        // The temporary wrapper proves fragment boundaries but is not part of
+        // either caller-owned input or the final decrypted document.
         nodes_limit: u32::try_from(policy.resources.max_xml_nodes)
-            .unwrap_or(crate::hard_limits::XML_DOCUMENT_NODE_CEILING),
+            .unwrap_or(crate::hard_limits::XML_DOCUMENT_NODE_CEILING)
+            .saturating_add(internal_nodes),
         entity_resolver: None,
     }
 }
@@ -545,14 +560,7 @@ fn validate_encryption_document_len(
     actual: usize,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<(), XmlEncError> {
-    if actual > policy.resources.max_encryption_document_bytes {
-        return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "encryption document",
-            maximum: policy.resources.max_encryption_document_bytes,
-            actual,
-        }
-        .into());
-    }
+    policy.resources.validate_xml_document_len(actual)?;
     Ok(())
 }
 
@@ -1975,7 +1983,7 @@ mod tests {
         let policy = crate::policy::DecryptionPolicy {
             resources: crate::policy::ResourcePolicy {
                 max_encryption_plaintext_bytes: 4,
-                max_encryption_document_bytes: aggregate_encoded_len - 1,
+                max_xml_document_bytes: aggregate_encoded_len - 1,
                 ..crate::policy::ResourcePolicy::default()
             },
             ..crate::policy::DecryptionPolicy::default()
@@ -2450,7 +2458,7 @@ mod tests {
         let document = format!("<root xmlns:xenc=\"{XMLENC_NS}\"><a/>{encrypted}</root>");
         let byte_policy = crate::policy::DecryptionPolicy {
             resources: crate::policy::ResourcePolicy {
-                max_encryption_document_bytes: document.len() - 1,
+                max_xml_document_bytes: document.len() - 1,
                 ..crate::policy::ResourcePolicy::default()
             },
             ..crate::policy::DecryptionPolicy::default()
@@ -2460,7 +2468,7 @@ mod tests {
                 .policy(byte_policy)
                 .decrypt_document(&document, None),
             Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "encryption document",
+                resource: "XML document",
                 maximum,
                 actual,
             })) if maximum == document.len() - 1 && actual == document.len()
@@ -2479,6 +2487,44 @@ mod tests {
                 .decrypt_document(&document, None),
             Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
         ));
+    }
+
+    #[test]
+    fn fragment_validation_does_not_charge_its_internal_wrapper_node() {
+        // The caller's node ceiling applies to input and output XML, not the
+        // implementation-only element used to prove replacement boundaries.
+        let key = [0x39_u8; 16];
+        let plaintext = "<item/>".repeat(20);
+        let encrypted = encrypted_gcm_element(
+            "http://www.w3.org/2001/04/xmlenc#Content",
+            &plaintext,
+            None,
+            false,
+            &key,
+        );
+        let document = format!("<root xmlns:xenc=\"{XMLENC_NS}\">{encrypted}</root>");
+        let resolver = SymmetricKeyDecryptor::new(key);
+        let expected = decrypt_document(&document, None, &resolver)
+            .expect("unbounded setup decryption must succeed");
+        let exact_output_nodes = Document::parse(&expected)
+            .expect("decrypted output must parse")
+            .descendants()
+            .count();
+        let policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_nodes: exact_output_nodes,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+
+        assert_eq!(
+            DecryptContext::new(&resolver)
+                .policy(policy)
+                .decrypt_document(&document, None)
+                .expect("temporary wrapper must not consume caller node budget"),
+            expected
+        );
     }
 
     #[test]

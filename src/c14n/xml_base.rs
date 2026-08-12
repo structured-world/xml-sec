@@ -160,6 +160,23 @@ pub(crate) fn resolve_uri_with_budget(
     Ok(resolved)
 }
 
+/// Resolve a reference against inherited XML Base without traversing ancestors
+/// when the reference already supplies an RFC 3986 scheme.
+#[cfg(feature = "xmldsig")]
+pub(crate) fn resolve_uri_from_node_with_budget(
+    origin: Node<'_, '_>,
+    reference: &str,
+    budget: &XmlBaseResolutionBudget,
+) -> Result<String, XmlBaseResolutionError> {
+    if has_scheme(reference) {
+        return resolve_uri_with_budget("", reference, budget);
+    }
+    match compute_effective_xml_base_with_budget(origin, None, budget)? {
+        Some(base) => resolve_uri_with_budget(&base, reference, budget),
+        None => resolve_uri_with_budget("", reference, budget),
+    }
+}
+
 /// Whether a selected element establishes its source `xml:base` context in the
 /// canonical output and therefore forms a boundary for descendant fixup.
 pub(super) fn preserves_xml_base_context(

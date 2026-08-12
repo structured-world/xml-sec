@@ -443,6 +443,72 @@ fn signing_policy_rejects_disallowed_reference_transform() {
 }
 
 #[test]
+fn signing_policy_bounds_document_bytes_before_parsing() {
+    // Signing must reject a large low-node document at the same policy
+    // boundary as verification rather than parsing it before work limits run.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let xml = format!("<root>{}</root>", "x".repeat(1_024));
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: xml.len() - 1,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(policy)
+            .sign_template(&xml),
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "XML document",
+                maximum,
+                actual,
+            }
+        )) if maximum == xml.len() - 1 && actual == xml.len()
+    ));
+}
+
+#[test]
+fn signing_policy_rechecks_document_bytes_after_mutation() {
+    // Filling DigestValue and SignatureValue grows the caller's document, so
+    // the same byte ceiling must cover intermediate and returned XML.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template = template_with_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#payload")
+            .transform(Transform::C14n(exclusive_c14n())),
+    );
+    let xml = append_signature_to_root("<root><payload ID=\"payload\"/></root>", &template)
+        .expect("append signature");
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: xml.len(),
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(policy)
+            .sign_template(&xml),
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "XML document",
+                maximum,
+                actual,
+            }
+        )) if maximum == xml.len() && actual > maximum
+    ));
+}
+
+#[test]
 fn signing_policy_shares_canonicalization_budget_with_signed_info() {
     // Reference transforms and SignedInfo consume one operation-wide C14N
     // allowance, preventing a template from multiplying the configured cap.

@@ -685,6 +685,7 @@ impl<'a> SignContext<'a> {
     /// base64 `<SignatureValue>`.
     pub fn sign_template(&self, xml: &str) -> Result<String, SigningError> {
         self.policy.validate()?;
+        self.policy.resources.validate_xml_document_len(xml.len())?;
         let execution_budget = TransformExecutionBudget::from_resources(&self.policy.resources);
         let transform_options = TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
@@ -696,6 +697,9 @@ impl<'a> SignContext<'a> {
             self.provider,
             &execution_budget,
         )?;
+        self.policy
+            .resources
+            .validate_xml_document_len(with_digests.len())?;
         let (algorithm, canonical_signed_info) =
             canonicalize_signed_info(&with_digests, &self.policy, &execution_budget)?;
         execution_budget
@@ -723,13 +727,17 @@ impl<'a> SignContext<'a> {
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature_value);
         let signed =
             fill_signature_value_with_options(&with_digests, &signature_b64, Some(&self.policy))?;
+        self.policy
+            .resources
+            .validate_xml_document_len(signed.len())?;
         if let Some(writer) = self.key_info_writer {
             let key_info_content = writer.write_key_info(self.signing_key)?;
-            Ok(fill_key_info_with_options(
-                &signed,
-                &key_info_content,
-                Some(&self.policy),
-            )?)
+            let signed =
+                fill_key_info_with_options(&signed, &key_info_content, Some(&self.policy))?;
+            self.policy
+                .resources
+                .validate_xml_document_len(signed.len())?;
+            Ok(signed)
         } else {
             Ok(signed)
         }
@@ -742,6 +750,7 @@ impl<'a> SignContext<'a> {
         builder: &SignatureBuilder,
     ) -> Result<String, SigningError> {
         self.policy.validate()?;
+        self.policy.resources.validate_xml_document_len(xml.len())?;
         let template = builder.build_template()?;
         let templated = append_signature_to_root_with_options(xml, &template, Some(&self.policy))?;
         self.sign_template(&templated)

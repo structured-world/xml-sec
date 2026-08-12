@@ -201,8 +201,8 @@ pub struct ResourcePolicy {
     pub max_external_resource_total_bytes: usize,
     /// Maximum XMLEnc plaintext bytes.
     pub max_encryption_plaintext_bytes: usize,
-    /// Maximum caller-owned XML bytes accepted by XMLEnc document operations.
-    pub max_encryption_document_bytes: usize,
+    /// Maximum caller-owned XML bytes accepted by any document operation.
+    pub max_xml_document_bytes: usize,
     /// Maximum independently wrapped recipients.
     pub max_encryption_recipients: usize,
     /// Maximum caller-controlled XMLEnc metadata bytes per field.
@@ -222,7 +222,7 @@ impl Default for ResourcePolicy {
             max_external_resource_total_bytes:
                 crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING,
             max_encryption_plaintext_bytes: crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING,
-            max_encryption_document_bytes: crate::hard_limits::ENCRYPTION_DOCUMENT_BYTE_CEILING,
+            max_xml_document_bytes: crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
             max_encryption_recipients: crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
             max_encryption_metadata_bytes: crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
         }
@@ -259,9 +259,9 @@ impl ResourcePolicy {
             crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING,
         )?;
         Self::within(
-            "encryption document",
-            self.max_encryption_document_bytes,
-            crate::hard_limits::ENCRYPTION_DOCUMENT_BYTE_CEILING,
+            "XML document",
+            self.max_xml_document_bytes,
+            crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
         )?;
         Self::within(
             "external resource bytes",
@@ -288,6 +288,17 @@ impl ResourcePolicy {
             self.max_encryption_metadata_bytes,
             crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
         )
+    }
+
+    pub(crate) fn validate_xml_document_len(&self, actual: usize) -> Result<(), PolicyViolation> {
+        if actual > self.max_xml_document_bytes {
+            return Err(PolicyViolation::ResourceLimit {
+                resource: "XML document",
+                maximum: self.max_xml_document_bytes,
+                actual,
+            });
+        }
+        Ok(())
     }
 
     fn within(
@@ -579,6 +590,9 @@ mod tests {
         let mut plaintext = ResourcePolicy::default();
         plaintext.max_encryption_plaintext_bytes += 1;
         policies.push(plaintext);
+        let mut document = ResourcePolicy::default();
+        document.max_xml_document_bytes += 1;
+        policies.push(document);
         let mut recipients = ResourcePolicy::default();
         recipients.max_encryption_recipients += 1;
         policies.push(recipients);
@@ -608,7 +622,7 @@ mod tests {
             max_external_resource_bytes: 0,
             max_external_resource_total_bytes: 0,
             max_encryption_plaintext_bytes: 0,
-            max_encryption_document_bytes: 0,
+            max_xml_document_bytes: 0,
             max_encryption_recipients: 0,
             max_encryption_metadata_bytes: 0,
         };

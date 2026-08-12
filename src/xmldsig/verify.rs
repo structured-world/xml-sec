@@ -953,6 +953,7 @@ fn verify_signature_with_context(
     ctx: &VerifyContext<'_>,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
     ctx.policy.validate()?;
+    ctx.policy.resources.validate_xml_document_len(xml.len())?;
     let doc = Document::parse_with_options(
         xml,
         roxmltree::ParsingOptions {
@@ -2228,6 +2229,31 @@ mod tests {
             ),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn verification_policy_bounds_document_bytes_before_parsing() {
+        // A small node count does not bound parser work when one text node is
+        // large, so the byte ceiling must reject before structural inspection.
+        let xml = format!("<root>{}</root>", "x".repeat(1_024));
+        let policy = crate::policy::VerificationPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_document_bytes: xml.len() - 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+
+        assert!(matches!(
+            VerifyContext::new().policy(policy).verify(&xml),
+            Err(SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "XML document",
+                    maximum,
+                    actual,
+                }
+            )) if maximum == xml.len() - 1 && actual == xml.len()
+        ));
     }
 
     #[test]
@@ -4532,18 +4558,27 @@ mod tests {
     }
 
     #[test]
-    fn canonical_signed_info_is_bounded_without_diagnostic_retention() {
+    fn canonical_signed_info_obeys_policy_without_diagnostic_retention() {
         // SignedInfo is always materialized for crypto verification, so its
-        // canonical bytes must consume the ceiling even under default options.
+        // canonical bytes must consume the configured ceiling even when
+        // diagnostics do not retain reference output.
         let xml = signature_with_target_reference("AQ==");
         let marker = "<ds:SignatureMethod";
-        let padding = " ".repeat(CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING + 1);
+        let padding = " ".repeat(1_025);
         let xml = xml.replacen(marker, &format!("{padding}{marker}"), 1);
+        let policy = crate::policy::VerificationPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_canonicalized_bytes: 1_024,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
 
         let error = VerifyContext::new()
             .key(&AcceptingKey)
+            .policy(policy)
             .verify(&xml)
-            .expect_err("canonicalized SignedInfo must remain bounded by default");
+            .expect_err("canonicalized SignedInfo must remain policy-bounded");
 
         assert!(matches!(
             error,

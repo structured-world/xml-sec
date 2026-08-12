@@ -66,6 +66,8 @@ a trusted anchor. A trusted certificate selected directly remains an anchor, whi
 certificates provide key material and do not become trusted merely because they appear in
 `<KeyInfo>`. Exact DER duplicates across configured pools are evaluated once; when the same
 certificate is present in both pools, its explicit trusted classification is retained.
+`ResourcePolicy::max_xml_document_bytes` rejects verification and signing inputs before DOM
+parsing; the same immutable ceiling is rechecked after signing mutations that enlarge the XML.
 Configured chain depth and candidate-path limits are validated after resolver defaults compose with
 the operation policy. Candidate-path accounting includes every generated partial path, and
 self-issued rollover certificates continue toward a distinct same-name issuer when its signature

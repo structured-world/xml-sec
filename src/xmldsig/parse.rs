@@ -38,9 +38,7 @@ use super::whitespace::{
 };
 use super::x509::certificate_signature_matches_with_provider;
 use crate::c14n::C14nAlgorithm;
-use crate::c14n::xml_base::{
-    XmlBaseResolutionBudget, compute_effective_xml_base_with_budget, resolve_uri_with_budget,
-};
+use crate::c14n::xml_base::{XmlBaseResolutionBudget, resolve_uri_from_node_with_budget};
 
 /// XMLDSig namespace URI.
 pub(crate) const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
@@ -674,14 +672,8 @@ pub(crate) fn parse_key_info_with_provider_and_xml_base_budget(
                 } else {
                     // RetrievalMethod is parsed independently from later key
                     // materialization, so retain its resolved resource identity.
-                    match compute_effective_xml_base_with_budget(child, None, xml_base_budget)
+                    resolve_uri_from_node_with_budget(child, lexical_uri, xml_base_budget)
                         .map_err(|error| ParseError::InvalidStructure(error.to_string()))?
-                    {
-                        Some(base) => resolve_uri_with_budget(&base, lexical_uri, xml_base_budget)
-                            .map_err(|error| ParseError::InvalidStructure(error.to_string()))?,
-                        None => resolve_uri_with_budget("", lexical_uri, xml_base_budget)
-                            .map_err(|error| ParseError::InvalidStructure(error.to_string()))?,
-                    }
                 };
                 let resource_type = child.attribute("Type");
                 if resource_type.is_some_and(|value| value.len() > MAX_KEY_NAME_TEXT_LEN) {
@@ -3803,6 +3795,31 @@ BA== </Modulus>
         );
         let document = Document::parse(&xml).unwrap();
         let key_info = parse_key_info(document.root_element()).unwrap();
+
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [KeyInfoSource::RetrievalMethod { uri, .. }]
+                if uri == "https://example.test/key.der"
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_absolute_retrieval_bypasses_xml_base_chain() {
+        // Absolute RetrievalMethod identities do not inherit xml:base, so an
+        // otherwise excessive ancestor chain must not reject them.
+        let mut xml = format!(
+            r#"<KeyInfo xmlns="{XMLDSIG_NS}"><RetrievalMethod URI="https://example.test/a/../key.der"/></KeyInfo>"#
+        );
+        for _ in 0..65 {
+            xml = format!(r#"<n xml:base="segment/">{xml}</n>"#);
+        }
+        let document = Document::parse(&xml).unwrap();
+        let key_info_node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .unwrap();
+        let key_info = parse_key_info(key_info_node)
+            .expect("absolute RetrievalMethod must not consume ancestor-base budget");
 
         assert!(matches!(
             key_info.sources.as_slice(),
