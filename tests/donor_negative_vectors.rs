@@ -143,6 +143,7 @@ fn phaos_certificate_chain_is_expired_at_a_modern_verification_time() {
         check_crls: false,
         allowed_extended_key_usages: None,
         rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
+        dsa_keys: xml_sec::policy::DsaKeyPolicy::default(),
     };
 
     assert_eq!(
@@ -164,6 +165,7 @@ fn x509_path_enforces_configured_issuer_rsa_minimum() {
         check_crls: false,
         allowed_extended_key_usages: None,
         rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
+        dsa_keys: xml_sec::policy::DsaKeyPolicy::default(),
     };
 
     assert!(matches!(

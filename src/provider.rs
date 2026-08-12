@@ -655,12 +655,11 @@ mod rustcrypto_x509 {
                     return Ok(false);
                 };
                 Ok(
-                    crate::xmldsig::signature::verify_dsa_signature_spki_with_minimum(
+                    crate::xmldsig::signature::verify_dsa_signature_spki_primitive(
                         SignatureAlgorithm::DsaSha1,
                         issuer_spki_der,
                         signed_data,
                         &signature,
-                        1024,
                     )
                     .unwrap_or(false),
                 )
@@ -769,8 +768,16 @@ mod rustcrypto_x509 {
         match spki.algorithm.algorithm.to_id_string().as_str() {
             "1.2.840.113549.1.1.1" => RsaPublicKey::from_public_key_der(spki_der).ok(),
             "1.2.840.113549.1.1.10" => {
-                let parameters = spki.algorithm.parameters.as_ref()?;
-                if !rsa_pss_key_parameters_allow(parameters, signature_algorithm) {
+                // RFC 4055 section 3.3 applies key restrictions only when
+                // RSASSA-PSS-params is present in SubjectPublicKeyInfo.
+                if spki
+                    .algorithm
+                    .parameters
+                    .as_ref()
+                    .is_some_and(|parameters| {
+                        !rsa_pss_key_parameters_allow(parameters, signature_algorithm)
+                    })
+                {
                     return None;
                 }
                 RsaPublicKey::from_pkcs1_der(&spki.subject_public_key.data).ok()
@@ -1697,7 +1704,7 @@ mod tests {
             .to_der()
             .expect("parameterless PSS SPKI must encode");
         assert!(
-            !RUST_CRYPTO_PROVIDER
+            RUST_CRYPTO_PROVIDER
                 .verify_x509_signature(
                     X509SignatureAlgorithm::RsaPss {
                         digest: DigestAlgorithm::Sha256,
@@ -1708,7 +1715,7 @@ mod tests {
                     &signature,
                     &parameterless_pss_spki,
                 )
-                .expect("malformed PSS key parameters are invalid, not unsupported")
+                .expect("parameterless PSS keys impose no signature restrictions")
         );
 
         let mut pss_spki = x509_cert::SubjectPublicKeyInfo::from_der(public_key.as_bytes())

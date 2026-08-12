@@ -197,9 +197,10 @@ are verify-only legacy algorithms. Every one is independently default-deny: `Non
 `VerificationPolicy::signature_algorithms` allowlist does not bypass
 `VerificationPolicy::key_trust.allowed_legacy_signature_algorithms`, where callers must explicitly
 opt in to each legacy method needed by that operation. `KeyTrustPolicy::rsa_keys` and
-`KeyTrustPolicy::dsa_keys` separately enforce key-strength minima on resolved verification keys;
-their secure defaults are 2048 bits. Compatibility operations may lower the DSA minimum to 1024
-bits, but the non-configurable DSA implementation ceiling remains 3072 bits.
+`KeyTrustPolicy::dsa_keys` separately enforce key-strength minima on resolved verification keys and
+on issuer keys used to authenticate certificate paths and applicable CRLs; their secure defaults
+are 2048 bits. Compatibility operations may lower the DSA minimum to 1024 bits, but the
+non-configurable DSA implementation ceiling remains 3072 bits.
 Selecting the algorithm in untrusted XML does not opt the operation into legacy cryptography, and
 this gate runs before key resolution.
 RSA-SHA1 signing remains unsupported.
@@ -207,5 +208,8 @@ X.509 path and CRL authentication additionally supports standard RSA-PSS with SH
 SHA-512 parameters, including RFC 4055 issuer-key restrictions, and Ed25519. Signature
 `AlgorithmIdentifier` parameters are validated before provider dispatch: DSA, ECDSA, and Ed25519
 require absent parameters; RSA PKCS#1 accepts NULL or absent; RSA-PSS requires valid typed
-parameters. DSA-SHA256, broader HMAC verification/signing, XMLDSig `SignatureMethod` RSA-PSS, and
+parameters. An `id-RSASSA-PSS` issuer key with absent parameters imposes no parameter restrictions,
+as required by RFC 4055 section 3.3; present key parameters constrain the signature hash, MGF,
+minimum salt length, and trailer field. DSA-SHA256, broader HMAC verification/signing, XMLDSig
+`SignatureMethod` RSA-PSS, and
 implicit external resource loading are not currently supported.

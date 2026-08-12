@@ -19,7 +19,7 @@ use super::{
     parse::{distinguished_name_within_subtree, distinguished_names_equal, x509_name_to_rfc4514},
 };
 use crate::{
-    policy::{ExtendedKeyPurpose, RsaKeyPolicy},
+    policy::{DsaKeyPolicy, ExtendedKeyPurpose, RsaKeyPolicy},
     provider::X509SignatureAlgorithm,
 };
 
@@ -38,6 +38,8 @@ pub struct X509ChainOptions<'a> {
     pub allowed_extended_key_usages: Option<&'a HashSet<ExtendedKeyPurpose>>,
     /// RSA strength requirements for every issuer key used by the path.
     pub rsa_keys: RsaKeyPolicy,
+    /// DSA strength requirements for every issuer key used by the path.
+    pub dsa_keys: DsaKeyPolicy,
 }
 
 /// Certificate-chain validation failure.
@@ -272,7 +274,7 @@ fn validate_path(
         let [child, issuer] = pair else {
             unreachable!()
         };
-        validate_issuer_key_policy(issuer, position + 1, options.rsa_keys)?;
+        validate_issuer_key_policy(issuer, position + 1, options.rsa_keys, options.dsa_keys)?;
         if !certificate_names_equal(child.issuer(), issuer.subject())
             || !verify_certificate_signature_with_provider(child, issuer, provider)?
         {
@@ -290,14 +292,34 @@ fn validate_issuer_key_policy(
     issuer: &X509Certificate<'_>,
     position: usize,
     rsa_keys: RsaKeyPolicy,
+    dsa_keys: DsaKeyPolicy,
 ) -> Result<(), X509ChainError> {
-    let Ok(x509_parser::public_key::PublicKey::RSA(key)) = issuer.public_key().parsed() else {
-        return Ok(());
-    };
-    rsa_keys
-        .validate_components("X.509 issuer verification", key.modulus, key.exponent)
-        .map(|_| ())
-        .map_err(|source| X509ChainError::KeyPolicy { position, source })
+    match issuer.public_key().parsed() {
+        Ok(x509_parser::public_key::PublicKey::RSA(key)) => rsa_keys
+            .validate_components("X.509 issuer verification", key.modulus, key.exponent)
+            .map(|_| ())
+            .map_err(|source| X509ChainError::KeyPolicy { position, source }),
+        Ok(x509_parser::public_key::PublicKey::DSA(_)) => {
+            match super::signature::validate_dsa_signature_spki_with_minimum(
+                issuer.public_key().raw,
+                dsa_keys.minimum_modulus_bits,
+            ) {
+                Ok(()) => Ok(()),
+                Err(super::SignatureVerificationError::KeyPolicy(source)) => {
+                    Err(X509ChainError::KeyPolicy { position, source })
+                }
+                Err(_) => Err(X509ChainError::InvalidDer {
+                    kind: "DSA issuer SubjectPublicKeyInfo",
+                    message: "invalid DSA key parameters".into(),
+                }),
+            }
+        }
+        Ok(_) => Ok(()),
+        Err(error) => Err(X509ChainError::InvalidDer {
+            kind: "issuer SubjectPublicKeyInfo",
+            message: error.to_string(),
+        }),
+    }
 }
 
 fn validate_certificate_serial(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
@@ -1750,6 +1772,7 @@ mod tests {
                 check_crls: false,
                 allowed_extended_key_usages,
                 rsa_keys: RsaKeyPolicy::default(),
+                dsa_keys: DsaKeyPolicy::default(),
             },
         )
     }
@@ -2206,10 +2229,52 @@ mod tests {
             check_crls: false,
             allowed_extended_key_usages: None,
             rsa_keys: RsaKeyPolicy::default(),
+            dsa_keys: DsaKeyPolicy {
+                minimum_modulus_bits: 1024,
+            },
         };
 
         verify_x509_certificate_chain(&info, &options)
             .expect("the stale DSA root must be replaced by the configured anchor");
+    }
+
+    #[test]
+    fn dsa_issuer_key_uses_the_configured_strength_policy() {
+        let leaf = include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
+        )
+        .to_vec();
+        let anchor =
+            include_bytes!("../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/ca.der")
+                .to_vec();
+        let anchors = vec![anchor.clone()];
+        let info = X509DataInfo {
+            certificates: vec![leaf, anchor],
+            certificate_chain: vec![0, 1],
+            ..X509DataInfo::default()
+        };
+        let options = X509ChainOptions {
+            trusted_certs: &anchors,
+            verification_time: UNIX_EPOCH + Duration::from_secs(1_104_580_800),
+            max_chain_depth: 2,
+            check_crls: false,
+            allowed_extended_key_usages: None,
+            rsa_keys: RsaKeyPolicy::default(),
+            dsa_keys: DsaKeyPolicy::default(),
+        };
+
+        assert!(matches!(
+            verify_x509_certificate_chain(&info, &options),
+            Err(X509ChainError::KeyPolicy {
+                position: 1,
+                source: crate::policy::PolicyViolation::KeySize {
+                    key_type: "DSA",
+                    minimum_bits: 2048,
+                    actual_bits: 1024,
+                    ..
+                }
+            })
+        ));
     }
 
     #[test]

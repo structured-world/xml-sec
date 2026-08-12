@@ -354,6 +354,7 @@ impl DefaultKeyResolver {
             check_crls: trust.check_crls,
             allowed_extended_key_usages: Some(&trust.allowed_extended_key_usages),
             rsa_keys: trust.rsa_keys,
+            dsa_keys: trust.dsa_keys,
         };
         verify_x509_certificate_chain_with_provider(info, &options, provider)?;
         Ok(())

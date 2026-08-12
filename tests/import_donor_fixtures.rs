@@ -338,4 +338,18 @@ fn merlin_import_rejects_conflicting_hmac_fixture_names() {
             .expect("existing snapshot must remain readable"),
         "<sentinel/>"
     );
+    let mut remaining = std::fs::read_dir(&target)
+        .expect("existing snapshot directory must remain readable")
+        .map(|entry| {
+            entry
+                .expect("snapshot entry must remain readable")
+                .file_name()
+        })
+        .collect::<Vec<_>>();
+    remaining.sort();
+    assert_eq!(
+        remaining,
+        [std::ffi::OsString::from("sentinel.xml")],
+        "failed imports must not add partial donor artifacts"
+    );
 }

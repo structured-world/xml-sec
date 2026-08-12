@@ -302,6 +302,36 @@ pub(crate) fn verify_dsa_signature_spki_with_minimum(
     signature_value: &[u8],
     minimum_modulus_bits: usize,
 ) -> Result<bool, SignatureVerificationError> {
+    validate_dsa_signature_spki_with_minimum(public_key_spki_der, minimum_modulus_bits)?;
+    verify_dsa_signature_spki_primitive(
+        algorithm,
+        public_key_spki_der,
+        signed_data,
+        signature_value,
+    )
+}
+
+pub(crate) fn validate_dsa_signature_spki_with_minimum(
+    public_key_spki_der: &[u8],
+    minimum_modulus_bits: usize,
+) -> Result<(), SignatureVerificationError> {
+    let key = dsa::VerifyingKey::from_public_key_der(public_key_spki_der)
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let modulus_bits = usize::try_from(key.components().p().bits_vartime())
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    crate::policy::DsaKeyPolicy {
+        minimum_modulus_bits,
+    }
+    .validate_modulus_bits(modulus_bits)
+    .map_err(SignatureVerificationError::KeyPolicy)
+}
+
+pub(crate) fn verify_dsa_signature_spki_primitive(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationError> {
     if algorithm != SignatureAlgorithm::DsaSha1 {
         return Err(SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_string(),
@@ -312,12 +342,6 @@ pub(crate) fn verify_dsa_signature_spki_with_minimum(
     }
     let key = dsa::VerifyingKey::from_public_key_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    let modulus_bits = usize::try_from(key.components().p().bits_vartime())
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    crate::policy::DsaKeyPolicy {
-        minimum_modulus_bits,
-    }
-    .validate_modulus_bits(modulus_bits)?;
     let Some(signature) = dsa::Signature::from_components(
         crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[..20]),
         crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[20..]),
