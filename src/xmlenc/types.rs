@@ -75,6 +75,17 @@ impl DataEncryptionAlgorithm {
             Self::Aes128Gcm | Self::Aes256Gcm => 28,
         }
     }
+
+    /// Exact wire length produced when encrypting the given plaintext length.
+    pub(crate) fn ciphertext_len_for_plaintext(self, plaintext_len: usize) -> Option<usize> {
+        match self {
+            Self::Aes128Cbc | Self::Aes256Cbc => (plaintext_len / 16)
+                .checked_add(1)?
+                .checked_mul(16)?
+                .checked_add(16),
+            Self::Aes128Gcm | Self::Aes256Gcm => plaintext_len.checked_add(28),
+        }
+    }
 }
 
 pub(crate) fn validate_ciphertext_framing(

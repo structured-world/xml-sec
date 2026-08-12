@@ -602,6 +602,20 @@ fn encrypt_content(
 ) -> Result<Vec<u8>, XmlEncError> {
     let ciphertext = provider.encrypt_data(algorithm, key, plaintext)?;
     super::types::validate_ciphertext_framing(algorithm, ciphertext.len())?;
+    let expected = algorithm
+        .ciphertext_len_for_plaintext(plaintext.len())
+        .ok_or(XmlEncError::PlaintextTooLarge {
+            maximum: crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING,
+            actual: plaintext.len(),
+        })?;
+    if ciphertext.len() != expected {
+        return Err(crate::provider::ProviderError::InvalidOutputSize {
+            operation: crate::provider::ProviderOperation::Encrypt,
+            expected,
+            actual: ciphertext.len(),
+        }
+        .into());
+    }
     Ok(ciphertext)
 }
 
@@ -1803,6 +1817,35 @@ mod tests {
             assert!(matches!(
                 error,
                 XmlEncError::DataTooShort { .. } | XmlEncError::InvalidCbcCiphertextLength(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_overlong_custom_provider_ciphertext_before_serialization() {
+        // Provider success cannot change the algorithm-defined relationship
+        // between plaintext and ciphertext length.
+        for (algorithm, expected, actual) in [
+            (DataEncryptionAlgorithm::Aes128Gcm, 32, 33),
+            (DataEncryptionAlgorithm::Aes128Cbc, 32, 48),
+        ] {
+            let error = EncryptedDataBuilder::new(algorithm)
+                .provider(Arc::new(OverridingOutputProvider {
+                    ciphertext: Some(vec![0_u8; actual]),
+                    wrapped_key: None,
+                    transported_key: None,
+                    transport_calls: AtomicUsize::new(0),
+                }))
+                .direct_key(vec![0_u8; algorithm.key_len()])
+                .encrypt_binary(b"data")
+                .expect_err("overlong provider output must fail before XML serialization");
+            assert!(matches!(
+                error,
+                XmlEncError::Provider(crate::provider::ProviderError::InvalidOutputSize {
+                    operation: crate::provider::ProviderOperation::Encrypt,
+                    expected: observed_expected,
+                    actual: observed_actual,
+                }) if observed_expected == expected && observed_actual == actual
             ));
         }
     }
