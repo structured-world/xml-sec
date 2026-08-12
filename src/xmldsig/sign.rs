@@ -534,7 +534,8 @@ impl SigningKey for EcdsaP256SigningKey {
                 });
             }
         };
-        let prehash = provider.digest(digest_algorithm, canonical_signed_info)?;
+        let prehash =
+            super::compute_digest_with_provider(provider, digest_algorithm, canonical_signed_info)?;
         let signature: P256Signature = self
             .key
             .sign_prehash(&prehash)
@@ -604,7 +605,8 @@ impl SigningKey for EcdsaP384SigningKey {
                 });
             }
         };
-        let prehash = provider.digest(digest_algorithm, canonical_signed_info)?;
+        let prehash =
+            super::compute_digest_with_provider(provider, digest_algorithm, canonical_signed_info)?;
         let signature: P384Signature = self
             .key
             .sign_prehash(&prehash)

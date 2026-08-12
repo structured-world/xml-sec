@@ -1288,6 +1288,7 @@ mod tests {
     struct CountingRandomProvider {
         random_calls: AtomicUsize,
         reject_digest: Option<DigestAlgorithm>,
+        extra_digest_byte: bool,
     }
 
     #[cfg(feature = "xmldsig")]
@@ -1316,7 +1317,11 @@ mod tests {
                     algorithm: Some(algorithm.uri().to_owned()),
                 });
             }
-            RUST_CRYPTO_PROVIDER.digest(algorithm, data)
+            let mut digest = RUST_CRYPTO_PROVIDER.digest(algorithm, data)?;
+            if self.extra_digest_byte {
+                digest.push(0);
+            }
+            Ok(digest)
         }
 
         fn sign(
@@ -1472,6 +1477,7 @@ mod tests {
         let provider = CountingRandomProvider {
             random_calls: AtomicUsize::new(0),
             reject_digest: None,
+            extra_digest_byte: false,
         };
 
         let signature = provider
@@ -1523,6 +1529,7 @@ mod tests {
             let provider = CountingRandomProvider {
                 random_calls: AtomicUsize::new(0),
                 reject_digest: Some(digest_algorithm),
+                extra_digest_byte: false,
             };
             let error = provider
                 .sign(key.as_ref(), signature_algorithm, b"signed info")
@@ -1534,6 +1541,63 @@ mod tests {
                     operation: ProviderOperation::Digest,
                     algorithm: Some(ref uri),
                 }) if uri == digest_algorithm.uri()
+            ));
+        }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn ecdsa_signing_rejects_provider_digests_with_the_wrong_length() {
+        use crate::xmldsig::{
+            EcdsaP256SigningKey, EcdsaP384SigningKey, SignatureAlgorithm, SigningKeyError,
+        };
+
+        // Prehash signers may truncate oversized input, so the provider
+        // boundary must reject it before either curve receives the digest.
+        let cases: [(
+            Box<dyn crate::xmldsig::SigningKey>,
+            SignatureAlgorithm,
+            usize,
+        ); 2] = [
+            (
+                Box::new(
+                    EcdsaP256SigningKey::from_pkcs8_pem(include_str!(
+                        "../tests/fixtures/keys/ec/ec-prime256v1-key.pem"
+                    ))
+                    .expect("P-256 fixture must parse"),
+                ),
+                SignatureAlgorithm::EcdsaSha256,
+                32,
+            ),
+            (
+                Box::new(
+                    EcdsaP384SigningKey::from_pkcs8_pem(include_str!(
+                        "../tests/fixtures/keys/ec/ec-prime384v1-key.pem"
+                    ))
+                    .expect("P-384 fixture must parse"),
+                ),
+                SignatureAlgorithm::EcdsaSha384,
+                48,
+            ),
+        ];
+
+        for (key, algorithm, expected) in cases {
+            let provider = CountingRandomProvider {
+                random_calls: AtomicUsize::new(0),
+                reject_digest: None,
+                extra_digest_byte: true,
+            };
+            let error = provider
+                .sign(key.as_ref(), algorithm, b"signed info")
+                .expect_err("an oversized provider digest must not reach ECDSA prehash signing");
+
+            assert!(matches!(
+                error,
+                SigningKeyError::Provider(ProviderError::InvalidOutputSize {
+                    operation: ProviderOperation::Digest,
+                    expected: actual_expected,
+                    actual,
+                }) if actual_expected == expected && actual == expected + 1
             ));
         }
     }

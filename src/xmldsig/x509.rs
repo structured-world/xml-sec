@@ -272,10 +272,10 @@ fn validate_path(
 }
 
 fn validate_certificate_serial(cert: &X509Certificate<'_>) -> Result<(), X509ChainError> {
-    validate_certificate_serial_bytes(cert.raw_serial())
+    validate_positive_serial_bytes(cert.raw_serial(), "certificate serial number")
 }
 
-fn validate_certificate_serial_bytes(serial: &[u8]) -> Result<(), X509ChainError> {
+fn validate_positive_serial_bytes(serial: &[u8], kind: &'static str) -> Result<(), X509ChainError> {
     let magnitude = serial.strip_prefix(&[0]).unwrap_or(serial);
     if serial.is_empty()
         || serial[0] & 0x80 != 0
@@ -284,7 +284,7 @@ fn validate_certificate_serial_bytes(serial: &[u8]) -> Result<(), X509ChainError
         || magnitude.iter().all(|byte| *byte == 0)
     {
         return Err(X509ChainError::InvalidDer {
-            kind: "certificate serial number",
+            kind,
             message: "RFC 5280 requires a positive, non-zero value of at most 20 octets".into(),
         });
     }
@@ -1536,6 +1536,8 @@ fn validate_crl_extension_uniqueness(
         .extensions_map()
         .map_err(|_| X509ChainError::InvalidCrl(crl_index))?;
     for revoked in crl.iter_revoked_certificates() {
+        validate_positive_serial_bytes(revoked.raw_serial(), "CRL revoked certificate serial")
+            .map_err(|_| X509ChainError::InvalidCrl(crl_index))?;
         revoked
             .extensions_map()
             .map_err(|_| X509ChainError::InvalidCrl(crl_index))?;
@@ -2858,6 +2860,42 @@ mod tests {
     }
 
     #[test]
+    fn malformed_revoked_certificate_serials_fail_closed() {
+        // Mutate the signed Merlin CRL fixture without changing DER lengths so
+        // zero and negative serials exercise the actual CRL parser path.
+        let original = merlin_crl_der();
+        let serial = parsed_merlin_crl(&original)
+            .iter_revoked_certificates()
+            .next()
+            .expect("tracked Merlin CRL must contain a revoked entry")
+            .raw_serial()
+            .to_vec();
+        let offsets = original
+            .windows(serial.len())
+            .enumerate()
+            .filter_map(|(offset, bytes)| (bytes == serial).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            offsets.len(),
+            1,
+            "revoked serial fixture must be unambiguous"
+        );
+
+        for replacement in [vec![0; serial.len()], {
+            let mut negative = serial.clone();
+            negative[0] = 0x80;
+            negative
+        }] {
+            let mut malformed = original.clone();
+            malformed[offsets[0]..offsets[0] + serial.len()].copy_from_slice(&replacement);
+            assert_eq!(
+                validate_crl_extensions(&parsed_merlin_crl(&malformed), 0),
+                Err(X509ChainError::InvalidCrl(0))
+            );
+        }
+    }
+
+    #[test]
     fn delta_crl_indicator_is_rejected_regardless_of_criticality() {
         use der::{Decode as _, Encode as _, asn1::OctetString};
         use x509_cert::{crl::CertificateList, ext::Extension};
@@ -3051,8 +3089,8 @@ mod tests {
             ));
         }
 
-        assert!(validate_certificate_serial_bytes(&[0x80]).is_err());
-        assert!(validate_certificate_serial_bytes(&[1; 20]).is_ok());
+        assert!(validate_positive_serial_bytes(&[0x80], "certificate serial number").is_err());
+        assert!(validate_positive_serial_bytes(&[1; 20], "certificate serial number").is_ok());
 
         let root = rcgen::CertifiedIssuer::self_signed(
             generated_certificate_params("serial-padding root", true),

@@ -63,9 +63,9 @@ pub(crate) const MAX_X509_DECODED_BINARY_LEN: usize =
 const MAX_X509_SUBJECT_NAME_TEXT_LEN: usize = 16_384;
 const MAX_X509_ISSUER_NAME_TEXT_LEN: usize = 16_384;
 const MAX_X509_SERIAL_NUMBER_RAW_TEXT_LEN: usize = 16_384;
-// RFC 5280 permits at most 20 DER content octets for a positive certificate
-// serial number. The sign bit leaves 159 value bits, or at most 49 significant
-// decimal digits; XML Schema permits insignificant leading zeroes.
+// RFC 5280 requires consumers to handle a 20-octet unsigned serial magnitude.
+// DER may add a leading sign-padding octet; XML Schema permits insignificant
+// leading decimal zeroes.
 const MAX_X509_SERIAL_NUMBER_VALUE_DIGITS: usize = 49;
 const MAX_X509_SERIAL_NUMBER_BYTES: usize = 20;
 const MAX_X509_DATA_ENTRY_COUNT: usize = 64;
@@ -2021,11 +2021,6 @@ fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
         }
     }
 
-    // DER INTEGER is signed, so a positive 20-octet serial must keep its high
-    // bit clear. Values requiring a 21st sign-extension octet exceed RFC 5280.
-    if bytes[0] & 0x80 != 0 {
-        return None;
-    }
     if bytes.iter().all(|byte| *byte == 0) {
         return None;
     }
@@ -3285,12 +3280,16 @@ BA== </Modulus>
 
     #[test]
     fn x509_serial_decimal_parser_enforces_rfc5280_positive_range() {
-        // RFC 5280 limits positive certificate serials to 20 DER content
-        // octets, leaving 159 value bits because the high bit is the sign.
-        let max_serial = "730750818665451459101842416358141509827966271487";
+        // A 20-octet unsigned magnitude may need a 21st DER sign-padding
+        // octet. The decimal selector denotes the value, not its DER encoding.
+        let max_serial = "1461501637330902918203684832716283019655932542975";
         assert_eq!(
             x509_serial_decimal_to_hex(max_serial),
-            Some("7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF".into())
+            Some("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF".into())
+        );
+        assert_eq!(
+            x509_serial_decimal_to_hex("730750818665451459101842416358141509827966271488"),
+            Some("8000000000000000000000000000000000000000".into())
         );
         assert_eq!(
             x509_serial_decimal_to_hex("0000000000000000000000000000000000000000000000001"),
@@ -3310,7 +3309,6 @@ BA== </Modulus>
             "++1",
             "-1",
             "1a",
-            "730750818665451459101842416358141509827966271488",
             "1461501637330902918203684832716283019655932542976",
         ] {
             assert_eq!(
@@ -3325,7 +3323,7 @@ BA== </Modulus>
     fn parse_x509_serial_normalizes_boundary_whitespace_and_rejects_overflow() {
         // XML Schema collapses integer whitespace before validation; the
         // normalized value must still obey the RFC 5280 positive range.
-        let max_serial = "730750818665451459101842416358141509827966271487";
+        let max_serial = "1461501637330902918203684832716283019655932542975";
         let valid = format!(
             "<KeyInfo xmlns=\"{XMLDSIG_NS}\"><X509Data><X509IssuerSerial><X509IssuerName>CN=issuer</X509IssuerName><X509SerialNumber>\n {max_serial}\t</X509SerialNumber></X509IssuerSerial></X509Data></KeyInfo>"
         );
@@ -3346,7 +3344,7 @@ BA== </Modulus>
 
         let overflow = valid.replace(
             max_serial,
-            "730750818665451459101842416358141509827966271488",
+            "1461501637330902918203684832716283019655932542976",
         );
         let doc = Document::parse(&overflow).unwrap();
         assert!(matches!(
@@ -3354,6 +3352,35 @@ BA== </Modulus>
             Err(ParseError::InvalidStructure(message))
                 if message.contains("invalid X509SerialNumber")
         ));
+    }
+
+    #[test]
+    fn issuer_selector_matches_a_sign_padded_twenty_octet_serial() {
+        // Selector decimal text represents the unsigned magnitude; the DER
+        // sign-padding octet must not make the same certificate unmatchable.
+        let serial_hex = "8000000000000000000000000000000000000000";
+        let info = X509DataInfo {
+            issuer_serials: vec![(
+                "CN=issuer".into(),
+                "730750818665451459101842416358141509827966271488".into(),
+            )],
+            parsed_certificates: vec![ParsedX509Certificate {
+                subject_dn: "CN=leaf".into(),
+                issuer_dn: "CN=issuer".into(),
+                serial_number: [vec![0, 0x80], vec![0; 19]].concat(),
+                serial_number_hex: serial_hex.into(),
+                subject_key_identifier: None,
+                public_key: X509PublicKeyInfo::Unsupported {
+                    algorithm_oid: "1.2.3.4".into(),
+                },
+            }],
+            ..X509DataInfo::default()
+        };
+
+        assert!(
+            x509_selector_categories_match_chain(&info, crate::provider::default_provider())
+                .unwrap()
+        );
     }
 
     #[test]
