@@ -1647,10 +1647,11 @@ fn verify_crls(
                     required: "cRLSign",
                 });
             }
-            let time_valid = crl.last_update() <= verification_time
-                && crl
-                    .next_update()
-                    .is_none_or(|next| verification_time <= next);
+            // RFC 5280 requires conforming CRL issuers to provide nextUpdate;
+            // without it this verifier cannot establish a bounded freshness window.
+            let time_valid = crl.next_update().is_some_and(|next| {
+                crl.last_update() <= verification_time && verification_time <= next
+            });
             if !time_valid {
                 return Err(X509ChainError::InvalidCrl(*crl_index));
             }

@@ -5,6 +5,8 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use der::{Decode as _, Encode as _, asn1::BitString};
+use rcgen::SigningKey as _;
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateRevocationListParams, CrlDistributionPoint,
     CrlIssuingDistributionPoint, CrlScope, IsCa, Issuer, KeyIdMethod, KeyPair, KeyUsagePurpose,
@@ -535,6 +537,52 @@ fn rejects_malformed_crl_when_revocation_checking_is_enabled() {
         verify_x509_certificate_chain(&info, &options(&anchors, true)),
         Err(X509ChainError::InvalidDer { kind: "CRL", .. })
     ));
+}
+
+#[test]
+fn rejects_crl_without_next_update() {
+    // RFC 5280 conforming issuers always provide nextUpdate; accepting an
+    // unbounded CRL would leave freshness undefined after thisUpdate.
+    let mut root_params = CertificateParams::new(Vec::new()).unwrap();
+    root_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "missing nextUpdate root");
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let root =
+        rcgen::CertifiedIssuer::self_signed(root_params, KeyPair::generate().unwrap()).unwrap();
+    let leaf = CertificateParams::new(Vec::new())
+        .unwrap()
+        .signed_by(&KeyPair::generate().unwrap(), &root)
+        .unwrap();
+    let crl = CertificateRevocationListParams {
+        this_update: date_time_ymd(2026, 3, 15),
+        next_update: date_time_ymd(2026, 4, 15),
+        crl_number: SerialNumber::from(1_u64),
+        issuing_distribution_point: None,
+        revoked_certs: Vec::new(),
+        key_identifier_method: KeyIdMethod::Sha256,
+    }
+    .signed_by(&root)
+    .unwrap();
+
+    let mut unsigned: x509_cert::crl::CertificateList =
+        x509_cert::crl::CertificateList::from_der(crl.der()).unwrap();
+    unsigned.tbs_cert_list.next_update = None;
+    let signature = root
+        .key()
+        .sign(&unsigned.tbs_cert_list.to_der().unwrap())
+        .unwrap();
+    unsigned.signature = BitString::from_bytes(&signature).unwrap();
+
+    let mut info = generated_info(vec![leaf.der().to_vec(), root.der().to_vec()]);
+    info.crls.push(unsigned.to_der().unwrap());
+    let anchors = [root.der().to_vec()];
+
+    assert_eq!(
+        verify_x509_certificate_chain(&info, &options(&anchors, true)),
+        Err(X509ChainError::InvalidCrl(0))
+    );
 }
 
 #[test]

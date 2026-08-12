@@ -132,6 +132,7 @@ impl<'a> DecryptContext<'a> {
             .provider
             .decrypt_data(algorithm, &key, &ciphertext)
             .map_err(|error| map_data_decryption_error(algorithm, ciphertext.len(), error))?;
+        validate_provider_plaintext_len(algorithm, ciphertext.len(), plaintext.len())?;
         validate_plaintext_len(
             plaintext.len(),
             self.policy.resources.max_encryption_plaintext_bytes,
@@ -787,6 +788,43 @@ fn validate_possible_plaintext_len(
     validate_plaintext_len(ciphertext_len.saturating_sub(framing), maximum)
 }
 
+fn validate_provider_plaintext_len(
+    algorithm: DataEncryptionAlgorithm,
+    ciphertext_len: usize,
+    plaintext_len: usize,
+) -> Result<(), XmlEncError> {
+    use crate::provider::{ProviderError, ProviderOperation};
+
+    match algorithm {
+        DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => {
+            let expected = ciphertext_len - algorithm.minimum_ciphertext_len();
+            if plaintext_len != expected {
+                return Err(ProviderError::InvalidOutputSize {
+                    operation: ProviderOperation::Decrypt,
+                    expected,
+                    actual: plaintext_len,
+                }
+                .into());
+            }
+        }
+        DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => {
+            let padded_len = ciphertext_len - 16;
+            let minimum = padded_len - 16;
+            let maximum = padded_len - 1;
+            if !(minimum..=maximum).contains(&plaintext_len) {
+                return Err(ProviderError::InvalidOutputSizeRange {
+                    operation: ProviderOperation::Decrypt,
+                    minimum,
+                    maximum,
+                    actual: plaintext_len,
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_plaintext_len(actual: usize, maximum: usize) -> Result<(), XmlEncError> {
     if actual <= maximum {
         Ok(())
@@ -873,6 +911,7 @@ mod tests {
         decrypt_calls: AtomicUsize,
         unwrap_calls: AtomicUsize,
         recover_calls: AtomicUsize,
+        plaintext: Vec<u8>,
     }
 
     impl crate::provider::CryptoProvider for PermissiveUnwrapProvider {
@@ -957,7 +996,7 @@ mod tests {
             _ciphertext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
             self.decrypt_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(b"provider plaintext".to_vec())
+            Ok(self.plaintext.clone())
         }
 
         fn wrap_key(
@@ -1322,6 +1361,67 @@ mod tests {
             );
             assert_eq!(resolver.calls.get(), 0);
             assert_eq!(provider.decrypt_calls.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn rejects_custom_provider_plaintext_outside_algorithm_bounds() {
+        // A provider success result is still untrusted: GCM fixes the plaintext
+        // length exactly, while CBC padding permits only one block-sized range.
+        for (algorithm, ciphertext_len, plaintext_len) in [
+            (DataEncryptionAlgorithm::Aes128Gcm, 32, 5),
+            (DataEncryptionAlgorithm::Aes128Cbc, 32, 16),
+        ] {
+            let resolver = AllCallsResolver {
+                calls: Cell::new(0),
+                key: vec![0_u8; algorithm.key_len()],
+            };
+            let provider = PermissiveUnwrapProvider {
+                plaintext: vec![0_u8; plaintext_len],
+                ..PermissiveUnwrapProvider::default()
+            };
+            let encrypted = EncryptedData {
+                id: None,
+                encrypted_type: None,
+                key_name: None,
+                encryption_method: super::super::EncryptionMethod {
+                    algorithm: algorithm.uri().into(),
+                    key_size_bits: None,
+                    oaep_digest: None,
+                    mgf_algorithm: None,
+                    oaep_params: None,
+                },
+                encrypted_keys: Vec::new(),
+                cipher_data: super::super::CipherData {
+                    value: STANDARD.encode(vec![0_u8; ciphertext_len]),
+                },
+            };
+
+            let error = DecryptContext::new(&resolver)
+                .provider(&provider)
+                .decrypt_data(&encrypted)
+                .expect_err("impossible provider output length must fail");
+            match algorithm {
+                DataEncryptionAlgorithm::Aes128Gcm => assert!(matches!(
+                    error,
+                    XmlEncError::Provider(crate::provider::ProviderError::InvalidOutputSize {
+                        operation: crate::provider::ProviderOperation::Decrypt,
+                        expected: 4,
+                        actual: 5,
+                    })
+                )),
+                DataEncryptionAlgorithm::Aes128Cbc => assert!(matches!(
+                    error,
+                    XmlEncError::Provider(crate::provider::ProviderError::InvalidOutputSizeRange {
+                        operation: crate::provider::ProviderOperation::Decrypt,
+                        minimum: 0,
+                        maximum: 15,
+                        actual: 16,
+                    })
+                )),
+                _ => unreachable!("the regression table covers one GCM and one CBC algorithm"),
+            }
+            assert_eq!(provider.decrypt_calls.load(Ordering::Relaxed), 1);
         }
     }
 

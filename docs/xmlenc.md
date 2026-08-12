@@ -104,6 +104,8 @@ Unknown key transport and wrap URIs fail closed before an application resolver i
 AES-CBC framing is bounded before decryption and the exact plaintext bound is checked again after
 padding removal. Invalid padding is reported only as `XmlEncError::InvalidPadding`; neither the
 provider error nor the public error exposes the final decrypted octet or derived padding length.
+Successful custom-provider output is also checked against the wire-derived contract: AES-GCM has
+one exact plaintext length, while AES-CBC output must fit the range permitted by one padding block.
 That uniform diagnostic does not authenticate CBC or remove the success-versus-failure signal.
 Applications processing attacker-controlled ciphertext must authenticate the enclosing protocol
 before acting on plaintext, or exclude AES-CBC with `EncryptionPolicy::data_algorithms` and use

@@ -159,7 +159,7 @@ impl RsaKeyPolicy {
                 actual_bits: modulus_bits,
             });
         }
-        if exponent.is_empty() || exponent[0] & 0x80 != 0 || exponent.len() > 8 {
+        if exponent.is_empty() || exponent.len() > 8 {
             return Err(PolicyViolation::InvalidKeyMaterial {
                 operation,
                 key_type: "RSA",
@@ -650,6 +650,11 @@ mod tests {
             secure.validate_components("test", &[0x80; 256], &[2]),
             Err(PolicyViolation::InvalidKeyMaterial { .. })
         ));
+        assert_eq!(
+            secure.validate_components("test", &[0x80; 256], &[0x80, 0, 0, 1]),
+            Ok(256),
+            "normalized RSA components encode the exponent as unsigned bytes"
+        );
 
         let compatibility = RsaKeyPolicy {
             minimum_modulus_bits: 1024,

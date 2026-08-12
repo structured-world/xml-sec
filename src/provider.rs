@@ -170,6 +170,21 @@ pub enum ProviderError {
         /// Actual provider output length.
         actual: usize,
     },
+    /// A provider reported success but returned bytes outside the selected
+    /// operation's variable-size output contract.
+    #[error(
+        "invalid provider output size for {operation:?}: expected {minimum}..={maximum} bytes, got {actual}"
+    )]
+    InvalidOutputSizeRange {
+        /// Operation whose output contract was violated.
+        operation: ProviderOperation,
+        /// Smallest output length permitted by the algorithm.
+        minimum: usize,
+        /// Largest output length permitted by the algorithm.
+        maximum: usize,
+        /// Actual provider output length.
+        actual: usize,
+    },
     /// Input framing, padding, or primitive initialization is invalid.
     #[error("invalid cryptographic input: {0}")]
     InvalidInput(ProviderInputError),

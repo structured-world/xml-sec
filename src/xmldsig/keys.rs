@@ -737,6 +737,19 @@ impl KeyResolver for DefaultKeyResolver {
         // validation requirements can only become stricter, while the legacy
         // algorithm opt-in remains exclusively context-owned and is enforced
         // before key resolution.
+        let verification_time = match (
+            policy.key_trust.verification_time,
+            self.config.trust.verification_time,
+        ) {
+            (Some(operation), Some(resolver)) if operation != resolver => {
+                return Err(crate::policy::PolicyViolation::KeyTrust {
+                    reason: "operation and resolver verification times conflict",
+                }
+                .into());
+            }
+            (Some(time), _) | (_, Some(time)) => Some(time),
+            (None, None) => None,
+        };
         let trust = crate::policy::KeyTrustPolicy {
             verify_x509_chains: policy.key_trust.verify_x509_chains
                 || self.config.trust.verify_x509_chains,
@@ -756,10 +769,7 @@ impl KeyResolver for DefaultKeyResolver {
                 .cloned()
                 .collect(),
             check_crls: policy.key_trust.check_crls || self.config.trust.check_crls,
-            verification_time: policy
-                .key_trust
-                .verification_time
-                .or(self.config.trust.verification_time),
+            verification_time,
         };
         self.resolve_with_trust(key_info, algorithm, &trust, provider)
     }
@@ -1365,6 +1375,40 @@ mod tests {
                 reason: "CRL checking requires X.509 chain validation"
             })
         ));
+    }
+
+    #[test]
+    fn resolver_rejects_conflicting_explicit_verification_times() {
+        // Two explicit clocks are caller decisions, not tightening bounds. The
+        // resolver must not silently discard either source during composition.
+        let resolver_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        let operation_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(20);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            trust: crate::policy::KeyTrustPolicy {
+                verification_time: Some(resolver_time),
+                ..crate::policy::KeyTrustPolicy::default()
+            },
+            ..KeyResolverConfig::default()
+        });
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_trust.verification_time = Some(operation_time);
+
+        assert!(matches!(
+            resolver.resolve_with_policy(None, SignatureAlgorithm::RsaSha256, &policy),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::KeyTrust {
+                    reason: "operation and resolver verification times conflict"
+                }
+            ))
+        ));
+
+        policy.key_trust.verification_time = Some(resolver_time);
+        assert!(
+            resolver
+                .resolve_with_policy(None, SignatureAlgorithm::RsaSha256, &policy)
+                .expect("identical explicit verification times must compose")
+                .is_none()
+        );
     }
 
     #[test]

@@ -70,6 +70,8 @@ Configured chain depth and candidate-path limits are validated after resolver de
 the operation policy. Candidate-path accounting includes every generated partial path, and
 self-issued rollover certificates continue toward a distinct same-name issuer when its signature
 validates; neither condition can bypass the configured work bounds or trust anchor requirement.
+An explicit verification time may come from either boundary; if both boundaries provide one, the
+timestamps must be identical because silently preferring either clock would discard caller policy.
 Path validation excludes self-issued rollover CAs from `pathLenConstraint`, applies supported RFC
 5280 NameConstraints to every subordinate certificate, and rejects critical extensions whose
 semantics are not implemented. Repeated extension OIDs are rejected certificate-wide before any
@@ -147,6 +149,8 @@ CRLs without enabling certificate-chain validation is rejected during context co
 than silently accepting a control the resolver cannot enforce.
 CRL structure is validated before authority-key applicability is selected: duplicate CRL or
 CRL-entry extension OIDs fail closed, and `deltaCRLIndicator` is rejected regardless of criticality.
+Applicable CRLs must include the RFC 5280 `nextUpdate` field and the verification time must remain
+inside the bounded `thisUpdate` through `nextUpdate` validity window.
 The `removeFromCRL` reason is rejected in complete CRLs because it is meaningful only in a delta
 CRL. URI subject alternative names
 likewise require one RFC 3986 authority, including syntactically valid userinfo, before their host
