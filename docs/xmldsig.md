@@ -55,6 +55,11 @@ capability such as ECDSA-SHA512 while a custom provider can implement it. For an
 hash, MGF, minimum salt, and trailer-field restrictions before verifying a certificate signature.
 Custom resolvers that evaluate cryptographic key metadata should override
 `KeyResolver::resolve_with_policy_and_provider`; source-only resolvers can retain the default hook.
+Before document-signature provider dispatch, the facade calls
+`VerifyingKey::validate_signature_value`. Built-in resolved keys enforce the exact RSA modulus or
+EC curve width there, so a permissive custom provider cannot reinterpret malformed XMLDSig wire
+framing. Custom opaque keys must override that hook when their accepted framing depends on key
+metadata unavailable through the generic algorithm URI.
 
 ## Verification Policy
 

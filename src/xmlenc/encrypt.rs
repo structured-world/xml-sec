@@ -820,7 +820,11 @@ fn validate_xml_plaintext(
         }
         EncryptedDataType::Content => {
             let wrapped = format!("<xmlsec-content>{xml}</xmlsec-content>");
-            let _ = Document::parse_with_options(&wrapped, parsing_options())?;
+            let mut options = parsing_options();
+            // The wrapper exists only to parse an XML fragment. Its node must
+            // not consume the caller-owned plaintext node allowance.
+            options.nodes_limit = options.nodes_limit.saturating_add(1);
+            let _ = Document::parse_with_options(&wrapped, options)?;
             Ok(())
         }
         EncryptedDataType::Other(_) => Err(XmlEncError::InvalidEncryptionConfig(
@@ -1423,6 +1427,24 @@ mod tests {
         ));
         assert!(matches!(
             builder().encrypt_document(xml, DocumentEncryptionOptions::default()),
+            Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
+        ));
+    }
+
+    #[test]
+    fn content_plaintext_node_limit_excludes_the_internal_wrapper() {
+        let policy = |max_xml_nodes| crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_nodes,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+
+        validate_xml_plaintext("<first/><second/>", &EncryptedDataType::Content, &policy(3))
+            .expect("the caller root and two elements must fit a three-node policy");
+        assert!(matches!(
+            validate_xml_plaintext("<first/><second/>", &EncryptedDataType::Content, &policy(2),),
             Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
         ));
     }

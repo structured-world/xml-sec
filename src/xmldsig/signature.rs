@@ -13,9 +13,12 @@
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
 use p521::ecdsa::{Signature as P521Signature, VerifyingKey as P521VerifyingKey};
-use rsa::pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaVerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::hazmat::PrehashVerifier;
+use rsa::{
+    pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaVerifyingKey},
+    traits::PublicKeyParts,
+};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use signature::Verifier;
@@ -24,6 +27,74 @@ use x509_parser::public_key::{ECPoint, PublicKey};
 use x509_parser::x509::SubjectPublicKeyInfo;
 
 use super::parse::SignatureAlgorithm;
+
+pub(crate) fn signature_value_matches_algorithm(
+    algorithm: SignatureAlgorithm,
+    signature_value: &[u8],
+) -> bool {
+    match algorithm {
+        SignatureAlgorithm::DsaSha1 => signature_value.len() == 40,
+        SignatureAlgorithm::HmacSha1 => (10..=20).contains(&signature_value.len()),
+        // Opaque custom keys expose no modulus here, so the default can enforce
+        // only non-empty framing under the absolute ceiling. Built-in keys
+        // override this with the exact modulus width.
+        SignatureAlgorithm::RsaSha1
+        | SignatureAlgorithm::RsaSha256
+        | SignatureAlgorithm::RsaSha384
+        | SignatureAlgorithm::RsaSha512 => {
+            (1..=crate::hard_limits::RSA_MODULUS_BIT_CEILING / 8).contains(&signature_value.len())
+        }
+        SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384 => {
+            [32, 48, 66].into_iter().any(|component_len| {
+                classify_ecdsa_signature_encoding(signature_value, component_len).is_ok()
+            })
+        }
+    }
+}
+
+pub(crate) fn signature_value_matches_spki(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationError> {
+    let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    if !rest.is_empty() {
+        return Err(SignatureVerificationError::InvalidKeyDer);
+    }
+    let public_key = spki
+        .parsed()
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+
+    match (algorithm, public_key) {
+        (SignatureAlgorithm::DsaSha1, PublicKey::DSA(_)) => Ok(signature_value.len() == 40),
+        (
+            SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha256
+            | SignatureAlgorithm::RsaSha384
+            | SignatureAlgorithm::RsaSha512,
+            PublicKey::RSA(_),
+        ) => {
+            let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
+                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+            Ok(signature_value.len() == key.size())
+        }
+        (SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384, PublicKey::EC(ec)) => {
+            validate_ec_public_key_encoding(&ec, &spki.subject_public_key.data)?;
+            let (_, component_len) = ecdsa_curve_and_component_len(&spki, &ec)?;
+            classify_ecdsa_signature_encoding(signature_value, component_len)?;
+            Ok(true)
+        }
+        (SignatureAlgorithm::HmacSha1, _) => {
+            Err(SignatureVerificationError::KeyAlgorithmMismatch {
+                uri: algorithm.uri().to_owned(),
+            })
+        }
+        _ => Err(SignatureVerificationError::KeyAlgorithmMismatch {
+            uri: algorithm.uri().to_owned(),
+        }),
+    }
+}
 
 /// Errors while preparing or running XMLDSig signature verification.
 #[derive(Debug, thiserror::Error)]
@@ -684,6 +755,33 @@ mod tests {
                 &signature,
             ),
             Ok(false)
+        ));
+    }
+
+    #[test]
+    fn spki_signature_framing_uses_the_resolved_key_width() {
+        let rsa = parse_public_key_pem(include_str!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"
+        ))
+        .expect("RSA fixture must parse");
+        assert!(
+            signature_value_matches_spki(SignatureAlgorithm::RsaSha256, &rsa, &[0; 256]).unwrap()
+        );
+        assert!(
+            !signature_value_matches_spki(SignatureAlgorithm::RsaSha256, &rsa, &[0; 255]).unwrap()
+        );
+
+        let p256 = parse_public_key_pem(include_str!(
+            "../../tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem"
+        ))
+        .expect("P-256 fixture must parse");
+        assert!(
+            signature_value_matches_spki(SignatureAlgorithm::EcdsaSha256, &p256, &[0xAA; 64])
+                .unwrap()
+        );
+        assert!(matches!(
+            signature_value_matches_spki(SignatureAlgorithm::EcdsaSha256, &p256, &[0xAA; 96]),
+            Err(SignatureVerificationError::InvalidSignatureFormat)
         ));
     }
 

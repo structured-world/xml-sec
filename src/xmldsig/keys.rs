@@ -11,7 +11,7 @@ use x509_parser::{
     x509::SubjectPublicKeyInfo,
 };
 
-use super::signature::verify_rsa_signature_spki_with_minimum;
+use super::signature::{signature_value_matches_spki, verify_rsa_signature_spki_with_minimum};
 use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
     X509ChainOptions, X509DataInfo,
@@ -69,6 +69,17 @@ impl HmacSha1VerificationKey {
 }
 
 impl VerifyingKey for HmacSha1VerificationKey {
+    fn validate_signature_value(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        if algorithm != SignatureAlgorithm::HmacSha1 {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        Ok(signature_value.len() == self.output_len)
+    }
+
     fn verify(
         &self,
         algorithm: SignatureAlgorithm,
@@ -103,6 +114,18 @@ pub struct VerificationKey {
 }
 
 impl VerifyingKey for VerificationKey {
+    fn validate_signature_value(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        if algorithm != self.algorithm {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        signature_value_matches_spki(algorithm, &self.public_key_bytes, signature_value)
+            .map_err(DsigError::Crypto)
+    }
+
     fn verify(
         &self,
         algorithm: SignatureAlgorithm,

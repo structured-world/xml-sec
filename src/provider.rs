@@ -225,6 +225,9 @@ pub trait CryptoProvider: Send + Sync {
     ) -> Result<Vec<u8>, crate::xmldsig::SigningKeyError>;
 
     /// Verify bytes with an opaque key handle.
+    ///
+    /// The XMLDSig facade validates algorithm- and key-specific signature
+    /// framing before this provider boundary.
     #[cfg(feature = "xmldsig")]
     fn verify(
         &self,
@@ -1289,6 +1292,7 @@ mod tests {
         random_calls: AtomicUsize,
         reject_digest: Option<DigestAlgorithm>,
         extra_digest_byte: bool,
+        accept_signatures: bool,
     }
 
     #[cfg(feature = "xmldsig")]
@@ -1340,6 +1344,9 @@ mod tests {
             data: &[u8],
             signature: &[u8],
         ) -> Result<bool, crate::xmldsig::DsigError> {
+            if self.accept_signatures {
+                return Ok(true);
+            }
             RUST_CRYPTO_PROVIDER.verify(key, algorithm, data, signature)
         }
 
@@ -1478,6 +1485,7 @@ mod tests {
             random_calls: AtomicUsize::new(0),
             reject_digest: None,
             extra_digest_byte: false,
+            accept_signatures: false,
         };
 
         let signature = provider
@@ -1530,6 +1538,7 @@ mod tests {
                 random_calls: AtomicUsize::new(0),
                 reject_digest: Some(digest_algorithm),
                 extra_digest_byte: false,
+                accept_signatures: false,
             };
             let error = provider
                 .sign(key.as_ref(), signature_algorithm, b"signed info")
@@ -1586,6 +1595,7 @@ mod tests {
                 random_calls: AtomicUsize::new(0),
                 reject_digest: None,
                 extra_digest_byte: true,
+                accept_signatures: false,
             };
             let error = provider
                 .sign(key.as_ref(), algorithm, b"signed info")
@@ -1600,6 +1610,43 @@ mod tests {
                 }) if actual_expected == expected && actual == expected + 1
             ));
         }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn verification_facade_rejects_malformed_dsa_before_provider_dispatch() {
+        use crate::xmldsig::{DefaultKeyResolver, DsigStatus, FailureReason, VerifyContext};
+
+        let original = include_str!(
+            "../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-dsa.xml"
+        );
+        let value_start = original
+            .find("<SignatureValue>")
+            .expect("Merlin fixture must contain SignatureValue")
+            + "<SignatureValue>".len();
+        let value_end = original[value_start..]
+            .find("</SignatureValue>")
+            .map(|offset| value_start + offset)
+            .expect("Merlin fixture must close SignatureValue");
+        let mut malformed = original.to_owned();
+        malformed.replace_range(value_start..value_end, "AQ==");
+        let provider = CountingRandomProvider {
+            random_calls: AtomicUsize::new(0),
+            reject_digest: None,
+            extra_digest_byte: false,
+            accept_signatures: true,
+        };
+
+        let result = VerifyContext::new()
+            .provider(&provider)
+            .key_resolver(&DefaultKeyResolver::default())
+            .verify(&malformed)
+            .expect("malformed framing must be a verification miss");
+
+        assert_eq!(
+            result.status,
+            DsigStatus::Invalid(FailureReason::SignatureMismatch)
+        );
     }
 
     #[cfg(feature = "xmldsig")]

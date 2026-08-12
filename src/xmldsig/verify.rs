@@ -56,6 +56,22 @@ const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;
 /// This trait intentionally has no `Send + Sync` supertraits so lightweight
 /// single-threaded verifiers can be used without additional bounds.
 pub trait VerifyingKey {
+    /// Check that `signature_value` has the wire framing required by the
+    /// declared algorithm and this key before provider dispatch.
+    ///
+    /// Key implementations with key-size-dependent framing should override
+    /// this method. The default enforces the algorithm-wide XMLDSig envelope.
+    fn validate_signature_value(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        Ok(super::signature::signature_value_matches_algorithm(
+            algorithm,
+            signature_value,
+        ))
+    }
+
     /// Verify `signature_value` over `signed_data` with the declared algorithm.
     fn verify(
         &self,
@@ -1180,6 +1196,18 @@ fn verify_signature_with_context(
         });
     };
     let verifier = resolved_key.as_ref();
+    if !verifier.validate_signature_value(signed_info.signature_method, &signature_value)? {
+        return Ok(VerifyResult {
+            status: DsigStatus::Invalid(FailureReason::SignatureMismatch),
+            signed_info_references: references.results,
+            manifest_references: Vec::new(),
+            canonicalized_signed_info: if ctx.store_pre_digest {
+                Some(canonical_signed_info)
+            } else {
+                None
+            },
+        });
+    }
     let signature_valid = ctx.provider.verify(
         verifier,
         signed_info.signature_method,

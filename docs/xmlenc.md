@@ -38,14 +38,16 @@ public keys, or use `recipient_aes_kw` with a shared KEK. `EncryptedDataBuilder`
 content key through `CryptoProvider::fill_random` and wraps it once per recipient. The default
 `RustCryptoProvider` uses the operating-system RNG; `.provider(...)` can replace that behavior
 together with the cryptographic primitives. The crate's secure RSA-OAEP default is
-SHA-256/MGF1-SHA-256. XMLEnc 1.1 itself defaults omitted parameters to SHA-1/MGF1-SHA-1, so
-`xml-sec` always emits explicit `ds:DigestMethod` and `xenc11:MGF` values rather than relying on
-those implicit legacy defaults. SHA-1 OAEP remains available only through explicit parameters.
+SHA-256/MGF1-SHA-256. XMLEnc 1.1 itself defaults omitted parameters to SHA-1/MGF1-SHA-1, so for
+the XML Encryption 1.1 RSA-OAEP URI `xml-sec` emits explicit `ds:DigestMethod` and `xenc11:MGF`
+values rather than relying on those implicit legacy defaults. SHA-1 OAEP remains available only
+through explicit parameters. The legacy `rsa-oaep-mgf1p` URI fixes MGF1 to SHA-1 and has no
+`xenc11:MGF` wire field.
 `EncryptionPolicy::rsa_keys` validates every recipient modulus and exponent before provider
 dispatch. New output defaults to 2048-8192-bit RSA keys; callers can explicitly tighten or relax
 the minimum for a deployment profile, but cannot exceed the implementation ceiling.
-The legacy `rsa-oaep-mgf1p` URI fixes MGF1 to SHA-1; configuration validation rejects any other
-MGF digest before provider dispatch because that URI has no wire field capable of representing it.
+Configuration validation rejects any non-SHA-1 MGF digest for the legacy URI before provider
+dispatch because its wire format cannot represent an alternative.
 AES-KW configuration similarly validates the KEK size fixed by its algorithm URI before provider
 dispatch, so custom providers cannot reinterpret `kw-aes128` with a 256-bit KEK or `kw-aes256`
 with a 128-bit KEK. A custom provider's wrapped-key output must contain the complete RFC 3394 value,
@@ -117,9 +119,10 @@ the shared `ResourcePolicy::max_xml_document_bytes` ceiling before DOM allocatio
 XML node ceiling to
 the initial document, replacement-boundary validation, and final output reparse. The projected
 output byte length is checked before constructing the replacement. DTD parsing remains disabled by
-default; legacy documents that need an internal DTD can opt in through
-`decrypt_document_with_options` and `DocumentDecryptionOptions`. That API never installs an
-external entity resolver.
+default; legacy documents that need an internal DTD can opt in only when both
+`EncryptionPolicy::xml.allow_internal_dtd` and `DocumentDecryptionOptions::allow_dtd` are enabled.
+The per-call option cannot weaken the operation policy, and the API never installs an external
+entity resolver.
 
 `encrypt_document` also checks the exact projected document byte length and XML node count after
 cipher framing, base64, and `EncryptedData` serialization but before allocating the replacement
