@@ -191,7 +191,7 @@ fn signing_facade_rejects_malformed_key_specific_signature_output() {
             SignatureAlgorithm::RsaSha256,
             SigningPublicKeyInfo::Rsa {
                 spki_der: Vec::new(),
-                modulus: vec![1_u8; 256],
+                modulus: vec![0x80_u8; 256],
                 exponent: vec![1, 0, 1],
             },
             255,
@@ -268,7 +268,7 @@ fn signing_policy_rejects_weak_rsa_key_before_provider_dispatch() {
         let calls = Arc::new(AtomicUsize::new(0));
         let key = CountingSigningKey {
             calls: Arc::clone(&calls),
-            modulus: vec![1_u8; modulus_bytes],
+            modulus: vec![0x80_u8; modulus_bytes],
             exponent: vec![1, 0, 1],
         };
         assert!(matches!(
@@ -292,7 +292,7 @@ fn signing_policy_rejects_weak_rsa_key_before_provider_dispatch() {
     let calls = Arc::new(AtomicUsize::new(0));
     let key = CountingSigningKey {
         calls: Arc::clone(&calls),
-        modulus: vec![1_u8; 256],
+        modulus: vec![0x80_u8; 256],
         exponent: vec![2],
     };
     assert!(matches!(

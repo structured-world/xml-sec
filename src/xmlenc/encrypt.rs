@@ -34,6 +34,11 @@ pub struct EncryptedDataBuilder {
     provider: Arc<dyn crate::provider::CryptoProvider>,
 }
 
+struct GeneratedEncryption {
+    result: EncryptionResult,
+    xml_nodes: usize,
+}
+
 impl fmt::Debug for EncryptedDataBuilder {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -126,12 +131,14 @@ impl EncryptedDataBuilder {
         self.validate_plaintext_len(xml.len())?;
         validate_xml_plaintext(xml, &self.encrypted_type, &self.policy)?;
         self.encrypt_payload(xml.as_bytes(), Some(self.encrypted_type.clone()))
+            .map(|generated| generated.result)
     }
 
     /// Encrypt opaque bytes without an XML `Type` attribute.
     pub fn encrypt_binary(&self, data: &[u8]) -> Result<EncryptionResult, XmlEncError> {
         self.policy.validate()?;
         self.encrypt_payload(data, None)
+            .map(|generated| generated.result)
     }
 
     /// Encrypt and replace the document root or one element selected by XML ID.
@@ -153,8 +160,9 @@ impl EncryptedDataBuilder {
 
         match self.encrypted_type {
             EncryptedDataType::Element => {
-                let result =
+                let generated =
                     self.encrypt_payload(source.as_bytes(), Some(EncryptedDataType::Element))?;
+                let result = generated.result;
                 validate_replacement_document_len(
                     xml.len(),
                     range.len(),
@@ -164,7 +172,7 @@ impl EncryptedDataBuilder {
                 validate_replacement_document_nodes(
                     &document,
                     selected,
-                    &result.encrypted_data_xml,
+                    generated.xml_nodes,
                     ReplacementMode::ReplaceElement,
                     self.policy.resources.max_xml_nodes,
                 )?;
@@ -173,8 +181,9 @@ impl EncryptedDataBuilder {
             EncryptedDataType::Content => {
                 let boundaries = element_content_boundaries(source)?;
                 let plaintext = &source[boundaries.content.clone()];
-                let result =
+                let generated =
                     self.encrypt_payload(plaintext.as_bytes(), Some(EncryptedDataType::Content))?;
+                let result = generated.result;
                 let (removed, inserted) = if boundaries.self_closing {
                     let slash = source[..boundaries.start_tag_end]
                         .rfind('/')
@@ -200,7 +209,7 @@ impl EncryptedDataBuilder {
                 validate_replacement_document_nodes(
                     &document,
                     selected,
-                    &result.encrypted_data_xml,
+                    generated.xml_nodes,
                     ReplacementMode::ReplaceContent,
                     self.policy.resources.max_xml_nodes,
                 )?;
@@ -216,7 +225,7 @@ impl EncryptedDataBuilder {
         &self,
         plaintext: &[u8],
         encrypted_type: Option<EncryptedDataType>,
-    ) -> Result<EncryptionResult, XmlEncError> {
+    ) -> Result<GeneratedEncryption, XmlEncError> {
         self.validate_plaintext_len(plaintext.len())?;
         self.validate_configuration()?;
 
@@ -246,15 +255,22 @@ impl EncryptedDataBuilder {
             &ciphertext,
         )?;
         self.validate_document_len(encrypted_data_xml.len())?;
+        let xml_nodes = validate_generated_encrypted_data_nodes(
+            &encrypted_data_xml,
+            self.policy.resources.max_xml_nodes,
+        )?;
         let replacement = match encrypted_type {
             Some(EncryptedDataType::Content) => ReplacementMode::ReplaceContent,
             Some(EncryptedDataType::Element | EncryptedDataType::Other(_)) | None => {
                 ReplacementMode::ReplaceElement
             }
         };
-        Ok(EncryptionResult {
-            encrypted_data_xml,
-            replacement,
+        Ok(GeneratedEncryption {
+            result: EncryptionResult {
+                encrypted_data_xml,
+                replacement,
+            },
+            xml_nodes,
         })
     }
 
@@ -507,19 +523,10 @@ fn validate_replacement_document_len(
 fn validate_replacement_document_nodes(
     document: &Document<'_>,
     selected: Node<'_, '_>,
-    inserted_xml: &str,
+    inserted_nodes: usize,
     replacement: ReplacementMode,
     maximum: usize,
 ) -> Result<(), XmlEncError> {
-    let inserted = Document::parse_with_options(
-        inserted_xml,
-        ParsingOptions {
-            allow_dtd: false,
-            nodes_limit: crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
-            entity_resolver: None,
-        },
-    )?;
-    let inserted_nodes = inserted.root_element().descendants().count();
     let selected_nodes = selected.descendants().count();
     let removed_nodes = match replacement {
         ReplacementMode::ReplaceElement => selected_nodes,
@@ -540,6 +547,30 @@ fn validate_replacement_document_nodes(
         .into());
     }
     Ok(())
+}
+
+fn validate_generated_encrypted_data_nodes(
+    encrypted_data_xml: &str,
+    maximum: usize,
+) -> Result<usize, XmlEncError> {
+    let generated = Document::parse_with_options(
+        encrypted_data_xml,
+        ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
+            entity_resolver: None,
+        },
+    )?;
+    let actual = generated.root_element().descendants().count();
+    if actual > maximum {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "generated EncryptedData XML nodes",
+            maximum,
+            actual,
+        }
+        .into());
+    }
+    Ok(actual)
 }
 
 fn validate_content_key(algorithm: DataEncryptionAlgorithm, key: &[u8]) -> Result<(), XmlEncError> {
@@ -1394,18 +1425,31 @@ mod tests {
             }
         }
 
+        let generated_nodes = {
+            let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .encrypt_binary(b"payload")
+                .expect("default policy must permit generated EncryptedData");
+            Document::parse(&encrypted.encrypted_data_xml)
+                .expect("generated EncryptedData must parse")
+                .root_element()
+                .descendants()
+                .count()
+        };
+
         // The source document fits the low limit, but the generated
-        // EncryptedData tree does not. Capture its exact projected node count.
+        // EncryptedData replacement does not. The ceiling admits the standalone
+        // fragment so this specifically exercises whole-document projection.
         let element_actual = match EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
             .direct_key([0_u8; 16])
-            .policy(policy(2))
+            .policy(policy(generated_nodes))
             .encrypt_document("<root/>", DocumentEncryptionOptions::default())
         {
             Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                 resource: "encrypted document XML nodes",
-                maximum: 2,
+                maximum,
                 actual,
-            })) if actual > 2 => actual,
+            })) if maximum == generated_nodes && actual > maximum => actual,
             result => panic!("expected projected element node bound, got {result:?}"),
         };
         EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
@@ -1420,14 +1464,14 @@ mod tests {
         let content_actual = match EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
             .encryption_type(EncryptedDataType::Content)
             .direct_key([0_u8; 16])
-            .policy(policy(2))
+            .policy(policy(generated_nodes))
             .encrypt_document("<root/>", DocumentEncryptionOptions::default())
         {
             Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                 resource: "encrypted document XML nodes",
-                maximum: 2,
+                maximum,
                 actual,
-            })) if actual > 2 => actual,
+            })) if maximum == generated_nodes && actual > maximum => actual,
             result => panic!("expected projected content node bound, got {result:?}"),
         };
         EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
@@ -1436,6 +1480,48 @@ mod tests {
             .policy(policy(content_actual))
             .encrypt_document("<root/>", DocumentEncryptionOptions::default())
             .expect("the exact projected content node limit must be accepted");
+    }
+
+    #[test]
+    fn standalone_encryption_bounds_generated_xml_nodes() {
+        fn policy(max_xml_nodes: usize) -> crate::policy::EncryptionPolicy {
+            crate::policy::EncryptionPolicy {
+                resources: crate::policy::ResourcePolicy {
+                    max_xml_nodes,
+                    ..crate::policy::ResourcePolicy::default()
+                },
+                ..crate::policy::EncryptionPolicy::default()
+            }
+        }
+
+        // Binary encryption has no input XML tree, but its generated EncryptedData
+        // must still be consumable under the same operation-policy node ceiling.
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy(1))
+                .encrypt_binary(b"payload"),
+            Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "generated EncryptedData XML nodes",
+                maximum: 1,
+                actual,
+            })) if actual > 1
+        ));
+
+        let generated = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .encrypt_binary(b"payload")
+            .expect("default policy must permit generated EncryptedData");
+        let actual = Document::parse(&generated.encrypted_data_xml)
+            .expect("generated EncryptedData must parse")
+            .root_element()
+            .descendants()
+            .count();
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy(actual))
+            .encrypt_binary(b"payload")
+            .expect("the exact generated node limit must be accepted");
     }
 
     #[test]

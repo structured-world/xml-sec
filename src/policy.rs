@@ -92,7 +92,7 @@ pub enum PolicyViolation {
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RsaKeyPolicy {
-    /// Minimum normalized RSA modulus width accepted for new output.
+    /// Minimum mathematical RSA modulus bit length accepted for new output.
     pub minimum_modulus_bits: usize,
 }
 
@@ -139,15 +139,15 @@ impl RsaKeyPolicy {
                 key_type: "RSA",
                 reason: "modulus is zero",
             })?;
-        let modulus_bits =
-            modulus
-                .len()
-                .checked_mul(8)
-                .ok_or(PolicyViolation::InvalidKeyMaterial {
-                    operation,
-                    key_type: "RSA",
-                    reason: "modulus width overflows",
-                })?;
+        let modulus_bits = modulus
+            .len()
+            .checked_mul(8)
+            .and_then(|width| width.checked_sub(modulus[0].leading_zeros() as usize))
+            .ok_or(PolicyViolation::InvalidKeyMaterial {
+                operation,
+                key_type: "RSA",
+                reason: "modulus width overflows",
+            })?;
         if !(self.minimum_modulus_bits..=crate::hard_limits::RSA_MODULUS_BIT_CEILING)
             .contains(&modulus_bits)
         {
@@ -621,7 +621,7 @@ mod tests {
     fn rsa_key_policy_enforces_structure_range_and_explicit_relaxation() {
         let secure = RsaKeyPolicy::default();
         assert!(matches!(
-            secure.validate_components("test", &[1; 128], &[1, 0, 1]),
+            secure.validate_components("test", &[0x80; 128], &[1, 0, 1]),
             Err(PolicyViolation::KeySize {
                 minimum_bits: 2048,
                 maximum_bits: 8192,
@@ -629,15 +629,25 @@ mod tests {
                 ..
             })
         ));
+        let mut short_2048_width = [0_u8; 256];
+        short_2048_width[0] = 1;
         assert!(matches!(
-            secure.validate_components("test", &[1; 1025], &[1, 0, 1]),
+            secure.validate_components("test", &short_2048_width, &[1, 0, 1]),
             Err(PolicyViolation::KeySize {
-                actual_bits: 8200,
+                minimum_bits: 2048,
+                actual_bits: 2041,
                 ..
             })
         ));
         assert!(matches!(
-            secure.validate_components("test", &[1; 256], &[2]),
+            secure.validate_components("test", &[1; 1025], &[1, 0, 1]),
+            Err(PolicyViolation::KeySize {
+                actual_bits: 8193,
+                ..
+            })
+        ));
+        assert!(matches!(
+            secure.validate_components("test", &[0x80; 256], &[2]),
             Err(PolicyViolation::InvalidKeyMaterial { .. })
         ));
 
@@ -645,7 +655,7 @@ mod tests {
             minimum_modulus_bits: 1024,
         };
         assert_eq!(
-            compatibility.validate_components("test", &[1; 128], &[1, 0, 1]),
+            compatibility.validate_components("test", &[0x80; 128], &[1, 0, 1]),
             Ok(128)
         );
         assert!(
