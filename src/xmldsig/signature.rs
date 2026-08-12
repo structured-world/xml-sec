@@ -225,54 +225,64 @@ pub(crate) fn verify_rsa_signature_spki_with_minimum(
     signature_value: &[u8],
     minimum_modulus_bits: usize,
 ) -> Result<bool, SignatureVerificationError> {
+    validate_rsa_signature_spki_with_minimum(algorithm, public_key_spki_der, minimum_modulus_bits)?;
+    verify_rsa_signature_spki_primitive(
+        algorithm,
+        public_key_spki_der,
+        signed_data,
+        signature_value,
+    )
+}
+
+pub(crate) fn validate_rsa_signature_spki_with_minimum(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    minimum_modulus_bits: usize,
+) -> Result<(), SignatureVerificationError> {
     let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
     if !rest.is_empty() {
         return Err(SignatureVerificationError::InvalidKeyDer);
     }
-    let public_key = spki
+    match spki
         .parsed()
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-
-    match public_key {
-        PublicKey::RSA(rsa) => {
-            validate_rsa_public_key(&rsa, algorithm, minimum_modulus_bits)?;
-            let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
-                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-            let Ok(signature) = RsaPkcs1v15Signature::try_from(signature_value) else {
-                return Ok(false);
-            };
-
-            let verified = match algorithm {
-                SignatureAlgorithm::RsaSha1 => {
-                    let key = RsaVerifyingKey::<Sha1>::new(key);
-                    key.verify(signed_data, &signature).is_ok()
-                }
-                SignatureAlgorithm::RsaSha256 => {
-                    let key = RsaVerifyingKey::<Sha256>::new(key);
-                    key.verify(signed_data, &signature).is_ok()
-                }
-                SignatureAlgorithm::RsaSha384 => {
-                    let key = RsaVerifyingKey::<Sha384>::new(key);
-                    key.verify(signed_data, &signature).is_ok()
-                }
-                SignatureAlgorithm::RsaSha512 => {
-                    let key = RsaVerifyingKey::<Sha512>::new(key);
-                    key.verify(signed_data, &signature).is_ok()
-                }
-                _ => {
-                    return Err(SignatureVerificationError::UnsupportedAlgorithm {
-                        uri: algorithm.uri().to_string(),
-                    });
-                }
-            };
-
-            Ok(verified)
-        }
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
+    {
+        PublicKey::RSA(rsa) => validate_rsa_public_key(&rsa, algorithm, minimum_modulus_bits),
         _ => Err(SignatureVerificationError::KeyAlgorithmMismatch {
             uri: algorithm.uri().to_string(),
         }),
     }
+}
+
+pub(crate) fn verify_rsa_signature_spki_primitive(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationError> {
+    ensure_rsa_signature_algorithm(algorithm)?;
+    let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let Ok(signature) = RsaPkcs1v15Signature::try_from(signature_value) else {
+        return Ok(false);
+    };
+    let verified = match algorithm {
+        SignatureAlgorithm::RsaSha1 => RsaVerifyingKey::<Sha1>::new(key)
+            .verify(signed_data, &signature)
+            .is_ok(),
+        SignatureAlgorithm::RsaSha256 => RsaVerifyingKey::<Sha256>::new(key)
+            .verify(signed_data, &signature)
+            .is_ok(),
+        SignatureAlgorithm::RsaSha384 => RsaVerifyingKey::<Sha384>::new(key)
+            .verify(signed_data, &signature)
+            .is_ok(),
+        SignatureAlgorithm::RsaSha512 => RsaVerifyingKey::<Sha512>::new(key)
+            .verify(signed_data, &signature)
+            .is_ok(),
+        _ => unreachable!("RSA algorithm checked above"),
+    };
+    Ok(verified)
 }
 
 /// Verify an XMLDSig DSA-SHA1 signature using a DER SPKI public key.

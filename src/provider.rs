@@ -628,14 +628,15 @@ fn is_supported_x509_signature_oid(algorithm: &str) -> bool {
 #[cfg(feature = "xmldsig")]
 mod rustcrypto_x509 {
     use der::Decode as _;
-    use ed25519_dalek::pkcs8::DecodePublicKey as _;
+    use dsa::pkcs8::DecodePublicKey as _;
     use rsa::{
         RsaPublicKey,
         pkcs1::DecodeRsaPublicKey as _,
         pss::{Signature as RsaPssSignature, VerifyingKey as RsaPssVerifyingKey},
     };
+    use sha1::Digest as _;
     use sha2::{Sha256, Sha384, Sha512};
-    use signature::Verifier as _;
+    use signature::{Verifier as _, hazmat::PrehashVerifier as _};
     use x509_parser::prelude::FromDer as _;
 
     use super::{ProviderError, X509SignatureAlgorithm};
@@ -651,18 +652,17 @@ mod rustcrypto_x509 {
     ) -> Result<bool, ProviderError> {
         match algorithm {
             X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1) => {
-                let Some(signature) = dsa_der_to_xmldsig(signature) else {
+                // Certificate signatures are ASN.1 DER integers sized by the
+                // issuer's q parameter. XMLDSig's fixed 20-byte r||s framing
+                // applies only to SignatureValue, never to X.509 signatures.
+                let Ok(key) = dsa::VerifyingKey::from_public_key_der(issuer_spki_der) else {
                     return Ok(false);
                 };
-                Ok(
-                    crate::xmldsig::signature::verify_dsa_signature_spki_primitive(
-                        SignatureAlgorithm::DsaSha1,
-                        issuer_spki_der,
-                        signed_data,
-                        &signature,
-                    )
-                    .unwrap_or(false),
-                )
+                let Ok(signature) = dsa::Signature::from_der(signature) else {
+                    return Ok(false);
+                };
+                let digest = sha1::Sha1::digest(signed_data);
+                Ok(key.verify_prehash(&digest, &signature).is_ok())
             }
             X509SignatureAlgorithm::RsaPkcs1v15(digest) => {
                 let Some(algorithm) = rsa_pkcs1_algorithm(digest) else {
@@ -821,21 +821,6 @@ mod rustcrypto_x509 {
             "2.16.840.1.101.3.4.2.3" => Some(DigestAlgorithm::Sha512),
             _ => None,
         }
-    }
-
-    fn dsa_der_to_xmldsig(signature: &[u8]) -> Option<Vec<u8>> {
-        let signature = dsa::Signature::from_der(signature).ok()?;
-        let r = signature.r().to_be_bytes();
-        let s = signature.s().to_be_bytes();
-        let r = &r[r.iter().position(|byte| *byte != 0).unwrap_or(r.len())..];
-        let s = &s[s.iter().position(|byte| *byte != 0).unwrap_or(s.len())..];
-        if r.len() > 20 || s.len() > 20 {
-            return None;
-        }
-        let mut fixed = vec![0_u8; 40];
-        fixed[20 - r.len()..20].copy_from_slice(r);
-        fixed[40 - s.len()..].copy_from_slice(s);
-        Some(fixed)
     }
 
     const fn rsa_pkcs1_algorithm(digest: DigestAlgorithm) -> Option<SignatureAlgorithm> {
@@ -1771,6 +1756,44 @@ mod tests {
                     .expect("incompatible PSS key restrictions are invalid, not unsupported")
             );
         }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn rustcrypto_provider_verifies_dsa_certificate_signature_at_q_width() {
+        use base64::Engine as _;
+
+        // OpenSSL-generated L=2048/N=224 DSA material. X.509 carries DER r/s
+        // integers at q width, not XMLDSig's legacy fixed 20-byte components.
+        let spki = base64::engine::general_purpose::STANDARD
+            .decode("MIIDQzCCAjYGByqGSM44BAEwggIpAoIBAQDEkm7mUEj1dizQRRrcU6ehyhpQ1NAkcKi9XyNcBJDZlyTdVH09XZ04UZNuXAWRL1hEDvDAvFimuwmW7k099j0PRM+WypsfOOgZPJhIVNZu9poTPGINKpbMTXFmR+qhrYM4z+NSKxuUBWZwX5HibBIG5INbx8IDHWAxZqxgHQsebDej1+yZyCTTpmDS9nKGkBRVaxsJgZt958UPNlIz1ECf4n4P4mPLAl7W5xV8VSWMqlXdkOAPbLC/mChjFoCj0jmCQpbcOvd7a6cWhcyhw/yikoVoKEPNWr9xLtdJV37f1/4q/xTvoPKWhMmgMQ/DigUnYgPzmexyS82m5HLZ/vOJAh0A/ckrg9g9PsZesUsH/4bEijeNwWGXB5e+/LCt0QKCAQEAuBGFzyjZEmvbDKbb+8tz+zqw4lK7RGwOjVM3v9xPS6LuG5L1OwCNQcUcVIsU9VxBnEx9oMnl8eVX1nq3kfdiZB2F9ESxwX5FzBt+KLjMOzBa8rPlzVcyCZ3sT3orAQ2D/q7ffDhTCUt+v8UNiAhVbaNnR/vI7AkVoP9crRjpOSV/7b5MGa0BcjIyEzTtqM58wppfSQt8jkj7WT3+Bww/Y9rOtshDE2QosaX/7xoDnzyeZ3amLjTe3/MjBcsKlbK2z4QuaI6xoQBVd/QjP8FjXpZBhXWFIAsOL/sz6uR2Er0ovdX8DBA0EJpuzlTX94Lvf+Eh+5/83ESAm97fk4pnhQOCAQUAAoIBAEwSwKuLFPeR7UJGXkWM9egyYewhqHpIXPBEWOVPqwTw3xLc3EkufpYY9wkhJS08KD+J92jMjm//0bYeVf7fXisc6PHtGY4wx5XBm1g9HKw9lwRjbk7nH495dlZdl0BXHa14TJ8myE2zOM1jsaFyz6jAFTaRnKYIj6WlKOj59d2iAXtLZRme9r+7U4G6zDUkphyIEcIGH4vhb6gm3URr1zAV5kJjTlsPAiqgeH/PgxU52tmvLphJgv/xPxsuX5W0/s7iKbphIb2YWh/gtTWXvRQHiQQ2fCncI3TAMnZ75dBY0gPOVLQJhUyffeRbk9UULux/jc8QBPgKBS7GM5DnNSw=")
+            .expect("DSA SPKI fixture must decode");
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode("MD0CHQChtB1c+f5BmTJCtT7Gi4cyQiR2igj0znRQYCJ3Ahw4NGg4pL5jgA8Ri07ESV9Yr90WfUmRrbRcnjsY")
+            .expect("DSA signature fixture must decode");
+        let message = b"certificate tbs bytes for dsa q-width regression";
+
+        assert!(
+            rustcrypto_x509::verify_signature(
+                X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1),
+                message,
+                &signature,
+                &spki,
+            )
+            .expect("supported DSA-SHA1 certificate signature")
+        );
+
+        let mut tampered = signature;
+        *tampered.last_mut().expect("DER signature is non-empty") ^= 1;
+        assert!(
+            !rustcrypto_x509::verify_signature(
+                X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1),
+                message,
+                &tampered,
+                &spki,
+            )
+            .expect("tampered DSA-SHA1 certificate signature is a verification miss")
+        );
     }
 
     #[cfg(feature = "xmldsig")]

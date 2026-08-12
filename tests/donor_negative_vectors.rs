@@ -14,9 +14,10 @@ use roxmltree::Document;
 use x509_parser::prelude::{FromDer, X509Certificate};
 use xml_sec::policy::PolicyViolation;
 use xml_sec::xmldsig::{
-    DsigError, DsigStatus, FailureReason, KeyInfoSource, ParseError, SignatureAlgorithm,
-    VerificationKey, VerifyContext, X509ChainError, X509ChainOptions, X509DataInfo, parse_key_info,
-    verify_signature_with_pem_key, verify_x509_certificate_chain,
+    DefaultKeyResolver, DsigError, DsigStatus, FailureReason, KeyInfoSource, KeyResolverConfig,
+    ParseError, SignatureAlgorithm, SignatureVerificationError, VerificationKey, VerifyContext,
+    X509ChainError, X509ChainOptions, X509DataInfo, parse_key_info, verify_signature_with_pem_key,
+    verify_x509_certificate_chain,
 };
 
 const PHAOS_DIR: &str = "tests/fixtures/xmldsig/phaos-xmldsig-three";
@@ -128,6 +129,71 @@ fn phaos_valid_baseline_rejects_legacy_rsa_key_policy() {
             ..
         })
     ));
+}
+
+#[test]
+fn pre_resolved_rsa_key_obeys_the_operation_strength_policy() {
+    // Direct keys and resolver-produced keys must enforce the same immutable
+    // operation policy; changing the key source must never weaken trust.
+    let xml = read_vector("signature-rsa-enveloped.xml");
+    let key = phaos_verification_key();
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(SignatureAlgorithm::RsaSha1);
+    policy.key_trust.rsa_keys.minimum_modulus_bits = 2048;
+
+    let error = VerifyContext::new()
+        .policy(policy)
+        .key(&key)
+        .verify(&xml)
+        .expect_err("the 1024-bit direct key must not bypass the 2048-bit policy");
+
+    assert!(matches!(
+        error,
+        DsigError::Crypto(SignatureVerificationError::KeyPolicy(
+            PolicyViolation::KeySize {
+                operation: "verification",
+                key_type: "RSA",
+                minimum_bits: 2048,
+                maximum_bits: 8192,
+                actual_bits: 1024,
+            }
+        ))
+    ));
+}
+
+#[test]
+fn fuzz_seed_reaches_valid_signature_verification() {
+    // The bounded CI fuzz run starts from a complete document so mutations can
+    // reach transforms, digesting, X.509 resolution, and signature verification.
+    let xml = std::fs::read_to_string("fuzz/corpus/xmldsig_verify/signature.xml")
+        .expect("fuzz seed must be readable");
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(SignatureAlgorithm::RsaSha1);
+    policy.key_trust.rsa_keys.minimum_modulus_bits = 1024;
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+        lookup_certs: vec![PHAOS_RSA_CERTIFICATE.to_vec()],
+        ..KeyResolverConfig::default()
+    });
+
+    let result = VerifyContext::new()
+        .policy(policy)
+        .key_resolver(&resolver)
+        .verify(&xml)
+        .expect("complete fuzz seed must traverse the verification pipeline");
+
+    assert_eq!(result.status, DsigStatus::Valid);
+    assert!(
+        result
+            .signed_info_references
+            .iter()
+            .all(|reference| reference.status == DsigStatus::Valid)
+    );
 }
 
 #[test]

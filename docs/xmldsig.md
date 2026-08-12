@@ -201,6 +201,10 @@ opt in to each legacy method needed by that operation. `KeyTrustPolicy::rsa_keys
 on issuer keys used to authenticate certificate paths and applicable CRLs; their secure defaults
 are 2048 bits. Compatibility operations may lower the DSA minimum to 1024 bits, but the
 non-configurable DSA implementation ceiling remains 3072 bits.
+Built-in keys supplied directly through `VerifyContext::key` enforce the same immutable operation
+policy as keys produced by `DefaultKeyResolver`; selecting a key source cannot tighten or weaken
+the configured minimum. Custom opaque `VerifyingKey` implementations remain responsible for key
+metadata that the core cannot inspect.
 Selecting the algorithm in untrusted XML does not opt the operation into legacy cryptography, and
 this gate runs before key resolution.
 RSA-SHA1 signing remains unsupported.

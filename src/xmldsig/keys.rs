@@ -12,7 +12,9 @@ use x509_parser::{
 };
 
 use super::signature::{
-    signature_value_matches_spki, verify_dsa_signature_spki_with_minimum,
+    signature_value_matches_spki, validate_dsa_signature_spki_with_minimum,
+    validate_rsa_signature_spki_with_minimum, verify_dsa_signature_spki_primitive,
+    verify_dsa_signature_spki_with_minimum, verify_rsa_signature_spki_primitive,
     verify_rsa_signature_spki_with_minimum,
 };
 use super::{
@@ -25,7 +27,7 @@ use super::{
         parse_x509_certificate, x509_certificate_matches_any_selector,
         x509_data_has_lookup_identifiers, x509_selector_categories_match_chain,
     },
-    verify_dsa_signature_spki, verify_ecdsa_signature_spki, verify_rsa_signature_spki,
+    verify_ecdsa_signature_spki,
     x509::verify_x509_certificate_chain_with_provider,
 };
 
@@ -117,6 +119,27 @@ pub struct VerificationKey {
 }
 
 impl VerifyingKey for VerificationKey {
+    fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
+        let result = match self.algorithm {
+            SignatureAlgorithm::DsaSha1 => validate_dsa_signature_spki_with_minimum(
+                &self.public_key_bytes,
+                policy.key_trust.dsa_keys.minimum_modulus_bits,
+            ),
+            SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha256
+            | SignatureAlgorithm::RsaSha384
+            | SignatureAlgorithm::RsaSha512 => validate_rsa_signature_spki_with_minimum(
+                self.algorithm,
+                &self.public_key_bytes,
+                policy.key_trust.rsa_keys.minimum_modulus_bits,
+            ),
+            SignatureAlgorithm::HmacSha1
+            | SignatureAlgorithm::EcdsaSha256
+            | SignatureAlgorithm::EcdsaSha384 => Ok(()),
+        };
+        result.map_err(DsigError::Crypto)
+    }
+
     fn validate_signature_value(
         &self,
         algorithm: SignatureAlgorithm,
@@ -139,7 +162,7 @@ impl VerifyingKey for VerificationKey {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
         let result = match algorithm {
-            SignatureAlgorithm::DsaSha1 => verify_dsa_signature_spki(
+            SignatureAlgorithm::DsaSha1 => verify_dsa_signature_spki_primitive(
                 algorithm,
                 &self.public_key_bytes,
                 signed_data,
@@ -148,16 +171,10 @@ impl VerifyingKey for VerificationKey {
             SignatureAlgorithm::HmacSha1 => {
                 return Err(KeyResolutionError::AlgorithmMismatch.into());
             }
-            SignatureAlgorithm::RsaSha1 => verify_rsa_signature_spki_with_minimum(
-                algorithm,
-                &self.public_key_bytes,
-                signed_data,
-                signature_value,
-                1024,
-            ),
-            SignatureAlgorithm::RsaSha256
+            SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512 => verify_rsa_signature_spki(
+            | SignatureAlgorithm::RsaSha512 => verify_rsa_signature_spki_primitive(
                 algorithm,
                 &self.public_key_bytes,
                 signed_data,

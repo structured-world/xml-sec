@@ -331,6 +331,22 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
 }
 
 #[test]
+fn pre_resolved_dsa_key_obeys_the_relaxed_operation_strength_policy() {
+    // Compatibility policy must apply identically to direct and resolved keys;
+    // the built-in key must not reapply a stricter hidden default afterward.
+    let key = verification_key("lugh-cert.pem", SignatureAlgorithm::DsaSha1);
+    assert_valid(
+        "direct legacy DSA key",
+        VerifyContext::new()
+            .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
+            .key(&key)
+            .allowed_uri_types(UriTypeSet::ALL)
+            .external_resources(&external_resources())
+            .verify(&xml("signature-keyname")),
+    );
+}
+
+#[test]
 fn rejects_missing_or_tampered_external_resources() {
     // Detached references cannot trigger I/O and must fail on absent or altered caller bytes.
     let default = DefaultKeyResolver::default();

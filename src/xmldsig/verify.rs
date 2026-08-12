@@ -56,6 +56,18 @@ const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;
 /// This trait intentionally has no `Send + Sync` supertraits so lightweight
 /// single-threaded verifiers can be used without additional bounds.
 pub trait VerifyingKey {
+    /// Validate this key against the operation's immutable trust policy.
+    ///
+    /// Built-in keys override this hook so pre-resolved and resolver-produced
+    /// keys enforce identical strength constraints. Custom opaque keys may
+    /// retain their own policy enforcement by accepting the default no-op.
+    fn validate_policy(
+        &self,
+        _policy: &crate::policy::VerificationPolicy,
+    ) -> Result<(), DsigError> {
+        Ok(())
+    }
+
     /// Check that `signature_value` has the wire framing required by the
     /// declared algorithm and this key before provider dispatch.
     ///
@@ -240,6 +252,11 @@ impl<'a> VerifyContext<'a> {
     }
 
     /// Set a pre-resolved verification key.
+    ///
+    /// Built-in [`super::VerificationKey`] values are validated against the
+    /// same operation key-strength policy as resolver-produced keys. Custom
+    /// opaque [`VerifyingKey`] implementations retain responsibility for any
+    /// key metadata that the core cannot inspect.
     pub fn key(mut self, key: &'a dyn VerifyingKey) -> Self {
         self.key = Some(key);
         self
@@ -1195,6 +1212,7 @@ fn verify_signature_with_context(
         });
     };
     let verifier = resolved_key.as_ref();
+    verifier.validate_policy(&ctx.policy)?;
     if !verifier.validate_signature_value(signed_info.signature_method, &signature_value)? {
         return Ok(VerifyResult {
             status: DsigStatus::Invalid(FailureReason::SignatureMismatch),
