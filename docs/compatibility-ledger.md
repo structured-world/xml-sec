@@ -13,7 +13,8 @@ pin:
   IDs, and complete registry families;
 - generic and crypto-backend-specific APIs;
 - algorithm and key-data URI constants and key serialization formats;
-- `xmlsec1` CLI commands and exit statuses;
+- `xmlsec1` CLI commands, typed option definitions (including aliases, argument
+  syntax, topic availability, value types, and flags), and exit statuses;
 - top-level upstream conformance and interoperability test families.
 
 The ledger is an honest parity map, not a blanket compatibility claim. Every
@@ -40,6 +41,8 @@ multiline macro bodies and typedef aliases therefore participate in donor-drift
 checks rather than only their first physical line. Definitions in separate
 preprocessor branches remain separate line-addressed entries, and configured
 header templates are rendered from the pinned `configure.ac` version contract.
+Normalization collapses formatting trivia while preserving exact bytes inside C
+string and character literals.
 
 ## Regenerating
 

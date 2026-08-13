@@ -119,11 +119,12 @@ fn complete_surface_categories_are_stable() {
         BTreeMap::from([
             ("algorithm-uri", 141),
             ("backend-api", 847),
-            ("build-define", 45),
+            ("build-define", 50),
             ("callback", 64),
             ("class-id", 1_078),
             ("cli-command", 24),
             ("cli-exit-status", 3),
+            ("cli-option", 74),
             ("deprecated-api", 13),
             ("enum", 15),
             ("export-function", 609),
@@ -253,54 +254,177 @@ fn c_surface_is_explicitly_incompatible() {
 
 #[test]
 fn native_algorithm_claims_match_the_rust_api() {
-    // This allowlist mirrors concrete parsers and prevents optimistic broad claims.
+    // Every positive claim must pass through the corresponding production parser or type.
     let ledger = ledger();
-    let actual: BTreeSet<_> = ledger
+    let claims: Vec<_> = ledger
         .items
         .iter()
-        .filter(|item| item.outcome == "behavior-compatible")
-        .map(|item| item.name.as_str())
+        .filter(|item| {
+            matches!(
+                item.outcome.as_str(),
+                "behavior-compatible" | "compatibility-profile-only"
+            )
+        })
         .collect();
-    let expected = BTreeSet::from([
-        "xmlSecHrefAes128Cbc",
-        "xmlSecHrefAes128Gcm",
-        "xmlSecHrefAes256Cbc",
-        "xmlSecHrefAes256Gcm",
-        "xmlSecHrefBase64",
-        "xmlSecHrefC14N",
-        "xmlSecHrefC14N11",
-        "xmlSecHrefC14N11WithComments",
-        "xmlSecHrefC14NWithComments",
-        "xmlSecHrefDEREncodedKeyValue",
-        "xmlSecHrefDSAKeyValue",
-        "xmlSecHrefECKeyValue",
-        "xmlSecHrefEcdsaSha256",
-        "xmlSecHrefEcdsaSha384",
-        "xmlSecHrefEncryptedKey",
-        "xmlSecHrefEnveloped",
-        "xmlSecHrefExcC14N",
-        "xmlSecHrefExcC14NWithComments",
-        "xmlSecHrefKWAes128",
-        "xmlSecHrefKWAes256",
-        "xmlSecHrefMgf1Sha1",
-        "xmlSecHrefMgf1Sha256",
-        "xmlSecHrefMgf1Sha384",
-        "xmlSecHrefMgf1Sha512",
-        "xmlSecHrefRSAKeyValue",
-        "xmlSecHrefRawX509Cert",
-        "xmlSecHrefRsaOaep",
-        "xmlSecHrefRsaOaepEnc11",
-        "xmlSecHrefRsaSha256",
-        "xmlSecHrefRsaSha384",
-        "xmlSecHrefRsaSha512",
-        "xmlSecHrefSha256",
-        "xmlSecHrefSha384",
-        "xmlSecHrefSha512",
-        "xmlSecHrefX509Data",
-        "xmlSecXPath2Ns",
-        "xmlSecXPathNs",
-    ]);
-    assert_eq!(actual, expected);
+    assert_eq!(claims.len(), 41);
+    for item in claims {
+        assert_native_uri_support(item);
+    }
+}
+
+fn assert_native_uri_support(item: &Item) {
+    use xml_sec::c14n::C14nAlgorithm;
+    use xml_sec::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
+    use xml_sec::xmlenc::{
+        DataEncryptionAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm,
+    };
+
+    let uri = item.detail.as_str();
+    match item.name.as_str() {
+        "xmlSecHrefAes128Cbc"
+        | "xmlSecHrefAes128Gcm"
+        | "xmlSecHrefAes256Cbc"
+        | "xmlSecHrefAes256Gcm" => {
+            assert_eq!(DataEncryptionAlgorithm::from_uri(uri).unwrap().uri(), uri);
+        }
+        "xmlSecHrefC14N"
+        | "xmlSecHrefC14N11"
+        | "xmlSecHrefC14N11WithComments"
+        | "xmlSecHrefC14NWithComments"
+        | "xmlSecHrefExcC14N"
+        | "xmlSecHrefExcC14NWithComments" => {
+            assert!(C14nAlgorithm::from_uri(uri).is_some(), "{}", item.id);
+        }
+        "xmlSecHrefDsaSha1"
+        | "xmlSecHrefEcdsaSha256"
+        | "xmlSecHrefEcdsaSha384"
+        | "xmlSecHrefHmacSha1"
+        | "xmlSecHrefRsaSha1"
+        | "xmlSecHrefRsaSha256"
+        | "xmlSecHrefRsaSha384"
+        | "xmlSecHrefRsaSha512" => {
+            assert_eq!(SignatureAlgorithm::from_uri(uri).unwrap().uri(), uri);
+        }
+        "xmlSecHrefSha1" | "xmlSecHrefSha256" | "xmlSecHrefSha384" | "xmlSecHrefSha512" => {
+            assert_eq!(DigestAlgorithm::from_uri(uri).unwrap().uri(), uri);
+        }
+        "xmlSecHrefKWAes128" | "xmlSecHrefKWAes256" => {
+            assert_eq!(KeyWrapAlgorithm::from_uri(uri).unwrap().uri(), uri);
+        }
+        "xmlSecHrefRsaOaep" | "xmlSecHrefRsaOaepEnc11" => {
+            assert_eq!(KeyTransportAlgorithm::from_uri(uri).unwrap().uri(), uri);
+        }
+        "xmlSecHrefMgf1Sha1"
+        | "xmlSecHrefMgf1Sha256"
+        | "xmlSecHrefMgf1Sha384"
+        | "xmlSecHrefMgf1Sha512" => {
+            let implemented = [
+                OaepDigestAlgorithm::Sha1,
+                OaepDigestAlgorithm::Sha256,
+                OaepDigestAlgorithm::Sha384,
+                OaepDigestAlgorithm::Sha512,
+            ];
+            assert!(
+                implemented
+                    .into_iter()
+                    .any(|algorithm| algorithm.mgf_uri() == uri)
+            );
+        }
+        "xmlSecHrefBase64" | "xmlSecHrefEnveloped" | "xmlSecXPath2Ns" | "xmlSecXPathNs" => {
+            assert_transform_uri_parses(uri)
+        }
+        "xmlSecHrefDEREncodedKeyValue"
+        | "xmlSecHrefDSAKeyValue"
+        | "xmlSecHrefECKeyValue"
+        | "xmlSecHrefRSAKeyValue"
+        | "xmlSecHrefRawX509Cert"
+        | "xmlSecHrefX509Data" => assert_key_info_uri_parses(item.name.as_str(), uri),
+        "xmlSecHrefEncryptedKey" => assert_encrypted_key_uri_parses(uri),
+        name => panic!("positive ledger claim {name} has no executable Rust evidence"),
+    }
+}
+
+fn assert_transform_uri_parses(uri: &str) {
+    let parameter = match uri {
+        "http://www.w3.org/TR/1999/REC-xpath-19991116" => {
+            "<XPath xmlns=\"http://www.w3.org/2000/09/xmldsig#\">true()</XPath>"
+        }
+        "http://www.w3.org/2002/06/xmldsig-filter2" => {
+            "<XPath xmlns=\"http://www.w3.org/2002/06/xmldsig-filter2\" Filter=\"intersect\">true()</XPath>"
+        }
+        _ => "",
+    };
+    let xml = format!(
+        "<Transforms xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><Transform Algorithm=\"{uri}\">{parameter}</Transform></Transforms>"
+    );
+    let document = roxmltree::Document::parse(&xml).unwrap();
+    assert_eq!(
+        xml_sec::xmldsig::transforms::parse_transforms(document.root_element())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+fn assert_key_info_uri_parses(name: &str, uri: &str) {
+    const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
+    const DS11: &str = "http://www.w3.org/2009/xmldsig11#";
+    let child = match name {
+        "xmlSecHrefDEREncodedKeyValue" => {
+            assert_eq!(uri, format!("{DS11}DEREncodedKeyValue"));
+            "<dsig11:DEREncodedKeyValue>AQIDBA==</dsig11:DEREncodedKeyValue>"
+        }
+        "xmlSecHrefDSAKeyValue" => {
+            assert_eq!(uri, format!("{DS}DSAKeyValue"));
+            "<KeyValue><DSAKeyValue><Y>AQ==</Y></DSAKeyValue></KeyValue>"
+        }
+        "xmlSecHrefECKeyValue" => {
+            assert_eq!(uri, format!("{DS11}ECKeyValue"));
+            "<KeyValue><dsig11:ECKeyValue><dsig11:NamedCurve URI=\"urn:oid:1.2.840.10045.3.1.7\"/><dsig11:PublicKey>BJ/yaXNlq4FRObyJCBhb5jAz8GVzinK3bBGLjSDfjbJwNfydtgjnlS4EsDmxSRhWyJWq6GIqy5wvnaiARK04uB4=</dsig11:PublicKey></dsig11:ECKeyValue></KeyValue>"
+        }
+        "xmlSecHrefRSAKeyValue" => {
+            assert_eq!(uri, format!("{DS}RSAKeyValue"));
+            "<KeyValue><RSAKeyValue><Modulus>AQAB</Modulus><Exponent>AQAB</Exponent></RSAKeyValue></KeyValue>"
+        }
+        "xmlSecHrefRawX509Cert" => {
+            assert_eq!(uri, format!("{DS}rawX509Certificate"));
+            return assert_retrieval_method_type_parses(uri);
+        }
+        "xmlSecHrefX509Data" => {
+            assert_eq!(uri, format!("{DS}X509Data"));
+            "<X509Data/>"
+        }
+        _ => unreachable!(),
+    };
+    let xml = format!("<KeyInfo xmlns=\"{DS}\" xmlns:dsig11=\"{DS11}\">{child}</KeyInfo>");
+    let document = roxmltree::Document::parse(&xml).unwrap();
+    assert_eq!(
+        xml_sec::xmldsig::parse_key_info(document.root_element())
+            .unwrap()
+            .sources
+            .len(),
+        1
+    );
+}
+
+fn assert_retrieval_method_type_parses(uri: &str) {
+    let xml = format!(
+        "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><RetrievalMethod URI=\"#key\" Type=\"{uri}\"/></KeyInfo>"
+    );
+    let document = roxmltree::Document::parse(&xml).unwrap();
+    xml_sec::xmldsig::parse_key_info(document.root_element()).unwrap();
+}
+
+fn assert_encrypted_key_uri_parses(uri: &str) {
+    assert_eq!(uri, "http://www.w3.org/2001/04/xmlenc#EncryptedKey");
+    let xml = r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes128"/><CipherData><CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</CipherValue></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</CipherValue></CipherData></EncryptedData>"#;
+    assert_eq!(
+        xml_sec::xmlenc::parse_encrypted_data(xml)
+            .unwrap()
+            .encrypted_keys
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -381,6 +505,30 @@ fn donor_declarations_are_extracted_without_truncation() {
             .iter()
             .any(|item| item.kind == "build-define" && item.name == "XMLSEC_CRYPTO_CFLAGS")
     );
+
+    for define in [
+        "XMLSEC_CUSTOM_CRYPT32",
+        "XMLSEC_DL_LIBLTDL",
+        "XMLSEC_OPENSSL3_ENGINES",
+        "XMLSEC_STATIC",
+    ] {
+        assert!(
+            ledger
+                .items
+                .iter()
+                .any(|item| { item.kind == "build-define" && item.name == define }),
+            "missing compiler define {define}"
+        );
+    }
+    for option in ["--output", "--privkey-pem", "--pubkey-pem"] {
+        let item = ledger
+            .items
+            .iter()
+            .find(|item| item.kind == "cli-option" && item.name == option)
+            .unwrap_or_else(|| panic!("missing CLI option {option}"));
+        assert!(item.detail.contains("xmlSecAppCmdLineParamType"));
+        assert!(item.detail.contains("xmlSecAppCmdLineParamFlag"));
+    }
 }
 
 #[test]
@@ -479,6 +627,7 @@ fn planned_surface_is_never_reported_as_supported() {
         .collect();
     assert!(!planned.is_empty());
     assert!(planned.iter().any(|item| item.kind == "cli-command"));
+    assert!(planned.iter().any(|item| item.kind == "cli-option"));
     assert!(planned.iter().any(|item| item.kind == "algorithm-uri"));
     assert!(planned.iter().any(|item| item.kind == "test-family"));
     assert!(planned.iter().any(|item| item.kind == "registry"));

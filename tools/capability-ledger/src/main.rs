@@ -569,8 +569,8 @@ fn extract_build_defines(donor: &Path, items: &mut Vec<SurfaceItem>) -> Result<(
 }
 
 fn extract_build_defines_from_content(content: &str) -> Vec<SurfaceItem> {
-    let regex = Regex::new(r#"-D(XMLSEC_(?:NO|CRYPTO)_[A-Z0-9_]+)(?:=[^\s"']+)?"#)
-        .expect("valid compiler define regex");
+    let regex =
+        Regex::new(r#"-D(XMLSEC_[A-Z0-9_]+)(?:=[^\s"']+)?"#).expect("valid compiler define regex");
     let mut items = Vec::new();
     for (index, line) in content.lines().enumerate() {
         for capture in regex.captures_iter(line) {
@@ -665,8 +665,51 @@ fn extract_cli(donor: &Path, items: &mut Vec<SurfaceItem>) -> Result<(), String>
             ));
         }
     }
+    items.extend(extract_cli_options_from_content(&content)?);
     items.extend(extract_cli_exit_statuses(&content)?);
     Ok(())
+}
+
+fn extract_cli_options_from_content(content: &str) -> Result<Vec<SurfaceItem>, String> {
+    let lines: Vec<_> = content.lines().collect();
+    let declaration =
+        Regex::new(r"^static\s+xmlSecAppCmdLineParam\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*\{")
+            .expect("valid CLI option declaration regex");
+    let full_name = Regex::new(
+        r#"(?s)^static\s+xmlSecAppCmdLineParam\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*\{\s*[^,]+,\s*\"([^\"]+)\"\s*,"#,
+    )
+    .expect("valid CLI option name regex");
+    let mut items = Vec::new();
+    let mut index = 0_usize;
+    while index < lines.len() {
+        if !declaration.is_match(lines[index].trim_start()) {
+            index += 1;
+            continue;
+        }
+        let (block, end) = collect_declaration(&lines, index)
+            .map_err(|error| format!("parse CLI option at apps/xmlsec.c:{}: {error}", index + 1))?;
+        // fullName is the stable option identity; retaining the whole initializer
+        // below also captures aliases, argument grammar, topics, type, and flags.
+        let name = full_name
+            .captures(&block)
+            .and_then(|capture| capture.get(1))
+            .ok_or_else(|| {
+                format!(
+                    "CLI option at apps/xmlsec.c:{} has no literal full name",
+                    index + 1
+                )
+            })?
+            .as_str();
+        items.push(item(
+            "cli-option",
+            name,
+            "apps/xmlsec.c",
+            index + 1,
+            &normalize(&block),
+        ));
+        index = end + 1;
+    }
+    Ok(items)
 }
 
 fn extract_cli_exit_statuses(content: &str) -> Result<Vec<SurfaceItem>, String> {
@@ -1000,7 +1043,40 @@ fn sanitize_c(value: &str) -> String {
 }
 
 fn normalize(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
+    // Formatting whitespace is irrelevant C trivia, but whitespace between quote
+    // delimiters is part of the compiled public value and must remain byte-exact.
+    let mut output = String::with_capacity(value.len());
+    let mut quote = None;
+    let mut escaped = false;
+    let mut pending_space = false;
+    for ch in value.chars() {
+        if let Some(delimiter) = quote {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+        } else if ch == '\'' || ch == '"' {
+            if pending_space && !output.is_empty() {
+                output.push(' ');
+            }
+            pending_space = false;
+            output.push(ch);
+            quote = Some(ch);
+        } else if ch.is_whitespace() {
+            pending_space = true;
+        } else {
+            if pending_space && !output.is_empty() {
+                output.push(' ');
+            }
+            pending_space = false;
+            output.push(ch);
+        }
+    }
+    output
 }
 
 fn exported_name(declaration: &str) -> Option<String> {
@@ -1322,17 +1398,65 @@ done:
 
     #[test]
     fn build_define_parser_only_accepts_compiler_definitions() {
-        // Configure shell variables are not part of the public preprocessor surface.
+        // Configure shell variables are not part of the public preprocessor surface,
+        // while every XMLSEC_* compiler token is part of the donor build contract.
         let content = r#"XMLSEC_CRYPTO_CFLAGS=\"-I/example\"
 XMLSEC_CRYPTO_DISABLED_LIST=\"openssl\"
-CFLAGS=\"$CFLAGS -DXMLSEC_NO_DES -DXMLSEC_CRYPTO_OPENSSL=1\""#;
+CFLAGS=\"$CFLAGS -DXMLSEC_NO_DES -DXMLSEC_CRYPTO_OPENSSL=1\"
+XMLSEC_DEFINES=\"$XMLSEC_DEFINES -DXMLSEC_STATIC=1 -DXMLSEC_DL_LIBLTDL=1\"
+OPENSSL_CFLAGS=\"$OPENSSL_CFLAGS -DXMLSEC_OPENSSL3_ENGINES=1\"
+MSCRYPTO_CFLAGS=\"$MSCRYPTO_CFLAGS -DXMLSEC_CUSTOM_CRYPT32=1\""#;
         let entries = extract_build_defines_from_content(content);
         assert_eq!(
             entries
                 .iter()
                 .map(|entry| entry.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["XMLSEC_NO_DES", "XMLSEC_CRYPTO_OPENSSL"]
+            vec![
+                "XMLSEC_NO_DES",
+                "XMLSEC_CRYPTO_OPENSSL",
+                "XMLSEC_STATIC",
+                "XMLSEC_DL_LIBLTDL",
+                "XMLSEC_OPENSSL3_ENGINES",
+                "XMLSEC_CUSTOM_CRYPT32",
+            ]
+        );
+    }
+
+    #[test]
+    fn normalization_preserves_c_literal_bytes() {
+        // Whitespace trivia may collapse, but bytes inside C literals are semantic.
+        assert_eq!(
+            normalize("#define VALUE   \" \"\n  \"  \""),
+            "#define VALUE \" \" \"  \""
+        );
+        assert_ne!(
+            normalize("#define VALUE \" \""),
+            normalize("#define VALUE \"  \"")
+        );
+    }
+
+    #[test]
+    fn cli_option_parser_preserves_the_typed_option_contract() {
+        // Name, aliases, help syntax, topic, type, and flags must drift together.
+        let content = r#"static xmlSecAppCmdLineParam outputParam = {
+    xmlSecAppCmdLineTopicAll,
+    "--output",
+    "-o",
+    "--output <filename>\n\twrite result to file",
+    xmlSecAppCmdLineParamTypeString,
+    xmlSecAppCmdLineParamFlagNone,
+    NULL
+};"#;
+        let options = extract_cli_options_from_content(content).expect("option must parse");
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].name, "--output");
+        assert!(options[0].detail.contains("\"-o\""));
+        assert!(options[0].detail.contains("<filename>"));
+        assert!(
+            options[0]
+                .detail
+                .contains("xmlSecAppCmdLineParamTypeString")
         );
     }
 

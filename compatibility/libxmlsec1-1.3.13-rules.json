@@ -88,9 +88,9 @@
     },
     {
       "id": "planned-cli-surface",
-      "kinds": ["cli-command", "cli-exit-status"],
+      "kinds": ["cli-command", "cli-option", "cli-exit-status"],
       "outcome": "planned",
-      "rationale": "A command-compatible xmlsec1 CLI is not yet shipped; commands and exit semantics remain explicit roadmap surface.",
+      "rationale": "A command-compatible xmlsec1 CLI is not yet shipped; commands, typed options, and exit semantics remain explicit roadmap surface.",
       "evidence": "planned-surface"
     },
     {
