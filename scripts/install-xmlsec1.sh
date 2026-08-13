@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly XMLSEC1_VERSION="1.3.13"
-readonly XMLSEC1_COMMIT="5fdd47dc35753438bdc38b6e96c1a3805c67a483"
+readonly XMLSEC1_COMMIT="$(<"$repo_root/compatibility/libxmlsec1-1.3.13-donor-commit.txt")"
 readonly XMLSEC1_REPOSITORY="https://github.com/lsh123/xmlsec.git"
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ ! "$XMLSEC1_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'invalid xmlsec1 donor commit: %s\n' "$XMLSEC1_COMMIT" >&2
+  exit 1
+fi
+
 prefix="${XMLSEC1_PREFIX:-$repo_root/.tools/xmlsec1-${XMLSEC1_VERSION}-${XMLSEC1_COMMIT:0:12}}"
 marker="$prefix/.xmlsec-source-commit"
 

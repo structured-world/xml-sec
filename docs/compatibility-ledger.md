@@ -3,7 +3,9 @@
 The machine-readable ledger at
 [`compatibility/libxmlsec1-1.3.13.json`](../compatibility/libxmlsec1-1.3.13.json)
 is the compatibility baseline for libxmlsec1 1.3.13. It inventories the public
-surface from upstream commit `5fdd47dc35753438bdc38b6e96c1a3805c67a483`:
+surface from the upstream commit recorded in the canonical
+[`libxmlsec1-1.3.13-donor-commit.txt`](../compatibility/libxmlsec1-1.3.13-donor-commit.txt)
+pin:
 
 - installed headers, exported functions and variables, macros, build defines,
   public enums, structure layouts, callbacks, class IDs, and registries;
@@ -17,6 +19,8 @@ entry has one outcome, a rationale, and an evidence reference:
 
 | Outcome | Meaning |
 |---|---|
+| `exact` | The relevant public contract, representation, and behavior match libxmlsec1 without a compatibility caveat. Reserved until an item satisfies that complete contract. |
+| `source-compatible` | Existing libxmlsec1 source can use the compatibility surface without call-site changes, while binary ABI identity is not implied. Reserved until the C compatibility layer exists. |
 | `behavior-compatible` | The native Rust API implements the wire behavior and has repository test coverage. |
 | `compatibility-profile-only` | The behavior exists but requires an explicit compatibility policy, normally for a legacy algorithm. |
 | `provider-limited` | The Rust provider abstraction covers the capability, but not the backend-specific C API. |

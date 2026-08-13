@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 const LEDGER_JSON: &str = include_str!("../compatibility/libxmlsec1-1.3.13.json");
+const DONOR_COMMIT: &str = include_str!("../compatibility/libxmlsec1-1.3.13-donor-commit.txt");
 
 #[derive(Debug, Deserialize)]
 struct Ledger {
@@ -44,6 +45,54 @@ fn ledger() -> Ledger {
     serde_json::from_str(LEDGER_JSON).expect("committed capability ledger must be valid JSON")
 }
 
+fn declared_tests() -> BTreeSet<&'static str> {
+    let mut names = BTreeSet::new();
+    let mut test_attribute = false;
+    for line in include_str!("capability_ledger.rs").lines() {
+        let line = line.trim();
+        if line == "#[test]" {
+            test_attribute = true;
+        } else if test_attribute {
+            if let Some(declaration) = line.strip_prefix("fn ") {
+                let name = declaration
+                    .split_once('(')
+                    .expect("test function declaration must have parameters")
+                    .0;
+                names.insert(name);
+                test_attribute = false;
+            } else if !line.starts_with("#[") {
+                test_attribute = false;
+            }
+        }
+    }
+    names
+}
+
+fn validate_evidence(ledger: &Ledger) -> Result<(), String> {
+    let referenced: BTreeSet<_> = ledger
+        .items
+        .iter()
+        .map(|item| item.evidence.as_str())
+        .collect();
+    let tests = declared_tests();
+    for (key, evidence) in &ledger.evidence {
+        if !referenced.contains(key.as_str()) {
+            return Err(format!("evidence {key} is not referenced by any item"));
+        }
+        let name = evidence
+            .test
+            .strip_prefix("capability_ledger::")
+            .ok_or_else(|| format!("evidence test {} has no suite prefix", evidence.test))?;
+        if !tests.contains(name) {
+            return Err(format!("evidence test {name} does not exist in this suite"));
+        }
+        if evidence.description.is_empty() {
+            return Err(format!("evidence {key} has no description"));
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn complete_surface_categories_are_stable() {
     // Exact category counts make an upstream or extractor drift visible in review.
@@ -51,10 +100,7 @@ fn complete_surface_categories_are_stable() {
     assert_eq!(ledger.schema_version, 1);
     assert_eq!(ledger.upstream.project, "libxmlsec1");
     assert_eq!(ledger.upstream.version, "1.3.13");
-    assert_eq!(
-        ledger.upstream.commit,
-        "5fdd47dc35753438bdc38b6e96c1a3805c67a483"
-    );
+    assert_eq!(ledger.upstream.commit, DONOR_COMMIT.trim());
     assert_eq!(
         ledger.upstream.repository,
         "https://github.com/lsh123/xmlsec"
@@ -145,10 +191,38 @@ fn every_entry_is_unique_sorted_and_evidenced() {
             item.outcome
         );
     }
-    for evidence in ledger.evidence.values() {
-        assert!(evidence.test.starts_with("capability_ledger::"));
-        assert!(!evidence.description.is_empty());
-    }
+    validate_evidence(&ledger).expect("all evidence must be referenced and executable");
+}
+
+#[test]
+fn orphaned_or_stale_evidence_is_rejected() {
+    // Evidence must remain both reachable from an item and executable by this suite.
+    let mut orphaned = ledger();
+    orphaned.evidence.insert(
+        "orphaned".into(),
+        Evidence {
+            test: "capability_ledger::complete_surface_categories_are_stable".into(),
+            description: "unused evidence".into(),
+        },
+    );
+    assert!(
+        validate_evidence(&orphaned)
+            .expect_err("orphaned evidence must fail")
+            .contains("not referenced")
+    );
+
+    let mut stale = ledger();
+    stale
+        .evidence
+        .values_mut()
+        .next()
+        .expect("ledger must contain evidence")
+        .test = "capability_ledger::renamed_or_deleted_test".into();
+    assert!(
+        validate_evidence(&stale)
+            .expect_err("stale test reference must fail")
+            .contains("does not exist")
+    );
 }
 
 #[test]

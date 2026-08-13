@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const EXPECTED_VERSION: &str = "1.3.13";
-const EXPECTED_COMMIT: &str = "5fdd47dc35753438bdc38b6e96c1a3805c67a483";
+const EXPECTED_COMMIT: &str =
+    include_str!("../../../compatibility/libxmlsec1-1.3.13-donor-commit.txt");
 
 #[derive(Debug, Deserialize)]
 struct RulesFile {
@@ -141,6 +142,7 @@ fn usage() -> String {
 }
 
 fn verify_donor(donor: &Path) -> Result<(), String> {
+    let expected_commit = EXPECTED_COMMIT.trim();
     let output = Command::new("git")
         .args([
             "-C",
@@ -157,9 +159,9 @@ fn verify_donor(donor: &Path) -> Result<(), String> {
         .map_err(|_| "git donor identity is not UTF-8")?
         .trim()
         .to_owned();
-    if commit != EXPECTED_COMMIT {
+    if commit != expected_commit {
         return Err(format!(
-            "libxmlsec donor revision mismatch: expected {EXPECTED_COMMIT}, got {commit}"
+            "libxmlsec donor revision mismatch: expected {expected_commit}, got {commit}"
         ));
     }
     let configure = fs::read_to_string(donor.join("configure.ac"))
@@ -211,7 +213,6 @@ fn installed_headers(donor: &Path) -> Result<Vec<String>, String> {
     }
     makefiles.sort();
 
-    let header = Regex::new(r"([A-Za-z0-9_./-]+\.h)\s*\\?").expect("valid header regex");
     let mut result = BTreeSet::new();
     for makefile in makefiles {
         let content = fs::read_to_string(&makefile)
@@ -220,26 +221,7 @@ fn installed_headers(donor: &Path) -> Result<Vec<String>, String> {
             .parent()
             .and_then(|path| path.strip_prefix(&root).ok())
             .unwrap_or(Path::new(""));
-        let mut in_headers = false;
-        for line in content.lines() {
-            if line.contains("inc_HEADERS") && line.contains('=') {
-                in_headers = true;
-            }
-            if in_headers {
-                for capture in header.captures_iter(line) {
-                    result.insert(
-                        Path::new("include/xmlsec")
-                            .join(relative_dir)
-                            .join(&capture[1])
-                            .to_string_lossy()
-                            .replace('\\', "/"),
-                    );
-                }
-                if line.contains("$(NULL)") {
-                    in_headers = false;
-                }
-            }
-        }
+        collect_installed_headers(&content, relative_dir, &mut result);
     }
     if result.len() < 50 {
         return Err(format!(
@@ -248,6 +230,33 @@ fn installed_headers(donor: &Path) -> Result<Vec<String>, String> {
         ));
     }
     Ok(result.into_iter().collect())
+}
+
+fn collect_installed_headers(content: &str, relative_dir: &Path, result: &mut BTreeSet<String>) {
+    let assignment = Regex::new(r"^[A-Za-z0-9_]*inc_HEADERS\s*=")
+        .expect("valid installed header assignment regex");
+    let header = Regex::new(r"([A-Za-z0-9_./-]+\.h)\s*\\?").expect("valid header regex");
+    let mut in_headers = false;
+    for line in content.lines() {
+        if assignment.is_match(line) {
+            in_headers = true;
+        }
+        if !in_headers {
+            continue;
+        }
+        for capture in header.captures_iter(line) {
+            result.insert(
+                Path::new("include/xmlsec")
+                    .join(relative_dir)
+                    .join(&capture[1])
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+        }
+        if line.contains("$(NULL)") || !line.trim_end().ends_with('\\') {
+            in_headers = false;
+        }
+    }
 }
 
 fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> Result<(), String> {
@@ -349,40 +358,44 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
             index = end;
         } else if line.contains("_EXPORT") && !line.trim_start().starts_with('#') {
             let (block, end) = collect_until(&lines, index, ";");
-            if let Some(name) = exported_name(&block) {
-                let backend = source.split('/').count() > 3;
-                let kind = if backend {
-                    "backend-api"
-                } else if block.contains("_EXPORT_VAR") {
-                    "export-variable"
-                } else {
-                    "export-function"
-                };
+            let name = exported_name(&block).ok_or_else(|| {
+                format!(
+                    "cannot extract exported symbol at {extraction_source}:{line_number}: {}",
+                    normalize(&block)
+                )
+            })?;
+            let backend = source.split('/').count() > 3;
+            let kind = if backend {
+                "backend-api"
+            } else if block.contains("_EXPORT_VAR") {
+                "export-variable"
+            } else {
+                "export-function"
+            };
+            items.push(item(
+                kind,
+                &name,
+                &extraction_source,
+                line_number,
+                &normalize(&block),
+            ));
+            if name.contains("Register") || name.contains("GetKlass") && name.contains("Ids") {
                 items.push(item(
-                    kind,
+                    "registry",
                     &name,
                     &extraction_source,
                     line_number,
                     &normalize(&block),
                 ));
-                if name.contains("Register") || name.contains("GetKlass") && name.contains("Ids") {
-                    items.push(item(
-                        "registry",
-                        &name,
-                        &extraction_source,
-                        line_number,
-                        &normalize(&block),
-                    ));
-                }
-                if block.contains("XMLSEC_DEPRECATED") {
-                    items.push(item(
-                        "deprecated-api",
-                        &name,
-                        &extraction_source,
-                        line_number,
-                        &normalize(&block),
-                    ));
-                }
+            }
+            if block.contains("XMLSEC_DEPRECATED") {
+                items.push(item(
+                    "deprecated-api",
+                    &name,
+                    &extraction_source,
+                    line_number,
+                    &normalize(&block),
+                ));
             }
             index = end;
         }
@@ -443,7 +456,15 @@ fn resolve_c_string_expression(
     let token =
         Regex::new(r#"([A-Z][A-Z0-9_]+)|\"([^\"]*)\""#).expect("valid C string token regex");
     let mut value = String::new();
+    let mut cursor = 0;
     for capture in token.captures_iter(expression) {
+        let whole = capture.get(0).expect("whole token capture");
+        if !expression[cursor..whole.start()].trim().is_empty() {
+            return Err(format!(
+                "unparsed token in C string expression: {expression}"
+            ));
+        }
+        cursor = whole.end();
         if let Some(literal) = capture.get(2) {
             value.push_str(literal.as_str());
         } else {
@@ -454,6 +475,11 @@ fn resolve_c_string_expression(
                     .ok_or_else(|| format!("unresolved string macro {name} in {expression}"))?,
             );
         }
+    }
+    if !expression[cursor..].trim().is_empty() {
+        return Err(format!(
+            "unparsed trailing token in C string expression: {expression}"
+        ));
     }
     if value.is_empty() {
         return Err(format!("empty C string expression: {expression}"));
@@ -477,22 +503,44 @@ fn extract_cli(donor: &Path, items: &mut Vec<SurfaceItem>) -> Result<(), String>
             ));
         }
     }
-    items.push(item("cli-exit-status", "success", source, 1430, "0"));
-    items.push(item(
-        "cli-exit-status",
-        "unknown-command",
-        source,
-        1378,
-        "0 after printing usage",
-    ));
-    items.push(item(
-        "cli-exit-status",
-        "failure",
-        source,
-        1338,
-        "1 for invalid parameters, missing input, initialization, or processing failure",
-    ));
+    items.extend(extract_cli_exit_statuses(&content)?);
     Ok(())
+}
+
+fn extract_cli_exit_statuses(content: &str) -> Result<Vec<SurfaceItem>, String> {
+    let definitions = [
+        (
+            "success",
+            r"(?m)^[ \t]*/\* sucecss! \*/\r?\n(?P<target>[ \t]*res = 0;)$",
+            "0",
+        ),
+        (
+            "unknown-command",
+            r"(?s)if\(command == xmlSecAppCommandUnknown\) \{.*?\n(?P<target>[ \t]*res = 0;)\r?\n[ \t]*goto done;",
+            "0 after printing usage",
+        ),
+        (
+            "failure",
+            r"(?m)^(?P<target>[ \t]*int res = 1;)$",
+            "1 for invalid parameters, missing input, initialization, or processing failure",
+        ),
+    ];
+    definitions
+        .into_iter()
+        .map(|(name, pattern, detail)| {
+            let regex = Regex::new(pattern).expect("valid CLI evidence regex");
+            let mut matches = regex.captures_iter(content);
+            let capture = matches
+                .next()
+                .ok_or_else(|| format!("donor CLI {name} exit path is missing"))?;
+            if matches.next().is_some() {
+                return Err(format!("donor CLI {name} exit path is ambiguous"));
+            }
+            let target = capture.name("target").expect("CLI target capture");
+            let line = content[..target.start()].lines().count() + 1;
+            Ok(item("cli-exit-status", name, "apps/xmlsec.c", line, detail))
+        })
+        .collect()
 }
 
 fn extract_test_families(donor: &Path, items: &mut Vec<SurfaceItem>) -> Result<(), String> {
@@ -514,16 +562,26 @@ fn extract_test_families(donor: &Path, items: &mut Vec<SurfaceItem>) -> Result<(
             ));
         }
     }
-    for script in ["testDSig.sh", "testEnc.sh", "testKeys.sh", "testRes.sh"] {
-        items.push(item(
-            "test-family",
-            script,
-            &format!("tests/{script}"),
-            1,
-            "upstream runner family",
-        ));
-    }
+    items.extend(required_test_runner_items(&tests)?);
     Ok(())
+}
+
+fn required_test_runner_items(tests: &Path) -> Result<Vec<SurfaceItem>, String> {
+    ["testDSig.sh", "testEnc.sh", "testKeys.sh", "testRes.sh"]
+        .into_iter()
+        .map(|script| {
+            if !tests.join(script).is_file() {
+                return Err(format!("donor test runner tests/{script} is missing"));
+            }
+            Ok(item(
+                "test-family",
+                script,
+                &format!("tests/{script}"),
+                1,
+                "upstream runner family",
+            ))
+        })
+        .collect()
 }
 
 fn classify(surface: Vec<SurfaceItem>, rules: RulesFile) -> Result<Ledger, String> {
@@ -611,7 +669,7 @@ fn classify(surface: Vec<SurfaceItem>, rules: RulesFile) -> Result<Ledger, Strin
         upstream: Upstream {
             project: "libxmlsec1".into(),
             version: EXPECTED_VERSION.into(),
-            commit: EXPECTED_COMMIT.into(),
+            commit: EXPECTED_COMMIT.trim().into(),
             repository: "https://github.com/lsh123/xmlsec".into(),
         },
         generated_by: "xml-sec-capability-ledger/1".into(),
@@ -640,11 +698,27 @@ fn normalize(value: &str) -> String {
 
 fn exported_name(declaration: &str) -> Option<String> {
     let function = Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(").expect("valid function regex");
-    if let Some(capture) = function.captures_iter(declaration).last() {
-        return Some(capture[1].to_owned());
+    let mut depth = 0_usize;
+    let mut cursor = 0_usize;
+    for capture in function.captures_iter(declaration) {
+        let whole = capture.get(0).expect("whole function capture");
+        for byte in declaration[cursor..whole.start()].bytes() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if depth == 0 && capture[1].starts_with("xmlSec") {
+            return Some(capture[1].to_owned());
+        }
+        // The regex includes the opening parenthesis, so account for it before
+        // scanning the gap that precedes the next candidate.
+        depth += 1;
+        cursor = whole.end();
     }
     let variable =
-        Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[\])?\s*;").expect("valid variable regex");
+        Regex::new(r"(xmlSec[A-Za-z0-9_]*)\s*(?:\[\])?\s*;").expect("valid variable regex");
     variable
         .captures(declaration)
         .map(|capture| capture[1].to_owned())
@@ -721,6 +795,82 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unparsed_uri_expression_tokens() {
+        // A partially parsed expression would publish a truncated URI as donor truth.
+        let macros = BTreeMap::from([("XMLSEC_PREFIX".into(), "urn:test:".into())]);
+        for expression in [
+            "XMLSEC_PREFIX lowercase \"suffix\"",
+            "XMLSEC_PREFIX \"suffix\" trailing",
+        ] {
+            let error = resolve_c_string_expression(expression, &macros)
+                .expect_err("every expression byte must be recognized");
+            assert!(error.contains("unparsed"), "{error}");
+        }
+    }
+
+    #[test]
+    fn installed_header_assignment_stops_without_a_continuation() {
+        // A later distribution entry must not become a public header accidentally.
+        let content = "inc_HEADERS = public.h\nEXTRA_DIST = private.h\n";
+        let mut headers = BTreeSet::new();
+        collect_installed_headers(content, Path::new("backend"), &mut headers);
+        assert_eq!(
+            headers,
+            BTreeSet::from(["include/xmlsec/backend/public.h".into()])
+        );
+    }
+
+    #[test]
+    fn cli_exit_statuses_are_derived_from_donor_control_flow() {
+        // Evidence lines must follow the donor statements instead of generator constants.
+        let content = r#"int main(void) {
+    int res = 1;
+    if(command == xmlSecAppCommandUnknown) {
+        xmlSecAppPrintUsage();
+        res = 0;
+        goto done;
+    }
+    /* sucecss! */
+    res = 0;
+done:
+    return(res);
+}"#;
+        let entries = extract_cli_exit_statuses(content).expect("fixture must be recognized");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.line))
+                .collect::<Vec<_>>(),
+            vec![("success", 9), ("unknown-command", 5), ("failure", 2)]
+        );
+
+        let error = extract_cli_exit_statuses(&content.replace("/* sucecss! */", "/* done */"))
+            .expect_err("missing semantic marker must fail closed");
+        assert!(error.contains("success"), "{error}");
+    }
+
+    #[test]
+    fn required_test_runners_fail_closed() {
+        // A renamed donor runner must disappear only through an explicit baseline update.
+        let directory = env::temp_dir().join(format!(
+            "xml-sec-ledger-runner-drift-{}",
+            std::process::id()
+        ));
+        if directory.exists() {
+            fs::remove_dir_all(&directory).expect("stale runner fixture must be removable");
+        }
+        fs::create_dir_all(&directory).expect("runner fixture must be creatable");
+        for script in ["testDSig.sh", "testEnc.sh", "testKeys.sh"] {
+            fs::write(directory.join(script), "#!/bin/sh\n")
+                .expect("runner fixture must be writable");
+        }
+        let error = required_test_runner_items(&directory)
+            .expect_err("a missing required runner must fail");
+        assert!(error.contains("testRes.sh"), "{error}");
+        fs::remove_dir_all(directory).expect("runner fixture must be removable");
+    }
+
+    #[test]
     fn first_matching_rule_wins() {
         // Ordered rules allow a precise supported subset before a planned fallback.
         let ledger = classify(
@@ -791,6 +941,28 @@ mod tests {
         assert_eq!(
             exported_name("XMLSEC_EXPORT_VAR const xmlChar xmlSecNameId[];").as_deref(),
             Some("xmlSecNameId")
+        );
+    }
+
+    #[test]
+    fn export_parser_selects_the_outer_function_declarator() {
+        // Nested callback types and trailing annotations are not exported symbols.
+        assert_eq!(
+            exported_name(
+                "XMLSEC_EXPORT int XMLSEC_CALL xmlSecRegister(int (*callback)(void *ctx));"
+            )
+            .as_deref(),
+            Some("xmlSecRegister")
+        );
+        assert_eq!(
+            exported_name("XMLSEC_EXPORT int XMLSEC_CALL xmlSecInit(void) XMLSEC_API(1);")
+                .as_deref(),
+            Some("xmlSecInit")
+        );
+        assert_eq!(
+            exported_name("XMLSEC_DEPRECATED(1) XMLSEC_EXPORT int XMLSEC_CALL xmlSecInit(void);")
+                .as_deref(),
+            Some("xmlSecInit")
         );
     }
 

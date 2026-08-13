@@ -15455,11 +15455,11 @@
       "classification_rule": "planned-cli-surface"
     },
     {
-      "id": "cli-exit-status:apps/xmlsec.c:1378:unknown-command",
+      "id": "cli-exit-status:apps/xmlsec.c:1377:unknown-command",
       "kind": "cli-exit-status",
       "name": "unknown-command",
       "source": "apps/xmlsec.c",
-      "line": 1378,
+      "line": 1377,
       "detail": "0 after printing usage",
       "outcome": "planned",
       "rationale": "A command-compatible xmlsec1 CLI is not yet shipped; commands and exit semantics remain explicit roadmap surface.",

@@ -4,8 +4,9 @@ These fixtures are tracked so decryption interoperability tests do not depend
 on network access or a local xmlsec1 checkout. They were imported from the
 `xmlsec_1_3_12` tag of
 [lsh123/xmlsec](https://github.com/lsh123/xmlsec/tree/xmlsec_1_3_12/tests).
-The pinned 1.3.13 development snapshot at commit
-`5fdd47dc35753438bdc38b6e96c1a3805c67a483` contains no changes to these
+The commit recorded in the canonical
+[`libxmlsec1-1.3.13-donor-commit.txt`](../../../compatibility/libxmlsec1-1.3.13-donor-commit.txt)
+contains no changes to these
 fixture bytes; reciprocal CLI tests run against that newer snapshot.
 
 Imported donor artifacts are kept byte-for-byte, including upstream wording
