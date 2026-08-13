@@ -10,7 +10,8 @@ pin:
 - installed headers (including configured template values), exported functions
   and variables, every conditional macro definition, compiler-provided build
   defines, typedef aliases, public enums, structure layouts, callbacks, class
-  IDs, and complete registry families;
+  IDs, complete registry families, and the exact nested preprocessor branch
+  path controlling every header item;
 - generic and crypto-backend-specific APIs;
 - algorithm and key-data URI constants and key serialization formats;
 - `xmlsec1` CLI commands, typed option definitions (including aliases, argument
@@ -43,6 +44,11 @@ preprocessor branches remain separate line-addressed entries, and configured
 header templates are rendered from the pinned `configure.ac` version contract.
 Normalization collapses formatting trivia while preserving exact bytes inside C
 string and character literals.
+Each item carries a `conditions` array. It records the complete active directive
+history, including prior `#if` branches before `#elif` or `#else`, so changing
+platform or feature availability produces a generated ledger diff even when the
+declaration text and line number are unchanged. Malformed or unbalanced donor
+condition stacks fail generation.
 
 ## Regenerating
 

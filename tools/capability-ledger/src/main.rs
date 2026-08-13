@@ -73,6 +73,7 @@ struct SurfaceItem {
     source: String,
     line: usize,
     detail: String,
+    conditions: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +84,7 @@ struct LedgerItem {
     source: String,
     line: usize,
     detail: String,
+    conditions: Vec<String>,
     outcome: Outcome,
     rationale: String,
     evidence: String,
@@ -318,6 +320,8 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
         ));
     };
     let lines: Vec<_> = content.lines().collect();
+    let conditions = preprocessor_conditions(&content)
+        .map_err(|error| format!("parse conditions in {extraction_source}: {error}"))?;
     let macro_re =
         Regex::new(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)").expect("valid macro regex");
     let callback_re =
@@ -330,6 +334,7 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
     while index < lines.len() {
         let line = lines[index];
         let line_number = index + 1;
+        let item_start = items.len();
         if let Some(capture) = macro_re.captures(line) {
             let name = &capture[1];
             if name.starts_with("XMLSEC") || name.starts_with("xmlSec") {
@@ -473,9 +478,102 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
             }
             index = end;
         }
+        for entry in &mut items[item_start..] {
+            entry.conditions.clone_from(&conditions[line_number - 1]);
+        }
         index += 1;
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct PreprocessorFrame {
+    branches: Vec<String>,
+    saw_else: bool,
+}
+
+fn preprocessor_conditions(content: &str) -> Result<Vec<Vec<String>>, String> {
+    let lines: Vec<_> = content.lines().collect();
+    let directive = Regex::new(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
+        .expect("valid preprocessor condition regex");
+    let mut contexts = vec![Vec::new(); lines.len()];
+    let mut stack: Vec<PreprocessorFrame> = Vec::new();
+    let mut index = 0_usize;
+    while index < lines.len() {
+        let start = index;
+        let mut logical = String::new();
+        loop {
+            let physical = lines[index].trim_end();
+            let continued = physical.ends_with('\\');
+            let fragment = physical.strip_suffix('\\').unwrap_or(physical).trim();
+            if !logical.is_empty() {
+                logical.push(' ');
+            }
+            logical.push_str(fragment);
+            if !continued {
+                break;
+            }
+            index += 1;
+            if index == lines.len() {
+                return Err(format!(
+                    "preprocessor directive at line {} has a dangling continuation",
+                    start + 1
+                ));
+            }
+        }
+
+        if let Some(capture) = directive.captures(&logical) {
+            let kind = capture.get(1).expect("directive kind").as_str();
+            let normalized = normalize(&logical);
+            match kind {
+                "if" | "ifdef" | "ifndef" => stack.push(PreprocessorFrame {
+                    branches: vec![normalized],
+                    saw_else: false,
+                }),
+                "elif" => {
+                    let frame = stack
+                        .last_mut()
+                        .ok_or_else(|| format!("unmatched #elif at line {}", start + 1))?;
+                    if frame.saw_else {
+                        return Err(format!("#elif after #else at line {}", start + 1));
+                    }
+                    frame.branches.push(normalized);
+                }
+                "else" => {
+                    let frame = stack
+                        .last_mut()
+                        .ok_or_else(|| format!("unmatched #else at line {}", start + 1))?;
+                    if frame.saw_else {
+                        return Err(format!("duplicate #else at line {}", start + 1));
+                    }
+                    frame.saw_else = true;
+                    frame.branches.push(normalized);
+                }
+                "endif" => {
+                    stack
+                        .pop()
+                        .ok_or_else(|| format!("unmatched #endif at line {}", start + 1))?;
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let active = stack
+            .iter()
+            .flat_map(|frame| frame.branches.iter().cloned())
+            .collect::<Vec<_>>();
+        for context in &mut contexts[start..=index] {
+            context.clone_from(&active);
+        }
+        index += 1;
+    }
+    if !stack.is_empty() {
+        return Err(format!(
+            "{} unterminated preprocessor condition(s)",
+            stack.len()
+        ));
+    }
+    Ok(contexts)
 }
 
 fn is_class_id_macro(name: &str, definition: &str) -> bool {
@@ -855,6 +953,7 @@ fn classify(surface: Vec<SurfaceItem>, rules: RulesFile) -> Result<Ledger, Strin
             source: entry.source,
             line: entry.line,
             detail: entry.detail,
+            conditions: entry.conditions,
             outcome: rule.outcome,
             rationale: rule.rationale.clone(),
             evidence: rule.evidence.clone(),
@@ -1126,6 +1225,7 @@ fn item(kind: &str, name: &str, source: &str, line: usize, detail: &str) -> Surf
         source: source.into(),
         line,
         detail: detail.into(),
+        conditions: Vec::new(),
     }
 }
 
@@ -1434,6 +1534,44 @@ MSCRYPTO_CFLAGS=\"$MSCRYPTO_CFLAGS -DXMLSEC_CUSTOM_CRYPT32=1\""#;
             normalize("#define VALUE \" \""),
             normalize("#define VALUE \"  \"")
         );
+    }
+
+    #[test]
+    fn preprocessor_conditions_preserve_nested_branch_history() {
+        // Availability evidence includes both the selected branch and alternatives passed over.
+        let conditions = preprocessor_conditions(
+            "#ifdef XMLSEC_FEATURE\n#if XMLSEC_BACKEND\nint first;\n#elif XMLSEC_FALLBACK\nint second;\n#else\nint third;\n#endif\n#endif\n",
+        )
+        .expect("balanced conditions must parse");
+        assert_eq!(
+            conditions[2],
+            ["#ifdef XMLSEC_FEATURE", "#if XMLSEC_BACKEND"]
+        );
+        assert_eq!(
+            conditions[4],
+            [
+                "#ifdef XMLSEC_FEATURE",
+                "#if XMLSEC_BACKEND",
+                "#elif XMLSEC_FALLBACK",
+            ]
+        );
+        assert_eq!(
+            conditions[6],
+            [
+                "#ifdef XMLSEC_FEATURE",
+                "#if XMLSEC_BACKEND",
+                "#elif XMLSEC_FALLBACK",
+                "#else",
+            ]
+        );
+    }
+
+    #[test]
+    fn preprocessor_conditions_reject_malformed_branching() {
+        // A damaged donor guard stack must fail generation instead of losing availability data.
+        for malformed in ["#else\n", "#if A\n#else\n#elif B\n#endif\n", "#if A\n"] {
+            assert!(preprocessor_conditions(malformed).is_err(), "{malformed:?}");
+        }
     }
 
     #[test]

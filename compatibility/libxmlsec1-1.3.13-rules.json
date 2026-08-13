@@ -11,7 +11,11 @@
     },
     "legacy-policy-tests": {
       "test": "capability_ledger::legacy_algorithm_claims_are_policy_gated",
-      "description": "Legacy SHA-1 signature and digest paths are available only through an explicit compatibility policy."
+      "description": "Legacy SHA-1 signature paths are available only through explicit compatibility policy opt-ins."
+    },
+    "sha1-verification-tests": {
+      "test": "capability_ledger::legacy_algorithm_claims_are_policy_gated",
+      "description": "SHA-1 reference digests remain available for verification interoperability while every signing path rejects them."
     },
     "provider-contract": {
       "test": "capability_ledger::backend_surface_distinguishes_provider_capabilities_from_unimplemented_apis",
@@ -36,9 +40,17 @@
       "evidence": "native-algorithm-tests"
     },
     {
+      "id": "native-sha1-verification-uri",
+      "kinds": ["algorithm-uri"],
+      "name_regex": "^xmlSecHrefSha1$",
+      "outcome": "behavior-compatible",
+      "rationale": "The native Rust API provides verification-only SHA-1 reference digest compatibility; signing rejects SHA-1 independently of policy.",
+      "evidence": "sha1-verification-tests"
+    },
+    {
       "id": "policy-gated-legacy-uri",
       "kinds": ["algorithm-uri"],
-      "name_regex": "^xmlSecHref(?:DsaSha1|HmacSha1|RsaSha1|Sha1)$",
+      "name_regex": "^xmlSecHref(?:DsaSha1|HmacSha1|RsaSha1)$",
       "outcome": "compatibility-profile-only",
       "rationale": "The implementation retains this legacy algorithm for interoperability, but the compiled policy must explicitly permit it.",
       "evidence": "legacy-policy-tests"

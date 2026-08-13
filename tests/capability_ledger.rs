@@ -35,6 +35,7 @@ struct Item {
     source: String,
     line: usize,
     detail: String,
+    conditions: Vec<String>,
     outcome: String,
     rationale: String,
     evidence: String,
@@ -177,6 +178,11 @@ fn every_entry_is_unique_sorted_and_evidenced() {
         );
         assert!(!item.classification_rule.is_empty());
         assert!(
+            item.conditions
+                .iter()
+                .all(|condition| condition.starts_with('#'))
+        );
+        assert!(
             [
                 "exact",
                 "source-compatible",
@@ -252,6 +258,7 @@ fn c_surface_is_explicitly_incompatible() {
     }
 }
 
+#[cfg(feature = "xmlenc")]
 #[test]
 fn native_algorithm_claims_match_the_rust_api() {
     // Every positive claim must pass through the corresponding production parser or type.
@@ -272,6 +279,7 @@ fn native_algorithm_claims_match_the_rust_api() {
     }
 }
 
+#[cfg(feature = "xmlenc")]
 fn assert_native_uri_support(item: &Item) {
     use xml_sec::c14n::C14nAlgorithm;
     use xml_sec::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
@@ -344,6 +352,7 @@ fn assert_native_uri_support(item: &Item) {
     }
 }
 
+#[cfg(feature = "xmlenc")]
 fn assert_transform_uri_parses(uri: &str) {
     let parameter = match uri {
         "http://www.w3.org/TR/1999/REC-xpath-19991116" => {
@@ -366,6 +375,7 @@ fn assert_transform_uri_parses(uri: &str) {
     );
 }
 
+#[cfg(feature = "xmlenc")]
 fn assert_key_info_uri_parses(name: &str, uri: &str) {
     const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
     const DS11: &str = "http://www.w3.org/2009/xmldsig11#";
@@ -407,6 +417,7 @@ fn assert_key_info_uri_parses(name: &str, uri: &str) {
     );
 }
 
+#[cfg(feature = "xmlenc")]
 fn assert_retrieval_method_type_parses(uri: &str) {
     let xml = format!(
         "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><RetrievalMethod URI=\"#key\" Type=\"{uri}\"/></KeyInfo>"
@@ -415,6 +426,7 @@ fn assert_retrieval_method_type_parses(uri: &str) {
     xml_sec::xmldsig::parse_key_info(document.root_element()).unwrap();
 }
 
+#[cfg(feature = "xmlenc")]
 fn assert_encrypted_key_uri_parses(uri: &str) {
     assert_eq!(uri, "http://www.w3.org/2001/04/xmlenc#EncryptedKey");
     let xml = r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes128"/><CipherData><CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</CipherValue></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</CipherValue></CipherData></EncryptedData>"#;
@@ -443,9 +455,22 @@ fn legacy_algorithm_claims_are_policy_gated() {
             "xmlSecHrefDsaSha1",
             "xmlSecHrefHmacSha1",
             "xmlSecHrefRsaSha1",
-            "xmlSecHrefSha1",
         ])
     );
+
+    let sha1 = ledger
+        .items
+        .iter()
+        .find(|item| item.name == "xmlSecHrefSha1")
+        .expect("SHA-1 digest URI must remain inventoried");
+    assert_eq!(sha1.outcome, "behavior-compatible");
+    assert!(sha1.rationale.contains("verification-only"));
+    assert!(
+        xml_sec::policy::VerificationPolicy::default()
+            .digest_algorithms
+            .is_none()
+    );
+    assert!(!xml_sec::xmldsig::DigestAlgorithm::Sha1.signing_allowed());
 }
 
 #[test]
@@ -529,6 +554,18 @@ fn donor_declarations_are_extracted_without_truncation() {
         assert!(item.detail.contains("xmlSecAppCmdLineParamType"));
         assert!(item.detail.contains("xmlSecAppCmdLineParamFlag"));
     }
+
+    let guarded_x509 = ledger
+        .items
+        .iter()
+        .find(|item| item.name == "xmlSecGCryptAppKeyCertLoad")
+        .expect("guarded X.509 API must be inventoried");
+    assert!(
+        guarded_x509
+            .conditions
+            .iter()
+            .any(|condition| condition == "#ifndef XMLSEC_NO_X509")
+    );
 }
 
 #[test]
