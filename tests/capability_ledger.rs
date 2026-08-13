@@ -121,7 +121,7 @@ fn complete_surface_categories_are_stable() {
             ("backend-api", 847),
             ("build-define", 45),
             ("callback", 64),
-            ("class-id", 156),
+            ("class-id", 1_078),
             ("cli-command", 24),
             ("cli-exit-status", 3),
             ("deprecated-api", 13),
@@ -130,8 +130,8 @@ fn complete_surface_categories_are_stable() {
             ("export-variable", 435),
             ("header", 59),
             ("key-format", 11),
-            ("macro", 1_460),
-            ("registry", 8),
+            ("macro", 1_499),
+            ("registry", 15),
             ("struct-layout", 25),
             ("test-family", 20),
             ("typedef", 70),
@@ -381,6 +381,91 @@ fn donor_declarations_are_extracted_without_truncation() {
             .iter()
             .any(|item| item.kind == "build-define" && item.name == "XMLSEC_CRYPTO_CFLAGS")
     );
+}
+
+#[test]
+fn conditional_macro_variants_and_class_ids_are_complete() {
+    // Conditional definitions and multiline class aliases must all remain drift-visible.
+    let ledger = ledger();
+    let export_variants: Vec<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "macro" && item.name == "XMLSEC_EXPORT")
+        .collect();
+    assert_eq!(export_variants.len(), 5);
+    assert!(
+        export_variants
+            .iter()
+            .any(|item| item.detail.contains("dllexport"))
+    );
+    assert!(
+        export_variants
+            .iter()
+            .any(|item| item.detail.contains("dllimport"))
+    );
+
+    for macro_item in ledger.items.iter().filter(|item| {
+        item.kind == "macro"
+            && item.name.ends_with("Id")
+            && !item.detail.contains(&format!("{}(", item.name))
+    }) {
+        assert!(
+            ledger.items.iter().any(|item| {
+                item.kind == "class-id"
+                    && item.name == macro_item.name
+                    && item.source == macro_item.source
+                    && item.line == macro_item.line
+            }),
+            "{}",
+            macro_item.id
+        );
+    }
+}
+
+#[test]
+fn registry_inventory_covers_complete_id_families() {
+    // Lookup and lifecycle functions are registry surface just like registration functions.
+    let ledger = ledger();
+    for name in [
+        "xmlSecKeyDataIdsGet",
+        "xmlSecKeyDataIdsGetEnabled",
+        "xmlSecKeyDataIdsInit",
+        "xmlSecKeyDataIdsShutdown",
+        "xmlSecKeyDataIdsRegisterDefault",
+        "xmlSecKeyDataIdsRegister",
+        "xmlSecKeyDataIdsRegisterDisabled",
+        "xmlSecTransformIdsGet",
+        "xmlSecTransformIdsInit",
+        "xmlSecTransformIdsShutdown",
+        "xmlSecTransformIdsRegisterDefault",
+        "xmlSecTransformIdsRegister",
+    ] {
+        assert!(
+            ledger
+                .items
+                .iter()
+                .any(|item| item.kind == "registry" && item.name == name),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn configured_header_contains_installed_version_values() {
+    // The ledger represents configured version.h values rather than Autoconf placeholders.
+    let ledger = ledger();
+    let macros: BTreeMap<_, _> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "macro" && item.source == "include/xmlsec/version.h.in")
+        .map(|item| (item.name.as_str(), item.detail.as_str()))
+        .collect();
+    assert!(macros["XMLSEC_VERSION"].contains("\"1.3.13\""));
+    assert!(macros["XMLSEC_VERSION_MAJOR"].ends_with('1'));
+    assert!(macros["XMLSEC_VERSION_MINOR"].ends_with('3'));
+    assert!(macros["XMLSEC_VERSION_SUBMINOR"].ends_with("13"));
+    assert!(macros["XMLSEC_VERSION_INFO"].contains("\"10313:0:0\""));
+    assert!(macros.values().all(|detail| !detail.contains('@')));
 }
 
 #[test]

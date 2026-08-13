@@ -7,9 +7,10 @@ surface from the upstream commit recorded in the canonical
 [`libxmlsec1-1.3.13-donor-commit.txt`](../compatibility/libxmlsec1-1.3.13-donor-commit.txt)
 pin:
 
-- installed headers, exported functions and variables, complete macro
-  definitions, compiler-provided build defines, typedef aliases, public enums,
-  structure layouts, callbacks, class IDs, and registries;
+- installed headers (including configured template values), exported functions
+  and variables, every conditional macro definition, compiler-provided build
+  defines, typedef aliases, public enums, structure layouts, callbacks, class
+  IDs, and complete registry families;
 - generic and crypto-backend-specific APIs;
 - algorithm and key-data URI constants and key serialization formats;
 - `xmlsec1` CLI commands and exit statuses;
@@ -36,7 +37,9 @@ backend-transform rules precede explicit planned fallbacks. A rule that matches
 nothing fails generation, as does an extracted item without a rule or evidence
 reference. Declaration extraction is comment-, literal-, and nesting-aware;
 multiline macro bodies and typedef aliases therefore participate in donor-drift
-checks rather than only their first physical line.
+checks rather than only their first physical line. Definitions in separate
+preprocessor branches remain separate line-addressed entries, and configured
+header templates are rendered from the pinned `configure.ac` version contract.
 
 ## Regenerating
 
@@ -59,6 +62,9 @@ cargo run -p xml-sec-capability-ledger -- check \
 ```
 
 Both commands reject any donor version or commit other than the pinned
-baseline. CI performs the same check from a clean upstream checkout. Updating
-the donor requires reviewing the extracted diff, changing classification rules
-where capabilities changed, and updating category-count regression tests.
+baseline. They also reject tracked, untracked, or ignored donor worktree files,
+because extraction must describe the recorded Git object rather than local
+configure output or edits. CI performs the same check from a clean upstream
+checkout. Updating the donor requires reviewing the extracted diff, changing
+classification rules where capabilities changed, and updating category-count
+regression tests.

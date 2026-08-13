@@ -164,10 +164,37 @@ fn verify_donor(donor: &Path) -> Result<(), String> {
             "libxmlsec donor revision mismatch: expected {expected_commit}, got {commit}"
         ));
     }
+    verify_clean_donor(donor)?;
     let configure = fs::read_to_string(donor.join("configure.ac"))
         .map_err(|error| format!("read donor configure.ac: {error}"))?;
     if !configure.contains(&format!("AC_INIT([xmlsec1],[{EXPECTED_VERSION}]")) {
         return Err(format!("donor does not declare xmlsec1 {EXPECTED_VERSION}"));
+    }
+    Ok(())
+}
+
+fn verify_clean_donor(donor: &Path) -> Result<(), String> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            donor.to_str().ok_or("donor path is not UTF-8")?,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ])
+        .output()
+        .map_err(|error| format!("inspect donor worktree: {error}"))?;
+    if !output.status.success() {
+        return Err("cannot inspect donor worktree cleanliness".into());
+    }
+    let status =
+        String::from_utf8(output.stdout).map_err(|_| "donor worktree status is not UTF-8")?;
+    if !status.is_empty() {
+        return Err(format!(
+            "libxmlsec donor worktree is not pristine:\n{}",
+            status.trim_end()
+        ));
     }
     Ok(())
 }
@@ -184,10 +211,7 @@ fn extract_surface(donor: &Path) -> Result<Vec<SurfaceItem>, String> {
     extract_cli(donor, &mut items)?;
     extract_test_families(donor, &mut items)?;
 
-    let mut seen = BTreeSet::new();
-    items.retain(|entry| {
-        seen.insert((entry.kind.clone(), entry.name.clone(), entry.source.clone()))
-    });
+    items = deduplicate_surface(items);
     items.sort_by(|left, right| {
         (&left.kind, &left.name, &left.source, left.line).cmp(&(
             &right.kind,
@@ -197,6 +221,19 @@ fn extract_surface(donor: &Path) -> Result<Vec<SurfaceItem>, String> {
         ))
     });
     Ok(items)
+}
+
+fn deduplicate_surface(mut items: Vec<SurfaceItem>) -> Vec<SurfaceItem> {
+    let mut seen = BTreeSet::new();
+    items.retain(|entry| {
+        seen.insert((
+            entry.kind.clone(),
+            entry.name.clone(),
+            entry.source.clone(),
+            entry.line,
+        ))
+    });
+    items
 }
 
 fn installed_headers(donor: &Path) -> Result<Vec<String>, String> {
@@ -262,22 +299,27 @@ fn collect_installed_headers(content: &str, relative_dir: &Path, result: &mut BT
 fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> Result<(), String> {
     let source_path = donor.join(source);
     let template_path = donor.join(format!("{source}.in"));
-    let extraction_source = if source_path.is_file() {
-        source.to_owned()
-    } else if template_path.is_file() {
-        format!("{source}.in")
+    let (extraction_source, content) = if template_path.is_file() {
+        let extraction_source = format!("{source}.in");
+        let template = fs::read_to_string(&template_path)
+            .map_err(|error| format!("read {extraction_source}: {error}"))?;
+        let configure = fs::read_to_string(donor.join("configure.ac"))
+            .map_err(|error| format!("read donor configure.ac: {error}"))?;
+        let content = render_configured_header(&template, &configure)
+            .map_err(|error| format!("configure {extraction_source}: {error}"))?;
+        (extraction_source, content)
+    } else if source_path.is_file() {
+        let content =
+            fs::read_to_string(&source_path).map_err(|error| format!("read {source}: {error}"))?;
+        (source.to_owned(), content)
     } else {
         return Err(format!(
             "installed header {source} has no source or configure template"
         ));
     };
-    let content = fs::read_to_string(donor.join(&extraction_source))
-        .map_err(|error| format!("read {extraction_source}: {error}"))?;
     let lines: Vec<_> = content.lines().collect();
     let macro_re =
         Regex::new(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)").expect("valid macro regex");
-    let class_re = Regex::new(r"^\s*#\s*define\s+(xmlSec[A-Za-z0-9_]*Id)\s+.*GetKlass")
-        .expect("valid class regex");
     let callback_re =
         Regex::new(r"\(\s*\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)").expect("valid callback regex");
     let enum_name = Regex::new(r"}\s*([A-Za-z_][A-Za-z0-9_]*)\s*;").expect("valid enum regex");
@@ -288,26 +330,27 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
     while index < lines.len() {
         let line = lines[index];
         let line_number = index + 1;
-        if let Some(capture) = class_re.captures(line) {
-            items.push(item(
-                "class-id",
-                &capture[1],
-                &extraction_source,
-                line_number,
-                line.trim(),
-            ));
-        }
         if let Some(capture) = macro_re.captures(line) {
             let name = &capture[1];
             if name.starts_with("XMLSEC") || name.starts_with("xmlSec") {
                 let (definition, end) = collect_macro_definition(&lines, index);
+                let detail = normalize(&definition);
                 items.push(item(
                     "macro",
                     name,
                     &extraction_source,
                     line_number,
-                    &normalize(&definition),
+                    &detail,
                 ));
+                if is_class_id_macro(name, &definition) {
+                    items.push(item(
+                        "class-id",
+                        name,
+                        &extraction_source,
+                        line_number,
+                        &detail,
+                    ));
+                }
                 index = end;
             }
         }
@@ -410,7 +453,7 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
                 line_number,
                 &normalize(&block),
             ));
-            if name.contains("Register") || name.contains("GetKlass") && name.contains("Ids") {
+            if is_registry_api(&name) {
                 items.push(item(
                     "registry",
                     &name,
@@ -433,6 +476,88 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
         index += 1;
     }
     Ok(())
+}
+
+fn is_class_id_macro(name: &str, definition: &str) -> bool {
+    if !name.starts_with("xmlSec") || !name.ends_with("Id") {
+        return false;
+    }
+    definition
+        .split_once(name)
+        .is_some_and(|(_, replacement)| !replacement.starts_with('('))
+}
+
+fn is_registry_api(name: &str) -> bool {
+    name.contains("Register")
+        || name.starts_with("xmlSecKeyDataIds")
+        || name.starts_with("xmlSecTransformIds")
+}
+
+fn render_configured_header(template: &str, configure: &str) -> Result<String, String> {
+    let version = Regex::new(r"AC_INIT\(\[xmlsec1\],\[([0-9]+)\.([0-9]+)\.([0-9]+)\]")
+        .expect("valid configured version regex")
+        .captures(configure)
+        .ok_or("configure.ac has no three-part xmlsec1 version")?;
+    let major = version[1]
+        .parse::<u32>()
+        .map_err(|error| format!("parse major version: {error}"))?;
+    let minor = version[2]
+        .parse::<u32>()
+        .map_err(|error| format!("parse minor version: {error}"))?;
+    let subminor = version[3]
+        .parse::<u32>()
+        .map_err(|error| format!("parse subminor version: {error}"))?;
+    for required in [
+        "XMLSEC_VERSION_MAJOR=$(echo $PACKAGE_VERSION | cut -d. -f1)",
+        "XMLSEC_VERSION_MINOR=$(echo $PACKAGE_VERSION | cut -d. -f2)",
+        "XMLSEC_VERSION_SUBMINOR=$(echo $PACKAGE_VERSION | cut -d. -f3)",
+        "XMLSEC_VERSION=\"$PACKAGE_VERSION\"",
+        "XMLSEC_VERSION_CURRENT=$((10000 * XMLSEC_VERSION_MAJOR + 100 * XMLSEC_VERSION_MINOR + XMLSEC_VERSION_SUBMINOR))",
+        "XMLSEC_VERSION_INFO=\"${XMLSEC_VERSION_CURRENT}:0:0\"",
+    ] {
+        if !configure.contains(required) {
+            return Err(format!(
+                "configure.ac version contract is missing: {required}"
+            ));
+        }
+    }
+
+    let semantic_version = format!("{major}.{minor}.{subminor}");
+    let version_current = major
+        .checked_mul(10_000)
+        .and_then(|value| {
+            minor
+                .checked_mul(100)
+                .and_then(|minor| value.checked_add(minor))
+        })
+        .and_then(|value| value.checked_add(subminor))
+        .ok_or("configured version info exceeds u32")?;
+    let version_info = format!("{version_current}:0:0");
+    let substitutions = [
+        ("@XMLSEC_VERSION@", semantic_version.as_str()),
+        (
+            "@XMLSEC_VERSION_MAJOR@",
+            version.get(1).expect("major capture").as_str(),
+        ),
+        (
+            "@XMLSEC_VERSION_MINOR@",
+            version.get(2).expect("minor capture").as_str(),
+        ),
+        (
+            "@XMLSEC_VERSION_SUBMINOR@",
+            version.get(3).expect("subminor capture").as_str(),
+        ),
+        ("@XMLSEC_VERSION_INFO@", version_info.as_str()),
+    ];
+    let mut rendered = template.to_owned();
+    for (placeholder, value) in substitutions {
+        rendered = rendered.replace(placeholder, value);
+    }
+    let unresolved = Regex::new(r"@([A-Z0-9_]+)@").expect("valid placeholder regex");
+    if let Some(capture) = unresolved.captures(&rendered) {
+        return Err(format!("unresolved Autoconf placeholder {}", &capture[1]));
+    }
+    Ok(rendered)
 }
 
 fn extract_build_defines(donor: &Path, items: &mut Vec<SurfaceItem>) -> Result<(), String> {
@@ -1209,6 +1334,150 @@ CFLAGS=\"$CFLAGS -DXMLSEC_NO_DES -DXMLSEC_CRYPTO_OPENSSL=1\""#;
                 .collect::<Vec<_>>(),
             vec!["XMLSEC_NO_DES", "XMLSEC_CRYPTO_OPENSSL"]
         );
+    }
+
+    #[test]
+    fn deduplication_preserves_conditional_macro_variants() {
+        // Alternative preprocessor branches are separate donor surface locations.
+        let entries = deduplicate_surface(vec![
+            item("macro", "XMLSEC_EXPORT", "exports.h", 41, "dllexport"),
+            item("macro", "XMLSEC_EXPORT", "exports.h", 48, "dllimport"),
+        ]);
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn registry_predicate_covers_lifecycle_lookup_and_registration() {
+        // Registry compatibility includes the complete public ID-list lifecycle.
+        for name in [
+            "xmlSecKeyDataIdsGet",
+            "xmlSecKeyDataIdsGetEnabled",
+            "xmlSecKeyDataIdsInit",
+            "xmlSecKeyDataIdsShutdown",
+            "xmlSecKeyDataIdsRegisterDefault",
+            "xmlSecKeyDataIdsRegister",
+            "xmlSecKeyDataIdsRegisterDisabled",
+            "xmlSecTransformIdsGet",
+            "xmlSecTransformIdsInit",
+            "xmlSecTransformIdsShutdown",
+            "xmlSecTransformIdsRegisterDefault",
+            "xmlSecTransformIdsRegister",
+            "xmlSecIORegisterCallbacks",
+        ] {
+            assert!(is_registry_api(name), "{name}");
+        }
+        assert!(!is_registry_api("xmlSecTransformGetName"));
+    }
+
+    #[test]
+    fn class_id_detection_uses_the_complete_macro_definition() {
+        // Backend class IDs commonly put GetKlass() on a continuation line.
+        assert!(is_class_id_macro(
+            "xmlSecGCryptTransformAes128CbcId",
+            "#define xmlSecGCryptTransformAes128CbcId \\\n             xmlSecGCryptTransformAes128CbcGetKlass()"
+        ));
+        assert!(is_class_id_macro(
+            "xmlSecTransformAes128CbcId",
+            "#define xmlSecTransformAes128CbcId xmlSecGCryptTransformAes128CbcId"
+        ));
+        assert!(!is_class_id_macro(
+            "xmlSecKeyCheckId",
+            "#define xmlSecKeyCheckId(key, keyId) ((key)->id == (keyId))"
+        ));
+    }
+
+    #[test]
+    fn configured_header_substitutes_pinned_version_values() {
+        // Installed header details must represent configure output, not @...@ tokens.
+        let configure = r#"AC_INIT([xmlsec1],[1.3.13],[https://example.invalid])
+XMLSEC_VERSION_MAJOR=$(echo $PACKAGE_VERSION | cut -d. -f1)
+XMLSEC_VERSION_MINOR=$(echo $PACKAGE_VERSION | cut -d. -f2)
+XMLSEC_VERSION_SUBMINOR=$(echo $PACKAGE_VERSION | cut -d. -f3)
+XMLSEC_VERSION="$PACKAGE_VERSION"
+XMLSEC_VERSION_CURRENT=$((10000 * XMLSEC_VERSION_MAJOR + 100 * XMLSEC_VERSION_MINOR + XMLSEC_VERSION_SUBMINOR))
+XMLSEC_VERSION_INFO="${XMLSEC_VERSION_CURRENT}:0:0""#;
+        let rendered = render_configured_header(
+            "#define XMLSEC_VERSION \"@XMLSEC_VERSION@\"\n#define XMLSEC_VERSION_INFO \"@XMLSEC_VERSION_INFO@\"\n",
+            configure,
+        )
+        .expect("known substitutions must render");
+        assert!(rendered.contains("\"1.3.13\""));
+        assert!(rendered.contains("\"10313:0:0\""));
+
+        let error = render_configured_header("@UNKNOWN_VALUE@", configure)
+            .expect_err("unknown substitutions must fail closed");
+        assert!(error.contains("UNKNOWN_VALUE"), "{error}");
+    }
+
+    #[test]
+    fn donor_cleanliness_rejects_tracked_and_ignored_changes() {
+        // HEAD identity is insufficient when extraction reads worktree files.
+        let directory =
+            env::temp_dir().join(format!("xml-sec-ledger-dirty-donor-{}", std::process::id()));
+        if directory.exists() {
+            fs::remove_dir_all(&directory).expect("stale donor fixture must be removable");
+        }
+        fs::create_dir_all(&directory).expect("fixture must be creatable");
+        fs::write(directory.join("tracked.h"), "original\n").expect("fixture must be writable");
+        fs::write(directory.join(".gitignore"), "generated/\n")
+            .expect("ignore fixture must be writable");
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg(&directory)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-C",
+                    directory.to_str().unwrap(),
+                    "add",
+                    ".gitignore",
+                    "tracked.h"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Capability Ledger Test",
+                    "-c",
+                    "user.email=ledger@example.invalid",
+                    "-C",
+                    directory.to_str().unwrap(),
+                    "commit",
+                    "-m",
+                    "test fixture"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        verify_clean_donor(&directory).expect("committed fixture must be clean");
+
+        fs::create_dir_all(directory.join("generated")).expect("ignored fixture must be creatable");
+        fs::write(directory.join("generated/header.h"), "generated\n")
+            .expect("ignored fixture must be writable");
+        assert!(verify_clean_donor(&directory).is_err());
+        fs::remove_dir_all(directory.join("generated")).expect("ignored fixture must be removable");
+
+        fs::write(directory.join("tracked.h"), "modified\n").expect("fixture must be writable");
+        assert!(verify_clean_donor(&directory).is_err());
+        assert!(
+            Command::new("git")
+                .args(["-C", directory.to_str().unwrap(), "add", "tracked.h"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(verify_clean_donor(&directory).is_err());
+        fs::remove_dir_all(directory).expect("donor fixture must be removable");
     }
 
     #[test]
