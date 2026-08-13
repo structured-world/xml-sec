@@ -20,6 +20,10 @@
       "test": "capability_ledger::native_algorithm_claims_match_the_rust_api",
       "description": "The claimed URI set is cross-checked against the native algorithm parsers and the repository's unit and interop suites."
     },
+    "native-cli-tests": {
+      "test": "capability_ledger::native_cli_claims_match_process_and_upstream_runner_tests",
+      "description": "Process tests cover native command parsing, exit statuses, sign/verify and encrypt/decrypt paths; the unmodified upstream DSig, Enc, and Keys runners exercise the same binary and capability registry."
+    },
     "planned-surface": {
       "test": "capability_ledger::planned_surface_is_never_reported_as_supported",
       "description": "Unimplemented backend APIs, CLI, registry, format, URI, and donor-suite entries remain machine-readable planned work."
@@ -57,6 +61,21 @@
       "rationale": "Deprecated C aliases are excluded until the compatibility layer has a concrete ABI contract.",
       "evidence": "unsupported-legacy-surface"
     },
+    "native-cli-commands": {
+      "outcome": "behavior-compatible",
+      "rationale": "The native binary implements the libxmlsec1 command spelling and dispatch contract while capability checks delimit the available algorithm and key-data subsets.",
+      "evidence": "native-cli-tests"
+    },
+    "native-cli-exit-status": {
+      "outcome": "behavior-compatible",
+      "rationale": "Successful operations exit zero and parse, policy, capability, verification, cryptographic, and I/O failures exit non-zero.",
+      "evidence": "native-cli-tests"
+    },
+    "native-cli-options": {
+      "outcome": "provider-limited",
+      "rationale": "The native CLI parses and executes this option for the RustCrypto-backed formats and algorithms advertised by its capability registry.",
+      "evidence": "native-cli-tests"
+    },
     "native-sha1-verification-uri": {
       "outcome": "behavior-compatible",
       "rationale": "The native Rust API provides verification-only SHA-1 reference digest compatibility; signing rejects SHA-1 independently of policy.",
@@ -74,7 +93,7 @@
     },
     "planned-cli-surface": {
       "outcome": "planned",
-      "rationale": "A command-compatible xmlsec1 CLI is not yet shipped; commands, typed options, and exit semantics remain explicit roadmap surface.",
+      "rationale": "This libxmlsec1 option or special status behavior is inventoried but is not yet reproduced by the native CLI.",
       "evidence": "planned-surface"
     },
     "planned-donor-families": {
@@ -21578,7 +21597,7 @@
       "source": "apps/xmlsec.c",
       "line": 3449,
       "detail": "if((strcmp(cmd, \"check-key-data\") == 0) || (strcmp(cmd, \"--check-key-data\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21586,7 +21605,7 @@
       "source": "apps/xmlsec.c",
       "line": 3461,
       "detail": "if((strcmp(cmd, \"check-transforms\") == 0) || (strcmp(cmd, \"--check-transforms\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21594,7 +21613,7 @@
       "source": "apps/xmlsec.c",
       "line": 3509,
       "detail": "if((strcmp(cmd, \"decrypt\") == 0) || (strcmp(cmd, \"--decrypt\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21602,7 +21621,7 @@
       "source": "apps/xmlsec.c",
       "line": 3499,
       "detail": "if((strcmp(cmd, \"encrypt\") == 0) || (strcmp(cmd, \"--encrypt\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21610,7 +21629,7 @@
       "source": "apps/xmlsec.c",
       "line": 3418,
       "detail": "if((strcmp(cmd, \"help\") == 0) || (strcmp(cmd, \"--help\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21618,7 +21637,7 @@
       "source": "apps/xmlsec.c",
       "line": 3423,
       "detail": "if((strcmp(cmd, \"help-all\") == 0) || (strcmp(cmd, \"--help-all\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21626,7 +21645,7 @@
       "source": "apps/xmlsec.c",
       "line": 3467,
       "detail": "if((strcmp(cmd, \"keys\") == 0) || (strcmp(cmd, \"--keys\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21634,7 +21653,7 @@
       "source": "apps/xmlsec.c",
       "line": 3443,
       "detail": "if((strcmp(cmd, \"list-key-data\") == 0) || (strcmp(cmd, \"--list-key-data\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21642,7 +21661,7 @@
       "source": "apps/xmlsec.c",
       "line": 3455,
       "detail": "if((strcmp(cmd, \"list-transforms\") == 0) || (strcmp(cmd, \"--list-transforms\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21650,7 +21669,7 @@
       "source": "apps/xmlsec.c",
       "line": 3476,
       "detail": "if((strcmp(cmd, \"sign\") == 0) || (strcmp(cmd, \"--sign\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21658,7 +21677,7 @@
       "source": "apps/xmlsec.c",
       "line": 3486,
       "detail": "if((strcmp(cmd, \"verify\") == 0) || (strcmp(cmd, \"--verify\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21666,7 +21685,7 @@
       "source": "apps/xmlsec.c",
       "line": 3438,
       "detail": "if((strcmp(cmd, \"version\") == 0) || (strcmp(cmd, \"--version\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21674,7 +21693,7 @@
       "source": "apps/xmlsec.c",
       "line": 3449,
       "detail": "if((strcmp(cmd, \"check-key-data\") == 0) || (strcmp(cmd, \"--check-key-data\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21682,7 +21701,7 @@
       "source": "apps/xmlsec.c",
       "line": 3461,
       "detail": "if((strcmp(cmd, \"check-transforms\") == 0) || (strcmp(cmd, \"--check-transforms\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21690,7 +21709,7 @@
       "source": "apps/xmlsec.c",
       "line": 3509,
       "detail": "if((strcmp(cmd, \"decrypt\") == 0) || (strcmp(cmd, \"--decrypt\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21698,7 +21717,7 @@
       "source": "apps/xmlsec.c",
       "line": 3499,
       "detail": "if((strcmp(cmd, \"encrypt\") == 0) || (strcmp(cmd, \"--encrypt\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21706,7 +21725,7 @@
       "source": "apps/xmlsec.c",
       "line": 3418,
       "detail": "if((strcmp(cmd, \"help\") == 0) || (strcmp(cmd, \"--help\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21714,7 +21733,7 @@
       "source": "apps/xmlsec.c",
       "line": 3423,
       "detail": "if((strcmp(cmd, \"help-all\") == 0) || (strcmp(cmd, \"--help-all\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21722,7 +21741,7 @@
       "source": "apps/xmlsec.c",
       "line": 3467,
       "detail": "if((strcmp(cmd, \"keys\") == 0) || (strcmp(cmd, \"--keys\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21730,7 +21749,7 @@
       "source": "apps/xmlsec.c",
       "line": 3443,
       "detail": "if((strcmp(cmd, \"list-key-data\") == 0) || (strcmp(cmd, \"--list-key-data\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21738,7 +21757,7 @@
       "source": "apps/xmlsec.c",
       "line": 3455,
       "detail": "if((strcmp(cmd, \"list-transforms\") == 0) || (strcmp(cmd, \"--list-transforms\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21746,7 +21765,7 @@
       "source": "apps/xmlsec.c",
       "line": 3476,
       "detail": "if((strcmp(cmd, \"sign\") == 0) || (strcmp(cmd, \"--sign\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21754,7 +21773,7 @@
       "source": "apps/xmlsec.c",
       "line": 3486,
       "detail": "if((strcmp(cmd, \"verify\") == 0) || (strcmp(cmd, \"--verify\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-command",
@@ -21762,7 +21781,7 @@
       "source": "apps/xmlsec.c",
       "line": 3438,
       "detail": "if((strcmp(cmd, \"version\") == 0) || (strcmp(cmd, \"--version\") == 0)) {",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-commands"
     },
     {
       "kind": "cli-exit-status",
@@ -21770,7 +21789,7 @@
       "source": "apps/xmlsec.c",
       "line": 1338,
       "detail": "1 for invalid parameters, missing input, initialization, or processing failure",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-exit-status"
     },
     {
       "kind": "cli-exit-status",
@@ -21778,7 +21797,7 @@
       "source": "apps/xmlsec.c",
       "line": 1430,
       "detail": "0",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-exit-status"
     },
     {
       "kind": "cli-exit-status",
@@ -21818,7 +21837,7 @@
       "source": "apps/xmlsec.c",
       "line": 413,
       "detail": "static xmlSecAppCmdLineParam aesKeyParam = { xmlSecAppCmdLineTopicKeysMngr, \"--aes-key\", \"--aeskey\", \"--aes-key[:<name>] <file>\" \"\\n\\tload AES key from binary file <file>\", xmlSecAppCmdLineParamTypeString, xmlSecAppCmdLineParamFlagParamNameValue | xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -21834,7 +21853,7 @@
       "source": "apps/xmlsec.c",
       "line": 883,
       "detail": "static xmlSecAppCmdLineParam binaryDataParam = { xmlSecAppCmdLineTopicEncEncrypt, \"--binary-data\", \"--binary\", \"--binary-data <file>\" \"\\n\\tbinary <file> to encrypt\", xmlSecAppCmdLineParamTypeString, xmlSecAppCmdLineParamFlagNone, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -21882,7 +21901,7 @@
       "source": "apps/xmlsec.c",
       "line": 161,
       "detail": "static xmlSecAppCmdLineParam cryptoParam = { xmlSecAppCmdLineTopicCryptoConfig, \"--crypto\", NULL, \"--crypto <name>\" \"\\n\\tthe name of the crypto engine to use from the following\" \"\\n\\tlist: openssl, mscrypto, nss, gnutls, gcrypt (if no crypto engine is\" \"\\n\\tspecified then the default one is used)\", xmlSecAppCmdLineParamTypeString, xmlSecAppCmdLineParamFlagNone, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -21978,7 +21997,7 @@
       "source": "apps/xmlsec.c",
       "line": 265,
       "detail": "static xmlSecAppCmdLineParam genKeyParam = { xmlSecAppCmdLineTopicKeysMngr, \"--gen-key\", \"-g\", \"--gen-key[:<name>] <keyKlass>-<keySize>\" \"\\n\\tgenerate new <keyKlass> key of <keySize> bits size,\" \"\\n\\tset the key name to <name> and add the result to keys\" \"\\n\\tmanager (for example, \\\"--gen:MyKeyName rsa-1024\\\" generates\" \"\\n\\ta new 1024 bits RSA key and sets it's name to \\\"MyKeyName\\\")\", xmlSecAppCmdLineParamTypeString, xmlSecAppCmdLineParamFlagParamNameValue | xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -21986,7 +22005,7 @@
       "source": "apps/xmlsec.c",
       "line": 150,
       "detail": "static xmlSecAppCmdLineParam helpParam = { xmlSecAppCmdLineTopicGeneral, \"--help\", \"-h\", \"--help\" \"\\n\\tprint help information about the command\", xmlSecAppCmdLineParamTypeFlag, xmlSecAppCmdLineParamFlagNone, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22026,7 +22045,7 @@
       "source": "apps/xmlsec.c",
       "line": 787,
       "detail": "static xmlSecAppCmdLineParam ignoreManifestsParam = { xmlSecAppCmdLineTopicDSigCommon, \"--ignore-manifests\", NULL, \"--ignore-manifests\" \"\\n\\tdo not process <dsig:Manifest> elements\", xmlSecAppCmdLineParamTypeFlag, xmlSecAppCmdLineParamFlagNone, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22034,7 +22053,7 @@
       "source": "apps/xmlsec.c",
       "line": 1080,
       "detail": "static xmlSecAppCmdLineParam X509DontVerifyCerts = { xmlSecAppCmdLineTopicX509Certs, \"--insecure\", NULL, \"--insecure\" \"\\n\\tdo not verify certificates or CRLs\", xmlSecAppCmdLineParamTypeFlag, xmlSecAppCmdLineParamFlagNone, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22082,7 +22101,7 @@
       "source": "apps/xmlsec.c",
       "line": 638,
       "detail": "static xmlSecAppCmdLineParam outputParam = { xmlSecAppCmdLineTopicDSigCommon | xmlSecAppCmdLineTopicEncCommon, \"--output\", \"-o\", \"--output <filename>\" \"\\n\\twrite result document to file <filename>; the <filename> can\" \"\\n\\tbe a template and include '{inputfile}' which will be repaced\" \"\\n\\twith the input filename\", xmlSecAppCmdLineParamTypeString, xmlSecAppCmdLineParamFlagNone, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22114,7 +22133,7 @@
       "source": "apps/xmlsec.c",
       "line": 326,
       "detail": "static xmlSecAppCmdLineParam pkcs8DerParam = { xmlSecAppCmdLineTopicKeysMngr, \"--pkcs8-der\", \"--privkey-p8-der\", \"--pkcs8-der[:<name>] <file>[,<cafile>[,<cafile>[...]]]\" \"\\n\\tload private key from PKCS8 DER file and DER certificates\" \"\\n\\tthat verify this key\", xmlSecAppCmdLineParamTypeStringList, xmlSecAppCmdLineParamFlagParamNameValue | xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22122,7 +22141,7 @@
       "source": "apps/xmlsec.c",
       "line": 314,
       "detail": "static xmlSecAppCmdLineParam pkcs8PemParam = { xmlSecAppCmdLineTopicKeysMngr, \"--pkcs8-pem\", \"--privkey-p8-pem\", \"--pkcs8-pem[:<name>] <file>[,<cafile>[,<cafile>[...]]]\" \"\\n\\tload private key from PKCS8 PEM file and PEM certificates\" \"\\n\\tthat verify this key\", xmlSecAppCmdLineParamTypeStringList, xmlSecAppCmdLineParamFlagParamNameValue | xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22154,7 +22173,7 @@
       "source": "apps/xmlsec.c",
       "line": 302,
       "detail": "static xmlSecAppCmdLineParam privkeyDerParam = { xmlSecAppCmdLineTopicKeysMngr, \"--privkey-der\", NULL, \"--privkey-der[:<name>] <file>[,<cafile>[,<cafile>[...]]]\" \"\\n\\tload private key from DER file and certificates\" \"\\n\\tthat verify this key\", xmlSecAppCmdLineParamTypeStringList, xmlSecAppCmdLineParamFlagParamNameValue | xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22178,7 +22197,7 @@
       "source": "apps/xmlsec.c",
       "line": 290,
       "detail": "static xmlSecAppCmdLineParam privkeyParam = { xmlSecAppCmdLineTopicKeysMngr, \"--privkey-pem\", \"--privkey\", \"--privkey-pem[:<name>] <file>[,<cafile>[,<cafile>[...]]]\" \"\\n\\tload private key from PEM file and certificates\" \"\\n\\tthat verify this key\", xmlSecAppCmdLineParamTypeStringList, xmlSecAppCmdLineParamFlagParamNameValue | xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22186,7 +22205,7 @@
       "source": "apps/xmlsec.c",
       "line": 946,
       "detail": "static xmlSecAppCmdLineParam pubkeyCertDerParam = { xmlSecAppCmdLineTopicKeysMngr, \"--pubkey-cert-der\", NULL, \"--pubkey-cert-der[:<name>] <file>\" \"\\n\\tload public key from DER cert file\", xmlSecAppCmdLineParamTypeStringList, xmlSecAppCmdLineParamFlagParamNameValue | xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22194,7 +22213,7 @@
       "source": "apps/xmlsec.c",
       "line": 935,
       "detail": "static xmlSecAppCmdLineParam pubkeyCertParam = { xmlSecAppCmdLineTopicKeysMngr, \"--pubkey-cert-pem\", \"--pubkey-cert\", \"--pubkey-cert-pem[:<name>] <file>\" \"\\n\\tload public key from PEM cert file\", xmlSecAppCmdLineParamTypeStringList, xmlSecAppCmdLineParamFlagParamNameValue | xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22202,7 +22221,7 @@
       "source": "apps/xmlsec.c",
       "line": 375,
       "detail": "static xmlSecAppCmdLineParam pubkeyDerParam = { xmlSecAppCmdLineTopicKeysMngr, \"--pubkey-der\", NULL, \"--pubkey-der[:<name>] <file>\" \"\\n\\tload public key from DER file\", xmlSecAppCmdLineParamTypeStringList, xmlSecAppCmdLineParamFlagParamNameValue | xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22226,7 +22245,7 @@
       "source": "apps/xmlsec.c",
       "line": 364,
       "detail": "static xmlSecAppCmdLineParam pubkeyParam = { xmlSecAppCmdLineTopicKeysMngr, \"--pubkey-pem\", \"--pubkey\", \"--pubkey-pem[:<name>] <file>\" \"\\n\\tload public key from PEM file\", xmlSecAppCmdLineParamTypeStringList, xmlSecAppCmdLineParamFlagParamNameValue | xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22290,7 +22309,7 @@
       "source": "apps/xmlsec.c",
       "line": 968,
       "detail": "static xmlSecAppCmdLineParam trustedDerParam = { xmlSecAppCmdLineTopicX509Certs, \"--trusted-der\", NULL, \"--trusted-der <file>\" \"\\n\\tload trusted (root) certificate from DER file <file>\", xmlSecAppCmdLineParamTypeString, xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22298,7 +22317,7 @@
       "source": "apps/xmlsec.c",
       "line": 957,
       "detail": "static xmlSecAppCmdLineParam trustedParam = { xmlSecAppCmdLineTopicX509Certs, \"--trusted-pem\", \"--trusted\", \"--trusted-pem <file>\" \"\\n\\tload trusted (root) certificate from PEM file <file>\", xmlSecAppCmdLineParamTypeString, xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22306,7 +22325,7 @@
       "source": "apps/xmlsec.c",
       "line": 990,
       "detail": "static xmlSecAppCmdLineParam untrustedDerParam = { xmlSecAppCmdLineTopicX509Certs, \"--untrusted-der\", NULL, \"--untrusted-der <file>\" \"\\n\\tload untrusted certificate from DER file <file>\", xmlSecAppCmdLineParamTypeString, xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22314,7 +22333,7 @@
       "source": "apps/xmlsec.c",
       "line": 979,
       "detail": "static xmlSecAppCmdLineParam untrustedParam = { xmlSecAppCmdLineTopicX509Certs, \"--untrusted-pem\", \"--untrusted\", \"--untrusted-pem <file>\" \"\\n\\tload untrusted certificate from PEM file <file>\", xmlSecAppCmdLineParamTypeString, xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",
@@ -22370,7 +22389,7 @@
       "source": "apps/xmlsec.c",
       "line": 894,
       "detail": "static xmlSecAppCmdLineParam xmlDataParam = { xmlSecAppCmdLineTopicEncEncrypt, \"--xml-data\", NULL, \"--xml-data <file>\" \"\\n\\tXML <file> to encrypt\", xmlSecAppCmdLineParamTypeString, xmlSecAppCmdLineParamFlagNone, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",

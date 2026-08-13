@@ -20,6 +20,7 @@ XML Security in pure Rust, built to replace libxmlsec1.
 - **XMLDSig** — XML Digital Signatures (verify and signing pipelines, X.509 `KeyInfo`, and xmlsec1 CLI interoperability)
 - **XMLEnc** — XML Encryption encrypt/decrypt pipelines (direct, RSA-OAEP, and AES-KW keys)
 - **X.509** — Certificate-based key extraction and validation
+- **Native CLI** — `xmlsec1` command surface backed by the same Rust policy and provider pipelines
 
 ## Why?
 
@@ -64,6 +65,23 @@ The [libxmlsec1 compatibility ledger](docs/compatibility-ledger.md) tracks the
 complete upstream 1.3.13 public surface as generated, evidence-linked data. It
 separates implemented wire behavior from policy-gated compatibility, planned
 parity work, provider-specific differences, and the not-yet-implemented C ABI.
+
+## Native CLI
+
+Install the command-line package and inspect its runtime capability registry:
+
+```sh
+cargo install xmlsec1-cli
+xmlsec1 version
+xmlsec1 list-transforms
+xmlsec1 list-key-data
+```
+
+The native binary supports sign/verify, encrypt/decrypt, AES key generation,
+capability checks, libxmlsec1 option syntax, and deterministic process statuses.
+Unsupported algorithms, key formats, providers, and policy controls fail closed
+instead of being silently ignored. See the [CLI compatibility guide](docs/cli.md)
+for commands, examples, current format coverage, and upstream runner validation.
 
 ## XMLDSig Usage
 
