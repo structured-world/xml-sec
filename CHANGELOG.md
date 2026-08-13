@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/structured-world/xml-sec/compare/v0.1.10...v0.1.11) - 2026-08-13
+
+### Added
+
+- *(xmldsig)* complete Merlin interop
+
+### Fixed
+
+- *(xmldsig)* enforce verification invariants
+- *(x509)* enforce issuer key contracts
+- *(xmldsig)* address review invariants
+
 ### Changed
 
 - *(xmldsig)* rename the curve-specific ECDSA `SignatureAlgorithm` variants to
