@@ -3,7 +3,9 @@
 This directory contains the XMLDSig test documents used by integration tests.
 They are checked into the repository so CI never depends on a local donor clone.
 The current compatibility oracle is the xmlsec1 1.3.13 development snapshot at
-commit `5fdd47dc35753438bdc38b6e96c1a3805c67a483`; upstream had bumped the
+the commit recorded in the canonical
+[`libxmlsec1-1.3.13-donor-commit.txt`](../../../compatibility/libxmlsec1-1.3.13-donor-commit.txt)
+pin; upstream had bumped the
 version but had not published a release tag when this snapshot was pinned.
 `scripts/install-xmlsec1.sh` verifies both that source commit and the live
 `xmlsec1 --version` output before reusing a cached development installation.

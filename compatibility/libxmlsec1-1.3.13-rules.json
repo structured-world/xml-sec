@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "evidence": {
+    "c-surface-inventory": {
+      "test": "capability_ledger::c_surface_is_explicitly_incompatible",
+      "description": "The Rust crate intentionally has no libxmlsec1 C ABI yet; every public C surface item remains visible rather than being implied by marketing copy."
+    },
+    "native-algorithm-tests": {
+      "test": "capability_ledger::native_algorithm_claims_match_the_rust_api",
+      "description": "The claimed URI set is cross-checked against the native algorithm parsers and the repository's unit and interop suites."
+    },
+    "xpath-compatibility-tests": {
+      "test": "capability_ledger::xpath_claims_record_libxmlsec_here_compatibility",
+      "description": "XPath and XPath Filter 2.0 use standards behavior by default; integration tests exercise the explicit libxmlsec1-compatible here() binding."
+    },
+    "legacy-policy-tests": {
+      "test": "capability_ledger::legacy_algorithm_claims_are_policy_gated",
+      "description": "Legacy SHA-1 signature paths are available only through explicit compatibility policy opt-ins."
+    },
+    "sha1-verification-tests": {
+      "test": "capability_ledger::legacy_algorithm_claims_are_policy_gated",
+      "description": "SHA-1 reference digests remain available for verification interoperability while every signing path rejects them."
+    },
+    "provider-contract": {
+      "test": "capability_ledger::backend_surface_distinguishes_provider_capabilities_from_unimplemented_apis",
+      "description": "Only backend transform classes backed by native provider operations are provider-limited; every other backend-specific C entry point remains planned."
+    },
+    "planned-surface": {
+      "test": "capability_ledger::planned_surface_is_never_reported_as_supported",
+      "description": "Unimplemented backend APIs, CLI, registry, format, URI, and donor-suite entries remain machine-readable planned work."
+    },
+    "unsupported-legacy-surface": {
+      "test": "capability_ledger::deprecated_surface_is_explicitly_unsupported",
+      "description": "Deprecated C compatibility aliases are not reproduced before a real C compatibility layer exists."
+    }
+  },
+  "rules": [
+    {
+      "id": "native-xpath-uri",
+      "kinds": ["algorithm-uri"],
+      "name_regex": "^xmlSecXPath2?Ns$",
+      "outcome": "behavior-compatible",
+      "rationale": "The native Rust API implements XPath and XPath Filter 2.0 with standards-compliant here() semantics by default; reproducing libxmlsec1's divergent Transform-element binding requires the explicit XmlSecLegacy mode.",
+      "evidence": "xpath-compatibility-tests"
+    },
+    {
+      "id": "native-supported-uri",
+      "kinds": ["algorithm-uri"],
+      "name_regex": "^xmlSecHref(?:Aes128Cbc|Aes256Cbc|Aes128Gcm|Aes256Gcm|KWAes128|KWAes256|Base64|C14N|C14NWithComments|C14N11|C14N11WithComments|ExcC14N|ExcC14NWithComments|DEREncodedKeyValue|DSAKeyValue|ECKeyValue|Enveloped|RSAKeyValue|RsaSha256|RsaSha384|RsaSha512|EcdsaSha256|EcdsaSha384|Sha256|Sha384|Sha512|RsaOaep|RsaOaepEnc11|Mgf1Sha1|Mgf1Sha256|Mgf1Sha384|Mgf1Sha512|X509Data|RawX509Cert|EncryptedKey)$",
+      "outcome": "behavior-compatible",
+      "rationale": "The native Rust API parses and executes this standard URI, with unit or interoperability coverage in the repository.",
+      "evidence": "native-algorithm-tests"
+    },
+    {
+      "id": "native-sha1-verification-uri",
+      "kinds": ["algorithm-uri"],
+      "name_regex": "^xmlSecHrefSha1$",
+      "outcome": "behavior-compatible",
+      "rationale": "The native Rust API provides verification-only SHA-1 reference digest compatibility; signing rejects SHA-1 independently of policy.",
+      "evidence": "sha1-verification-tests"
+    },
+    {
+      "id": "policy-gated-legacy-uri",
+      "kinds": ["algorithm-uri"],
+      "name_regex": "^xmlSecHref(?:DsaSha1|HmacSha1|RsaSha1)$",
+      "outcome": "compatibility-profile-only",
+      "rationale": "The implementation retains this legacy algorithm for interoperability, but the compiled policy must explicitly permit it.",
+      "evidence": "legacy-policy-tests"
+    },
+    {
+      "id": "remaining-uri-surface",
+      "kinds": ["algorithm-uri"],
+      "outcome": "planned",
+      "rationale": "The URI is part of the libxmlsec1 1.3.13 public vocabulary but is not yet implemented by the native Rust API.",
+      "evidence": "planned-surface"
+    },
+    {
+      "id": "backend-provider-transform-surface",
+      "kinds": ["backend-api"],
+      "name_regex": "^xmlSec(?:GCrypt|GnuTLS|MSCng|MSCrypto|Nss|OpenSSL)Transform(?:Aes128Cbc|Aes256Cbc|Aes128Gcm|Aes256Gcm|KWAes128|KWAes256|DsaSha1|EcdsaSha256|EcdsaSha384|HmacSha1|RsaOaep|RsaOaepEnc11|RsaSha1|RsaSha256|RsaSha384|RsaSha512|Sha1|Sha256|Sha384|Sha512)GetKlass$",
+      "outcome": "provider-limited",
+      "rationale": "The native provider contract implements the corresponding cryptographic operation, but not this libxmlsec1 backend-specific C symbol.",
+      "evidence": "provider-contract"
+    },
+    {
+      "id": "remaining-backend-surface",
+      "kinds": ["backend-api"],
+      "outcome": "planned",
+      "rationale": "This libxmlsec1 backend-specific C capability is not represented by the current native provider contract.",
+      "evidence": "planned-surface"
+    },
+    {
+      "id": "deprecated-c-surface",
+      "kinds": ["deprecated-api"],
+      "outcome": "intentionally-unsupported",
+      "rationale": "Deprecated C aliases are excluded until the compatibility layer has a concrete ABI contract.",
+      "evidence": "unsupported-legacy-surface"
+    },
+    {
+      "id": "binary-c-surface",
+      "kinds": ["header", "export-function", "export-variable", "macro", "build-define", "enum", "struct-layout", "callback", "typedef", "class-id"],
+      "outcome": "binary-abi-incompatible",
+      "rationale": "The current deliverable is a native Rust crate and does not claim libxmlsec1 C source or binary compatibility.",
+      "evidence": "c-surface-inventory"
+    },
+    {
+      "id": "planned-registry-surface",
+      "kinds": ["registry"],
+      "outcome": "planned",
+      "rationale": "libxmlsec1 registry entry points are inventoried for the future compatibility layer and are not exposed by the native API.",
+      "evidence": "planned-surface"
+    },
+    {
+      "id": "planned-cli-surface",
+      "kinds": ["cli-command", "cli-option", "cli-exit-status"],
+      "outcome": "planned",
+      "rationale": "A command-compatible xmlsec1 CLI is not yet shipped; commands, typed options, and exit semantics remain explicit roadmap surface.",
+      "evidence": "planned-surface"
+    },
+    {
+      "id": "planned-key-format-surface",
+      "kinds": ["key-format"],
+      "outcome": "planned",
+      "rationale": "Native Rust key parsing exists, but the libxmlsec1 key-format enum contract is not yet reproduced.",
+      "evidence": "planned-surface"
+    },
+    {
+      "id": "planned-donor-families",
+      "kinds": ["test-family"],
+      "outcome": "planned",
+      "rationale": "The upstream family is tracked as a parity target; individual covered vectors are recorded by native interoperability tests rather than claiming the whole family.",
+      "evidence": "planned-surface"
+    }
+  ]
+}

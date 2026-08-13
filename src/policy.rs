@@ -363,16 +363,19 @@ impl ResourcePolicy {
             .min(crate::hard_limits::XML_DOCUMENT_NODE_CEILING)
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn effective_canonicalized_bytes(&self) -> usize {
         self.max_canonicalized_bytes
             .min(crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING)
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn effective_xml_base_components(&self) -> usize {
         self.max_xml_base_components
             .min(crate::hard_limits::XML_BASE_COMPONENT_CEILING)
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn effective_xml_base_resolution_bytes(&self) -> usize {
         self.max_xml_base_resolution_bytes
             .min(crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING)

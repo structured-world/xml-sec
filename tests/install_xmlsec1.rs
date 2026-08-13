@@ -6,6 +6,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const DONOR_COMMIT: &str = include_str!("../compatibility/libxmlsec1-1.3.13-donor-commit.txt");
+
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {
@@ -217,7 +219,7 @@ fn exact_version_output_commits_the_new_installation() {
     assert_eq!(
         std::fs::read_to_string(harness.prefix.join(".xmlsec-source-commit"))
             .expect("successful validation must write the source marker"),
-        "5fdd47dc35753438bdc38b6e96c1a3805c67a483\n"
+        format!("{}\n", DONOR_COMMIT.trim())
     );
 }
 
@@ -234,11 +236,8 @@ fn cached_installation_is_revalidated_before_reuse() {
         .permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&binary, permissions).expect("cached binary must be executable");
-    std::fs::write(
-        harness.prefix.join(".xmlsec-source-commit"),
-        "5fdd47dc35753438bdc38b6e96c1a3805c67a483\n",
-    )
-    .expect("cached source marker must be writable");
+    std::fs::write(harness.prefix.join(".xmlsec-source-commit"), DONOR_COMMIT)
+        .expect("cached source marker must be writable");
 
     let status = harness.run(None, None, None, None);
 
