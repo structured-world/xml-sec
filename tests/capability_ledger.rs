@@ -1,0 +1,299 @@
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
+
+const LEDGER_JSON: &str = include_str!("../compatibility/libxmlsec1-1.3.13.json");
+
+#[derive(Debug, Deserialize)]
+struct Ledger {
+    schema_version: u32,
+    upstream: Upstream,
+    generated_by: String,
+    evidence: BTreeMap<String, Evidence>,
+    items: Vec<Item>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Upstream {
+    project: String,
+    version: String,
+    commit: String,
+    repository: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Evidence {
+    test: String,
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Item {
+    id: String,
+    kind: String,
+    name: String,
+    source: String,
+    line: usize,
+    detail: String,
+    outcome: String,
+    rationale: String,
+    evidence: String,
+    classification_rule: String,
+}
+
+fn ledger() -> Ledger {
+    serde_json::from_str(LEDGER_JSON).expect("committed capability ledger must be valid JSON")
+}
+
+#[test]
+fn complete_surface_categories_are_stable() {
+    // Exact category counts make an upstream or extractor drift visible in review.
+    let ledger = ledger();
+    assert_eq!(ledger.schema_version, 1);
+    assert_eq!(ledger.upstream.project, "libxmlsec1");
+    assert_eq!(ledger.upstream.version, "1.3.13");
+    assert_eq!(
+        ledger.upstream.commit,
+        "5fdd47dc35753438bdc38b6e96c1a3805c67a483"
+    );
+    assert_eq!(
+        ledger.upstream.repository,
+        "https://github.com/lsh123/xmlsec"
+    );
+    assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/1");
+
+    let counts = ledger
+        .items
+        .iter()
+        .fold(BTreeMap::new(), |mut counts, item| {
+            *counts.entry(item.kind.as_str()).or_insert(0_usize) += 1;
+            counts
+        });
+    assert_eq!(
+        counts,
+        BTreeMap::from([
+            ("algorithm-uri", 141),
+            ("backend-api", 847),
+            ("build-define", 51),
+            ("callback", 64),
+            ("class-id", 156),
+            ("cli-command", 24),
+            ("cli-exit-status", 3),
+            ("deprecated-api", 13),
+            ("enum", 15),
+            ("export-function", 609),
+            ("export-variable", 435),
+            ("header", 59),
+            ("key-format", 11),
+            ("macro", 1_460),
+            ("registry", 8),
+            ("struct-layout", 25),
+            ("test-family", 20),
+        ])
+    );
+}
+
+#[test]
+fn every_entry_is_unique_sorted_and_evidenced() {
+    // Deterministic ordering and complete evidence keep regeneration reviewable.
+    let ledger = ledger();
+    let ids: Vec<_> = ledger.items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(
+        ids.iter().copied().collect::<BTreeSet<_>>().len(),
+        ids.len()
+    );
+
+    let sort_keys: Vec<_> = ledger
+        .items
+        .iter()
+        .map(|item| (&item.kind, &item.name, &item.source, item.line))
+        .collect();
+    let mut sorted = sort_keys.clone();
+    sorted.sort();
+    assert_eq!(sort_keys, sorted);
+
+    for item in &ledger.items {
+        assert!(!item.name.is_empty(), "{} has no name", item.id);
+        assert!(!item.source.is_empty(), "{} has no source", item.id);
+        assert!(item.line > 0, "{} has no source line", item.id);
+        assert!(
+            !item.detail.is_empty(),
+            "{} has no extracted detail",
+            item.id
+        );
+        assert!(!item.rationale.is_empty(), "{} has no rationale", item.id);
+        assert!(
+            ledger.evidence.contains_key(&item.evidence),
+            "{} references unknown evidence {}",
+            item.id,
+            item.evidence
+        );
+        assert!(!item.classification_rule.is_empty());
+        assert!(
+            [
+                "exact",
+                "source-compatible",
+                "behavior-compatible",
+                "compatibility-profile-only",
+                "provider-limited",
+                "intentionally-unsupported",
+                "binary-abi-incompatible",
+                "planned",
+            ]
+            .contains(&item.outcome.as_str()),
+            "{} has undocumented outcome {}",
+            item.id,
+            item.outcome
+        );
+    }
+    for evidence in ledger.evidence.values() {
+        assert!(evidence.test.starts_with("capability_ledger::"));
+        assert!(!evidence.description.is_empty());
+    }
+}
+
+#[test]
+fn c_surface_is_explicitly_incompatible() {
+    // A native Rust API must not be reported as drop-in C ABI compatibility.
+    let ledger = ledger();
+    let c_kinds = [
+        "header",
+        "export-function",
+        "export-variable",
+        "macro",
+        "build-define",
+        "enum",
+        "struct-layout",
+        "callback",
+        "class-id",
+    ];
+    for item in ledger
+        .items
+        .iter()
+        .filter(|item| c_kinds.contains(&item.kind.as_str()))
+    {
+        assert_eq!(item.outcome, "binary-abi-incompatible", "{}", item.id);
+    }
+}
+
+#[test]
+fn native_algorithm_claims_match_the_rust_api() {
+    // This allowlist mirrors concrete parsers and prevents optimistic broad claims.
+    let ledger = ledger();
+    let actual: BTreeSet<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.outcome == "behavior-compatible")
+        .map(|item| item.name.as_str())
+        .collect();
+    let expected = BTreeSet::from([
+        "xmlSecHrefAes128Cbc",
+        "xmlSecHrefAes128Gcm",
+        "xmlSecHrefAes256Cbc",
+        "xmlSecHrefAes256Gcm",
+        "xmlSecHrefBase64",
+        "xmlSecHrefC14N",
+        "xmlSecHrefC14N11",
+        "xmlSecHrefC14N11WithComments",
+        "xmlSecHrefC14NWithComments",
+        "xmlSecHrefDEREncodedKeyValue",
+        "xmlSecHrefDSAKeyValue",
+        "xmlSecHrefECKeyValue",
+        "xmlSecHrefEcdsaSha256",
+        "xmlSecHrefEcdsaSha384",
+        "xmlSecHrefEncryptedKey",
+        "xmlSecHrefEnveloped",
+        "xmlSecHrefExcC14N",
+        "xmlSecHrefExcC14NWithComments",
+        "xmlSecHrefKWAes128",
+        "xmlSecHrefKWAes256",
+        "xmlSecHrefMgf1Sha1",
+        "xmlSecHrefMgf1Sha256",
+        "xmlSecHrefMgf1Sha384",
+        "xmlSecHrefMgf1Sha512",
+        "xmlSecHrefRSAKeyValue",
+        "xmlSecHrefRawX509Cert",
+        "xmlSecHrefRsaOaep",
+        "xmlSecHrefRsaOaepEnc11",
+        "xmlSecHrefRsaSha256",
+        "xmlSecHrefRsaSha384",
+        "xmlSecHrefRsaSha512",
+        "xmlSecHrefSha256",
+        "xmlSecHrefSha384",
+        "xmlSecHrefSha512",
+        "xmlSecHrefX509Data",
+        "xmlSecXPath2Ns",
+        "xmlSecXPathNs",
+    ]);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn legacy_algorithm_claims_are_policy_gated() {
+    // Only algorithms independently gated by compiled policy belong here.
+    let ledger = ledger();
+    let actual: BTreeSet<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.outcome == "compatibility-profile-only")
+        .map(|item| item.name.as_str())
+        .collect();
+    assert_eq!(
+        actual,
+        BTreeSet::from([
+            "xmlSecHrefDsaSha1",
+            "xmlSecHrefHmacSha1",
+            "xmlSecHrefRsaSha1",
+            "xmlSecHrefSha1",
+        ])
+    );
+}
+
+#[test]
+fn backend_surface_is_provider_limited() {
+    // Provider selection does not imply compatibility with backend-specific C APIs.
+    let ledger = ledger();
+    let backend: Vec<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "backend-api")
+        .collect();
+    assert!(!backend.is_empty());
+    assert!(
+        backend
+            .iter()
+            .all(|item| item.outcome == "provider-limited")
+    );
+}
+
+#[test]
+fn planned_surface_is_never_reported_as_supported() {
+    // All unimplemented parity targets must remain explicit, not silently omitted.
+    let ledger = ledger();
+    let planned: Vec<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.outcome == "planned")
+        .collect();
+    assert!(!planned.is_empty());
+    assert!(planned.iter().any(|item| item.kind == "cli-command"));
+    assert!(planned.iter().any(|item| item.kind == "algorithm-uri"));
+    assert!(planned.iter().any(|item| item.kind == "test-family"));
+    assert!(planned.iter().any(|item| item.kind == "registry"));
+}
+
+#[test]
+fn deprecated_surface_is_explicitly_unsupported() {
+    // Deprecated aliases stay visible without adding compatibility shims prematurely.
+    let ledger = ledger();
+    let deprecated: Vec<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "deprecated-api")
+        .collect();
+    assert!(!deprecated.is_empty());
+    assert!(
+        deprecated
+            .iter()
+            .all(|item| item.outcome == "intentionally-unsupported")
+    );
+}

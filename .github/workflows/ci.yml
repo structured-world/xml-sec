@@ -16,6 +16,28 @@ env:
   LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-1.3.13-5fdd47dc3575/lib
 
 jobs:
+  capability-ledger:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: lsh123/xmlsec
+          ref: 5fdd47dc35753438bdc38b6e96c1a3805c67a483
+          path: .donors/xmlsec
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: >-
+          cargo run -p xml-sec-capability-ledger -- check
+          .donors/xmlsec
+          compatibility/libxmlsec1-1.3.13-rules.json
+          compatibility/libxmlsec1-1.3.13.json
+
   build-matrix:
     name: build-matrix (${{ matrix.rust }})
     runs-on: ubuntu-latest

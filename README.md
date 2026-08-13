@@ -60,6 +60,11 @@ Still in progress:
 - Complete XMLDSig and XMLEnc conformance-suite classification
 - Expanded fuzz coverage, benchmarks, production hardening, and API stabilization
 
+The [libxmlsec1 compatibility ledger](docs/compatibility-ledger.md) tracks the
+complete upstream 1.3.13 public surface as generated, evidence-linked data. It
+separates implemented wire behavior from policy-gated compatibility, planned
+parity work, provider-specific differences, and the not-yet-implemented C ABI.
+
 ## XMLDSig Usage
 
 `examples/sign.rs` builds an enveloped RSA-SHA256 signature and `examples/verify.rs`
