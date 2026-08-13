@@ -19,7 +19,9 @@ pin:
 - top-level upstream conformance and interoperability test families.
 
 The ledger is an honest parity map, not a blanket compatibility claim. Every
-entry has one outcome, a rationale, and an evidence reference:
+item references one entry in the top-level `classifications` table, which owns
+the outcome, rationale, and evidence reference without repeating that metadata
+for thousands of items:
 
 | Outcome | Meaning |
 |---|---|
@@ -42,13 +44,19 @@ multiline macro bodies and typedef aliases therefore participate in donor-drift
 checks rather than only their first physical line. Definitions in separate
 preprocessor branches remain separate line-addressed entries, and configured
 header templates are rendered from the pinned `configure.ac` version contract.
-Normalization collapses formatting trivia while preserving exact bytes inside C
-string and character literals.
-Each item carries a `conditions` array. It records the complete active directive
-history, including prior `#if` branches before `#elif` or `#else`, so changing
-platform or feature availability produces a generated ledger diff even when the
-declaration text and line number are unchanged. Malformed or unbalanced donor
-condition stacks fail generation.
+The schema derives item identity from `kind`, `name`, `source`, and `line`; it
+does not duplicate that tuple in a serialized ID. C lexical normalization
+removes comments and collapses formatting trivia while preserving exact bytes
+inside string and character literals. Unterminated comments or literals fail
+generation.
+
+The top-level `availability` table stores source/line spans instead of repeating
+the same condition array on each item. A span records the complete active
+directive history, including prior `#if` branches before `#elif` or `#else`, so
+changing platform or feature availability produces a generated ledger diff even
+when declaration text is unchanged. An item outside these spans is
+unconditional. Malformed, overlapping, or unbalanced donor condition data fails
+generation.
 
 ## Regenerating
 

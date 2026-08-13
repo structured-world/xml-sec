@@ -55,6 +55,8 @@ struct Ledger {
     upstream: Upstream,
     generated_by: String,
     evidence: BTreeMap<String, Evidence>,
+    classifications: BTreeMap<String, Classification>,
+    availability: Vec<AvailabilitySpan>,
     items: Vec<LedgerItem>,
 }
 
@@ -78,17 +80,27 @@ struct SurfaceItem {
 
 #[derive(Debug, Serialize)]
 struct LedgerItem {
-    id: String,
     kind: String,
     name: String,
     source: String,
     line: usize,
     detail: String,
-    conditions: Vec<String>,
+    classification: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Classification {
     outcome: Outcome,
     rationale: String,
     evidence: String,
-    classification_rule: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AvailabilitySpan {
+    source: String,
+    start_line: usize,
+    end_line: usize,
+    conditions: Vec<String>,
 }
 
 fn main() -> Result<(), String> {
@@ -339,7 +351,9 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
             let name = &capture[1];
             if name.starts_with("XMLSEC") || name.starts_with("xmlSec") {
                 let (definition, end) = collect_macro_definition(&lines, index);
-                let detail = normalize(&definition);
+                let detail = normalize_c(&definition).map_err(|error| {
+                    format!("normalize macro at {extraction_source}:{line_number}: {error}")
+                })?;
                 items.push(item(
                     "macro",
                     name,
@@ -367,12 +381,15 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
                 .captures(&block)
                 .map(|capture| capture[1].to_owned())
                 .unwrap_or_else(|| format!("anonymous-enum-{line_number}"));
+            let detail = normalize_c(&block).map_err(|error| {
+                format!("normalize enum at {extraction_source}:{line_number}: {error}")
+            })?;
             items.push(item(
                 "enum",
                 &name,
                 &extraction_source,
                 line_number,
-                &normalize(&block),
+                &detail,
             ));
             if name == "xmlSecKeyDataFormat" {
                 for value in extract_identifiers(&block, "xmlSecKeyDataFormat") {
@@ -390,17 +407,23 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
             let (block, end) = collect_declaration(&lines, index).map_err(|error| {
                 format!("parse struct at {extraction_source}:{line_number}: {error}")
             })?;
+            let detail = normalize_c(&block).map_err(|error| {
+                format!("normalize struct at {extraction_source}:{line_number}: {error}")
+            })?;
             items.push(item(
                 "struct-layout",
                 capture.get(1).expect("struct capture").as_str(),
                 &extraction_source,
                 line_number,
-                &normalize(&block),
+                &detail,
             ));
             index = end;
         } else if line.contains("typedef") && line.contains("(*") {
             let (block, end) = collect_declaration(&lines, index).map_err(|error| {
                 format!("parse callback at {extraction_source}:{line_number}: {error}")
+            })?;
+            let detail = normalize_c(&block).map_err(|error| {
+                format!("normalize callback at {extraction_source}:{line_number}: {error}")
             })?;
             if let Some(capture) = callback_re.captures(&block) {
                 items.push(item(
@@ -408,7 +431,7 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
                     &capture[1],
                     &extraction_source,
                     line_number,
-                    &normalize(&block),
+                    &detail,
                 ));
             }
             index = end;
@@ -416,11 +439,14 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
             let (block, end) = collect_declaration(&lines, index).map_err(|error| {
                 format!("parse typedef at {extraction_source}:{line_number}: {error}")
             })?;
+            let detail = normalize_c(&block).map_err(|error| {
+                format!("normalize typedef at {extraction_source}:{line_number}: {error}")
+            })?;
             let aliases = typedef_aliases(&block);
             if aliases.is_empty() {
                 return Err(format!(
                     "cannot extract typedef alias at {extraction_source}:{line_number}: {}",
-                    normalize(&block)
+                    detail
                 ));
             }
             for alias in aliases {
@@ -429,7 +455,7 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
                     &alias,
                     &extraction_source,
                     line_number,
-                    &normalize(&block),
+                    &detail,
                 ));
             }
             index = end;
@@ -437,10 +463,13 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
             let (block, end) = collect_declaration(&lines, index).map_err(|error| {
                 format!("parse export at {extraction_source}:{line_number}: {error}")
             })?;
+            let detail = normalize_c(&block).map_err(|error| {
+                format!("normalize export at {extraction_source}:{line_number}: {error}")
+            })?;
             let name = exported_name(&block).ok_or_else(|| {
                 format!(
                     "cannot extract exported symbol at {extraction_source}:{line_number}: {}",
-                    normalize(&block)
+                    detail
                 )
             })?;
             let backend = source.split('/').count() > 3;
@@ -451,20 +480,14 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
             } else {
                 "export-function"
             };
-            items.push(item(
-                kind,
-                &name,
-                &extraction_source,
-                line_number,
-                &normalize(&block),
-            ));
+            items.push(item(kind, &name, &extraction_source, line_number, &detail));
             if is_registry_api(&name) {
                 items.push(item(
                     "registry",
                     &name,
                     &extraction_source,
                     line_number,
-                    &normalize(&block),
+                    &detail,
                 ));
             }
             if block.contains("XMLSEC_DEPRECATED") {
@@ -473,7 +496,7 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
                     &name,
                     &extraction_source,
                     line_number,
-                    &normalize(&block),
+                    &detail,
                 ));
             }
             index = end;
@@ -524,7 +547,12 @@ fn preprocessor_conditions(content: &str) -> Result<Vec<Vec<String>>, String> {
 
         if let Some(capture) = directive.captures(&logical) {
             let kind = capture.get(1).expect("directive kind").as_str();
-            let normalized = normalize(&logical);
+            let normalized = normalize_c(&logical).map_err(|error| {
+                format!(
+                    "normalize preprocessor directive at line {}: {error}",
+                    start + 1
+                )
+            })?;
             match kind {
                 "if" | "ifdef" | "ifndef" => stack.push(PreprocessorFrame {
                     branches: vec![normalized],
@@ -798,12 +826,18 @@ fn extract_cli_options_from_content(content: &str) -> Result<Vec<SurfaceItem>, S
                 )
             })?
             .as_str();
+        let detail = normalize_c(&block).map_err(|error| {
+            format!(
+                "normalize CLI option at apps/xmlsec.c:{}: {error}",
+                index + 1
+            )
+        })?;
         items.push(item(
             "cli-option",
             name,
             "apps/xmlsec.c",
             index + 1,
-            &normalize(&block),
+            &detail,
         ));
         index = end + 1;
     }
@@ -912,7 +946,9 @@ fn classify(surface: Vec<SurfaceItem>, rules: RulesFile) -> Result<Ledger, Strin
         })
         .collect::<Result<_, String>>()?;
 
+    let availability = availability_spans(&surface)?;
     let mut items = Vec::with_capacity(surface.len());
+    let mut classifications = BTreeMap::new();
     let mut rule_matches = vec![0_usize; compiled.len()];
     for entry in surface {
         let matching = compiled
@@ -942,22 +978,21 @@ fn classify(surface: Vec<SurfaceItem>, rules: RulesFile) -> Result<Ledger, Strin
                 rule.id, rule.evidence
             ));
         }
-        let id = format!(
-            "{}:{}:{}:{}",
-            entry.kind, entry.source, entry.line, entry.name
+        classifications.insert(
+            rule.id.clone(),
+            Classification {
+                outcome: rule.outcome,
+                rationale: rule.rationale.clone(),
+                evidence: rule.evidence.clone(),
+            },
         );
         items.push(LedgerItem {
-            id,
             kind: entry.kind,
             name: entry.name,
             source: entry.source,
             line: entry.line,
             detail: entry.detail,
-            conditions: entry.conditions,
-            outcome: rule.outcome,
-            rationale: rule.rationale.clone(),
-            evidence: rule.evidence.clone(),
-            classification_rule: rule.id.clone(),
+            classification: rule.id.clone(),
         });
     }
     for (index, count) in rule_matches.into_iter().enumerate() {
@@ -969,17 +1004,59 @@ fn classify(surface: Vec<SurfaceItem>, rules: RulesFile) -> Result<Ledger, Strin
         }
     }
     Ok(Ledger {
-        schema_version: 1,
+        schema_version: 2,
         upstream: Upstream {
             project: "libxmlsec1".into(),
             version: EXPECTED_VERSION.into(),
             commit: EXPECTED_COMMIT.trim().into(),
             repository: "https://github.com/lsh123/xmlsec".into(),
         },
-        generated_by: "xml-sec-capability-ledger/1".into(),
+        generated_by: "xml-sec-capability-ledger/2".into(),
         evidence: rules.evidence,
+        classifications,
+        availability,
         items,
     })
+}
+
+fn availability_spans(surface: &[SurfaceItem]) -> Result<Vec<AvailabilitySpan>, String> {
+    let mut lines = BTreeMap::<(&str, usize), &[String]>::new();
+    for item in surface {
+        let key = (item.source.as_str(), item.line);
+        if let Some(existing) = lines.insert(key, &item.conditions)
+            && existing != item.conditions
+        {
+            return Err(format!(
+                "items at {}:{} have inconsistent preprocessor conditions",
+                item.source, item.line
+            ));
+        }
+    }
+
+    let mut spans: Vec<AvailabilitySpan> = Vec::new();
+    let mut interrupted = false;
+    for ((source, line), conditions) in lines {
+        if conditions.is_empty() {
+            interrupted = true;
+            continue;
+        }
+        if let Some(last) = spans.last_mut()
+            && !interrupted
+            && last.source == source
+            && last.conditions == conditions
+        {
+            last.end_line = line;
+            continue;
+        }
+        spans.push(AvailabilitySpan {
+            source: source.to_owned(),
+            start_line: line,
+            end_line: line,
+            conditions: conditions.to_vec(),
+        });
+        interrupted = false;
+    }
+    Ok(spans)
 }
 
 fn collect_macro_definition(lines: &[&str], start: usize) -> (String, usize) {
@@ -1141,14 +1218,33 @@ fn sanitize_c(value: &str) -> String {
     output
 }
 
-fn normalize(value: &str) -> String {
-    // Formatting whitespace is irrelevant C trivia, but whitespace between quote
-    // delimiters is part of the compiled public value and must remain byte-exact.
+fn normalize_c(value: &str) -> Result<String, String> {
     let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
     let mut quote = None;
     let mut escaped = false;
+    let mut in_block_comment = false;
+    let mut in_line_comment = false;
     let mut pending_space = false;
-    for ch in value.chars() {
+
+    while let Some(ch) = chars.next() {
+        if in_line_comment {
+            if ch == '\\' && chars.peek() == Some(&'\n') {
+                chars.next();
+            } else if ch == '\n' {
+                in_line_comment = false;
+                pending_space = true;
+            }
+            continue;
+        }
+        if in_block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_block_comment = false;
+                pending_space = true;
+            }
+            continue;
+        }
         if let Some(delimiter) = quote {
             output.push(ch);
             if escaped {
@@ -1158,6 +1254,17 @@ fn normalize(value: &str) -> String {
             } else if ch == delimiter {
                 quote = None;
             }
+            continue;
+        }
+
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            in_block_comment = true;
+            pending_space = true;
+        } else if ch == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            in_line_comment = true;
+            pending_space = true;
         } else if ch == '\'' || ch == '"' {
             if pending_space && !output.is_empty() {
                 output.push(' ');
@@ -1175,7 +1282,14 @@ fn normalize(value: &str) -> String {
             output.push(ch);
         }
     }
-    output
+
+    if in_block_comment {
+        return Err("unterminated block comment".into());
+    }
+    if let Some(delimiter) = quote {
+        return Err(format!("unterminated {delimiter} literal"));
+    }
+    Ok(output)
 }
 
 fn exported_name(declaration: &str) -> Option<String> {
@@ -1377,8 +1491,9 @@ done:
             },
         )
         .expect("both ordered rules must classify at least one item");
-        assert_eq!(ledger.items[0].classification_rule, "supported");
-        assert_eq!(ledger.items[1].classification_rule, "fallback");
+        assert_eq!(ledger.items[0].classification, "supported");
+        assert_eq!(ledger.items[1].classification, "fallback");
+        assert_eq!(ledger.classifications.len(), 2);
     }
 
     #[test]
@@ -1527,13 +1642,33 @@ MSCRYPTO_CFLAGS=\"$MSCRYPTO_CFLAGS -DXMLSEC_CUSTOM_CRYPT32=1\""#;
     fn normalization_preserves_c_literal_bytes() {
         // Whitespace trivia may collapse, but bytes inside C literals are semantic.
         assert_eq!(
-            normalize("#define VALUE   \" \"\n  \"  \""),
+            normalize_c("#define VALUE   \" \"\n  \"  \"").unwrap(),
             "#define VALUE \" \" \"  \""
         );
         assert_ne!(
-            normalize("#define VALUE \" \""),
-            normalize("#define VALUE \"  \"")
+            normalize_c("#define VALUE \" \"").unwrap(),
+            normalize_c("#define VALUE \"  \"").unwrap()
         );
+    }
+
+    #[test]
+    fn c_normalization_removes_comments_but_preserves_literal_markers() {
+        // Donor comments are trivia, while identical bytes inside literals are public data.
+        assert_eq!(
+            normalize_c(
+                "int value /* owner's note */ = call(\"/*kept*/\", '//'); // tail \\\ndiscarded\n;"
+            )
+            .unwrap(),
+            "int value = call(\"/*kept*/\", '//'); ;"
+        );
+    }
+
+    #[test]
+    fn c_normalization_rejects_unterminated_lexical_states() {
+        // Truncated donor input must fail generation rather than enter the baseline.
+        for malformed in ["int x; /*", "const char *x = \"unterminated", "int x = '"] {
+            assert!(normalize_c(malformed).is_err(), "{malformed:?}");
+        }
     }
 
     #[test]
@@ -1572,6 +1707,24 @@ MSCRYPTO_CFLAGS=\"$MSCRYPTO_CFLAGS -DXMLSEC_CUSTOM_CRYPT32=1\""#;
         for malformed in ["#else\n", "#if A\n#else\n#elif B\n#endif\n", "#if A\n"] {
             assert!(preprocessor_conditions(malformed).is_err(), "{malformed:?}");
         }
+    }
+
+    #[test]
+    fn availability_spans_normalize_repeated_item_conditions() {
+        // One source span replaces repeated per-item arrays without covering unguarded entries.
+        let mut guarded_a = item("macro", "A", "public.h", 10, "A");
+        guarded_a.conditions = vec!["#ifndef XMLSEC_NO_A".into()];
+        let mut guarded_b = item("macro", "B", "public.h", 20, "B");
+        guarded_b.conditions = guarded_a.conditions.clone();
+        let unguarded = item("macro", "C", "public.h", 30, "C");
+        let mut guarded_d = item("macro", "D", "public.h", 40, "D");
+        guarded_d.conditions = guarded_a.conditions.clone();
+
+        let spans = availability_spans(&[guarded_a, guarded_b, unguarded, guarded_d])
+            .expect("consistent item conditions must normalize");
+        assert_eq!(spans.len(), 2);
+        assert_eq!((spans[0].start_line, spans[0].end_line), (10, 20));
+        assert_eq!((spans[1].start_line, spans[1].end_line), (40, 40));
     }
 
     #[test]

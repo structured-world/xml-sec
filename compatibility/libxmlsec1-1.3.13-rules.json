@@ -9,6 +9,10 @@
       "test": "capability_ledger::native_algorithm_claims_match_the_rust_api",
       "description": "The claimed URI set is cross-checked against the native algorithm parsers and the repository's unit and interop suites."
     },
+    "xpath-compatibility-tests": {
+      "test": "capability_ledger::xpath_claims_record_libxmlsec_here_compatibility",
+      "description": "XPath and XPath Filter 2.0 use standards behavior by default; integration tests exercise the explicit libxmlsec1-compatible here() binding."
+    },
     "legacy-policy-tests": {
       "test": "capability_ledger::legacy_algorithm_claims_are_policy_gated",
       "description": "Legacy SHA-1 signature paths are available only through explicit compatibility policy opt-ins."
@@ -32,9 +36,17 @@
   },
   "rules": [
     {
+      "id": "native-xpath-uri",
+      "kinds": ["algorithm-uri"],
+      "name_regex": "^xmlSecXPath2?Ns$",
+      "outcome": "behavior-compatible",
+      "rationale": "The native Rust API implements XPath and XPath Filter 2.0 with standards-compliant here() semantics by default; reproducing libxmlsec1's divergent Transform-element binding requires the explicit XmlSecLegacy mode.",
+      "evidence": "xpath-compatibility-tests"
+    },
+    {
       "id": "native-supported-uri",
       "kinds": ["algorithm-uri"],
-      "name_regex": "^xmlSec(?:Href(?:Aes128Cbc|Aes256Cbc|Aes128Gcm|Aes256Gcm|KWAes128|KWAes256|Base64|C14N|C14NWithComments|C14N11|C14N11WithComments|ExcC14N|ExcC14NWithComments|DEREncodedKeyValue|DSAKeyValue|ECKeyValue|Enveloped|RSAKeyValue|RsaSha256|RsaSha384|RsaSha512|EcdsaSha256|EcdsaSha384|Sha256|Sha384|Sha512|RsaOaep|RsaOaepEnc11|Mgf1Sha1|Mgf1Sha256|Mgf1Sha384|Mgf1Sha512|X509Data|RawX509Cert|EncryptedKey)|XPath2?Ns)$",
+      "name_regex": "^xmlSecHref(?:Aes128Cbc|Aes256Cbc|Aes128Gcm|Aes256Gcm|KWAes128|KWAes256|Base64|C14N|C14NWithComments|C14N11|C14N11WithComments|ExcC14N|ExcC14NWithComments|DEREncodedKeyValue|DSAKeyValue|ECKeyValue|Enveloped|RSAKeyValue|RsaSha256|RsaSha384|RsaSha512|EcdsaSha256|EcdsaSha384|Sha256|Sha384|Sha512|RsaOaep|RsaOaepEnc11|Mgf1Sha1|Mgf1Sha256|Mgf1Sha384|Mgf1Sha512|X509Data|RawX509Cert|EncryptedKey)$",
       "outcome": "behavior-compatible",
       "rationale": "The native Rust API parses and executes this standard URI, with unit or interoperability coverage in the repository.",
       "evidence": "native-algorithm-tests"

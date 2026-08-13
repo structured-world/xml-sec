@@ -5,11 +5,14 @@ const LEDGER_JSON: &str = include_str!("../compatibility/libxmlsec1-1.3.13.json"
 const DONOR_COMMIT: &str = include_str!("../compatibility/libxmlsec1-1.3.13-donor-commit.txt");
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Ledger {
     schema_version: u32,
     upstream: Upstream,
     generated_by: String,
     evidence: BTreeMap<String, Evidence>,
+    classifications: BTreeMap<String, Classification>,
+    availability: Vec<AvailabilitySpan>,
     items: Vec<Item>,
 }
 
@@ -28,22 +31,61 @@ struct Evidence {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Item {
-    id: String,
     kind: String,
     name: String,
     source: String,
     line: usize,
     detail: String,
-    conditions: Vec<String>,
+    classification: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Classification {
     outcome: String,
     rationale: String,
     evidence: String,
-    classification_rule: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AvailabilitySpan {
+    source: String,
+    start_line: usize,
+    end_line: usize,
+    conditions: Vec<String>,
 }
 
 fn ledger() -> Ledger {
     serde_json::from_str(LEDGER_JSON).expect("committed capability ledger must be valid JSON")
+}
+
+fn item_id(item: &Item) -> String {
+    format!("{}:{}:{}:{}", item.kind, item.source, item.line, item.name)
+}
+
+fn classification<'a>(ledger: &'a Ledger, item: &Item) -> &'a Classification {
+    ledger
+        .classifications
+        .get(&item.classification)
+        .unwrap_or_else(|| panic!("{} references unknown classification", item_id(item)))
+}
+
+fn conditions_for<'a>(ledger: &'a Ledger, item: &Item) -> &'a [String] {
+    let mut matching = ledger.availability.iter().filter(|span| {
+        span.source == item.source && span.start_line <= item.line && item.line <= span.end_line
+    });
+    let conditions = matching
+        .next()
+        .map_or(&[][..], |span| span.conditions.as_slice());
+    assert!(
+        matching.next().is_none(),
+        "{} has overlapping availability spans",
+        item_id(item)
+    );
+    conditions
 }
 
 fn declared_tests() -> BTreeSet<&'static str> {
@@ -70,10 +112,22 @@ fn declared_tests() -> BTreeSet<&'static str> {
 }
 
 fn validate_evidence(ledger: &Ledger) -> Result<(), String> {
-    let referenced: BTreeSet<_> = ledger
+    let referenced_classifications: BTreeSet<_> = ledger
         .items
         .iter()
-        .map(|item| item.evidence.as_str())
+        .map(|item| item.classification.as_str())
+        .collect();
+    for key in ledger.classifications.keys() {
+        if !referenced_classifications.contains(key.as_str()) {
+            return Err(format!(
+                "classification {key} is not referenced by any item"
+            ));
+        }
+    }
+    let referenced: BTreeSet<_> = ledger
+        .classifications
+        .values()
+        .map(|classification| classification.evidence.as_str())
         .collect();
     let tests = declared_tests();
     for (key, evidence) in &ledger.evidence {
@@ -98,7 +152,7 @@ fn validate_evidence(ledger: &Ledger) -> Result<(), String> {
 fn complete_surface_categories_are_stable() {
     // Exact category counts make an upstream or extractor drift visible in review.
     let ledger = ledger();
-    assert_eq!(ledger.schema_version, 1);
+    assert_eq!(ledger.schema_version, 2);
     assert_eq!(ledger.upstream.project, "libxmlsec1");
     assert_eq!(ledger.upstream.version, "1.3.13");
     assert_eq!(ledger.upstream.commit, DONOR_COMMIT.trim());
@@ -106,7 +160,9 @@ fn complete_surface_categories_are_stable() {
         ledger.upstream.repository,
         "https://github.com/lsh123/xmlsec"
     );
-    assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/1");
+    assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
+    assert_eq!(ledger.classifications.len(), 13);
+    assert_eq!(ledger.availability.len(), 427);
 
     let counts = ledger
         .items
@@ -145,11 +201,8 @@ fn complete_surface_categories_are_stable() {
 fn every_entry_is_unique_sorted_and_evidenced() {
     // Deterministic ordering and complete evidence keep regeneration reviewable.
     let ledger = ledger();
-    let ids: Vec<_> = ledger.items.iter().map(|item| item.id.as_str()).collect();
-    assert_eq!(
-        ids.iter().copied().collect::<BTreeSet<_>>().len(),
-        ids.len()
-    );
+    let ids: Vec<_> = ledger.items.iter().map(item_id).collect();
+    assert_eq!(ids.iter().collect::<BTreeSet<_>>().len(), ids.len());
 
     let sort_keys: Vec<_> = ledger
         .items
@@ -160,25 +213,39 @@ fn every_entry_is_unique_sorted_and_evidenced() {
     sorted.sort();
     assert_eq!(sort_keys, sorted);
 
+    for pair in ledger.availability.windows(2) {
+        let left = &pair[0];
+        let right = &pair[1];
+        assert!(
+            (left.source.as_str(), left.start_line) < (right.source.as_str(), right.start_line),
+            "availability spans must remain uniquely sorted"
+        );
+        assert!(
+            left.source != right.source || left.end_line < right.start_line,
+            "availability spans must not overlap in {}",
+            left.source
+        );
+    }
+
     for item in &ledger.items {
-        assert!(!item.name.is_empty(), "{} has no name", item.id);
-        assert!(!item.source.is_empty(), "{} has no source", item.id);
-        assert!(item.line > 0, "{} has no source line", item.id);
+        let id = item_id(item);
+        let classification = classification(&ledger, item);
+        assert!(!item.name.is_empty(), "{id} has no name");
+        assert!(!item.source.is_empty(), "{id} has no source");
+        assert!(item.line > 0, "{id} has no source line");
+        assert!(!item.detail.is_empty(), "{id} has no extracted detail");
         assert!(
-            !item.detail.is_empty(),
-            "{} has no extracted detail",
-            item.id
+            !classification.rationale.is_empty(),
+            "{id} has no rationale"
         );
-        assert!(!item.rationale.is_empty(), "{} has no rationale", item.id);
         assert!(
-            ledger.evidence.contains_key(&item.evidence),
-            "{} references unknown evidence {}",
-            item.id,
-            item.evidence
+            ledger.evidence.contains_key(&classification.evidence),
+            "{id} references unknown evidence {}",
+            classification.evidence
         );
-        assert!(!item.classification_rule.is_empty());
+        assert!(!item.classification.is_empty());
         assert!(
-            item.conditions
+            conditions_for(&ledger, item)
                 .iter()
                 .all(|condition| condition.starts_with('#'))
         );
@@ -193,10 +260,9 @@ fn every_entry_is_unique_sorted_and_evidenced() {
                 "binary-abi-incompatible",
                 "planned",
             ]
-            .contains(&item.outcome.as_str()),
-            "{} has undocumented outcome {}",
-            item.id,
-            item.outcome
+            .contains(&classification.outcome.as_str()),
+            "{id} has undocumented outcome {}",
+            classification.outcome
         );
     }
     validate_evidence(&ledger).expect("all evidence must be referenced and executable");
@@ -254,11 +320,16 @@ fn c_surface_is_explicitly_incompatible() {
         .iter()
         .filter(|item| c_kinds.contains(&item.kind.as_str()))
     {
-        assert_eq!(item.outcome, "binary-abi-incompatible", "{}", item.id);
+        assert_eq!(
+            classification(&ledger, item).outcome,
+            "binary-abi-incompatible",
+            "{}",
+            item_id(item)
+        );
     }
 }
 
-#[cfg(feature = "xmlenc")]
+#[cfg(all(feature = "xmldsig", feature = "xmlenc"))]
 #[test]
 fn native_algorithm_claims_match_the_rust_api() {
     // Every positive claim must pass through the corresponding production parser or type.
@@ -268,7 +339,7 @@ fn native_algorithm_claims_match_the_rust_api() {
         .iter()
         .filter(|item| {
             matches!(
-                item.outcome.as_str(),
+                classification(&ledger, item).outcome.as_str(),
                 "behavior-compatible" | "compatibility-profile-only"
             )
         })
@@ -279,7 +350,7 @@ fn native_algorithm_claims_match_the_rust_api() {
     }
 }
 
-#[cfg(feature = "xmlenc")]
+#[cfg(all(feature = "xmldsig", feature = "xmlenc"))]
 fn assert_native_uri_support(item: &Item) {
     use xml_sec::c14n::C14nAlgorithm;
     use xml_sec::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
@@ -301,7 +372,7 @@ fn assert_native_uri_support(item: &Item) {
         | "xmlSecHrefC14NWithComments"
         | "xmlSecHrefExcC14N"
         | "xmlSecHrefExcC14NWithComments" => {
-            assert!(C14nAlgorithm::from_uri(uri).is_some(), "{}", item.id);
+            assert!(C14nAlgorithm::from_uri(uri).is_some(), "{}", item_id(item));
         }
         "xmlSecHrefDsaSha1"
         | "xmlSecHrefEcdsaSha256"
@@ -352,7 +423,7 @@ fn assert_native_uri_support(item: &Item) {
     }
 }
 
-#[cfg(feature = "xmlenc")]
+#[cfg(all(feature = "xmldsig", feature = "xmlenc"))]
 fn assert_transform_uri_parses(uri: &str) {
     let parameter = match uri {
         "http://www.w3.org/TR/1999/REC-xpath-19991116" => {
@@ -375,7 +446,7 @@ fn assert_transform_uri_parses(uri: &str) {
     );
 }
 
-#[cfg(feature = "xmlenc")]
+#[cfg(all(feature = "xmldsig", feature = "xmlenc"))]
 fn assert_key_info_uri_parses(name: &str, uri: &str) {
     const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
     const DS11: &str = "http://www.w3.org/2009/xmldsig11#";
@@ -417,7 +488,7 @@ fn assert_key_info_uri_parses(name: &str, uri: &str) {
     );
 }
 
-#[cfg(feature = "xmlenc")]
+#[cfg(all(feature = "xmldsig", feature = "xmlenc"))]
 fn assert_retrieval_method_type_parses(uri: &str) {
     let xml = format!(
         "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><RetrievalMethod URI=\"#key\" Type=\"{uri}\"/></KeyInfo>"
@@ -426,7 +497,7 @@ fn assert_retrieval_method_type_parses(uri: &str) {
     xml_sec::xmldsig::parse_key_info(document.root_element()).unwrap();
 }
 
-#[cfg(feature = "xmlenc")]
+#[cfg(all(feature = "xmldsig", feature = "xmlenc"))]
 fn assert_encrypted_key_uri_parses(uri: &str) {
     assert_eq!(uri, "http://www.w3.org/2001/04/xmlenc#EncryptedKey");
     let xml = r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes128"/><CipherData><CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</CipherValue></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</CipherValue></CipherData></EncryptedData>"#;
@@ -439,6 +510,7 @@ fn assert_encrypted_key_uri_parses(uri: &str) {
     );
 }
 
+#[cfg(feature = "xmldsig")]
 #[test]
 fn legacy_algorithm_claims_are_policy_gated() {
     // Only algorithms independently gated by compiled policy belong here.
@@ -446,7 +518,7 @@ fn legacy_algorithm_claims_are_policy_gated() {
     let actual: BTreeSet<_> = ledger
         .items
         .iter()
-        .filter(|item| item.outcome == "compatibility-profile-only")
+        .filter(|item| classification(&ledger, item).outcome == "compatibility-profile-only")
         .map(|item| item.name.as_str())
         .collect();
     assert_eq!(
@@ -463,14 +535,37 @@ fn legacy_algorithm_claims_are_policy_gated() {
         .iter()
         .find(|item| item.name == "xmlSecHrefSha1")
         .expect("SHA-1 digest URI must remain inventoried");
-    assert_eq!(sha1.outcome, "behavior-compatible");
-    assert!(sha1.rationale.contains("verification-only"));
+    let sha1_classification = classification(&ledger, sha1);
+    assert_eq!(sha1_classification.outcome, "behavior-compatible");
+    assert!(sha1_classification.rationale.contains("verification-only"));
     assert!(
         xml_sec::policy::VerificationPolicy::default()
             .digest_algorithms
             .is_none()
     );
     assert!(!xml_sec::xmldsig::DigestAlgorithm::Sha1.signing_allowed());
+}
+
+#[cfg(feature = "xmldsig")]
+#[test]
+fn xpath_claims_record_libxmlsec_here_compatibility() {
+    // URI support is native, but the donor's non-standard here() binding is explicit opt-in.
+    let ledger = ledger();
+    for name in ["xmlSecXPathNs", "xmlSecXPath2Ns"] {
+        let item = ledger
+            .items
+            .iter()
+            .find(|item| item.name == name)
+            .unwrap_or_else(|| panic!("{name} must remain inventoried"));
+        let classification = classification(&ledger, item);
+        assert_eq!(item.classification, "native-xpath-uri");
+        assert_eq!(classification.outcome, "behavior-compatible");
+        assert!(classification.rationale.contains("XmlSecLegacy"));
+    }
+    assert_eq!(
+        xml_sec::xmldsig::XPathHereSemantics::default(),
+        xml_sec::xmldsig::XPathHereSemantics::Specification
+    );
 }
 
 #[test]
@@ -480,7 +575,10 @@ fn backend_surface_distinguishes_provider_capabilities_from_unimplemented_apis()
     let provider_limited: Vec<_> = ledger
         .items
         .iter()
-        .filter(|item| item.kind == "backend-api" && item.outcome == "provider-limited")
+        .filter(|item| {
+            item.kind == "backend-api"
+                && classification(&ledger, item).outcome == "provider-limited"
+        })
         .collect();
     assert!(!provider_limited.is_empty());
     assert!(
@@ -493,7 +591,7 @@ fn backend_surface_distinguishes_provider_capabilities_from_unimplemented_apis()
         assert!(ledger.items.iter().any(|item| {
             item.kind == "backend-api"
                 && item.name.contains(unsupported)
-                && item.outcome == "planned"
+                && classification(&ledger, item).outcome == "planned"
         }));
     }
 }
@@ -561,8 +659,7 @@ fn donor_declarations_are_extracted_without_truncation() {
         .find(|item| item.name == "xmlSecGCryptAppKeyCertLoad")
         .expect("guarded X.509 API must be inventoried");
     assert!(
-        guarded_x509
-            .conditions
+        conditions_for(&ledger, guarded_x509)
             .iter()
             .any(|condition| condition == "#ifndef XMLSEC_NO_X509")
     );
@@ -602,7 +699,7 @@ fn conditional_macro_variants_and_class_ids_are_complete() {
                     && item.line == macro_item.line
             }),
             "{}",
-            macro_item.id
+            item_id(macro_item)
         );
     }
 }
@@ -660,7 +757,7 @@ fn planned_surface_is_never_reported_as_supported() {
     let planned: Vec<_> = ledger
         .items
         .iter()
-        .filter(|item| item.outcome == "planned")
+        .filter(|item| classification(&ledger, item).outcome == "planned")
         .collect();
     assert!(!planned.is_empty());
     assert!(planned.iter().any(|item| item.kind == "cli-command"));
@@ -683,6 +780,6 @@ fn deprecated_surface_is_explicitly_unsupported() {
     assert!(
         deprecated
             .iter()
-            .all(|item| item.outcome == "intentionally-unsupported")
+            .all(|item| classification(&ledger, item).outcome == "intentionally-unsupported")
     );
 }
