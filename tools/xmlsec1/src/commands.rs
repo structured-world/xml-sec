@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -11,8 +11,9 @@ use xml_sec::{
     policy::{DecryptionPolicy, EncryptionPolicy, SigningPolicy, VerificationPolicy},
     provider::default_provider,
     xmldsig::{
-        DefaultKeyResolver, DsigStatus, KeyResolverConfig, SignContext, SignatureAlgorithm,
-        UriTypeSet, VerifyContext, X509CertificateKeyInfoWriter,
+        DefaultKeyResolver, DsigStatus, KeyResolver, KeyResolverConfig, SignContext,
+        SignatureAlgorithm, UriTypeSet, VerifyContext, X509CertificateKeyInfoWriter,
+        parse_key_info,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
@@ -59,6 +60,8 @@ pub enum CommandError {
     InputTooLarge { maximum: usize },
     #[error("input XML is not valid UTF-8")]
     InvalidUtf8Input,
+    #[error("encryption plaintext exceeds policy limit of {maximum} bytes")]
+    PlaintextTooLarge { maximum: usize },
     #[error(transparent)]
     Key(#[from] key_material::KeyMaterialError),
     #[error("XML signature operation failed: {0}")]
@@ -220,14 +223,60 @@ fn write_output(
     bytes: &[u8],
     stdout: &mut dyn Write,
 ) -> Result<(), CommandError> {
-    if let Some(path) = invocation.last_value("output") {
-        fs::write(path, bytes).map_err(|source| CommandError::Io {
-            path: PathBuf::from(path),
-            source,
-        })
+    if let Some(template) = invocation.last_value("output") {
+        let path = expand_output_path(invocation, template)?;
+        fs::write(&path, bytes).map_err(|source| CommandError::Io { path, source })
     } else {
         stdout.write_all(bytes).map_err(stdout_error)
     }
+}
+
+fn expand_output_path(invocation: &Invocation, template: &OsStr) -> Result<PathBuf, CommandError> {
+    const PLACEHOLDER: &[u8] = b"{inputfile}";
+    let template_bytes = template.as_encoded_bytes();
+    let Some(start) = template_bytes
+        .windows(PLACEHOLDER.len())
+        .position(|candidate| candidate == PLACEHOLDER)
+    else {
+        return Ok(PathBuf::from(template));
+    };
+    let input = input_path(invocation)?;
+    let basename = Path::new(input)
+        .file_name()
+        .unwrap_or(input)
+        .as_encoded_bytes();
+    let stem = basename
+        .iter()
+        .rposition(|byte| *byte == b'.')
+        .map_or(basename, |dot| &basename[..dot]);
+    let mut expanded = Vec::with_capacity(template_bytes.len() - PLACEHOLDER.len() + stem.len());
+    expanded.extend_from_slice(&template_bytes[..start]);
+    expanded.extend_from_slice(stem);
+    expanded.extend_from_slice(&template_bytes[start + PLACEHOLDER.len()..]);
+    // The placeholder is ASCII and every other boundary comes from a complete
+    // OsStr, so concatenation preserves the platform's encoded-byte contract.
+    Ok(PathBuf::from(unsafe {
+        OsString::from_encoded_bytes_unchecked(expanded)
+    }))
+}
+
+fn read_plaintext(path: &OsStr, maximum: usize) -> Result<Vec<u8>, CommandError> {
+    let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
+    File::open(path)
+        .map_err(|source| CommandError::Io {
+            path: PathBuf::from(path),
+            source,
+        })?
+        .take(maximum.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| CommandError::Io {
+            path: PathBuf::from(path),
+            source,
+        })?;
+    if bytes.len() > maximum {
+        return Err(CommandError::PlaintextTooLarge { maximum });
+    }
+    Ok(bytes)
 }
 
 fn option_text<'a>(
@@ -461,13 +510,13 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     let algorithm = key_material::signature_algorithm(&xml)?;
     let result = if let Some(path) = direct_path {
         let key = key_material::load_verification_key(path, algorithm)?;
-        VerifyContext::new().policy(policy).key(&key).verify(&xml)
+        VerifyContext::new()
+            .policy(policy)
+            .key(&key)
+            .verify(&xml)
+            .map_err(|error| CommandError::Signature(error.to_string()))?
     } else if let [certificate] = explicit_certificates.as_slice() {
-        let key = key_material::load_certificate_verification_key(
-            certificate.value.as_deref().unwrap_or_default(),
-            algorithm,
-        )?;
-        VerifyContext::new().policy(policy).key(&key).verify(&xml)
+        verify_with_explicit_certificate(invocation, certificate, algorithm, policy, &xml)?
     } else {
         let mut config = KeyResolverConfig::default();
         for name in [
@@ -494,8 +543,8 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             .policy(policy)
             .key_resolver(&resolver)
             .verify(&xml)
-    }
-    .map_err(|error| CommandError::Signature(error.to_string()))?;
+            .map_err(|error| CommandError::Signature(error.to_string()))?
+    };
     if result.status != DsigStatus::Valid
         || result
             .manifest_references
@@ -508,6 +557,55 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         writeln!(stdout, "Status: valid").map_err(stdout_error)?;
     }
     Ok(())
+}
+
+fn verify_with_explicit_certificate(
+    invocation: &Invocation,
+    certificate: &crate::OptionValue,
+    algorithm: SignatureAlgorithm,
+    policy: VerificationPolicy,
+    xml: &str,
+) -> Result<xml_sec::xmldsig::VerifyResult, CommandError> {
+    let certificate_der =
+        key_material::load_certificate(certificate.value.as_deref().unwrap_or_default())?;
+    // Model the caller-pinned leaf as the sole document key source. The core
+    // resolver can then build its path through caller-supplied intermediates
+    // and anchors without allowing the document's embedded KeyInfo to replace
+    // the explicitly selected identity.
+    let encoded =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, certificate_der);
+    let key_info_xml = format!(
+        "<KeyInfo xmlns=\"{XMLDSIG_NS}\"><X509Data><X509Certificate>{encoded}</X509Certificate></X509Data></KeyInfo>"
+    );
+    let document = Document::parse(&key_info_xml)
+        .map_err(|error| CommandError::Signature(error.to_string()))?;
+    let key_info = parse_key_info(document.root_element())
+        .map_err(|error| CommandError::Signature(error.to_string()))?;
+    let mut config = KeyResolverConfig::default();
+    for name in ["untrusted-pem", "untrusted-der"] {
+        for option in invocation.values(name) {
+            config.lookup_certs.push(key_material::load_certificate(
+                option.value.as_deref().unwrap_or_default(),
+            )?);
+        }
+    }
+    for name in ["trusted-pem", "trusted-der"] {
+        for option in invocation.values(name) {
+            config.trusted_certs.push(key_material::load_certificate(
+                option.value.as_deref().unwrap_or_default(),
+            )?);
+        }
+    }
+    let resolver = DefaultKeyResolver::new(config);
+    let key = resolver
+        .resolve_with_policy(Some(&key_info), algorithm, &policy)
+        .map_err(|error| CommandError::Signature(error.to_string()))?
+        .ok_or_else(|| CommandError::Signature("explicit certificate was not resolved".into()))?;
+    VerifyContext::new()
+        .policy(policy)
+        .key(key.as_ref())
+        .verify(xml)
+        .map_err(|error| CommandError::Signature(error.to_string()))
 }
 
 fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
@@ -531,6 +629,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     reject_unimplemented_selectors(invocation, &[])?;
     let policy = EncryptionPolicy::default();
     let maximum_document_bytes = policy.resources.max_xml_document_bytes;
+    let maximum_plaintext_bytes = policy.resources.max_encryption_plaintext_bytes;
     let template = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let (algorithm, encrypted_type) = encryption_template(&template)?;
     let mut builder = EncryptedDataBuilder::new(algorithm).policy(policy);
@@ -567,10 +666,11 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     }
     builder = builder.encryption_type(encrypted_type);
     let result = if let Some(path) = invocation.last_value("binary-data") {
-        let data = key_material::read(path)?;
+        let data = read_plaintext(path, maximum_plaintext_bytes)?;
         builder.encrypt_binary(&data)
     } else if let Some(path) = invocation.last_value("xml-data") {
-        let data = key_material::read_text(path)?;
+        let data = String::from_utf8(read_plaintext(path, maximum_plaintext_bytes)?)
+            .map_err(|_| CommandError::InvalidUtf8Input)?;
         builder.encrypt_xml(&data)
     } else {
         return Err(CommandError::Usage(
@@ -878,10 +978,6 @@ fn keys(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     }
     let mut entries = String::new();
     for generated in generated {
-        let name = generated
-            .parameter
-            .as_deref()
-            .ok_or_else(|| CommandError::Usage("--gen-key requires a key name".into()))?;
         let algorithm = option_value_text(generated)?;
         let size = match algorithm {
             "aes-128" => 16,
@@ -894,10 +990,15 @@ fn keys(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
             .fill_random(&mut key)
             .map_err(|error| CommandError::Encryption(error.to_string()))?;
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
-        let name = quick_xml::escape::escape(name);
+        let key_name = generated
+            .parameter
+            .as_deref()
+            .map_or_else(String::new, |name| {
+                format!("<KeyName>{}</KeyName>\n", quick_xml::escape::escape(name))
+            });
         entries.push_str(&format!(
             "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\n\
-             <KeyName>{name}</KeyName>\n\
+             {key_name}\
              <KeyValue>\n\
              <AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{encoded}</AESKeyValue>\n\
              </KeyValue>\n\
@@ -1066,6 +1167,19 @@ mod tests {
         assert!(matches!(
             read_input(&invocation, 4),
             Err(CommandError::InputTooLarge { maximum: 4 })
+        ));
+    }
+
+    #[test]
+    fn plaintext_reader_enforces_the_compiled_policy_limit_before_encryption() {
+        // Payload limits must be enforced by the reader, before the encryption
+        // builder receives an attacker-controlled allocation.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("oversized.bin");
+        fs::write(&path, b"12345").unwrap();
+        assert!(matches!(
+            read_plaintext(path.as_os_str(), 4),
+            Err(CommandError::PlaintextTooLarge { maximum: 4 })
         ));
     }
 }

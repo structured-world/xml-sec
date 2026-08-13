@@ -67,6 +67,36 @@ fn signs_verifies_and_rejects_tampering_through_process_api() {
 }
 
 #[test]
+fn output_template_expands_the_extensionless_input_basename() {
+    // libxmlsec1 automation uses one output template across many input files;
+    // only the first placeholder is replaced and the input extension is removed.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let output_template = temp.path().join("signed-{inputfile}-{inputfile}.xml");
+    let expected = temp
+        .path()
+        .join("signed-enveloping-sha256-rsa-sha256-{inputfile}.xml");
+
+    let signed = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(private_key)
+        .arg("--output")
+        .arg(output_template)
+        .arg(template)
+        .output()
+        .unwrap();
+
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+    assert!(expected.is_file());
+}
+
+#[test]
 fn encrypts_decrypts_and_rejects_wrong_symmetric_key() {
     // A reciprocal binary round trip must preserve non-UTF-8 bytes, while an
     // authenticated GCM decrypt with the wrong key must fail.
@@ -404,6 +434,39 @@ fn generated_key_store_uses_the_libxmlsec1_xml_shape() {
     );
 }
 
+#[test]
+fn generated_key_store_allows_an_unnamed_key() {
+    // The optional --gen-key parameter controls KeyName presence; omitting it
+    // must still generate usable AES material rather than rejecting the command.
+    let generated = Command::new(binary())
+        .args(["keys", "--gen-key", "aes-128"])
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let xml = String::from_utf8(generated.stdout).unwrap();
+    let document = roxmltree::Document::parse(&xml).unwrap();
+    assert!(
+        !document
+            .descendants()
+            .any(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+    );
+    let value = document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.aleksey.com/xmlsec/2002", "AESKeyValue")))
+        .and_then(|node| node.text())
+        .unwrap();
+    assert_eq!(
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value)
+            .unwrap()
+            .len(),
+        16
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn generated_key_store_is_private_on_create_and_overwrite() {
@@ -466,6 +529,65 @@ fn explicit_certificate_pins_the_verification_identity() {
         !Command::new(binary())
             .args(["verify", "--pubkey-cert-pem"])
             .arg(&wrong_certificate)
+            .arg(&signed)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn explicit_certificate_obeys_trust_anchor_policy() {
+    // An explicit leaf pins identity but does not establish trust when callers
+    // also supply anchors; --insecure is the explicit compatibility opt-out.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    let wrong_anchor = project_root().join("tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+    let signed = temp.path().join("signed.xml");
+    let compound = format!("{},{}", private_key.display(), certificate.display());
+    assert!(
+        Command::new(binary())
+            .args(["sign", "--privkey-pem"])
+            .arg(compound)
+            .arg("--output")
+            .arg(&signed)
+            .arg(&template)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    assert!(
+        Command::new(binary())
+            .args(["verify", "--pubkey-cert-pem"])
+            .arg(&certificate)
+            .arg("--trusted-pem")
+            .arg(&certificate)
+            .arg(&signed)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        !Command::new(binary())
+            .args(["verify", "--pubkey-cert-pem"])
+            .arg(&certificate)
+            .arg("--trusted-pem")
+            .arg(&wrong_anchor)
+            .arg(&signed)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(binary())
+            .args(["verify", "--insecure", "--pubkey-cert-pem"])
+            .arg(&certificate)
+            .arg("--trusted-pem")
+            .arg(&wrong_anchor)
             .arg(&signed)
             .status()
             .unwrap()

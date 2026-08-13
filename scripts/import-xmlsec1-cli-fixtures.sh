@@ -3,9 +3,9 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 donor_tests="${XMLSEC_DONOR_ROOT:-$repo_root/donors/xmlsec/tests}"
-target="$repo_root/tools/xmlsec1/tests/fixtures/upstream"
-mode="${1:-import}"
-if [[ "$mode" != "import" && "$mode" != "--check" ]]; then
+target="${XMLSEC_FIXTURE_TARGET:-$repo_root/tools/xmlsec1/tests/fixtures/upstream}"
+operation="${1:-import}"
+if [[ "$operation" != "import" && "$operation" != "--check" ]]; then
   printf 'usage: %s [--check]\n' "$0" >&2
   exit 2
 fi
@@ -37,18 +37,18 @@ for asset in "${assets[@]}"; do
     exit 1
   fi
   mkdir -p "$staging/$(dirname "$asset")"
-  mode=0644
+  file_mode=0644
   if [[ "$asset" == *.sh ]]; then
-    mode=0755
+    file_mode=0755
   fi
-  install -m "$mode" "$source" "$staging/$asset"
+  install -m "$file_mode" "$source" "$staging/$asset"
 done
 
 printf '%s\n' "$(<"$repo_root/compatibility/libxmlsec1-1.3.13-donor-commit.txt")" \
   > "$staging/DONOR_COMMIT"
 
 backup="${target}.backup.$$"
-if [[ "$mode" == "--check" ]]; then
+if [[ "$operation" == "--check" ]]; then
   diff --recursive --brief "$target" "$staging"
   exit
 fi

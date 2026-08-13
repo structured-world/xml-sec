@@ -39,6 +39,11 @@ xmlsec1 sign --privkey-pem signing-key.pem --output signed.xml template.xml
 xmlsec1 verify --pubkey-pem signing-key.pub.pem signed.xml
 ```
 
+`--output` follows the upstream filename-template contract. The first
+`{inputfile}` token is replaced with the input file's basename after removing
+its final extension, for example `--output 'signed-{inputfile}.xml'` with
+`templates/order.tmpl` writes `signed-order.xml`.
+
 Encrypt and decrypt binary data with a direct AES key:
 
 ```sh
@@ -62,6 +67,9 @@ Generate an AES key store using the upstream command shape:
 xmlsec1 keys --gen-key:content aes-256 keys.xml
 ```
 
+The key name is optional. `--gen-key aes-128` writes an unnamed key without a
+`KeyName` element, while `--gen-key:content aes-128` writes the supplied name.
+
 ## Compatibility boundary
 
 The command and status surface is available now, while individual key formats,
@@ -71,7 +79,10 @@ PKCS#1 RSA in PEM or DER; `--privkey-p8-pem` and `--privkey-p8-der` are accepted
 as upstream PKCS#8 aliases. Public verification accepts SubjectPublicKeyInfo,
 PKCS#1 RSA public keys, and X.509 certificates. Explicit certificate options
 pin verification to that certificate's public key instead of permitting an
-embedded `KeyInfo` to select another identity. Direct XMLEnc keys accept
+embedded `KeyInfo` to select another identity. When `--trusted-pem` or
+`--trusted-der` is also supplied, the explicit certificate must build a valid
+path through any `--untrusted-*` intermediates to a supplied anchor; `--insecure`
+is the explicit opt-out. Direct XMLEnc keys accept
 AES-128/256; RSA-OAEP supports both the XMLEnc 1.0 `rsa-oaep-mgf1p` and XMLEnc
 1.1 parameter contracts. Encrypted
 PKCS#8, PKCS#12, platform crypto stores, external DTDs, implicit network access,

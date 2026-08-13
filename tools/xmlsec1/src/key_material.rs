@@ -162,22 +162,6 @@ pub fn load_certificate(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialEr
     Ok(der)
 }
 
-pub fn load_certificate_verification_key(
-    path: impl AsRef<Path>,
-    algorithm: SignatureAlgorithm,
-) -> Result<VerificationKey, KeyMaterialError> {
-    let path = path.as_ref();
-    let certificate_der = load_certificate(path)?;
-    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(&certificate_der)
-        .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
-    Ok(VerificationKey {
-        algorithm,
-        public_key_bytes: certificate.public_key().raw.to_vec(),
-        certificate_der: Some(certificate_der),
-        name: None,
-    })
-}
-
 fn parse_pem(text: &str, expected_label: &str, path: &Path) -> Result<Vec<u8>, KeyMaterialError> {
     let (rest, pem) = x509_parser::pem::parse_x509_pem(text.as_bytes())
         .map_err(|_| KeyMaterialError::InvalidPem(path.to_owned()))?;
@@ -242,29 +226,17 @@ pub fn load_symmetric(
 
 #[cfg(test)]
 mod tests {
-    use rsa::{
-        pkcs1::{EncodeRsaPrivateKey as _, EncodeRsaPublicKey as _},
-        pkcs8::DecodePrivateKey as _,
-    };
+    use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
+    use rsa::pkcs1::{EncodeRsaPrivateKey as _, EncodeRsaPublicKey as _};
 
     use super::*;
-
-    fn fixture(path: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join(path)
-    }
 
     #[test]
     fn normalizes_pkcs1_private_and_public_keys() {
         // PKCS#1 is a donor-supported RSA container. The CLI normalizes it to
-        // the core's PKCS#8/SPKI contracts instead of duplicating crypto code.
-        let original = RsaPrivateKey::from_pkcs8_pem(
-            &fs::read_to_string(fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem")).unwrap(),
-        )
-        .unwrap();
+        // the core's PKCS#8/SPKI contracts. Generating the source key keeps this
+        // unit test runnable from the published crate without repository paths.
+        let original = RsaPrivateKey::new(&mut ChaCha20Rng::from_seed([7; 32]), 1024).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let private = temp.path().join("private.pem");
         let public = temp.path().join("public.der");
