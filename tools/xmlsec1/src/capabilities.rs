@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{ffi::OsString, io::Write};
 
 pub const TRANSFORMS: &[&str] = &[
     "base64",
@@ -26,6 +26,7 @@ pub const TRANSFORMS: &[&str] = &[
     "aes256-cbc",
     "aes128-gcm",
     "aes256-gcm",
+    "rsa-oaep-mgf1p",
     "rsa-oaep-enc11",
 ];
 
@@ -51,11 +52,15 @@ pub fn list(label: &str, values: &[&str], output: &mut dyn Write) -> std::io::Re
     writeln!(output)
 }
 
-pub fn contains_all(values: &[&str], requested: &[String]) -> bool {
+pub fn all_requested_available(values: &[&str], requested: &[OsString]) -> bool {
+    // libxmlsec1 treats an empty check as a vacuously successful query. Keep
+    // that process contract distinct from fail-closed handling of unknown names.
     requested
         .iter()
-        .flat_map(|value| value.split(','))
+        .map(|value| value.to_str())
+        .flat_map(|value| value.into_iter().flat_map(|value| value.split(',')))
         .all(|value| values.contains(&value))
+        && requested.iter().all(|value| value.to_str().is_some())
 }
 
 #[cfg(test)]
@@ -64,12 +69,25 @@ mod tests {
 
     #[test]
     fn checks_comma_separated_and_repeated_capabilities() {
-        assert!(contains_all(
+        assert!(all_requested_available(
             TRANSFORMS,
             &["c14n,rsa-sha256".into(), "sha256".into()]
         ));
-        assert!(!contains_all(TRANSFORMS, &["xslt".into()]));
-        assert!(contains_all(TRANSFORMS, &["rsa-oaep-enc11".into()]));
-        assert!(!contains_all(KEY_DATA, &["key-name".into()]));
+        assert!(!all_requested_available(TRANSFORMS, &["xslt".into()]));
+        assert!(all_requested_available(
+            TRANSFORMS,
+            &["rsa-oaep-enc11".into()]
+        ));
+        assert!(all_requested_available(
+            TRANSFORMS,
+            &["rsa-oaep-mgf1p".into()]
+        ));
+        assert!(!all_requested_available(KEY_DATA, &["key-name".into()]));
+    }
+
+    #[test]
+    fn empty_queries_match_the_donor_vacuous_success_contract() {
+        // No requested names means no missing capabilities in libxmlsec1.
+        assert!(all_requested_available(TRANSFORMS, &[]));
     }
 }

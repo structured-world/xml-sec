@@ -1,14 +1,7 @@
 use std::{path::Path, process::Command};
 
-fn root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .unwrap()
-}
-
 fn run_upstream(script: &str, selected_test: &str) {
-    let tests = root().join("donors/xmlsec/tests");
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/upstream");
     let output = Command::new(tests.join("testrun.sh"))
         .arg(tests.join(script))
         .arg("rustcrypto")

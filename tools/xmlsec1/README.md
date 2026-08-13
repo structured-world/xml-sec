@@ -16,4 +16,6 @@ coverage.
 
 `--aeskey` files are raw binary key material. Decryption accepts standalone
 `EncryptedData` and performs in-document replacement, optionally selected by
-`--node-id`.
+`--node-id`. Encryption retains template metadata and RSA-OAEP parameters;
+PKCS#1 RSA and PKCS#8/SPKI/X.509 PEM or DER key material is normalized into the
+same core signing, verification, and encryption pipelines.

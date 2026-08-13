@@ -22077,7 +22077,7 @@
       "source": "apps/xmlsec.c",
       "line": 652,
       "detail": "static xmlSecAppCmdLineParam nodeIdParam = { xmlSecAppCmdLineTopicDSigCommon | xmlSecAppCmdLineTopicEncCommon, \"--node-id\", NULL, \"--node-id <id>\" \"\\n\\tset the operation start point to the node with given <id>\", xmlSecAppCmdLineParamTypeString, xmlSecAppCmdLineParamFlagNone, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-options"
     },
     {
       "kind": "cli-option",

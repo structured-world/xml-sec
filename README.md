@@ -77,8 +77,11 @@ xmlsec1 list-transforms
 xmlsec1 list-key-data
 ```
 
-The native binary supports sign/verify, encrypt/decrypt, AES key generation,
-capability checks, libxmlsec1 option syntax, and deterministic process statuses.
+The native binary supports sign/verify, template-preserving encrypt/decrypt,
+AES key generation, capability checks, libxmlsec1 key aliases and option syntax,
+and deterministic process statuses. Its process tests run a minimal checked-in
+snapshot of the unmodified upstream DSig, Enc, and Keys runners without network
+access or a system `xmlsec1` installation.
 Unsupported algorithms, key formats, providers, and policy controls fail closed
 instead of being silently ignored. See the [CLI compatibility guide](docs/cli.md)
 for commands, examples, current format coverage, and upstream runner validation.

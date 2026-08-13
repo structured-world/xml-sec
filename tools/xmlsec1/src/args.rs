@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, ffi::OsString, fmt};
+use std::{
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+    fmt,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -51,14 +55,14 @@ impl Command {
 pub struct OptionValue {
     pub name: String,
     pub parameter: Option<String>,
-    pub value: Option<String>,
+    pub value: Option<OsString>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
     pub command: Command,
     pub options: BTreeMap<String, Vec<OptionValue>>,
-    pub positional: Vec<String>,
+    pub positional: Vec<OsString>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -91,47 +95,44 @@ impl Invocation {
             .map_err(|_| ParseError::NonUtf8)?;
         let command = Command::parse(&command_text)
             .ok_or_else(|| ParseError::UnknownCommand(command_text.clone()))?;
-        let remaining = args
-            .map(|arg| arg.into_string().map_err(|_| ParseError::NonUtf8))
-            .collect::<Result<Vec<_>, _>>()?;
+        let remaining = args.collect::<Vec<_>>();
         let mut options = BTreeMap::<String, Vec<OptionValue>>::new();
         let mut positional = Vec::new();
         let mut index = 0;
         let mut options_finished = false;
         while index < remaining.len() {
             let argument = &remaining[index];
-            if argument == "--" {
+            if argument == OsStr::new("--") {
                 options_finished = true;
                 index += 1;
                 continue;
             }
-            if options_finished || !argument.starts_with('-') {
+            let option_text = argument.to_str();
+            if options_finished || !option_text.is_some_and(|value| value.starts_with('-')) {
                 positional.push(argument.clone());
                 options_finished = true;
                 index += 1;
                 continue;
             }
-            let stripped = argument.trim_start_matches('-');
+            let argument_text = option_text.ok_or(ParseError::NonUtf8)?;
+            let stripped = argument_text.trim_start_matches('-');
             let (raw_name, parameter) = stripped
                 .split_once(':')
                 .map_or((stripped, None), |(name, parameter)| {
                     (name, Some(parameter.to_owned()))
                 });
             let name = canonical_option(raw_name)
-                .ok_or_else(|| ParseError::UnsupportedOption(argument.clone()))?;
-            let value = match option_arity(name) {
-                Arity::Flag => None,
-                Arity::Value => {
-                    index += 1;
-                    Some(
-                        remaining
-                            .get(index)
-                            .filter(|value| !value.starts_with('-'))
-                            .cloned()
-                            .ok_or_else(|| ParseError::MissingOptionValue(argument.clone()))?,
-                    )
-                }
-            };
+                .ok_or_else(|| ParseError::UnsupportedOption(argument_text.to_owned()))?;
+            let value =
+                match option_arity(name) {
+                    Arity::Flag => None,
+                    Arity::Value => {
+                        index += 1;
+                        Some(remaining.get(index).cloned().ok_or_else(|| {
+                            ParseError::MissingOptionValue(argument_text.to_owned())
+                        })?)
+                    }
+                };
             options
                 .entry(name.to_owned())
                 .or_default()
@@ -153,7 +154,7 @@ impl Invocation {
         self.options.contains_key(name)
     }
 
-    pub fn last_value(&self, name: &str) -> Option<&str> {
+    pub fn last_value(&self, name: &str) -> Option<&OsStr> {
         self.options
             .get(name)
             .and_then(|values| values.last())
@@ -176,11 +177,11 @@ fn canonical_option(name: &str) -> Option<&'static str> {
         "print-xml-debug" => "print-xml-debug",
         "repeat" => "repeat",
         "keys-file" => "keys-file",
-        "gen-key" => "gen-key",
+        "g" | "gen-key" => "gen-key",
         "privkey" | "privkey-pem" => "privkey-pem",
         "privkey-der" => "privkey-der",
-        "pkcs8-pem" => "pkcs8-pem",
-        "pkcs8-der" => "pkcs8-der",
+        "pkcs8-pem" | "privkey-p8-pem" => "pkcs8-pem",
+        "pkcs8-der" | "privkey-p8-der" => "pkcs8-der",
         "pubkey" | "pubkey-pem" => "pubkey-pem",
         "pubkey-der" => "pubkey-der",
         "pubkey-cert-pem" => "pubkey-cert-pem",
@@ -270,7 +271,7 @@ mod tests {
         ])
         .expect("valid donor-shaped arguments must parse");
         assert_eq!(parsed.command, Command::SignTemplate);
-        assert_eq!(parsed.last_value("output"), Some("signed.xml"));
+        assert_eq!(parsed.last_value("output"), Some(OsStr::new("signed.xml")));
         assert_eq!(parsed.values("trusted-pem").count(), 2);
         assert_eq!(
             parsed
@@ -281,7 +282,7 @@ mod tests {
                 .as_deref(),
             Some("signer")
         );
-        assert_eq!(parsed.positional, ["input.xml"]);
+        assert_eq!(parsed.positional, [OsString::from("input.xml")]);
     }
 
     #[test]
@@ -302,7 +303,10 @@ mod tests {
     fn rejects_options_after_input_like_the_donor_parser() {
         let parsed = parse(&["xmlsec1", "verify", "input.xml", "--verbose"])
             .expect("the donor treats trailing options as filenames");
-        assert_eq!(parsed.positional, ["input.xml", "--verbose"]);
+        assert_eq!(
+            parsed.positional,
+            [OsString::from("input.xml"), OsString::from("--verbose")]
+        );
         assert!(!parsed.flag("verbose"));
     }
 
@@ -316,5 +320,58 @@ mod tests {
             parse(&["xmlsec1", "verify", "--output"]),
             Err(ParseError::MissingOptionValue(_))
         ));
+    }
+
+    #[test]
+    fn consumes_dash_prefixed_option_values_verbatim() {
+        // Option arity, not the first byte of its value, determines parsing.
+        let parsed = parse(&["xmlsec1", "verify", "--pubkey-pem", "-key.pem", "input.xml"])
+            .expect("the donor consumes the argument after a valued option");
+        assert_eq!(
+            parsed.last_value("pubkey-pem"),
+            Some(OsStr::new("-key.pem"))
+        );
+    }
+
+    #[test]
+    fn recognizes_donor_key_generation_and_pkcs8_aliases() {
+        // These spellings are used by unmodified donor automation.
+        let generated = parse(&["xmlsec1", "keys", "-g:session", "aes-128"])
+            .expect("short key-generation alias must parse");
+        assert_eq!(generated.values("gen-key").count(), 1);
+
+        for alias in ["--privkey-p8-pem", "--privkey-p8-der"] {
+            let parsed = parse(&["xmlsec1", "sign", alias, "key.p8", "template.xml"])
+                .expect("PKCS#8 donor alias must parse");
+            assert_eq!(
+                parsed
+                    .values(if alias.ends_with("pem") {
+                        "pkcs8-pem"
+                    } else {
+                        "pkcs8-der"
+                    })
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_non_utf8_filesystem_arguments() {
+        // Unix paths are opaque bytes and must not pass through String.
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = OsString::from_vec(vec![b'i', b'n', 0xff]);
+        let parsed = Invocation::parse([
+            OsString::from("xmlsec1"),
+            OsString::from("verify"),
+            OsString::from("--pubkey-pem"),
+            path.clone(),
+            path.clone(),
+        ])
+        .expect("filesystem arguments are opaque bytes on Unix");
+        assert_eq!(parsed.last_value("pubkey-pem"), Some(path.as_os_str()));
+        assert_eq!(parsed.positional, [path]);
     }
 }

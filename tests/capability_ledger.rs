@@ -788,7 +788,30 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
             .unwrap_or_else(|| panic!("missing CLI command {command}"));
         assert_eq!(classification(&ledger, item).outcome, "behavior-compatible");
     }
-    for option in ["--output", "--aes-key", "--privkey-pem", "--pubkey-pem"] {
+    for option in [
+        "--aes-key",
+        "--binary-data",
+        "--crypto",
+        "--gen-key",
+        "--help",
+        "--ignore-manifests",
+        "--insecure",
+        "--node-id",
+        "--output",
+        "--pkcs8-der",
+        "--pkcs8-pem",
+        "--privkey-der",
+        "--privkey-pem",
+        "--pubkey-cert-der",
+        "--pubkey-cert-pem",
+        "--pubkey-der",
+        "--pubkey-pem",
+        "--trusted-der",
+        "--trusted-pem",
+        "--untrusted-der",
+        "--untrusted-pem",
+        "--xml-data",
+    ] {
         let item = ledger
             .items
             .iter()
@@ -796,13 +819,21 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
             .unwrap_or_else(|| panic!("missing CLI option {option}"));
         assert_eq!(classification(&ledger, item).outcome, "provider-limited");
     }
-    for status in ["success", "failure"] {
+    for (status, outcome, code) in [
+        ("success", "behavior-compatible", "0"),
+        ("failure", "behavior-compatible", "1"),
+        ("unknown-command", "planned", "0"),
+    ] {
         let item = ledger
             .items
             .iter()
             .find(|item| item.kind == "cli-exit-status" && item.name == status)
             .unwrap_or_else(|| panic!("missing CLI status {status}"));
-        assert_eq!(classification(&ledger, item).outcome, "behavior-compatible");
+        assert_eq!(classification(&ledger, item).outcome, outcome);
+        assert!(
+            item.detail.contains(code),
+            "{status} must record exit code {code}"
+        );
     }
 }
 
