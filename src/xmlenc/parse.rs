@@ -1,7 +1,7 @@
 //! Strict parsing for the subset of XMLEnc needed by the decryption API.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use roxmltree::{Document, Node};
+use roxmltree::{Document, Node, ParsingOptions};
 
 use super::types::{
     CipherData, EncryptedData, EncryptedDataType, EncryptedKey, EncryptionMethod,
@@ -15,19 +15,40 @@ struct ParsedKeyInfo {
 
 /// Parse one `xenc:EncryptedData` document fragment.
 pub fn parse_encrypted_data(xml: &str) -> Result<EncryptedData, XmlEncError> {
-    let document = Document::parse(xml)?;
-    parse_encrypted_data_node(document.root_element())
+    parse_encrypted_data_with_policy(xml, &crate::policy::DecryptionPolicy::default())
 }
 
-pub(super) fn parse_encrypted_data_node(node: Node<'_, '_>) -> Result<EncryptedData, XmlEncError> {
+pub(super) fn parse_encrypted_data_with_policy(
+    xml: &str,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<EncryptedData, XmlEncError> {
+    policy.resources.validate()?;
+    policy.resources.validate_xml_document_len(xml.len())?;
+    let document = Document::parse_with_options(
+        xml,
+        ParsingOptions {
+            allow_dtd: policy.xml.allow_internal_dtd,
+            nodes_limit: policy.resources.effective_xml_nodes(),
+            entity_resolver: None,
+        },
+    )?;
+    parse_encrypted_data_node_with_policy(document.root_element(), policy)
+}
+
+pub(super) fn parse_encrypted_data_node_with_policy(
+    node: Node<'_, '_>,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<EncryptedData, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedData")?;
     let mut children = element_children(node);
-    let encryption_method =
-        parse_encryption_method(next_required(&mut children, "EncryptionMethod")?)?;
+    let encryption_method = parse_encryption_method_with_limit(
+        next_required(&mut children, "EncryptionMethod")?,
+        policy.resources.max_encryption_metadata_bytes,
+    )?;
 
     let key_info = match children.peek() {
         Some(child) if child.has_tag_name((XMLDSIG_NS, "KeyInfo")) => {
-            parse_key_info(next_required(&mut children, "KeyInfo")?)?
+            parse_key_info(next_required(&mut children, "KeyInfo")?, policy)?
         }
         _ => ParsedKeyInfo {
             key_name: None,
@@ -43,17 +64,22 @@ pub(super) fn parse_encrypted_data_node(node: Node<'_, '_>) -> Result<EncryptedD
         ));
     }
 
-    Ok(EncryptedData {
-        id: node.attribute("Id").map(str::to_owned),
-        encrypted_type: parse_type(node.attribute("Type")),
+    let encrypted = EncryptedData {
+        id: bounded_attribute(node, "Id", "EncryptedData Id", policy)?,
+        encrypted_type: parse_type_bounded(node.attribute("Type"), policy)?,
         key_name: key_info.key_name,
         encryption_method,
         encrypted_keys: key_info.encrypted_keys,
         cipher_data,
-    })
+    };
+    validate_encrypted_data_metadata(&encrypted, policy)?;
+    Ok(encrypted)
 }
 
-fn parse_key_info(node: Node<'_, '_>) -> Result<ParsedKeyInfo, XmlEncError> {
+fn parse_key_info(
+    node: Node<'_, '_>,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<ParsedKeyInfo, XmlEncError> {
     require_element(node, XMLDSIG_NS, "KeyInfo")?;
     let mut key_name = None;
     let mut encrypted_keys = Vec::new();
@@ -65,9 +91,17 @@ fn parse_key_info(node: Node<'_, '_>) -> Result<ParsedKeyInfo, XmlEncError> {
                     "KeyInfo contains more than one direct KeyName".into(),
                 ));
             }
-            key_name = Some(parse_key_name(child)?);
+            key_name = Some(parse_key_name(child, policy)?);
         } else if child.has_tag_name((XMLENC_NS, "EncryptedKey")) {
-            encrypted_keys.push(parse_encrypted_key(child)?);
+            if encrypted_keys.len() == policy.resources.max_encryption_recipients {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "encryption recipients",
+                    maximum: policy.resources.max_encryption_recipients,
+                    actual: encrypted_keys.len() + 1,
+                }
+                .into());
+            }
+            encrypted_keys.push(parse_encrypted_key(child, policy)?);
         } else if child.has_tag_name((XMLENC_NS, "AgreementMethod")) {
             // Agreement methods require a separate key-derivation trust boundary.
             // Keep the URI as a fallback error while allowing another advertised
@@ -77,6 +111,11 @@ fn parse_key_info(node: Node<'_, '_>) -> Result<ParsedKeyInfo, XmlEncError> {
                 .ok_or(XmlEncError::MissingRequired(
                     "AgreementMethod Algorithm attribute",
                 ))?;
+            validate_metadata_len(
+                "AgreementMethod Algorithm",
+                algorithm.len(),
+                policy.resources.max_encryption_metadata_bytes,
+            )?;
             unsupported_agreement.get_or_insert_with(|| algorithm.to_owned());
         }
     }
@@ -92,16 +131,21 @@ fn parse_key_info(node: Node<'_, '_>) -> Result<ParsedKeyInfo, XmlEncError> {
     })
 }
 
-fn parse_encrypted_key(node: Node<'_, '_>) -> Result<EncryptedKey, XmlEncError> {
+fn parse_encrypted_key(
+    node: Node<'_, '_>,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<EncryptedKey, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedKey")?;
     let mut children = element_children(node);
-    let encryption_method =
-        parse_encryption_method(next_required(&mut children, "EncryptionMethod")?)?;
+    let encryption_method = parse_encryption_method_with_limit(
+        next_required(&mut children, "EncryptionMethod")?,
+        policy.resources.max_encryption_metadata_bytes,
+    )?;
     let key_name = if children
         .peek()
         .is_some_and(|child| child.has_tag_name((XMLDSIG_NS, "KeyInfo")))
     {
-        parse_key_name_hint(next_required(&mut children, "KeyInfo")?)?
+        parse_key_name_hint(next_required(&mut children, "KeyInfo")?, policy)?
     } else {
         None
     };
@@ -111,10 +155,10 @@ fn parse_encrypted_key(node: Node<'_, '_>) -> Result<EncryptedKey, XmlEncError> 
         .peek()
         .is_some_and(|child| child.has_tag_name((XMLENC_NS, "ReferenceList")))
     {
-        Some(parse_reference_list(next_required(
-            &mut children,
-            "ReferenceList",
-        )?)?)
+        Some(parse_reference_list(
+            next_required(&mut children, "ReferenceList")?,
+            policy,
+        )?)
     } else {
         None
     };
@@ -122,10 +166,10 @@ fn parse_encrypted_key(node: Node<'_, '_>) -> Result<EncryptedKey, XmlEncError> 
         .peek()
         .is_some_and(|child| child.has_tag_name((XMLENC_NS, "CarriedKeyName")))
     {
-        Some(parse_carried_key_name(next_required(
-            &mut children,
-            "CarriedKeyName",
-        )?)?)
+        Some(parse_carried_key_name(
+            next_required(&mut children, "CarriedKeyName")?,
+            policy,
+        )?)
     } else {
         None
     };
@@ -135,8 +179,8 @@ fn parse_encrypted_key(node: Node<'_, '_>) -> Result<EncryptedKey, XmlEncError> 
         ));
     }
     Ok(EncryptedKey {
-        id: node.attribute("Id").map(str::to_owned),
-        recipient: node.attribute("Recipient").map(str::to_owned),
+        id: bounded_attribute(node, "Id", "EncryptedKey Id", policy)?,
+        recipient: bounded_attribute(node, "Recipient", "EncryptedKey Recipient", policy)?,
         key_name,
         encryption_method,
         cipher_data,
@@ -145,9 +189,12 @@ fn parse_encrypted_key(node: Node<'_, '_>) -> Result<EncryptedKey, XmlEncError> 
     })
 }
 
-fn parse_carried_key_name(node: Node<'_, '_>) -> Result<String, XmlEncError> {
+fn parse_carried_key_name(
+    node: Node<'_, '_>,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<String, XmlEncError> {
     require_element(node, XMLENC_NS, "CarriedKeyName")?;
-    let value = simple_text(node, "CarriedKeyName")?;
+    let value = bounded_simple_text(node, "CarriedKeyName", policy)?;
     if value.is_empty() {
         return Err(XmlEncError::InvalidStructure(
             "CarriedKeyName is empty".into(),
@@ -156,7 +203,10 @@ fn parse_carried_key_name(node: Node<'_, '_>) -> Result<String, XmlEncError> {
     Ok(value)
 }
 
-fn parse_key_name_hint(node: Node<'_, '_>) -> Result<Option<String>, XmlEncError> {
+fn parse_key_name_hint(
+    node: Node<'_, '_>,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<Option<String>, XmlEncError> {
     require_element(node, XMLDSIG_NS, "KeyInfo")?;
     let mut key_names = node
         .children()
@@ -169,18 +219,24 @@ fn parse_key_name_hint(node: Node<'_, '_>) -> Result<Option<String>, XmlEncError
             "EncryptedKey KeyInfo contains more than one direct KeyName".into(),
         ));
     }
-    parse_key_name(key_name).map(Some)
+    parse_key_name(key_name, policy).map(Some)
 }
 
-fn parse_key_name(node: Node<'_, '_>) -> Result<String, XmlEncError> {
-    let value = simple_text(node, "KeyName")?;
+fn parse_key_name(
+    node: Node<'_, '_>,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<String, XmlEncError> {
+    let value = bounded_simple_text(node, "KeyName", policy)?;
     if value.is_empty() {
         return Err(XmlEncError::InvalidStructure("KeyName is empty".into()));
     }
     Ok(value)
 }
 
-fn parse_reference_list(node: Node<'_, '_>) -> Result<ReferenceList, XmlEncError> {
+fn parse_reference_list(
+    node: Node<'_, '_>,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<ReferenceList, XmlEncError> {
     require_element(node, XMLENC_NS, "ReferenceList")?;
     let mut data_references = Vec::new();
     let mut key_references = Vec::new();
@@ -188,8 +244,13 @@ fn parse_reference_list(node: Node<'_, '_>) -> Result<ReferenceList, XmlEncError
         let uri = child
             .attribute("URI")
             .filter(|uri| !uri.is_empty())
-            .ok_or(XmlEncError::MissingRequired("Reference URI attribute"))?
-            .to_owned();
+            .ok_or(XmlEncError::MissingRequired("Reference URI attribute"))?;
+        validate_metadata_len(
+            "Reference URI",
+            uri.len(),
+            policy.resources.max_encryption_metadata_bytes,
+        )?;
+        let uri = uri.to_owned();
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLENC_NS), "DataReference") => data_references.push(uri),
             (Some(XMLENC_NS), "KeyReference") => key_references.push(uri),
@@ -224,14 +285,27 @@ where
     }
 }
 
+#[cfg(test)]
 fn parse_encryption_method(node: Node<'_, '_>) -> Result<EncryptionMethod, XmlEncError> {
+    parse_encryption_method_with_limit(node, crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING)
+}
+
+fn parse_encryption_method_with_limit(
+    node: Node<'_, '_>,
+    metadata_limit: usize,
+) -> Result<EncryptionMethod, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptionMethod")?;
     let algorithm = node
         .attribute("Algorithm")
         .ok_or(XmlEncError::MissingRequired(
             "EncryptionMethod Algorithm attribute",
-        ))?
-        .to_owned();
+        ))?;
+    validate_metadata_len(
+        "EncryptionMethod Algorithm",
+        algorithm.len(),
+        metadata_limit,
+    )?;
+    let algorithm = algorithm.to_owned();
 
     let mut oaep_digest = None;
     let mut mgf_algorithm = None;
@@ -245,28 +319,26 @@ fn parse_encryption_method(node: Node<'_, '_>) -> Result<EncryptionMethod, XmlEn
                     && oaep_digest.is_none()
                     && mgf_algorithm.is_none() =>
             {
-                key_size_bits = Some(parse_key_size(child)?);
+                key_size_bits = Some(parse_key_size(child, metadata_limit)?);
             }
             (Some(XMLENC_NS), "OAEPparams") if oaep_params.is_none() => {
-                oaep_params = Some(decode_base64_text(&simple_text(child, "OAEPparams")?)?);
+                oaep_params = Some(decode_bounded_base64_text(child, metadata_limit)?);
             }
             (Some(XMLDSIG_NS), "DigestMethod") if oaep_digest.is_none() => {
-                oaep_digest = Some(
-                    child
-                        .attribute("Algorithm")
-                        .ok_or(XmlEncError::MissingRequired(
-                            "DigestMethod Algorithm attribute",
-                        ))?
-                        .to_owned(),
-                );
+                let digest = child
+                    .attribute("Algorithm")
+                    .ok_or(XmlEncError::MissingRequired(
+                        "DigestMethod Algorithm attribute",
+                    ))?;
+                validate_metadata_len("DigestMethod Algorithm", digest.len(), metadata_limit)?;
+                oaep_digest = Some(digest.to_owned());
             }
             (Some(XMLENC11_NS), "MGF") if mgf_algorithm.is_none() => {
-                mgf_algorithm = Some(
-                    child
-                        .attribute("Algorithm")
-                        .ok_or(XmlEncError::MissingRequired("MGF Algorithm attribute"))?
-                        .to_owned(),
-                );
+                let mgf = child
+                    .attribute("Algorithm")
+                    .ok_or(XmlEncError::MissingRequired("MGF Algorithm attribute"))?;
+                validate_metadata_len("MGF Algorithm", mgf.len(), metadata_limit)?;
+                mgf_algorithm = Some(mgf.to_owned());
             }
             _ => {
                 return Err(XmlEncError::InvalidStructure(format!(
@@ -277,40 +349,19 @@ fn parse_encryption_method(node: Node<'_, '_>) -> Result<EncryptionMethod, XmlEn
         }
     }
 
-    let is_legacy_oaep = algorithm == "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p";
-    let is_oaep11 = algorithm == "http://www.w3.org/2009/xmlenc11#rsa-oaep";
-    if (oaep_params.is_some() || oaep_digest.is_some() || mgf_algorithm.is_some())
-        && !is_legacy_oaep
-        && !is_oaep11
-    {
-        return Err(XmlEncError::InvalidStructure(
-            "OAEP parameters are only valid for RSA-OAEP EncryptionMethod".into(),
-        ));
-    }
-    if mgf_algorithm.is_some() && !is_oaep11 {
-        return Err(XmlEncError::InvalidStructure(
-            "MGF is only valid for XML Encryption 1.1 RSA-OAEP".into(),
-        ));
-    }
-    if let (Some(actual), Some(expected)) = (key_size_bits, fixed_aes_key_size(&algorithm))
-        && actual != expected
-    {
-        return Err(XmlEncError::InvalidStructure(format!(
-            "EncryptionMethod {algorithm} requires KeySize {expected}, got {actual}"
-        )));
-    }
-
-    Ok(EncryptionMethod {
+    let method = EncryptionMethod {
         algorithm,
         key_size_bits,
         oaep_digest,
         mgf_algorithm,
         oaep_params,
-    })
+    };
+    method.validate_structure()?;
+    Ok(method)
 }
 
-fn parse_key_size(node: Node<'_, '_>) -> Result<usize, XmlEncError> {
-    let value = simple_text(node, "KeySize")?;
+fn parse_key_size(node: Node<'_, '_>, metadata_limit: usize) -> Result<usize, XmlEncError> {
+    let value = bounded_simple_text_with_limit(node, "KeySize", metadata_limit)?;
     let value = value.trim();
     let bits = value
         .parse::<usize>()
@@ -321,18 +372,6 @@ fn parse_key_size(node: Node<'_, '_>) -> Result<usize, XmlEncError> {
         ));
     }
     Ok(bits)
-}
-
-fn fixed_aes_key_size(algorithm: &str) -> Option<usize> {
-    match algorithm {
-        "http://www.w3.org/2001/04/xmlenc#aes128-cbc"
-        | "http://www.w3.org/2009/xmlenc11#aes128-gcm"
-        | "http://www.w3.org/2001/04/xmlenc#kw-aes128" => Some(128),
-        "http://www.w3.org/2001/04/xmlenc#aes256-cbc"
-        | "http://www.w3.org/2009/xmlenc11#aes256-gcm"
-        | "http://www.w3.org/2001/04/xmlenc#kw-aes256" => Some(256),
-        _ => None,
-    }
 }
 
 fn parse_cipher_data(node: Node<'_, '_>) -> Result<CipherData, XmlEncError> {
@@ -363,20 +402,183 @@ fn simple_text(node: Node<'_, '_>, element_name: &str) -> Result<String, XmlEncE
         .collect())
 }
 
-fn parse_type(value: Option<&str>) -> Option<EncryptedDataType> {
-    match value {
-        None => None,
-        Some("http://www.w3.org/2001/04/xmlenc#Element") => Some(EncryptedDataType::Element),
-        Some("http://www.w3.org/2001/04/xmlenc#Content") => Some(EncryptedDataType::Content),
-        Some(other) => Some(EncryptedDataType::Other(other.to_owned())),
+fn bounded_simple_text(
+    node: Node<'_, '_>,
+    field: &'static str,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<String, XmlEncError> {
+    bounded_simple_text_with_limit(node, field, policy.resources.max_encryption_metadata_bytes)
+}
+
+fn bounded_simple_text_with_limit(
+    node: Node<'_, '_>,
+    field: &'static str,
+    maximum: usize,
+) -> Result<String, XmlEncError> {
+    if node.children().any(|child| child.is_element()) {
+        return Err(XmlEncError::InvalidStructure(format!(
+            "{field} must not contain element children"
+        )));
+    }
+    let mut value = String::new();
+    for text in node
+        .children()
+        .filter(Node::is_text)
+        .filter_map(|child| child.text())
+    {
+        let actual = value.len().saturating_add(text.len());
+        validate_metadata_len(field, actual, maximum)?;
+        value.push_str(text);
+    }
+    Ok(value)
+}
+
+fn bounded_attribute(
+    node: Node<'_, '_>,
+    attribute: &str,
+    field: &'static str,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<Option<String>, XmlEncError> {
+    let Some(value) = node.attribute(attribute) else {
+        return Ok(None);
+    };
+    validate_metadata_len(
+        field,
+        value.len(),
+        policy.resources.max_encryption_metadata_bytes,
+    )?;
+    Ok(Some(value.to_owned()))
+}
+
+fn validate_metadata_len(
+    field: &'static str,
+    actual: usize,
+    maximum: usize,
+) -> Result<(), XmlEncError> {
+    if actual <= maximum {
+        Ok(())
+    } else {
+        Err(XmlEncError::EncryptionMetadataTooLarge {
+            field,
+            maximum,
+            actual,
+        })
     }
 }
 
-fn decode_base64_text(value: &str) -> Result<Vec<u8>, XmlEncError> {
-    let normalized = normalize_base64_with_empty(value, true)?;
-    STANDARD
+pub(super) fn validate_encrypted_data_metadata(
+    encrypted: &EncryptedData,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<(), XmlEncError> {
+    let maximum = policy.resources.max_encryption_metadata_bytes;
+    let validate = |field, value: Option<&str>| {
+        validate_metadata_len(field, value.map_or(0, str::len), maximum)
+    };
+    validate("EncryptedData Id", encrypted.id.as_deref())?;
+    if let Some(encrypted_type) = encrypted.encrypted_type.as_ref() {
+        let value = match encrypted_type {
+            EncryptedDataType::Element => "http://www.w3.org/2001/04/xmlenc#Element",
+            EncryptedDataType::Content => "http://www.w3.org/2001/04/xmlenc#Content",
+            EncryptedDataType::Other(value) => value,
+        };
+        validate("EncryptedData Type", Some(value))?;
+    }
+    validate("direct KeyName", encrypted.key_name.as_deref())?;
+    validate_encryption_method_metadata(&encrypted.encryption_method, maximum)?;
+    for key in &encrypted.encrypted_keys {
+        validate("EncryptedKey Id", key.id.as_deref())?;
+        validate("EncryptedKey Recipient", key.recipient.as_deref())?;
+        validate("EncryptedKey KeyName", key.key_name.as_deref())?;
+        validate("CarriedKeyName", key.carried_key_name.as_deref())?;
+        validate_encryption_method_metadata(&key.encryption_method, maximum)?;
+        if let Some(references) = key.reference_list.as_ref() {
+            for uri in references
+                .data_references
+                .iter()
+                .chain(&references.key_references)
+            {
+                validate("Reference URI", Some(uri))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_encryption_method_metadata(
+    method: &EncryptionMethod,
+    maximum: usize,
+) -> Result<(), XmlEncError> {
+    validate_metadata_len(
+        "EncryptionMethod Algorithm",
+        method.algorithm.len(),
+        maximum,
+    )?;
+    if let Some(value) = method.oaep_digest.as_deref() {
+        validate_metadata_len("DigestMethod Algorithm", value.len(), maximum)?;
+    }
+    if let Some(value) = method.mgf_algorithm.as_deref() {
+        validate_metadata_len("MGF Algorithm", value.len(), maximum)?;
+    }
+    if let Some(value) = method.oaep_params.as_deref() {
+        validate_metadata_len("OAEPparams", value.len(), maximum)?;
+    }
+    Ok(())
+}
+
+fn parse_type_bounded(
+    value: Option<&str>,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<Option<EncryptedDataType>, XmlEncError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    validate_metadata_len(
+        "EncryptedData Type",
+        value.len(),
+        policy.resources.max_encryption_metadata_bytes,
+    )?;
+    Ok(Some(match value {
+        "http://www.w3.org/2001/04/xmlenc#Element" => EncryptedDataType::Element,
+        "http://www.w3.org/2001/04/xmlenc#Content" => EncryptedDataType::Content,
+        other => EncryptedDataType::Other(other.to_owned()),
+    }))
+}
+
+fn decode_bounded_base64_text(node: Node<'_, '_>, maximum: usize) -> Result<Vec<u8>, XmlEncError> {
+    if node.children().any(|child| child.is_element()) {
+        return Err(XmlEncError::InvalidStructure(
+            "OAEPparams must not contain element children".into(),
+        ));
+    }
+    let encoded_limit = maximum.div_ceil(3).saturating_mul(4);
+    let mut normalized = String::with_capacity(encoded_limit);
+    for character in node
+        .children()
+        .filter(Node::is_text)
+        .filter_map(|child| child.text())
+        .flat_map(str::chars)
+    {
+        if !character.is_ascii() {
+            return Err(XmlEncError::Base64(
+                "OAEPparams contains non-ASCII data".into(),
+            ));
+        }
+        if !character.is_ascii_whitespace() {
+            if normalized.len() == encoded_limit {
+                return Err(XmlEncError::EncryptionMetadataTooLarge {
+                    field: "OAEPparams",
+                    maximum,
+                    actual: maximum.saturating_add(1),
+                });
+            }
+            normalized.push(character);
+        }
+    }
+    let decoded = STANDARD
         .decode(normalized)
-        .map_err(|error| XmlEncError::Base64(error.to_string()))
+        .map_err(|error| XmlEncError::Base64(error.to_string()))?;
+    validate_metadata_len("OAEPparams", decoded.len(), maximum)?;
+    Ok(decoded)
 }
 
 /// Normalize XML base64 whitespace while applying a pre-allocation bound.
@@ -597,6 +799,26 @@ mod tests {
     }
 
     #[test]
+    fn bounds_oaep_parameters_before_base64_allocation() {
+        // OAEP labels are retained as decoded metadata. The parser must cap the
+        // normalized lexical form before either String or decoded Vec can grow.
+        let xml = format!(
+            "<xenc:EncryptionMethod xmlns:xenc=\"{XMLENC_NS}\" Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"><xenc:OAEPparams>{}</xenc:OAEPparams></xenc:EncryptionMethod>",
+            STANDARD.encode([0_u8; 65])
+        );
+        let document = Document::parse(&xml).expect("test method must be XML");
+
+        assert!(matches!(
+            parse_encryption_method_with_limit(document.root_element(), 64),
+            Err(XmlEncError::EncryptionMetadataTooLarge {
+                field: "OAEPparams",
+                maximum: 64,
+                actual: 65,
+            })
+        ));
+    }
+
+    #[test]
     fn validates_explicit_key_size_for_supported_aes_methods() {
         // KeySize is valid for every EncryptionMethod, but fixed-size AES URIs
         // must reject a declaration that disagrees with the algorithm.
@@ -634,6 +856,26 @@ mod tests {
                 Err(XmlEncError::InvalidStructure(_))
             ));
         }
+    }
+
+    #[test]
+    fn key_size_text_is_bounded_before_integer_parsing() {
+        // Leading zeroes keep the numeric value valid while making the lexical
+        // form arbitrarily large; enforce the metadata budget before parsing.
+        let key_size = format!("{}128", "0".repeat(65));
+        let xml = format!(
+            "<xenc:EncryptionMethod xmlns:xenc=\"{XMLENC_NS}\" Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"><xenc:KeySize>{key_size}</xenc:KeySize></xenc:EncryptionMethod>"
+        );
+        let document = Document::parse(&xml).expect("test method must be XML");
+
+        assert!(matches!(
+            parse_encryption_method_with_limit(document.root_element(), 64),
+            Err(XmlEncError::EncryptionMetadataTooLarge {
+                field: "KeySize",
+                maximum: 64,
+                actual: 68,
+            })
+        ));
     }
 
     #[test]
@@ -754,6 +996,36 @@ mod tests {
             normalize_base64(&oversized),
             Err(XmlEncError::Base64(_))
         ));
+    }
+
+    #[test]
+    fn policy_bounds_copied_encryption_metadata() {
+        // Every retained metadata field must be rejected before it can bypass
+        // the configured per-field ceiling through the XML parser entry point.
+        let policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_encryption_metadata_bytes: 64,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        let oversized = "x".repeat(65);
+        for xml in [
+            DATA.replace("<xenc:EncryptedData ", &format!("<xenc:EncryptedData Id=\"{oversized}\" ")),
+            DATA.replace(
+                "<xenc:CipherData>",
+                &format!("<ds:KeyInfo xmlns:ds=\"{XMLDSIG_NS}\"><ds:KeyName>{oversized}</ds:KeyName></ds:KeyInfo><xenc:CipherData>"),
+            ),
+        ] {
+            assert!(matches!(
+                parse_encrypted_data_with_policy(&xml, &policy),
+                Err(XmlEncError::EncryptionMetadataTooLarge {
+                    maximum: 64,
+                    actual: 65,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(xmldsig)* rename the curve-specific ECDSA `SignatureAlgorithm` variants to
+  `EcdsaSha256` and `EcdsaSha384`; add legacy `DsaSha1` and `HmacSha1` variants
+- *(xmldsig)* add `SignedInfo::hmac_output_length_bits` and make
+  `SignatureAlgorithm` and `SignedInfo` non-exhaustive
+- *(xmldsig)* enforce operation key-strength policy consistently for direct and
+  resolver-produced built-in verification keys
+- *(crypto)* use the hardened pure-Rust `sad-rsa` backend for RSA private operations
+
 ## [0.1.10](https://github.com/structured-world/xml-sec/compare/v0.1.9...v0.1.10) - 2026-08-04
 
 ### Added

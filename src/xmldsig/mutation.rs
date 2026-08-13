@@ -12,6 +12,23 @@ use quick_xml::{Reader, Writer};
 
 use super::parse::XMLDSIG_NS;
 
+pub(super) fn parse_with_options<'a>(
+    xml: &'a str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<roxmltree::Document<'a>, roxmltree::Error> {
+    let Some(policy) = policy else {
+        return roxmltree::Document::parse(xml);
+    };
+    roxmltree::Document::parse_with_options(
+        xml,
+        roxmltree::ParsingOptions {
+            allow_dtd: policy.xml.allow_internal_dtd,
+            nodes_limit: policy.resources.effective_xml_nodes(),
+            entity_resolver: None,
+        },
+    )
+}
+
 /// Errors produced by XMLDSig XML mutation helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum XmlMutationError {
@@ -51,8 +68,16 @@ pub fn append_signature_to_root(
     xml: &str,
     signature_template: &str,
 ) -> Result<String, XmlMutationError> {
+    append_signature_to_root_with_options(xml, signature_template, None)
+}
+
+pub(super) fn append_signature_to_root_with_options(
+    xml: &str,
+    signature_template: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError> {
     validate_signature_template(signature_template)?;
-    let source = roxmltree::Document::parse(xml)?;
+    let source = parse_with_options(xml, policy)?;
     if !source.root().children().any(|node| node.is_element()) {
         return Err(XmlMutationError::MissingRootElement);
     }
@@ -100,7 +125,7 @@ pub fn append_signature_to_root(
     }
 
     let output = String::from_utf8(writer.into_inner())?;
-    roxmltree::Document::parse(&output)?;
+    parse_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -122,12 +147,24 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    fill_signed_info_digest_values_with_options(xml, values, None)
+}
+
+pub(super) fn fill_signed_info_digest_values_with_options<I, S>(
+    xml: &str,
+    values: I,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let values: Vec<String> = values
         .into_iter()
         .map(|value| value.as_ref().to_owned())
         .collect();
-    let target_signature = last_signature_index(xml)?;
-    let expected = count_signed_info_digest_values(xml)?;
+    let target_signature = last_signature_index(xml, policy)?;
+    let expected = count_signed_info_digest_values(xml, policy)?;
     if expected != values.len() {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "DigestValue",
@@ -136,7 +173,7 @@ where
         });
     }
 
-    fill_dsig_values_matching(xml, "DigestValue", values, |stack, namespace| {
+    fill_dsig_values_matching(xml, "DigestValue", values, policy, |stack, namespace| {
         is_signed_info_reference_context(stack, namespace, target_signature)
     })
 }
@@ -152,8 +189,16 @@ where
 
 /// Fill the direct `<Signature>/<SignatureValue>` child for a signing template.
 pub fn fill_signature_value(xml: &str, value: &str) -> Result<String, XmlMutationError> {
-    let target_signature = last_signature_index(xml)?;
-    let expected = count_direct_signature_values(xml)?;
+    fill_signature_value_with_options(xml, value, None)
+}
+
+pub(super) fn fill_signature_value_with_options(
+    xml: &str,
+    value: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError> {
+    let target_signature = last_signature_index(xml, policy)?;
+    let expected = count_direct_signature_values(xml, policy)?;
     if expected != 1 {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "SignatureValue",
@@ -166,14 +211,23 @@ pub fn fill_signature_value(xml: &str, value: &str) -> Result<String, XmlMutatio
         xml,
         "SignatureValue",
         vec![value.to_owned()],
+        policy,
         |stack, namespace| is_direct_signature_context(stack, namespace, target_signature),
     )
 }
 
 /// Fill the direct `<Signature>/<KeyInfo>` child with XML child content.
 pub fn fill_key_info(xml: &str, key_info_content: &str) -> Result<String, XmlMutationError> {
-    let target_signature = last_signature_index(xml)?;
-    let expected = count_direct_key_infos(xml)?;
+    fill_key_info_with_options(xml, key_info_content, None)
+}
+
+pub(super) fn fill_key_info_with_options(
+    xml: &str,
+    key_info_content: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError> {
+    let target_signature = last_signature_index(xml, policy)?;
+    let expected = count_direct_key_infos(xml, policy)?;
     if expected != 1 {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "KeyInfo",
@@ -182,9 +236,13 @@ pub fn fill_key_info(xml: &str, key_info_content: &str) -> Result<String, XmlMut
         });
     }
 
-    fill_dsig_element_raw_matching(xml, "KeyInfo", key_info_content, |stack, namespace| {
-        is_direct_signature_context(stack, namespace, target_signature)
-    })
+    fill_dsig_element_raw_matching(
+        xml,
+        "KeyInfo",
+        key_info_content,
+        policy,
+        |stack, namespace| is_direct_signature_context(stack, namespace, target_signature),
+    )
 }
 
 fn fill_dsig_values<I, S>(
@@ -209,13 +267,14 @@ where
         });
     }
 
-    fill_dsig_values_matching(xml, local_name, values, |_, _| true)
+    fill_dsig_values_matching(xml, local_name, values, None, |_, _| true)
 }
 
 fn fill_dsig_values_matching(
     xml: &str,
     local_name: &'static str,
     values: Vec<String>,
+    policy: Option<&crate::policy::SigningPolicy>,
     mut should_replace: impl FnMut(&[(bool, Vec<u8>, Option<usize>)], &ResolveResult<'_>) -> bool,
 ) -> Result<String, XmlMutationError> {
     let mut reader = NsReader::from_str(xml);
@@ -318,7 +377,7 @@ fn fill_dsig_values_matching(
     }
 
     let output = String::from_utf8(writer.into_inner())?;
-    roxmltree::Document::parse(&output)?;
+    parse_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -326,6 +385,7 @@ fn fill_dsig_element_raw_matching(
     xml: &str,
     local_name: &'static str,
     content: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
     mut should_replace: impl FnMut(&[(bool, Vec<u8>, Option<usize>)], &ResolveResult<'_>) -> bool,
 ) -> Result<String, XmlMutationError> {
     let mut reader = NsReader::from_str(xml);
@@ -417,7 +477,7 @@ fn fill_dsig_element_raw_matching(
     }
 
     let output = String::from_utf8(writer.into_inner())?;
-    roxmltree::Document::parse(&output)?;
+    parse_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -443,8 +503,11 @@ fn count_dsig_elements(xml: &str, local_name: &str) -> Result<usize, XmlMutation
         .count())
 }
 
-fn count_signed_info_digest_values(xml: &str) -> Result<usize, XmlMutationError> {
-    let document = roxmltree::Document::parse(xml)?;
+fn count_signed_info_digest_values(
+    xml: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<usize, XmlMutationError> {
+    let document = parse_with_options(xml, policy)?;
     let Some(signature) = last_signature_node(&document) else {
         return Ok(0);
     };
@@ -454,8 +517,11 @@ fn count_signed_info_digest_values(xml: &str) -> Result<usize, XmlMutationError>
         .count())
 }
 
-fn count_direct_signature_values(xml: &str) -> Result<usize, XmlMutationError> {
-    let document = roxmltree::Document::parse(xml)?;
+fn count_direct_signature_values(
+    xml: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<usize, XmlMutationError> {
+    let document = parse_with_options(xml, policy)?;
     let Some(signature) = last_signature_node(&document) else {
         return Ok(0);
     };
@@ -470,8 +536,11 @@ fn count_direct_signature_values(xml: &str) -> Result<usize, XmlMutationError> {
         .count())
 }
 
-fn count_direct_key_infos(xml: &str) -> Result<usize, XmlMutationError> {
-    let document = roxmltree::Document::parse(xml)?;
+fn count_direct_key_infos(
+    xml: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<usize, XmlMutationError> {
+    let document = parse_with_options(xml, policy)?;
     let Some(signature) = last_signature_node(&document) else {
         return Ok(0);
     };
@@ -494,8 +563,11 @@ fn last_signature_node<'a>(
         .rfind(|node| is_dsig_node(*node, "Signature"))
 }
 
-fn last_signature_index(xml: &str) -> Result<usize, XmlMutationError> {
-    let document = roxmltree::Document::parse(xml)?;
+fn last_signature_index(
+    xml: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<usize, XmlMutationError> {
+    let document = parse_with_options(xml, policy)?;
     document
         .descendants()
         .filter(|node| is_dsig_node(*node, "Signature"))

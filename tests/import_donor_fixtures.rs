@@ -287,3 +287,69 @@ fn file_import_replaces_an_existing_directory() {
         "the previous directory contents must not survive"
     );
 }
+
+#[test]
+fn merlin_import_rejects_conflicting_hmac_fixture_names() {
+    // Upstream may eventually ship both historical and corrected names. The
+    // importer must not silently choose one donor artifact or replace the last
+    // known-good local snapshot in that case.
+    let root = TestDirectory::new();
+    let scripts = root.path().join("scripts");
+    let donor = root.path().join("donor/merlin-xmldsig-twenty-three");
+    let target = root
+        .path()
+        .join("tests/fixtures/xmldsig/merlin-xmldsig-twenty-three");
+    for directory in [&scripts, &donor, &target] {
+        std::fs::create_dir_all(directory).expect("test directory must be creatable");
+    }
+    std::fs::copy(
+        "scripts/import-donor-fixtures.sh",
+        scripts.join("import-donor-fixtures.sh"),
+    )
+    .expect("import script must be copied into the isolated repository");
+    for extension in ["tmpl", "xml"] {
+        std::fs::write(
+            donor.join(format!("signature-enveloping-hmac-sha1-40.{extension}")),
+            format!("historical-{extension}"),
+        )
+        .expect("historical donor fixture must be writable");
+        std::fs::write(
+            donor.join(format!("signature-enveloping-hmac-sha1-80.{extension}")),
+            format!("corrected-{extension}"),
+        )
+        .expect("corrected donor fixture must be writable");
+    }
+    std::fs::write(target.join("sentinel.xml"), "<sentinel/>")
+        .expect("existing snapshot must be writable");
+
+    let status = Command::new("bash")
+        .arg(scripts.join("import-donor-fixtures.sh"))
+        .arg("xmldsig/merlin-xmldsig-twenty-three")
+        .env("XMLSEC_DONOR_ROOT", root.path().join("donor"))
+        .status()
+        .expect("fixture import script must run");
+
+    assert!(
+        !status.success(),
+        "conflicting donor names must be rejected"
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("sentinel.xml"))
+            .expect("existing snapshot must remain readable"),
+        "<sentinel/>"
+    );
+    let mut remaining = std::fs::read_dir(&target)
+        .expect("existing snapshot directory must remain readable")
+        .map(|entry| {
+            entry
+                .expect("snapshot entry must remain readable")
+                .file_name()
+        })
+        .collect::<Vec<_>>();
+    remaining.sort();
+    assert_eq!(
+        remaining,
+        [std::ffi::OsString::from("sentinel.xml")],
+        "failed imports must not add partial donor artifacts"
+    );
+}

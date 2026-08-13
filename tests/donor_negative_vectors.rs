@@ -12,10 +12,12 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use roxmltree::Document;
 use x509_parser::prelude::{FromDer, X509Certificate};
+use xml_sec::policy::PolicyViolation;
 use xml_sec::xmldsig::{
-    DsigError, DsigStatus, FailureReason, KeyInfoSource, ParseError, SignatureAlgorithm,
-    SignatureVerificationError, VerificationKey, VerifyContext, X509ChainError, X509ChainOptions,
-    X509DataInfo, parse_key_info, verify_signature_with_pem_key, verify_x509_certificate_chain,
+    DefaultKeyResolver, DsigError, DsigStatus, FailureReason, KeyInfoSource, KeyResolverConfig,
+    ParseError, SignatureAlgorithm, SignatureVerificationError, VerificationKey, VerifyContext,
+    X509ChainError, X509ChainOptions, X509DataInfo, parse_key_info, verify_signature_with_pem_key,
+    verify_x509_certificate_chain,
 };
 
 const PHAOS_DIR: &str = "tests/fixtures/xmldsig/phaos-xmldsig-three";
@@ -73,7 +75,16 @@ fn phaos_bad_digest_reports_reference_mismatch_before_key_use() {
     // is advisory. The unrelated strong key is never used because digest
     // validation fails first, proving the exact fail-fast boundary.
     let xml = read_vector("signature-rsa-enveloped-bad-digest-val.xml");
-    let result = verify_signature_with_pem_key(&xml, STRONG_RSA_PUBLIC_KEY, false)
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(SignatureAlgorithm::RsaSha1);
+    let key = phaos_verification_key();
+    let result = VerifyContext::new()
+        .policy(policy)
+        .key(&key)
+        .verify(&xml)
         .expect("bad DigestValue must be a completed invalid verification");
 
     assert_eq!(
@@ -102,8 +113,8 @@ fn phaos_bad_signature_artifact_fails_on_its_unsupported_md5_reference() {
 
 #[test]
 fn phaos_valid_baseline_rejects_legacy_rsa_key_policy() {
-    // References in the historical positive vector are valid, but its
-    // 1024-bit RSA key is below the crate's 2048-bit verification minimum.
+    // References in the historical positive vector are valid, but RSA-SHA1 is
+    // rejected by the default verification policy before backend key handling.
     let xml = read_vector("signature-rsa-enveloped.xml");
     let key = phaos_verification_key();
     let error = VerifyContext::new()
@@ -113,8 +124,76 @@ fn phaos_valid_baseline_rejects_legacy_rsa_key_policy() {
 
     assert!(matches!(
         error,
-        DsigError::Crypto(SignatureVerificationError::InvalidKeyDer)
+        DsigError::Policy(PolicyViolation::Algorithm {
+            operation: "verification",
+            ..
+        })
     ));
+}
+
+#[test]
+fn pre_resolved_rsa_key_obeys_the_operation_strength_policy() {
+    // Direct keys and resolver-produced keys must enforce the same immutable
+    // operation policy; changing the key source must never weaken trust.
+    let xml = read_vector("signature-rsa-enveloped.xml");
+    let key = phaos_verification_key();
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(SignatureAlgorithm::RsaSha1);
+    policy.key_trust.rsa_keys.minimum_modulus_bits = 2048;
+
+    let error = VerifyContext::new()
+        .policy(policy)
+        .key(&key)
+        .verify(&xml)
+        .expect_err("the 1024-bit direct key must not bypass the 2048-bit policy");
+
+    assert!(matches!(
+        error,
+        DsigError::Crypto(SignatureVerificationError::KeyPolicy(
+            PolicyViolation::KeySize {
+                operation: "verification",
+                key_type: "RSA",
+                minimum_bits: 2048,
+                maximum_bits: 8192,
+                actual_bits: 1024,
+            }
+        ))
+    ));
+}
+
+#[test]
+fn fuzz_seed_reaches_valid_signature_verification() {
+    // The bounded CI fuzz run starts from a complete document so mutations can
+    // reach transforms, digesting, X.509 resolution, and signature verification.
+    let xml = std::fs::read_to_string("fuzz/corpus/xmldsig_verify/signature.xml")
+        .expect("fuzz seed must be readable");
+    let mut policy = xml_sec::policy::VerificationPolicy::default();
+    policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(SignatureAlgorithm::RsaSha1);
+    policy.key_trust.rsa_keys.minimum_modulus_bits = 1024;
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+        lookup_certs: vec![PHAOS_RSA_CERTIFICATE.to_vec()],
+        ..KeyResolverConfig::default()
+    });
+
+    let result = VerifyContext::new()
+        .policy(policy)
+        .key_resolver(&resolver)
+        .verify(&xml)
+        .expect("complete fuzz seed must traverse the verification pipeline");
+
+    assert_eq!(result.status, DsigStatus::Valid);
+    assert!(
+        result
+            .signed_info_references
+            .iter()
+            .all(|reference| reference.status == DsigStatus::Valid)
+    );
 }
 
 #[test]
@@ -128,10 +207,42 @@ fn phaos_certificate_chain_is_expired_at_a_modern_verification_time() {
         verification_time: UNIX_EPOCH + Duration::from_secs(1_767_225_600),
         max_chain_depth: 2,
         check_crls: false,
+        allowed_extended_key_usages: None,
+        rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
+        dsa_keys: xml_sec::policy::DsaKeyPolicy::default(),
     };
 
     assert_eq!(
         verify_x509_certificate_chain(&info, &options),
         Err(X509ChainError::CertificateNotValid(0))
     );
+}
+
+#[test]
+fn x509_path_enforces_configured_issuer_rsa_minimum() {
+    // Cryptographic providers authenticate signatures; deployment key strength
+    // belongs to the compiled path policy and must reject this historical CA.
+    let info = phaos_x509_data();
+    let trusted = vec![PHAOS_RSA_CA_CERTIFICATE.to_vec()];
+    let options = X509ChainOptions {
+        trusted_certs: &trusted,
+        verification_time: UNIX_EPOCH + Duration::from_secs(1_104_580_800),
+        max_chain_depth: 2,
+        check_crls: false,
+        allowed_extended_key_usages: None,
+        rsa_keys: xml_sec::policy::RsaKeyPolicy::default(),
+        dsa_keys: xml_sec::policy::DsaKeyPolicy::default(),
+    };
+
+    assert!(matches!(
+        verify_x509_certificate_chain(&info, &options),
+        Err(X509ChainError::KeyPolicy {
+            position: 1,
+            source: PolicyViolation::KeySize {
+                key_type: "RSA",
+                minimum_bits: 2048,
+                ..
+            }
+        })
+    ));
 }

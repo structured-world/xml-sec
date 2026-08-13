@@ -1,38 +1,22 @@
 //! XMLEnc content encryption, key wrapping, and XML generation.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
-use aes::{
-    Aes128, Aes256,
-    cipher::{BlockModeEncrypt, KeyIvInit, block_padding::NoPadding},
-};
-use aes_gcm::{
-    Aes128Gcm, Aes256Gcm, Nonce,
-    aead::{AeadInOut, KeyInit},
-};
-use aes_kw::{KwAes128, KwAes256};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use cbc::Encryptor;
-use getrandom::{SysRng, rand_core::TryRng};
 use quick_xml::{
     Writer,
     events::{BytesEnd, BytesStart, BytesText, Event},
 };
 use roxmltree::{Document, Node, ParsingOptions};
-use rsa::{Oaep, RsaPublicKey, traits::PaddingScheme};
-use sha1::Sha1;
-use sha2::{Sha256, Sha384, Sha512};
+use rsa::{RsaPublicKey, traits::PublicKeyParts as _};
 
-use crate::xml::is_xml_1_0_character;
+use crate::xml::{is_xml_1_0_character, is_xml_ncname};
 
-use super::types::{
-    MAX_ENCRYPTION_DOCUMENT_LEN, MAX_ENCRYPTION_METADATA_LEN, MAX_ENCRYPTION_PLAINTEXT_LEN,
-    MAX_ENCRYPTION_RECIPIENTS, XMLDSIG_NS, XMLENC_NS, XMLENC11_NS,
-};
+use super::types::{XMLDSIG_NS, XMLENC_NS, XMLENC11_NS};
 use super::{
     DataEncryptionAlgorithm, DocumentEncryptionOptions, EncryptedDataType, EncryptionRecipient,
-    EncryptionResult, KeyWrapAlgorithm, OaepDigestAlgorithm, ReplacementMode, RsaOaepParameters,
-    XmlEncError, has_single_element_with_boundary_trivia,
+    EncryptionResult, KeyWrapAlgorithm, ReplacementMode, RsaOaepParameters, XmlEncError,
+    has_single_element_with_boundary_trivia,
 };
 
 const XML_WHITESPACE: &[char] = &[' ', '\t', '\n', '\r'];
@@ -46,6 +30,13 @@ pub struct EncryptedDataBuilder {
     direct_key: Option<Vec<u8>>,
     direct_key_name: Option<String>,
     recipients: Vec<EncryptionRecipient>,
+    policy: crate::policy::EncryptionPolicy,
+    provider: Arc<dyn crate::provider::CryptoProvider>,
+}
+
+struct GeneratedEncryption {
+    result: EncryptionResult,
+    xml_nodes: usize,
 }
 
 impl fmt::Debug for EncryptedDataBuilder {
@@ -61,6 +52,8 @@ impl fmt::Debug for EncryptedDataBuilder {
             )
             .field("direct_key_name", &self.direct_key_name)
             .field("recipients", &self.recipients)
+            .field("policy", &self.policy)
+            .field("provider", &self.provider.name())
             .finish()
     }
 }
@@ -75,7 +68,21 @@ impl EncryptedDataBuilder {
             direct_key: None,
             direct_key_name: None,
             recipients: Vec::new(),
+            policy: crate::policy::EncryptionPolicy::default(),
+            provider: Arc::new(crate::provider::RustCryptoProvider),
         }
+    }
+
+    /// Replace the complete immutable encryption policy snapshot.
+    pub fn policy(mut self, policy: crate::policy::EncryptionPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Select the cryptographic provider for this operation context.
+    pub fn provider(mut self, provider: Arc<dyn crate::provider::CryptoProvider>) -> Self {
+        self.provider = provider;
+        self
     }
 
     /// Set whether XML encryption covers one element or its child content.
@@ -120,14 +127,18 @@ impl EncryptedDataBuilder {
 
     /// Encrypt one complete XML element or an XML content fragment.
     pub fn encrypt_xml(&self, xml: &str) -> Result<EncryptionResult, XmlEncError> {
-        validate_plaintext_len(xml.len())?;
-        validate_xml_plaintext(xml, &self.encrypted_type)?;
+        self.policy.validate()?;
+        self.validate_plaintext_len(xml.len())?;
+        validate_xml_plaintext(xml, &self.encrypted_type, &self.policy)?;
         self.encrypt_payload(xml.as_bytes(), Some(self.encrypted_type.clone()))
+            .map(|generated| generated.result)
     }
 
     /// Encrypt opaque bytes without an XML `Type` attribute.
     pub fn encrypt_binary(&self, data: &[u8]) -> Result<EncryptionResult, XmlEncError> {
+        self.policy.validate()?;
         self.encrypt_payload(data, None)
+            .map(|generated| generated.result)
     }
 
     /// Encrypt and replace the document root or one element selected by XML ID.
@@ -136,12 +147,12 @@ impl EncryptedDataBuilder {
         xml: &str,
         options: DocumentEncryptionOptions<'_>,
     ) -> Result<String, XmlEncError> {
-        validate_document_len(xml.len())?;
-        let parsing_options = ParsingOptions {
-            allow_dtd: options.allow_dtd,
-            entity_resolver: None,
-            ..ParsingOptions::default()
-        };
+        self.policy.validate()?;
+        self.validate_document_len(xml.len())?;
+        let parsing_options = encryption_parsing_options(
+            &self.policy,
+            self.policy.xml.allow_internal_dtd && options.allow_dtd,
+        );
         let document = Document::parse_with_options(xml, parsing_options)?;
         let selected = select_encryption_target(&document, options.element_id)?;
         let range = selected.range();
@@ -149,15 +160,59 @@ impl EncryptedDataBuilder {
 
         match self.encrypted_type {
             EncryptedDataType::Element => {
-                let result =
+                let generated =
                     self.encrypt_payload(source.as_bytes(), Some(EncryptedDataType::Element))?;
+                let result = generated.result;
+                validate_replacement_document_len(
+                    xml.len(),
+                    range.len(),
+                    result.encrypted_data_xml.len(),
+                    self.policy.resources.max_xml_document_bytes,
+                )?;
+                validate_replacement_document_nodes(
+                    &document,
+                    selected,
+                    generated.xml_nodes,
+                    ReplacementMode::ReplaceElement,
+                    self.policy.resources.effective_xml_nodes() as usize,
+                )?;
                 Ok(replace_range(xml, range, &result.encrypted_data_xml))
             }
             EncryptedDataType::Content => {
                 let boundaries = element_content_boundaries(source)?;
                 let plaintext = &source[boundaries.content.clone()];
-                let result =
+                let generated =
                     self.encrypt_payload(plaintext.as_bytes(), Some(EncryptedDataType::Content))?;
+                let result = generated.result;
+                let (removed, inserted) = if boundaries.self_closing {
+                    let slash = source[..boundaries.start_tag_end]
+                        .rfind('/')
+                        .ok_or_else(|| {
+                            XmlEncError::InvalidStructure("self-closing tag has no slash".into())
+                        })?;
+                    (
+                        range.len(),
+                        slash
+                            .saturating_add(result.encrypted_data_xml.len())
+                            .saturating_add(boundaries.qualified_name.len())
+                            .saturating_add(4),
+                    )
+                } else {
+                    (boundaries.content.len(), result.encrypted_data_xml.len())
+                };
+                validate_replacement_document_len(
+                    xml.len(),
+                    removed,
+                    inserted,
+                    self.policy.resources.max_xml_document_bytes,
+                )?;
+                validate_replacement_document_nodes(
+                    &document,
+                    selected,
+                    generated.xml_nodes,
+                    ReplacementMode::ReplaceContent,
+                    self.policy.resources.effective_xml_nodes() as usize,
+                )?;
                 replace_element_content(xml, range, source, boundaries, &result.encrypted_data_xml)
             }
             EncryptedDataType::Other(_) => Err(XmlEncError::InvalidEncryptionConfig(
@@ -170,21 +225,26 @@ impl EncryptedDataBuilder {
         &self,
         plaintext: &[u8],
         encrypted_type: Option<EncryptedDataType>,
-    ) -> Result<EncryptionResult, XmlEncError> {
-        validate_plaintext_len(plaintext.len())?;
+    ) -> Result<GeneratedEncryption, XmlEncError> {
+        self.validate_plaintext_len(plaintext.len())?;
         self.validate_configuration()?;
 
         let content_key = if let Some(key) = &self.direct_key {
             validate_content_key(self.algorithm, key)?;
             key.clone()
         } else {
-            random_bytes(self.algorithm.key_len())?
+            random_bytes(self.provider.as_ref(), self.algorithm.key_len())?
         };
-        let ciphertext = encrypt_content(self.algorithm, &content_key, plaintext)?;
+        let ciphertext = encrypt_content(
+            self.provider.as_ref(),
+            self.algorithm,
+            &content_key,
+            plaintext,
+        )?;
         let encrypted_keys = self
             .recipients
             .iter()
-            .map(|recipient| wrap_content_key(recipient, &content_key))
+            .map(|recipient| wrap_content_key(self.provider.as_ref(), recipient, &content_key))
             .collect::<Result<Vec<_>, _>>()?;
         let encrypted_data_xml = render_encrypted_data(
             self.algorithm,
@@ -194,51 +254,126 @@ impl EncryptedDataBuilder {
             &encrypted_keys,
             &ciphertext,
         )?;
+        self.validate_document_len(encrypted_data_xml.len())?;
+        let xml_nodes = validate_generated_encrypted_data_nodes(
+            &encrypted_data_xml,
+            self.policy.resources.effective_xml_nodes() as usize,
+        )?;
         let replacement = match encrypted_type {
             Some(EncryptedDataType::Content) => ReplacementMode::ReplaceContent,
             Some(EncryptedDataType::Element | EncryptedDataType::Other(_)) | None => {
                 ReplacementMode::ReplaceElement
             }
         };
-        Ok(EncryptionResult {
-            encrypted_data_xml,
-            replacement,
+        Ok(GeneratedEncryption {
+            result: EncryptionResult {
+                encrypted_data_xml,
+                replacement,
+            },
+            xml_nodes,
         })
     }
 
     fn validate_configuration(&self) -> Result<(), XmlEncError> {
+        self.policy.validate()?;
+        if self
+            .policy
+            .data_algorithms
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&self.algorithm))
+        {
+            return Err(crate::policy::PolicyViolation::Algorithm {
+                operation: "encryption",
+                algorithm: self.algorithm.to_string(),
+            }
+            .into());
+        }
         if matches!(self.encrypted_type, EncryptedDataType::Other(_)) {
             return Err(XmlEncError::InvalidEncryptionConfig(
                 "Other Type hints are not valid for XML encryption".into(),
             ));
         }
-        if self.recipients.len() > MAX_ENCRYPTION_RECIPIENTS {
+        if self.recipients.len() > self.policy.resources.max_encryption_recipients {
             return Err(XmlEncError::TooManyRecipients {
-                maximum: MAX_ENCRYPTION_RECIPIENTS,
+                maximum: self.policy.resources.max_encryption_recipients,
                 actual: self.recipients.len(),
             });
         }
-        validate_metadata("EncryptedData Id", self.id.as_deref())?;
-        validate_key_name("direct KeyName", self.direct_key_name.as_deref())?;
+        self.validate_metadata("EncryptedData Id", self.id.as_deref())?;
+        if self.id.as_deref().is_some_and(|id| !is_xml_ncname(id)) {
+            return Err(XmlEncError::InvalidEncryptionConfig(
+                "EncryptedData Id must be an XML NCName".into(),
+            ));
+        }
+        self.validate_key_name("direct KeyName", self.direct_key_name.as_deref())?;
         for recipient in &self.recipients {
             match recipient {
                 EncryptionRecipient::RsaOaep {
+                    public_key,
                     parameters,
                     recipient,
                     key_name,
-                    ..
                 } => {
-                    validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
-                    validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
-                    validate_metadata_len("OAEPparams", parameters.label.len())?;
+                    self.policy.rsa_keys.validate_components(
+                        "encryption",
+                        &public_key.n().to_be_bytes_trimmed_vartime(),
+                        &public_key.e().to_be_bytes_trimmed_vartime(),
+                    )?;
+                    if parameters.algorithm == super::KeyTransportAlgorithm::RsaOaepMgf1p
+                        && parameters.mgf_digest != super::OaepDigestAlgorithm::Sha1
+                    {
+                        return Err(XmlEncError::InvalidEncryptionConfig(
+                            "legacy RSA-OAEP fixes MGF1 to SHA-1".into(),
+                        ));
+                    }
+                    if self
+                        .policy
+                        .key_transport_algorithms
+                        .as_ref()
+                        .is_some_and(|allowed| !allowed.contains(&parameters.algorithm))
+                        || self.policy.oaep_digests.as_ref().is_some_and(|allowed| {
+                            !allowed.contains(&parameters.digest)
+                                || !allowed.contains(&parameters.mgf_digest)
+                        })
+                    {
+                        return Err(crate::policy::PolicyViolation::Algorithm {
+                            operation: "encryption",
+                            algorithm: parameters.algorithm.uri().to_string(),
+                        }
+                        .into());
+                    }
+                    self.validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
+                    self.validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
+                    self.validate_metadata_len("OAEPparams", parameters.label.len())?;
                 }
                 EncryptionRecipient::AesKeyWrap {
+                    kek,
+                    algorithm,
                     recipient,
                     key_name,
-                    ..
                 } => {
-                    validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
-                    validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
+                    if self
+                        .policy
+                        .key_wrap_algorithms
+                        .as_ref()
+                        .is_some_and(|allowed| !allowed.contains(algorithm))
+                    {
+                        return Err(crate::policy::PolicyViolation::Algorithm {
+                            operation: "encryption",
+                            algorithm: algorithm.uri().to_string(),
+                        }
+                        .into());
+                    }
+                    if kek.len() != algorithm.key_len() {
+                        return Err(XmlEncError::InvalidEncryptionConfig(format!(
+                            "{} requires a {}-byte key-encryption key, got {} bytes",
+                            algorithm.uri(),
+                            algorithm.key_len(),
+                            kek.len()
+                        )));
+                    }
+                    self.validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
+                    self.validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
                 }
             }
         }
@@ -257,33 +392,85 @@ impl EncryptedDataBuilder {
             _ => Ok(()),
         }
     }
+
+    fn validate_metadata(
+        &self,
+        field: &'static str,
+        value: Option<&str>,
+    ) -> Result<(), XmlEncError> {
+        validate_metadata(
+            field,
+            value,
+            self.policy.resources.max_encryption_metadata_bytes,
+        )
+    }
+
+    fn validate_key_name(
+        &self,
+        field: &'static str,
+        value: Option<&str>,
+    ) -> Result<(), XmlEncError> {
+        validate_key_name(
+            field,
+            value,
+            self.policy.resources.max_encryption_metadata_bytes,
+        )
+    }
+
+    fn validate_metadata_len(&self, field: &'static str, actual: usize) -> Result<(), XmlEncError> {
+        validate_metadata_len(
+            field,
+            actual,
+            self.policy.resources.max_encryption_metadata_bytes,
+        )
+    }
+
+    fn validate_plaintext_len(&self, actual: usize) -> Result<(), XmlEncError> {
+        validate_plaintext_len(actual, self.policy.resources.max_encryption_plaintext_bytes)
+    }
+
+    fn validate_document_len(&self, actual: usize) -> Result<(), XmlEncError> {
+        validate_document_len(actual, self.policy.resources.max_xml_document_bytes)
+    }
 }
 
-fn validate_metadata(field: &'static str, value: Option<&str>) -> Result<(), XmlEncError> {
+fn validate_metadata(
+    field: &'static str,
+    value: Option<&str>,
+    maximum: usize,
+) -> Result<(), XmlEncError> {
     if value.is_some_and(|value| !value.chars().all(is_xml_1_0_character)) {
         return Err(XmlEncError::InvalidEncryptionConfig(format!(
             "{field} contains a character forbidden by XML 1.0"
         )));
     }
-    validate_metadata_len(field, value.map_or(0, str::len))
+    validate_metadata_len(field, value.map_or(0, str::len), maximum)
 }
 
-fn validate_key_name(field: &'static str, value: Option<&str>) -> Result<(), XmlEncError> {
+fn validate_key_name(
+    field: &'static str,
+    value: Option<&str>,
+    maximum: usize,
+) -> Result<(), XmlEncError> {
     if value.is_some_and(str::is_empty) {
         return Err(XmlEncError::InvalidEncryptionConfig(format!(
             "{field} must not be empty"
         )));
     }
-    validate_metadata(field, value)
+    validate_metadata(field, value, maximum)
 }
 
-fn validate_metadata_len(field: &'static str, actual: usize) -> Result<(), XmlEncError> {
-    if actual <= MAX_ENCRYPTION_METADATA_LEN {
+fn validate_metadata_len(
+    field: &'static str,
+    actual: usize,
+    maximum: usize,
+) -> Result<(), XmlEncError> {
+    if actual <= maximum {
         Ok(())
     } else {
         Err(XmlEncError::EncryptionMetadataTooLarge {
             field,
-            maximum: MAX_ENCRYPTION_METADATA_LEN,
+            maximum,
             actual,
         })
     }
@@ -306,25 +493,84 @@ struct ContentBoundaries {
     start_tag_end: usize,
 }
 
-fn validate_plaintext_len(actual: usize) -> Result<(), XmlEncError> {
-    if actual <= MAX_ENCRYPTION_PLAINTEXT_LEN {
+fn validate_plaintext_len(actual: usize, maximum: usize) -> Result<(), XmlEncError> {
+    if actual <= maximum {
         Ok(())
     } else {
-        Err(XmlEncError::PlaintextTooLarge {
-            maximum: MAX_ENCRYPTION_PLAINTEXT_LEN,
-            actual,
-        })
+        Err(XmlEncError::PlaintextTooLarge { maximum, actual })
     }
 }
 
-fn validate_document_len(actual: usize) -> Result<(), XmlEncError> {
-    if actual > MAX_ENCRYPTION_DOCUMENT_LEN {
-        return Err(XmlEncError::DocumentTooLarge {
-            maximum: MAX_ENCRYPTION_DOCUMENT_LEN,
-            actual,
-        });
+fn validate_document_len(actual: usize, maximum: usize) -> Result<(), XmlEncError> {
+    if actual > maximum {
+        return Err(XmlEncError::DocumentTooLarge { maximum, actual });
     }
     Ok(())
+}
+
+fn validate_replacement_document_len(
+    document_len: usize,
+    removed_len: usize,
+    inserted_len: usize,
+    maximum: usize,
+) -> Result<(), XmlEncError> {
+    let actual = document_len
+        .saturating_sub(removed_len)
+        .saturating_add(inserted_len);
+    validate_document_len(actual, maximum)
+}
+
+fn validate_replacement_document_nodes(
+    document: &Document<'_>,
+    selected: Node<'_, '_>,
+    inserted_nodes: usize,
+    replacement: ReplacementMode,
+    maximum: usize,
+) -> Result<(), XmlEncError> {
+    let selected_nodes = selected.descendants().count();
+    let removed_nodes = match replacement {
+        ReplacementMode::ReplaceElement => selected_nodes,
+        ReplacementMode::ReplaceContent => selected_nodes.saturating_sub(1),
+    };
+    let actual = document
+        .root()
+        .descendants()
+        .count()
+        .saturating_sub(removed_nodes)
+        .saturating_add(inserted_nodes);
+    if actual > maximum {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "encrypted document XML nodes",
+            maximum,
+            actual,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_generated_encrypted_data_nodes(
+    encrypted_data_xml: &str,
+    maximum: usize,
+) -> Result<usize, XmlEncError> {
+    let generated = Document::parse_with_options(
+        encrypted_data_xml,
+        ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
+            entity_resolver: None,
+        },
+    )?;
+    let actual = generated.root_element().descendants().count();
+    if actual > maximum {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "generated EncryptedData XML nodes",
+            maximum,
+            actual,
+        }
+        .into());
+    }
+    Ok(actual)
 }
 
 fn validate_content_key(algorithm: DataEncryptionAlgorithm, key: &[u8]) -> Result<(), XmlEncError> {
@@ -339,88 +585,42 @@ fn validate_content_key(algorithm: DataEncryptionAlgorithm, key: &[u8]) -> Resul
     }
 }
 
-fn random_bytes(len: usize) -> Result<Vec<u8>, XmlEncError> {
+fn random_bytes(
+    provider: &dyn crate::provider::CryptoProvider,
+    len: usize,
+) -> Result<Vec<u8>, XmlEncError> {
     let mut bytes = vec![0_u8; len];
-    SysRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|error| XmlEncError::Rng(error.to_string()))?;
+    provider.fill_random(&mut bytes)?;
     Ok(bytes)
 }
 
 fn encrypt_content(
+    provider: &dyn crate::provider::CryptoProvider,
     algorithm: DataEncryptionAlgorithm,
     key: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, XmlEncError> {
-    validate_content_key(algorithm, key)?;
-    match algorithm {
-        DataEncryptionAlgorithm::Aes128Cbc => encrypt_cbc::<Aes128>(key, plaintext),
-        DataEncryptionAlgorithm::Aes256Cbc => encrypt_cbc::<Aes256>(key, plaintext),
-        DataEncryptionAlgorithm::Aes128Gcm => encrypt_gcm::<Aes128Gcm>(key, plaintext),
-        DataEncryptionAlgorithm::Aes256Gcm => encrypt_gcm::<Aes256Gcm>(key, plaintext),
+    let ciphertext = provider.encrypt_data(algorithm, key, plaintext)?;
+    super::types::validate_ciphertext_framing(algorithm, ciphertext.len())?;
+    let expected = algorithm
+        .ciphertext_len_for_plaintext(plaintext.len())
+        .ok_or(XmlEncError::PlaintextTooLarge {
+            maximum: crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING,
+            actual: plaintext.len(),
+        })?;
+    if ciphertext.len() != expected {
+        return Err(crate::provider::ProviderError::InvalidOutputSize {
+            operation: crate::provider::ProviderOperation::Encrypt,
+            expected,
+            actual: ciphertext.len(),
+        }
+        .into());
     }
-}
-
-fn encrypt_cbc<C>(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, XmlEncError>
-where
-    C: aes::cipher::BlockCipherEncrypt + aes::cipher::KeyInit,
-{
-    const BLOCK: usize = 16;
-    let iv = random_bytes(BLOCK)?;
-    let pad_len = BLOCK - (plaintext.len() % BLOCK);
-    let mut padded = Vec::with_capacity(plaintext.len() + pad_len);
-    padded.extend_from_slice(plaintext);
-    if pad_len > 1 {
-        padded.extend_from_slice(&random_bytes(pad_len - 1)?);
-    }
-    padded.push(pad_len as u8);
-    let padded_len = padded.len();
-    Encryptor::<C>::new_from_slices(key, &iv)
-        .map_err(|_| XmlEncError::InvalidKeySize {
-            algorithm: if key.len() == 16 {
-                DataEncryptionAlgorithm::Aes128Cbc
-            } else {
-                DataEncryptionAlgorithm::Aes256Cbc
-            },
-            expected: key.len(),
-            actual: key.len(),
-        })?
-        .encrypt_padded::<NoPadding>(&mut padded, padded_len)
-        .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))?;
-    let mut output = Vec::with_capacity(BLOCK + padded.len());
-    output.extend_from_slice(&iv);
-    output.extend_from_slice(&padded);
-    Ok(output)
-}
-
-fn encrypt_gcm<C>(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, XmlEncError>
-where
-    C: AeadInOut + KeyInit,
-{
-    const NONCE_LEN: usize = 12;
-    let nonce = random_bytes(NONCE_LEN)?;
-    let cipher = C::new_from_slice(key).map_err(|_| XmlEncError::InvalidKeySize {
-        algorithm: if key.len() == 16 {
-            DataEncryptionAlgorithm::Aes128Gcm
-        } else {
-            DataEncryptionAlgorithm::Aes256Gcm
-        },
-        expected: key.len(),
-        actual: key.len(),
-    })?;
-    let mut encrypted = plaintext.to_vec();
-    let nonce_value = Nonce::try_from(nonce.as_slice())
-        .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))?;
-    cipher
-        .encrypt_in_place(&nonce_value, b"", &mut encrypted)
-        .map_err(|_| XmlEncError::AeadAuthenticationFailed)?;
-    let mut output = Vec::with_capacity(NONCE_LEN + encrypted.len());
-    output.extend_from_slice(&nonce);
-    output.extend_from_slice(&encrypted);
-    Ok(output)
+    Ok(ciphertext)
 }
 
 fn wrap_content_key(
+    provider: &dyn crate::provider::CryptoProvider,
     recipient: &EncryptionRecipient,
     content_key: &[u8],
 ) -> Result<WrappedKey, XmlEncError> {
@@ -435,7 +635,7 @@ fn wrap_content_key(
             oaep: Some(parameters.clone()),
             recipient: recipient.clone(),
             key_name: key_name.clone(),
-            ciphertext: wrap_rsa_oaep(public_key, parameters, content_key)?,
+            ciphertext: wrap_rsa_oaep(provider, public_key, parameters, content_key)?,
         }),
         EncryptionRecipient::AesKeyWrap {
             kek,
@@ -443,121 +643,48 @@ fn wrap_content_key(
             recipient,
             key_name,
         } => {
-            if kek.len() != algorithm.key_len() {
-                return Err(XmlEncError::InvalidKekSize {
-                    algorithm: *algorithm,
-                    expected: algorithm.key_len(),
-                    actual: kek.len(),
+            let wrapped = provider.wrap_key(*algorithm, kek, content_key)?;
+            let expected = content_key.len() + 8;
+            if wrapped.len() != expected {
+                return Err(XmlEncError::InvalidWrappedKeyLength {
+                    expected,
+                    actual: wrapped.len(),
                 });
             }
-            let mut output = vec![0_u8; content_key.len() + 8];
-            let wrapped = match algorithm {
-                KeyWrapAlgorithm::AesKw128 => KwAes128::new_from_slice(kek)
-                    .map_err(|_| invalid_kek_size(*algorithm, kek.len()))?
-                    .wrap_key(content_key, &mut output),
-                KeyWrapAlgorithm::AesKw256 => KwAes256::new_from_slice(kek)
-                    .map_err(|_| invalid_kek_size(*algorithm, kek.len()))?
-                    .wrap_key(content_key, &mut output),
-            }
-            .map_err(|_| XmlEncError::KeyWrapIntegrity)?;
             Ok(WrappedKey {
                 algorithm_uri: algorithm.uri(),
                 oaep: None,
                 recipient: recipient.clone(),
                 key_name: key_name.clone(),
-                ciphertext: wrapped.to_vec(),
+                ciphertext: wrapped,
             })
         }
     }
 }
 
 fn wrap_rsa_oaep(
+    provider: &dyn crate::provider::CryptoProvider,
     public_key: &RsaPublicKey,
     parameters: &RsaOaepParameters,
     content_key: &[u8],
 ) -> Result<Vec<u8>, XmlEncError> {
-    if parameters.algorithm == super::KeyTransportAlgorithm::RsaOaepMgf1p
-        && parameters.mgf_digest != OaepDigestAlgorithm::Sha1
-    {
-        return Err(XmlEncError::InvalidEncryptionConfig(
-            "legacy rsa-oaep-mgf1p requires MGF1-SHA1".into(),
-        ));
+    let ciphertext = provider
+        .transport_key(public_key, parameters, content_key)
+        .map_err(|error| match error {
+            crate::provider::ProviderError::Random(message) => XmlEncError::Rng(message),
+            crate::provider::ProviderError::InvalidInput(reason) => {
+                XmlEncError::InvalidEncryptionConfig(reason.to_string())
+            }
+            error => XmlEncError::RsaEncrypt(error.to_string()),
+        })?;
+    let expected = public_key.size();
+    if ciphertext.len() != expected {
+        return Err(XmlEncError::InvalidWrappedKeyLength {
+            expected,
+            actual: ciphertext.len(),
+        });
     }
-    let mut rng = SysRng;
-    macro_rules! encrypt_with {
-        ($digest:ty, $mgf:ty) => {
-            // Call `PaddingScheme` directly: it accepts `TryCryptoRng`, so a
-            // `SysRng` failure returns `rsa::Error::Rng` for the mapping below
-            // instead of entering RSA's infallible `CryptoRng` convenience API.
-            Oaep::<$digest, $mgf>::new_with_mgf_hash_and_label(parameters.label.clone()).encrypt(
-                &mut rng,
-                public_key,
-                content_key,
-            )
-        };
-    }
-    let result = match (parameters.digest, parameters.mgf_digest) {
-        (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha1) => {
-            encrypt_with!(Sha1, Sha1)
-        }
-        (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha256) => {
-            encrypt_with!(Sha1, Sha256)
-        }
-        (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha384) => {
-            encrypt_with!(Sha1, Sha384)
-        }
-        (OaepDigestAlgorithm::Sha1, OaepDigestAlgorithm::Sha512) => {
-            encrypt_with!(Sha1, Sha512)
-        }
-        (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha1) => {
-            encrypt_with!(Sha256, Sha1)
-        }
-        (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha256) => {
-            encrypt_with!(Sha256, Sha256)
-        }
-        (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha384) => {
-            encrypt_with!(Sha256, Sha384)
-        }
-        (OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha512) => {
-            encrypt_with!(Sha256, Sha512)
-        }
-        (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha1) => {
-            encrypt_with!(Sha384, Sha1)
-        }
-        (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha256) => {
-            encrypt_with!(Sha384, Sha256)
-        }
-        (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha384) => {
-            encrypt_with!(Sha384, Sha384)
-        }
-        (OaepDigestAlgorithm::Sha384, OaepDigestAlgorithm::Sha512) => {
-            encrypt_with!(Sha384, Sha512)
-        }
-        (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha1) => {
-            encrypt_with!(Sha512, Sha1)
-        }
-        (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha256) => {
-            encrypt_with!(Sha512, Sha256)
-        }
-        (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha384) => {
-            encrypt_with!(Sha512, Sha384)
-        }
-        (OaepDigestAlgorithm::Sha512, OaepDigestAlgorithm::Sha512) => {
-            encrypt_with!(Sha512, Sha512)
-        }
-    };
-    result.map_err(|error| match error {
-        rsa::Error::Rng => XmlEncError::Rng("RSA-OAEP random generation failed".into()),
-        error => XmlEncError::RsaEncrypt(error.to_string()),
-    })
-}
-
-fn invalid_kek_size(algorithm: KeyWrapAlgorithm, actual: usize) -> XmlEncError {
-    XmlEncError::InvalidKekSize {
-        algorithm,
-        expected: algorithm.key_len(),
-        actual,
-    }
+    Ok(ciphertext)
 }
 
 fn render_encrypted_data(
@@ -678,10 +805,12 @@ fn write_event(writer: &mut Writer<Vec<u8>>, event: Event<'_>) -> Result<(), Xml
 fn validate_xml_plaintext(
     xml: &str,
     encrypted_type: &EncryptedDataType,
+    policy: &crate::policy::EncryptionPolicy,
 ) -> Result<(), XmlEncError> {
+    let parsing_options = || encryption_parsing_options(policy, policy.xml.allow_internal_dtd);
     match encrypted_type {
         EncryptedDataType::Element => {
-            let document = Document::parse(xml)?;
+            let document = Document::parse_with_options(xml, parsing_options())?;
             if !has_single_element_with_boundary_trivia(document.root()) {
                 return Err(XmlEncError::InvalidStructure(
                     "Element plaintext must contain exactly one element".into(),
@@ -691,12 +820,27 @@ fn validate_xml_plaintext(
         }
         EncryptedDataType::Content => {
             let wrapped = format!("<xmlsec-content>{xml}</xmlsec-content>");
-            let _ = Document::parse(&wrapped)?;
+            let mut options = parsing_options();
+            // The wrapper exists only to parse an XML fragment. Its node must
+            // not consume the caller-owned plaintext node allowance.
+            options.nodes_limit = options.nodes_limit.saturating_add(1);
+            let _ = Document::parse_with_options(&wrapped, options)?;
             Ok(())
         }
         EncryptedDataType::Other(_) => Err(XmlEncError::InvalidEncryptionConfig(
             "encrypt_xml requires Element or Content Type".into(),
         )),
+    }
+}
+
+fn encryption_parsing_options<'a>(
+    policy: &crate::policy::EncryptionPolicy,
+    allow_dtd: bool,
+) -> ParsingOptions<'a> {
+    ParsingOptions {
+        allow_dtd,
+        nodes_limit: policy.resources.effective_xml_nodes(),
+        entity_resolver: None,
     }
 }
 
@@ -802,14 +946,190 @@ fn replace_range(xml: &str, range: std::ops::Range<usize>, replacement: &str) ->
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use std::sync::Arc;
+
+    use getrandom::SysRng;
     use getrandom::rand_core::UnwrapErr;
+    use rsa::pkcs8::DecodePublicKey as _;
     use rsa::{RsaPrivateKey, RsaPublicKey};
 
     use super::*;
-    use crate::xmlenc::{
-        KekDecryptor, PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt, decrypt_document,
-        parse_encrypted_data,
+    use crate::hard_limits::{
+        ENCRYPTION_METADATA_BYTE_CEILING as MAX_ENCRYPTION_METADATA_LEN,
+        ENCRYPTION_PLAINTEXT_BYTE_CEILING as MAX_ENCRYPTION_PLAINTEXT_LEN,
+        ENCRYPTION_RECIPIENT_CEILING as MAX_ENCRYPTION_RECIPIENTS,
+        XML_DOCUMENT_BYTE_CEILING as MAX_ENCRYPTION_DOCUMENT_LEN,
     };
+    use crate::xmlenc::{
+        KekDecryptor, OaepDigestAlgorithm, PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt,
+        decrypt_document, parse_encrypted_data,
+    };
+
+    #[derive(Debug)]
+    struct OverridingOutputProvider {
+        ciphertext: Option<Vec<u8>>,
+        wrapped_key: Option<Vec<u8>>,
+        transported_key: Option<Vec<u8>>,
+        transport_calls: AtomicUsize,
+    }
+
+    impl crate::provider::CryptoProvider for OverridingOutputProvider {
+        fn name(&self) -> &'static str {
+            "overriding-output-test"
+        }
+
+        fn supports(&self, query: crate::provider::CapabilityQuery<'_>) -> bool {
+            crate::provider::CryptoProvider::supports(&crate::provider::RustCryptoProvider, query)
+        }
+
+        fn fill_random(&self, output: &mut [u8]) -> Result<(), crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::fill_random(
+                &crate::provider::RustCryptoProvider,
+                output,
+            )
+        }
+
+        #[cfg(feature = "xmldsig")]
+        fn digest(
+            &self,
+            algorithm: crate::xmldsig::DigestAlgorithm,
+            data: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::digest(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                data,
+            )
+        }
+
+        #[cfg(feature = "xmldsig")]
+        fn sign(
+            &self,
+            key: &dyn crate::xmldsig::SigningKey,
+            algorithm: crate::xmldsig::SignatureAlgorithm,
+            data: &[u8],
+        ) -> Result<Vec<u8>, crate::xmldsig::SigningKeyError> {
+            crate::provider::CryptoProvider::sign(
+                &crate::provider::RustCryptoProvider,
+                key,
+                algorithm,
+                data,
+            )
+        }
+
+        #[cfg(feature = "xmldsig")]
+        fn verify(
+            &self,
+            key: &dyn crate::xmldsig::VerifyingKey,
+            algorithm: crate::xmldsig::SignatureAlgorithm,
+            data: &[u8],
+            signature: &[u8],
+        ) -> Result<bool, crate::xmldsig::DsigError> {
+            crate::provider::CryptoProvider::verify(
+                &crate::provider::RustCryptoProvider,
+                key,
+                algorithm,
+                data,
+                signature,
+            )
+        }
+
+        fn encrypt_data(
+            &self,
+            algorithm: DataEncryptionAlgorithm,
+            key: &[u8],
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            if let Some(ciphertext) = &self.ciphertext {
+                return Ok(ciphertext.clone());
+            }
+            crate::provider::CryptoProvider::encrypt_data(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                key,
+                plaintext,
+            )
+        }
+
+        fn decrypt_data(
+            &self,
+            algorithm: DataEncryptionAlgorithm,
+            key: &[u8],
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::decrypt_data(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                key,
+                ciphertext,
+            )
+        }
+
+        fn wrap_key(
+            &self,
+            algorithm: KeyWrapAlgorithm,
+            kek: &[u8],
+            key: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            if let Some(wrapped_key) = &self.wrapped_key {
+                return Ok(wrapped_key.clone());
+            }
+            crate::provider::CryptoProvider::wrap_key(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                kek,
+                key,
+            )
+        }
+
+        fn unwrap_key(
+            &self,
+            algorithm: KeyWrapAlgorithm,
+            kek: &[u8],
+            wrapped: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::unwrap_key(
+                &crate::provider::RustCryptoProvider,
+                algorithm,
+                kek,
+                wrapped,
+            )
+        }
+
+        fn transport_key(
+            &self,
+            key: &RsaPublicKey,
+            parameters: &RsaOaepParameters,
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            self.transport_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(transported_key) = &self.transported_key {
+                return Ok(transported_key.clone());
+            }
+            crate::provider::CryptoProvider::transport_key(
+                &crate::provider::RustCryptoProvider,
+                key,
+                parameters,
+                plaintext,
+            )
+        }
+
+        fn recover_key(
+            &self,
+            key: &RsaPrivateKey,
+            parameters: &RsaOaepParameters,
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::CryptoProvider::recover_key(
+                &crate::provider::RustCryptoProvider,
+                key,
+                parameters,
+                ciphertext,
+            )
+        }
+    }
 
     #[test]
     fn direct_key_round_trips_every_content_algorithm() {
@@ -869,6 +1189,19 @@ mod tests {
     }
 
     #[test]
+    fn aes_key_wrap_rejects_mismatched_kek_before_provider_dispatch() {
+        // Algorithm URIs define the KEK size. Provider implementations are
+        // capabilities, not authorities allowed to reinterpret wire semantics.
+        let builder = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .recipient_aes_kw([0x44; 32], KeyWrapAlgorithm::AesKw128);
+
+        assert!(matches!(
+            builder.validate_configuration(),
+            Err(XmlEncError::InvalidEncryptionConfig(_))
+        ));
+    }
+
+    #[test]
     fn rsa_oaep_round_trips_configurable_parameters() {
         let private = RsaPrivateKey::new(&mut UnwrapErr(SysRng), 2048)
             .expect("test RSA key generation must succeed");
@@ -892,6 +1225,29 @@ mod tests {
             .expect("RSA recipient must recover content key"),
             super::super::DecryptedContent::Xml("<secret/>".into())
         );
+    }
+
+    #[test]
+    fn legacy_oaep_rejects_non_sha1_mgf_during_configuration_validation() {
+        // The legacy URI has no MGF child on the wire, so accepting another
+        // digest here would let a permissive provider emit ambiguous ciphertext.
+        let public = RsaPublicKey::from_public_key_pem(include_str!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"
+        ))
+        .expect("tracked RSA public key must parse");
+        let parameters = RsaOaepParameters {
+            algorithm: super::super::KeyTransportAlgorithm::RsaOaepMgf1p,
+            digest: OaepDigestAlgorithm::Sha256,
+            mgf_digest: OaepDigestAlgorithm::Sha256,
+            label: Vec::new(),
+        };
+        let builder = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .add_recipient(EncryptionRecipient::rsa_oaep(public).oaep_parameters(parameters));
+
+        assert!(matches!(
+            builder.validate_configuration(),
+            Err(XmlEncError::InvalidEncryptionConfig(_))
+        ));
     }
 
     #[test]
@@ -942,9 +1298,15 @@ mod tests {
             .expect_err("missing key source must fail");
         assert!(matches!(no_key, XmlEncError::InvalidEncryptionConfig(_)));
 
-        assert!(validate_plaintext_len(MAX_ENCRYPTION_PLAINTEXT_LEN).is_ok());
+        assert!(
+            validate_plaintext_len(MAX_ENCRYPTION_PLAINTEXT_LEN, MAX_ENCRYPTION_PLAINTEXT_LEN,)
+                .is_ok()
+        );
         assert!(matches!(
-            validate_plaintext_len(MAX_ENCRYPTION_PLAINTEXT_LEN + 1),
+            validate_plaintext_len(
+                MAX_ENCRYPTION_PLAINTEXT_LEN + 1,
+                MAX_ENCRYPTION_PLAINTEXT_LEN,
+            ),
             Err(XmlEncError::PlaintextTooLarge { .. })
         ));
 
@@ -1006,6 +1368,354 @@ mod tests {
                 .direct_key([0_u8; 16])
                 .encrypt_document(&oversized_malformed, DocumentEncryptionOptions::default()),
             Err(XmlEncError::DocumentTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn encrypted_replacement_must_fit_document_policy() {
+        // Cipher framing, base64, and EncryptedData markup expand the selected
+        // range; the returned document must remain valid input to decryption.
+        for encrypted_type in [EncryptedDataType::Element, EncryptedDataType::Content] {
+            let document = "<root><target ID=\"selected\">x</target></root>";
+            let policy = crate::policy::EncryptionPolicy {
+                resources: crate::policy::ResourcePolicy {
+                    max_xml_document_bytes: document.len(),
+                    ..crate::policy::ResourcePolicy::default()
+                },
+                ..crate::policy::EncryptionPolicy::default()
+            };
+
+            assert!(matches!(
+                EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                    .encryption_type(encrypted_type)
+                    .direct_key([0_u8; 16])
+                    .policy(policy)
+                    .encrypt_document(
+                        document,
+                        DocumentEncryptionOptions {
+                            element_id: Some("selected"),
+                            allow_dtd: false,
+                        },
+                    ),
+                Err(XmlEncError::DocumentTooLarge { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn encryption_policy_bounds_xml_nodes_at_both_parse_entry_points() {
+        // XML plaintext and whole-document encryption are separate parser paths;
+        // both must consume the same immutable operation-policy node ceiling.
+        let policy = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_nodes: 4,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let builder = || {
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy.clone())
+        };
+        let xml = "<root><a/><b/><c/><d/></root>";
+
+        assert!(matches!(
+            builder().encrypt_xml(xml),
+            Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
+        ));
+        assert!(matches!(
+            builder().encrypt_document(xml, DocumentEncryptionOptions::default()),
+            Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
+        ));
+    }
+
+    #[test]
+    fn content_plaintext_node_limit_excludes_the_internal_wrapper() {
+        let policy = |max_xml_nodes| crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_nodes,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+
+        validate_xml_plaintext("<first/><second/>", &EncryptedDataType::Content, &policy(3))
+            .expect("the caller root and two elements must fit a three-node policy");
+        assert!(matches!(
+            validate_xml_plaintext("<first/><second/>", &EncryptedDataType::Content, &policy(2),),
+            Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
+        ));
+    }
+
+    #[test]
+    fn document_encryption_bounds_projected_replacement_nodes() {
+        fn policy(max_xml_nodes: usize) -> crate::policy::EncryptionPolicy {
+            crate::policy::EncryptionPolicy {
+                resources: crate::policy::ResourcePolicy {
+                    max_xml_nodes,
+                    ..crate::policy::ResourcePolicy::default()
+                },
+                ..crate::policy::EncryptionPolicy::default()
+            }
+        }
+
+        let generated_nodes = {
+            let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .encrypt_binary(b"payload")
+                .expect("default policy must permit generated EncryptedData");
+            Document::parse(&encrypted.encrypted_data_xml)
+                .expect("generated EncryptedData must parse")
+                .root_element()
+                .descendants()
+                .count()
+        };
+
+        // The source document fits the low limit, but the generated
+        // EncryptedData replacement does not. The ceiling admits the standalone
+        // fragment so this specifically exercises whole-document projection.
+        let element_actual = match EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy(generated_nodes))
+            .encrypt_document("<root/>", DocumentEncryptionOptions::default())
+        {
+            Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "encrypted document XML nodes",
+                maximum,
+                actual,
+            })) if maximum == generated_nodes && actual > maximum => actual,
+            result => panic!("expected projected element node bound, got {result:?}"),
+        };
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy(element_actual))
+            .encrypt_document("<root/>", DocumentEncryptionOptions::default())
+            .expect("the exact projected element node limit must be accepted");
+
+        // Content replacement retains the selected element. In particular, a
+        // self-closing element expands around EncryptedData without adding an
+        // extra source node to the projection.
+        let content_actual = match EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .encryption_type(EncryptedDataType::Content)
+            .direct_key([0_u8; 16])
+            .policy(policy(generated_nodes))
+            .encrypt_document("<root/>", DocumentEncryptionOptions::default())
+        {
+            Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "encrypted document XML nodes",
+                maximum,
+                actual,
+            })) if maximum == generated_nodes && actual > maximum => actual,
+            result => panic!("expected projected content node bound, got {result:?}"),
+        };
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .encryption_type(EncryptedDataType::Content)
+            .direct_key([0_u8; 16])
+            .policy(policy(content_actual))
+            .encrypt_document("<root/>", DocumentEncryptionOptions::default())
+            .expect("the exact projected content node limit must be accepted");
+    }
+
+    #[test]
+    fn standalone_encryption_bounds_generated_xml_nodes() {
+        fn policy(max_xml_nodes: usize) -> crate::policy::EncryptionPolicy {
+            crate::policy::EncryptionPolicy {
+                resources: crate::policy::ResourcePolicy {
+                    max_xml_nodes,
+                    ..crate::policy::ResourcePolicy::default()
+                },
+                ..crate::policy::EncryptionPolicy::default()
+            }
+        }
+
+        // Binary encryption has no input XML tree, but its generated EncryptedData
+        // must still be consumable under the same operation-policy node ceiling.
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy(1))
+                .encrypt_binary(b"payload"),
+            Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "generated EncryptedData XML nodes",
+                maximum: 1,
+                actual,
+            })) if actual > 1
+        ));
+
+        let generated = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .encrypt_binary(b"payload")
+            .expect("default policy must permit generated EncryptedData");
+        let actual = Document::parse(&generated.encrypted_data_xml)
+            .expect("generated EncryptedData must parse")
+            .root_element()
+            .descendants()
+            .count();
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy(actual))
+            .encrypt_binary(b"payload")
+            .expect("the exact generated node limit must be accepted");
+    }
+
+    #[test]
+    fn document_dtd_requires_policy_and_per_call_opt_in() {
+        // Internal DTD parsing is a two-party decision: operation policy sets
+        // the ceiling and the call site must opt in for this document.
+        let document = "<!DOCTYPE root [<!ELEMENT root ANY>]><root/>";
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .encrypt_document(
+                    document,
+                    DocumentEncryptionOptions {
+                        element_id: None,
+                        allow_dtd: true,
+                    },
+                ),
+            Err(XmlEncError::XmlParse(_))
+        ));
+        let mut policy = crate::policy::EncryptionPolicy::default();
+        policy.xml.allow_internal_dtd = true;
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy.clone())
+            .encrypt_document(
+                document,
+                DocumentEncryptionOptions {
+                    element_id: None,
+                    allow_dtd: true,
+                },
+            )
+            .expect("both DTD controls should permit parsing");
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy)
+                .encrypt_document(document, DocumentEncryptionOptions::default()),
+            Err(XmlEncError::XmlParse(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_resource_policy_is_rejected_at_every_entry_point() {
+        // Entry points must reject an invalid snapshot before parsing or using
+        // any caller-selected limit derived from it.
+        let mut policy = crate::policy::EncryptionPolicy::default();
+        policy.resources.max_encryption_plaintext_bytes =
+            crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING + 1;
+        let builder = || {
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy.clone())
+        };
+
+        assert!(matches!(
+            builder().encrypt_xml("<broken>"),
+            Err(XmlEncError::Policy(_))
+        ));
+        assert!(matches!(
+            builder().encrypt_binary(b"x"),
+            Err(XmlEncError::Policy(_))
+        ));
+        assert!(matches!(
+            builder().encrypt_document("<broken>", DocumentEncryptionOptions::default()),
+            Err(XmlEncError::Policy(_))
+        ));
+    }
+
+    #[test]
+    fn standalone_encrypted_output_obeys_document_byte_ceiling() {
+        // The returned fragment must remain admissible to the reciprocal parser;
+        // plaintext bounds alone do not account for framing, base64, or markup.
+        let policy = |maximum| crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_document_bytes: maximum,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+
+        let binary_len = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .encrypt_binary(b"bounded binary")
+            .expect("baseline binary encryption must succeed")
+            .encrypted_data_xml
+            .len();
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy(binary_len - 1))
+                .encrypt_binary(b"bounded binary"),
+            Err(XmlEncError::DocumentTooLarge { maximum, actual })
+                if maximum == binary_len - 1 && actual == binary_len
+        ));
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy(binary_len))
+            .encrypt_binary(b"bounded binary")
+            .expect("the exact standalone binary output bound must be accepted");
+
+        let xml_len = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .encrypt_xml("<secret>bounded XML</secret>")
+            .expect("baseline XML encryption must succeed")
+            .encrypted_data_xml
+            .len();
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy(xml_len - 1))
+                .encrypt_xml("<secret>bounded XML</secret>"),
+            Err(XmlEncError::DocumentTooLarge { maximum, actual })
+                if maximum == xml_len - 1 && actual == xml_len
+        ));
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy(xml_len))
+            .encrypt_xml("<secret>bounded XML</secret>")
+            .expect("the exact standalone XML output bound must be accepted");
+    }
+
+    #[test]
+    fn zero_resource_ceilings_allow_operations_that_consume_none() {
+        // Zero is deny-all, not an invalid policy. Direct-key encryption has no
+        // recipients, and an empty binary payload consumes no plaintext bytes.
+        let policy = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_encryption_plaintext_bytes: 0,
+                max_encryption_recipients: 0,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy.clone())
+            .encrypt_binary(&[])
+            .expect("zero ceilings must allow resources the operation does not consume");
+
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy.clone())
+                .encrypt_binary(b"x"),
+            Err(XmlEncError::PlaintextTooLarge {
+                maximum: 0,
+                actual: 1
+            })
+        ));
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .recipient_aes_kw([0_u8; 16], KeyWrapAlgorithm::AesKw128)
+                .policy(policy)
+                .encrypt_binary(&[]),
+            Err(XmlEncError::TooManyRecipients {
+                maximum: 0,
+                actual: 1,
+            })
         ));
     }
 
@@ -1083,6 +1793,185 @@ mod tests {
                 .encrypt_binary(b"data"),
             Err(XmlEncError::InvalidEncryptionConfig(_))
         ));
+    }
+
+    #[test]
+    fn encrypted_data_id_must_be_an_xml_ncname() {
+        // xsd:ID derives from NCName; escaping arbitrary attribute text cannot
+        // make whitespace, a leading digit, or a colon schema-valid.
+        for invalid in ["bad id", "1leading", "qualified:name", ""] {
+            assert!(matches!(
+                EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                    .direct_key([0_u8; 16])
+                    .id(invalid)
+                    .encrypt_binary(b"data"),
+                Err(XmlEncError::InvalidEncryptionConfig(_))
+            ));
+        }
+
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .id("Δοκιμή")
+            .encrypt_binary(b"data")
+            .expect("Unicode XML NCNames must remain valid identifiers");
+    }
+
+    #[test]
+    fn rejects_malformed_custom_provider_ciphertext_before_serialization() {
+        // Providers supply primitives, but the facade owns the standard wire
+        // contract and must not serialize output its own decryptor rejects.
+        for (algorithm, ciphertext) in [
+            (DataEncryptionAlgorithm::Aes128Gcm, vec![0_u8; 27]),
+            (DataEncryptionAlgorithm::Aes128Cbc, vec![0_u8; 31]),
+            (DataEncryptionAlgorithm::Aes256Cbc, vec![0_u8; 33]),
+        ] {
+            let error = EncryptedDataBuilder::new(algorithm)
+                .provider(Arc::new(OverridingOutputProvider {
+                    ciphertext: Some(ciphertext),
+                    wrapped_key: None,
+                    transported_key: None,
+                    transport_calls: AtomicUsize::new(0),
+                }))
+                .direct_key(vec![0_u8; algorithm.key_len()])
+                .encrypt_binary(b"data")
+                .expect_err("malformed provider output must fail before XML serialization");
+            assert!(matches!(
+                error,
+                XmlEncError::DataTooShort { .. } | XmlEncError::InvalidCbcCiphertextLength(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_overlong_custom_provider_ciphertext_before_serialization() {
+        // Provider success cannot change the algorithm-defined relationship
+        // between plaintext and ciphertext length.
+        for (algorithm, expected, actual) in [
+            (DataEncryptionAlgorithm::Aes128Gcm, 32, 33),
+            (DataEncryptionAlgorithm::Aes128Cbc, 32, 48),
+        ] {
+            let error = EncryptedDataBuilder::new(algorithm)
+                .provider(Arc::new(OverridingOutputProvider {
+                    ciphertext: Some(vec![0_u8; actual]),
+                    wrapped_key: None,
+                    transported_key: None,
+                    transport_calls: AtomicUsize::new(0),
+                }))
+                .direct_key(vec![0_u8; algorithm.key_len()])
+                .encrypt_binary(b"data")
+                .expect_err("overlong provider output must fail before XML serialization");
+            assert!(matches!(
+                error,
+                XmlEncError::Provider(crate::provider::ProviderError::InvalidOutputSize {
+                    operation: crate::provider::ProviderOperation::Encrypt,
+                    expected: observed_expected,
+                    actual: observed_actual,
+                }) if observed_expected == expected && observed_actual == actual
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_custom_provider_wrapped_keys_before_serialization() {
+        // RFC 3394 adds exactly one 64-bit integrity block. Accepting any other
+        // provider output would emit EncryptedKey data no recipient can unwrap.
+        for wrapped_key in [vec![], vec![0_u8; 23], vec![0_u8; 25]] {
+            let result = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .provider(Arc::new(OverridingOutputProvider {
+                    ciphertext: None,
+                    wrapped_key: Some(wrapped_key),
+                    transported_key: None,
+                    transport_calls: AtomicUsize::new(0),
+                }))
+                .recipient_aes_kw([0_u8; 16], KeyWrapAlgorithm::AesKw128)
+                .encrypt_binary(b"data");
+            assert!(matches!(
+                result,
+                Err(XmlEncError::InvalidWrappedKeyLength { expected: 24, actual })
+                    if actual != 24
+            ));
+        }
+
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .provider(Arc::new(OverridingOutputProvider {
+                ciphertext: None,
+                wrapped_key: Some(vec![0_u8; 24]),
+                transported_key: None,
+                transport_calls: AtomicUsize::new(0),
+            }))
+            .recipient_aes_kw([0_u8; 16], KeyWrapAlgorithm::AesKw128)
+            .encrypt_binary(b"data")
+            .expect("exact RFC 3394 wrapped-key length must remain accepted");
+    }
+
+    #[test]
+    fn rejects_malformed_custom_provider_rsa_transport_before_serialization() {
+        // RSA ciphertext is exactly one modulus wide. Enforcing that invariant
+        // here prevents custom providers from emitting undecryptable XML.
+        let private_key = RsaPrivateKey::new(&mut UnwrapErr(SysRng), 2048)
+            .expect("RSA key generation should succeed");
+        let public_key = RsaPublicKey::from(&private_key);
+        for transported_key in [vec![], vec![0_u8; 255], vec![0_u8; 257]] {
+            let result = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .provider(Arc::new(OverridingOutputProvider {
+                    ciphertext: None,
+                    wrapped_key: None,
+                    transported_key: Some(transported_key),
+                    transport_calls: AtomicUsize::new(0),
+                }))
+                .recipient_rsa_oaep(public_key.clone())
+                .encrypt_binary(b"data");
+            assert!(matches!(
+                result,
+                Err(XmlEncError::InvalidWrappedKeyLength {
+                    expected: 256,
+                    actual,
+                }) if actual != 256
+            ));
+        }
+
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .provider(Arc::new(OverridingOutputProvider {
+                ciphertext: None,
+                wrapped_key: None,
+                transported_key: Some(vec![0_u8; 256]),
+                transport_calls: AtomicUsize::new(0),
+            }))
+            .recipient_rsa_oaep(public_key)
+            .encrypt_binary(b"data")
+            .expect("modulus-sized RSA transport output must remain accepted");
+    }
+
+    #[test]
+    fn encryption_policy_rejects_weak_rsa_recipient_before_provider_dispatch() {
+        // Provider capability cannot weaken the outbound recipient-key policy.
+        let private_key = RsaPrivateKey::new(&mut UnwrapErr(SysRng), 1024)
+            .expect("test RSA key generation should succeed");
+        let provider = Arc::new(OverridingOutputProvider {
+            ciphertext: None,
+            wrapped_key: None,
+            transported_key: Some(vec![0_u8; 128]),
+            transport_calls: AtomicUsize::new(0),
+        });
+
+        let result = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .provider(provider.clone())
+            .recipient_rsa_oaep(RsaPublicKey::from(&private_key))
+            .encrypt_binary(b"data");
+
+        assert!(matches!(
+            result,
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::KeySize {
+                    operation: "encryption",
+                    minimum_bits: 2048,
+                    maximum_bits: 8192,
+                    actual_bits: 1024,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(provider.transport_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

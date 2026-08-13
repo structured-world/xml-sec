@@ -106,14 +106,11 @@ fn fragment_id_canonicalizes_subtree_only() {
 }
 
 #[test]
-fn fragment_id_includes_comments_in_subtree() {
-    // Unlike empty URI, #id subtrees include comments
+fn fragment_id_excludes_comments_in_subtree() {
+    // XMLDSig bare-name dereference strips comments even when C14N retains them.
     let xml = r#"<root><item ID="x"><!-- keep this --><child/></item></root>"#;
     let result = deref_and_canonicalize_with_comments(xml, "#x");
-    assert_eq!(
-        result,
-        r#"<item ID="x"><!-- keep this --><child></child></item>"#
-    );
+    assert_eq!(result, r#"<item ID="x"><child></child></item>"#);
 }
 
 #[test]

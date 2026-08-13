@@ -2,9 +2,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "common/xmlsec1.rs"]
+mod xmlsec1;
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::xmldsig::{
@@ -118,41 +120,34 @@ fn encoded_payload_xml(id_attribute: &str) -> String {
     )
 }
 
-// `--add-id-attr`, used by the reciprocal interop helpers below, was added in 1.3.8.
-fn xmlsec1_version_supports_interop(version: &str) -> bool {
-    version
-        .split_whitespace()
-        .find_map(|token| {
-            let mut components = token.split('.');
-            Some((
-                components.next()?.parse::<u16>().ok()?,
-                components.next()?.parse::<u16>().ok()?,
-                components.next()?.parse::<u16>().ok()?,
-            ))
-        })
-        .is_some_and(|version| version >= (1, 3, 8))
-}
-
-fn xmlsec1_is_available() -> bool {
-    let Ok(output) = Command::new("xmlsec1").arg("--version").output() else {
-        return false;
-    };
-
-    output.status.success()
-        && std::str::from_utf8(&output.stdout).is_ok_and(xmlsec1_version_supports_interop)
-}
-
 #[test]
-fn xmlsec1_version_gate_requires_add_id_attr_support() {
-    assert!(!xmlsec1_version_supports_interop("xmlsec1 1.3.0 (openssl)"));
-    assert!(!xmlsec1_version_supports_interop("xmlsec1 1.3.7 (openssl)"));
-    assert!(xmlsec1_version_supports_interop("xmlsec1 1.3.8 (openssl)"));
-    assert!(xmlsec1_version_supports_interop("xmlsec1 1.3.12 (openssl)"));
-    assert!(xmlsec1_version_supports_interop("xmlsec1 2.0.0 (openssl)"));
-    assert!(!xmlsec1_version_supports_interop(
+fn xmlsec1_version_gate_requires_pinned_snapshot() {
+    assert!(!xmlsec1::version_supports_interop(
+        "xmlsec1 1.3.8 (openssl)"
+    ));
+    assert!(!xmlsec1::version_supports_interop(
+        "xmlsec1 1.3.12 (openssl)"
+    ));
+    assert!(xmlsec1::version_supports_interop(
+        "xmlsec1 1.3.13 (openssl)"
+    ));
+    assert!(xmlsec1::version_supports_interop("xmlsec1 2.0.0 (openssl)"));
+    assert!(!xmlsec1::version_supports_interop(
         "xmlsec1 1.2.37 (openssl)"
     ));
-    assert!(!xmlsec1_version_supports_interop("xmlsec1 unknown"));
+    assert!(!xmlsec1::version_supports_interop("xmlsec1 unknown"));
+    for malformed in [
+        "OpenSSL 3.0.0",
+        "xmlsec1 unknown OpenSSL 3.0.0",
+        "xmlsec1 1.3",
+        "xmlsec1 1.3.13.1",
+        "prefix xmlsec1 1.3.13",
+    ] {
+        assert!(
+            !xmlsec1::version_supports_interop(malformed),
+            "malformed xmlsec1 version output {malformed:?} must fail closed"
+        );
+    }
 }
 
 fn signed_payload_xml(key: &dyn SigningKey, builder: &SignatureBuilder) -> String {
@@ -184,7 +179,7 @@ fn interop_fixture_references_the_enveloped_root() {
 
 fn verify_with_xmlsec1(signed_xml: &str, public_key: &Path) -> std::process::Output {
     let input = TemporaryXmlFile::write("xmlsec1-interop", signed_xml);
-    Command::new("xmlsec1")
+    xmlsec1::command()
         .arg("--verify")
         .arg("--lax-key-search")
         .arg("--add-id-attr")
@@ -204,7 +199,7 @@ fn sign_with_xmlsec1(
 ) -> String {
     let output_file = TemporaryXmlFile::write("xmlsec1-signed", "");
     let key_and_certificate = format!("{},{}", private_key.display(), certificate.display());
-    let output = Command::new("xmlsec1")
+    let output = xmlsec1::command()
         .arg("--sign")
         .arg("--add-id-attr")
         .arg("Id")
@@ -243,8 +238,8 @@ fn assert_xmlsec1_accepts(signed_xml: &str, public_key: &str) {
 fn xmlsec1_verifies_rsa_sha256_signature_from_xml_sec() {
     // A separate implementation must accept the generated enveloped signature,
     // including its reference digest, exclusive C14N, and RSA SignatureValue.
-    if !xmlsec1_is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 
@@ -266,8 +261,8 @@ fn xmlsec1_verifies_rsa_sha256_signature_from_xml_sec() {
 fn xmlsec1_verifies_base64_reference_signature_from_xml_sec() {
     // The donor implementation must derive the same decoded octets from a
     // node set containing nested elements and comments.
-    if !xmlsec1_is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 
@@ -287,8 +282,8 @@ fn xmlsec1_verifies_base64_reference_signature_from_xml_sec() {
 fn xml_sec_verifies_base64_reference_signature_from_xmlsec1() {
     // Reciprocal generation proves our parser and text-node conversion accept
     // the transform representation emitted and digested by xmlsec1.
-    if !xmlsec1_is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 
@@ -328,8 +323,8 @@ fn xml_sec_verifies_base64_reference_signature_from_xmlsec1() {
 fn xmlsec1_verifies_xpath_filter2_signature_from_xml_sec() {
     // xmlsec1 must derive the same subtree set after ordered intersect and
     // subtract operations and accept our resulting RSA signature.
-    if !xmlsec1_is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
     let key = RsaSigningKey::from_pkcs8_pem(
@@ -351,8 +346,8 @@ fn xmlsec1_verifies_xpath_filter2_signature_from_xml_sec() {
 fn xml_sec_verifies_xpath_filter2_signature_from_xmlsec1() {
     // Reciprocal signing proves the parser and evaluator accept Filter 2.0 XML
     // and digest octets produced independently by xmlsec1.
-    if !xmlsec1_is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
     let template = xpath_filter2_signing_builder()
@@ -387,8 +382,8 @@ fn xmlsec1_verifies_selected_axes_without_their_owner_from_xml_sec() {
     // Canonical XML serializes selected attribute and namespace nodes even
     // when their owner element is absent, producing valid digest octets that
     // are intentionally not a well-balanced XML fragment.
-    if !xmlsec1_is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
     let key = RsaSigningKey::from_pkcs8_pem(
@@ -410,8 +405,8 @@ fn xmlsec1_verifies_selected_axes_without_their_owner_from_xml_sec() {
 fn xml_sec_verifies_selected_axes_without_their_owner_from_xmlsec1() {
     // Reciprocal signing proves xmlsec1 independently canonicalizes the same
     // esoteric node-set to the octets consumed by xml-sec.
-    if !xmlsec1_is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
     let template = omitted_owner_axes_signing_builder()
@@ -445,8 +440,8 @@ fn xml_sec_verifies_selected_axes_without_their_owner_from_xmlsec1() {
 fn xmlsec1_verifies_ecdsa_signatures_from_xml_sec() {
     // P-256 and P-384 prove that xml-sec emits XMLDSig raw r||s values that
     // xmlsec1 accepts for both supported ECDSA curve widths.
-    if !xmlsec1_is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 
@@ -463,7 +458,7 @@ fn xmlsec1_verifies_ecdsa_signatures_from_xml_sec() {
 
     let p256_signed = signed_payload_xml(
         &p256_key,
-        &signing_builder(SignatureAlgorithm::EcdsaP256Sha256, DigestAlgorithm::Sha256),
+        &signing_builder(SignatureAlgorithm::EcdsaSha256, DigestAlgorithm::Sha256),
     );
     assert_xmlsec1_accepts(
         &p256_signed,
@@ -472,7 +467,7 @@ fn xmlsec1_verifies_ecdsa_signatures_from_xml_sec() {
 
     let p384_signed = signed_payload_xml(
         &p384_key,
-        &signing_builder(SignatureAlgorithm::EcdsaP384Sha384, DigestAlgorithm::Sha384),
+        &signing_builder(SignatureAlgorithm::EcdsaSha384, DigestAlgorithm::Sha384),
     );
     assert_xmlsec1_accepts(
         &p384_signed,
@@ -484,8 +479,8 @@ fn xmlsec1_verifies_ecdsa_signatures_from_xml_sec() {
 fn xmlsec1_rejects_tampered_signature_from_xml_sec() {
     // The external verifier must reject a changed signed payload, proving the
     // test is exercising validation rather than merely command invocation.
-    if !xmlsec1_is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 
@@ -516,8 +511,8 @@ fn xmlsec1_rejects_tampered_signature_from_xml_sec() {
 fn xml_sec_verifies_xmlsec1_signatures_with_embedded_certificates() {
     // xmlsec1 must create signatures that our full pipeline accepts through
     // the embedded X509Data resolver, not through a separately injected key.
-    if !xmlsec1_is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 
@@ -561,8 +556,8 @@ fn xml_sec_verifies_xmlsec1_signatures_with_embedded_certificates() {
 fn xml_sec_rejects_tampered_xmlsec1_signature_before_crypto_verification() {
     // Mutating the signed Object must fail reference validation before the
     // verifier reaches SignatureValue cryptography, matching XMLDSig fail-fast.
-    if !xmlsec1_is_available() {
-        eprintln!("skipping xmlsec1 interoperability test: xmlsec1 is not installed");
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
         return;
     }
 

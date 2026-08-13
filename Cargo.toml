@@ -22,29 +22,34 @@ roxmltree = { version = "0.21", features = ["positions"] }
 quick-xml = "0.41"
 
 # Crypto
-rsa = { version = "0.10.0-rc.18", optional = true }
+rsa = { package = "sad-rsa", version = "0.2.3", features = ["sha1", "sha2"], optional = true }
 sha1 = { version = "0.11", features = ["oid"], optional = true }
 sha2 = { version = "0.11", features = ["oid"], optional = true }
 p256 = { version = "0.14", features = ["ecdsa"], optional = true }
 p384 = { version = "0.14", features = ["ecdsa"], optional = true }
 p521 = { version = "0.14", features = ["ecdsa"], optional = true }
+dsa = { version = "0.7", optional = true }
+ed25519-dalek = { version = "3", features = ["pkcs8"], optional = true }
+hmac = { version = "0.13", optional = true }
 signature = { version = "3", optional = true }
 subtle = { version = "2", optional = true }
 getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
 sxd-document-no-unsafe = { version = "0.4.1", default-features = false, features = ["no-unsafe"], optional = true }
 sxd-xpath-no-unsafe = { version = "0.5.1", default-features = false, features = ["no-unsafe"], optional = true }
-aes = { version = "0.9.1", optional = true }
+aes = { version = "0.9.2", optional = true }
 aes-gcm = { version = "0.11.0", optional = true }
 aes-kw = { version = "0.3.1", optional = true }
 cbc = { version = "0.2.1", optional = true }
 
 # X.509 certificates
 x509-parser = { version = "0.18", features = ["verify"], optional = true }
+x509-cert = { version = "0.3", default-features = false, optional = true }
+x520-stringprep = { version = "1", features = ["alloc"], optional = true }
 der = { version = "0.8", optional = true }
 crypto-bigint = { version = "0.7", optional = true }
 
 # Base64 encoding/decoding
-base64 = "0.22"
+base64 = "0.23"
 
 # Error handling
 thiserror = "2"
@@ -52,14 +57,17 @@ thiserror = "2"
 [dev-dependencies]
 rcgen = "0.14.6"
 rand_chacha = "0.10"
-time = "0.3.53"
+time = "0.3.55"
 
 [features]
 default = ["xmldsig", "c14n"]
 xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:der",
     "dep:crypto-bigint",
+    "dep:dsa",
+    "dep:ed25519-dalek",
     "dep:getrandom",
+    "dep:hmac",
     "dep:p256",
     "dep:p384",
     "dep:p521",
@@ -71,6 +79,8 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:sxd-document-no-unsafe",
     "dep:sxd-xpath-no-unsafe",
     "dep:x509-parser",
+    "dep:x509-cert",
+    "dep:x520-stringprep",
 ]
 xmlenc = [             # XML Encryption (encrypt + decrypt)
     "dep:aes",

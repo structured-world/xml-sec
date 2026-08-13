@@ -6,7 +6,7 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 
 use crate::c14n::{C14nAlgorithm, C14nMode};
-use crate::xml::is_xml_1_0_character;
+use crate::xml::{is_xml_1_0_character, is_xml_ncname};
 
 use super::parse::MAX_REFERENCES_PER_SIGNATURE;
 use super::transforms::{
@@ -241,7 +241,7 @@ impl SignatureBuilder {
             ));
         }
         if let Some(id) = &self.signature_id
-            && !is_ncname(id)
+            && !is_xml_ncname(id)
         {
             return Err(SignatureBuilderError::InvalidId {
                 element: "Signature",
@@ -352,7 +352,7 @@ impl SignatureBuilder {
         }
         for reference in &self.references {
             if let Some(id) = &reference.id
-                && !is_ncname(id)
+                && !is_xml_ncname(id)
             {
                 return Err(SignatureBuilderError::InvalidId {
                     element: "Reference",
@@ -585,27 +585,7 @@ fn qualified_name(prefix: Option<&str>, local_name: &str) -> String {
     )
 }
 
-fn is_ncname(value: &str) -> bool {
-    if value.is_empty() || value.contains(':') {
-        return false;
-    }
-
-    roxmltree::Document::parse(&format!("<{value}/>"))
-        .is_ok_and(|document| document.root_element().tag_name().name() == value)
-}
-
 fn is_namespace_prefix(value: &str) -> bool {
     // Namespaces in XML reserves these names regardless of the URI being bound.
-    // Keep the invariant explicit instead of depending on parser rejection of a
-    // synthetic declaration assembled below.
-    if matches!(value, "xml" | "xmlns") || !is_ncname(value) {
-        return false;
-    }
-
-    // Parsing delegates the complete Unicode XML Name grammar to the same parser
-    // used by the rest of the crate.
-    roxmltree::Document::parse(&format!(
-        "<{value}:n xmlns:{value}=\"urn:xml-sec:prefix-validation\"/>"
-    ))
-    .is_ok()
+    !matches!(value, "xml" | "xmlns") && is_xml_ncname(value)
 }

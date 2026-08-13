@@ -8,6 +8,7 @@ use std::path::Path;
 
 use base64::Engine;
 use xml_sec::c14n::canonicalize;
+use xml_sec::policy::PolicyViolation;
 use xml_sec::xmldsig::parse::{SignatureAlgorithm, find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::signature::{
     SignatureVerificationError, verify_rsa_signature_pem, verify_rsa_signature_spki,
@@ -235,7 +236,15 @@ fn undersized_rsa_public_key_returns_typed_error() {
     )
     .expect_err("1024-bit RSA key should be rejected before verification");
 
-    assert!(matches!(err, SignatureVerificationError::InvalidKeyDer));
+    assert!(matches!(
+        err,
+        SignatureVerificationError::KeyPolicy(PolicyViolation::KeySize {
+            key_type: "RSA",
+            minimum_bits: 2048,
+            actual_bits: 1024,
+            ..
+        })
+    ));
 }
 
 #[test]

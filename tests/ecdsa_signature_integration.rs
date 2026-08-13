@@ -86,7 +86,7 @@ fn donor_ecdsa_p256_signature_matches() {
     assert_donor_signature_valid(
         Path::new("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml"),
         Path::new("tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem"),
-        SignatureAlgorithm::EcdsaP256Sha256,
+        SignatureAlgorithm::EcdsaSha256,
     );
 }
 
@@ -100,9 +100,9 @@ fn local_p384_signature_matches() {
     let (signature_algorithm, canonical_signed_info, _) =
         canonicalized_signed_info_and_signature(&xml);
     assert_eq!(
-        SignatureAlgorithm::EcdsaP384Sha384,
+        SignatureAlgorithm::EcdsaSha384,
         signature_algorithm,
-        "fixture SignatureMethod should be EcdsaP384Sha384",
+        "fixture SignatureMethod should be EcdsaSha384",
     );
 
     let pkcs8_der = x509_parser::pem::parse_x509_pem(private_key_pem.as_bytes())
@@ -115,7 +115,7 @@ fn local_p384_signature_matches() {
     let signature_bytes = signature.to_bytes();
 
     let valid = verify_ecdsa_signature_pem(
-        SignatureAlgorithm::EcdsaP384Sha384,
+        SignatureAlgorithm::EcdsaSha384,
         &public_key_pem,
         &canonical_signed_info,
         signature_bytes.as_ref(),
@@ -135,9 +135,9 @@ fn local_p384_der_signature_matches() {
     let (signature_algorithm, canonical_signed_info, _) =
         canonicalized_signed_info_and_signature(&xml);
     assert_eq!(
-        SignatureAlgorithm::EcdsaP384Sha384,
+        SignatureAlgorithm::EcdsaSha384,
         signature_algorithm,
-        "fixture SignatureMethod should be EcdsaP384Sha384",
+        "fixture SignatureMethod should be EcdsaSha384",
     );
 
     let pkcs8_der = x509_parser::pem::parse_x509_pem(private_key_pem.as_bytes())
@@ -150,7 +150,7 @@ fn local_p384_der_signature_matches() {
     let signature_der = signature.to_der();
 
     let valid = verify_ecdsa_signature_pem(
-        SignatureAlgorithm::EcdsaP384Sha384,
+        SignatureAlgorithm::EcdsaSha384,
         &public_key_pem,
         &canonical_signed_info,
         signature_der.as_bytes(),
@@ -189,7 +189,7 @@ fn tampered_signed_info_fails_verification() {
 }
 
 #[test]
-fn curve_mismatched_public_key_returns_typed_key_error() {
+fn different_curve_key_with_wrong_signature_width_returns_format_error() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
     ));
@@ -197,24 +197,24 @@ fn curve_mismatched_public_key_returns_typed_key_error() {
     let (algorithm, canonical_signed_info, signature_value) =
         canonicalized_signed_info_and_signature(&xml);
 
-    let err = verify_ecdsa_signature_pem(
+    let error = verify_ecdsa_signature_pem(
         algorithm,
         &public_key_pem,
         &canonical_signed_info,
         &signature_value,
     )
-    .expect_err("curve-mismatched EC key should be rejected before verification");
+    .expect_err("the P-256 SignatureValue width is invalid for a P-384 key");
 
     assert!(matches!(
-        err,
-        SignatureVerificationError::KeyAlgorithmMismatch { .. }
+        error,
+        SignatureVerificationError::InvalidSignatureFormat
     ));
 }
 
 #[test]
 fn non_public_key_pem_returns_invalid_key_format() {
     let err = verify_ecdsa_signature_pem(
-        SignatureAlgorithm::EcdsaP256Sha256,
+        SignatureAlgorithm::EcdsaSha256,
         "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n",
         b"payload",
         &[0_u8; 64],
@@ -230,7 +230,7 @@ fn non_public_key_pem_returns_invalid_key_format() {
 #[test]
 fn malformed_pem_returns_typed_error() {
     let err = verify_ecdsa_signature_pem(
-        SignatureAlgorithm::EcdsaP256Sha256,
+        SignatureAlgorithm::EcdsaSha256,
         "-----BEGIN PUBLIC KEY-----\n%%%%\n-----END PUBLIC KEY-----\n",
         b"payload",
         &[0_u8; 64],
@@ -248,7 +248,7 @@ fn pem_with_trailing_garbage_returns_typed_error() {
     );
 
     let err = verify_ecdsa_signature_pem(
-        SignatureAlgorithm::EcdsaP256Sha256,
+        SignatureAlgorithm::EcdsaSha256,
         &public_key_pem,
         b"payload",
         &[0_u8; 64],
@@ -261,7 +261,7 @@ fn pem_with_trailing_garbage_returns_typed_error() {
 #[test]
 fn malformed_spki_der_returns_typed_error() {
     let err = verify_ecdsa_signature_spki(
-        SignatureAlgorithm::EcdsaP256Sha256,
+        SignatureAlgorithm::EcdsaSha256,
         &[0x01, 0x02, 0x03],
         b"payload",
         &[0_u8; 64],
@@ -284,7 +284,7 @@ fn non_ec_spki_key_returns_algorithm_mismatch_error() {
     .contents;
 
     let err = verify_ecdsa_signature_spki(
-        SignatureAlgorithm::EcdsaP256Sha256,
+        SignatureAlgorithm::EcdsaSha256,
         &public_key_der,
         b"payload",
         &[0_u8; 64],
@@ -390,7 +390,7 @@ fn signature_with_wrong_length_returns_typed_error() {
     let public_key_pem = read_fixture(Path::new("tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem"));
 
     let err = verify_ecdsa_signature_pem(
-        SignatureAlgorithm::EcdsaP256Sha256,
+        SignatureAlgorithm::EcdsaSha256,
         &public_key_pem,
         b"payload",
         &[0_u8; 63],
@@ -414,7 +414,7 @@ fn malformed_der_signature_with_non_raw_length_returns_typed_error() {
     };
 
     let err = verify_ecdsa_signature_pem(
-        SignatureAlgorithm::EcdsaP384Sha384,
+        SignatureAlgorithm::EcdsaSha384,
         &public_key_pem,
         b"payload",
         &malformed_der_signature,
@@ -438,7 +438,7 @@ fn spki_der_with_trailing_garbage_returns_typed_error() {
     public_key_der.extend_from_slice(b"TRAILING");
 
     let err = verify_ecdsa_signature_spki(
-        SignatureAlgorithm::EcdsaP256Sha256,
+        SignatureAlgorithm::EcdsaSha256,
         &public_key_der,
         b"payload",
         &[0_u8; 64],

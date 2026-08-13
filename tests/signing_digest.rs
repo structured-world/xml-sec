@@ -1,14 +1,22 @@
+use std::collections::HashSet;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::policy::SigningPolicy;
 use xml_sec::xmldsig::mutation::append_signature_to_root;
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::uri::UriReferenceResolver;
 use xml_sec::xmldsig::verify::process_all_references;
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, DigestAlgorithm, DsigStatus, EcdsaP256SigningKey, EcdsaP384SigningKey,
-    KeyInfoWriter, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
-    SignatureBuilder, SigningDigestError, SigningError, SigningKey, SigningKeyError,
-    SigningPublicKeyInfo, Transform, X509CertificateKeyInfoWriter, compute_reference_digest_values,
-    fill_reference_digest_values, parse_key_info, verify_signature_with_pem_key,
+    DEFAULT_IMPLICIT_C14N_URI, DefaultKeyResolver, DigestAlgorithm, DsigStatus,
+    EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriter, ReferenceBuilder, RsaSigningKey,
+    SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError,
+    SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, X509CertificateKeyInfoWriter,
+    compute_reference_digest_values, fill_reference_digest_values, parse_key_info,
+    verify_signature_with_pem_key,
 };
 
 fn exclusive_c14n() -> C14nAlgorithm {
@@ -137,23 +145,14 @@ fn signing_keys_reject_unsupported_signature_algorithms() {
         "tests/fixtures/keys/ec/ec-prime256v1-key.pem",
     ))
     .expect("P-256 private key fixture must parse");
-    let p384_key = EcdsaP384SigningKey::from_pkcs8_pem(&read_fixture(
-        "tests/fixtures/keys/ec/ec-prime384v1-key.pem",
-    ))
-    .expect("P-384 private key fixture must parse");
-
     for (result, expected_uri) in [
         (
-            rsa_key.sign(SignatureAlgorithm::EcdsaP256Sha256, b"signed-info"),
-            SignatureAlgorithm::EcdsaP256Sha256.uri(),
+            rsa_key.sign(SignatureAlgorithm::EcdsaSha256, b"signed-info"),
+            SignatureAlgorithm::EcdsaSha256.uri(),
         ),
         (
             p256_key.sign(SignatureAlgorithm::RsaSha256, b"signed-info"),
             SignatureAlgorithm::RsaSha256.uri(),
-        ),
-        (
-            p384_key.sign(SignatureAlgorithm::EcdsaP256Sha256, b"signed-info"),
-            SignatureAlgorithm::EcdsaP256Sha256.uri(),
         ),
     ] {
         assert!(matches!(
@@ -161,6 +160,154 @@ fn signing_keys_reject_unsupported_signature_algorithms() {
             Err(SigningKeyError::UnsupportedAlgorithm { uri }) if uri == expected_uri
         ));
     }
+}
+
+#[test]
+fn signing_facade_rejects_malformed_key_specific_signature_output() {
+    // Custom signing keys cannot bypass fixed-width RSA and XMLDSig ECDSA
+    // output framing before SignatureValue serialization.
+    struct FixedOutputSigningKey {
+        output: Vec<u8>,
+        public_key: SigningPublicKeyInfo,
+    }
+
+    impl SigningKey for FixedOutputSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            Ok(self.output.clone())
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Ok(self.public_key.clone())
+        }
+    }
+
+    let xml = "<root><payload ID=\"payload\">hello</payload></root>";
+    let cases = [
+        (
+            SignatureAlgorithm::RsaSha256,
+            SigningPublicKeyInfo::Rsa {
+                spki_der: Vec::new(),
+                modulus: vec![0x80_u8; 256],
+                exponent: vec![1, 0, 1],
+            },
+            255,
+            256,
+        ),
+        (
+            SignatureAlgorithm::EcdsaSha256,
+            SigningPublicKeyInfo::Ec {
+                spki_der: Vec::new(),
+                curve_oid: "1.2.840.10045.3.1.7",
+                public_key: [vec![4], vec![1_u8; 64]].concat(),
+            },
+            63,
+            64,
+        ),
+    ];
+
+    for (algorithm, public_key, actual, expected) in cases {
+        let key = FixedOutputSigningKey {
+            output: vec![1_u8; actual],
+            public_key,
+        };
+        let builder = SignatureBuilder::new(exclusive_c14n(), algorithm).add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+
+        assert!(matches!(
+            SignContext::new(&key).sign_with_builder(xml, &builder),
+            Err(SigningError::InvalidSignatureOutputLength {
+                expected: expected_len,
+                actual: actual_len,
+            }) if expected_len == expected && actual_len == actual
+        ));
+    }
+}
+
+#[test]
+fn signing_policy_rejects_weak_rsa_key_before_provider_dispatch() {
+    struct CountingSigningKey {
+        calls: Arc<AtomicUsize>,
+        modulus: Vec<u8>,
+        exponent: Vec<u8>,
+    }
+
+    impl SigningKey for CountingSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1_u8; self.modulus.len()])
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Ok(SigningPublicKeyInfo::Rsa {
+                spki_der: Vec::new(),
+                modulus: self.modulus.clone(),
+                exponent: self.exponent.clone(),
+            })
+        }
+    }
+
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+
+    for (modulus_bytes, actual_bits) in [(128, 1024), (1025, 8200)] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = CountingSigningKey {
+            calls: Arc::clone(&calls),
+            modulus: vec![0x80_u8; modulus_bytes],
+            exponent: vec![1, 0, 1],
+        };
+        assert!(matches!(
+            SignContext::new(&key).sign_with_builder(
+                "<root><payload ID=\"payload\">hello</payload></root>",
+                &builder
+            ),
+            Err(SigningError::Policy(
+                xml_sec::policy::PolicyViolation::KeySize {
+                    operation: "signing",
+                    minimum_bits: 2048,
+                    maximum_bits: 8192,
+                    actual_bits: observed_bits,
+                    ..
+                }
+            )) if observed_bits == actual_bits
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let key = CountingSigningKey {
+        calls: Arc::clone(&calls),
+        modulus: vec![0x80_u8; 256],
+        exponent: vec![2],
+    };
+    assert!(matches!(
+        SignContext::new(&key).sign_with_builder(
+            "<root><payload ID=\"payload\">hello</payload></root>",
+            &builder
+        ),
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::InvalidKeyMaterial {
+                operation: "signing",
+                ..
+            }
+        ))
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -266,6 +413,266 @@ fn computes_enveloped_signature_digest_for_whole_document() {
 
     let filled = fill_reference_digest_values(&xml).expect("fill digest values");
     assert_reference_digests_verify(&filled);
+}
+
+#[test]
+fn signing_policy_rejects_disallowed_reference_transform() {
+    // A signing policy is an execution boundary, not advisory metadata: every
+    // template transform must be accepted before any digest work runs.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template = template_with_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("")
+            .transform(Transform::Enveloped),
+    );
+    let xml =
+        append_signature_to_root("<root><payload/></root>", &template).expect("append signature");
+    let policy = SigningPolicy {
+        transforms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+        ..SigningPolicy::default()
+    };
+
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(policy)
+            .sign_template(&xml),
+        Err(SigningError::Digest(SigningDigestError::Policy(_)))
+    ));
+}
+
+#[test]
+fn signing_policy_bounds_document_bytes_before_parsing() {
+    // Signing must reject a large low-node document at the same policy
+    // boundary as verification rather than parsing it before work limits run.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let xml = format!("<root>{}</root>", "x".repeat(1_024));
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: xml.len() - 1,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(policy)
+            .sign_template(&xml),
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "XML document",
+                maximum,
+                actual,
+            }
+        )) if maximum == xml.len() - 1 && actual == xml.len()
+    ));
+}
+
+#[test]
+fn signing_policy_rechecks_document_bytes_after_mutation() {
+    // Filling DigestValue and SignatureValue grows the caller's document, so
+    // the same byte ceiling must cover intermediate and returned XML.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template = template_with_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#payload")
+            .transform(Transform::C14n(exclusive_c14n())),
+    );
+    let xml = append_signature_to_root("<root><payload ID=\"payload\"/></root>", &template)
+        .expect("append signature");
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: xml.len(),
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(policy)
+            .sign_template(&xml),
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "XML document",
+                maximum,
+                actual,
+            }
+        )) if maximum == xml.len() && actual > maximum
+    ));
+}
+
+#[test]
+fn signing_policy_shares_canonicalization_budget_with_signed_info() {
+    // Reference transforms and SignedInfo consume one operation-wide C14N
+    // allowance, preventing a template from multiplying the configured cap.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template = template_with_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#payload")
+            .transform(Transform::C14n(exclusive_c14n())),
+    );
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">x</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+    let constrained = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            // The reference serializes below this bound; SignedInfo pushes the
+            // operation-wide total over it.
+            max_canonicalized_bytes: 64,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(constrained)
+            .sign_template(&xml),
+        Err(SigningError::Digest(SigningDigestError::Transform(_)))
+    ));
+
+    let sufficient = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_canonicalized_bytes: 4_096,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    SignContext::new(&private_key)
+        .policy(sufficient)
+        .sign_template(&xml)
+        .expect("the same reference must sign when the combined budget fits");
+}
+
+#[test]
+fn signing_policy_applies_xml_base_budget_to_signed_info_c14n() {
+    // SignedInfo canonicalization is part of the same operation as Reference
+    // transforms and must not replace the compiled XML Base policy with hard
+    // defaults when inherited context is reconstructed.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template =
+        template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"));
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">x</payload></root>",
+        &template,
+    )
+    .expect("append signature")
+    .replacen(
+        "http://www.w3.org/2001/10/xml-exc-c14n#",
+        "http://www.w3.org/2006/12/xml-c14n11",
+        1,
+    )
+    .replace(
+        "<Signature xmlns=",
+        "<outer xml:base=\"one/\"><inner xml:base=\"two/\"><Signature xmlns=",
+    )
+    .replace("</Signature>", "</Signature></inner></outer>");
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_base_components: 1,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    let result = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_template(&xml);
+    assert!(
+        matches!(
+            result,
+            Err(SigningError::Canonicalization(
+                xml_sec::c14n::C14nError::XmlBaseComponentsTooLarge { max: 1, actual: 2 }
+            ))
+        ),
+        "unexpected signing result: {result:?}"
+    );
+}
+
+#[test]
+fn signing_policy_covers_implicit_and_signed_info_canonicalization() {
+    // The transform allowlist covers algorithms executed implicitly by the
+    // pipeline, not only explicit Reference/Transforms children.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template =
+        template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"));
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">x</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+
+    let implicit_disallowed = SigningPolicy {
+        transforms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+        ..SigningPolicy::default()
+    };
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(implicit_disallowed)
+            .sign_template(&xml),
+        Err(SigningError::Digest(SigningDigestError::Policy(_)))
+    ));
+
+    let signed_info_disallowed = SigningPolicy {
+        transforms: Some(HashSet::from([DEFAULT_IMPLICIT_C14N_URI.to_owned()])),
+        ..SigningPolicy::default()
+    };
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(signed_info_disallowed)
+            .sign_template(&xml),
+        Err(SigningError::Policy(xml_sec::policy::PolicyViolation::Algorithm {
+            operation: "SignedInfo canonicalization",
+            algorithm,
+        })) if algorithm == exclusive_c14n().uri()
+    ));
+}
+
+#[test]
+fn signing_internal_dtd_policy_reaches_builder_and_mutation_reparses() {
+    // The parser opt-in is operation-wide: source validation, digest mutation,
+    // SignedInfo canonicalization, and final mutation must agree on DTD policy.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    let xml = "<!DOCTYPE root [<!ENTITY value 'signed'>]><root><payload ID=\"payload\">&value;</payload></root>";
+
+    assert!(matches!(
+        SignContext::new(&private_key).sign_with_builder(xml, &builder),
+        Err(SigningError::XmlMutation(
+            xml_sec::xmldsig::mutation::XmlMutationError::XmlParse(roxmltree::Error::DtdDetected)
+        ))
+    ));
+
+    let mut policy = SigningPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let signed = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_with_builder(xml, &builder)
+        .expect("internal-DTD opt-in must reach every signing parse and reparse");
+    assert!(!signed.contains("<DigestValue></DigestValue>"));
+    assert!(!signed.contains("<SignatureValue></SignatureValue>"));
 }
 
 #[test]
@@ -677,7 +1084,7 @@ fn signs_ecdsa_p256_template_and_verifies_round_trip() {
     ))
     .expect("P-256 private key fixture must parse");
     let public_key_pem = read_fixture("tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem");
-    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaP256Sha256)
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaSha256)
         .add_reference(
             ReferenceBuilder::new(DigestAlgorithm::Sha256)
                 .uri("#payload")
@@ -707,7 +1114,7 @@ fn signs_ecdsa_p384_template_and_verifies_round_trip() {
     ))
     .expect("P-384 private key fixture must parse");
     let public_key_pem = read_fixture("tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem");
-    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaP384Sha384)
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaSha384)
         .add_reference(
             ReferenceBuilder::new(DigestAlgorithm::Sha384)
                 .uri("#payload")
@@ -726,6 +1133,52 @@ fn signs_ecdsa_p384_template_and_verifies_round_trip() {
     assert_eq!(verify_result.status, DsigStatus::Valid);
     assert!(signed.contains("<SignatureValue>"));
     assert!(!signed.contains("<DigestValue></DigestValue>"));
+}
+
+#[test]
+fn signs_ecdsa_with_digest_independent_of_curve() {
+    // XMLDSig SignatureMethod selects the hash; the signing key selects the
+    // curve and SignatureValue width. Exercise both non-default pairings
+    // through the complete template, signing, and verification pipeline.
+    let p256_key = EcdsaP256SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime256v1-key.pem",
+    ))
+    .expect("P-256 private key fixture must parse");
+    let p384_key = EcdsaP384SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime384v1-key.pem",
+    ))
+    .expect("P-384 private key fixture must parse");
+    let cases: [(&dyn SigningKey, SignatureAlgorithm, &str); 2] = [
+        (
+            &p384_key,
+            SignatureAlgorithm::EcdsaSha256,
+            "tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem",
+        ),
+        (
+            &p256_key,
+            SignatureAlgorithm::EcdsaSha384,
+            "tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem",
+        ),
+    ];
+
+    for (key, algorithm, public_key_path) in cases {
+        let builder = SignatureBuilder::new(exclusive_c14n(), algorithm).add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+        let signed = SignContext::new(key)
+            .sign_with_builder(
+                "<root><payload ID=\"payload\">hello</payload></root>",
+                &builder,
+            )
+            .expect("curve-independent ECDSA signing must succeed");
+        let public_key_pem = read_fixture(public_key_path);
+        let result = verify_signature_with_pem_key(&signed, &public_key_pem, true)
+            .expect("curve-independent ECDSA verification must run");
+
+        assert_eq!(result.status, DsigStatus::Valid, "{}", algorithm.uri());
+    }
 }
 
 #[test]

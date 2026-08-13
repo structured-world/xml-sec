@@ -1,8 +1,7 @@
 //! Signature verification helpers for XMLDSig.
 //!
-//! This module currently covers roadmap task P1-019 (RSA PKCS#1 v1.5) and
-//! P1-020 (ECDSA P-256/P-384) verification, plus donor P-521 interop under
-//! the XMLDSig `ecdsa-sha384` URI.
+//! This module covers RSA PKCS#1 v1.5, DSA-SHA1, and ECDSA verification,
+//! including donor P-521 interoperability under the XMLDSig `ecdsa-sha384` URI.
 //!
 //! Input public keys are accepted in SubjectPublicKeyInfo (SPKI) form because
 //! that is how the vendored PEM fixtures are stored.
@@ -11,20 +10,91 @@
 //! - ECDSA keys are validated as uncompressed SEC1 points from the SPKI bit
 //!   string and verified with RustCrypto curve crates (`p256`/`p384`/`p521`).
 
-use p256::ecdsa::signature::Verifier as P256Verifier;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
 use p521::ecdsa::{Signature as P521Signature, VerifyingKey as P521VerifyingKey};
-use rsa::pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaVerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::hazmat::PrehashVerifier;
+use rsa::{
+    pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaVerifyingKey},
+    traits::PublicKeyParts,
+};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
+use signature::Verifier;
 use x509_parser::prelude::FromDer;
 use x509_parser::public_key::{ECPoint, PublicKey};
 use x509_parser::x509::SubjectPublicKeyInfo;
 
 use super::parse::SignatureAlgorithm;
+
+pub(crate) fn signature_value_matches_algorithm(
+    algorithm: SignatureAlgorithm,
+    signature_value: &[u8],
+) -> bool {
+    match algorithm {
+        SignatureAlgorithm::DsaSha1 => signature_value.len() == 40,
+        SignatureAlgorithm::HmacSha1 => (10..=20).contains(&signature_value.len()),
+        // Opaque custom keys expose no modulus here, so the default can enforce
+        // only non-empty framing under the absolute ceiling. Built-in keys
+        // override this with the exact modulus width.
+        SignatureAlgorithm::RsaSha1
+        | SignatureAlgorithm::RsaSha256
+        | SignatureAlgorithm::RsaSha384
+        | SignatureAlgorithm::RsaSha512 => {
+            (1..=crate::hard_limits::RSA_MODULUS_BIT_CEILING / 8).contains(&signature_value.len())
+        }
+        SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384 => {
+            [32, 48, 66].into_iter().any(|component_len| {
+                classify_ecdsa_signature_encoding(signature_value, component_len).is_ok()
+            })
+        }
+    }
+}
+
+pub(crate) fn signature_value_matches_spki(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationError> {
+    let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    if !rest.is_empty() {
+        return Err(SignatureVerificationError::InvalidKeyDer);
+    }
+    let public_key = spki
+        .parsed()
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+
+    match (algorithm, public_key) {
+        (SignatureAlgorithm::DsaSha1, PublicKey::DSA(_)) => Ok(signature_value.len() == 40),
+        (
+            SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha256
+            | SignatureAlgorithm::RsaSha384
+            | SignatureAlgorithm::RsaSha512,
+            PublicKey::RSA(_),
+        ) => {
+            let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
+                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+            Ok(signature_value.len() == key.size())
+        }
+        (SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384, PublicKey::EC(ec)) => {
+            validate_ec_public_key_encoding(&ec, &spki.subject_public_key.data)?;
+            let (_, component_len) = ecdsa_curve_and_component_len(&spki, &ec)?;
+            classify_ecdsa_signature_encoding(signature_value, component_len)?;
+            Ok(true)
+        }
+        (SignatureAlgorithm::HmacSha1, _) => {
+            Err(SignatureVerificationError::KeyAlgorithmMismatch {
+                uri: algorithm.uri().to_owned(),
+            })
+        }
+        _ => Err(SignatureVerificationError::KeyAlgorithmMismatch {
+            uri: algorithm.uri().to_owned(),
+        }),
+    }
+}
 
 /// Errors while preparing or running XMLDSig signature verification.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +121,10 @@ pub enum SignatureVerificationError {
     /// The provided DER bytes were not a valid SPKI-encoded public key.
     #[error("invalid SubjectPublicKeyInfo DER")]
     InvalidKeyDer,
+
+    /// A structurally valid key violates the active key-strength policy.
+    #[error("verification key rejected by policy: {0}")]
+    KeyPolicy(#[from] crate::policy::PolicyViolation),
 
     /// The provided public key does not match the signature algorithm.
     #[error("public key does not match signature algorithm: {uri}")]
@@ -135,54 +209,157 @@ pub fn verify_rsa_signature_spki(
     signed_data: &[u8],
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
+    verify_rsa_signature_spki_with_minimum(
+        algorithm,
+        public_key_spki_der,
+        signed_data,
+        signature_value,
+        2048,
+    )
+}
+
+pub(crate) fn verify_rsa_signature_spki_with_minimum(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+    minimum_modulus_bits: usize,
+) -> Result<bool, SignatureVerificationError> {
+    validate_rsa_signature_spki_with_minimum(algorithm, public_key_spki_der, minimum_modulus_bits)?;
+    verify_rsa_signature_spki_primitive(
+        algorithm,
+        public_key_spki_der,
+        signed_data,
+        signature_value,
+    )
+}
+
+pub(crate) fn validate_rsa_signature_spki_with_minimum(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    minimum_modulus_bits: usize,
+) -> Result<(), SignatureVerificationError> {
     let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
     if !rest.is_empty() {
         return Err(SignatureVerificationError::InvalidKeyDer);
     }
-    let public_key = spki
+    match spki
         .parsed()
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-
-    match public_key {
-        PublicKey::RSA(rsa) => {
-            validate_rsa_public_key(&rsa, algorithm)?;
-            let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
-                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-            let Ok(signature) = RsaPkcs1v15Signature::try_from(signature_value) else {
-                return Ok(false);
-            };
-
-            let verified = match algorithm {
-                SignatureAlgorithm::RsaSha1 => {
-                    let key = RsaVerifyingKey::<Sha1>::new(key);
-                    key.verify(signed_data, &signature).is_ok()
-                }
-                SignatureAlgorithm::RsaSha256 => {
-                    let key = RsaVerifyingKey::<Sha256>::new(key);
-                    key.verify(signed_data, &signature).is_ok()
-                }
-                SignatureAlgorithm::RsaSha384 => {
-                    let key = RsaVerifyingKey::<Sha384>::new(key);
-                    key.verify(signed_data, &signature).is_ok()
-                }
-                SignatureAlgorithm::RsaSha512 => {
-                    let key = RsaVerifyingKey::<Sha512>::new(key);
-                    key.verify(signed_data, &signature).is_ok()
-                }
-                _ => {
-                    return Err(SignatureVerificationError::UnsupportedAlgorithm {
-                        uri: algorithm.uri().to_string(),
-                    });
-                }
-            };
-
-            Ok(verified)
-        }
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
+    {
+        PublicKey::RSA(rsa) => validate_rsa_public_key(&rsa, algorithm, minimum_modulus_bits),
         _ => Err(SignatureVerificationError::KeyAlgorithmMismatch {
             uri: algorithm.uri().to_string(),
         }),
     }
+}
+
+pub(crate) fn verify_rsa_signature_spki_primitive(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationError> {
+    ensure_rsa_signature_algorithm(algorithm)?;
+    let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let Ok(signature) = RsaPkcs1v15Signature::try_from(signature_value) else {
+        return Ok(false);
+    };
+    let verified = match algorithm {
+        SignatureAlgorithm::RsaSha1 => RsaVerifyingKey::<Sha1>::new(key)
+            .verify(signed_data, &signature)
+            .is_ok(),
+        SignatureAlgorithm::RsaSha256 => RsaVerifyingKey::<Sha256>::new(key)
+            .verify(signed_data, &signature)
+            .is_ok(),
+        SignatureAlgorithm::RsaSha384 => RsaVerifyingKey::<Sha384>::new(key)
+            .verify(signed_data, &signature)
+            .is_ok(),
+        SignatureAlgorithm::RsaSha512 => RsaVerifyingKey::<Sha512>::new(key)
+            .verify(signed_data, &signature)
+            .is_ok(),
+        _ => unreachable!("RSA algorithm checked above"),
+    };
+    Ok(verified)
+}
+
+/// Verify an XMLDSig DSA-SHA1 signature using a DER SPKI public key.
+///
+/// XMLDSig 1.0 encodes the signature as the fixed-width 20-byte `r` followed
+/// by the fixed-width 20-byte `s`, rather than ASN.1 DER.
+#[must_use = "discarding the verification result skips signature validation"]
+pub fn verify_dsa_signature_spki(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationError> {
+    verify_dsa_signature_spki_with_minimum(
+        algorithm,
+        public_key_spki_der,
+        signed_data,
+        signature_value,
+        crate::policy::DsaKeyPolicy::default().minimum_modulus_bits,
+    )
+}
+
+pub(crate) fn verify_dsa_signature_spki_with_minimum(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+    minimum_modulus_bits: usize,
+) -> Result<bool, SignatureVerificationError> {
+    validate_dsa_signature_spki_with_minimum(public_key_spki_der, minimum_modulus_bits)?;
+    verify_dsa_signature_spki_primitive(
+        algorithm,
+        public_key_spki_der,
+        signed_data,
+        signature_value,
+    )
+}
+
+pub(crate) fn validate_dsa_signature_spki_with_minimum(
+    public_key_spki_der: &[u8],
+    minimum_modulus_bits: usize,
+) -> Result<(), SignatureVerificationError> {
+    let key = dsa::VerifyingKey::from_public_key_der(public_key_spki_der)
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let modulus_bits = usize::try_from(key.components().p().bits_vartime())
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    crate::policy::DsaKeyPolicy {
+        minimum_modulus_bits,
+    }
+    .validate_modulus_bits(modulus_bits)
+    .map_err(SignatureVerificationError::KeyPolicy)
+}
+
+pub(crate) fn verify_dsa_signature_spki_primitive(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationError> {
+    if algorithm != SignatureAlgorithm::DsaSha1 {
+        return Err(SignatureVerificationError::UnsupportedAlgorithm {
+            uri: algorithm.uri().to_string(),
+        });
+    }
+    if signature_value.len() != 40 {
+        return Ok(false);
+    }
+    let key = dsa::VerifyingKey::from_public_key_der(public_key_spki_der)
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let Some(signature) = dsa::Signature::from_components(
+        crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[..20]),
+        crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[20..]),
+    ) else {
+        return Ok(false);
+    };
+    let digest = Sha1::digest(signed_data);
+    Ok(key.verify_prehash(&digest, &signature).is_ok())
 }
 
 /// Verify an ECDSA XMLDSig signature using DER-encoded SPKI public key bytes.
@@ -201,7 +378,7 @@ pub fn verify_ecdsa_signature_spki(
 ) -> Result<bool, SignatureVerificationError> {
     if !matches!(
         algorithm,
-        SignatureAlgorithm::EcdsaP256Sha256 | SignatureAlgorithm::EcdsaP384Sha384
+        SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384
     ) {
         return Err(SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_string(),
@@ -220,25 +397,30 @@ pub fn verify_ecdsa_signature_spki(
     match public_key {
         PublicKey::EC(ec) => {
             validate_ec_public_key_encoding(&ec, &spki.subject_public_key.data)?;
-            let (curve, component_len) = ecdsa_curve_and_component_len(&spki, &ec, algorithm)?;
+            let (curve, component_len) = ecdsa_curve_and_component_len(&spki, &ec)?;
             let signature_encoding =
                 classify_ecdsa_signature_encoding(signature_value, component_len)?;
+            let prehash = match algorithm {
+                SignatureAlgorithm::EcdsaSha256 => Sha256::digest(signed_data).to_vec(),
+                SignatureAlgorithm::EcdsaSha384 => Sha384::digest(signed_data).to_vec(),
+                _ => unreachable!("ECDSA algorithm was validated above"),
+            };
             match curve {
-                EcCurve::P256 => verify_ecdsa_p256_sha256(
+                EcCurve::P256 => verify_ecdsa_p256(
                     &spki.subject_public_key.data,
-                    signed_data,
+                    &prehash,
                     signature_value,
                     signature_encoding,
                 ),
-                EcCurve::P384 => verify_ecdsa_p384_sha384(
+                EcCurve::P384 => verify_ecdsa_p384(
                     &spki.subject_public_key.data,
-                    signed_data,
+                    &prehash,
                     signature_value,
                     signature_encoding,
                 ),
-                EcCurve::P521 => verify_ecdsa_p521_sha384(
+                EcCurve::P521 => verify_ecdsa_p521(
                     &spki.subject_public_key.data,
-                    signed_data,
+                    &prehash,
                     signature_value,
                     signature_encoding,
                 ),
@@ -253,46 +435,34 @@ pub fn verify_ecdsa_signature_spki(
 fn validate_rsa_public_key(
     rsa: &x509_parser::public_key::RSAPublicKey<'_>,
     algorithm: SignatureAlgorithm,
+    minimum_modulus_bits: usize,
 ) -> Result<(), SignatureVerificationError> {
-    let min_modulus_bits = minimum_rsa_modulus_bits(algorithm)?;
-    let modulus_start = rsa
-        .modulus
-        .iter()
-        .position(|byte| *byte != 0)
-        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-    let modulus = &rsa.modulus[modulus_start..];
-    if modulus.is_empty() {
-        return Err(SignatureVerificationError::InvalidKeyDer);
-    }
-    // Match ring's RSA parameter checks: modulus length is evaluated after
-    // rounding up to the nearest whole byte, not by exact significant-bit
-    // length of the highest non-zero byte.
-    let modulus_bits = modulus
-        .len()
-        .checked_mul(8)
-        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-    if !(min_modulus_bits..=8192).contains(&modulus_bits) {
-        return Err(SignatureVerificationError::InvalidKeyDer);
-    }
-
-    let exponent = rsa
-        .try_exponent()
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    if !(3..=((1_u64 << 33) - 1)).contains(&exponent) || exponent % 2 == 0 {
-        return Err(SignatureVerificationError::InvalidKeyDer);
-    }
-
-    Ok(())
+    ensure_rsa_signature_algorithm(algorithm)?;
+    validate_rsa_key_components(rsa.modulus, rsa.exponent, minimum_modulus_bits)
 }
 
-fn minimum_rsa_modulus_bits(
+/// Apply the RSA key-strength invariant shared by XMLDSig and X.509 algorithms.
+pub(crate) fn validate_rsa_key_components(
+    modulus: &[u8],
+    exponent: &[u8],
+    minimum_modulus_bits: usize,
+) -> Result<(), SignatureVerificationError> {
+    crate::policy::RsaKeyPolicy {
+        minimum_modulus_bits,
+    }
+    .validate_components("verification", modulus, exponent)
+    .map(|_| ())
+    .map_err(SignatureVerificationError::KeyPolicy)
+}
+
+fn ensure_rsa_signature_algorithm(
     algorithm: SignatureAlgorithm,
-) -> Result<usize, SignatureVerificationError> {
+) -> Result<(), SignatureVerificationError> {
     match algorithm {
         SignatureAlgorithm::RsaSha1
         | SignatureAlgorithm::RsaSha256
         | SignatureAlgorithm::RsaSha384
-        | SignatureAlgorithm::RsaSha512 => Ok(2048),
+        | SignatureAlgorithm::RsaSha512 => Ok(()),
         _ => Err(SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_string(),
         }),
@@ -309,7 +479,6 @@ enum EcCurve {
 fn ecdsa_curve_and_component_len(
     spki: &SubjectPublicKeyInfo<'_>,
     ec: &ECPoint<'_>,
-    algorithm: SignatureAlgorithm,
 ) -> Result<(EcCurve, usize), SignatureVerificationError> {
     let curve_oid = spki
         .algorithm
@@ -320,98 +489,75 @@ fn ecdsa_curve_and_component_len(
     let point_len = ec.key_size();
 
     let curve_oid = curve_oid.to_id_string();
-    match algorithm {
-        SignatureAlgorithm::EcdsaP256Sha256 => {
-            if curve_oid == "1.2.840.10045.3.1.7" && point_len == 256 {
-                Ok((EcCurve::P256, 32))
-            } else {
-                Err(SignatureVerificationError::KeyAlgorithmMismatch {
-                    uri: algorithm.uri().to_string(),
-                })
-            }
-        }
-        SignatureAlgorithm::EcdsaP384Sha384 => {
-            if curve_oid == "1.3.132.0.34" && point_len == 384 {
-                Ok((EcCurve::P384, 48))
-            // XMLDSig `ecdsa-sha384` identifies the digest/signature method URI,
-            // not a single curve. For interop we accept secp521r1 donor vectors;
-            // x509-parser reports ECPoint::key_size() as byte-aligned bits (528)
-            // for P-521 uncompressed points, so allow both exact and aligned size.
-            } else if curve_oid == "1.3.132.0.35" && matches!(point_len, 521 | 528) {
-                Ok((EcCurve::P521, 66))
-            } else {
-                Err(SignatureVerificationError::KeyAlgorithmMismatch {
-                    uri: algorithm.uri().to_string(),
-                })
-            }
-        }
-        _ => Err(SignatureVerificationError::UnsupportedAlgorithm {
-            uri: algorithm.uri().to_string(),
-        }),
+    match (curve_oid.as_str(), point_len) {
+        ("1.2.840.10045.3.1.7", 256) => Ok((EcCurve::P256, 32)),
+        ("1.3.132.0.34", 384) => Ok((EcCurve::P384, 48)),
+        // x509-parser reports the byte-aligned SEC1 point size for P-521.
+        ("1.3.132.0.35", 528) => Ok((EcCurve::P521, 66)),
+        _ => Err(SignatureVerificationError::InvalidKeyDer),
     }
 }
 
-fn verify_ecdsa_p256_sha256(
+fn verify_ecdsa_p256(
     public_key: &[u8],
-    signed_data: &[u8],
+    prehash: &[u8],
     signature_value: &[u8],
     signature_encoding: EcdsaSignatureEncoding,
 ) -> Result<bool, SignatureVerificationError> {
     let key = P256VerifyingKey::from_sec1_bytes(public_key)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    verify_p256_signature(&key, signature_value, signature_encoding, signed_data)
+    verify_p256_signature(&key, signature_value, signature_encoding, prehash)
 }
 
-fn verify_ecdsa_p384_sha384(
+fn verify_ecdsa_p384(
     public_key: &[u8],
-    signed_data: &[u8],
+    prehash: &[u8],
     signature_value: &[u8],
     signature_encoding: EcdsaSignatureEncoding,
 ) -> Result<bool, SignatureVerificationError> {
     let key = P384VerifyingKey::from_sec1_bytes(public_key)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    verify_p384_signature(&key, signature_value, signature_encoding, signed_data)
+    verify_p384_signature(&key, signature_value, signature_encoding, prehash)
 }
 
-fn verify_ecdsa_p521_sha384(
+fn verify_ecdsa_p521(
     public_key: &[u8],
-    signed_data: &[u8],
+    prehash: &[u8],
     signature_value: &[u8],
     signature_encoding: EcdsaSignatureEncoding,
 ) -> Result<bool, SignatureVerificationError> {
     let key = P521VerifyingKey::from_sec1_bytes(public_key)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    let prehash = Sha384::digest(signed_data);
-    verify_p521_signature(&key, signature_value, signature_encoding, &prehash)
+    verify_p521_signature(&key, signature_value, signature_encoding, prehash)
 }
 
 fn verify_p256_signature(
     key: &P256VerifyingKey,
     signature_value: &[u8],
     signature_encoding: EcdsaSignatureEncoding,
-    signed_data: &[u8],
+    prehash: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
     match signature_encoding {
         EcdsaSignatureEncoding::XmlDsigFixed => {
             let signature = P256Signature::from_slice(signature_value)
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify(signed_data, &signature).is_ok())
+            Ok(key.verify_prehash(prehash, &signature).is_ok())
         }
         EcdsaSignatureEncoding::Asn1Der => {
             let signature = P256Signature::from_der(signature_value)
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify(signed_data, &signature).is_ok())
+            Ok(key.verify_prehash(prehash, &signature).is_ok())
         }
         EcdsaSignatureEncoding::Ambiguous => {
             if let Ok(signature) = P256Signature::from_der(signature_value)
-                && key.verify(signed_data, &signature).is_ok()
+                && key.verify_prehash(prehash, &signature).is_ok()
             {
                 return Ok(true);
             }
 
             let signature = P256Signature::from_slice(signature_value)
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify(signed_data, &signature).is_ok())
+            Ok(key.verify_prehash(prehash, &signature).is_ok())
         }
     }
 }
@@ -420,29 +566,29 @@ fn verify_p384_signature(
     key: &P384VerifyingKey,
     signature_value: &[u8],
     signature_encoding: EcdsaSignatureEncoding,
-    signed_data: &[u8],
+    prehash: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
     match signature_encoding {
         EcdsaSignatureEncoding::XmlDsigFixed => {
             let signature = P384Signature::from_slice(signature_value)
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify(signed_data, &signature).is_ok())
+            Ok(key.verify_prehash(prehash, &signature).is_ok())
         }
         EcdsaSignatureEncoding::Asn1Der => {
             let signature = P384Signature::from_der(signature_value)
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify(signed_data, &signature).is_ok())
+            Ok(key.verify_prehash(prehash, &signature).is_ok())
         }
         EcdsaSignatureEncoding::Ambiguous => {
             if let Ok(signature) = P384Signature::from_der(signature_value)
-                && key.verify(signed_data, &signature).is_ok()
+                && key.verify_prehash(prehash, &signature).is_ok()
             {
                 return Ok(true);
             }
 
             let signature = P384Signature::from_slice(signature_value)
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify(signed_data, &signature).is_ok())
+            Ok(key.verify_prehash(prehash, &signature).is_ok())
         }
     }
 }
@@ -643,15 +789,61 @@ mod tests {
     #[test]
     fn ecdsa_algorithms_are_rejected_for_rsa_verification() {
         for algorithm in [
-            SignatureAlgorithm::EcdsaP256Sha256,
-            SignatureAlgorithm::EcdsaP384Sha384,
+            SignatureAlgorithm::EcdsaSha256,
+            SignatureAlgorithm::EcdsaSha384,
         ] {
-            let err = minimum_rsa_modulus_bits(algorithm).unwrap_err();
+            let err = ensure_rsa_signature_algorithm(algorithm).unwrap_err();
             assert!(matches!(
                 err,
                 SignatureVerificationError::UnsupportedAlgorithm { .. }
             ));
         }
+    }
+
+    #[test]
+    fn malformed_dsa_components_are_verification_misses() {
+        let public_key = include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/lugh.der"
+        );
+        let signature = [0_u8; 40];
+
+        assert!(matches!(
+            verify_dsa_signature_spki_with_minimum(
+                SignatureAlgorithm::DsaSha1,
+                public_key,
+                b"signed",
+                &signature,
+                1024,
+            ),
+            Ok(false)
+        ));
+    }
+
+    #[test]
+    fn spki_signature_framing_uses_the_resolved_key_width() {
+        let rsa = parse_public_key_pem(include_str!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"
+        ))
+        .expect("RSA fixture must parse");
+        assert!(
+            signature_value_matches_spki(SignatureAlgorithm::RsaSha256, &rsa, &[0; 256]).unwrap()
+        );
+        assert!(
+            !signature_value_matches_spki(SignatureAlgorithm::RsaSha256, &rsa, &[0; 255]).unwrap()
+        );
+
+        let p256 = parse_public_key_pem(include_str!(
+            "../../tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem"
+        ))
+        .expect("P-256 fixture must parse");
+        assert!(
+            signature_value_matches_spki(SignatureAlgorithm::EcdsaSha256, &p256, &[0xAA; 64])
+                .unwrap()
+        );
+        assert!(matches!(
+            signature_value_matches_spki(SignatureAlgorithm::EcdsaSha256, &p256, &[0xAA; 96]),
+            Err(SignatureVerificationError::InvalidSignatureFormat)
+        ));
     }
 
     #[test]

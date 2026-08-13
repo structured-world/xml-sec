@@ -1,2 +1,3 @@
 tests/fixtures/xmlenc/aleksey-xmlenc-01/*.tmpl -text whitespace=-trailing-space,-space-before-tab
 tests/fixtures/xmlenc/01-phaos-xmlenc-3/** -text whitespace=-trailing-space,-space-before-tab
+tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/** -text whitespace=-blank-at-eof

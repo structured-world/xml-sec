@@ -2,6 +2,11 @@
 
 This directory contains the XMLDSig test documents used by integration tests.
 They are checked into the repository so CI never depends on a local donor clone.
+The current compatibility oracle is the xmlsec1 1.3.13 development snapshot at
+commit `5fdd47dc35753438bdc38b6e96c1a3805c67a483`; upstream had bumped the
+version but had not published a release tag when this snapshot was pinned.
+`scripts/install-xmlsec1.sh` verifies both that source commit and the live
+`xmlsec1 --version` output before reusing a cached development installation.
 
 ## Importing Vectors
 
@@ -23,13 +28,14 @@ fixture provenance and CI coverage difficult to audit.
 
 Core xmlsec1-generated XMLDSig vectors used by the signing and verification
 pipeline tests. They cover RSA SHA-1/SHA-256/SHA-384/SHA-512, ECDSA P-256 and
-P-384, X.509 KeyInfo, and template signing.
+P-384, SHA-256/SHA-512 X.509 digest selectors, X.509 KeyInfo, and template
+signing.
 
 ### `merlin-xmldsig-twenty-three`
 
-W3C/Merlin basic signature vectors. Some files intentionally remain outside
-the supported algorithm set, such as DSA, and are accounted for as skips or
-fail-closed cases by the donor verification suite.
+W3C/Merlin basic signature vectors. DSA-SHA1 and HMAC-SHA1 are supported for
+legacy verification, including XMLDSig's permitted HMAC truncation. Unsupported
+DSA and HMAC variants remain fail-closed.
 
 ### `xmldsig11-interop-2012`
 
@@ -46,7 +52,7 @@ Currently verified as valid:
 
 Currently fail-closed:
 
-- HMAC algorithms.
+- HMAC algorithms other than HMAC-SHA1.
 - SHA-224 digest or signature algorithms.
 - P-521 KeyValue resolution.
 - `KeyInfoReference` dereference.
@@ -57,8 +63,9 @@ Currently fail-closed:
 
 XMLDSig Second Edition errata vectors. They exercise HMAC-SHA1, external URI
 references, XPath transforms, and Canonical XML 1.1. XPath and C14N 1.1 are
-implemented; documents that additionally require HMAC, an external resource,
-or an unsupported key source remain explicitly classified as fail-closed.
+implemented; HMAC-SHA1 is supported for verification, while documents that
+require another HMAC variant, an unavailable external resource, or an
+unsupported key source remain explicitly classified as fail-closed.
 
 ### `merlin-xpath-filter2`
 
@@ -86,6 +93,13 @@ signature. Expiry coverage therefore uses the original Phaos leaf and CA at a
 fixed modern verification time without modifying the donor artifacts.
 
 ## Test Contract
+
+Merlin `.tmpl` files are byte-preserved donor templates whose relative URIs are
+interpreted from the upstream xmlsec runner working directory. Their paths are
+not rewritten to the repository fixture layout. The corresponding signed `.xml`
+files contain the materialized URI identities exercised by `VerifyContext` and
+the caller-provided resource map. This distinction is part of fixture provenance,
+not a missing local file reference.
 
 Positive fixtures must be validated end-to-end through `VerifyContext`; a
 successful XML parse alone is never sufficient. Negative fixtures must assert

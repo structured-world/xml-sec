@@ -35,10 +35,49 @@ replace_target() {
   return 1
 }
 
+normalize_imported_snapshot() {
+  local relative_path="$1"
+  local staging="$2"
+  local donor
+
+  if [[ "$relative_path" == "xmldsig/merlin-xmldsig-twenty-three" ]]; then
+    # The donor README contains unresolved placeholders and is not executable
+    # fixture data. Keep the imported corpus curated rather than publishing
+    # upstream prose as project documentation.
+    rm -f "$staging/Readme.txt"
+
+    # xmlsec 1.3.13's historical "-40" filenames contain an 80-bit HMAC,
+    # matching XMLDSig 1.1's security floor. Normalize only the local names;
+    # file contents remain byte-for-byte donor data.
+    for extension in tmpl xml; do
+      donor="$staging/signature-enveloping-hmac-sha1-40.$extension"
+      if [[ ! -f "$donor" ]]; then
+        printf 'donor snapshot no longer provides %s; update normalize_imported_snapshot\n' \
+          "${donor##*/}" >&2
+        return 1
+      fi
+      normalized="$staging/signature-enveloping-hmac-sha1-80.$extension"
+      if [[ -e "$normalized" ]]; then
+        printf 'donor snapshot provides both historical and normalized HMAC fixtures: %s\n' \
+          "${normalized##*/}" >&2
+        return 1
+      fi
+      if ! mv "$donor" "$normalized"; then
+        printf 'failed to normalize donor fixture: %s\n' "${donor##*/}" >&2
+        return 1
+      fi
+    done
+  fi
+}
+
 fixture_paths=("$@")
 if (( ${#fixture_paths[@]} == 0 )); then
   fixture_paths=(
     "xmldsig/aleksey-xmldsig-01/enveloping-rsa-x509chain.xml"
+    "xmldsig/aleksey-xmldsig-01/enveloped-x509-digest-sha256.xml"
+    "xmldsig/merlin-xmldsig-twenty-three"
+    "xmldsig/external-data/xml-stylesheet-2005"
+    "xmldsig/external-data/xml-stylesheet-2005.b64"
     "xmlenc/aleksey-xmlenc-01/enc-aes128cbc-keyname.tmpl"
     "xmlenc/aleksey-xmlenc-01/enc-aes128gcm-keyname.tmpl"
     "xmlenc/aleksey-xmlenc-01/enc-aes256cbc-keyname.tmpl"
@@ -94,6 +133,10 @@ for relative_path in "${fixture_paths[@]}"; do
     done < "$manifest"
     rm -f "$manifest"
     if [[ "$copy_failed" == true ]]; then
+      rm -rf "$staging"
+      exit 1
+    fi
+    if ! normalize_imported_snapshot "$relative_path" "$staging"; then
       rm -rf "$staging"
       exit 1
     fi

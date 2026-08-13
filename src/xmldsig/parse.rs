@@ -16,18 +16,33 @@
 //! </Signature>
 //! ```
 
+use der::{
+    Decode,
+    asn1::{Ia5StringRef, ObjectIdentifier},
+};
 use roxmltree::{Document, Node};
+use x509_cert::ext::pkix::name::DirectoryString;
+use x509_cert::name::Name;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::prelude::FromDer;
 use x509_parser::public_key::PublicKey;
+use x509_parser::x509::X509Name;
 
-use super::digest::{DigestAlgorithm, compute_digest, constant_time_eq};
+#[cfg(test)]
+use super::digest::compute_digest;
+use super::digest::{DigestAlgorithm, compute_digest_with_provider, constant_time_eq};
 use super::transforms::{self, Transform};
 use super::whitespace::{
     XmlBase64NormalizeLimitedError, is_xml_whitespace_only, normalize_xml_base64_text,
     normalize_xml_base64_text_with_limit,
 };
+use super::x509::certificate_signature_matches_with_provider;
 use crate::c14n::C14nAlgorithm;
+use crate::c14n::xml_base::{XmlBaseResolutionBudget, resolve_uri_from_node_with_budget};
+
+pub(crate) use crate::hard_limits::SIGNATURE_REFERENCE_CEILING as MAX_REFERENCES_PER_SIGNATURE;
+#[cfg(test)]
+use crate::hard_limits::X509_CHAIN_DEPTH_CEILING as MAX_X509_CHAIN_DEPTH;
 
 /// XMLDSig namespace URI.
 pub(crate) const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
@@ -37,6 +52,9 @@ const MAX_DER_ENCODED_KEY_VALUE_LEN: usize = 8192;
 const MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN: usize = 65_536;
 const MAX_DER_ENCODED_KEY_VALUE_BASE64_LEN: usize = MAX_DER_ENCODED_KEY_VALUE_LEN.div_ceil(3) * 4;
 const MAX_KEY_NAME_TEXT_LEN: usize = 4096;
+const MAX_KEY_INFO_CHILD_COUNT: usize = 64;
+const MAX_HMAC_OUTPUT_LENGTH_TEXT_LEN: usize = 32;
+const MAX_RETRIEVAL_XPATH_TEXT_LEN: usize = 256;
 const MAX_RSA_MODULUS_LEN: usize = 1024;
 const MAX_RSA_EXPONENT_LEN: usize = 8;
 pub(crate) const EC_P256_OID: &str = "1.2.840.10045.3.1.7";
@@ -44,18 +62,27 @@ pub(crate) const EC_P384_OID: &str = "1.3.132.0.34";
 const MAX_EC_PUBLIC_KEY_LEN: usize = 97;
 const MAX_X509_BASE64_TEXT_LEN: usize = 262_144;
 const MAX_X509_BASE64_NORMALIZED_LEN: usize = MAX_X509_BASE64_TEXT_LEN;
-const MAX_X509_DECODED_BINARY_LEN: usize = MAX_X509_BASE64_NORMALIZED_LEN.div_ceil(4) * 3;
+pub(crate) const MAX_X509_DECODED_BINARY_LEN: usize =
+    MAX_X509_BASE64_NORMALIZED_LEN.div_ceil(4) * 3;
 const MAX_X509_SUBJECT_NAME_TEXT_LEN: usize = 16_384;
 const MAX_X509_ISSUER_NAME_TEXT_LEN: usize = 16_384;
-const MAX_X509_SERIAL_NUMBER_TEXT_LEN: usize = 4096;
+const MAX_X509_SERIAL_NUMBER_RAW_TEXT_LEN: usize = 16_384;
+// RFC 5280 requires consumers to handle a 20-octet unsigned serial magnitude.
+// DER may add a leading sign-padding octet; XML Schema permits insignificant
+// leading decimal zeroes.
+const MAX_X509_SERIAL_NUMBER_VALUE_DIGITS: usize = 49;
+const MAX_X509_SERIAL_NUMBER_BYTES: usize = 20;
 const MAX_X509_DATA_ENTRY_COUNT: usize = 64;
-const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
-const MAX_X509_CHAIN_DEPTH: usize = 9;
-pub(crate) const MAX_REFERENCES_PER_SIGNATURE: usize = 64;
+pub(crate) const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
 
 /// Signature algorithms supported for signing and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SignatureAlgorithm {
+    /// DSA with SHA-1. Verify-only legacy XMLDSig algorithm.
+    DsaSha1,
+    /// HMAC with SHA-1. Verify-only legacy XMLDSig algorithm.
+    HmacSha1,
     /// RSA with SHA-1. **Verify-only** — signing disabled.
     RsaSha1,
     /// RSA with SHA-256 (most common in SAML).
@@ -64,15 +91,10 @@ pub enum SignatureAlgorithm {
     RsaSha384,
     /// RSA with SHA-512.
     RsaSha512,
-    /// ECDSA P-256 with SHA-256.
-    EcdsaP256Sha256,
-    /// XMLDSig `ecdsa-sha384` URI.
-    ///
-    /// The variant name is historical.
-    ///
-    /// Verification currently accepts this XMLDSig URI for P-384 and for the
-    /// donor P-521 interop case.
-    EcdsaP384Sha384,
+    /// ECDSA with SHA-256; the key selects the elliptic curve.
+    EcdsaSha256,
+    /// ECDSA with SHA-384; the key selects the elliptic curve.
+    EcdsaSha384,
 }
 
 impl SignatureAlgorithm {
@@ -80,12 +102,14 @@ impl SignatureAlgorithm {
     #[must_use]
     pub fn from_uri(uri: &str) -> Option<Self> {
         match uri {
+            "http://www.w3.org/2000/09/xmldsig#dsa-sha1" => Some(Self::DsaSha1),
+            "http://www.w3.org/2000/09/xmldsig#hmac-sha1" => Some(Self::HmacSha1),
             "http://www.w3.org/2000/09/xmldsig#rsa-sha1" => Some(Self::RsaSha1),
             "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256" => Some(Self::RsaSha256),
             "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384" => Some(Self::RsaSha384),
             "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512" => Some(Self::RsaSha512),
-            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256" => Some(Self::EcdsaP256Sha256),
-            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384" => Some(Self::EcdsaP384Sha384),
+            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256" => Some(Self::EcdsaSha256),
+            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384" => Some(Self::EcdsaSha384),
             _ => None,
         }
     }
@@ -94,29 +118,34 @@ impl SignatureAlgorithm {
     #[must_use]
     pub fn uri(self) -> &'static str {
         match self {
+            Self::DsaSha1 => "http://www.w3.org/2000/09/xmldsig#dsa-sha1",
+            Self::HmacSha1 => "http://www.w3.org/2000/09/xmldsig#hmac-sha1",
             Self::RsaSha1 => "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
             Self::RsaSha256 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
             Self::RsaSha384 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384",
             Self::RsaSha512 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512",
-            Self::EcdsaP256Sha256 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
-            Self::EcdsaP384Sha384 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
+            Self::EcdsaSha256 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
+            Self::EcdsaSha384 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
         }
     }
 
     /// Whether this algorithm is allowed for signing (not just verification).
     #[must_use]
     pub fn signing_allowed(self) -> bool {
-        !matches!(self, Self::RsaSha1)
+        !matches!(self, Self::RsaSha1 | Self::DsaSha1 | Self::HmacSha1)
     }
 }
 
 /// Parsed `<SignedInfo>` element.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct SignedInfo {
     /// Canonicalization method for SignedInfo itself.
     pub c14n_method: C14nAlgorithm,
     /// Signature algorithm.
     pub signature_method: SignatureAlgorithm,
+    /// Optional byte-aligned HMAC output length in bits.
+    pub hmac_output_length_bits: Option<usize>,
     /// One or more `<Reference>` elements.
     pub references: Vec<Reference>,
 }
@@ -158,12 +187,46 @@ pub enum KeyInfoSource {
     X509Data(X509DataInfo),
     /// `dsig11:DEREncodedKeyValue` source (base64-decoded DER bytes).
     DerEncodedKeyValue(Vec<u8>),
+    /// `<RetrievalMethod>` URI and optional type URI.
+    RetrievalMethod {
+        /// RFC 3986-resolved resource identity. Same-document fragments remain unchanged.
+        uri: String,
+        /// Declared resource type.
+        resource_type: Option<String>,
+        /// Supported transform shape declared by the retrieval method.
+        transforms: RetrievalMethodTransforms,
+    },
+}
+
+/// Transform forms accepted on `<RetrievalMethod>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RetrievalMethodTransforms {
+    /// No transform chain is present.
+    None,
+    /// Filter a same-document node-set to one `ds:X509Data`-rooted subtree.
+    X509DataNodeSetFilter,
+    /// A transform chain attached to a RetrievalMethod type this implementation
+    /// does not materialize. Resolvers may ignore this advisory key source and
+    /// continue with later `<KeyInfo>` children.
+    Unsupported,
 }
 
 /// Parsed `<KeyValue>` dispatch result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeyValueInfo {
+    /// `<DSAKeyValue>` public parameters.
+    Dsa {
+        /// Optional prime modulus P, present only together with Q.
+        p: Option<Vec<u8>>,
+        /// Optional prime divisor Q, present only together with P.
+        q: Option<Vec<u8>>,
+        /// Optional generator G.
+        g: Option<Vec<u8>>,
+        /// Public value Y.
+        y: Vec<u8>,
+    },
     /// `<RSAKeyValue>` with unsigned big-endian CryptoBinary parameters.
     Rsa {
         /// RSA modulus.
@@ -262,6 +325,10 @@ pub enum X509PublicKeyInfo {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParseError {
+    /// The selected cryptographic provider could not evaluate parsed key metadata.
+    #[error("cryptographic provider error: {0}")]
+    Provider(#[from] crate::provider::ProviderError),
+
     /// Missing required element.
     #[error("missing required element: <{element}>")]
     MissingElement {
@@ -368,14 +435,15 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
         SignatureAlgorithm::from_uri(sig_uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
             uri: sig_uri.to_string(),
         })?;
+    let hmac_output_length_bits = parse_hmac_output_length(sig_method_node, signature_method)?;
 
     // 3. One or more Reference elements
     let mut references = Vec::new();
     for child in children {
         verify_ds_element(child, "Reference")?;
-        if references.len() == MAX_REFERENCES_PER_SIGNATURE {
+        if references.len() == crate::hard_limits::SIGNATURE_REFERENCE_CEILING {
             return Err(ParseError::TooManyReferences {
-                max: MAX_REFERENCES_PER_SIGNATURE,
+                max: crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
             });
         }
         references.push(parse_reference_with_xpath_budget(child, xpath_budget)?);
@@ -389,8 +457,45 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
     Ok(SignedInfo {
         c14n_method,
         signature_method,
+        hmac_output_length_bits,
         references,
     })
+}
+
+fn parse_hmac_output_length(
+    node: Node<'_, '_>,
+    algorithm: SignatureAlgorithm,
+) -> Result<Option<usize>, ParseError> {
+    ensure_no_non_whitespace_text(node, "SignatureMethod")?;
+    let mut children = element_children(node);
+    let Some(child) = children.next() else {
+        return Ok(None);
+    };
+    if algorithm != SignatureAlgorithm::HmacSha1
+        || child.tag_name().namespace() != Some(XMLDSIG_NS)
+        || child.tag_name().name() != "HMACOutputLength"
+        || children.next().is_some()
+    {
+        return Err(ParseError::InvalidStructure(
+            "SignatureMethod parameters do not match the selected algorithm".into(),
+        ));
+    }
+    ensure_no_element_children(child, "HMACOutputLength")?;
+    let text =
+        collect_text_content_bounded(child, MAX_HMAC_OUTPUT_LENGTH_TEXT_LEN, "HMACOutputLength")?;
+    let bits = text
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| ParseError::InvalidStructure("invalid HMACOutputLength".into()))?;
+    // XMLDSig 1.1 section 6.3.1 requires HMAC truncation to end on a
+    // byte boundary because SignatureValue is encoded as complete octets:
+    // https://www.w3.org/TR/xmldsig-core1/#sec-HMAC
+    if !(80..=160).contains(&bits) || !bits.is_multiple_of(8) {
+        return Err(ParseError::InvalidStructure(
+            "HMACOutputLength must be a byte-aligned value from 80 through 160".into(),
+        ));
+    }
+    Ok(Some(bits))
 }
 
 /// Parse a single `<ds:Reference>` element.
@@ -417,20 +522,19 @@ pub(crate) fn parse_reference_with_xpath_budget(
 
     // Optional <Transforms>
     let mut transforms = Vec::new();
-    let mut next = children.next().ok_or(ParseError::MissingElement {
-        element: "DigestMethod",
-    })?;
+    let mut transform_error = None;
+    let (transforms_node, digest_method_node) =
+        reference_transforms_and_digest_method(&mut children)?;
 
-    if next.tag_name().name() == "Transforms" && next.tag_name().namespace() == Some(XMLDSIG_NS) {
-        transforms = transforms::parse_transforms_with_budget(next, xpath_budget)?;
-        next = children.next().ok_or(ParseError::MissingElement {
-            element: "DigestMethod",
-        })?;
+    if let Some(transforms_node) = transforms_node {
+        match transforms::parse_transforms_with_budget(transforms_node, xpath_budget) {
+            Ok(parsed) => transforms = parsed,
+            Err(error) => transform_error = Some(error),
+        }
     }
 
     // Required <DigestMethod>
-    verify_ds_element(next, "DigestMethod")?;
-    let digest_uri = required_algorithm_attr(next, "DigestMethod")?;
+    let digest_uri = required_algorithm_attr(digest_method_node, "DigestMethod")?;
     let digest_method =
         DigestAlgorithm::from_uri(digest_uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
             uri: digest_uri.to_string(),
@@ -451,6 +555,13 @@ pub(crate) fn parse_reference_with_xpath_budget(
         )));
     }
 
+    // Validate the complete Reference before reporting an unsupported transform.
+    // This prevents malformed DigestMethod/DigestValue content from being
+    // downgraded to a non-fatal unsupported Manifest transform result.
+    if let Some(error) = transform_error {
+        return Err(ParseError::Transform(error));
+    }
+
     Ok(Reference {
         uri,
         id,
@@ -459,6 +570,36 @@ pub(crate) fn parse_reference_with_xpath_budget(
         digest_method,
         digest_value,
     })
+}
+
+pub(crate) fn reference_digest_method(
+    reference_node: Node<'_, '_>,
+) -> Result<DigestAlgorithm, ParseError> {
+    verify_ds_element(reference_node, "Reference")?;
+    let mut children = element_children(reference_node);
+    let (_, digest_method_node) = reference_transforms_and_digest_method(&mut children)?;
+    let uri = required_algorithm_attr(digest_method_node, "DigestMethod")?;
+    DigestAlgorithm::from_uri(uri).ok_or_else(|| ParseError::UnsupportedAlgorithm {
+        uri: uri.to_owned(),
+    })
+}
+
+fn reference_transforms_and_digest_method<'a, 'input>(
+    children: &mut impl Iterator<Item = Node<'a, 'input>>,
+) -> Result<(Option<Node<'a, 'input>>, Node<'a, 'input>), ParseError> {
+    let first = children.next().ok_or(ParseError::MissingElement {
+        element: "DigestMethod",
+    })?;
+    let transforms_node = is_ds_element(first, "Transforms").then_some(first);
+    let digest_method_node = if transforms_node.is_some() {
+        children.next().ok_or(ParseError::MissingElement {
+            element: "DigestMethod",
+        })?
+    } else {
+        first
+    };
+    verify_ds_element(digest_method_node, "DigestMethod")?;
+    Ok((transforms_node, digest_method_node))
 }
 
 /// Parse `<ds:KeyInfo>` and dispatch supported child sources.
@@ -474,11 +615,33 @@ pub(crate) fn parse_reference_with_xpath_budget(
 /// rejected fail-closed.
 /// `<X509Data>` may still be empty or contain only non-XMLDSig extension children.
 pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
+    parse_key_info_with_provider(key_info_node, crate::provider::default_provider())
+}
+
+pub(crate) fn parse_key_info_with_provider(
+    key_info_node: Node,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<KeyInfo, ParseError> {
+    let xml_base_budget = XmlBaseResolutionBudget::default();
+    parse_key_info_with_provider_and_xml_base_budget(key_info_node, provider, &xml_base_budget)
+}
+
+pub(crate) fn parse_key_info_with_provider_and_xml_base_budget(
+    key_info_node: Node,
+    provider: &dyn crate::provider::CryptoProvider,
+    xml_base_budget: &XmlBaseResolutionBudget,
+) -> Result<KeyInfo, ParseError> {
     verify_ds_element(key_info_node, "KeyInfo")?;
     ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
 
     let mut sources = Vec::new();
-    for child in element_children(key_info_node) {
+    let mut x509_total_binary_len = 0usize;
+    for (index, child) in element_children(key_info_node).enumerate() {
+        if index >= MAX_KEY_INFO_CHILD_COUNT {
+            return Err(ParseError::InvalidStructure(
+                "KeyInfo contains too many child elements".into(),
+            ));
+        }
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "KeyName") => {
                 ensure_no_element_children(child, "KeyName")?;
@@ -491,8 +654,52 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
                 sources.push(KeyInfoSource::KeyValue(key_value));
             }
             (Some(XMLDSIG_NS), "X509Data") => {
-                let x509 = parse_x509_data_dispatch(child)?;
+                let x509 = parse_x509_data_dispatch_with_budget_and_provider(
+                    child,
+                    &mut x509_total_binary_len,
+                    provider,
+                )?;
                 sources.push(KeyInfoSource::X509Data(x509));
+            }
+            (Some(XMLDSIG_NS), "RetrievalMethod") => {
+                ensure_no_non_whitespace_text(child, "RetrievalMethod")?;
+                let lexical_uri = child.attribute("URI").ok_or_else(|| {
+                    ParseError::InvalidStructure("RetrievalMethod requires URI".into())
+                })?;
+                if lexical_uri.len() > MAX_KEY_NAME_TEXT_LEN {
+                    return Err(ParseError::InvalidStructure(
+                        "RetrievalMethod URI exceeds maximum length".into(),
+                    ));
+                }
+                let uri = if lexical_uri.is_empty() || lexical_uri.starts_with('#') {
+                    lexical_uri.to_owned()
+                } else {
+                    // RetrievalMethod is parsed independently from later key
+                    // materialization, so retain its resolved resource identity.
+                    resolve_uri_from_node_with_budget(child, lexical_uri, xml_base_budget)
+                        .map_err(|error| ParseError::InvalidStructure(error.to_string()))?
+                };
+                let resource_type = child.attribute("Type");
+                if resource_type.is_some_and(|value| value.len() > MAX_KEY_NAME_TEXT_LEN) {
+                    return Err(ParseError::InvalidStructure(
+                        "RetrievalMethod Type exceeds maximum length".into(),
+                    ));
+                }
+                let resource_type = resource_type.map(str::to_owned);
+                let transforms = if resource_type.as_deref()
+                    == Some("http://www.w3.org/2000/09/xmldsig#X509Data")
+                {
+                    parse_retrieval_method_transforms(child)?
+                } else if element_children(child).next().is_some() {
+                    RetrievalMethodTransforms::Unsupported
+                } else {
+                    RetrievalMethodTransforms::None
+                };
+                sources.push(KeyInfoSource::RetrievalMethod {
+                    uri,
+                    resource_type,
+                    transforms,
+                });
             }
             (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
                 ensure_no_element_children(child, "DEREncodedKeyValue")?;
@@ -504,6 +711,66 @@ pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
     }
 
     Ok(KeyInfo { sources })
+}
+
+fn parse_retrieval_method_transforms(
+    node: Node<'_, '_>,
+) -> Result<RetrievalMethodTransforms, ParseError> {
+    let mut children = element_children(node);
+    let Some(transforms) = children.next() else {
+        return Ok(RetrievalMethodTransforms::None);
+    };
+    if children.next().is_some()
+        || transforms.tag_name().namespace() != Some(XMLDSIG_NS)
+        || transforms.tag_name().name() != "Transforms"
+    {
+        return Err(ParseError::InvalidStructure(
+            "RetrievalMethod accepts only one optional ds:Transforms child".into(),
+        ));
+    }
+    ensure_no_non_whitespace_text(transforms, "Transforms")?;
+    let mut transform_children = element_children(transforms);
+    let transform = transform_children.next().ok_or_else(|| {
+        ParseError::InvalidStructure("RetrievalMethod Transforms must not be empty".into())
+    })?;
+    if transform_children.next().is_some()
+        || transform.tag_name().namespace() != Some(XMLDSIG_NS)
+        || transform.tag_name().name() != "Transform"
+        || transform.attribute("Algorithm") != Some(transforms::XPATH_TRANSFORM_URI)
+    {
+        return Err(ParseError::InvalidStructure(
+            "unsupported RetrievalMethod transform chain".into(),
+        ));
+    }
+    ensure_no_non_whitespace_text(transform, "Transform")?;
+    let mut parameters = element_children(transform);
+    let xpath = parameters.next().ok_or_else(|| {
+        ParseError::InvalidStructure("RetrievalMethod XPath parameter is missing".into())
+    })?;
+    if parameters.next().is_some()
+        || xpath.tag_name().namespace() != Some(XMLDSIG_NS)
+        || xpath.tag_name().name() != "XPath"
+    {
+        return Err(ParseError::InvalidStructure(
+            "unsupported RetrievalMethod transform chain".into(),
+        ));
+    }
+    ensure_no_element_children(xpath, "XPath")?;
+    let expression =
+        collect_text_content_bounded(xpath, MAX_RETRIEVAL_XPATH_TEXT_LEN, "RetrievalMethod XPath")?;
+    let expression = expression.trim();
+    let selects_x509_data = expression
+        .strip_prefix("ancestor-or-self::")
+        .and_then(|step| step.split_once(':'))
+        .is_some_and(|(prefix, local)| {
+            local == "X509Data" && xpath.lookup_namespace_uri(Some(prefix)) == Some(XMLDSIG_NS)
+        });
+    if !selects_x509_data {
+        return Err(ParseError::InvalidStructure(
+            "unsupported RetrievalMethod XPath selection".into(),
+        ));
+    }
+    Ok(RetrievalMethodTransforms::X509DataNodeSetFilter)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -613,12 +880,64 @@ fn parse_key_value_dispatch(node: Node) -> Result<KeyValueInfo, ParseError> {
         first_child.tag_name().name(),
     ) {
         (Some(XMLDSIG_NS), "RSAKeyValue") => parse_rsa_key_value(first_child),
+        (Some(XMLDSIG_NS), "DSAKeyValue") => parse_dsa_key_value(first_child),
         (Some(XMLDSIG11_NS), "ECKeyValue") => parse_ec_key_value(first_child),
         (namespace, child_name) => Ok(KeyValueInfo::Unsupported {
             namespace: namespace.map(str::to_string),
             local_name: child_name.to_string(),
         }),
     }
+}
+
+fn parse_dsa_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
+    verify_ds_element(node, "DSAKeyValue")?;
+    ensure_no_non_whitespace_text(node, "DSAKeyValue")?;
+    let children = element_children(node).collect::<Vec<_>>();
+    let mut index = 0;
+    let p = take_dsa_crypto_binary(&children, &mut index, "P")?;
+    let q = take_dsa_crypto_binary(&children, &mut index, "Q")?;
+    if p.is_some() != q.is_some() {
+        return Err(ParseError::InvalidStructure(
+            "DSAKeyValue P and Q must be present together".into(),
+        ));
+    }
+    let g = take_dsa_crypto_binary(&children, &mut index, "G")?;
+    let y = take_dsa_crypto_binary(&children, &mut index, "Y")?
+        .ok_or_else(|| ParseError::InvalidStructure("DSAKeyValue requires Y".into()))?;
+    let _j = take_dsa_crypto_binary(&children, &mut index, "J")?;
+    let seed = take_dsa_crypto_binary(&children, &mut index, "Seed")?;
+    let counter = take_dsa_crypto_binary(&children, &mut index, "PgenCounter")?;
+    if seed.is_some() != counter.is_some() {
+        return Err(ParseError::InvalidStructure(
+            "DSAKeyValue Seed and PgenCounter must be present together".into(),
+        ));
+    }
+    if index != children.len() {
+        return Err(ParseError::InvalidStructure(
+            "DSAKeyValue children do not match the XMLDSig schema order".into(),
+        ));
+    }
+    Ok(KeyValueInfo::Dsa { p, q, g, y })
+}
+
+fn take_dsa_crypto_binary(
+    children: &[Node<'_, '_>],
+    index: &mut usize,
+    name: &'static str,
+) -> Result<Option<Vec<u8>>, ParseError> {
+    let Some(&child) = children.get(*index) else {
+        return Ok(None);
+    };
+    if !is_ds_element(child, name) {
+        return Ok(None);
+    }
+    *index += 1;
+    ensure_no_element_children(child, name)?;
+    decode_crypto_binary(child, name, MAX_RSA_MODULUS_LEN).map(Some)
+}
+
+fn is_ds_element(node: Node<'_, '_>, name: &str) -> bool {
+    node.tag_name().namespace() == Some(XMLDSIG_NS) && node.tag_name().name() == name
 }
 
 fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
@@ -760,7 +1079,11 @@ fn decode_crypto_binary(
 
     let max_base64_len = max_decoded_len.div_ceil(3) * 4;
     let mut cleaned = String::with_capacity(max_base64_len);
-    for text in node.children().filter_map(|child| child.text()) {
+    for text in node
+        .children()
+        .filter(|child| child.is_text())
+        .filter_map(|child| child.text())
+    {
         normalize_xml_base64_text_with_limit(text, &mut cleaned, max_base64_len).map_err(
             |err| match err {
                 XmlBase64NormalizeLimitedError::InvalidWhitespace(err) => {
@@ -792,19 +1115,22 @@ fn decode_crypto_binary(
     Ok(value)
 }
 
-fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
+pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
+    node: Node,
+    total_binary_len: &mut usize,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<X509DataInfo, ParseError> {
     verify_ds_element(node, "X509Data")?;
     ensure_no_non_whitespace_text(node, "X509Data")?;
 
     let mut info = X509DataInfo::default();
-    let mut total_binary_len = 0usize;
     for child in element_children(node) {
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "X509Certificate") => {
                 ensure_no_element_children(child, "X509Certificate")?;
                 ensure_x509_data_entry_budget(&info)?;
                 let cert = decode_x509_base64(child, "X509Certificate")?;
-                add_x509_data_usage(&mut total_binary_len, cert.len())?;
+                add_x509_data_usage(total_binary_len, cert.len())?;
                 let parsed_cert = parse_x509_certificate(cert.as_slice())?;
                 info.parsed_certificates.push(parsed_cert);
                 info.certificates.push(cert);
@@ -828,14 +1154,14 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
                 ensure_no_element_children(child, "X509SKI")?;
                 ensure_x509_data_entry_budget(&info)?;
                 let ski = decode_x509_base64(child, "X509SKI")?;
-                add_x509_data_usage(&mut total_binary_len, ski.len())?;
+                add_x509_data_usage(total_binary_len, ski.len())?;
                 info.skis.push(ski);
             }
             (Some(XMLDSIG_NS), "X509CRL") => {
                 ensure_no_element_children(child, "X509CRL")?;
                 ensure_x509_data_entry_budget(&info)?;
                 let crl = decode_x509_base64(child, "X509CRL")?;
-                add_x509_data_usage(&mut total_binary_len, crl.len())?;
+                add_x509_data_usage(total_binary_len, crl.len())?;
                 info.crls.push(crl);
             }
             (Some(XMLDSIG11_NS), "X509Digest") => {
@@ -843,7 +1169,7 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
                 ensure_x509_data_entry_budget(&info)?;
                 let algorithm = required_algorithm_attr(child, "X509Digest")?;
                 let digest = decode_x509_base64(child, "X509Digest")?;
-                add_x509_data_usage(&mut total_binary_len, digest.len())?;
+                add_x509_data_usage(total_binary_len, digest.len())?;
                 info.digests.push((algorithm.to_string(), digest));
             }
             (Some(XMLDSIG_NS), child_name) | (Some(XMLDSIG11_NS), child_name) => {
@@ -855,30 +1181,79 @@ fn parse_x509_data_dispatch(node: Node) -> Result<X509DataInfo, ParseError> {
         }
     }
 
-    info.certificate_chain = build_x509_certificate_chain(&info)?;
+    info.certificate_chain = build_x509_certificate_chain(&info, provider)?;
     Ok(info)
 }
 
-fn build_x509_certificate_chain(info: &X509DataInfo) -> Result<Vec<usize>, ParseError> {
+fn build_x509_certificate_chain(
+    info: &X509DataInfo,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<Vec<usize>, ParseError> {
     if info.parsed_certificates.is_empty() {
         return Ok(Vec::new());
     }
 
-    let signing_idx = select_x509_signing_certificate(info)?;
+    let signing_idx = select_x509_signing_certificate(info, provider)?;
+    build_x509_certificate_chain_from(info, signing_idx, provider).map_err(ParseError::from)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum X509ChainBuildError {
+    InconsistentMetadata,
+    DepthExceeded,
+    Cycle,
+    IssuerSignatureMismatch,
+    AmbiguousIssuer,
+    UnsupportedSignatureAlgorithm { oid: String },
+    Provider(crate::provider::ProviderError),
+}
+
+impl From<X509ChainBuildError> for ParseError {
+    fn from(error: X509ChainBuildError) -> Self {
+        let reason = match error {
+            X509ChainBuildError::InconsistentMetadata => {
+                "X509Data certificate metadata is inconsistent"
+            }
+            X509ChainBuildError::DepthExceeded => {
+                "X509Data certificate chain exceeds maximum depth"
+            }
+            X509ChainBuildError::Cycle => "X509Data certificate chain contains a cycle",
+            X509ChainBuildError::IssuerSignatureMismatch => {
+                "X509Data issuer candidates do not verify the certificate signature"
+            }
+            X509ChainBuildError::AmbiguousIssuer => {
+                "X509Data certificate chain contains ambiguous issuer certificates"
+            }
+            X509ChainBuildError::UnsupportedSignatureAlgorithm { oid } => {
+                return Self::InvalidStructure(format!(
+                    "X509Data certificate chain uses unsupported signature algorithm {oid}"
+                ));
+            }
+            X509ChainBuildError::Provider(error) => return Self::Provider(error),
+        };
+        Self::InvalidStructure(reason.into())
+    }
+}
+
+/// Order an available certificate pool from a preselected signing certificate.
+pub(crate) fn build_x509_certificate_chain_from(
+    info: &X509DataInfo,
+    signing_idx: usize,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<Vec<usize>, X509ChainBuildError> {
+    if signing_idx >= info.parsed_certificates.len()
+        || info.parsed_certificates.len() != info.certificates.len()
+    {
+        return Err(X509ChainBuildError::InconsistentMetadata);
+    }
     let mut chain = vec![signing_idx];
 
     loop {
-        if chain.len() > MAX_X509_CHAIN_DEPTH {
-            return Err(ParseError::InvalidStructure(
-                "X509Data certificate chain exceeds maximum depth".into(),
-            ));
-        }
-
         let current_idx = *chain
             .last()
             .expect("chain starts with signing certificate index");
         let current = &info.parsed_certificates[current_idx];
-        if current.subject_dn == current.issuer_dn {
+        if distinguished_names_equal(&current.subject_dn, &current.issuer_dn) {
             break;
         }
 
@@ -886,37 +1261,233 @@ fn build_x509_certificate_chain(info: &X509DataInfo) -> Result<Vec<usize>, Parse
             .parsed_certificates
             .iter()
             .enumerate()
-            .filter(|(idx, cert)| *idx != current_idx && cert.subject_dn == current.issuer_dn)
+            .filter(|(idx, cert)| {
+                *idx != current_idx
+                    && distinguished_names_equal(&cert.subject_dn, &current.issuer_dn)
+            })
             .map(|(idx, _)| idx)
             .collect::<Vec<_>>();
 
-        match candidates.as_slice() {
+        let issuer_idx = match candidates.as_slice() {
             [] => break,
-            [issuer_idx] => {
-                if chain.contains(issuer_idx) {
-                    return Err(ParseError::InvalidStructure(
-                        "X509Data certificate chain contains a cycle".into(),
-                    ));
-                }
-                if chain.len() == MAX_X509_CHAIN_DEPTH {
-                    return Err(ParseError::InvalidStructure(
-                        "X509Data certificate chain exceeds maximum depth".into(),
-                    ));
-                }
-                chain.push(*issuer_idx);
-            }
+            [issuer_idx] => *issuer_idx,
             _ => {
-                return Err(ParseError::InvalidStructure(
-                    "X509Data certificate chain contains ambiguous issuer certificates".into(),
-                ));
+                let mut verified = Vec::new();
+                let mut unsupported_oid = None;
+                for issuer_idx in candidates {
+                    match certificate_signature_matches_with_provider(
+                        &info.certificates[current_idx],
+                        &info.certificates[issuer_idx],
+                        provider,
+                    ) {
+                        Ok(true) => verified.push(issuer_idx),
+                        Ok(false) => {}
+                        Err(super::X509ChainError::Provider(
+                            crate::provider::ProviderError::Unsupported {
+                                operation: crate::provider::ProviderOperation::VerifyCertificate,
+                                algorithm: Some(oid),
+                            },
+                        )) => {
+                            unsupported_oid.get_or_insert(oid);
+                        }
+                        Err(super::X509ChainError::Provider(error)) => {
+                            return Err(X509ChainBuildError::Provider(error));
+                        }
+                        Err(super::X509ChainError::UnsupportedSignatureAlgorithm { oid }) => {
+                            unsupported_oid.get_or_insert(oid);
+                        }
+                        Err(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
+                    }
+                }
+                match verified.as_slice() {
+                    [issuer_idx] => *issuer_idx,
+                    [] => {
+                        if let Some(oid) = unsupported_oid {
+                            return Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { oid });
+                        }
+                        return Err(X509ChainBuildError::IssuerSignatureMismatch);
+                    }
+                    _ => return Err(X509ChainBuildError::AmbiguousIssuer),
+                }
             }
+        };
+        if chain.contains(&issuer_idx) {
+            return Err(X509ChainBuildError::Cycle);
         }
+        if chain.len() == crate::hard_limits::X509_CHAIN_DEPTH_CEILING {
+            return Err(X509ChainBuildError::DepthExceeded);
+        }
+        chain.push(issuer_idx);
     }
 
     Ok(chain)
 }
 
-fn select_x509_signing_certificate(info: &X509DataInfo) -> Result<usize, ParseError> {
+/// Enumerate signature-valid certificate paths that terminate at a certificate
+/// in the trusted prefix. Trust and certificate policy are intentionally not
+/// assigned here; callers must fully validate every returned candidate.
+pub(crate) fn build_x509_certificate_paths_to_trusted_prefix(
+    info: &X509DataInfo,
+    signing_idx: usize,
+    trusted_prefix_len: usize,
+    max_depth: usize,
+    max_candidate_paths: usize,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
+    if trusted_prefix_len > info.certificates.len() {
+        return Err(X509ChainBuildError::InconsistentMetadata);
+    }
+    build_x509_certificate_paths(
+        info,
+        signing_idx,
+        |index| index < trusted_prefix_len,
+        false,
+        max_depth,
+        max_candidate_paths,
+        provider,
+    )
+}
+
+/// Enumerate signature-valid paths that reach any candidate selector target.
+/// A matching intermediate is retained as a candidate and traversal continues
+/// so callers can test selector categories against every longer path as well.
+pub(crate) fn build_x509_certificate_paths_to_selector_targets(
+    info: &X509DataInfo,
+    signing_idx: usize,
+    targets: &[usize],
+    max_depth: usize,
+    max_candidate_paths: usize,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
+    if targets
+        .iter()
+        .any(|index| *index >= info.certificates.len())
+    {
+        return Err(X509ChainBuildError::InconsistentMetadata);
+    }
+    build_x509_certificate_paths(
+        info,
+        signing_idx,
+        |index| targets.contains(&index),
+        true,
+        max_depth,
+        max_candidate_paths,
+        provider,
+    )
+}
+
+fn build_x509_certificate_paths(
+    info: &X509DataInfo,
+    signing_idx: usize,
+    is_terminal: impl Fn(usize) -> bool,
+    continue_after_terminal: bool,
+    max_depth: usize,
+    max_candidate_paths: usize,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<Vec<Vec<usize>>, X509ChainBuildError> {
+    if signing_idx >= info.parsed_certificates.len()
+        || info.parsed_certificates.len() != info.certificates.len()
+    {
+        return Err(X509ChainBuildError::InconsistentMetadata);
+    }
+    if max_candidate_paths == 0 {
+        return Err(X509ChainBuildError::AmbiguousIssuer);
+    }
+
+    let mut pending = vec![vec![signing_idx]];
+    let mut completed = Vec::new();
+    let mut generated_paths = 1usize;
+    let mut depth_exceeded = false;
+    let mut unsupported_oid = None;
+    let mut issuer_cache = vec![None; info.parsed_certificates.len()];
+    while let Some(path) = pending.pop() {
+        let current_idx = *path
+            .last()
+            .expect("candidate path starts with signing certificate index");
+        if is_terminal(current_idx) {
+            completed.push(path.clone());
+            if !continue_after_terminal {
+                continue;
+            }
+        }
+        if path.len() == max_depth {
+            depth_exceeded = true;
+            continue;
+        }
+
+        let current = &info.parsed_certificates[current_idx];
+        if issuer_cache[current_idx].is_none() {
+            let mut verified = Vec::new();
+            for (issuer_idx, issuer) in info.parsed_certificates.iter().enumerate() {
+                if !distinguished_names_equal(&issuer.subject_dn, &current.issuer_dn) {
+                    continue;
+                }
+                match certificate_signature_matches_with_provider(
+                    &info.certificates[current_idx],
+                    &info.certificates[issuer_idx],
+                    provider,
+                ) {
+                    Ok(true) => verified.push(issuer_idx),
+                    Ok(false) => {}
+                    Err(super::X509ChainError::Provider(
+                        crate::provider::ProviderError::Unsupported {
+                            operation: crate::provider::ProviderOperation::VerifyCertificate,
+                            algorithm: Some(oid),
+                        },
+                    )) => {
+                        // Provider capability can depend on the issuer SPKI,
+                        // so retain the diagnostic but try every same-DN key.
+                        unsupported_oid.get_or_insert(oid);
+                        continue;
+                    }
+                    Err(super::X509ChainError::Provider(error)) => {
+                        return Err(X509ChainBuildError::Provider(error));
+                    }
+                    Err(super::X509ChainError::UnsupportedSignatureAlgorithm { oid }) => {
+                        // The mapper rejected this child's AlgorithmIdentifier;
+                        // no issuer candidate can alter it on the current path.
+                        unsupported_oid.get_or_insert(oid);
+                        break;
+                    }
+                    Err(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
+                }
+            }
+            issuer_cache[current_idx] = Some(verified);
+        }
+        let issuers = issuer_cache[current_idx]
+            .as_ref()
+            .expect("issuer cache entry was initialized");
+        let issuers = issuers
+            .iter()
+            .copied()
+            .filter(|issuer_idx| !path.contains(issuer_idx))
+            .collect::<Vec<_>>();
+        if generated_paths.saturating_add(issuers.len()) > max_candidate_paths {
+            return Err(X509ChainBuildError::AmbiguousIssuer);
+        }
+        generated_paths += issuers.len();
+        for issuer_idx in issuers {
+            let mut candidate = path.clone();
+            candidate.push(issuer_idx);
+            pending.push(candidate);
+        }
+    }
+
+    if completed.is_empty() {
+        if let Some(oid) = unsupported_oid {
+            return Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { oid });
+        }
+        if depth_exceeded {
+            return Err(X509ChainBuildError::DepthExceeded);
+        }
+    }
+    Ok(completed)
+}
+
+fn select_x509_signing_certificate(
+    info: &X509DataInfo,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<usize, ParseError> {
     let has_lookup_identifiers = x509_data_has_lookup_identifiers(info);
     let mut candidates = Vec::new();
     if has_lookup_identifiers {
@@ -926,11 +1497,11 @@ fn select_x509_signing_certificate(info: &X509DataInfo) -> Result<usize, ParseEr
             .zip(&info.certificates)
             .enumerate()
         {
-            if x509_certificate_matches_any_selector(info, parsed, der)? {
+            if x509_certificate_matches_any_selector(info, parsed, der, provider)? {
                 candidates.push(idx);
             }
         }
-        if !x509_selector_categories_match_chain(info)? {
+        if !x509_selector_categories_match_chain(info, provider)? {
             return Err(ParseError::InvalidStructure(
                 "X509Data lookup identifiers do not match the embedded certificate chain".into(),
             ));
@@ -953,11 +1524,11 @@ fn select_x509_signing_certificate(info: &X509DataInfo) -> Result<usize, ParseEr
         .iter()
         .enumerate()
         .filter(|(_, cert)| {
-            cert.subject_dn != cert.issuer_dn
+            !distinguished_names_equal(&cert.subject_dn, &cert.issuer_dn)
                 && !info
                     .parsed_certificates
                     .iter()
-                    .any(|other| other.issuer_dn == cert.subject_dn)
+                    .any(|other| distinguished_names_equal(&other.issuer_dn, &cert.subject_dn))
         })
         .map(|(idx, _)| idx)
         .collect::<Vec<_>>();
@@ -997,11 +1568,12 @@ pub(crate) fn x509_certificate_matches_any_selector(
     info: &X509DataInfo,
     certificate: &ParsedX509Certificate,
     certificate_der: &[u8],
+    provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<bool, ParseError> {
     let subject_match = info
         .subject_names
         .iter()
-        .any(|subject| subject.trim() == certificate.subject_dn);
+        .any(|subject| distinguished_names_equal(subject, &certificate.subject_dn));
     let mut issuer_serial_match = false;
     for (issuer, serial) in &info.issuer_serials {
         let serial_hex = x509_serial_decimal_to_hex(serial).ok_or_else(|| {
@@ -1009,8 +1581,8 @@ pub(crate) fn x509_certificate_matches_any_selector(
                 "X509Data lookup identifiers contain an invalid serial number".into(),
             )
         })?;
-        issuer_serial_match |=
-            issuer.trim() == certificate.issuer_dn && serial_hex == certificate.serial_number_hex;
+        issuer_serial_match |= distinguished_names_equal(issuer, &certificate.issuer_dn)
+            && serial_hex == certificate.serial_number_hex;
     }
     let ski_match = certificate
         .subject_key_identifier
@@ -1023,18 +1595,22 @@ pub(crate) fn x509_certificate_matches_any_selector(
                 uri: algorithm_uri.clone(),
             }
         })?;
-        digest_match |= constant_time_eq(&compute_digest(algorithm, certificate_der), expected);
+        digest_match |= constant_time_eq(
+            &compute_digest_with_provider(provider, algorithm, certificate_der)?,
+            expected,
+        );
     }
     Ok(subject_match || issuer_serial_match || ski_match || digest_match)
 }
 
 pub(crate) fn x509_selector_categories_match_chain(
     info: &X509DataInfo,
+    provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<bool, ParseError> {
     let subject_match = info.subject_names.iter().all(|subject| {
         info.parsed_certificates
             .iter()
-            .any(|certificate| subject.trim() == certificate.subject_dn)
+            .any(|certificate| distinguished_names_equal(subject, &certificate.subject_dn))
     });
 
     let mut issuer_serial_match = true;
@@ -1045,7 +1621,8 @@ pub(crate) fn x509_selector_categories_match_chain(
             )
         })?;
         issuer_serial_match &= info.parsed_certificates.iter().any(|certificate| {
-            issuer.trim() == certificate.issuer_dn && serial_hex == certificate.serial_number_hex
+            distinguished_names_equal(issuer, &certificate.issuer_dn)
+                && serial_hex == certificate.serial_number_hex
         });
     }
 
@@ -1065,13 +1642,187 @@ pub(crate) fn x509_selector_categories_match_chain(
                 uri: algorithm_uri.clone(),
             }
         })?;
-        digest_match &= info
-            .certificates
-            .iter()
-            .any(|certificate| constant_time_eq(&compute_digest(algorithm, certificate), expected));
+        let mut category_match = false;
+        for certificate in &info.certificates {
+            category_match |= constant_time_eq(
+                &compute_digest_with_provider(provider, algorithm, certificate)?,
+                expected,
+            );
+        }
+        digest_match &= category_match;
     }
 
     Ok(subject_match && issuer_serial_match && ski_match && digest_match)
+}
+
+fn x509_attribute_values_equal(
+    left: &x509_cert::attr::AttributeTypeAndValue,
+    right: &x509_cert::attr::AttributeTypeAndValue,
+) -> bool {
+    if left.oid != right.oid {
+        return false;
+    }
+    const EMAIL_ADDRESS: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.1");
+    const DOMAIN_COMPONENT: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("0.9.2342.19200300.100.1.25");
+    if left.oid == EMAIL_ADDRESS {
+        let (Ok(left), Ok(right)) = (
+            Ia5StringRef::try_from(&left.value),
+            Ia5StringRef::try_from(&right.value),
+        ) else {
+            return false;
+        };
+        let (Some((left_local, left_domain)), Some((right_local, right_domain))) = (
+            left.as_str().rsplit_once('@'),
+            right.as_str().rsplit_once('@'),
+        ) else {
+            return false;
+        };
+        return left_local == right_local && left_domain.eq_ignore_ascii_case(right_domain);
+    }
+    if left.oid == DOMAIN_COMPONENT {
+        let (Ok(left), Ok(right)) = (
+            Ia5StringRef::try_from(&left.value),
+            Ia5StringRef::try_from(&right.value),
+        ) else {
+            return false;
+        };
+        return left.as_str().eq_ignore_ascii_case(right.as_str());
+    }
+    match (
+        DirectoryString::try_from(&left.value),
+        DirectoryString::try_from(&right.value),
+    ) {
+        (Ok(left), Ok(right)) => {
+            // RFC 5280 section 7.1 requires caseIgnoreMatch with LDAP/X.520
+            // string preparation for PrintableString and UTF8String names.
+            let Ok(left) =
+                x520_stringprep::x520_stringprep_to_case_ignore_string(left.value().as_ref())
+            else {
+                return false;
+            };
+            let Ok(right) =
+                x520_stringprep::x520_stringprep_to_case_ignore_string(right.value().as_ref())
+            else {
+                return false;
+            };
+            left.trim_matches(' ') == right.trim_matches(' ')
+        }
+        _ => left.value == right.value,
+    }
+}
+
+fn x509_rdns_equal(
+    left: &x509_cert::name::RelativeDistinguishedName,
+    right: &x509_cert::name::RelativeDistinguishedName,
+) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    // A DN is an ordered RDN sequence, but each individual RDN is a set.
+    let right = right.iter().collect::<Vec<_>>();
+    let mut matched = vec![false; right.len()];
+    left.iter().all(|left_attribute| {
+        right
+            .iter()
+            .enumerate()
+            .find(|(index, right_attribute)| {
+                !matched[*index] && x509_attribute_values_equal(left_attribute, right_attribute)
+            })
+            .is_some_and(|(index, _)| {
+                matched[index] = true;
+                true
+            })
+    })
+}
+
+fn trailing_whitespace_is_escaped(value: &str) -> bool {
+    let Some((&last, prefix)) = value.as_bytes().split_last() else {
+        return false;
+    };
+    if !matches!(last, b' ' | b'\t' | b'\r' | b'\n') {
+        return false;
+    }
+    prefix
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn parse_distinguished_name(value: &str) -> Option<Name> {
+    let mut normalized = String::with_capacity(value.len());
+    let mut chars = value
+        .trim_start_matches([' ', '\t', '\r', '\n'])
+        .chars()
+        .peekable();
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            normalized.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            normalized.push(ch);
+            escaped = true;
+            continue;
+        }
+        if matches!(ch, ',' | '+') {
+            while normalized
+                .chars()
+                .next_back()
+                .is_some_and(|last| matches!(last, ' ' | '\t' | '\r' | '\n'))
+                && !trailing_whitespace_is_escaped(&normalized)
+            {
+                normalized.pop();
+            }
+            normalized.push(ch);
+            while chars
+                .next_if(|next| matches!(next, ' ' | '\t' | '\r' | '\n'))
+                .is_some()
+            {}
+            continue;
+        }
+        normalized.push(ch);
+    }
+
+    while normalized
+        .chars()
+        .next_back()
+        .is_some_and(|last| matches!(last, ' ' | '\t' | '\r' | '\n'))
+        && !trailing_whitespace_is_escaped(&normalized)
+    {
+        normalized.pop();
+    }
+    normalized.parse().ok()
+}
+
+pub(crate) fn distinguished_names_equal(left: &str, right: &str) -> bool {
+    parse_distinguished_name(left)
+        .zip(parse_distinguished_name(right))
+        .is_some_and(|(left, right)| {
+            left.len() == right.len()
+                && left
+                    .iter_rdn()
+                    .zip(right.iter_rdn())
+                    .all(|(left, right)| x509_rdns_equal(left, right))
+        })
+}
+
+pub(crate) fn distinguished_name_within_subtree(name: &str, subtree: &str) -> bool {
+    parse_distinguished_name(name)
+        .zip(parse_distinguished_name(subtree))
+        .is_some_and(|(name, subtree)| {
+            subtree.len() <= name.len()
+                && name
+                    .iter_rdn()
+                    .zip(subtree.iter_rdn())
+                    .all(|(name, subtree)| x509_rdns_equal(name, subtree))
+        })
 }
 
 fn ensure_x509_data_entry_budget(info: &X509DataInfo) -> Result<(), ParseError> {
@@ -1161,8 +1912,12 @@ pub(crate) fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certif
         ));
     }
 
-    let subject_dn = cert.subject().to_string();
-    let issuer_dn = cert.issuer().to_string();
+    // x509-parser displays the DER RDN sequence in storage order, while
+    // XMLDSig names follow RFC 4514 and serialize that sequence in reverse.
+    // Normalize at the certificate boundary so matching remains ordered and
+    // cannot confuse a DN with another hierarchy containing reversed RDNs.
+    let subject_dn = x509_name_to_rfc4514(cert.subject())?;
+    let issuer_dn = x509_name_to_rfc4514(cert.issuer())?;
     let serial_number = cert.tbs_certificate.raw_serial().to_vec();
     let serial_number_hex = format_x509_serial_value_hex(&serial_number);
 
@@ -1220,6 +1975,15 @@ pub(crate) fn parse_x509_certificate(cert_der: &[u8]) -> Result<ParsedX509Certif
     })
 }
 
+pub(crate) fn x509_name_to_rfc4514(name: &X509Name<'_>) -> Result<String, ParseError> {
+    let name = Name::from_der(name.as_raw()).map_err(|error| {
+        ParseError::InvalidStructure(format!(
+            "X509Certificate distinguished name is invalid DER: {error}"
+        ))
+    })?;
+    Ok(name.to_string())
+}
+
 fn format_x509_serial_hex(serial: &[u8]) -> String {
     serial
         .iter()
@@ -1243,11 +2007,15 @@ fn format_x509_serial_value_hex(serial: &[u8]) -> String {
 fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
     let serial = serial.trim();
     let serial = serial.strip_prefix('+').unwrap_or(serial);
-    if serial.is_empty() || !serial.bytes().all(|byte| byte.is_ascii_digit()) {
+    let serial = serial.trim_start_matches('0');
+    let serial = if serial.is_empty() { "0" } else { serial };
+    if serial.len() > MAX_X509_SERIAL_NUMBER_VALUE_DIGITS
+        || !serial.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
 
-    let mut bytes = Vec::<u8>::new();
+    let mut bytes = [0_u8; MAX_X509_SERIAL_NUMBER_BYTES];
     for digit in serial.bytes().map(|byte| byte - b'0') {
         let mut carry = u16::from(digit);
         for byte in bytes.iter_mut().rev() {
@@ -1255,10 +2023,13 @@ fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
             *byte = value as u8;
             carry = value >> 8;
         }
-        while carry > 0 {
-            bytes.insert(0, carry as u8);
-            carry >>= 8;
+        if carry != 0 {
+            return None;
         }
+    }
+
+    if bytes.iter().all(|byte| *byte == 0) {
+        return None;
     }
 
     Some(format_x509_serial_value_hex(&bytes))
@@ -1312,12 +2083,8 @@ fn parse_x509_issuer_serial(node: Node<'_, '_>) -> Result<(String, String), Pars
 
     let serial_node = children[1];
     ensure_no_element_children(serial_node, "X509SerialNumber")?;
-    let serial_number = collect_text_content_bounded(
-        serial_node,
-        MAX_X509_SERIAL_NUMBER_TEXT_LEN,
-        "X509SerialNumber",
-    )?;
-    if issuer_name.trim().is_empty() || serial_number.trim().is_empty() {
+    let serial_number = collect_x509_serial_number(serial_node)?;
+    if issuer_name.trim().is_empty() {
         return Err(ParseError::InvalidStructure(
             "X509IssuerSerial requires non-empty X509IssuerName and X509SerialNumber".into(),
         ));
@@ -1458,6 +2225,67 @@ fn collect_text_content_bounded(
     Ok(text)
 }
 
+fn collect_x509_serial_number(node: Node<'_, '_>) -> Result<String, ParseError> {
+    let mut serial = String::with_capacity(MAX_X509_SERIAL_NUMBER_VALUE_DIGITS);
+    let mut raw_text_len = 0usize;
+    let mut trailing_whitespace = false;
+    let mut explicit_positive = false;
+    let mut saw_digit = false;
+
+    for chunk in node
+        .children()
+        .filter_map(|child| child.is_text().then(|| child.text()).flatten())
+    {
+        raw_text_len = raw_text_len.saturating_add(chunk.len());
+        if raw_text_len > MAX_X509_SERIAL_NUMBER_RAW_TEXT_LEN {
+            return Err(ParseError::InvalidStructure(
+                "X509SerialNumber exceeds maximum allowed text length".into(),
+            ));
+        }
+        for byte in chunk.bytes() {
+            if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                trailing_whitespace |= explicit_positive || saw_digit;
+                continue;
+            }
+            if byte == b'+' && !saw_digit && !explicit_positive && !trailing_whitespace {
+                explicit_positive = true;
+                continue;
+            }
+            if trailing_whitespace || !byte.is_ascii_digit() {
+                return Err(ParseError::InvalidStructure(
+                    "invalid X509SerialNumber decimal value".into(),
+                ));
+            }
+            saw_digit = true;
+            if byte == b'0' && serial.is_empty() {
+                continue;
+            }
+            if serial.len() == MAX_X509_SERIAL_NUMBER_VALUE_DIGITS {
+                return Err(ParseError::InvalidStructure(
+                    "X509SerialNumber exceeds maximum allowed decimal value".into(),
+                ));
+            }
+            serial.push(char::from(byte));
+        }
+    }
+
+    if !saw_digit {
+        return Err(ParseError::InvalidStructure(
+            "X509IssuerSerial requires non-empty X509IssuerName and X509SerialNumber".into(),
+        ));
+    }
+    if serial.is_empty() {
+        serial.push('0');
+    }
+    if x509_serial_decimal_to_hex(&serial).is_none() {
+        return Err(ParseError::InvalidStructure(
+            "invalid X509SerialNumber decimal value or RFC 5280 range".into(),
+        ));
+    }
+
+    Ok(serial)
+}
+
 fn ensure_no_element_children(node: Node<'_, '_>, element_name: &str) -> Result<(), ParseError> {
     if node.children().any(|child| child.is_element()) {
         return Err(ParseError::InvalidStructure(format!(
@@ -1535,7 +2363,7 @@ mod tests {
     fn signature_algorithm_from_uri_ecdsa_sha256() {
         assert_eq!(
             SignatureAlgorithm::from_uri("http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"),
-            Some(SignatureAlgorithm::EcdsaP256Sha256)
+            Some(SignatureAlgorithm::EcdsaSha256)
         );
     }
 
@@ -1550,12 +2378,14 @@ mod tests {
     #[test]
     fn signature_algorithm_uri_round_trip() {
         for algo in [
+            SignatureAlgorithm::DsaSha1,
+            SignatureAlgorithm::HmacSha1,
             SignatureAlgorithm::RsaSha1,
             SignatureAlgorithm::RsaSha256,
             SignatureAlgorithm::RsaSha384,
             SignatureAlgorithm::RsaSha512,
-            SignatureAlgorithm::EcdsaP256Sha256,
-            SignatureAlgorithm::EcdsaP384Sha384,
+            SignatureAlgorithm::EcdsaSha256,
+            SignatureAlgorithm::EcdsaSha384,
         ] {
             assert_eq!(
                 SignatureAlgorithm::from_uri(algo.uri()),
@@ -1566,10 +2396,12 @@ mod tests {
     }
 
     #[test]
-    fn rsa_sha1_verify_only() {
+    fn legacy_algorithms_are_verify_only() {
+        assert!(!SignatureAlgorithm::DsaSha1.signing_allowed());
+        assert!(!SignatureAlgorithm::HmacSha1.signing_allowed());
         assert!(!SignatureAlgorithm::RsaSha1.signing_allowed());
         assert!(SignatureAlgorithm::RsaSha256.signing_allowed());
-        assert!(SignatureAlgorithm::EcdsaP256Sha256.signing_allowed());
+        assert!(SignatureAlgorithm::EcdsaSha256.signing_allowed());
     }
 
     // ── find_signature_node ──────────────────────────────────────────
@@ -1623,9 +2455,9 @@ mod tests {
             </KeyValue>
             <X509Data>
                 <X509Certificate>{cert_base64}</X509Certificate>
-                <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                <X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>
                 <X509IssuerSerial>
-                    <X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName>
+                    <X509IssuerName>Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName>
                     <X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber>
                 </X509IssuerSerial>
                 <X509SKI>bcOXN/nsVl8GatRbcKrPbzIbw0Y=</X509SKI>
@@ -1659,14 +2491,14 @@ mod tests {
         assert_eq!(
             x509_info.subject_names,
             vec![
-                "C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048"
+                "CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US"
                     .to_string()
             ]
         );
         assert_eq!(
             x509_info.issuer_serials,
             vec![(
-                "C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com".to_string(),
+                "Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US".to_string(),
                 "680572598617295163017172295025714171905498632019".to_string()
             )]
         );
@@ -1709,13 +2541,13 @@ mod tests {
     #[test]
     fn parse_rsa_key_value_preserves_wrapped_crypto_binary() {
         // CryptoBinary is unsigned big-endian data and XML whitespace is insignificant.
-        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue><RSAKeyValue>
                 <Modulus> AQID
 BA== </Modulus>
                 <Exponent> AQAB </Exponent>
             </RSAKeyValue></KeyValue>
-        </KeyInfo>"#;
+        </KeyInfo>"##;
         let doc = Document::parse(xml).unwrap();
 
         assert_eq!(
@@ -1730,11 +2562,11 @@ BA== </Modulus>
     #[test]
     fn parse_rsa_key_value_rejects_reordered_parameters() {
         // XMLDSig defines Modulus followed by Exponent; accepting reordered input is ambiguous.
-        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue><RSAKeyValue>
                 <Exponent>AQAB</Exponent><Modulus>AQID</Modulus>
             </RSAKeyValue></KeyValue>
-        </KeyInfo>"#;
+        </KeyInfo>"##;
         let doc = Document::parse(xml).unwrap();
 
         assert!(matches!(
@@ -1746,9 +2578,9 @@ BA== </Modulus>
     #[test]
     fn parse_rsa_key_value_rejects_missing_exponent() {
         // Both RSA public parameters are required to construct a usable key.
-        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue><RSAKeyValue><Modulus>AQID</Modulus></RSAKeyValue></KeyValue>
-        </KeyInfo>"#;
+        </KeyInfo>"##;
         let doc = Document::parse(xml).unwrap();
 
         assert!(matches!(
@@ -1760,11 +2592,11 @@ BA== </Modulus>
     #[test]
     fn parse_rsa_key_value_rejects_duplicate_exponent() {
         // RSAKeyValue has a closed two-child schema; duplicate parameters are invalid.
-        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue><RSAKeyValue>
                 <Modulus>AQID</Modulus><Exponent>AQAB</Exponent><Exponent>AQAB</Exponent>
             </RSAKeyValue></KeyValue>
-        </KeyInfo>"#;
+        </KeyInfo>"##;
         let doc = Document::parse(xml).unwrap();
 
         assert!(matches!(
@@ -2155,6 +2987,45 @@ BA== </Modulus>
     }
 
     #[test]
+    fn chain_builder_matches_x509_equivalent_distinguished_names() {
+        // RFC 5280 name chaining uses X.501 matching rather than the lexical
+        // RFC 4514 rendering. Case differences in DirectoryString values must
+        // not disconnect an otherwise valid configured path.
+        let certificates = [
+            fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+            fixture_cert_base64("../../tests/fixtures/keys/ca2cert.pem"),
+            fixture_cert_base64("../../tests/fixtures/keys/cacert.pem"),
+        ]
+        .map(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap()
+        })
+        .to_vec();
+        let mut parsed_certificates = certificates
+            .iter()
+            .map(|certificate| parse_x509_certificate(certificate).unwrap())
+            .collect::<Vec<_>>();
+        parsed_certificates[0].issuer_dn = parsed_certificates[1].subject_dn.to_ascii_lowercase();
+        parsed_certificates[1].issuer_dn = parsed_certificates[2].subject_dn.to_ascii_lowercase();
+        let info = X509DataInfo {
+            certificates,
+            parsed_certificates,
+            ..X509DataInfo::default()
+        };
+
+        assert_eq!(
+            select_x509_signing_certificate(&info, crate::provider::default_provider()).unwrap(),
+            0
+        );
+        assert_eq!(
+            build_x509_certificate_chain_from(&info, 0, crate::provider::default_provider())
+                .unwrap(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
     fn parse_key_info_uses_issuer_serial_to_select_x509_signing_certificate() {
         let root = fixture_cert_base64("../../tests/fixtures/keys/cacert.pem");
         let intermediate = fixture_cert_base64("../../tests/fixtures/keys/ca2cert.pem");
@@ -2163,7 +3034,7 @@ BA== </Modulus>
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
                     <X509IssuerSerial>
-                        <X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName>
+                        <X509IssuerName>Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName>
                         <X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber>
                     </X509IssuerSerial>
                     <X509Certificate>{root}</X509Certificate>
@@ -2193,7 +3064,7 @@ BA== </Modulus>
         let xml = format!(
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
-                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>
                     <X509SKI>0X0XrEVCio75sBcl1TxymJ2IOiU=</X509SKI>
                     <X509Certificate>{root}</X509Certificate>
                     <X509Certificate>{intermediate}</X509Certificate>
@@ -2214,9 +3085,10 @@ BA== </Modulus>
 
     #[test]
     fn parse_key_info_uses_decimal_issuer_serial_to_select_x509_signing_certificate() {
+        let serial = "680572598617295163017172295025714171905498632019";
+        let padded_serial = format!("{}{}", "0".repeat(64), serial);
         assert_eq!(
-            x509_serial_decimal_to_hex("680572598617295163017172295025714171905498632019")
-                .as_deref(),
+            x509_serial_decimal_to_hex(&padded_serial).as_deref(),
             Some("7735EE487F6862DAF1B3956D961CCB0FA6F34F53")
         );
         let root = fixture_cert_base64("../../tests/fixtures/keys/cacert.pem");
@@ -2227,8 +3099,8 @@ BA== </Modulus>
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
                     <X509IssuerSerial>
-                        <X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName>
-                        <X509SerialNumber>680572598617295163017172295025714171905498632019</X509SerialNumber>
+                        <X509IssuerName>Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName>
+                        <X509SerialNumber>{padded_serial}</X509SerialNumber>
                     </X509IssuerSerial>
                     <X509Certificate>{root}</X509Certificate>
                     <X509Certificate>{intermediate}</X509Certificate>
@@ -2293,7 +3165,7 @@ BA== </Modulus>
         let xml = format!(
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
-                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>
                     <X509SubjectName>CN=Not In The Embedded Chain</X509SubjectName>
                     <X509Certificate>{cert}</X509Certificate>
                 </X509Data>
@@ -2309,13 +3181,15 @@ BA== </Modulus>
 
     #[test]
     fn parse_key_info_rejects_malformed_issuer_serial_even_with_matching_subject() {
+        // Lexically invalid serials must fail while parsing X509IssuerSerial,
+        // before another selector or embedded certificate can mask them.
         let cert = fixture_cert_base64("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
         let xml = format!(
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
-                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>
                     <X509IssuerSerial>
-                        <X509IssuerName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), OU=Second level CA, CN=Aleksey Sanin, Email=xmlsec@aleksey.com</X509IssuerName>
+                        <X509IssuerName>Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509IssuerName>
                         <X509SerialNumber>not-a-decimal-serial</X509SerialNumber>
                     </X509IssuerSerial>
                     <X509Certificate>{cert}</X509Certificate>
@@ -2326,7 +3200,7 @@ BA== </Modulus>
 
         let err = parse_key_info(doc.root_element()).unwrap_err();
         assert!(
-            matches!(err, ParseError::InvalidStructure(message) if message.contains("lookup identifiers"))
+            matches!(err, ParseError::InvalidStructure(message) if message.contains("invalid X509SerialNumber"))
         );
     }
 
@@ -2336,7 +3210,7 @@ BA== </Modulus>
         let xml = format!(
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
-                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>
                     <X509SKI>AQIDBA==</X509SKI>
                     <X509Certificate>{cert}</X509Certificate>
                 </X509Data>
@@ -2357,7 +3231,7 @@ BA== </Modulus>
         let xml = format!(
             r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <X509Data>
-                    <X509SubjectName>C=US, ST=California, O=XML Security Library (http://www.aleksey.com/xmlsec), CN=Test Key rsa-2048</X509SubjectName>
+                    <X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName>
                     <X509SKI>60zMLKCfzQ3qnXAzABzRNpdgQ8Q=</X509SKI>
                     <X509Certificate>{first_cert}</X509Certificate>
                     <X509Certificate>{second_cert}</X509Certificate>
@@ -2374,7 +3248,7 @@ BA== </Modulus>
 
     #[test]
     fn build_x509_certificate_chain_rejects_chain_exceeding_max_depth() {
-        let parsed_certificates = (0..=MAX_X509_CHAIN_DEPTH)
+        let parsed_certificates: Vec<ParsedX509Certificate> = (0..=MAX_X509_CHAIN_DEPTH)
             .map(|idx| ParsedX509Certificate {
                 subject_dn: format!("CN=cert-{idx}"),
                 issuer_dn: if idx == MAX_X509_CHAIN_DEPTH {
@@ -2390,12 +3264,15 @@ BA== </Modulus>
                 },
             })
             .collect();
+        let certificates = vec![Vec::new(); parsed_certificates.len()];
         let info = X509DataInfo {
+            certificates,
             parsed_certificates,
             ..X509DataInfo::default()
         };
 
-        let err = build_x509_certificate_chain(&info).unwrap_err();
+        let err =
+            build_x509_certificate_chain(&info, crate::provider::default_provider()).unwrap_err();
         assert!(
             matches!(err, ParseError::InvalidStructure(message) if message.contains("maximum depth"))
         );
@@ -2409,9 +3286,205 @@ BA== </Modulus>
     }
 
     #[test]
+    fn x509_serial_decimal_parser_enforces_rfc5280_positive_range() {
+        // A 20-octet unsigned magnitude may need a 21st DER sign-padding
+        // octet. The decimal selector denotes the value, not its DER encoding.
+        let max_serial = "1461501637330902918203684832716283019655932542975";
+        assert_eq!(
+            x509_serial_decimal_to_hex(max_serial),
+            Some("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF".into())
+        );
+        assert_eq!(
+            x509_serial_decimal_to_hex("730750818665451459101842416358141509827966271488"),
+            Some("8000000000000000000000000000000000000000".into())
+        );
+        assert_eq!(
+            x509_serial_decimal_to_hex("0000000000000000000000000000000000000000000000001"),
+            Some("01".into())
+        );
+        assert_eq!(
+            x509_serial_decimal_to_hex("00000000000000000000000000000000000000000000000001"),
+            Some("01".into())
+        );
+        assert_eq!(x509_serial_decimal_to_hex("+1"), Some("01".into()));
+
+        for invalid in [
+            "",
+            "0",
+            "000",
+            "+0",
+            "++1",
+            "-1",
+            "1a",
+            "1461501637330902918203684832716283019655932542976",
+        ] {
+            assert_eq!(
+                x509_serial_decimal_to_hex(invalid),
+                None,
+                "invalid serial {invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_x509_serial_normalizes_boundary_whitespace_and_rejects_overflow() {
+        // XML Schema collapses integer whitespace before validation; the
+        // normalized value must still obey the RFC 5280 positive range.
+        let max_serial = "1461501637330902918203684832716283019655932542975";
+        let valid = format!(
+            "<KeyInfo xmlns=\"{XMLDSIG_NS}\"><X509Data><X509IssuerSerial><X509IssuerName>CN=issuer</X509IssuerName><X509SerialNumber>\n {max_serial}\t</X509SerialNumber></X509IssuerSerial></X509Data></KeyInfo>"
+        );
+        let doc = Document::parse(&valid).unwrap();
+        let parsed = parse_key_info(doc.root_element()).unwrap();
+        let KeyInfoSource::X509Data(x509) = &parsed.sources[0] else {
+            panic!("expected X509Data source");
+        };
+        assert_eq!(x509.issuer_serials[0].1, max_serial);
+
+        let explicit_positive = valid.replace(max_serial, "+42");
+        let doc = Document::parse(&explicit_positive).unwrap();
+        let parsed = parse_key_info(doc.root_element()).unwrap();
+        let KeyInfoSource::X509Data(x509) = &parsed.sources[0] else {
+            panic!("expected X509Data source");
+        };
+        assert_eq!(x509.issuer_serials[0].1, "42");
+
+        let overflow = valid.replace(
+            max_serial,
+            "1461501637330902918203684832716283019655932542976",
+        );
+        let doc = Document::parse(&overflow).unwrap();
+        assert!(matches!(
+            parse_key_info(doc.root_element()),
+            Err(ParseError::InvalidStructure(message))
+                if message.contains("invalid X509SerialNumber")
+        ));
+    }
+
+    #[test]
+    fn issuer_selector_matches_a_sign_padded_twenty_octet_serial() {
+        // Selector decimal text represents the unsigned magnitude; the DER
+        // sign-padding octet must not make the same certificate unmatchable.
+        let serial_hex = "8000000000000000000000000000000000000000";
+        let info = X509DataInfo {
+            issuer_serials: vec![(
+                "CN=issuer".into(),
+                "730750818665451459101842416358141509827966271488".into(),
+            )],
+            parsed_certificates: vec![ParsedX509Certificate {
+                subject_dn: "CN=leaf".into(),
+                issuer_dn: "CN=issuer".into(),
+                serial_number: [vec![0, 0x80], vec![0; 19]].concat(),
+                serial_number_hex: serial_hex.into(),
+                subject_key_identifier: None,
+                public_key: X509PublicKeyInfo::Unsupported {
+                    algorithm_oid: "1.2.3.4".into(),
+                },
+            }],
+            ..X509DataInfo::default()
+        };
+
+        assert!(
+            x509_selector_categories_match_chain(&info, crate::provider::default_provider())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn distinguished_name_matching_preserves_rdn_order() {
+        // RFC 4514 permits alternate encodings within an RDN, but reversing
+        // the RDN sequence identifies a different hierarchical name.
+        assert!(distinguished_names_equal(
+            "CN=leaf, O=example",
+            "CN=leaf,O=example"
+        ));
+        assert!(!distinguished_names_equal(
+            "CN=leaf,O=example",
+            "O=example,CN=leaf"
+        ));
+    }
+
+    #[test]
+    fn distinguished_name_matching_applies_x520_string_preparation() {
+        // RFC 5280 requires caseIgnoreMatch with insignificant-space handling
+        // for DirectoryString values rather than exact ASN.1 value equality.
+        assert!(distinguished_names_equal(
+            "CN=  TEST   key  ,O=Example",
+            "CN=test key,O=example"
+        ));
+        assert!(distinguished_names_equal(
+            "CN=Straße,O=Example",
+            "CN=STRASSE,O=EXAMPLE"
+        ));
+        assert!(distinguished_names_equal(
+            "CN=test+OU=security,O=example",
+            "OU=SECURITY+CN=TEST,O=EXAMPLE"
+        ));
+        assert!(!distinguished_names_equal(
+            "1.2.3.4=#040141,O=example",
+            "1.2.3.4=#040142,O=example"
+        ));
+    }
+
+    #[test]
+    fn distinguished_name_matching_applies_ia5_matching_rules() {
+        // RFC 5280 emailAddress matching preserves the local part while the
+        // domain is case-insensitive; domainComponent is case-insensitive too.
+        assert!(distinguished_names_equal(
+            "EMAIL=ops@EXAMPLE.COM,DC=EXAMPLE,DC=COM",
+            "EMAIL=ops@example.com,DC=example,DC=com"
+        ));
+        assert!(!distinguished_names_equal(
+            "EMAIL=OPS@example.com,DC=example,DC=com",
+            "EMAIL=ops@example.com,DC=example,DC=com"
+        ));
+    }
+
+    #[test]
+    fn distinguished_name_matching_handles_rfc4514_escaped_values() {
+        // Certificate values containing RFC 4514 separators and boundary spaces
+        // must remain one attribute when matched against an XMLDSig selector.
+        let value = " leading,plus+equals=slash\\trailing ";
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, value);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        let parsed = parse_x509_certificate(certificate.der()).unwrap();
+
+        assert_eq!(
+            parsed.subject_dn,
+            r"CN=\ leading\,plus\+equals=slash\\trailing\ "
+        );
+        assert!(distinguished_names_equal(
+            r"CN=\ leading\,plus\+equals=slash\\trailing\ ",
+            &parsed.subject_dn
+        ));
+        assert!(distinguished_names_equal(
+            "\n  CN=\\ leading\\,plus\\+equals=slash\\\\trailing\\ \n",
+            &parsed.subject_dn
+        ));
+    }
+
+    #[test]
+    fn distinguished_name_trailing_escape_covers_all_xml_whitespace() {
+        // The normalizer strips all four XML whitespace characters, so escape
+        // detection must preserve each one consistently at RDN boundaries.
+        for whitespace in [' ', '\t', '\r', '\n'] {
+            assert!(trailing_whitespace_is_escaped(&format!(
+                "CN=value\\{whitespace}"
+            )));
+            assert!(!trailing_whitespace_is_escaped(&format!(
+                "CN=value{whitespace}"
+            )));
+        }
+    }
+
+    #[test]
     fn parse_key_info_accepts_large_textual_x509_entries_within_entry_budget() {
         let issuer_name = "C".repeat(MAX_X509_ISSUER_NAME_TEXT_LEN);
-        let serial_number = "7".repeat(MAX_X509_SERIAL_NUMBER_TEXT_LEN);
+        let serial_number = "0".repeat(MAX_X509_SERIAL_NUMBER_VALUE_DIGITS - 1) + "1";
         let issuer_serials = (0..52)
             .map(|_| {
                 format!(
@@ -2431,6 +3504,25 @@ BA== </Modulus>
             _ => panic!("expected X509Data source"),
         };
         assert_eq!(parsed.issuer_serials.len(), 52);
+    }
+
+    #[test]
+    fn parse_key_info_bounds_raw_x509_serial_text() {
+        // Leading zeroes are lexically valid, but their raw XML representation
+        // remains bounded independently from the canonical certificate value.
+        let serial = "0".repeat(MAX_X509_SERIAL_NUMBER_RAW_TEXT_LEN + 1);
+        let xml = format!(
+            "<KeyInfo xmlns=\"{XMLDSIG_NS}\"><X509Data><X509IssuerSerial><X509IssuerName>CN=issuer</X509IssuerName><X509SerialNumber>{serial}</X509SerialNumber></X509IssuerSerial></X509Data></KeyInfo>"
+        );
+        let doc = Document::parse(&xml).unwrap();
+
+        let error = parse_key_info(doc.root_element()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::InvalidStructure(reason)
+                if reason == "X509SerialNumber exceeds maximum allowed text length"
+        ));
     }
 
     #[test]
@@ -2664,7 +3756,7 @@ BA== </Modulus>
     fn parse_key_info_keeps_unsupported_keyvalue_child_as_marker() {
         let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue>
-                <DSAKeyValue/>
+                <FutureKeyValue/>
             </KeyValue>
         </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
@@ -2674,9 +3766,281 @@ BA== </Modulus>
             key_info.sources,
             vec![KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
                 namespace: Some(XMLDSIG_NS.to_string()),
-                local_name: "DSAKeyValue".into(),
+                local_name: "FutureKeyValue".into(),
             })]
         );
+    }
+
+    #[test]
+    fn parse_key_info_accepts_supported_x509_retrieval_xpath() {
+        // Merlin's same-document RetrievalMethod selects only X509Data nodes.
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+          <RetrievalMethod Type="http://www.w3.org/2000/09/xmldsig#X509Data" URI="#keys">
+            <Transforms><Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+              <XPath xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">ancestor-or-self::dsig:X509Data</XPath>
+            </Transform></Transforms>
+          </RetrievalMethod>
+        </KeyInfo>"##;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element()).unwrap();
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [KeyInfoSource::RetrievalMethod {
+                uri,
+                resource_type: Some(resource_type),
+                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter,
+            }] if uri == "#keys"
+                && resource_type == "http://www.w3.org/2000/09/xmldsig#X509Data"
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_oversized_retrieval_method_type() {
+        // Type is advisory, but retaining it must not allocate unbounded
+        // attacker-controlled KeyInfo metadata before resolution.
+        let oversized_type = "x".repeat(MAX_KEY_NAME_TEXT_LEN + 1);
+        let xml = format!(
+            r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><RetrievalMethod URI="#key" Type="{oversized_type}"/></KeyInfo>"##
+        );
+        let document = Document::parse(&xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(document.root_element()),
+            Err(ParseError::InvalidStructure(reason))
+                if reason == "RetrievalMethod Type exceeds maximum length"
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_bounds_retrieval_method_xml_base_chain() {
+        // RetrievalMethod resolves its resource identity during parsing, so it
+        // must use the same bounded XML Base algorithm as Reference lookup.
+        let mut xml =
+            format!(r#"<KeyInfo xmlns="{XMLDSIG_NS}"><RetrievalMethod URI="key.der"/></KeyInfo>"#);
+        for _ in 0..65 {
+            xml = format!(r#"<n xml:base="segment/">{xml}</n>"#);
+        }
+        let document = Document::parse(&xml).unwrap();
+        let key_info = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .unwrap();
+
+        assert!(matches!(
+            parse_key_info(key_info),
+            Err(ParseError::InvalidStructure(reason))
+                if reason.contains("XML Base resolution")
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_normalizes_external_retrieval_without_xml_base() {
+        // RetrievalMethod stores the resolved identity used for caller-map
+        // lookup, including RFC 3986 normalization when no base is declared.
+        let xml = format!(
+            r#"<KeyInfo xmlns="{XMLDSIG_NS}"><RetrievalMethod URI="https://example.test/a/../key.der"/></KeyInfo>"#
+        );
+        let document = Document::parse(&xml).unwrap();
+        let key_info = parse_key_info(document.root_element()).unwrap();
+
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [KeyInfoSource::RetrievalMethod { uri, .. }]
+                if uri == "https://example.test/key.der"
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_absolute_retrieval_bypasses_xml_base_chain() {
+        // Absolute RetrievalMethod identities do not inherit xml:base, so an
+        // otherwise excessive ancestor chain must not reject them.
+        let mut xml = format!(
+            r#"<KeyInfo xmlns="{XMLDSIG_NS}"><RetrievalMethod URI="https://example.test/a/../key.der"/></KeyInfo>"#
+        );
+        for _ in 0..65 {
+            xml = format!(r#"<n xml:base="segment/">{xml}</n>"#);
+        }
+        let document = Document::parse(&xml).unwrap();
+        let key_info_node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .unwrap();
+        let key_info = parse_key_info(key_info_node)
+            .expect("absolute RetrievalMethod must not consume ancestor-base budget");
+
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [KeyInfoSource::RetrievalMethod { uri, .. }]
+                if uri == "https://example.test/key.der"
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_accepts_namespace_equivalent_retrieval_xpath_prefix() {
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+          <RetrievalMethod Type="http://www.w3.org/2000/09/xmldsig#X509Data" URI="#keys">
+            <Transforms><Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+              <XPath xmlns:ds="http://www.w3.org/2000/09/xmldsig#">ancestor-or-self::ds:X509Data</XPath>
+            </Transform></Transforms>
+          </RetrievalMethod>
+        </KeyInfo>"##;
+        let doc = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element())
+                .unwrap()
+                .sources
+                .as_slice(),
+            [KeyInfoSource::RetrievalMethod {
+                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_reads_complete_retrieval_xpath_text() {
+        // XML comments split character data into multiple text nodes; all chunks
+        // still belong to the XPath parameter's string-value.
+        let valid = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+          <RetrievalMethod Type="http://www.w3.org/2000/09/xmldsig#X509Data" URI="#keys">
+            <Transforms><Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+              <XPath xmlns:ds="http://www.w3.org/2000/09/xmldsig#">ancestor-or-self::ds:X509<!-- split -->Data</XPath>
+            </Transform></Transforms>
+          </RetrievalMethod>
+        </KeyInfo>"##;
+        let document = Document::parse(valid).unwrap();
+        assert!(parse_key_info(document.root_element()).is_ok());
+
+        let unsupported =
+            valid.replace("X509<!-- split -->Data", "X509Data<!-- split -->[false()]");
+        let document = Document::parse(&unsupported).unwrap();
+        assert!(matches!(
+            parse_key_info(document.root_element()),
+            Err(ParseError::InvalidStructure(reason))
+                if reason == "unsupported RetrievalMethod XPath selection"
+        ));
+    }
+
+    #[test]
+    fn parse_dsa_key_value_accepts_schema_optional_parameters_and_rejects_half_pair() {
+        let key_info = |parameters: &str| {
+            format!(
+                r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyValue><DSAKeyValue>
+                {parameters}
+                </DSAKeyValue></KeyValue></KeyInfo>"#
+            )
+        };
+        for parameters in [
+            "<Y>AQ==</Y>",
+            "<G>AQ==</G><Y>AQ==</Y>",
+            "<P>AQ==</P><Q>AQ==</Q><Y>AQ==</Y>",
+            "<P>AQ==</P><Q>AQ==</Q><G>AQ==</G><Y>AQ==</Y><J>AQ==</J>",
+            "<Y>AQ==</Y><Seed>AQ==</Seed><PgenCounter>AQ==</PgenCounter>",
+            "<Y>AQ==</Y><J>AQ==</J><Seed>AQ==</Seed><PgenCounter>AQ==</PgenCounter>",
+        ] {
+            let xml = key_info(parameters);
+            let doc = Document::parse(&xml).unwrap();
+            assert!(matches!(
+                parse_key_info(doc.root_element())
+                    .unwrap()
+                    .sources
+                    .as_slice(),
+                [KeyInfoSource::KeyValue(KeyValueInfo::Dsa { .. })]
+            ));
+        }
+
+        for invalid_parameters in [
+            "<P>AQ==</P><Y>AQ==</Y>",
+            "<Q>AQ==</Q><Y>AQ==</Y>",
+            "<Y>AQ==</Y><Seed>AQ==</Seed>",
+            "<Y>AQ==</Y><PgenCounter>AQ==</PgenCounter>",
+        ] {
+            let xml = key_info(invalid_parameters);
+            let doc = Document::parse(&xml).unwrap();
+            assert!(matches!(
+                parse_key_info(doc.root_element()),
+                Err(ParseError::InvalidStructure(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_dsa_crypto_binary_ignores_comment_nodes() {
+        // XML comments split simple content without contributing to its string value.
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue><DSAKeyValue><Y>AQ<!-- split -->ID</Y></DSAKeyValue></KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element())
+                .unwrap()
+                .sources
+                .as_slice(),
+            [KeyInfoSource::KeyValue(KeyValueInfo::Dsa { y, .. })] if y == &[1, 2, 3]
+        ));
+    }
+
+    #[test]
+    fn parse_rsa_crypto_binary_ignores_comment_nodes() {
+        // The shared CryptoBinary decoder must apply XML simple-content semantics to every key type.
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <KeyValue><RSAKeyValue>
+                <Modulus>AQ<!-- split -->ID</Modulus><Exponent>Aw==</Exponent>
+            </RSAKeyValue></KeyValue>
+        </KeyInfo>"#;
+        let doc = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(doc.root_element())
+                .unwrap()
+                .sources
+                .as_slice(),
+            [KeyInfoSource::KeyValue(KeyValueInfo::Rsa { modulus, exponent })]
+                if modulus == &[1, 2, 3] && exponent == &[3]
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_preserves_advisory_unsupported_retrieval_transform() {
+        // Unsupported RetrievalMethod types are advisory key sources. Their
+        // transform syntax must not hide a later source the resolver can use.
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+          <RetrievalMethod URI="#keys" Type="urn:vendor:key"><Transforms>
+            <Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/>
+          </Transforms></RetrievalMethod>
+          <KeyName>fallback</KeyName>
+        </KeyInfo>"##;
+        let doc = Document::parse(xml).unwrap();
+
+        let key_info = parse_key_info(doc.root_element())
+            .expect("unsupported advisory retrieval must not reject all KeyInfo sources");
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [
+                KeyInfoSource::RetrievalMethod { resource_type: Some(resource_type), .. },
+                KeyInfoSource::KeyName(name),
+            ] if resource_type == "urn:vendor:key" && name == "fallback"
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_rejects_excessive_child_sources() {
+        // KeyInfo extensions are lax, but their parse work remains bounded.
+        let children = (0..=64)
+            .map(|index| format!(r#"<extension xmlns="urn:test" index="{index}"/>"#))
+            .collect::<String>();
+        let xml =
+            format!(r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">{children}</KeyInfo>"#);
+        let document = Document::parse(&xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(document.root_element()),
+            Err(ParseError::InvalidStructure(reason))
+                if reason == "KeyInfo contains too many child elements"
+        ));
     }
 
     #[test]
@@ -2771,6 +4135,52 @@ BA== </Modulus>
     // ── parse_signed_info: happy path ────────────────────────────────
 
     #[test]
+    fn parse_hmac_output_length_reads_all_text_nodes() {
+        // A comment may split valid simple content without changing its value.
+        let xml = r#"<SignatureMethod xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <HMACOutputLength>8<!-- split -->0</HMACOutputLength>
+        </SignatureMethod>"#;
+        let document = Document::parse(xml).unwrap();
+
+        assert_eq!(
+            parse_hmac_output_length(document.root_element(), SignatureAlgorithm::HmacSha1)
+                .unwrap(),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn parse_hmac_output_length_rejects_hidden_suffix_text() {
+        // Reading only the first text node would misinterpret 800 bits as 80.
+        let xml = r#"<SignatureMethod xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <HMACOutputLength>80<!-- split -->0</HMACOutputLength>
+        </SignatureMethod>"#;
+        let document = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_hmac_output_length(document.root_element(), SignatureAlgorithm::HmacSha1),
+            Err(ParseError::InvalidStructure(reason))
+                if reason == "HMACOutputLength must be a byte-aligned value from 80 through 160"
+        ));
+    }
+
+    #[test]
+    fn parse_hmac_output_length_rejects_non_octet_truncation() {
+        // XMLDSig 1.1 section 6.3.1 requires a byte boundary even though the
+        // HMACOutputLength schema represents the value as a bit count.
+        let xml = r#"<SignatureMethod xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <HMACOutputLength>81</HMACOutputLength>
+        </SignatureMethod>"#;
+        let document = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_hmac_output_length(document.root_element(), SignatureAlgorithm::HmacSha1),
+            Err(ParseError::InvalidStructure(reason))
+                if reason == "HMACOutputLength must be a byte-aligned value from 80 through 160"
+        ));
+    }
+
+    #[test]
     fn parse_signed_info_rsa_sha256_with_reference() {
         let xml = r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
@@ -2814,7 +4224,7 @@ BA== </Modulus>
         let doc = Document::parse(xml).unwrap();
         let si = parse_signed_info(doc.root_element()).unwrap();
 
-        assert_eq!(si.signature_method, SignatureAlgorithm::EcdsaP256Sha256);
+        assert_eq!(si.signature_method, SignatureAlgorithm::EcdsaSha256);
         assert_eq!(si.references.len(), 2);
         assert_eq!(si.references[0].uri.as_deref(), Some("#a"));
         assert_eq!(si.references[0].digest_method, DigestAlgorithm::Sha256);

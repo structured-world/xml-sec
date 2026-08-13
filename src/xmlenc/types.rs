@@ -12,22 +12,8 @@ pub const XMLENC11_NS: &str = "http://www.w3.org/2009/xmlenc11#";
 pub const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
 /// Maximum normalized base64 text accepted from a `CipherValue`.
-pub const MAX_CIPHER_VALUE_BASE64_LEN: usize = 16 * 1024 * 1024;
-/// Maximum plaintext accepted by the encryption API.
-///
-/// The limit leaves room for CBC/GCM framing while guaranteeing that the
-/// resulting base64 `CipherValue` fits the parser's input bound.
-pub const MAX_ENCRYPTION_PLAINTEXT_LEN: usize = (MAX_CIPHER_VALUE_BASE64_LEN / 4 * 3) - 32;
-/// Maximum caller-owned XML document size accepted for node encryption.
-///
-/// This separately bounds parser work while leaving room around a maximum-size
-/// selected plaintext element or content fragment.
-pub const MAX_ENCRYPTION_DOCUMENT_LEN: usize = MAX_CIPHER_VALUE_BASE64_LEN;
-/// Maximum number of independently wrapped copies of one content key.
-pub const MAX_ENCRYPTION_RECIPIENTS: usize = 64;
-/// Maximum byte length of one caller-controlled XML metadata value.
-pub const MAX_ENCRYPTION_METADATA_LEN: usize = 4 * 1024;
-
+pub const MAX_CIPHER_VALUE_BASE64_LEN: usize =
+    crate::hard_limits::ENCRYPTION_CIPHER_VALUE_BASE64_BYTE_CEILING;
 /// The `Type` attribute on an `EncryptedData` element.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncryptedDataType {
@@ -40,7 +26,7 @@ pub enum EncryptedDataType {
 }
 
 /// Supported content-encryption algorithms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataEncryptionAlgorithm {
     /// AES-128 in CBC mode with XMLEnc padding.
     Aes128Cbc,
@@ -81,6 +67,51 @@ impl DataEncryptionAlgorithm {
             Self::Aes256Gcm => "http://www.w3.org/2009/xmlenc11#aes256-gcm",
         }
     }
+
+    /// Minimum standard wire length for ciphertext produced by this algorithm.
+    pub(crate) const fn minimum_ciphertext_len(self) -> usize {
+        match self {
+            Self::Aes128Cbc | Self::Aes256Cbc => 32,
+            Self::Aes128Gcm | Self::Aes256Gcm => 28,
+        }
+    }
+
+    /// Exact wire length produced when encrypting the given plaintext length.
+    pub(crate) fn ciphertext_len_for_plaintext(self, plaintext_len: usize) -> Option<usize> {
+        match self {
+            Self::Aes128Cbc | Self::Aes256Cbc => (plaintext_len / 16)
+                .checked_add(1)?
+                .checked_mul(16)?
+                .checked_add(16),
+            Self::Aes128Gcm | Self::Aes256Gcm => plaintext_len.checked_add(28),
+        }
+    }
+}
+
+pub(crate) fn validate_ciphertext_framing(
+    algorithm: DataEncryptionAlgorithm,
+    ciphertext_len: usize,
+) -> Result<(), XmlEncError> {
+    let minimum = algorithm.minimum_ciphertext_len();
+    if ciphertext_len < minimum {
+        let algorithm_name = match algorithm {
+            DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc => "AES-CBC",
+            DataEncryptionAlgorithm::Aes128Gcm | DataEncryptionAlgorithm::Aes256Gcm => "AES-GCM",
+        };
+        return Err(XmlEncError::DataTooShort {
+            algorithm: algorithm_name,
+            minimum,
+            actual: ciphertext_len,
+        });
+    }
+    if matches!(
+        algorithm,
+        DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc
+    ) && !(ciphertext_len - 16).is_multiple_of(16)
+    {
+        return Err(XmlEncError::InvalidCbcCiphertextLength(ciphertext_len - 16));
+    }
+    Ok(())
 }
 
 impl KeyTransportAlgorithm {
@@ -130,7 +161,7 @@ impl KeyWrapAlgorithm {
 }
 
 /// Supported asymmetric session-key transport algorithms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyTransportAlgorithm {
     /// XML Encryption 1.0 OAEP with SHA-1 and MGF1-SHA-1.
     RsaOaepMgf1p,
@@ -139,7 +170,7 @@ pub enum KeyTransportAlgorithm {
 }
 
 /// Supported symmetric key-wrap algorithms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyWrapAlgorithm {
     /// RFC 3394 AES key wrap with a 128-bit KEK.
     AesKw128,
@@ -148,7 +179,7 @@ pub enum KeyWrapAlgorithm {
 }
 
 /// Digest algorithms accepted by RSA-OAEP encryption.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OaepDigestAlgorithm {
     /// SHA-1, retained for legacy XMLEnc OAEP interoperability.
     Sha1,
@@ -368,7 +399,10 @@ pub struct EncryptionResult {
 pub struct DocumentEncryptionOptions<'a> {
     /// Select an element by `Id`, `ID`, or `id`; `None` selects the document root.
     pub element_id: Option<&'a str>,
-    /// Permit an internal DTD subset while parsing the caller's document.
+    /// Request internal-DTD parsing for this call.
+    ///
+    /// The operation policy must also permit internal DTDs; either control can
+    /// deny parsing, so a permissive caller option cannot weaken policy.
     pub allow_dtd: bool,
 }
 
@@ -385,6 +419,55 @@ pub struct EncryptionMethod {
     pub mgf_algorithm: Option<String>,
     /// Decoded OAEP label bytes.
     pub oaep_params: Option<Vec<u8>>,
+}
+
+impl EncryptionMethod {
+    /// Validate invariants imposed by the selected algorithm URI.
+    ///
+    /// Parsed XML and caller-constructed typed values share this check so the
+    /// public typed API cannot express wire structures that XML parsing rejects.
+    pub(crate) fn validate_structure(&self) -> Result<(), XmlEncError> {
+        if self.key_size_bits == Some(0) {
+            return Err(XmlEncError::InvalidStructure(
+                "KeySize must be a positive integer".into(),
+            ));
+        }
+        let is_legacy_oaep = self.algorithm == KeyTransportAlgorithm::RsaOaepMgf1p.uri();
+        let is_oaep11 = self.algorithm == KeyTransportAlgorithm::RsaOaep11.uri();
+        if (self.oaep_params.is_some()
+            || self.oaep_digest.is_some()
+            || self.mgf_algorithm.is_some())
+            && !is_legacy_oaep
+            && !is_oaep11
+        {
+            return Err(XmlEncError::InvalidStructure(
+                "OAEP parameters are only valid for RSA-OAEP EncryptionMethod".into(),
+            ));
+        }
+        if self.mgf_algorithm.is_some() && !is_oaep11 {
+            return Err(XmlEncError::InvalidStructure(
+                "MGF is only valid for XML Encryption 1.1 RSA-OAEP".into(),
+            ));
+        }
+        if let (Some(actual), Some(expected)) =
+            (self.key_size_bits, fixed_aes_key_size(&self.algorithm))
+            && actual != expected
+        {
+            return Err(XmlEncError::InvalidStructure(format!(
+                "EncryptionMethod {} requires KeySize {expected}, got {actual}",
+                self.algorithm
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn fixed_aes_key_size(algorithm: &str) -> Option<usize> {
+    let key_len = DataEncryptionAlgorithm::from_uri(algorithm)
+        .map(DataEncryptionAlgorithm::key_len)
+        .or_else(|_| KeyWrapAlgorithm::from_uri(algorithm).map(KeyWrapAlgorithm::key_len))
+        .ok()?;
+    Some(key_len * 8)
 }
 
 /// Inline ciphertext data.
@@ -452,6 +535,14 @@ pub enum DecryptedContent {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum XmlEncError {
+    /// The compiled encryption or decryption policy rejected an operation input.
+    #[error("XML Encryption policy violation: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
+
+    /// The selected cryptographic provider rejected or failed an operation.
+    #[error("cryptographic provider error: {0}")]
+    Provider(#[from] crate::provider::ProviderError),
+
     /// XML document parsing failed.
     #[error("XML parsing error: {0}")]
     XmlParse(#[from] roxmltree::Error),
@@ -480,14 +571,12 @@ pub enum XmlEncError {
     /// CBC ciphertext is not a non-empty multiple of the AES block size.
     #[error("AES-CBC ciphertext length must be a non-zero multiple of 16 bytes, got {0}")]
     InvalidCbcCiphertextLength(usize),
-    /// XMLEnc's final random-padding length byte is invalid.
-    #[error("invalid XMLEnc padding length {pad_len} for {block_size}-byte block")]
-    InvalidPadding {
-        /// Padding length from plaintext's final byte.
-        pad_len: u8,
-        /// Cipher block size.
-        block_size: usize,
-    },
+    /// XMLEnc random padding is invalid.
+    ///
+    /// No decrypted padding details are exposed. This does not authenticate CBC
+    /// ciphertexts or make success/failure safe to expose to an attacker.
+    #[error("invalid XMLEnc padding")]
+    InvalidPadding,
     /// GCM authentication failed.
     #[error("AES-GCM authentication failed")]
     AeadAuthenticationFailed,
@@ -509,6 +598,14 @@ pub enum XmlEncError {
         /// Expected KEK size.
         expected: usize,
         /// Actual KEK size.
+        actual: usize,
+    },
+    /// A wrapped-key input or provider output has invalid algorithm framing.
+    #[error("wrapped-key value must be {expected} bytes, got {actual}")]
+    InvalidWrappedKeyLength {
+        /// Exact wrapped length required by the algorithm and key context.
+        expected: usize,
+        /// Actual input or provider output length.
         actual: usize,
     },
     /// Plaintext exceeds the bounded encryption input size.

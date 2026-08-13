@@ -39,20 +39,26 @@ Currently implemented (core paths):
 - XMLDSig parsing, same-document URI dereference, enveloped/C14N/Base64/XPath 1.0/XPath Filter 2.0 transform chains, and digest verification
 - XMLDSig full verify pipeline (`SignedInfo` canonicalization + `SignatureValue` verification)
 - XMLDSig template signing pipeline (`DigestValue` fill + `SignedInfo` canonicalization + `SignatureValue` fill), including enveloped SAML Response templates
+- Typed signing and verification policy covers XML parsing, explicit transforms, implicit reference canonicalization, `SignedInfo` canonicalization, and outbound RSA key strength under shared work limits
 - XMLDSig signing KeyInfo writer for embedded X.509 certificates
 - Built-in verification-key resolution from embedded X.509/DER/`KeyValue` sources and configured `KeyName`, X.509 subject, issuer/serial, SKI, or digest selectors
 - RSA PKCS#1 v1.5 verification helpers for SHA-1 / SHA-256 / SHA-384 / SHA-512
-- ECDSA verification helpers for P-256/SHA-256 and P-384/SHA-384
-- RSA PKCS#1 v1.5 and ECDSA P-256/P-384 signing from PKCS#8 private keys
-- Opt-in X.509 certificate-chain validation with explicit trust anchors, validity checks, CA constraints, and CRLs
+- ECDSA SHA-256/SHA-384 verification for P-256, P-384, and P-521 keys
+- Legacy DSA-SHA1 and HMAC-SHA1 verification, including truncated HMAC output
+- RSA PKCS#1 v1.5 and ECDSA SHA-256/SHA-384 signing with P-256/P-384 PKCS#8 keys
+- Opt-in X.509 certificate-chain validation with explicit trust anchors, validity and path-length checks, NameConstraints, authenticated CRLs, typed path-wide ExtendedKeyUsage policy, and RSA-PSS/Ed25519 certificate-signature support. Duplicate certificate, CRL, and CRL-entry extension OIDs, malformed SAN identities, unsupported delta CRLs, `removeFromCRL` entries in complete CRLs, and invalid name constraints are rejected; implemented critical extensions are processed and every other critical extension fails closed.
+- Caller-supplied external references and X.509 `RetrievalMethod` resolution with bounded RFC 3986 `xml:base` processing and no implicit I/O
 - XMLEnc AES-128/256-CBC and AES-128/256-GCM encryption/decryption with direct
   keys, RSA-OAEP key transport, AES-128/256-KW, multiple recipients, and
-  Element/Content document replacement
+  Element/Content document replacement; document, node, and aggregate recipient
+  limits plus outbound RSA key-strength policy cover caller-constructed ciphertext and generated replacement output
+  before expensive work. CBC failures expose no decrypted
+  padding details, but CBC remains unauthenticated and can be excluded by policy
 
 Still in progress:
-- XMLDSig DSA, HMAC, and RSA-PSS signature algorithms
+- XMLDSig DSA-SHA256, broader HMAC verification/signing, and RSA-PSS `SignatureMethod` algorithms
 - Complete XMLDSig and XMLEnc conformance-suite classification
-- Production hardening, fuzzing, benchmarks, and API stabilization
+- Expanded fuzz coverage, benchmarks, production hardening, and API stabilization
 
 ## XMLDSig Usage
 
@@ -100,7 +106,7 @@ Current MSRV: Rust 1.92.
 | [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) | Implemented; full-document and document-subset vectors |
 | [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) | Implemented; `xml:id` and `xml:base` subset rules |
 | [Exclusive C14N](https://www.w3.org/TR/xml-exc-c14n/) | Implemented; `InclusiveNamespaces PrefixList` support |
-| [XMLDSig](https://www.w3.org/TR/xmldsig-core1/) | Core sign/verify pipelines implemented; additional algorithms and conformance coverage in progress |
+| [XMLDSig](https://www.w3.org/TR/xmldsig-core1/) | Core sign/verify pipelines and the complete Merlin corpus implemented; additional algorithms and conformance suites in progress |
 | [XMLEnc](https://www.w3.org/TR/xmlenc-core1/) | Core AES-CBC/GCM encrypt/decrypt with RSA-OAEP and AES-KW implemented; broader conformance coverage in progress |
 
 ## License

@@ -79,7 +79,7 @@ fn builds_parseable_prefixed_template_in_required_order() {
 #[test]
 fn preserves_reference_order_and_default_namespace() {
     // Reference order is signed data and must never be normalized or sorted.
-    let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaP256Sha256)
+    let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaSha256)
         .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha384).uri("#first"))
         .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha512).uri("#second"))
         .build_template()
