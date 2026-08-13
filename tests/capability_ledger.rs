@@ -119,7 +119,7 @@ fn complete_surface_categories_are_stable() {
         BTreeMap::from([
             ("algorithm-uri", 141),
             ("backend-api", 847),
-            ("build-define", 51),
+            ("build-define", 45),
             ("callback", 64),
             ("class-id", 156),
             ("cli-command", 24),
@@ -134,6 +134,7 @@ fn complete_surface_categories_are_stable() {
             ("registry", 8),
             ("struct-layout", 25),
             ("test-family", 20),
+            ("typedef", 70),
         ])
     );
 }
@@ -238,6 +239,7 @@ fn c_surface_is_explicitly_incompatible() {
         "enum",
         "struct-layout",
         "callback",
+        "typedef",
         "class-id",
     ];
     for item in ledger
@@ -323,19 +325,61 @@ fn legacy_algorithm_claims_are_policy_gated() {
 }
 
 #[test]
-fn backend_surface_is_provider_limited() {
-    // Provider selection does not imply compatibility with backend-specific C APIs.
+fn backend_surface_distinguishes_provider_capabilities_from_unimplemented_apis() {
+    // Donor backend symbols are supported only when the native provider has that capability.
     let ledger = ledger();
-    let backend: Vec<_> = ledger
+    let provider_limited: Vec<_> = ledger
         .items
         .iter()
-        .filter(|item| item.kind == "backend-api")
+        .filter(|item| item.kind == "backend-api" && item.outcome == "provider-limited")
         .collect();
-    assert!(!backend.is_empty());
+    assert!(!provider_limited.is_empty());
     assert!(
-        backend
+        provider_limited
             .iter()
-            .all(|item| item.outcome == "provider-limited")
+            .all(|item| item.name.contains("Transform"))
+    );
+
+    for unsupported in ["Des3", "Gost"] {
+        assert!(ledger.items.iter().any(|item| {
+            item.kind == "backend-api"
+                && item.name.contains(unsupported)
+                && item.outcome == "planned"
+        }));
+    }
+}
+
+#[test]
+fn donor_declarations_are_extracted_without_truncation() {
+    // Representative aliases, enums, macros, and defines guard each lexical extractor.
+    let ledger = ledger();
+    for alias in ["xmlSecSize", "xmlSecByte", "xmlSecKey", "xmlSecKeyPtr"] {
+        assert!(
+            ledger
+                .items
+                .iter()
+                .any(|item| item.kind == "typedef" && item.name == alias)
+        );
+    }
+    for enum_name in ["xmlSecDSigReferenceOrigin", "xmlEncCtxMode"] {
+        assert!(
+            ledger
+                .items
+                .iter()
+                .any(|item| item.kind == "enum" && item.name == enum_name)
+        );
+    }
+    let assertion = ledger
+        .items
+        .iter()
+        .find(|item| item.kind == "macro" && item.name == "xmlSecAssert")
+        .expect("xmlSecAssert macro must be inventoried");
+    assert!(assertion.detail.contains("xmlSecError"));
+    assert!(
+        !ledger
+            .items
+            .iter()
+            .any(|item| item.kind == "build-define" && item.name == "XMLSEC_CRYPTO_CFLAGS")
     );
 }
 

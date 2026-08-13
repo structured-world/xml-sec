@@ -300,17 +300,21 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
         if let Some(capture) = macro_re.captures(line) {
             let name = &capture[1];
             if name.starts_with("XMLSEC") || name.starts_with("xmlSec") {
+                let (definition, end) = collect_macro_definition(&lines, index);
                 items.push(item(
                     "macro",
                     name,
                     &extraction_source,
                     line_number,
-                    line.trim(),
+                    &normalize(&definition),
                 ));
+                index = end;
             }
         }
         if line.trim_start().starts_with("typedef enum") {
-            let (block, end) = collect_until(&lines, index, ";");
+            let (block, end) = collect_declaration(&lines, index).map_err(|error| {
+                format!("parse enum at {extraction_source}:{line_number}: {error}")
+            })?;
             let name = enum_name
                 .captures(&block)
                 .map(|capture| capture[1].to_owned())
@@ -335,7 +339,9 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
             }
             index = end;
         } else if let Some(capture) = struct_name.captures(line) {
-            let (block, end) = collect_until(&lines, index, "};");
+            let (block, end) = collect_declaration(&lines, index).map_err(|error| {
+                format!("parse struct at {extraction_source}:{line_number}: {error}")
+            })?;
             items.push(item(
                 "struct-layout",
                 capture.get(1).expect("struct capture").as_str(),
@@ -345,7 +351,9 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
             ));
             index = end;
         } else if line.contains("typedef") && line.contains("(*") {
-            let (block, end) = collect_until(&lines, index, ";");
+            let (block, end) = collect_declaration(&lines, index).map_err(|error| {
+                format!("parse callback at {extraction_source}:{line_number}: {error}")
+            })?;
             if let Some(capture) = callback_re.captures(&block) {
                 items.push(item(
                     "callback",
@@ -356,8 +364,31 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
                 ));
             }
             index = end;
+        } else if line.trim_start().starts_with("typedef") {
+            let (block, end) = collect_declaration(&lines, index).map_err(|error| {
+                format!("parse typedef at {extraction_source}:{line_number}: {error}")
+            })?;
+            let aliases = typedef_aliases(&block);
+            if aliases.is_empty() {
+                return Err(format!(
+                    "cannot extract typedef alias at {extraction_source}:{line_number}: {}",
+                    normalize(&block)
+                ));
+            }
+            for alias in aliases {
+                items.push(item(
+                    "typedef",
+                    &alias,
+                    &extraction_source,
+                    line_number,
+                    &normalize(&block),
+                ));
+            }
+            index = end;
         } else if line.contains("_EXPORT") && !line.trim_start().starts_with('#') {
-            let (block, end) = collect_until(&lines, index, ";");
+            let (block, end) = collect_declaration(&lines, index).map_err(|error| {
+                format!("parse export at {extraction_source}:{line_number}: {error}")
+            })?;
             let name = exported_name(&block).ok_or_else(|| {
                 format!(
                     "cannot extract exported symbol at {extraction_source}:{line_number}: {}",
@@ -408,20 +439,26 @@ fn extract_build_defines(donor: &Path, items: &mut Vec<SurfaceItem>) -> Result<(
     let source = "configure.ac";
     let content = fs::read_to_string(donor.join(source))
         .map_err(|error| format!("read donor {source}: {error}"))?;
-    let regex =
-        Regex::new(r"\b(XMLSEC_(?:NO|CRYPTO)_[A-Z0-9_]+)\b").expect("valid configure define regex");
+    items.extend(extract_build_defines_from_content(&content));
+    Ok(())
+}
+
+fn extract_build_defines_from_content(content: &str) -> Vec<SurfaceItem> {
+    let regex = Regex::new(r#"-D(XMLSEC_(?:NO|CRYPTO)_[A-Z0-9_]+)(?:=[^\s"']+)?"#)
+        .expect("valid compiler define regex");
+    let mut items = Vec::new();
     for (index, line) in content.lines().enumerate() {
         for capture in regex.captures_iter(line) {
             items.push(item(
                 "build-define",
                 &capture[1],
-                source,
+                "configure.ac",
                 index + 1,
                 line.trim(),
             ));
         }
     }
-    Ok(())
+    items
 }
 
 fn extract_algorithm_uris(donor: &Path, items: &mut Vec<SurfaceItem>) -> Result<(), String> {
@@ -678,18 +715,163 @@ fn classify(surface: Vec<SurfaceItem>, rules: RulesFile) -> Result<Ledger, Strin
     })
 }
 
-fn collect_until(lines: &[&str], start: usize, terminator: &str) -> (String, usize) {
+fn collect_macro_definition(lines: &[&str], start: usize) -> (String, usize) {
     let mut end = start;
     let mut block = String::new();
     while end < lines.len() {
         block.push_str(lines[end]);
         block.push('\n');
-        if lines[end].contains(terminator) {
+        if !lines[end].trim_end().ends_with('\\') {
             break;
         }
         end += 1;
     }
     (block, end)
+}
+
+fn collect_declaration(lines: &[&str], start: usize) -> Result<(String, usize), String> {
+    let mut block = String::new();
+    let mut in_block_comment = false;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut braces = 0_usize;
+    let mut parentheses = 0_usize;
+    let mut brackets = 0_usize;
+
+    for (end, line) in lines.iter().enumerate().skip(start) {
+        block.push_str(line);
+        block.push('\n');
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if in_block_comment {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block_comment = false;
+                }
+                continue;
+            }
+            if let Some(delimiter) = quote {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == delimiter {
+                    quote = None;
+                }
+                continue;
+            }
+            if ch == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                in_block_comment = true;
+                continue;
+            }
+            if ch == '/' && chars.peek() == Some(&'/') {
+                break;
+            }
+            match ch {
+                '\'' | '"' => quote = Some(ch),
+                '{' => braces += 1,
+                '}' => braces = braces.saturating_sub(1),
+                '(' => parentheses += 1,
+                ')' => parentheses = parentheses.saturating_sub(1),
+                '[' => brackets += 1,
+                ']' => brackets = brackets.saturating_sub(1),
+                ';' if braces == 0 && parentheses == 0 && brackets == 0 => {
+                    return Ok((block, end));
+                }
+                _ => {}
+            }
+        }
+    }
+    Err("declaration has no top-level semicolon".into())
+}
+
+fn typedef_aliases(declaration: &str) -> Vec<String> {
+    let sanitized = sanitize_c(declaration);
+    let alias = Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]\s*)?$")
+        .expect("valid typedef alias regex");
+    let mut aliases = Vec::new();
+    let mut segment_start = sanitized.find("typedef").map_or(0, |start| start + 7);
+    let scan_start = segment_start;
+    let mut braces = 0_usize;
+    let mut parentheses = 0_usize;
+    let mut brackets = 0_usize;
+    for (index, ch) in sanitized
+        .char_indices()
+        .skip_while(|(index, _)| *index < scan_start)
+    {
+        match ch {
+            '{' => braces += 1,
+            '}' => braces = braces.saturating_sub(1),
+            '(' => parentheses += 1,
+            ')' => parentheses = parentheses.saturating_sub(1),
+            '[' => brackets += 1,
+            ']' => brackets = brackets.saturating_sub(1),
+            ',' | ';' if braces == 0 && parentheses == 0 && brackets == 0 => {
+                if let Some(capture) = alias.captures(sanitized[segment_start..index].trim()) {
+                    aliases.push(capture[1].to_owned());
+                }
+                segment_start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    aliases
+}
+
+fn sanitize_c(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    let mut in_block_comment = false;
+    let mut in_line_comment = false;
+    let mut quote = None;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+                output.push(ch);
+            } else {
+                output.push(' ');
+            }
+        } else if in_block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                output.push(' ');
+                output.push(' ');
+                chars.next();
+                in_block_comment = false;
+            } else if ch == '\n' {
+                output.push(ch);
+            } else {
+                output.push(' ');
+            }
+        } else if let Some(delimiter) = quote {
+            output.push(' ');
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            output.push(' ');
+            output.push(' ');
+            chars.next();
+            in_block_comment = true;
+        } else if ch == '/' && chars.peek() == Some(&'/') {
+            output.push(' ');
+            output.push(' ');
+            chars.next();
+            in_line_comment = true;
+        } else if ch == '\'' || ch == '"' {
+            output.push(' ');
+            quote = Some(ch);
+        } else {
+            output.push(ch);
+        }
+    }
+    output
 }
 
 fn normalize(value: &str) -> String {
@@ -963,6 +1145,69 @@ done:
             exported_name("XMLSEC_DEPRECATED(1) XMLSEC_EXPORT int XMLSEC_CALL xmlSecInit(void);")
                 .as_deref(),
             Some("xmlSecInit")
+        );
+    }
+
+    #[test]
+    fn declaration_collector_ignores_semicolons_in_comments_and_literals() {
+        // Documentation entities and examples must not truncate a public declaration.
+        let lines = [
+            "typedef enum {",
+            "    value = 0, /* compares as value &lt; limit; */",
+            "    other = 1 /* example: \"done;\" */",
+            "} xmlSecExample;",
+        ];
+        let (declaration, end) = collect_declaration(&lines, 0).expect("enum must parse");
+        assert_eq!(end, 3);
+        assert!(declaration.contains("xmlSecExample;"));
+    }
+
+    #[test]
+    fn macro_collector_preserves_the_complete_definition() {
+        // A continuation-body change must produce a generated ledger diff.
+        let lines = [
+            "#define xmlSecAssert(condition) \\",
+            "    do { \\",
+            "        check(condition); \\",
+            "    } while(0)",
+            "#define xmlSecNext 1",
+        ];
+        let (definition, end) = collect_macro_definition(&lines, 0);
+        assert_eq!(end, 3);
+        assert!(definition.contains("check(condition)"));
+        assert!(!definition.contains("xmlSecNext"));
+    }
+
+    #[test]
+    fn typedef_parser_extracts_public_alias_declarators() {
+        // Scalar, pointer, and inline-layout aliases are separate public C names.
+        assert_eq!(
+            typedef_aliases("typedef size_t xmlSecSize;"),
+            vec!["xmlSecSize"]
+        );
+        assert_eq!(
+            typedef_aliases("typedef struct _xmlSecKey xmlSecKey, *xmlSecKeyPtr;"),
+            vec!["xmlSecKey", "xmlSecKeyPtr"]
+        );
+        assert_eq!(
+            typedef_aliases("typedef struct { int member; } xmlSecInline, *xmlSecInlinePtr;"),
+            vec!["xmlSecInline", "xmlSecInlinePtr"]
+        );
+    }
+
+    #[test]
+    fn build_define_parser_only_accepts_compiler_definitions() {
+        // Configure shell variables are not part of the public preprocessor surface.
+        let content = r#"XMLSEC_CRYPTO_CFLAGS=\"-I/example\"
+XMLSEC_CRYPTO_DISABLED_LIST=\"openssl\"
+CFLAGS=\"$CFLAGS -DXMLSEC_NO_DES -DXMLSEC_CRYPTO_OPENSSL=1\""#;
+        let entries = extract_build_defines_from_content(content);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["XMLSEC_NO_DES", "XMLSEC_CRYPTO_OPENSSL"]
         );
     }
 

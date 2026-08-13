@@ -14,12 +14,12 @@
       "description": "Legacy SHA-1 signature and digest paths are available only through an explicit compatibility policy."
     },
     "provider-contract": {
-      "test": "capability_ledger::backend_surface_is_provider_limited",
-      "description": "RustCrypto implements the native provider contract, but libxmlsec1 backend-specific C entry points are not source or ABI compatible."
+      "test": "capability_ledger::backend_surface_distinguishes_provider_capabilities_from_unimplemented_apis",
+      "description": "Only backend transform classes backed by native provider operations are provider-limited; every other backend-specific C entry point remains planned."
     },
     "planned-surface": {
       "test": "capability_ledger::planned_surface_is_never_reported_as_supported",
-      "description": "Unimplemented CLI, registry, format, URI, and donor-suite entries remain machine-readable planned work."
+      "description": "Unimplemented backend APIs, CLI, registry, format, URI, and donor-suite entries remain machine-readable planned work."
     },
     "unsupported-legacy-surface": {
       "test": "capability_ledger::deprecated_surface_is_explicitly_unsupported",
@@ -51,11 +51,19 @@
       "evidence": "planned-surface"
     },
     {
-      "id": "backend-provider-surface",
+      "id": "backend-provider-transform-surface",
       "kinds": ["backend-api"],
+      "name_regex": "^xmlSec(?:GCrypt|GnuTLS|MSCng|MSCrypto|Nss|OpenSSL)Transform(?:Aes128Cbc|Aes256Cbc|Aes128Gcm|Aes256Gcm|KWAes128|KWAes256|DsaSha1|EcdsaSha256|EcdsaSha384|HmacSha1|RsaOaep|RsaOaepEnc11|RsaSha1|RsaSha256|RsaSha384|RsaSha512|Sha1|Sha256|Sha384|Sha512)GetKlass$",
       "outcome": "provider-limited",
-      "rationale": "Rust exposes a backend-neutral CryptoProvider contract rather than libxmlsec1 backend-specific C symbols.",
+      "rationale": "The native provider contract implements the corresponding cryptographic operation, but not this libxmlsec1 backend-specific C symbol.",
       "evidence": "provider-contract"
+    },
+    {
+      "id": "remaining-backend-surface",
+      "kinds": ["backend-api"],
+      "outcome": "planned",
+      "rationale": "This libxmlsec1 backend-specific C capability is not represented by the current native provider contract.",
+      "evidence": "planned-surface"
     },
     {
       "id": "deprecated-c-surface",
@@ -66,7 +74,7 @@
     },
     {
       "id": "binary-c-surface",
-      "kinds": ["header", "export-function", "export-variable", "macro", "build-define", "enum", "struct-layout", "callback", "class-id"],
+      "kinds": ["header", "export-function", "export-variable", "macro", "build-define", "enum", "struct-layout", "callback", "typedef", "class-id"],
       "outcome": "binary-abi-incompatible",
       "rationale": "The current deliverable is a native Rust crate and does not claim libxmlsec1 C source or binary compatibility.",
       "evidence": "c-surface-inventory"
