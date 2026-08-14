@@ -9,7 +9,7 @@ use std::{
 use roxmltree::{Document, Node, ParsingOptions};
 use xml_sec::{
     policy::{DecryptionPolicy, EncryptionPolicy, SigningPolicy, VerificationPolicy},
-    provider::default_provider,
+    provider::{CryptoProvider, default_provider},
     xmldsig::{
         DefaultKeyResolver, DsigStatus, KeyInfoWriter, KeyResolver, KeyResolverConfig, SignContext,
         SignatureAlgorithm, UriTypeSet, VerifyContext, X509CertificateKeyInfoWriter,
@@ -17,8 +17,9 @@ use xml_sec::{
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
-        EncryptedDataBuilder, EncryptedDataType, EncryptionRecipient, KeyTransportAlgorithm,
-        OaepDigestAlgorithm, PrivateKeyDecryptor, RsaOaepParameters, SymmetricKeyDecryptor,
+        EncryptedDataBuilder, EncryptedDataType, EncryptedKey, EncryptionRecipient,
+        KeyTransportAlgorithm, OaepDigestAlgorithm, PrivateKeyDecryptor, RsaOaepParameters,
+        SymmetricKeyDecryptor, XmlEncError,
     },
 };
 
@@ -1079,7 +1080,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let encrypted_data = select_encrypted_data(&document, encrypted_data_id)?;
     let standalone = encrypted_data == document.root_element();
     let content_key_name = encrypted_data_key_name(encrypted_data);
-    let recipient_key_name = encrypted_key_recipient_name(encrypted_data);
+    let recipient_key_names = encrypted_key_recipient_names(encrypted_data);
     let aes_keys = invocation.values("aes-key").collect::<Vec<_>>();
     let private_keys = ["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"]
         .into_iter()
@@ -1106,18 +1107,20 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             policy,
         )?
     } else if let [option] = private_keys.as_slice() {
-        enforce_named_key_match(
+        let recipient_filter = named_recipient_filter(
             option,
-            recipient_key_name.as_deref(),
+            &recipient_key_names,
             invocation.flag("lax-key-search"),
-            "RSA recipient key",
         )?;
         let (path, certificate_paths) =
             split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
         for certificate in certificate_paths {
             key_material::load_certificate(certificate)?;
         }
-        let resolver = PrivateKeyDecryptor::new(key_material::load_rsa_private(path)?);
+        let resolver = NamedRecipientDecryptor {
+            inner: PrivateKeyDecryptor::new(key_material::load_rsa_private(path)?),
+            key_name: recipient_filter,
+        };
         decrypt_input(&resolver, &xml, encrypted_data_id, standalone, policy)?
     } else {
         return Err(CommandError::Usage(
@@ -1125,6 +1128,27 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         ));
     };
     write_output(invocation, &bytes, stdout)
+}
+
+struct NamedRecipientDecryptor<'a> {
+    inner: PrivateKeyDecryptor,
+    key_name: Option<&'a str>,
+}
+
+impl DecryptionKeyResolver for NamedRecipientDecryptor<'_> {
+    fn resolve_key(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+    ) -> Result<Vec<u8>, XmlEncError> {
+        if let (Some(expected), Some(candidate)) = (self.key_name, encrypted_key)
+            && candidate.key_name.as_deref() != Some(expected)
+        {
+            return Err(XmlEncError::KeyNotFound);
+        }
+        self.inner.resolve_key(provider, algorithm, encrypted_key)
+    }
 }
 
 fn decrypt_input(
@@ -1201,12 +1225,40 @@ fn encrypted_data_key_name(encrypted_data: Node<'_, '_>) -> Option<String> {
 }
 
 fn encrypted_key_recipient_name(encrypted_data: Node<'_, '_>) -> Option<String> {
+    encrypted_key_recipient_names(encrypted_data)
+        .into_iter()
+        .next()
+}
+
+fn encrypted_key_recipient_names(encrypted_data: Node<'_, '_>) -> Vec<String> {
     direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
-        .and_then(|key_info| direct_child_element(key_info, XMLENC_NS, "EncryptedKey"))
-        .and_then(|encrypted_key| direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo"))
-        .and_then(|key_info| direct_child_element(key_info, XMLDSIG_NS, "KeyName"))
-        .and_then(|key_name| key_name.text())
+        .into_iter()
+        .flat_map(|key_info| key_info.children())
+        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+        .filter_map(|encrypted_key| direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo"))
+        .filter_map(|key_info| direct_child_element(key_info, XMLDSIG_NS, "KeyName"))
+        .filter_map(|key_name| key_name.text())
         .map(str::to_owned)
+        .collect()
+}
+
+fn named_recipient_filter<'a>(
+    option: &'a crate::OptionValue,
+    recipient_names: &[String],
+    lax_key_search: bool,
+) -> Result<Option<&'a str>, CommandError> {
+    let Some(option_name) = option.parameter.as_deref() else {
+        return Ok(None);
+    };
+    if lax_key_search || recipient_names.is_empty() {
+        return Ok(None);
+    }
+    if recipient_names.iter().any(|name| name == option_name) {
+        return Ok(Some(option_name));
+    }
+    Err(CommandError::Usage(format!(
+        "template recipient KeyNames do not contain named RSA recipient key {option_name}"
+    )))
 }
 
 fn parse_encryption_document<'a>(

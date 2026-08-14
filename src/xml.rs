@@ -1,5 +1,81 @@
 //! Shared XML lexical invariants used before serialization.
 
+use std::collections::{HashMap, HashSet, hash_map::Entry};
+
+use roxmltree::{Document, Node};
+
+#[cfg(feature = "xmldsig")]
+use roxmltree::NodeId;
+
+/// Default ID attribute names shared by XMLDSig and XMLEnc selection.
+const DEFAULT_ID_ATTRS: &[&str] = &["ID", "Id", "id"];
+
+/// Duplicate-safe index of XML ID attributes in one parsed document.
+pub(crate) struct XmlIdIndex<'a> {
+    nodes: HashMap<&'a str, Node<'a, 'a>>,
+}
+
+impl<'a> XmlIdIndex<'a> {
+    /// Index the standard `ID`, `Id`, and `id` spellings.
+    #[cfg(any(feature = "xmlenc", test))]
+    pub(crate) fn new(document: &'a Document<'a>) -> Self {
+        Self::with_extra_attrs(document, &[])
+    }
+
+    /// Index standard ID spellings plus caller-declared local attribute names.
+    pub(crate) fn with_extra_attrs(document: &'a Document<'a>, extra_attrs: &[&str]) -> Self {
+        let mut names = DEFAULT_ID_ATTRS.to_vec();
+        for name in extra_attrs {
+            if !names.contains(name) {
+                names.push(name);
+            }
+        }
+
+        let mut nodes = HashMap::new();
+        let mut duplicates = HashSet::new();
+        for node in document.descendants().filter(Node::is_element) {
+            for name in &names {
+                let Some(value) = node.attribute(*name) else {
+                    continue;
+                };
+                if duplicates.contains(value) {
+                    continue;
+                }
+                match nodes.entry(value) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(node);
+                    }
+                    Entry::Occupied(entry) if entry.get().id() != node.id() => {
+                        entry.remove();
+                        duplicates.insert(value);
+                    }
+                    Entry::Occupied(_) => {}
+                }
+            }
+        }
+        Self { nodes }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.nodes.contains_key(id)
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn node_id(&self, id: &str) -> Option<NodeId> {
+        self.nodes.get(id).map(Node::id)
+    }
+
+    pub(crate) fn node(&self, id: &str) -> Option<Node<'a, 'a>> {
+        self.nodes.get(id).copied()
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
 /// Return whether a Unicode scalar is permitted by XML 1.0 Fifth Edition [2].
 pub(crate) fn is_xml_1_0_character(character: char) -> bool {
     // Rust `char` cannot represent the surrogate range between D7FF and E000,
@@ -29,7 +105,9 @@ pub(crate) fn is_xml_ncname(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_xml_1_0_character, is_xml_ncname};
+    use roxmltree::Document;
+
+    use super::{XmlIdIndex, is_xml_1_0_character, is_xml_ncname};
 
     #[test]
     fn xml_1_0_character_boundaries_match_production_two() {
@@ -62,5 +140,20 @@ mod tests {
         for invalid in ["", "1leading", "bad id", "qualified:name"] {
             assert!(!is_xml_ncname(invalid), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn id_index_rejects_duplicate_values_but_not_duplicate_attributes_on_one_node() {
+        // Ambiguous IDs must fail closed across every consumer, while one node
+        // carrying equivalent ID spellings still denotes one stable target.
+        let document = Document::parse(
+            r#"<root><one ID="same" Id="same"/><two id="duplicate"/><three ID="duplicate"/></root>"#,
+        )
+        .expect("ID index fixture must be valid XML");
+        let index = XmlIdIndex::new(&document);
+
+        assert!(index.contains("same"));
+        assert!(!index.contains("duplicate"));
+        assert_eq!(index.len(), 1);
     }
 }

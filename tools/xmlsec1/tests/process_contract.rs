@@ -6,8 +6,8 @@ use std::{
 };
 
 use rsa::{
-    RsaPrivateKey,
-    pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _},
+    RsaPrivateKey, RsaPublicKey,
+    pkcs8::{DecodePrivateKey as _, DecodePublicKey as _, EncodePrivateKey as _},
 };
 use xml_sec::{
     c14n::{C14nAlgorithm, C14nMode},
@@ -15,6 +15,7 @@ use xml_sec::{
         DigestAlgorithm, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
         SignatureBuilder, Transform, XPathExpression, XPathHereSemantics,
     },
+    xmlenc::{DataEncryptionAlgorithm, EncryptedDataBuilder, EncryptionRecipient},
 };
 
 fn binary() -> &'static str {
@@ -1051,6 +1052,45 @@ fn rsa_recipient_name_must_match_the_template_unless_lax() {
         String::from_utf8_lossy(&lax_decrypt.stderr)
     );
     assert_eq!(lax_decrypt.stdout, b"named recipient");
+}
+
+#[test]
+fn named_decryption_key_selects_a_later_recipient() {
+    // A document KeyName selects among all EncryptedKey recipients. Checking
+    // only the first recipient would reject a valid key before core decryption
+    // can reach the matching wrapped content key.
+    let temp = tempfile::tempdir().unwrap();
+    let encrypted = temp.path().join("encrypted.xml");
+    let matching_private = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let matching_public = RsaPublicKey::from_public_key_pem(
+        &fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem"))
+            .unwrap(),
+    )
+    .unwrap();
+    let other_public = RsaPublicKey::from_public_key_pem(
+        &fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+            .unwrap(),
+    )
+    .unwrap();
+    let generated = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .add_recipient(EncryptionRecipient::rsa_oaep(other_public).key_name("other"))
+        .add_recipient(EncryptionRecipient::rsa_oaep(matching_public).key_name("matching"))
+        .encrypt_binary(b"later recipient")
+        .unwrap();
+    fs::write(&encrypted, generated.encrypted_data_xml).unwrap();
+
+    let output = Command::new(binary())
+        .args(["decrypt", "--privkey-pem:matching"])
+        .arg(&matching_private)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"later recipient");
 }
 
 #[test]

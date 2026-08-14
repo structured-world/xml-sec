@@ -16,7 +16,7 @@ use super::{
     KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm, RsaOaepParameters, XmlEncError,
     has_single_element_with_boundary_trivia,
 };
-use crate::xmldsig::uri::UriReferenceResolver;
+use crate::xml::XmlIdIndex;
 
 #[cfg(test)]
 use super::parse_encrypted_data;
@@ -472,13 +472,11 @@ fn decrypt_document_with_context(
     let document = Document::parse_with_options(xml, parsing_options())?;
     let start = match selector {
         DocumentEncryptedDataSelector::StartNodeId(Some(id)) => {
-            UriReferenceResolver::new(&document)
-                .node_for_id(id)
-                .ok_or_else(|| {
-                    XmlEncError::InvalidStructure(format!(
-                        "selected node ID is missing or ambiguous: {id}"
-                    ))
-                })?
+            XmlIdIndex::new(&document).node(id).ok_or_else(|| {
+                XmlEncError::InvalidStructure(format!(
+                    "selected node ID is missing or ambiguous: {id}"
+                ))
+            })?
         }
         DocumentEncryptedDataSelector::StartNodeId(None)
         | DocumentEncryptedDataSelector::EncryptedDataId(_) => document.root(),
