@@ -770,6 +770,100 @@ fn encryption_rejects_simultaneous_binary_and_xml_payloads() {
 }
 
 #[test]
+fn untyped_xml_template_round_trips_when_embedded() {
+    // --xml-data infers Element semantics. The rendered wire document must
+    // retain that inference so embedded decryption performs XML replacement.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.xml");
+    let encrypted = temp.path().join("encrypted.xml");
+    let document = temp.path().join("document.xml");
+    let key = temp.path().join("key.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Id="quoted>delimiter"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"<secret>inferred XML</secret>").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    let encryption = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .arg("--xml-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encryption.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encryption.stderr)
+    );
+    let encrypted_xml = fs::read_to_string(&encrypted).unwrap();
+    assert!(
+        encrypted_xml.contains("Id=\"quoted>delimiter\" Type="),
+        "{encrypted_xml}"
+    );
+    fs::write(
+        &document,
+        format!(
+            "<root><scope Id=\"selected\">{}</scope></root>",
+            encrypted_xml
+        ),
+    )
+    .unwrap();
+
+    let decryption = Command::new(binary())
+        .args(["decrypt", "--aes-key"])
+        .arg(&key)
+        .args(["--node-id", "selected"])
+        .arg(&document)
+        .output()
+        .unwrap();
+    assert!(
+        decryption.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decryption.stderr)
+    );
+    assert!(
+        String::from_utf8(decryption.stdout)
+            .unwrap()
+            .contains("<scope Id=\"selected\"><secret>inferred XML</secret></scope>")
+    );
+}
+
+#[test]
+fn direct_aes_encryption_rejects_recipient_templates() {
+    // A direct content key cannot refresh an EncryptedKey recipient. Emitting
+    // the untouched wrapped key would create internally inconsistent XML.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("recipient-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let key = temp.path().join("key.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><CipherData><CipherValue>c3RhbGU=</CipherValue></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"recipient mismatch").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    let output = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("recipient"));
+}
+
+#[test]
 fn direct_aes_key_name_must_match_the_template_unless_lax() {
     let temp = tempfile::tempdir().unwrap();
     let template = temp.path().join("named-template.xml");
@@ -1544,6 +1638,51 @@ fn explicit_certificate_pins_the_verification_identity() {
             .status()
             .unwrap()
             .success()
+    );
+}
+
+#[test]
+fn embedded_certificate_requires_trust_unless_insecure() {
+    // Document-controlled X509Data is an identity claim, not a trust anchor.
+    // Only an explicit insecure opt-out may verify it without caller trust.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    let signed = temp.path().join("signed.xml");
+    let compound = format!("{},{}", private_key.display(), certificate.display());
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(compound)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let untrusted = Command::new(binary())
+        .arg("verify")
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(!untrusted.status.success());
+    assert!(String::from_utf8_lossy(&untrusted.stderr).contains("trusted"));
+
+    let insecure = Command::new(binary())
+        .args(["verify", "--insecure"])
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        insecure.status.success(),
+        "{}",
+        String::from_utf8_lossy(&insecure.stderr)
     );
 }
 

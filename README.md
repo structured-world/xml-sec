@@ -85,8 +85,11 @@ commands and options accepted by the parser. Named signing keys require a
 template `KeyName`, while named verification and encryption/decryption keys
 obey a selected XML `KeyName` unless lax lookup is requested; unnamed templates
 still use their sole explicit verification or encryption key. Certificate
-companions are validated even when no output `KeyInfo` placeholder is present.
-Its process tests run a minimal checked-in
+companions are validated even when no output `KeyInfo` placeholder is present;
+document-supplied X.509 certificates require a caller trust anchor unless
+`--insecure` is explicit. XML payload encryption materializes inferred Element
+metadata, and direct AES keys reject templates containing recipient
+`EncryptedKey` metadata they cannot refresh. Its process tests run a minimal checked-in
 snapshot of the unmodified upstream DSig, Enc, and Keys runners without network
 access or a system `xmlsec1` installation.
 Unsupported algorithms, key formats, providers, and policy controls fail closed

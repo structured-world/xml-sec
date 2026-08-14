@@ -604,9 +604,10 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         SignatureAlgorithm::HmacSha1,
     ]);
     policy.key_trust.check_crls = invocation.flag("verify-crls");
-    policy.key_trust.verify_x509_chains = !invocation.flag("insecure")
-        && (invocation.values("trusted-pem").next().is_some()
-            || invocation.values("trusted-der").next().is_some());
+    // X509Data is controlled by the signed document and therefore cannot
+    // establish its own trust. Only an explicit insecure opt-out disables
+    // path validation for resolver-selected certificates.
+    policy.key_trust.verify_x509_chains = !invocation.flag("insecure");
     policy
 }
 
@@ -759,9 +760,16 @@ fn verify_with_explicit_certificate(
             )?);
         }
     }
+    let mut resolver_policy = policy.clone();
+    if config.trusted_certs.is_empty() {
+        // An explicit certificate pins the caller-selected identity. In the
+        // absence of separate anchors this path is direct key verification,
+        // unlike document-controlled X509Data discovery.
+        resolver_policy.key_trust.verify_x509_chains = false;
+    }
     let resolver = DefaultKeyResolver::new(config);
     let key = resolver
-        .resolve_with_policy(Some(&key_info), algorithm, &policy)
+        .resolve_with_policy(Some(&key_info), algorithm, &resolver_policy)
         .map_err(|error| CommandError::Signature(error.to_string()))?
         .ok_or_else(|| CommandError::Signature("explicit certificate was not resolved".into()))?;
     verification_context(policy, start_node_id)
@@ -810,6 +818,11 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         ));
     }
     if let [option] = aes_keys.as_slice() {
+        if metadata.has_encrypted_key_recipient {
+            return Err(CommandError::Usage(
+                "direct AES key cannot satisfy an EncryptedKey recipient in the template".into(),
+            ));
+        }
         enforce_named_key_match(
             option,
             metadata.content_key_name.as_deref(),
@@ -976,6 +989,19 @@ fn apply_encryption_template(
         template_cipher.range(),
         standalone_cipher_value(generated_cipher),
     )];
+    if template_data.attribute("Type").is_none()
+        && let Some(generated_type) = generated_data.attribute("Type")
+    {
+        let opening_end = opening_tag_end(&template[template_data.range().start..])
+            .map(|offset| template_data.range().start + offset)
+            .ok_or_else(|| {
+                CommandError::Encryption("template EncryptedData is malformed".into())
+            })?;
+        replacements.push((
+            opening_end..opening_end,
+            format!(" Type=\"{}\"", quick_xml::escape::escape(generated_type)),
+        ));
+    }
 
     let template_key_info = direct_child_element(template_data, XMLDSIG_NS, "KeyInfo");
     let generated_key_info = direct_child_element(generated_data, XMLDSIG_NS, "KeyInfo");
@@ -1021,6 +1047,19 @@ fn apply_encryption_template(
         output.replace_range(range, &replacement);
     }
     Ok(output)
+}
+
+fn opening_tag_end(fragment: &str) -> Option<usize> {
+    let mut quote = None;
+    for (offset, ch) in fragment.char_indices() {
+        match (quote, ch) {
+            (None, '\'' | '"') => quote = Some(ch),
+            (Some(delimiter), current) if delimiter == current => quote = None,
+            (None, '>') => return Some(offset),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn standalone_cipher_value(node: roxmltree::Node<'_, '_>) -> String {
@@ -1191,6 +1230,7 @@ struct EncryptionTemplateMetadata {
     algorithm: DataEncryptionAlgorithm,
     encrypted_type: EncryptedDataType,
     explicit_encrypted_type: bool,
+    has_encrypted_key_recipient: bool,
     content_key_name: Option<String>,
     recipient_key_name: Option<String>,
     oaep_parameters: Option<RsaOaepParameters>,
@@ -1224,6 +1264,12 @@ fn encryption_template(
         algorithm,
         encrypted_type,
         explicit_encrypted_type,
+        has_encrypted_key_recipient: direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
+            .is_some_and(|key_info| {
+                key_info
+                    .children()
+                    .any(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+            }),
         content_key_name: encrypted_data_key_name(encrypted_data),
         recipient_key_name: encrypted_key_recipient_name(encrypted_data),
         oaep_parameters: template_oaep_parameters(encrypted_data)?,

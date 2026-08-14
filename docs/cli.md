@@ -82,13 +82,14 @@ its final extension, for example `--output 'signed-{inputfile}.xml'` with
 Encrypt and decrypt binary data with a direct AES key:
 
 ```sh
-xmlsec1 encrypt --aeskey:content content.key \
+xmlsec1 encrypt --aes-key:content content.key \
   --binary-data plaintext.bin --output encrypted.xml encrypted-data.tmpl
-xmlsec1 decrypt --aeskey:content content.key \
+xmlsec1 decrypt --aes-key:content content.key \
   --output plaintext.bin encrypted.xml
 ```
 
-Files passed through `--aeskey` use libxmlsec1's binary-key contract: their
+Files passed through `--aes-key` (`--aeskey` is an alias) use libxmlsec1's
+binary-key contract: their
 bytes are consumed verbatim rather than guessed to be Base64 text. `decrypt`
 accepts both standalone `EncryptedData` and encrypted elements embedded in a
 larger XML document; `--node-id` selects an ID-bearing operation start node and
@@ -96,6 +97,8 @@ then requires exactly one `EncryptedData` in its subtree.
 Encryption preserves the template's `Id`, `Type`, `MimeType`, `KeyInfo`,
 `EncryptionProperties`, and RSA-OAEP parameters while replacing only the
 cryptographic `CipherValue` payloads.
+For `--xml-data`, a missing template `Type` is materialized as XML Element
+metadata so a later embedded-document decrypt can perform XML replacement.
 When an encryption template contains a direct content-key `KeyName`, a named
 AES key must match it. Likewise, an RSA wrapping key must match a recipient
 `KeyName` inside `EncryptedKey`. An unnamed template does not constrain the sole
@@ -111,6 +114,9 @@ templates explicitly typed as XML `Element` or `Content`; use `--xml-data` for
 those templates so ciphertext metadata cannot mislabel arbitrary bytes as XML.
 Supplying `--binary-data` and `--xml-data` together is rejected before either
 payload is read; encryption requires exactly one payload mode.
+A direct `--aes-key` cannot satisfy an `EncryptedKey` recipient embedded in the
+template, so that inconsistent combination is rejected rather than preserving
+a stale wrapped key.
 
 Generate an AES key store using the upstream command shape:
 
@@ -131,10 +137,13 @@ as upstream PKCS#8 aliases. Public verification accepts SubjectPublicKeyInfo,
 PKCS#1 RSA public keys, and X.509 certificates. Encryption accepts RSA public
 keys or RSA X.509 recipient certificates in PEM or DER. Explicit verification
 certificate options pin verification to that certificate's public key instead
-of permitting an embedded `KeyInfo` to select another identity. When `--trusted-pem` or
-`--trusted-der` is also supplied, the explicit certificate must build a valid
-path through any `--untrusted-*` intermediates to a supplied anchor; `--insecure`
-is the explicit opt-out. Direct XMLEnc keys accept
+of permitting an embedded `KeyInfo` to select another identity. Certificates
+discovered from document-controlled `X509Data` require a path through any
+`--untrusted-*` intermediates to a caller-supplied `--trusted-pem` or
+`--trusted-der` anchor. They are accepted without an anchor only when
+`--insecure` explicitly disables trust validation. An explicit certificate
+remains a caller-pinned identity; when separate anchors are supplied, it must
+also build a valid path to one of them. Direct XMLEnc keys accept
 AES-128/256; RSA-OAEP supports both the XMLEnc 1.0 `rsa-oaep-mgf1p` and XMLEnc
 1.1 parameter contracts. Encrypted
 PKCS#8, PKCS#12, platform crypto stores, external DTDs, implicit network access,
