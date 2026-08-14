@@ -24,8 +24,10 @@ alias). Decrypting a standalone
 `EncryptedData` returns opaque decrypted bytes; embedded encrypted data uses
 in-document replacement and supports operation-start selection with
 `--node-id`. Encryption retains template metadata and RSA-OAEP parameters;
-PKCS#1 RSA, unencrypted PKCS#8, SPKI, and X.509 PEM or DER key material is
-normalized into the same core signing, verification, and encryption pipelines.
+signing accepts PKCS#1 RSA and unencrypted PKCS#8 private keys, verification
+accepts SPKI, PKCS#1 RSA public keys, and X.509 certificates, and RSA encryption
+accepts public keys or recipient certificates. Supported formats are normalized
+into the corresponding core pipeline from PEM or DER.
 Untyped `--xml-data` templates gain the inferred XML Element type, while direct
 AES keys reject recipient `EncryptedKey` templates they cannot refresh.
 Signing options validate every certificate from `key,leaf,intermediate,...` and embed the chain
