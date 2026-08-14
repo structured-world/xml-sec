@@ -1483,7 +1483,14 @@ mod tests {
         }
         xml.push_str("</EncryptedData>");
 
-        assert!(encryption_template(&xml, &EncryptionPolicy::default()).is_err());
+        let error = match encryption_template(&xml, &EncryptionPolicy::default()) {
+            Ok(_) => panic!("over-budget template must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, CommandError::Encryption(message) if message.contains("nodes limit")),
+            "expected the parser node ceiling, got: {error}"
+        );
     }
 
     #[test]
