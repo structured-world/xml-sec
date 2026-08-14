@@ -19,7 +19,9 @@ The binary recognizes libxmlsec1's command names and leading-dash aliases for
 `check-transforms`, `list-key-data`, `check-key-data`, `help`, and `version`.
 Successful operations exit zero. Invalid arguments, unavailable capabilities,
 policy violations, invalid signatures, decryption failures, and I/O errors exit
-non-zero.
+non-zero. Commands absent from the pinned 1.3.13 surface are not advertised;
+historical `sign-tmpl` spellings are rejected instead of being routed to `sign`
+without template-generation semantics.
 
 Capability checks and runtime dispatch use one registry. A transform or key-data
 class absent from `list-*` is not silently substituted and causes `check-*` to
@@ -35,6 +37,8 @@ which options accept `[:name]` and which consume a value. The listing is built
 from the parser's option metadata, so it cannot advertise a syntax the parser
 does not recognize. A `:<parameter>` suffix on flags or unrelated valued
 options is rejected rather than silently activating the underlying option.
+Native aliases from the same donor metadata are accepted, including
+`--pubkey-cert`, `--binary`, and command-local `-h`.
 
 ## Examples
 
@@ -60,6 +64,10 @@ Verification accepts `-` as the conventional stdin marker. For documents with
 multiple signatures, `--node-id <id>` selects an ID-bearing start node and
 verifies the single `Signature` in its subtree; missing and duplicate IDs fail
 closed.
+XPath and XPath Filter 2.0 verification uses libxmlsec1's legacy `here()`
+binding at this CLI compatibility boundary. The Rust library API retains the
+XMLDSig specification binding by default and requires an explicit opt-in for
+legacy documents.
 When the selected signature contains `KeyName`, named raw public-key and
 explicit certificate inputs must match it; `--lax-key-search` is the explicit
 opt-out. A signature without `KeyName` does not request a different identity,
@@ -99,6 +107,8 @@ Named AES and RSA decryption keys obey the selected `EncryptedData` or nested
 routing them through XML document replacement. `--binary-data` rejects
 templates explicitly typed as XML `Element` or `Content`; use `--xml-data` for
 those templates so ciphertext metadata cannot mislabel arbitrary bytes as XML.
+Supplying `--binary-data` and `--xml-data` together is rejected before either
+payload is read; encryption requires exactly one payload mode.
 
 Generate an AES key store using the upstream command shape:
 

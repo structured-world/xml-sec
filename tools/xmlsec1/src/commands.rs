@@ -13,7 +13,7 @@ use xml_sec::{
     xmldsig::{
         DefaultKeyResolver, DsigStatus, KeyInfoWriter, KeyResolver, KeyResolverConfig, SignContext,
         SignatureAlgorithm, UriTypeSet, VerifyContext, X509CertificateKeyInfoWriter,
-        parse_key_info,
+        XPathHereSemantics, parse_key_info,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
@@ -117,7 +117,7 @@ pub fn execute(
             }
         }
         Command::Keys => keys(&invocation, stdout),
-        Command::Sign | Command::SignTemplate => sign(&invocation, stdout),
+        Command::Sign => sign(&invocation, stdout),
         Command::Verify => verify(&invocation, stdout),
         Command::Encrypt => encrypt(&invocation, stdout),
         Command::Decrypt => decrypt(&invocation, stdout),
@@ -140,7 +140,7 @@ fn help_all(output: &mut dyn Write) -> Result<(), CommandError> {
         output,
         "Commands: help help-all help-dsig help-enc help-keys help-x509 version \
          list-key-data check-key-data list-transforms check-transforms keys sign \
-         verify sign-tmpl encrypt decrypt"
+         verify encrypt decrypt"
     )
     .map_err(stdout_error)?;
     writeln!(output, "Options:").map_err(stdout_error)?;
@@ -466,6 +466,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         process_manifests: !invocation.flag("ignore-manifests"),
         reference_uri_types: UriTypeSet::ALL,
         retrieval_uri_types: UriTypeSet::ALL,
+        xpath_here_semantics: XPathHereSemantics::XmlSecLegacy,
         ..VerificationPolicy::default()
     };
     policy.key_trust.allowed_legacy_signature_algorithms = HashSet::from([
@@ -690,6 +691,13 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         ],
     )?;
     reject_unimplemented_selectors(invocation, &[])?;
+    let has_binary_data = invocation.last_value("binary-data").is_some();
+    let has_xml_data = invocation.last_value("xml-data").is_some();
+    if has_binary_data == has_xml_data {
+        return Err(CommandError::Usage(
+            "encrypt requires exactly one of --binary-data or --xml-data".into(),
+        ));
+    }
     let policy = EncryptionPolicy::default();
     let maximum_document_bytes = policy.resources.max_xml_document_bytes;
     let maximum_plaintext_bytes = policy.resources.max_encryption_plaintext_bytes;
@@ -1378,6 +1386,21 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_verification_uses_libxmlsec_here_semantics() {
+        // The CLI compatibility boundary must verify the same node set as the
+        // donor when an XPath transform uses its non-standard here() binding.
+        let policy = xmlsec_compatibility_verification_policy(&invocation(&[
+            "xmlsec1",
+            "verify",
+            "input.xml",
+        ]));
+        assert_eq!(
+            policy.xpath_here_semantics,
+            xml_sec::xmldsig::XPathHereSemantics::XmlSecLegacy
+        );
+    }
+
+    #[test]
     fn help_all_enumerates_the_registered_surface() {
         let mut output = Vec::new();
         execute(
@@ -1387,9 +1410,10 @@ mod tests {
         )
         .unwrap();
         let help = String::from_utf8(output).unwrap();
-        for command in ["help-dsig", "check-key-data", "sign-tmpl", "decrypt"] {
+        for command in ["help-dsig", "check-key-data", "decrypt"] {
             assert!(help.contains(command), "missing command {command}");
         }
+        assert!(!help.contains("sign-tmpl"));
         for option in OPTION_SPECS {
             assert!(
                 help.contains(&format!("--{}", option.canonical)),

@@ -9,6 +9,13 @@ use rsa::{
     RsaPrivateKey,
     pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _},
 };
+use xml_sec::{
+    c14n::{C14nAlgorithm, C14nMode},
+    xmldsig::{
+        DigestAlgorithm, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
+        SignatureBuilder, Transform, XPathExpression, XPathHereSemantics,
+    },
+};
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_xmlsec1")
@@ -81,6 +88,59 @@ fn signs_verifies_and_rejects_tampering_through_process_api() {
         .unwrap();
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("invalid"));
+}
+
+#[test]
+fn short_command_help_alias_reaches_process_dispatch() {
+    // Parsing an alias is insufficient if command validation later rejects its
+    // canonical option, so exercise the complete process route for donor `-h`.
+    let output = Command::new(binary())
+        .args(["verify", "-h"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("Usage:"));
+}
+
+#[test]
+fn verifies_libxmlsec_legacy_here_semantics_through_process_api() {
+    // The expression selects different nodes under specification and libxmlsec
+    // semantics, so process success proves the CLI policy reaches transforms.
+    let temp = tempfile::tempdir().unwrap();
+    let signed_path = temp.path().join("legacy-here.xml");
+    let private_key =
+        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .unwrap();
+    let key = RsaSigningKey::from_pkcs8_pem(&private_key).unwrap();
+    let builder = SignatureBuilder::new(
+        C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+        SignatureAlgorithm::RsaSha256,
+    )
+    .add_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("")
+            .transform(Transform::XPath(XPathExpression::new(
+                "count(. | here()) = 1",
+            ))),
+    );
+    let signed = SignContext::new(&key)
+        .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy)
+        .sign_with_builder("<root><payload>legacy here</payload></root>", &builder)
+        .unwrap();
+    fs::write(&signed_path, signed).unwrap();
+
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(public_key)
+        .arg(signed_path)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
 }
 
 #[test]
@@ -506,6 +566,42 @@ fn binary_encryption_rejects_xml_typed_templates() {
         .unwrap();
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("binary-data"));
+}
+
+#[test]
+fn encryption_rejects_simultaneous_binary_and_xml_payloads() {
+    // Selecting one option by branch order can encrypt the wrong input while
+    // reporting success, so payload mode must be an exclusive choice.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let binary_payload = temp.path().join("payload.bin");
+    let xml = temp.path().join("payload.xml");
+    let key = temp.path().join("content.key");
+    let output = temp.path().join("encrypted.xml");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&binary_payload, b"binary payload").unwrap();
+    fs::write(&xml, b"<payload>xml payload</payload>").unwrap();
+    fs::write(&key, [0x31; 16]).unwrap();
+
+    let result = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(key)
+        .args(["--binary-data"])
+        .arg(binary_payload)
+        .args(["--xml-data"])
+        .arg(xml)
+        .args(["--output"])
+        .arg(&output)
+        .arg(template)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("exactly one"));
+    assert!(!output.exists());
 }
 
 #[test]

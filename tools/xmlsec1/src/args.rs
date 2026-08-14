@@ -20,7 +20,6 @@ pub enum Command {
     Keys,
     Sign,
     Verify,
-    SignTemplate,
     Encrypt,
     Decrypt,
 }
@@ -43,7 +42,6 @@ impl Command {
             "keys" => Self::Keys,
             "sign" => Self::Sign,
             "verify" => Self::Verify,
-            "sign-tmpl" | "sign-template" => Self::SignTemplate,
             "encrypt" => Self::Encrypt,
             "decrypt" => Self::Decrypt,
             _ => return None,
@@ -196,7 +194,7 @@ pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
     },
     OptionSpec {
         canonical: "pubkey-cert-pem",
-        aliases: &[],
+        aliases: &["pubkey-cert"],
         arity: VALUE,
         accepts_parameter: true,
     },
@@ -358,7 +356,7 @@ pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
     },
     OptionSpec {
         canonical: "binary-data",
-        aliases: &[],
+        aliases: &["binary"],
         arity: VALUE,
         accepts_parameter: false,
     },
@@ -388,7 +386,7 @@ pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
     },
     OptionSpec {
         canonical: "help",
-        aliases: &[],
+        aliases: &["h"],
         arity: FLAG,
         accepts_parameter: false,
     },
@@ -519,7 +517,7 @@ mod tests {
     fn parses_alias_named_and_repeated_options() {
         let parsed = parse(&[
             "xmlsec1",
-            "sign-tmpl",
+            "sign",
             "-o",
             "signed.xml",
             "--privkey-pem:signer",
@@ -531,7 +529,7 @@ mod tests {
             "input.xml",
         ])
         .expect("valid donor-shaped arguments must parse");
-        assert_eq!(parsed.command, Command::SignTemplate);
+        assert_eq!(parsed.command, Command::Sign);
         assert_eq!(parsed.last_value("output"), Some(OsStr::new("signed.xml")));
         assert_eq!(parsed.values("trusted-pem").count(), 2);
         assert_eq!(
@@ -637,6 +635,34 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn recognizes_all_aliases_for_native_donor_options() {
+        // The pinned donor metadata is the source of truth for aliases; accepting
+        // only each canonical spelling breaks otherwise native command lines.
+        for (alias, canonical) in [
+            ("--pubkey-cert", "pubkey-cert-pem"),
+            ("--binary", "binary-data"),
+        ] {
+            let parsed = parse(&["xmlsec1", "verify", alias, "value", "input.xml"])
+                .expect("native donor alias must parse");
+            assert_eq!(parsed.values(canonical).count(), 1, "alias {alias}");
+        }
+
+        let parsed = parse(&["xmlsec1", "verify", "-h", "input.xml"])
+            .expect("short command-help alias must parse");
+        assert!(parsed.flag("help"));
+    }
+
+    #[test]
+    fn rejects_commands_absent_from_the_pinned_donor_surface() {
+        // libxmlsec1 1.3.13 has no sign-tmpl command. Advertising it as an alias
+        // for sign would claim template generation while requiring a template.
+        assert!(matches!(
+            parse(&["xmlsec1", "sign-tmpl"]),
+            Err(ParseError::UnknownCommand(command)) if command == "sign-tmpl"
+        ));
     }
 
     #[cfg(unix)]
