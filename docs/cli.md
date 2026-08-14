@@ -63,7 +63,8 @@ template unconstrained when one explicit key is supplied.
 Verification accepts `-` as the conventional stdin marker. For documents with
 multiple signatures, `--node-id <id>` selects an ID-bearing start node and
 verifies the single `Signature` in its subtree; missing and duplicate IDs fail
-closed.
+closed. Signing applies the same start-node contract and mutates only the
+selected template's digest, signature, and optional key-info placeholders.
 XPath and XPath Filter 2.0 verification uses libxmlsec1's legacy `here()`
 binding at this CLI compatibility boundary. The Rust library API retains the
 XMLDSig specification binding by default and requires an explicit opt-in for
@@ -90,7 +91,8 @@ xmlsec1 decrypt --aeskey:content content.key \
 Files passed through `--aeskey` use libxmlsec1's binary-key contract: their
 bytes are consumed verbatim rather than guessed to be Base64 text. `decrypt`
 accepts both standalone `EncryptedData` and encrypted elements embedded in a
-larger XML document; `--node-id` selects an embedded `EncryptedData` by `Id`.
+larger XML document; `--node-id` selects an ID-bearing operation start node and
+then requires exactly one `EncryptedData` in its subtree.
 Encryption preserves the template's `Id`, `Type`, `MimeType`, `KeyInfo`,
 `EncryptionProperties`, and RSA-OAEP parameters while replacing only the
 cryptographic `CipherValue` payloads.
@@ -126,9 +128,10 @@ algorithms, selectors, and policy controls remain capability-limited. Current
 private-key loading accepts unencrypted PKCS#8 RSA, P-256, and P-384 plus
 PKCS#1 RSA in PEM or DER; `--privkey-p8-pem` and `--privkey-p8-der` are accepted
 as upstream PKCS#8 aliases. Public verification accepts SubjectPublicKeyInfo,
-PKCS#1 RSA public keys, and X.509 certificates. Explicit certificate options
-pin verification to that certificate's public key instead of permitting an
-embedded `KeyInfo` to select another identity. When `--trusted-pem` or
+PKCS#1 RSA public keys, and X.509 certificates. Encryption accepts RSA public
+keys or RSA X.509 recipient certificates in PEM or DER. Explicit verification
+certificate options pin verification to that certificate's public key instead
+of permitting an embedded `KeyInfo` to select another identity. When `--trusted-pem` or
 `--trusted-der` is also supplied, the explicit certificate must build a valid
 path through any `--untrusted-*` intermediates to a supplied anchor; `--insecure`
 is the explicit opt-out. Direct XMLEnc keys accept

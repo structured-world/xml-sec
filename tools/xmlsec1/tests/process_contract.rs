@@ -387,6 +387,87 @@ fn verification_node_id_selects_one_signature_subtree() {
 }
 
 #[test]
+fn signing_node_id_selects_one_signature_subtree() {
+    // The donor treats --node-id as an operation start node. Signing must fill
+    // only the Signature below that node while preserving unrelated templates.
+    let temp = tempfile::tempdir().unwrap();
+    let original = fs::read_to_string(
+        project_root()
+            .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl"),
+    )
+    .unwrap();
+    let body = original
+        .split_once("?>")
+        .map_or(original.as_str(), |(_, body)| body);
+    let template = temp.path().join("multiple-templates.xml");
+    let first = body
+        .replace("#object", "#first-object")
+        .replace("Id=\"object\"", "Id=\"first-object\"");
+    let second = body
+        .replace("#object", "#second-object")
+        .replace("Id=\"object\"", "Id=\"second-object\"");
+    fs::write(
+        &template,
+        format!(
+            "<Document><Envelope Id=\"first\">{first}</Envelope><Envelope Id=\"second\">{second}</Envelope></Document>"
+        ),
+    )
+    .unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+
+    let output = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--node-id", "first"])
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let signed = String::from_utf8(output.stdout).unwrap();
+    let document = roxmltree::Document::parse(&signed).unwrap();
+    let values = document
+        .descendants()
+        .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue")))
+        .map(|node| node.text().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(!values[0].trim().is_empty());
+    assert!(values[1].trim().is_empty());
+
+    let missing = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--node-id", "missing"])
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing or ambiguous"));
+
+    let duplicate = temp.path().join("duplicate-start.xml");
+    fs::write(
+        &duplicate,
+        fs::read_to_string(&template)
+            .unwrap()
+            .replace("Id=\"second\"", "Id=\"first\""),
+    )
+    .unwrap();
+    let ambiguous = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--node-id", "first"])
+        .arg(&duplicate)
+        .output()
+        .unwrap();
+    assert!(!ambiguous.status.success());
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("missing or ambiguous"));
+}
+
+#[test]
 fn output_template_expands_the_extensionless_input_basename() {
     // libxmlsec1 automation uses one output template across many input files;
     // only the first placeholder is replaced and the input extension is removed.
@@ -538,6 +619,89 @@ fn encryption_preserves_template_metadata_and_supports_id_selection() {
         decrypted.stdout,
         b"<secret>template metadata payload</secret>"
     );
+}
+
+#[test]
+fn encryption_node_id_selects_one_template_subtree() {
+    // --node-id selects the operation start node, not EncryptedData/@Id. Both
+    // template inspection and replacement must stay within that subtree.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("multiple-templates.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let key = temp.path().join("key.bin");
+    let encrypted_data = |id: &str| {
+        format!(
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Id="{id}"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#
+        )
+    };
+    fs::write(
+        &template,
+        format!(
+            "<Document><Envelope Id=\"first\">{}</Envelope><Envelope Id=\"second\">{}</Envelope></Document>",
+            encrypted_data("first-template"),
+            encrypted_data("second-template")
+        ),
+    )
+    .unwrap();
+    fs::write(&plaintext, b"selected payload").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    let output = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .args(["--binary-data"])
+        .arg(&plaintext)
+        .args(["--node-id", "first"])
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let encrypted = String::from_utf8(output.stdout).unwrap();
+    let document = roxmltree::Document::parse(&encrypted).unwrap();
+    let values = document
+        .descendants()
+        .filter(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherValue")))
+        .map(|node| node.text().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(!values[0].trim().is_empty());
+    assert!(values[1].trim().is_empty());
+
+    let missing = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .args(["--binary-data"])
+        .arg(&plaintext)
+        .args(["--node-id", "missing"])
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing or ambiguous"));
+
+    let duplicate = temp.path().join("duplicate-start.xml");
+    fs::write(
+        &duplicate,
+        fs::read_to_string(&template)
+            .unwrap()
+            .replace("Id=\"second\"", "Id=\"first\""),
+    )
+    .unwrap();
+    let ambiguous = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .args(["--binary-data"])
+        .arg(&plaintext)
+        .args(["--node-id", "first"])
+        .arg(&duplicate)
+        .output()
+        .unwrap();
+    assert!(!ambiguous.status.success());
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("missing or ambiguous"));
 }
 
 #[test]
@@ -750,6 +914,63 @@ fn standalone_binary_decryption_accepts_its_root_node_id() {
 }
 
 #[test]
+fn embedded_decryption_node_id_selects_an_operation_subtree() {
+    // The selected ID belongs to an ancestor operation node; EncryptedData is
+    // intentionally anonymous, matching libxmlsec1's start-node contract.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.xml");
+    let encrypted = temp.path().join("encrypted.xml");
+    let document = temp.path().join("document.xml");
+    let key = temp.path().join("key.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"<secret>selected subtree</secret>").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+    let encryption = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .args(["--xml-data"])
+        .arg(&plaintext)
+        .args(["--output"])
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(encryption.status.success());
+    fs::write(
+        &document,
+        format!(
+            "<Document><Envelope Id=\"selected\">{}</Envelope></Document>",
+            fs::read_to_string(&encrypted).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(binary())
+        .args(["decrypt", "--aes-key"])
+        .arg(&key)
+        .args(["--node-id", "selected"])
+        .arg(&document)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("<Envelope Id=\"selected\"><secret>selected subtree</secret></Envelope>")
+    );
+}
+
+#[test]
 fn rsa_recipient_name_must_match_the_template_unless_lax() {
     // A named RSA key selects the nested EncryptedKey recipient identity, not
     // the direct content-encryption key metadata on EncryptedData.
@@ -884,6 +1105,62 @@ fn encrypts_and_decrypts_with_an_rsa_oaep_recipient() {
         String::from_utf8_lossy(&decrypt.stderr)
     );
     assert_eq!(decrypt.stdout, fs::read(&plaintext).unwrap());
+}
+
+#[test]
+fn encrypts_with_rsa_recipient_certificates() {
+    // Donor certificate options extract the recipient public key from either
+    // PEM or DER X.509 input and feed the same RSA-OAEP encryption path.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let certificate_pem = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    let certificate_der = temp.path().join("certificate.der");
+    let pem = fs::read(&certificate_pem).unwrap();
+    let (_, certificate) = x509_parser::pem::parse_x509_pem(&pem).unwrap();
+    fs::write(&certificate_der, certificate.contents).unwrap();
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"certificate recipient").unwrap();
+
+    for (option, certificate) in [
+        ("--pubkey-cert-pem", certificate_pem.as_path()),
+        ("--pubkey-cert-der", certificate_der.as_path()),
+    ] {
+        let encrypted = temp.path().join(format!("{option}.xml"));
+        let encryption = Command::new(binary())
+            .args(["encrypt", option])
+            .arg(certificate)
+            .args(["--binary-data"])
+            .arg(&plaintext)
+            .args(["--output"])
+            .arg(&encrypted)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            encryption.status.success(),
+            "{option}: {}",
+            String::from_utf8_lossy(&encryption.stderr)
+        );
+
+        let decryption = Command::new(binary())
+            .args(["decrypt", "--privkey-pem"])
+            .arg(&private_key)
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            decryption.status.success(),
+            "{option}: {}",
+            String::from_utf8_lossy(&decryption.stderr)
+        );
+        assert_eq!(decryption.stdout, b"certificate recipient");
+    }
 }
 
 #[test]

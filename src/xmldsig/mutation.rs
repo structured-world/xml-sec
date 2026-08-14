@@ -159,12 +159,25 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    let target_signature = last_signature_index(xml, policy)?;
+    fill_signed_info_digest_values_at_index_with_options(xml, values, target_signature, policy)
+}
+
+pub(super) fn fill_signed_info_digest_values_at_index_with_options<I, S>(
+    xml: &str,
+    values: I,
+    target_signature: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let values: Vec<String> = values
         .into_iter()
         .map(|value| value.as_ref().to_owned())
         .collect();
-    let target_signature = last_signature_index(xml, policy)?;
-    let expected = count_signed_info_digest_values(xml, policy)?;
+    let expected = count_signed_info_digest_values(xml, target_signature, policy)?;
     if expected != values.len() {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "DigestValue",
@@ -198,7 +211,16 @@ pub(super) fn fill_signature_value_with_options(
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
     let target_signature = last_signature_index(xml, policy)?;
-    let expected = count_direct_signature_values(xml, policy)?;
+    fill_signature_value_at_index_with_options(xml, value, target_signature, policy)
+}
+
+pub(super) fn fill_signature_value_at_index_with_options(
+    xml: &str,
+    value: &str,
+    target_signature: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError> {
+    let expected = count_direct_signature_values(xml, target_signature, policy)?;
     if expected != 1 {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "SignatureValue",
@@ -227,7 +249,16 @@ pub(super) fn fill_key_info_with_options(
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
     let target_signature = last_signature_index(xml, policy)?;
-    let expected = count_direct_key_infos(xml, policy)?;
+    fill_key_info_at_index_with_options(xml, key_info_content, target_signature, policy)
+}
+
+pub(super) fn fill_key_info_at_index_with_options(
+    xml: &str,
+    key_info_content: &str,
+    target_signature: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError> {
+    let expected = count_direct_key_infos(xml, target_signature, policy)?;
     if expected != 1 {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "KeyInfo",
@@ -505,10 +536,11 @@ fn count_dsig_elements(xml: &str, local_name: &str) -> Result<usize, XmlMutation
 
 fn count_signed_info_digest_values(
     xml: &str,
+    target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<usize, XmlMutationError> {
     let document = parse_with_options(xml, policy)?;
-    let Some(signature) = last_signature_node(&document) else {
+    let Some(signature) = signature_node(&document, target_signature) else {
         return Ok(0);
     };
     Ok(document
@@ -519,10 +551,11 @@ fn count_signed_info_digest_values(
 
 fn count_direct_signature_values(
     xml: &str,
+    target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<usize, XmlMutationError> {
     let document = parse_with_options(xml, policy)?;
-    let Some(signature) = last_signature_node(&document) else {
+    let Some(signature) = signature_node(&document, target_signature) else {
         return Ok(0);
     };
     Ok(document
@@ -538,10 +571,11 @@ fn count_direct_signature_values(
 
 fn count_direct_key_infos(
     xml: &str,
+    target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<usize, XmlMutationError> {
     let document = parse_with_options(xml, policy)?;
-    let Some(signature) = last_signature_node(&document) else {
+    let Some(signature) = signature_node(&document, target_signature) else {
         return Ok(0);
     };
     Ok(document
@@ -555,12 +589,14 @@ fn count_direct_key_infos(
         .count())
 }
 
-fn last_signature_node<'a>(
+fn signature_node<'a>(
     document: &'a roxmltree::Document<'a>,
+    target_signature: usize,
 ) -> Option<roxmltree::Node<'a, 'a>> {
     document
         .descendants()
-        .rfind(|node| is_dsig_node(*node, "Signature"))
+        .filter(|node| is_dsig_node(*node, "Signature"))
+        .nth(target_signature)
 }
 
 fn last_signature_index(

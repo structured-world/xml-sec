@@ -14,12 +14,13 @@ See the repository's [CLI compatibility guide](https://github.com/structured-wor
 examples, supported key formats, fail-closed behavior, and upstream runner
 coverage.
 
-`--aeskey` files are raw binary key material. Decryption accepts standalone
-`EncryptedData` and performs in-document replacement, optionally selected by
+`--aeskey` files are raw binary key material. Decrypting a standalone
+`EncryptedData` returns opaque decrypted bytes; embedded encrypted data uses
+in-document replacement and supports operation-start selection with
 `--node-id`. Encryption retains template metadata and RSA-OAEP parameters;
-PKCS#1 RSA and PKCS#8/SPKI/X.509 PEM or DER key material is normalized into the
-same core signing, verification, and encryption pipelines. Signing options
-validate every certificate from `key,leaf,intermediate,...` and embed the chain
+PKCS#1 RSA, unencrypted PKCS#8, SPKI, and X.509 PEM or DER key material is
+normalized into the same core signing, verification, and encryption pipelines.
+Signing options validate every certificate from `key,leaf,intermediate,...` and embed the chain
 when the template provides a `KeyInfo` placeholder; verification accepts
 stdin as `-` and can select one signature subtree with `--node-id`. Output paths
 support the upstream `{inputfile}` basename template, and `--gen-key[:name]`

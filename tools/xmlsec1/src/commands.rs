@@ -13,7 +13,7 @@ use xml_sec::{
     xmldsig::{
         DefaultKeyResolver, DsigStatus, KeyInfoWriter, KeyResolver, KeyResolverConfig, SignContext,
         SignatureAlgorithm, UriTypeSet, VerifyContext, X509CertificateKeyInfoWriter,
-        XPathHereSemantics, parse_key_info,
+        XPathHereSemantics, parse_key_info, uri::UriReferenceResolver,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
@@ -40,6 +40,78 @@ const GENERIC_OPTIONS: &[&str] = &[
     "print-xml-debug",
     "help",
 ];
+const SIGN_OPTIONS: &[&str] = &[
+    "output",
+    "privkey-pem",
+    "privkey-der",
+    "pkcs8-pem",
+    "pkcs8-der",
+    "pwd",
+    "lax-key-search",
+    "node-id",
+    "node-name",
+    "node-xpath",
+    "id-attr",
+    "add-id-attr",
+];
+const VERIFY_OPTIONS: &[&str] = &[
+    "pubkey-pem",
+    "pubkey-der",
+    "pubkey-cert-pem",
+    "pubkey-cert-der",
+    "trusted-pem",
+    "trusted-der",
+    "untrusted-pem",
+    "untrusted-der",
+    "enabled-reference-uris",
+    "enabled-retrieval-uris",
+    "ignore-manifests",
+    "lax-key-search",
+    "verify-crls",
+    "X509-skip-time-checks",
+    "X509-skip-strict-checks",
+    "insecure",
+    "verification-time",
+    "depth",
+    "node-id",
+    "node-name",
+    "node-xpath",
+    "id-attr",
+    "add-id-attr",
+    "url-map",
+];
+const ENCRYPT_OPTIONS: &[&str] = &[
+    "output",
+    "binary-data",
+    "xml-data",
+    "aes-key",
+    "pubkey-pem",
+    "pubkey-der",
+    "pubkey-cert-pem",
+    "pubkey-cert-der",
+    "lax-key-search",
+    "node-id",
+    "node-name",
+    "node-xpath",
+    "id-attr",
+    "add-id-attr",
+];
+const DECRYPT_OPTIONS: &[&str] = &[
+    "output",
+    "aes-key",
+    "privkey-pem",
+    "privkey-der",
+    "pkcs8-pem",
+    "pkcs8-der",
+    "pwd",
+    "lax-key-search",
+    "node-id",
+    "node-name",
+    "node-xpath",
+    "id-attr",
+    "add-id-attr",
+];
+const KEYS_OPTIONS: &[&str] = &["gen-key"];
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const XMLENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";
 const XMLENC11_NS: &str = "http://www.w3.org/2009/xmlenc11#";
@@ -81,16 +153,20 @@ pub fn execute(
     _stderr: &mut dyn Write,
 ) -> Result<(), CommandError> {
     if invocation.flag("help") {
-        return help(stdout);
+        return command_help(invocation.command, stdout);
     }
     validate_provider(&invocation)?;
     validate_crypto_config(&invocation)?;
     match invocation.command {
         Command::Help => help(stdout),
         Command::HelpAll => help_all(stdout),
-        Command::HelpDsig | Command::HelpEnc | Command::HelpKeys | Command::HelpX509 => {
-            help(stdout)
-        }
+        Command::HelpDsig => topic_help(&[Command::Sign, Command::Verify], stdout),
+        Command::HelpEnc => topic_help(&[Command::Encrypt, Command::Decrypt], stdout),
+        Command::HelpKeys => topic_help(
+            &[Command::Keys, Command::ListKeyData, Command::CheckKeyData],
+            stdout,
+        ),
+        Command::HelpX509 => topic_help(&[Command::Verify], stdout),
         Command::Version => writeln!(stdout, "xmlsec1 1.3.13 (rustcrypto)").map_err(stdout_error),
         Command::ListTransforms => {
             validate_options(&invocation, &[])?;
@@ -158,6 +234,57 @@ fn help_all(output: &mut dyn Write) -> Result<(), CommandError> {
         writeln!(output, "  --{}{parameter}{value}", spec.canonical).map_err(stdout_error)?;
     }
     Ok(())
+}
+
+fn command_help(command: Command, output: &mut dyn Write) -> Result<(), CommandError> {
+    let Some((name, options)) = command_contract(command) else {
+        return help(output);
+    };
+    writeln!(output, "Usage: xmlsec1 {name} [options] [files]").map_err(stdout_error)?;
+    writeln!(output, "Options:").map_err(stdout_error)?;
+    for option in GENERIC_OPTIONS.iter().chain(options) {
+        let spec = OPTION_SPECS
+            .iter()
+            .find(|spec| spec.canonical == *option)
+            .expect("command option must exist in OPTION_SPECS");
+        let parameter = if spec.accepts_parameter {
+            "[:name]"
+        } else {
+            ""
+        };
+        let value = if matches!(spec.arity, Arity::Value) {
+            " <value>"
+        } else {
+            ""
+        };
+        writeln!(output, "  --{}{parameter}{value}", spec.canonical).map_err(stdout_error)?;
+    }
+    Ok(())
+}
+
+fn topic_help(commands: &[Command], output: &mut dyn Write) -> Result<(), CommandError> {
+    for (index, command) in commands.iter().copied().enumerate() {
+        if index != 0 {
+            writeln!(output).map_err(stdout_error)?;
+        }
+        command_help(command, output)?;
+    }
+    Ok(())
+}
+
+fn command_contract(command: Command) -> Option<(&'static str, &'static [&'static str])> {
+    Some(match command {
+        Command::Sign => ("sign", SIGN_OPTIONS),
+        Command::Verify => ("verify", VERIFY_OPTIONS),
+        Command::Encrypt => ("encrypt", ENCRYPT_OPTIONS),
+        Command::Decrypt => ("decrypt", DECRYPT_OPTIONS),
+        Command::Keys => ("keys", KEYS_OPTIONS),
+        Command::ListKeyData => ("list-key-data", &[]),
+        Command::CheckKeyData => ("check-key-data", &[]),
+        Command::ListTransforms => ("list-transforms", &[]),
+        Command::CheckTransforms => ("check-transforms", &[]),
+        _ => return None,
+    })
 }
 
 fn validate_provider(invocation: &Invocation) -> Result<(), CommandError> {
@@ -328,30 +455,15 @@ fn option_value_text(option: &crate::OptionValue) -> Result<&str, CommandError> 
 }
 
 fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
-    validate_options(
-        invocation,
-        &[
-            "output",
-            "privkey-pem",
-            "privkey-der",
-            "pkcs8-pem",
-            "pkcs8-der",
-            "pwd",
-            "lax-key-search",
-            "node-id",
-            "node-name",
-            "node-xpath",
-            "id-attr",
-            "add-id-attr",
-        ],
-    )?;
-    reject_unimplemented_selectors(invocation, &[])?;
+    validate_options(invocation, SIGN_OPTIONS)?;
+    reject_unimplemented_selectors(invocation, &["node-id"])?;
     if invocation.last_value("pwd").is_some() {
         return Err(CommandError::UnsupportedOption("pwd".into()));
     }
     let policy = SigningPolicy::default();
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
-    let signature = key_material::signing_signature_metadata(&xml, &policy)?;
+    let start_node_id = option_text(invocation, "node-id")?;
+    let signature = key_material::signing_signature_metadata(&xml, start_node_id, &policy)?;
     let (key_option, certificate_is_der) =
         select_signing_key(invocation, signature.key_name.as_deref())?;
     let value = key_option.value.as_deref().unwrap_or_default();
@@ -378,6 +490,9 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         )
     };
     let mut context = SignContext::new(key.as_ref()).policy(policy);
+    if let Some(id) = start_node_id {
+        context = context.start_node_id(id);
+    }
     if let Some(writer) = &writer {
         if signature.has_key_info {
             context = context.key_info_writer(writer);
@@ -482,38 +597,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
 }
 
 fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
-    validate_options(
-        invocation,
-        &[
-            "pubkey-pem",
-            "pubkey-der",
-            "pubkey-cert-pem",
-            "pubkey-cert-der",
-            "trusted-pem",
-            "trusted-der",
-            "untrusted-pem",
-            "untrusted-der",
-            "enabled-reference-uris",
-            "enabled-retrieval-uris",
-            "ignore-manifests",
-            "lax-key-search",
-            "verify-crls",
-            "X509-skip-time-checks",
-            // libxmlsec uses this to relax provider security levels for legacy
-            // certificate signatures. RustCrypto has no provider strict mode and
-            // already verifies every certificate signature algorithm it implements.
-            "X509-skip-strict-checks",
-            "insecure",
-            "verification-time",
-            "depth",
-            "node-id",
-            "node-name",
-            "node-xpath",
-            "id-attr",
-            "add-id-attr",
-            "url-map",
-        ],
-    )?;
+    validate_options(invocation, VERIFY_OPTIONS)?;
     reject_unimplemented_selectors(invocation, &["node-id"])?;
     reject_unimplemented_verification_policy(invocation)?;
     let direct_keys = ["pubkey-pem", "pubkey-der"]
@@ -673,24 +757,8 @@ fn verify_with_explicit_certificate(
 }
 
 fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
-    validate_options(
-        invocation,
-        &[
-            "output",
-            "binary-data",
-            "xml-data",
-            "aes-key",
-            "pubkey-pem",
-            "pubkey-der",
-            "lax-key-search",
-            "node-id",
-            "node-name",
-            "node-xpath",
-            "id-attr",
-            "add-id-attr",
-        ],
-    )?;
-    reject_unimplemented_selectors(invocation, &[])?;
+    validate_options(invocation, ENCRYPT_OPTIONS)?;
+    reject_unimplemented_selectors(invocation, &["node-id"])?;
     let has_binary_data = invocation.last_value("binary-data").is_some();
     let has_xml_data = invocation.last_value("xml-data").is_some();
     if has_binary_data == has_xml_data {
@@ -702,16 +770,26 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let maximum_document_bytes = policy.resources.max_xml_document_bytes;
     let maximum_plaintext_bytes = policy.resources.max_encryption_plaintext_bytes;
     let template = read_input(invocation, policy.resources.max_xml_document_bytes)?;
-    let metadata = encryption_template(&template, &policy)?;
+    let start_node_id = option_text(invocation, "node-id")?;
+    let metadata = encryption_template(&template, start_node_id, &policy)?;
     let algorithm = metadata.algorithm;
     let encrypted_type = metadata.encrypted_type;
     let explicit_encrypted_type = metadata.explicit_encrypted_type;
     let mut builder = EncryptedDataBuilder::new(algorithm).policy(policy.clone());
     let aes_keys = invocation.values("aes-key").collect::<Vec<_>>();
-    let public_keys = ["pubkey-pem", "pubkey-der"]
-        .into_iter()
-        .flat_map(|name| invocation.values(name))
-        .collect::<Vec<_>>();
+    let public_keys = [
+        ("pubkey-pem", false),
+        ("pubkey-der", false),
+        ("pubkey-cert-pem", true),
+        ("pubkey-cert-der", true),
+    ]
+    .into_iter()
+    .flat_map(|(name, certificate)| {
+        invocation
+            .values(name)
+            .map(move |option| (option, certificate))
+    })
+    .collect::<Vec<_>>();
     if aes_keys.len() + public_keys.len() > 1 {
         return Err(CommandError::Usage(
             "encrypt accepts exactly one AES key or RSA public key".into(),
@@ -732,7 +810,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         if let Some(name) = option.parameter.as_deref() {
             builder = builder.direct_key_name(name);
         }
-    } else if let [option] = public_keys.as_slice() {
+    } else if let [(option, certificate)] = public_keys.as_slice() {
         enforce_named_key_match(
             option,
             metadata.recipient_key_name.as_deref(),
@@ -740,14 +818,19 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             "RSA recipient key",
         )?;
         let path = option.value.as_deref().unwrap_or_default();
-        let mut recipient = EncryptionRecipient::rsa_oaep(key_material::load_rsa_public(path)?);
+        let public_key = if *certificate {
+            key_material::load_rsa_certificate_public(path)?
+        } else {
+            key_material::load_rsa_public(path)?
+        };
+        let mut recipient = EncryptionRecipient::rsa_oaep(public_key);
         if let Some(parameters) = metadata.oaep_parameters {
             recipient = recipient.oaep_parameters(parameters);
         }
         builder = builder.add_recipient(recipient);
     } else {
         return Err(CommandError::Usage(
-            "encrypt requires --aes-key or --pubkey-pem".into(),
+            "encrypt requires --aes-key, an RSA public key, or an RSA certificate".into(),
         ));
     }
     builder = builder.encryption_type(encrypted_type);
@@ -769,7 +852,12 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         ));
     }
     .map_err(|error| CommandError::Encryption(error.to_string()))?;
-    let rendered = apply_encryption_template(&template, &result.encrypted_data_xml, &policy)?;
+    let rendered = apply_encryption_template(
+        &template,
+        &result.encrypted_data_xml,
+        start_node_id,
+        &policy,
+    )?;
     if rendered.len() > maximum_document_bytes {
         return Err(CommandError::Encryption(
             "encrypted template output exceeds XML document policy".into(),
@@ -859,11 +947,12 @@ fn oaep_mgf_from_uri(uri: &str) -> Result<OaepDigestAlgorithm, CommandError> {
 fn apply_encryption_template(
     template: &str,
     generated: &str,
+    start_node_id: Option<&str>,
     policy: &EncryptionPolicy,
 ) -> Result<String, CommandError> {
     let template_document = parse_encryption_document(template, policy)?;
     let generated_document = parse_encryption_document(generated, policy)?;
-    let template_data = select_encrypted_data(&template_document, None)?;
+    let template_data = select_encrypted_data(&template_document, start_node_id)?;
     let generated_data = generated_document.root_element();
     let template_cipher = encrypted_data_cipher_value(template_data)
         .ok_or_else(|| CommandError::Encryption("template has no CipherValue".into()))?;
@@ -978,24 +1067,7 @@ fn encrypted_data_cipher_value<'a, 'input>(
 }
 
 fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
-    validate_options(
-        invocation,
-        &[
-            "output",
-            "aes-key",
-            "privkey-pem",
-            "privkey-der",
-            "pkcs8-pem",
-            "pkcs8-der",
-            "pwd",
-            "lax-key-search",
-            "node-id",
-            "node-name",
-            "node-xpath",
-            "id-attr",
-            "add-id-attr",
-        ],
-    )?;
+    validate_options(invocation, DECRYPT_OPTIONS)?;
     reject_unimplemented_selectors(invocation, &["node-id"])?;
     if invocation.last_value("pwd").is_some() {
         return Err(CommandError::UnsupportedOption("pwd".into()));
@@ -1073,7 +1145,7 @@ fn decrypt_input(
             .map_err(|error| CommandError::Encryption(error.to_string()));
     }
     context
-        .decrypt_document(xml, encrypted_data_id)
+        .decrypt_document_from_start_node(xml, encrypted_data_id)
         .map(String::into_bytes)
         .map_err(|error| CommandError::Encryption(error.to_string()))
 }
@@ -1089,10 +1161,11 @@ struct EncryptionTemplateMetadata {
 
 fn encryption_template(
     xml: &str,
+    start_node_id: Option<&str>,
     policy: &EncryptionPolicy,
 ) -> Result<EncryptionTemplateMetadata, CommandError> {
     let document = parse_encryption_document(xml, policy)?;
-    let encrypted_data = select_encrypted_data(&document, None)?;
+    let encrypted_data = select_encrypted_data(&document, start_node_id)?;
     let method = encrypted_data
         .children()
         .find(|node| node.has_tag_name((XMLENC_NS, "EncryptionMethod")))
@@ -1157,14 +1230,22 @@ fn parse_encryption_document<'a>(
     .map_err(|error| CommandError::Encryption(error.to_string()))
 }
 
-fn select_encrypted_data<'a, 'input>(
-    document: &'a Document<'input>,
-    id: Option<&str>,
-) -> Result<Node<'a, 'input>, CommandError> {
-    let mut matches = document.descendants().filter(|node| {
-        node.has_tag_name((XMLENC_NS, "EncryptedData"))
-            && id.is_none_or(|id| node.attribute("Id") == Some(id))
-    });
+fn select_encrypted_data<'a>(
+    document: &'a Document<'a>,
+    start_node_id: Option<&str>,
+) -> Result<Node<'a, 'a>, CommandError> {
+    let start = if let Some(id) = start_node_id {
+        UriReferenceResolver::new(document)
+            .node_for_id(id)
+            .ok_or_else(|| {
+                CommandError::Encryption(format!("selected node ID is missing or ambiguous: {id}"))
+            })?
+    } else {
+        document.root()
+    };
+    let mut matches = start
+        .descendants()
+        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedData")));
     let selected = matches
         .next()
         .ok_or_else(|| CommandError::Encryption("document has no EncryptedData".into()))?;
@@ -1203,7 +1284,7 @@ fn enforce_named_key_match(
 }
 
 fn keys(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
-    validate_options(invocation, &["gen-key"])?;
+    validate_options(invocation, KEYS_OPTIONS)?;
     let generated = invocation.values("gen-key").collect::<Vec<_>>();
     if generated.is_empty() {
         return Err(CommandError::Usage(
@@ -1374,7 +1455,23 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert!(String::from_utf8(output).unwrap().starts_with("Usage:"));
+        let help = String::from_utf8(output).unwrap();
+        assert!(help.starts_with("Usage: xmlsec1 verify"));
+        assert!(help.contains("--pubkey-cert-pem"));
+        assert!(!help.contains("--binary-data"));
+
+        let mut topic = Vec::new();
+        execute(
+            invocation(&["xmlsec1", "help-enc"]),
+            &mut topic,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let topic = String::from_utf8(topic).unwrap();
+        assert!(topic.contains("Usage: xmlsec1 encrypt"));
+        assert!(topic.contains("Usage: xmlsec1 decrypt"));
+        assert!(topic.contains("--binary-data"));
+        assert!(topic.contains("--privkey-pem"));
 
         let error = execute(
             invocation(&["xmlsec1", "verify", "--lax-key-search", "input.xml"]),
@@ -1437,7 +1534,8 @@ mod tests {
         );
 
         let rendered =
-            apply_encryption_template(&template, &generated, &EncryptionPolicy::default()).unwrap();
+            apply_encryption_template(&template, &generated, None, &EncryptionPolicy::default())
+                .unwrap();
         let document = Document::parse(&rendered)
             .expect("injected KeyInfo prefixes must remain namespace-bound");
         assert!(
@@ -1483,7 +1581,7 @@ mod tests {
         }
         xml.push_str("</EncryptedData>");
 
-        let error = match encryption_template(&xml, &EncryptionPolicy::default()) {
+        let error = match encryption_template(&xml, None, &EncryptionPolicy::default()) {
             Ok(_) => panic!("over-budget template must fail"),
             Err(error) => error,
         };

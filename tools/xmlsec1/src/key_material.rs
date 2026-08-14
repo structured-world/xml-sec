@@ -108,6 +108,7 @@ pub fn verification_signature_metadata(
 
 pub fn signing_signature_metadata(
     xml: &str,
+    start_node_id: Option<&str>,
     policy: &SigningPolicy,
 ) -> Result<SigningTemplateMetadata, KeyMaterialError> {
     policy.validate()?;
@@ -116,7 +117,20 @@ pub fn signing_signature_metadata(
         policy.xml.allow_internal_dtd,
         policy.resources.max_xml_nodes,
     )?;
-    let signature = find_signature_node(&document).ok_or(KeyMaterialError::MissingSignedInfo)?;
+    let signature = match start_node_id {
+        Some(id) => {
+            let start = UriReferenceResolver::new(&document)
+                .node_for_id(id)
+                .ok_or_else(|| KeyMaterialError::SelectedNodeUnavailable(id.to_owned()))?;
+            start
+                .descendants()
+                .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Signature")))
+        }
+        None => document
+            .descendants()
+            .rfind(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Signature"))),
+    }
+    .ok_or(KeyMaterialError::MissingSignedInfo)?;
     Ok(SigningTemplateMetadata {
         key_name: signature_key_name(signature),
         has_key_info: signature_key_info(signature).is_some(),
@@ -303,6 +317,17 @@ pub fn load_rsa_public(path: impl AsRef<Path>) -> Result<RsaPublicKey, KeyMateri
     }
     RsaPublicKey::from_public_key_der(&bytes)
         .or_else(|_| RsaPublicKey::from_pkcs1_der(&bytes))
+        .map_err(|_| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))
+}
+
+pub fn load_rsa_certificate_public(
+    path: impl AsRef<Path>,
+) -> Result<RsaPublicKey, KeyMaterialError> {
+    let path = path.as_ref();
+    let der = load_certificate(path)?;
+    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(&der)
+        .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
+    RsaPublicKey::from_public_key_der(certificate.public_key().raw)
         .map_err(|_| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))
 }
 
