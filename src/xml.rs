@@ -152,8 +152,10 @@ mod tests {
         .expect("ID index fixture must be valid XML");
         let index = XmlIdIndex::new(&document);
 
-        assert!(index.contains("same"));
-        assert!(!index.contains("duplicate"));
-        assert_eq!(index.len(), 1);
+        assert_eq!(
+            index.node("same").map(|node| node.tag_name().name()),
+            Some("one")
+        );
+        assert!(index.node("duplicate").is_none());
     }
 }

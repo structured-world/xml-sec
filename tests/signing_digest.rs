@@ -1040,6 +1040,78 @@ fn sign_with_builder_targets_appended_signature_when_existing_key_info_is_presen
 }
 
 #[test]
+fn sign_with_builder_appends_and_targets_within_the_selected_start_node() {
+    // A start-node selector scopes both template placement and target choice;
+    // an older template in that subtree must remain untouched.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let old_builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#old")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    let old_template = old_builder
+        .build_template()
+        .expect("old template must build");
+    let xml = format!(
+        "<root><scope Id=\"selected\"><payload Id=\"old\">old</payload><payload Id=\"new\">new</payload>{old_template}</scope></root>"
+    );
+    let new_builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#new")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+
+    let signed = SignContext::new(&private_key)
+        .start_node_id("selected")
+        .sign_with_builder(&xml, &new_builder)
+        .expect("builder signing must target its appended selected-node template");
+    let document = roxmltree::Document::parse(&signed).expect("signed XML must parse");
+    let scope = document
+        .descendants()
+        .find(|node| node.attribute("Id") == Some("selected"))
+        .expect("selected scope must remain");
+    let signatures = scope
+        .children()
+        .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Signature")))
+        .collect::<Vec<_>>();
+    assert_eq!(signatures.len(), 2);
+    assert_eq!(
+        signatures[0]
+            .descendants()
+            .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue")))
+            .and_then(|node| node.text()),
+        None
+    );
+    assert_eq!(
+        signatures[1]
+            .descendants()
+            .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Reference")))
+            .and_then(|node| node.attribute("URI")),
+        Some("#new")
+    );
+    assert!(
+        signatures[1]
+            .descendants()
+            .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue")))
+            .and_then(|node| node.text())
+            .is_some()
+    );
+    assert!(
+        signatures[1]
+            .children()
+            .find(|node| {
+                node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue"))
+            })
+            .and_then(|node| node.text())
+            .is_some()
+    );
+}
+
+#[test]
 fn signing_fills_only_top_level_signature_value() {
     // Object payloads may contain SignatureValue-named XMLDSig elements. The
     // signing pass must fill only the direct child of the selected Signature.

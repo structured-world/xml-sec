@@ -14,6 +14,11 @@ See the repository's [CLI compatibility guide](https://github.com/structured-wor
 examples, supported key formats, fail-closed behavior, and upstream runner
 coverage.
 
+The parser rejects repeated singleton options, including mixed canonical and
+alias spellings, while preserving donor multi-value key and certificate inputs.
+`--print-debug` is text; `--print-xml-debug` emits a parseable donor-shaped
+`VerificationContext` for both successful and invalid verification results.
+
 `--aes-key` files are raw binary key material (`--aeskey` remains a compatible
 alias). Decrypting a standalone
 `EncryptedData` returns opaque decrypted bytes; embedded encrypted data uses

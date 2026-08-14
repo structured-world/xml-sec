@@ -23,6 +23,11 @@ non-zero. Commands absent from the pinned 1.3.13 surface are not advertised;
 historical `sign-tmpl` spellings are rejected instead of being routed to `sign`
 without template-generation semantics.
 
+`--print-debug` emits the donor-style text status, while `--print-xml-debug`
+emits a well-formed `VerificationContext` with donor `OK`/`FAILED` status and
+failure-reason vocabulary. XML diagnostics are emitted for invalid signatures
+before the command returns its required non-zero status.
+
 Capability checks and runtime dispatch use one registry. A transform or key-data
 class absent from `list-*` is not silently substituted and causes `check-*` to
 fail. Backend selection is equally strict: `--crypto rustcrypto` and
@@ -39,6 +44,10 @@ does not recognize. A `:<parameter>` suffix on flags or unrelated valued
 options is rejected rather than silently activating the underlying option.
 Native aliases from the same donor metadata are accepted, including
 `--pubkey-cert`, `--binary`, and command-local `-h`.
+The same metadata enforces option multiplicity: key, certificate, ID-attribute,
+and key-generation options may repeat where libxmlsec1 marks them as
+multi-value; repeating singleton output, provider, payload, selector, password,
+or policy options is rejected even when canonical and alias spellings are mixed.
 
 ## Examples
 

@@ -115,6 +115,8 @@ pub enum ParseError {
     UnsupportedOption(String),
     #[error("option {0} does not accept a name parameter")]
     UnexpectedOptionParameter(String),
+    #[error("option {0} cannot be repeated")]
+    RepeatedOption(String),
     #[error("arguments are not valid UTF-8")]
     NonUtf8,
 }
@@ -130,6 +132,26 @@ pub(crate) struct OptionSpec {
     aliases: &'static [&'static str],
     pub arity: Arity,
     pub accepts_parameter: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Repeatability {
+    Singleton,
+    Multiple,
+}
+
+impl OptionSpec {
+    fn repeatability(&self) -> Repeatability {
+        match self.canonical {
+            "keys-file" | "gen-key" | "privkey-pem" | "privkey-der" | "pkcs8-pem" | "pkcs8-der"
+            | "pubkey-pem" | "pubkey-der" | "pubkey-cert-pem" | "pubkey-cert-der"
+            | "trusted-pem" | "trusted-der" | "untrusted-pem" | "untrusted-der" | "aes-key"
+            | "hmac-key" | "enabled-key-data" | "id-attr" | "add-id-attr" | "url-map" => {
+                Repeatability::Multiple
+            }
+            _ => Repeatability::Singleton,
+        }
+    }
 }
 
 const FLAG: Arity = Arity::Flag;
@@ -478,6 +500,11 @@ impl Invocation {
                     argument_text.to_owned(),
                 ));
             }
+            if option_spec(name).repeatability() == Repeatability::Singleton
+                && options.contains_key(name)
+            {
+                return Err(ParseError::RepeatedOption(format!("--{name}")));
+            }
             let value =
                 match option_arity(name) {
                     Arity::Flag => None,
@@ -634,6 +661,33 @@ mod tests {
             .is_err(),
             "only key options with named lookup semantics accept parameters"
         );
+    }
+
+    #[test]
+    fn rejects_repeated_singleton_options_across_aliases() {
+        for arguments in [
+            &[
+                "xmlsec1",
+                "sign",
+                "--output",
+                "first.xml",
+                "-o",
+                "second.xml",
+                "input.xml",
+            ][..],
+            &[
+                "xmlsec1",
+                "verify",
+                "--node-id",
+                "first",
+                "--node-id",
+                "second",
+                "input.xml",
+            ],
+            &["xmlsec1", "verify", "--insecure", "--insecure", "input.xml"],
+        ] {
+            assert!(parse(arguments).is_err(), "{arguments:?}");
+        }
     }
 
     #[test]

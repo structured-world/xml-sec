@@ -11,9 +11,10 @@ use xml_sec::{
     policy::{DecryptionPolicy, EncryptionPolicy, SigningPolicy, VerificationPolicy},
     provider::{CryptoProvider, default_provider},
     xmldsig::{
-        DefaultKeyResolver, DsigStatus, KeyInfoWriter, KeyResolver, KeyResolverConfig, SignContext,
-        SignatureAlgorithm, UriTypeSet, VerifyContext, X509CertificateKeyInfoWriter,
-        XPathHereSemantics, parse_key_info, uri::UriReferenceResolver,
+        DefaultKeyResolver, DsigStatus, FailureReason, KeyInfoWriter, KeyResolver,
+        KeyResolverConfig, ReferenceResult, SignContext, SignatureAlgorithm, UriTypeSet,
+        VerifyContext, VerifyResult, X509CertificateKeyInfoWriter, XPathHereSemantics,
+        parse_key_info, uri::UriReferenceResolver,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
@@ -697,6 +698,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             .verify(&xml)
             .map_err(|error| CommandError::Signature(error.to_string()))?
     };
+    write_verification_diagnostics(invocation, &result, stdout)?;
     if result.status != DsigStatus::Valid
         || result
             .manifest_references
@@ -705,10 +707,73 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     {
         return Err(CommandError::InvalidSignature);
     }
-    if invocation.flag("print-debug") || invocation.flag("print-xml-debug") {
-        writeln!(stdout, "Status: valid").map_err(stdout_error)?;
+    Ok(())
+}
+
+fn write_verification_diagnostics(
+    invocation: &Invocation,
+    result: &VerifyResult,
+    stdout: &mut dyn Write,
+) -> Result<(), CommandError> {
+    if invocation.flag("print-debug") {
+        let status = if result.status == DsigStatus::Valid {
+            "valid"
+        } else {
+            "invalid"
+        };
+        writeln!(stdout, "Status: {status}").map_err(stdout_error)?;
+    }
+    if invocation.flag("print-xml-debug") {
+        let (status, failure_reason) = donor_dsig_status(result.status);
+        writeln!(
+            stdout,
+            "<VerificationContext status=\"{status}\" failureReason=\"{failure_reason}\">"
+        )
+        .map_err(stdout_error)?;
+        write_reference_diagnostics(
+            stdout,
+            "SignedInfoReferences",
+            &result.signed_info_references,
+        )?;
+        write_reference_diagnostics(stdout, "ManifestReferences", &result.manifest_references)?;
+        writeln!(stdout, "</VerificationContext>").map_err(stdout_error)?;
     }
     Ok(())
+}
+
+fn write_reference_diagnostics(
+    stdout: &mut dyn Write,
+    container: &str,
+    references: &[ReferenceResult],
+) -> Result<(), CommandError> {
+    writeln!(stdout, "<{container}>").map_err(stdout_error)?;
+    for reference in references {
+        let (status, _) = donor_dsig_status(reference.status);
+        writeln!(stdout, "<ReferenceVerificationContext status=\"{status}\">")
+            .map_err(stdout_error)?;
+        writeln!(
+            stdout,
+            "<URI>{}</URI>",
+            quick_xml::escape::escape(&reference.uri)
+        )
+        .map_err(stdout_error)?;
+        writeln!(stdout, "</ReferenceVerificationContext>").map_err(stdout_error)?;
+    }
+    writeln!(stdout, "</{container}>").map_err(stdout_error)
+}
+
+fn donor_dsig_status(status: DsigStatus) -> (&'static str, &'static str) {
+    match status {
+        DsigStatus::Valid => ("OK", "UNKNOWN"),
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { .. })
+        | DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { .. })
+        | DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { .. }) => {
+            ("FAILED", "REFERENCE")
+        }
+        DsigStatus::Invalid(FailureReason::SignatureMismatch) => ("FAILED", "SIGNATURE"),
+        DsigStatus::Invalid(FailureReason::KeyNotFound) => ("FAILED", "KEY-NOT-FOUND"),
+        _ => ("ERROR", "UNKNOWN"),
+    }
 }
 
 fn verification_context(

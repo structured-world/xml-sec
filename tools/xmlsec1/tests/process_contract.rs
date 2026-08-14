@@ -92,6 +92,67 @@ fn signs_verifies_and_rejects_tampering_through_process_api() {
 }
 
 #[test]
+fn xml_debug_verification_output_matches_the_donor_xml_contract() {
+    // The upstream runner parses --print-xml-debug output with xmllint, so the
+    // diagnostic mode must not share the plain-text debug renderer.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let signed = temp.path().join("signed.xml");
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(sign.status.success());
+
+    let verify = Command::new(binary())
+        .args(["verify", "--print-xml-debug", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let debug_xml = String::from_utf8(verify.stdout).unwrap();
+    let document = roxmltree::Document::parse(&debug_xml).expect("debug output must be XML");
+    let root = document.root_element();
+    assert_eq!(root.tag_name().name(), "VerificationContext");
+    assert_eq!(root.attribute("status"), Some("OK"));
+    assert_eq!(root.attribute("failureReason"), Some("UNKNOWN"));
+
+    let tampered = temp.path().join("tampered.xml");
+    fs::write(
+        &tampered,
+        fs::read_to_string(&signed)
+            .unwrap()
+            .replace("some text", "tampered text"),
+    )
+    .unwrap();
+    let invalid = Command::new(binary())
+        .args(["verify", "--print-xml-debug", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&tampered)
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    let invalid_xml = String::from_utf8(invalid.stdout).unwrap();
+    let invalid_document =
+        roxmltree::Document::parse(&invalid_xml).expect("invalid debug output must still be XML");
+    let invalid_root = invalid_document.root_element();
+    assert_eq!(invalid_root.attribute("status"), Some("FAILED"));
+    assert_eq!(invalid_root.attribute("failureReason"), Some("REFERENCE"));
+}
+
+#[test]
 fn short_command_help_alias_reaches_process_dispatch() {
     // Parsing an alias is insufficient if command validation later rejects its
     // canonical option, so exercise the complete process route for donor `-h`.
@@ -496,6 +557,33 @@ fn output_template_expands_the_extensionless_input_basename() {
         String::from_utf8_lossy(&signed.stderr)
     );
     assert!(expected.is_file());
+}
+
+#[test]
+fn repeated_output_options_fail_before_creating_files() {
+    // Canonical and alias spellings identify one donor singleton; accepting
+    // both would silently redirect output through last-value wins behavior.
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first.xml");
+    let second = temp.path().join("second.xml");
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let output = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&first)
+        .arg("-o")
+        .arg(&second)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be repeated"));
+    assert!(!first.exists());
+    assert!(!second.exists());
 }
 
 #[test]

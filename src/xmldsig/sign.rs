@@ -25,7 +25,8 @@ use crate::c14n::{canonicalize_bounded_with_xml_base_budget, is_output_limit_err
 use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::DigestAlgorithm;
 use super::mutation::{
-    XmlMutationError, append_signature_to_root_with_options, fill_key_info_at_index_with_options,
+    XmlMutationError, append_signature_to_element_with_options,
+    append_signature_to_root_with_options, fill_key_info_at_index_with_options,
     fill_signature_value_at_index_with_options, fill_signed_info_digest_values,
     fill_signed_info_digest_values_at_index_with_options,
     fill_signed_info_digest_values_with_options,
@@ -745,6 +746,14 @@ impl<'a> SignContext<'a> {
         let document = parse_signing_document(xml, Some(&self.policy))
             .map_err(SigningDigestError::XmlParse)?;
         let target_signature = signing_signature_index(&document, self.start_node_id)?;
+        self.sign_template_at_index(xml, target_signature)
+    }
+
+    fn sign_template_at_index(
+        &self,
+        xml: &str,
+        target_signature: usize,
+    ) -> Result<String, SigningError> {
         let execution_budget = TransformExecutionBudget::from_resources(&self.policy.resources);
         let transform_options = TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
@@ -815,7 +824,8 @@ impl<'a> SignContext<'a> {
         }
     }
 
-    /// Build a signature template, append it to the source root, then sign it.
+    /// Build a signature template, append it to the selected start node (or
+    /// the document root when no selector is set), then sign that new template.
     pub fn sign_with_builder(
         &self,
         xml: &str,
@@ -824,8 +834,37 @@ impl<'a> SignContext<'a> {
         self.policy.validate()?;
         self.policy.resources.validate_xml_document_len(xml.len())?;
         let template = builder.build_template()?;
-        let templated = append_signature_to_root_with_options(xml, &template, Some(&self.policy))?;
-        self.sign_template(&templated)
+        let templated = if let Some(id) = self.start_node_id {
+            let document = parse_signing_document(xml, Some(&self.policy))
+                .map_err(SigningDigestError::XmlParse)?;
+            let start = signing_start_node(&document, id)?;
+            append_signature_to_element_with_options(
+                xml,
+                &template,
+                start.range(),
+                Some(&self.policy),
+            )?
+        } else {
+            append_signature_to_root_with_options(xml, &template, Some(&self.policy))?
+        };
+        self.policy
+            .resources
+            .validate_xml_document_len(templated.len())?;
+        let document = parse_signing_document(&templated, Some(&self.policy))
+            .map_err(SigningDigestError::XmlParse)?;
+        let target_signature = if let Some(id) = self.start_node_id {
+            let start = signing_start_node(&document, id)?;
+            let appended = start
+                .children()
+                .rfind(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
+                .ok_or(SigningDigestError::MissingElement {
+                    element: "Signature",
+                })?;
+            signature_index(&document, appended)?
+        } else {
+            signing_signature_index(&document, None)?
+        };
+        self.sign_template_at_index(&templated, target_signature)
     }
 }
 
@@ -1096,13 +1135,7 @@ fn signing_signature_index(
     start_node_id: Option<&str>,
 ) -> Result<usize, SigningDigestError> {
     let selected = if let Some(id) = start_node_id {
-        let start = UriReferenceResolver::new(doc)
-            .node_for_id(id)
-            .ok_or_else(|| {
-                SigningDigestError::InvalidStructure(format!(
-                    "selected node ID is missing or ambiguous: {id}"
-                ))
-            })?;
+        let start = signing_start_node(doc, id)?;
         start
             .descendants()
             .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
@@ -1114,6 +1147,26 @@ fn signing_signature_index(
     } else {
         find_signing_signature_node(doc, None)?
     };
+    signature_index(doc, selected)
+}
+
+fn signing_start_node<'a>(
+    doc: &'a Document<'a>,
+    id: &str,
+) -> Result<Node<'a, 'a>, SigningDigestError> {
+    UriReferenceResolver::new(doc)
+        .node_for_id(id)
+        .ok_or_else(|| {
+            SigningDigestError::InvalidStructure(format!(
+                "selected node ID is missing or ambiguous: {id}"
+            ))
+        })
+}
+
+fn signature_index(
+    doc: &Document<'_>,
+    selected: Node<'_, '_>,
+) -> Result<usize, SigningDigestError> {
     doc.descendants()
         .filter(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
         .position(|node| node == selected)

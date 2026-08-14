@@ -3,7 +3,7 @@
 //! Signing cannot mutate `roxmltree`'s read-only DOM. These helpers validate
 //! structure with `roxmltree`, then rewrite the document with `quick-xml`.
 
-use std::io::Write;
+use std::{io::Write, ops::Range};
 
 use quick_xml::events::{BytesText, Event};
 use quick_xml::name::{Namespace, ResolveResult};
@@ -60,6 +60,9 @@ pub enum XmlMutationError {
     /// The source XML did not contain a root element that can receive a signature.
     #[error("source XML must contain a root element")]
     MissingRootElement,
+    /// The selected source element cannot receive an appended signature.
+    #[error("selected source element cannot receive a signature")]
+    InvalidAppendTarget,
 }
 
 /// Append a generated XMLDSig `<Signature>` template as the last child of the
@@ -127,6 +130,56 @@ pub(super) fn append_signature_to_root_with_options(
     let output = String::from_utf8(writer.into_inner())?;
     parse_with_options(&output, policy)?;
     Ok(output)
+}
+
+pub(super) fn append_signature_to_element_with_options(
+    xml: &str,
+    signature_template: &str,
+    target: Range<usize>,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError> {
+    validate_signature_template(signature_template)?;
+    let _source = parse_with_options(xml, policy)?;
+    let fragment = xml
+        .get(target.clone())
+        .ok_or(XmlMutationError::InvalidAppendTarget)?;
+    let opening_end = opening_tag_end(fragment).ok_or(XmlMutationError::InvalidAppendTarget)?;
+    let mut output = xml.to_owned();
+    if fragment[..opening_end].trim_end().ends_with('/') {
+        let slash = fragment[..opening_end]
+            .rfind('/')
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let name_end = fragment[1..]
+            .find(|character: char| character.is_whitespace() || matches!(character, '/' | '>'))
+            .map(|offset| offset + 1)
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let qualified_name = &fragment[1..name_end];
+        let replacement = format!(
+            "{}>{signature_template}</{qualified_name}>",
+            &fragment[..slash]
+        );
+        output.replace_range(target, &replacement);
+    } else {
+        let closing_start = fragment
+            .rfind("</")
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        output.insert_str(target.start + closing_start, signature_template);
+    }
+    parse_with_options(&output, policy)?;
+    Ok(output)
+}
+
+fn opening_tag_end(fragment: &str) -> Option<usize> {
+    let mut quote = None;
+    for (offset, character) in fragment.char_indices() {
+        match (quote, character) {
+            (None, '\'' | '"') => quote = Some(character),
+            (Some(delimiter), current) if delimiter == current => quote = None,
+            (None, '>') => return Some(offset),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Fill XMLDSig `<DigestValue>` elements in document order.
@@ -680,11 +733,8 @@ fn is_in_target_signature(
     element_stack
         .iter()
         .rev()
-        .any(|(is_dsig, local_name, signature)| {
-            *is_dsig
-                && local_name.as_slice() == b"Signature"
-                && *signature == Some(target_signature)
-        })
+        .find(|(is_dsig, local_name, _)| *is_dsig && local_name.as_slice() == b"Signature")
+        .is_some_and(|(_, _, signature)| *signature == Some(target_signature))
 }
 
 fn is_dsig_element(namespace: &ResolveResult<'_>, local: &[u8], expected_local: &str) -> bool {
@@ -766,6 +816,32 @@ mod tests {
                 .tag_name()
                 .name(),
             "Signature"
+        );
+    }
+
+    #[test]
+    fn appends_signature_template_to_selected_empty_element() {
+        // Selected builder targets may be self-closing; insertion must expand
+        // the element without dropping its qualified name or attributes.
+        let source = r#"<root xmlns:s="urn:scope"><s:scope Id="selected"/></root>"#;
+        let document = roxmltree::Document::parse(source).expect("source must parse");
+        let scope = document
+            .descendants()
+            .find(|node| node.attribute("Id") == Some("selected"))
+            .expect("selected scope");
+        let signed =
+            append_signature_to_element_with_options(source, &template(1), scope.range(), None)
+                .expect("selected empty element must accept a signature");
+        let output = roxmltree::Document::parse(&signed).expect("output must parse");
+        let scope = output
+            .descendants()
+            .find(|node| node.has_tag_name(("urn:scope", "scope")))
+            .expect("qualified scope must remain");
+
+        assert!(
+            scope
+                .children()
+                .any(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
         );
     }
 
@@ -871,5 +947,23 @@ mod tests {
                 actual: 1
             }
         ));
+    }
+
+    #[test]
+    fn indexed_digest_replacement_ignores_nested_signatures() {
+        // Digest counts and replacements must use the same nearest-Signature
+        // boundary or a nested Object signature can exhaust the value list.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:Reference><ds:DigestValue>outer-old</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Signature><ds:SignedInfo><ds:Reference><ds:DigestValue>inner-keep</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></ds:Object></ds:Signature>"#;
+        let filled =
+            fill_signed_info_digest_values_at_index_with_options(source, ["outer-new"], 0, None)
+                .expect("outer signature replacement must ignore nested signatures");
+        let document = roxmltree::Document::parse(&filled).expect("filled XML must parse");
+        let values = document
+            .descendants()
+            .filter(|node| node.has_tag_name((XMLDSIG_NS, "DigestValue")))
+            .filter_map(|node| node.text())
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, ["outer-new", "inner-keep"]);
     }
 }
