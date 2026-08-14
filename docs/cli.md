@@ -46,11 +46,15 @@ xmlsec1 verify --pubkey-pem signing-key.pub.pem signed.xml
 ```
 
 Signing key options accept libxmlsec1's comma-separated certificate form,
-`key.pem,leaf.pem,intermediate.pem,...`. Every certificate is validated and
-embedded in order under `X509Data`; the first certificate must contain the
-signing key's public key. Named keys are matched against the template's
-`KeyName` even when only one key is supplied. `--lax-key-search` explicitly
-opts out of that name match.
+`key.pem,leaf.pem,intermediate.pem,...`. Every certificate is structurally
+validated, and the first certificate must contain the signing key. When the
+template contains the optional direct `KeyInfo`
+placeholder, the chain is embedded there in order under `X509Data`; omitting
+that placeholder leaves the signed output without `KeyInfo`. Named signing keys
+require a matching template `KeyName` even when only one key is supplied. A
+named key with no template `KeyName` fails unless `--lax-key-search` explicitly
+opts out of lookup. Verification and encryption instead leave a `KeyName`-less
+template unconstrained when one explicit key is supplied.
 
 Verification accepts `-` as the conventional stdin marker. For documents with
 multiple signatures, `--node-id <id>` selects an ID-bearing start node and
@@ -87,8 +91,12 @@ AES key must match it. Likewise, an RSA wrapping key must match a recipient
 `KeyName` inside `EncryptedKey`. An unnamed template does not constrain the sole
 explicit key; an explicit mismatch fails unless `--lax-key-search` is supplied.
 RSA private-key decryption accepts the upstream
-`key.pem,certificate.pem,...` option syntax and consumes the first component as
-the decryption key. `--binary-data` rejects
+`key.pem,certificate.pem,...` option syntax, consumes the first component as
+the decryption key, and validates every certificate companion before decrypting.
+Named AES and RSA decryption keys obey the selected `EncryptedData` or nested
+`EncryptedKey` name unless lax lookup is requested. Selecting a standalone
+`EncryptedData` by its own `Id` still returns opaque decrypted bytes rather than
+routing them through XML document replacement. `--binary-data` rejects
 templates explicitly typed as XML `Element` or `Content`; use `--xml-data` for
 those templates so ciphertext metadata cannot mislabel arbitrary bytes as XML.
 

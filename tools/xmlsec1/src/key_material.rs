@@ -51,6 +51,12 @@ pub struct SignatureMetadata {
     pub key_name: Option<String>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct SigningTemplateMetadata {
+    pub key_name: Option<String>,
+    pub has_key_info: bool,
+}
+
 pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialError> {
     let path = path.as_ref();
     fs::read(path).map_err(|source| KeyMaterialError::Read {
@@ -100,19 +106,21 @@ pub fn verification_signature_metadata(
     })
 }
 
-pub fn signing_signature_key_name(
+pub fn signing_signature_metadata(
     xml: &str,
     policy: &SigningPolicy,
-) -> Result<Option<String>, KeyMaterialError> {
+) -> Result<SigningTemplateMetadata, KeyMaterialError> {
     policy.validate()?;
     let document = parse_signature_document(
         xml,
         policy.xml.allow_internal_dtd,
         policy.resources.max_xml_nodes,
     )?;
-    find_signature_node(&document)
-        .map(signature_key_name)
-        .ok_or(KeyMaterialError::MissingSignedInfo)
+    let signature = find_signature_node(&document).ok_or(KeyMaterialError::MissingSignedInfo)?;
+    Ok(SigningTemplateMetadata {
+        key_name: signature_key_name(signature),
+        has_key_info: signature_key_info(signature).is_some(),
+    })
 }
 
 fn parse_signature_document(
@@ -135,9 +143,7 @@ fn parse_signature_document(
 }
 
 fn signature_key_name(signature: roxmltree::Node<'_, '_>) -> Option<String> {
-    signature
-        .children()
-        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
+    signature_key_info(signature)
         .and_then(|key_info| {
             key_info
                 .children()
@@ -145,6 +151,14 @@ fn signature_key_name(signature: roxmltree::Node<'_, '_>) -> Option<String> {
         })
         .and_then(|key_name| key_name.text())
         .map(str::to_owned)
+}
+
+fn signature_key_info<'a, 'input>(
+    signature: roxmltree::Node<'a, 'input>,
+) -> Option<roxmltree::Node<'a, 'input>> {
+    signature
+        .children()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
 }
 
 pub fn load_signing_key(path: impl AsRef<Path>) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
@@ -230,8 +244,13 @@ fn valid_spki(bytes: &[u8]) -> bool {
 pub fn load_certificate(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialError> {
     let path = path.as_ref();
     let bytes = read(path)?;
-    let der = if let Ok(text) = std::str::from_utf8(&bytes) {
-        parse_pem(text, "CERTIFICATE", path)?
+    let der = if std::str::from_utf8(&bytes).is_ok() {
+        let (rest, pem) = x509_parser::pem::parse_x509_pem(&bytes)
+            .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
+        if !rest.iter().all(u8::is_ascii_whitespace) || pem.label != "CERTIFICATE" {
+            return Err(KeyMaterialError::InvalidCertificate(path.to_owned()));
+        }
+        pem.contents
     } else {
         bytes
     };

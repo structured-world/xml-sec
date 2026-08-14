@@ -19,11 +19,13 @@ coverage.
 `--node-id`. Encryption retains template metadata and RSA-OAEP parameters;
 PKCS#1 RSA and PKCS#8/SPKI/X.509 PEM or DER key material is normalized into the
 same core signing, verification, and encryption pipelines. Signing options
-embed every certificate from `key,leaf,intermediate,...`; verification accepts
+validate every certificate from `key,leaf,intermediate,...` and embed the chain
+when the template provides a `KeyInfo` placeholder; verification accepts
 stdin as `-` and can select one signature subtree with `--node-id`. Output paths
 support the upstream `{inputfile}` basename template, and `--gen-key[:name]`
 emits both named and unnamed AES key-store entries. `help-all` is generated from
-the parser registry. When a template requests `KeyName`, named raw keys,
-certificates, and RSA recipients require an exact match unless lax lookup is
-explicit; unnamed templates leave the sole explicit key unconstrained. Binary
+the parser registry. Named signing keys require a template `KeyName`; named
+verification and encryption/decryption keys require an exact match when the
+selected XML names a key, unless lax lookup is explicit. Unnamed verification
+and encryption templates leave the sole explicit key unconstrained. Binary
 payloads cannot be emitted with XML Element/Content type metadata.

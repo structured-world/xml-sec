@@ -81,10 +81,12 @@ The native binary supports sign/verify, template-preserving encrypt/decrypt,
 AES key generation, capability checks, libxmlsec1 key aliases and option syntax,
 certificate-chain embedding, stdin input, signature selection by node ID, and
 deterministic process statuses. `help-all` enumerates the same registered
-commands and options accepted by the parser, while named direct keys obey
-an explicit template `KeyName` unless lax lookup is requested; unnamed templates
-still use their sole explicit key. This applies to raw keys, explicit certificates,
-and RSA recipients. Its process tests run a minimal checked-in
+commands and options accepted by the parser. Named signing keys require a
+template `KeyName`, while named verification and encryption/decryption keys
+obey a selected XML `KeyName` unless lax lookup is requested; unnamed templates
+still use their sole explicit verification or encryption key. Certificate
+companions are validated even when no output `KeyInfo` placeholder is present.
+Its process tests run a minimal checked-in
 snapshot of the unmodified upstream DSig, Enc, and Keys runners without network
 access or a system `xmlsec1` installation.
 Unsupported algorithms, key formats, providers, and policy controls fail closed

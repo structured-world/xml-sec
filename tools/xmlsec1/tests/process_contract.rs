@@ -21,6 +21,18 @@ fn project_root() -> &'static Path {
         .unwrap()
 }
 
+fn signature_template_without_key_info() -> &'static str {
+    r##"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
+<SignedInfo>
+<CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/>
+<SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+<Reference URI="#object"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference>
+</SignedInfo>
+<SignatureValue/>
+<Object Id="object">payload</Object>
+</Signature>"##
+}
+
 #[test]
 fn signs_verifies_and_rejects_tampering_through_process_api() {
     // Exercise the process boundary and prove a post-signature content change
@@ -537,13 +549,120 @@ fn direct_aes_key_name_must_match_the_template_unless_lax() {
 }
 
 #[test]
+fn named_aes_decryption_obeys_encrypted_data_key_name_unless_lax() {
+    // Decryption key selection must enforce the same document identity contract
+    // as encryption rather than discarding the CLI option's registry name.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("named-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let key = temp.path().join("key.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyName>expected</KeyName></KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"named decrypt").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--aes-key:expected"])
+        .arg(&key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(encrypt.status.success());
+
+    let strict = Command::new(binary())
+        .args(["decrypt", "--aes-key:wrong"])
+        .arg(&key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(!strict.status.success());
+    assert!(String::from_utf8_lossy(&strict.stderr).contains("KeyName"));
+
+    let lax = Command::new(binary())
+        .args(["decrypt", "--lax-key-search", "--aes-key:wrong"])
+        .arg(&key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        lax.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax.stderr)
+    );
+    assert_eq!(lax.stdout, b"named decrypt");
+}
+
+#[test]
+fn standalone_binary_decryption_accepts_its_root_node_id() {
+    // --node-id selects an operation start point; selecting the standalone root
+    // must not route opaque bytes through XML document replacement validation.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let key = temp.path().join("key.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Id="payload"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, [0xff, 0x00, 0xfe]).unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(encrypt.status.success());
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--aes-key"])
+        .arg(&key)
+        .args(["--node-id", "payload"])
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, [0xff, 0x00, 0xfe]);
+
+    let missing = Command::new(binary())
+        .args(["decrypt", "--aes-key"])
+        .arg(&key)
+        .args(["--node-id", "missing"])
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+}
+
+#[test]
 fn rsa_recipient_name_must_match_the_template_unless_lax() {
     // A named RSA key selects the nested EncryptedKey recipient identity, not
     // the direct content-encryption key metadata on EncryptedData.
     let temp = tempfile::tempdir().unwrap();
     let template = temp.path().join("named-rsa-template.xml");
     let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
     let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
     fs::write(
         &template,
         r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
@@ -567,6 +686,7 @@ fn rsa_recipient_name_must_match_the_template_unless_lax() {
         "{}",
         String::from_utf8_lossy(&matching.stderr)
     );
+    fs::write(&encrypted, &matching.stdout).unwrap();
 
     let strict = Command::new(binary())
         .args(["encrypt", "--pubkey-pem:wrong"])
@@ -592,6 +712,28 @@ fn rsa_recipient_name_must_match_the_template_unless_lax() {
         "{}",
         String::from_utf8_lossy(&lax.stderr)
     );
+
+    let strict_decrypt = Command::new(binary())
+        .args(["decrypt", "--privkey-pem:wrong"])
+        .arg(&private_key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(!strict_decrypt.status.success());
+    assert!(String::from_utf8_lossy(&strict_decrypt.stderr).contains("KeyName"));
+
+    let lax_decrypt = Command::new(binary())
+        .args(["decrypt", "--lax-key-search", "--privkey-pem:wrong"])
+        .arg(&private_key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        lax_decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax_decrypt.stderr)
+    );
+    assert_eq!(lax_decrypt.stdout, b"named recipient");
 }
 
 #[test]
@@ -690,6 +832,32 @@ fn rsa_decryption_accepts_private_key_certificate_companions() {
         String::from_utf8_lossy(&decrypt.stderr)
     );
     assert_eq!(decrypt.stdout, b"certificate companion");
+
+    let malformed = temp.path().join("malformed.pem");
+    fs::write(&malformed, "not a certificate").unwrap();
+    let malformed_compound = format!("{},{}", private_key.display(), malformed.display());
+    let rejected = Command::new(binary())
+        .args(["decrypt", "--privkey-pem"])
+        .arg(malformed_compound)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("certificate"));
+
+    let missing_compound = format!(
+        "{},{}",
+        private_key.display(),
+        temp.path().join("missing.pem").display()
+    );
+    let missing = Command::new(binary())
+        .args(["decrypt", "--privkey-pem"])
+        .arg(missing_compound)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing.pem"));
 }
 
 #[test]
@@ -1039,6 +1207,45 @@ fn signing_rejects_a_malformed_secondary_certificate() {
 }
 
 #[test]
+fn signing_with_certificate_companions_does_not_require_key_info() {
+    // Certificate companions are always validated, but optional output metadata
+    // must only be written when the signature template provides its placeholder.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("without-key-info.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    fs::write(&template, signature_template_without_key_info()).unwrap();
+    let compound = format!("{},{}", private_key.display(), certificate.display());
+
+    let result = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(compound)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let signed = String::from_utf8(result.stdout).unwrap();
+    assert!(signed.contains("<SignatureValue>"));
+    assert!(!signed.contains("<KeyInfo"));
+
+    let malformed = temp.path().join("malformed.pem");
+    fs::write(&malformed, "not a certificate").unwrap();
+    let malformed_compound = format!("{},{}", private_key.display(), malformed.display());
+    let rejected = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(malformed_compound)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("certificate"));
+}
+
+#[test]
 fn explicit_certificate_obeys_trust_anchor_policy() {
     // An explicit leaf pins identity but does not establish trust when callers
     // also supply anchors; --insecure is the explicit compatibility opt-out.
@@ -1205,6 +1412,27 @@ fn singleton_named_signing_key_obeys_template_key_name() {
         "{}",
         String::from_utf8_lossy(&lax.stderr)
     );
+}
+
+#[test]
+fn singleton_named_signing_key_reports_missing_template_key_name() {
+    // A registry-named signing key without a template lookup name is a distinct
+    // failure from ambiguity among multiple keys and must report that contract.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("without-key-info.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    fs::write(&template, signature_template_without_key_info()).unwrap();
+
+    let result = Command::new(binary())
+        .args(["sign", "--privkey-pem:named"])
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("named private key requires a template KeyName"));
+    assert!(!stderr.contains("multiple private keys"));
 }
 
 #[cfg(target_os = "linux")]
