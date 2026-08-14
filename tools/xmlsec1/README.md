@@ -23,5 +23,7 @@ embed every certificate from `key,leaf,intermediate,...`; verification accepts
 stdin as `-` and can select one signature subtree with `--node-id`. Output paths
 support the upstream `{inputfile}` basename template, and `--gen-key[:name]`
 emits both named and unnamed AES key-store entries. `help-all` is generated from
-the parser registry, named direct keys are checked against template `KeyName`,
-and binary payloads cannot be emitted with XML Element/Content type metadata.
+the parser registry. When a template requests `KeyName`, named raw keys,
+certificates, and RSA recipients require an exact match unless lax lookup is
+explicit; unnamed templates leave the sole explicit key unconstrained. Binary
+payloads cannot be emitted with XML Element/Content type metadata.

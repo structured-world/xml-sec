@@ -114,6 +114,69 @@ fn named_public_key_obeys_signature_key_name_unless_lax() {
 }
 
 #[test]
+fn named_verification_certificate_obeys_signature_key_name_unless_lax() {
+    // Explicit certificates are pinned verification identities, so naming one
+    // must use the same strict lookup contract as naming a raw public key.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    let certificate_der = temp.path().join("certificate.der");
+    let certificate_pem = fs::read(&certificate).unwrap();
+    let (_, certificate_contents) = x509_parser::pem::parse_x509_pem(&certificate_pem).unwrap();
+    fs::write(&certificate_der, certificate_contents.contents).unwrap();
+    let signed = temp.path().join("signed.xml");
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(sign.status.success());
+
+    for (option, path) in [
+        ("pubkey-cert-pem", certificate.as_path()),
+        ("pubkey-cert-der", certificate_der.as_path()),
+    ] {
+        let matching = Command::new(binary())
+            .args(["verify", &format!("--{option}:TestKeyName-rsa-2048")])
+            .arg(path)
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(
+            matching.status.success(),
+            "{}",
+            String::from_utf8_lossy(&matching.stderr)
+        );
+
+        let strict = Command::new(binary())
+            .args(["verify", &format!("--{option}:wrong")])
+            .arg(path)
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(!strict.status.success());
+        assert!(String::from_utf8_lossy(&strict.stderr).contains("KeyName"));
+
+        let lax = Command::new(binary())
+            .args(["verify", "--lax-key-search", &format!("--{option}:wrong")])
+            .arg(path)
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(
+            lax.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lax.stderr)
+        );
+    }
+}
+
+#[test]
 fn verification_reads_the_conventional_stdin_marker() {
     // A lone dash is input data, not an option name; this is the process-level
     // contract used by shell pipelines and the donor CLI.
@@ -474,6 +537,64 @@ fn direct_aes_key_name_must_match_the_template_unless_lax() {
 }
 
 #[test]
+fn rsa_recipient_name_must_match_the_template_unless_lax() {
+    // A named RSA key selects the nested EncryptedKey recipient identity, not
+    // the direct content-encryption key metadata on EncryptedData.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("named-rsa-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+<EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/>
+<ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo><ds:KeyName>recipient</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo>
+<CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"named recipient").unwrap();
+
+    let matching = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem:recipient"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        matching.status.success(),
+        "{}",
+        String::from_utf8_lossy(&matching.stderr)
+    );
+
+    let strict = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem:wrong"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!strict.status.success());
+    assert!(String::from_utf8_lossy(&strict.stderr).contains("KeyName"));
+
+    let lax = Command::new(binary())
+        .args(["encrypt", "--lax-key-search", "--pubkey-pem:wrong"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        lax.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax.stderr)
+    );
+}
+
+#[test]
 fn encrypts_and_decrypts_with_an_rsa_oaep_recipient() {
     // The advertised RSA path must emit XML Encryption 1.1 OAEP and unwrap its
     // generated content key through a separate CLI invocation.
@@ -525,6 +646,50 @@ fn encrypts_and_decrypts_with_an_rsa_oaep_recipient() {
         String::from_utf8_lossy(&decrypt.stderr)
     );
     assert_eq!(decrypt.stdout, fs::read(&plaintext).unwrap());
+}
+
+#[test]
+fn rsa_decryption_accepts_private_key_certificate_companions() {
+    // libxmlsec private-key options permit certificate companions after the
+    // key path; decryption consumes the key while retaining that syntax.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"certificate companion").unwrap();
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(encrypt.status.success());
+
+    let compound = format!("{},{}", private_key.display(), certificate.display());
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--privkey-pem"])
+        .arg(compound)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"certificate companion");
 }
 
 #[test]

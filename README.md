@@ -82,7 +82,9 @@ AES key generation, capability checks, libxmlsec1 key aliases and option syntax,
 certificate-chain embedding, stdin input, signature selection by node ID, and
 deterministic process statuses. `help-all` enumerates the same registered
 commands and options accepted by the parser, while named direct keys obey
-template `KeyName` unless lax lookup is explicitly requested. Its process tests run a minimal checked-in
+an explicit template `KeyName` unless lax lookup is requested; unnamed templates
+still use their sole explicit key. This applies to raw keys, explicit certificates,
+and RSA recipients. Its process tests run a minimal checked-in
 snapshot of the unmodified upstream DSig, Enc, and Keys runners without network
 access or a system `xmlsec1` installation.
 Unsupported algorithms, key formats, providers, and policy controls fail closed

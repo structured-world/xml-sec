@@ -13,7 +13,7 @@ use xml_sec::{
     xmldsig::{
         DefaultKeyResolver, DsigStatus, KeyResolver, KeyResolverConfig, SignContext,
         SignatureAlgorithm, UriTypeSet, VerifyContext, X509CertificateKeyInfoWriter,
-        parse_key_info, uri::UriReferenceResolver,
+        parse_key_info,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
@@ -351,7 +351,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     }
     let policy = SigningPolicy::default();
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
-    let (key_option, certificate_is_der) = select_signing_key(invocation, &xml)?;
+    let (key_option, certificate_is_der) = select_signing_key(invocation, &xml, &policy)?;
     let value = key_option.value.as_deref().unwrap_or_default();
     let (key_path, certificate_paths) = split_key_and_certificates(value)?;
     let key = key_material::load_signing_key(key_path)?;
@@ -386,6 +386,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
 fn select_signing_key<'a>(
     invocation: &'a Invocation,
     xml: &str,
+    policy: &SigningPolicy,
 ) -> Result<(&'a crate::OptionValue, bool), CommandError> {
     let mut keys = Vec::new();
     for (name, certificate_is_der) in [
@@ -406,7 +407,7 @@ fn select_signing_key<'a>(
     {
         return Ok(*selected);
     }
-    let requested_name = template_key_name(xml)?;
+    let requested_name = key_material::signing_signature_key_name(xml, policy)?;
     if let Some(requested_name) = requested_name {
         let matching = keys
             .into_iter()
@@ -425,35 +426,6 @@ fn select_signing_key<'a>(
     Err(CommandError::Usage(
         "multiple private keys require a template KeyName and named options".into(),
     ))
-}
-
-fn template_key_name(xml: &str) -> Result<Option<String>, CommandError> {
-    signature_key_name(xml, None)
-}
-
-fn signature_key_name(
-    xml: &str,
-    start_node_id: Option<&str>,
-) -> Result<Option<String>, CommandError> {
-    let document =
-        Document::parse(xml).map_err(|error| CommandError::Signature(error.to_string()))?;
-    let selected_root =
-        start_node_id.and_then(|id| UriReferenceResolver::new(&document).node_for_id(id));
-    let signature = selected_root
-        .map_or_else(|| document.descendants(), |node| node.descendants())
-        .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")));
-    Ok(signature.and_then(|signature| {
-        signature
-            .children()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
-            .and_then(|key_info| {
-                key_info
-                    .children()
-                    .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyName")))
-            })
-            .and_then(|key_name| key_name.text())
-            .map(str::to_owned)
-    }))
 }
 
 fn split_key_and_certificates(value: &OsStr) -> Result<(&OsStr, Vec<&OsStr>), CommandError> {
@@ -557,15 +529,18 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     let policy = xmlsec_compatibility_verification_policy(invocation);
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
-    let algorithm = key_material::signature_algorithm(&xml, start_node_id)?;
-    if let [direct_key] = direct_keys.as_slice()
-        && let Some(name) = direct_key.parameter.as_deref()
-        && !invocation.flag("lax-key-search")
-        && signature_key_name(&xml, start_node_id)?.as_deref() != Some(name)
+    let signature = key_material::verification_signature_metadata(&xml, start_node_id, &policy)?;
+    let algorithm = signature.algorithm;
+    if let Some(identity) = direct_keys
+        .first()
+        .or_else(|| explicit_certificates.first())
     {
-        return Err(CommandError::Usage(format!(
-            "signature KeyName does not match named public key {name}"
-        )));
+        enforce_named_key_match(
+            identity,
+            signature.key_name.as_deref(),
+            invocation.flag("lax-key-search"),
+            "verification key",
+        )?;
     }
     let result = if let Some(path) = direct_path {
         let key = key_material::load_verification_key(path, algorithm)?;
@@ -719,15 +694,13 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         ));
     }
     if let [option] = aes_keys.as_slice() {
-        if let Some(name) = option.parameter.as_deref()
-            && !invocation.flag("lax-key-search")
-            && let Some(template_name) = encrypted_data_key_name(&template)?
-            && template_name != name
-        {
-            return Err(CommandError::Usage(format!(
-                "template KeyName {template_name} does not match named AES key {name}"
-            )));
-        }
+        let template_name = encrypted_data_key_name(&template)?;
+        enforce_named_key_match(
+            option,
+            template_name.as_deref(),
+            invocation.flag("lax-key-search"),
+            "AES key",
+        )?;
         let key = key_material::load_symmetric(
             option.value.as_deref().unwrap_or_default(),
             Some(algorithm.key_len()),
@@ -737,6 +710,13 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             builder = builder.direct_key_name(name);
         }
     } else if let [option] = public_keys.as_slice() {
+        let recipient_name = encrypted_key_recipient_name(&template)?;
+        enforce_named_key_match(
+            option,
+            recipient_name.as_deref(),
+            invocation.flag("lax-key-search"),
+            "RSA recipient key",
+        )?;
         let path = option.value.as_deref().unwrap_or_default();
         let mut recipient = EncryptionRecipient::rsa_oaep(key_material::load_rsa_public(path)?);
         if let Some(parameters) = template_oaep_parameters(&template)? {
@@ -1021,7 +1001,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             policy,
         )?
     } else if let [option] = private_keys.as_slice() {
-        let path = option.value.as_deref().unwrap_or_default();
+        let (path, _) = split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
         let resolver = PrivateKeyDecryptor::new(key_material::load_rsa_private(path)?);
         decrypt_input(&resolver, &xml, encrypted_data_id, policy)?
     } else {
@@ -1099,6 +1079,47 @@ fn encrypted_data_key_name(xml: &str) -> Result<Option<String>, CommandError> {
         .and_then(|key_info| direct_child_element(key_info, XMLDSIG_NS, "KeyName"))
         .and_then(|key_name| key_name.text())
         .map(str::to_owned))
+}
+
+fn encrypted_key_recipient_name(xml: &str) -> Result<Option<String>, CommandError> {
+    let document =
+        Document::parse(xml).map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let encrypted_data = document
+        .descendants()
+        .find(|node| node.has_tag_name((XMLENC_NS, "EncryptedData")))
+        .ok_or_else(|| CommandError::Encryption("template has no EncryptedData".into()))?;
+    Ok(direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
+        .and_then(|key_info| direct_child_element(key_info, XMLENC_NS, "EncryptedKey"))
+        .and_then(|encrypted_key| direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo"))
+        .and_then(|key_info| direct_child_element(key_info, XMLDSIG_NS, "KeyName"))
+        .and_then(|key_name| key_name.text())
+        .map(str::to_owned))
+}
+
+fn enforce_named_key_match(
+    option: &crate::OptionValue,
+    template_name: Option<&str>,
+    lax_key_search: bool,
+    key_kind: &str,
+) -> Result<(), CommandError> {
+    let Some(option_name) = option.parameter.as_deref() else {
+        return Ok(());
+    };
+    // A missing KeyName does not request a different identity: with one
+    // explicit key, libxmlsec uses that key regardless of its registry name.
+    // Strict lookup applies when the document actually names an identity.
+    if lax_key_search {
+        return Ok(());
+    }
+    let Some(template_name) = template_name else {
+        return Ok(());
+    };
+    if template_name == option_name {
+        return Ok(());
+    }
+    Err(CommandError::Usage(format!(
+        "template KeyName {template_name} does not match named {key_kind} {option_name}"
+    )))
 }
 
 fn keys(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {

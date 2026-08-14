@@ -12,6 +12,7 @@ use rsa::{
     },
 };
 use x509_parser::prelude::FromDer as _;
+use xml_sec::policy::{PolicyViolation, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
     EcdsaP256SigningKey, EcdsaP384SigningKey, RsaSigningKey, SignatureAlgorithm, SigningKey,
     VerificationKey, find_signature_node, parse_signed_info, uri::UriReferenceResolver,
@@ -40,6 +41,14 @@ pub enum KeyMaterialError {
     Signature(String),
     #[error("invalid symmetric key length: expected {expected} bytes, got {actual}")]
     SymmetricLength { expected: usize, actual: usize },
+    #[error("invalid operation policy: {0}")]
+    Policy(#[from] PolicyViolation),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct SignatureMetadata {
+    pub algorithm: SignatureAlgorithm,
+    pub key_name: Option<String>,
 }
 
 pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialError> {
@@ -55,12 +64,17 @@ pub fn read_text(path: impl AsRef<Path>) -> Result<String, KeyMaterialError> {
     String::from_utf8(read(path)?).map_err(|_| KeyMaterialError::InvalidPem(path.to_owned()))
 }
 
-pub fn signature_algorithm(
+pub fn verification_signature_metadata(
     xml: &str,
     start_node_id: Option<&str>,
-) -> Result<SignatureAlgorithm, KeyMaterialError> {
-    let document =
-        Document::parse(xml).map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
+    policy: &VerificationPolicy,
+) -> Result<SignatureMetadata, KeyMaterialError> {
+    policy.validate()?;
+    let document = parse_signature_document(
+        xml,
+        policy.xml.allow_internal_dtd,
+        policy.resources.max_xml_nodes,
+    )?;
     let signature = match start_node_id {
         Some(id) => {
             let start = UriReferenceResolver::new(&document)
@@ -75,11 +89,62 @@ pub fn signature_algorithm(
     .ok_or(KeyMaterialError::MissingSignedInfo)?;
     let signed_info = signature
         .children()
-        .find(|node| node.is_element() && node.tag_name().name() == "SignedInfo")
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignedInfo")))
         .ok_or(KeyMaterialError::MissingSignedInfo)?;
-    parse_signed_info(signed_info)
+    let algorithm = parse_signed_info(signed_info)
         .map(|info| info.signature_method)
-        .map_err(|error| KeyMaterialError::Signature(error.to_string()))
+        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
+    Ok(SignatureMetadata {
+        algorithm,
+        key_name: signature_key_name(signature),
+    })
+}
+
+pub fn signing_signature_key_name(
+    xml: &str,
+    policy: &SigningPolicy,
+) -> Result<Option<String>, KeyMaterialError> {
+    policy.validate()?;
+    let document = parse_signature_document(
+        xml,
+        policy.xml.allow_internal_dtd,
+        policy.resources.max_xml_nodes,
+    )?;
+    find_signature_node(&document)
+        .map(signature_key_name)
+        .ok_or(KeyMaterialError::MissingSignedInfo)
+}
+
+fn parse_signature_document(
+    xml: &str,
+    allow_internal_dtd: bool,
+    max_xml_nodes: usize,
+) -> Result<Document<'_>, KeyMaterialError> {
+    let nodes_limit = u32::try_from(max_xml_nodes).map_err(|_| {
+        KeyMaterialError::Signature("XML node ceiling does not fit the parser limit".into())
+    })?;
+    Document::parse_with_options(
+        xml,
+        roxmltree::ParsingOptions {
+            allow_dtd: allow_internal_dtd,
+            nodes_limit,
+            entity_resolver: None,
+        },
+    )
+    .map_err(|error| KeyMaterialError::Signature(error.to_string()))
+}
+
+fn signature_key_name(signature: roxmltree::Node<'_, '_>) -> Option<String> {
+    signature
+        .children()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
+        .and_then(|key_info| {
+            key_info
+                .children()
+                .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+        })
+        .and_then(|key_name| key_name.text())
+        .map(str::to_owned)
 }
 
 pub fn load_signing_key(path: impl AsRef<Path>) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
@@ -306,9 +371,32 @@ mod tests {
             signature("ec", "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256")
         );
 
-        assert_eq!(
-            signature_algorithm(&xml, Some("ec")).unwrap(),
-            SignatureAlgorithm::EcdsaSha256
+        let metadata = verification_signature_metadata(
+            &xml,
+            Some("ec"),
+            &xml_sec::policy::VerificationPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(metadata.algorithm, SignatureAlgorithm::EcdsaSha256);
+    }
+
+    #[test]
+    fn signature_discovery_obeys_the_verification_node_ceiling() {
+        // Metadata discovery runs before cryptographic verification and must
+        // not allocate a DOM larger than the operation policy permits.
+        let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
+        let xml = format!(
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue></ds:Signature>"#
         );
+        let policy = xml_sec::policy::VerificationPolicy {
+            resources: xml_sec::policy::ResourcePolicy {
+                max_xml_nodes: 4,
+                ..xml_sec::policy::ResourcePolicy::default()
+            },
+            ..xml_sec::policy::VerificationPolicy::default()
+        };
+
+        let error = verification_signature_metadata(&xml, None, &policy).unwrap_err();
+        assert!(error.to_string().contains("nodes limit"));
     }
 }

@@ -56,8 +56,10 @@ Verification accepts `-` as the conventional stdin marker. For documents with
 multiple signatures, `--node-id <id>` selects an ID-bearing start node and
 verifies the single `Signature` in its subtree; missing and duplicate IDs fail
 closed.
-Named `--pubkey-pem:name` and `--pubkey-der:name` inputs must match the selected
-signature's `KeyName`; `--lax-key-search` is the explicit opt-out.
+When the selected signature contains `KeyName`, named raw public-key and
+explicit certificate inputs must match it; `--lax-key-search` is the explicit
+opt-out. A signature without `KeyName` does not request a different identity,
+so its sole explicit key remains usable even when that key has a registry name.
 
 `--output` follows the upstream filename-template contract. The first
 `{inputfile}` token is replaced with the input file's basename after removing
@@ -80,8 +82,13 @@ larger XML document; `--node-id` selects an embedded `EncryptedData` by `Id`.
 Encryption preserves the template's `Id`, `Type`, `MimeType`, `KeyInfo`,
 `EncryptionProperties`, and RSA-OAEP parameters while replacing only the
 cryptographic `CipherValue` payloads.
-For direct AES encryption, a named key must match an existing template
-`KeyName` unless `--lax-key-search` is supplied. `--binary-data` rejects
+When an encryption template contains a direct content-key `KeyName`, a named
+AES key must match it. Likewise, an RSA wrapping key must match a recipient
+`KeyName` inside `EncryptedKey`. An unnamed template does not constrain the sole
+explicit key; an explicit mismatch fails unless `--lax-key-search` is supplied.
+RSA private-key decryption accepts the upstream
+`key.pem,certificate.pem,...` option syntax and consumes the first component as
+the decryption key. `--binary-data` rejects
 templates explicitly typed as XML `Element` or `Content`; use `--xml-data` for
 those templates so ciphertext metadata cannot mislabel arbitrary bytes as XML.
 
