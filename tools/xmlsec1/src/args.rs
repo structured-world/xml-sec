@@ -25,6 +25,46 @@ pub enum Command {
 }
 
 impl Command {
+    pub(crate) const ALL: &[Self] = &[
+        Self::Help,
+        Self::HelpAll,
+        Self::HelpDsig,
+        Self::HelpEnc,
+        Self::HelpKeys,
+        Self::HelpX509,
+        Self::Version,
+        Self::ListKeyData,
+        Self::CheckKeyData,
+        Self::ListTransforms,
+        Self::CheckTransforms,
+        Self::Keys,
+        Self::Sign,
+        Self::Verify,
+        Self::Encrypt,
+        Self::Decrypt,
+    ];
+
+    pub(crate) const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Help => "help",
+            Self::HelpAll => "help-all",
+            Self::HelpDsig => "help-dsig",
+            Self::HelpEnc => "help-enc",
+            Self::HelpKeys => "help-keys",
+            Self::HelpX509 => "help-x509",
+            Self::Version => "version",
+            Self::ListKeyData => "list-key-data",
+            Self::CheckKeyData => "check-key-data",
+            Self::ListTransforms => "list-transforms",
+            Self::CheckTransforms => "check-transforms",
+            Self::Keys => "keys",
+            Self::Sign => "sign",
+            Self::Verify => "verify",
+            Self::Encrypt => "encrypt",
+            Self::Decrypt => "decrypt",
+        }
+    }
+
     fn parse(value: &str) -> Option<Self> {
         let value = value.strip_prefix("--").unwrap_or(value);
         Some(match value {

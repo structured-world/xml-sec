@@ -14,7 +14,8 @@ See the repository's [CLI compatibility guide](https://github.com/structured-wor
 examples, supported key formats, fail-closed behavior, and upstream runner
 coverage.
 
-`--aeskey` files are raw binary key material. Decrypting a standalone
+`--aes-key` files are raw binary key material (`--aeskey` remains a compatible
+alias). Decrypting a standalone
 `EncryptedData` returns opaque decrypted bytes; embedded encrypted data uses
 in-document replacement and supports operation-start selection with
 `--node-id`. Encryption retains template metadata and RSA-OAEP parameters;

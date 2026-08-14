@@ -116,6 +116,17 @@ const KEYS_OPTIONS: &[&str] = &["gen-key"];
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const XMLENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";
 const XMLENC11_NS: &str = "http://www.w3.org/2009/xmlenc11#";
+const PRIMARY_COMMANDS: &[Command] = &[
+    Command::Sign,
+    Command::Verify,
+    Command::Encrypt,
+    Command::Decrypt,
+    Command::Keys,
+    Command::ListTransforms,
+    Command::CheckTransforms,
+    Command::ListKeyData,
+    Command::CheckKeyData,
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum CommandError {
@@ -146,6 +157,8 @@ pub enum CommandError {
     Encryption(String),
     #[error("requested capability is not available")]
     CapabilityUnavailable,
+    #[error("invalid internal command contract: {0}")]
+    InvalidContract(&'static str),
 }
 
 pub fn execute(
@@ -202,24 +215,13 @@ pub fn execute(
 }
 
 fn help(output: &mut dyn Write) -> Result<(), CommandError> {
-    writeln!(
-        output,
-        "Usage: xmlsec1 <command> [options] [files]\n\
-         Commands: sign verify encrypt decrypt keys list-transforms check-transforms \
-         list-key-data check-key-data"
-    )
-    .map_err(stdout_error)
+    writeln!(output, "Usage: xmlsec1 <command> [options] [files]").map_err(stdout_error)?;
+    write_command_list(PRIMARY_COMMANDS, output)
 }
 
 fn help_all(output: &mut dyn Write) -> Result<(), CommandError> {
     writeln!(output, "Usage: xmlsec1 <command> [options] [files]").map_err(stdout_error)?;
-    writeln!(
-        output,
-        "Commands: help help-all help-dsig help-enc help-keys help-x509 version \
-         list-key-data check-key-data list-transforms check-transforms keys sign \
-         verify encrypt decrypt"
-    )
-    .map_err(stdout_error)?;
+    write_command_list(Command::ALL, output)?;
     writeln!(output, "Options:").map_err(stdout_error)?;
     for spec in OPTION_SPECS {
         let parameter = if spec.accepts_parameter {
@@ -237,6 +239,14 @@ fn help_all(output: &mut dyn Write) -> Result<(), CommandError> {
     Ok(())
 }
 
+fn write_command_list(commands: &[Command], output: &mut dyn Write) -> Result<(), CommandError> {
+    write!(output, "Commands:").map_err(stdout_error)?;
+    for command in commands {
+        write!(output, " {}", command.canonical_name()).map_err(stdout_error)?;
+    }
+    writeln!(output).map_err(stdout_error)
+}
+
 fn command_help(command: Command, output: &mut dyn Write) -> Result<(), CommandError> {
     let Some((name, options)) = command_contract(command) else {
         return help(output);
@@ -247,7 +257,9 @@ fn command_help(command: Command, output: &mut dyn Write) -> Result<(), CommandE
         let spec = OPTION_SPECS
             .iter()
             .find(|spec| spec.canonical == *option)
-            .expect("command option must exist in OPTION_SPECS");
+            .ok_or(CommandError::InvalidContract(
+                "command option is absent from OPTION_SPECS",
+            ))?;
         let parameter = if spec.accepts_parameter {
             "[:name]"
         } else {
@@ -274,18 +286,19 @@ fn topic_help(commands: &[Command], output: &mut dyn Write) -> Result<(), Comman
 }
 
 fn command_contract(command: Command) -> Option<(&'static str, &'static [&'static str])> {
-    Some(match command {
-        Command::Sign => ("sign", SIGN_OPTIONS),
-        Command::Verify => ("verify", VERIFY_OPTIONS),
-        Command::Encrypt => ("encrypt", ENCRYPT_OPTIONS),
-        Command::Decrypt => ("decrypt", DECRYPT_OPTIONS),
-        Command::Keys => ("keys", KEYS_OPTIONS),
-        Command::ListKeyData => ("list-key-data", &[]),
-        Command::CheckKeyData => ("check-key-data", &[]),
-        Command::ListTransforms => ("list-transforms", &[]),
-        Command::CheckTransforms => ("check-transforms", &[]),
+    let options = match command {
+        Command::Sign => SIGN_OPTIONS,
+        Command::Verify => VERIFY_OPTIONS,
+        Command::Encrypt => ENCRYPT_OPTIONS,
+        Command::Decrypt => DECRYPT_OPTIONS,
+        Command::Keys => KEYS_OPTIONS,
+        Command::ListKeyData
+        | Command::CheckKeyData
+        | Command::ListTransforms
+        | Command::CheckTransforms => &[],
         _ => return None,
-    })
+    };
+    Some((command.canonical_name(), options))
 }
 
 fn validate_provider(invocation: &Invocation) -> Result<(), CommandError> {
@@ -1559,8 +1572,21 @@ mod tests {
         )
         .unwrap();
         let help = String::from_utf8(output).unwrap();
-        for command in ["help-dsig", "check-key-data", "decrypt"] {
-            assert!(help.contains(command), "missing command {command}");
+        for command in Command::ALL {
+            assert!(
+                help.contains(command.canonical_name()),
+                "missing command {}",
+                command.canonical_name()
+            );
+            if command_contract(*command).is_some() {
+                let mut command_output = Vec::new();
+                command_help(*command, &mut command_output).unwrap();
+                assert!(
+                    String::from_utf8(command_output)
+                        .unwrap()
+                        .starts_with(&format!("Usage: xmlsec1 {}", command.canonical_name()))
+                );
+            }
         }
         assert!(!help.contains("sign-tmpl"));
         for option in OPTION_SPECS {
