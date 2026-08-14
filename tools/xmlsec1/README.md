@@ -22,4 +22,6 @@ same core signing, verification, and encryption pipelines. Signing options
 embed every certificate from `key,leaf,intermediate,...`; verification accepts
 stdin as `-` and can select one signature subtree with `--node-id`. Output paths
 support the upstream `{inputfile}` basename template, and `--gen-key[:name]`
-emits both named and unnamed AES key-store entries.
+emits both named and unnamed AES key-store entries. `help-all` is generated from
+the parser registry, named direct keys are checked against template `KeyName`,
+and binary payloads cannot be emitted with XML Element/Content type metadata.

@@ -11,11 +11,26 @@ if [[ "$operation" != "import" && "$operation" != "--check" ]]; then
 fi
 mkdir -p "$(dirname "$target")"
 staging="$(mktemp -d "${target}.import.XXXXXX")"
+backup=""
 
 cleanup() {
+  local status="${1:-$?}"
+  trap - EXIT INT TERM HUP
   rm -rf "$staging"
+  if [[ -n "$backup" && -e "$backup" ]]; then
+    if [[ -e "$target" ]]; then
+      rm -rf "$backup"
+    elif ! mv "$backup" "$target"; then
+      printf 'failed to restore fixture snapshot from %s\n' "$backup" >&2
+      status=1
+    fi
+  fi
+  exit "$status"
 }
-trap cleanup EXIT
+trap 'cleanup $?' EXIT
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
+trap 'cleanup 129' HUP
 
 assets=(
   "testrun.sh"
@@ -44,8 +59,17 @@ for asset in "${assets[@]}"; do
   install -m "$file_mode" "$source" "$staging/$asset"
 done
 
-printf '%s\n' "$(<"$repo_root/compatibility/libxmlsec1-1.3.13-donor-commit.txt")" \
-  > "$staging/DONOR_COMMIT"
+donor_commit_file="$repo_root/compatibility/libxmlsec1-1.3.13-donor-commit.txt"
+if [[ ! -s "$donor_commit_file" ]]; then
+  printf 'donor commit pin is missing or empty: %s\n' "$donor_commit_file" >&2
+  exit 1
+fi
+donor_commit="$(<"$donor_commit_file")"
+if [[ ! "$donor_commit" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+  printf 'donor commit pin is not a Git object ID: %s\n' "$donor_commit_file" >&2
+  exit 1
+fi
+printf '%s\n' "$donor_commit" > "$staging/DONOR_COMMIT"
 
 backup="${target}.backup.$$"
 if [[ "$operation" == "--check" ]]; then

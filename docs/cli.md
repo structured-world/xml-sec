@@ -30,6 +30,12 @@ backend. RustCrypto accepts an absent or empty configuration directory because
 it has no external backend configuration; a non-empty path is rejected rather
 than ignored.
 
+`help-all` enumerates every registered command and canonical option, including
+which options accept `[:name]` and which consume a value. The listing is built
+from the parser's option metadata, so it cannot advertise a syntax the parser
+does not recognize. A `:<parameter>` suffix on flags or unrelated valued
+options is rejected rather than silently activating the underlying option.
+
 ## Examples
 
 Sign an existing XMLDSig template and verify it with an explicit public key:
@@ -50,6 +56,8 @@ Verification accepts `-` as the conventional stdin marker. For documents with
 multiple signatures, `--node-id <id>` selects an ID-bearing start node and
 verifies the single `Signature` in its subtree; missing and duplicate IDs fail
 closed.
+Named `--pubkey-pem:name` and `--pubkey-der:name` inputs must match the selected
+signature's `KeyName`; `--lax-key-search` is the explicit opt-out.
 
 `--output` follows the upstream filename-template contract. The first
 `{inputfile}` token is replaced with the input file's basename after removing
@@ -72,6 +80,10 @@ larger XML document; `--node-id` selects an embedded `EncryptedData` by `Id`.
 Encryption preserves the template's `Id`, `Type`, `MimeType`, `KeyInfo`,
 `EncryptionProperties`, and RSA-OAEP parameters while replacing only the
 cryptographic `CipherValue` payloads.
+For direct AES encryption, a named key must match an existing template
+`KeyName` unless `--lax-key-search` is supplied. `--binary-data` rejects
+templates explicitly typed as XML `Element` or `Content`; use `--xml-data` for
+those templates so ciphertext metadata cannot mislabel arbitrary bytes as XML.
 
 Generate an AES key store using the upstream command shape:
 

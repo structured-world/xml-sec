@@ -85,7 +85,11 @@ stage_dir="$work_dir/stage"
 
 if [[ -n "${XMLSEC1_SOURCE_DIR:-}" ]]; then
   local_source_dir="$XMLSEC1_SOURCE_DIR"
-  if [[ "$local_source_dir" != /* || ! -d "$local_source_dir/.git" ]]; then
+  if [[ "$local_source_dir" != /* || ! -d "$local_source_dir" ]]; then
+    printf 'XMLSEC1_SOURCE_DIR must be an absolute git checkout: %s\n' "$local_source_dir" >&2
+    exit 1
+  fi
+  if [[ "$(git -C "$local_source_dir" rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]]; then
     printf 'XMLSEC1_SOURCE_DIR must be an absolute git checkout: %s\n' "$local_source_dir" >&2
     exit 1
   fi

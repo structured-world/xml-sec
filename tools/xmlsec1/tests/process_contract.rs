@@ -72,6 +72,48 @@ fn signs_verifies_and_rejects_tampering_through_process_api() {
 }
 
 #[test]
+fn named_public_key_obeys_signature_key_name_unless_lax() {
+    // Named direct keys participate in the same strict KeyName contract as a
+    // key manager; --lax-key-search is the explicit compatibility escape hatch.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let signed = temp.path().join("signed.xml");
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--output"])
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(sign.status.success());
+
+    let strict = Command::new(binary())
+        .args(["verify", "--pubkey-pem:wrong"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(!strict.status.success());
+    assert!(String::from_utf8_lossy(&strict.stderr).contains("KeyName"));
+
+    let lax = Command::new(binary())
+        .args(["verify", "--lax-key-search", "--pubkey-pem:wrong"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        lax.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax.stderr)
+    );
+}
+
+#[test]
 fn verification_reads_the_conventional_stdin_marker() {
     // A lone dash is input data, not an option name; this is the process-level
     // contract used by shell pipelines and the donor CLI.
@@ -364,6 +406,74 @@ fn encryption_preserves_template_metadata_and_supports_id_selection() {
 }
 
 #[test]
+fn binary_encryption_rejects_xml_typed_templates() {
+    // Binary payloads cannot truthfully carry the XML Element or Content type;
+    // otherwise decryption routes arbitrary bytes through XML validation.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("typed-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let key = temp.path().join("key.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, [0xff, 0x00, 0xfe]).unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    let result = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .args(["--binary-data"])
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("binary-data"));
+}
+
+#[test]
+fn direct_aes_key_name_must_match_the_template_unless_lax() {
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("named-template.xml");
+    let plaintext = temp.path().join("plaintext.xml");
+    let key = temp.path().join("key.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyName>expected</KeyName></KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, "<secret/>").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    let strict = Command::new(binary())
+        .args(["encrypt", "--aes-key:wrong"])
+        .arg(&key)
+        .args(["--xml-data"])
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!strict.status.success());
+    assert!(String::from_utf8_lossy(&strict.stderr).contains("KeyName"));
+
+    let lax = Command::new(binary())
+        .args(["encrypt", "--lax-key-search", "--aes-key:wrong"])
+        .arg(&key)
+        .args(["--xml-data"])
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        lax.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax.stderr)
+    );
+}
+
+#[test]
 fn encrypts_and_decrypts_with_an_rsa_oaep_recipient() {
     // The advertised RSA path must emit XML Encryption 1.1 OAEP and unwrap its
     // generated content key through a separate CLI invocation.
@@ -618,6 +728,18 @@ fn generated_key_store_is_private_on_create_and_overwrite() {
     // Key stores contain raw symmetric keys; both a new file and an existing
     // permissive file must end with owner-only permissions.
     let temp = tempfile::tempdir().unwrap();
+    let created = temp.path().join("created.xml");
+    let create = Command::new(binary())
+        .args(["keys", "--gen-key:private", "aes-128"])
+        .arg(&created)
+        .output()
+        .unwrap();
+    assert!(create.status.success());
+    assert_eq!(
+        fs::metadata(&created).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
     let key_store = temp.path().join("keys.xml");
     fs::write(&key_store, b"old").unwrap();
     fs::set_permissions(&key_store, fs::Permissions::from_mode(0o666)).unwrap();
@@ -975,22 +1097,23 @@ fn generated_key_store_contains_every_requested_key() {
         .filter_map(|node| node.text())
         .collect::<Vec<_>>();
     assert_eq!(names, ["first", "second"]);
+    let key_lengths = document
+        .descendants()
+        .filter(|node| node.has_tag_name(("http://www.aleksey.com/xmlsec/2002", "AESKeyValue")))
+        .map(|node| {
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                node.text().unwrap(),
+            )
+            .unwrap()
+            .len()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(key_lengths, [16, 32]);
 }
 
 #[test]
-fn reports_capabilities_and_process_failures_deterministically() {
-    // Cover parser, capability, malformed-input, and output-path failures at
-    // the executable boundary where automation observes only status and stderr.
-    let temp = tempfile::tempdir().unwrap();
-    let malformed = temp.path().join("malformed.xml");
-    fs::write(&malformed, "<Signature>").unwrap();
-    let foreign_template = temp.path().join("foreign-template.xml");
-    fs::write(
-        &foreign_template,
-        "<EncryptedData xmlns=\"urn:not-xmlenc\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><CipherData><CipherValue/></CipherData></EncryptedData>",
-    )
-    .unwrap();
-
+fn capability_queries_report_supported_and_unsupported_names() {
     assert!(
         Command::new(binary())
             .args(["check-transforms", "c14n", "rsa-sha256"])
@@ -998,31 +1121,6 @@ fn reports_capabilities_and_process_failures_deterministically() {
             .unwrap()
             .success()
     );
-    let conflicting_keys = Command::new(binary())
-        .args([
-            "verify",
-            "--pubkey-pem",
-            "first.pem",
-            "--pubkey-pem",
-            "second.pem",
-        ])
-        .arg(&malformed)
-        .output()
-        .unwrap();
-    assert!(!conflicting_keys.status.success());
-    assert!(
-        String::from_utf8_lossy(&conflicting_keys.stderr)
-            .contains("exactly one explicit public key")
-    );
-
-    let foreign = Command::new(binary())
-        .args(["encrypt", "--aeskey", "missing.key", "--binary-data"])
-        .arg(&malformed)
-        .arg(&foreign_template)
-        .output()
-        .unwrap();
-    assert!(!foreign.status.success());
-    assert!(String::from_utf8_lossy(&foreign.stderr).contains("no EncryptedData"));
     assert_eq!(
         Command::new(binary())
             .arg("check-transforms")
@@ -1039,6 +1137,64 @@ fn reports_capabilities_and_process_failures_deterministically() {
             .code(),
         Some(0)
     );
+    assert!(
+        !Command::new(binary())
+            .args(["check-transforms", "xslt"])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn conflicting_verification_keys_fail_before_input_parsing() {
+    let temp = tempfile::tempdir().unwrap();
+    let malformed = temp.path().join("malformed.xml");
+    fs::write(&malformed, "<Signature>").unwrap();
+    let conflicting_keys = Command::new(binary())
+        .args([
+            "verify",
+            "--pubkey-pem",
+            "first.pem",
+            "--pubkey-pem",
+            "second.pem",
+        ])
+        .arg(&malformed)
+        .output()
+        .unwrap();
+    assert!(!conflicting_keys.status.success());
+    assert!(
+        String::from_utf8_lossy(&conflicting_keys.stderr)
+            .contains("exactly one explicit public key")
+    );
+}
+
+#[test]
+fn foreign_encryption_namespace_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let malformed = temp.path().join("malformed.xml");
+    let foreign_template = temp.path().join("foreign-template.xml");
+    fs::write(&malformed, "<Signature>").unwrap();
+    fs::write(
+        &foreign_template,
+        "<EncryptedData xmlns=\"urn:not-xmlenc\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><CipherData><CipherValue/></CipherData></EncryptedData>",
+    )
+    .unwrap();
+    let foreign = Command::new(binary())
+        .args(["encrypt", "--aeskey", "missing.key", "--binary-data"])
+        .arg(&malformed)
+        .arg(&foreign_template)
+        .output()
+        .unwrap();
+    assert!(!foreign.status.success());
+    assert!(String::from_utf8_lossy(&foreign.stderr).contains("no EncryptedData"));
+}
+
+#[test]
+fn parser_input_and_output_failures_are_nonzero() {
+    let temp = tempfile::tempdir().unwrap();
+    let malformed = temp.path().join("malformed.xml");
+    fs::write(&malformed, "<Signature>").unwrap();
     assert_eq!(
         Command::new(binary())
             .arg("unknown-command")
@@ -1046,13 +1202,6 @@ fn reports_capabilities_and_process_failures_deterministically() {
             .unwrap()
             .code(),
         Some(1)
-    );
-    assert!(
-        !Command::new(binary())
-            .args(["check-transforms", "xslt"])
-            .status()
-            .unwrap()
-            .success()
     );
     let invalid_xml = Command::new(binary())
         .args(["verify", "--pubkey-pem", "missing.pem"])
@@ -1080,17 +1229,23 @@ fn reports_capabilities_and_process_failures_deterministically() {
             .unwrap()
             .success()
     );
+}
 
+#[test]
+fn nonempty_crypto_config_is_rejected_with_the_expected_diagnostic() {
+    let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("crypto-config");
     fs::create_dir(&config).unwrap();
     fs::write(config.join("backend.conf"), "unsupported").unwrap();
+    let output = Command::new(binary())
+        .args(["check-transforms", "--crypto-config"])
+        .arg(&config)
+        .arg("c14n")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
     assert!(
-        !Command::new(binary())
-            .args(["check-transforms", "--crypto-config"])
-            .arg(&config)
-            .arg("c14n")
-            .status()
-            .unwrap()
-            .success()
+        String::from_utf8_lossy(&output.stderr)
+            .contains("unsupported option for this command: --crypto-config")
     );
 }

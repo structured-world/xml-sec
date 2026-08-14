@@ -25,16 +25,27 @@ fn run_upstream(script: &str, selected_test: &str) -> String {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("TOTAL OK:"), "runner summary is missing");
+    let total_ok = stdout
+        .lines()
+        .find_map(|line| line.split_once("TOTAL OK:").map(|(_, count)| count))
+        .and_then(|count| count.split(';').next())
+        .and_then(|count| count.trim().parse::<usize>().ok())
+        .expect("runner TOTAL OK count must be numeric");
+    assert!(total_ok > 0, "selected upstream test did not execute");
     assert!(
         stdout.contains("TOTAL FAILED: 0"),
         "runner reported a failed operation"
     );
-    let run_directory = fs::read_dir(run_root.path())
+    let mut run_directories = fs::read_dir(run_root.path())
         .expect("the runner log root must be readable")
-        .next()
-        .expect("the runner must create one log directory")
-        .expect("the runner log directory entry must be readable")
-        .path();
+        .map(|entry| entry.expect("the runner log directory entry must be readable"))
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    run_directories.sort();
+    let [run_directory] = run_directories.as_slice() else {
+        panic!("the runner must create exactly one log directory: {run_directories:?}");
+    };
     fs::read_to_string(run_directory.join("full.log"))
         .expect("the unmodified runner must preserve its full operation log")
 }

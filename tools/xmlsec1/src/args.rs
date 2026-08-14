@@ -75,15 +75,324 @@ pub enum ParseError {
     MissingOptionValue(String),
     #[error("unsupported option: {0}")]
     UnsupportedOption(String),
+    #[error("option {0} does not accept a name parameter")]
+    UnexpectedOptionParameter(String),
     #[error("arguments are not valid UTF-8")]
     NonUtf8,
 }
 
 #[derive(Clone, Copy)]
-enum Arity {
+pub(crate) enum Arity {
     Flag,
     Value,
 }
+
+pub(crate) struct OptionSpec {
+    pub canonical: &'static str,
+    aliases: &'static [&'static str],
+    pub arity: Arity,
+    pub accepts_parameter: bool,
+}
+
+const FLAG: Arity = Arity::Flag;
+const VALUE: Arity = Arity::Value;
+
+pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
+    OptionSpec {
+        canonical: "output",
+        aliases: &["o"],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "crypto",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "crypto-config",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "verbose",
+        aliases: &[],
+        arity: FLAG,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "print-crypto-library-errors",
+        aliases: &[],
+        arity: FLAG,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "print-debug",
+        aliases: &[],
+        arity: FLAG,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "print-xml-debug",
+        aliases: &[],
+        arity: FLAG,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "repeat",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "keys-file",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "gen-key",
+        aliases: &["g"],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "privkey-pem",
+        aliases: &["privkey"],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "privkey-der",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "pkcs8-pem",
+        aliases: &["privkey-p8-pem"],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "pkcs8-der",
+        aliases: &["privkey-p8-der"],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "pubkey-pem",
+        aliases: &["pubkey"],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "pubkey-der",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "pubkey-cert-pem",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "pubkey-cert-der",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "trusted-pem",
+        aliases: &["trusted"],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "trusted-der",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "untrusted-pem",
+        aliases: &["untrusted"],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "untrusted-der",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "aes-key",
+        aliases: &["aeskey"],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "hmac-key",
+        aliases: &["hmackey"],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "pwd",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "enabled-key-data",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "enabled-reference-uris",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "enabled-retrieval-uris",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "enabled-cipher-reference-uris",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "ignore-manifests",
+        aliases: &[],
+        arity: FLAG,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "lax-key-search",
+        aliases: &[],
+        arity: FLAG,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "verify-keys",
+        aliases: &[],
+        arity: FLAG,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "verify-crls",
+        aliases: &[],
+        arity: FLAG,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "X509-skip-time-checks",
+        aliases: &[],
+        arity: FLAG,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "X509-skip-strict-checks",
+        aliases: &[],
+        arity: FLAG,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "insecure",
+        aliases: &[],
+        arity: FLAG,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "verification-time",
+        aliases: &["verification-gmt-time"],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "depth",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "node-id",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "node-name",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "node-xpath",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "id-attr",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "add-id-attr",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "binary-data",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "xml-data",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "session-key",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "url-map",
+        aliases: &[],
+        arity: VALUE,
+        accepts_parameter: true,
+    },
+    OptionSpec {
+        canonical: "enable-asn1-signatures-hack",
+        aliases: &[],
+        arity: FLAG,
+        accepts_parameter: false,
+    },
+    OptionSpec {
+        canonical: "help",
+        aliases: &[],
+        arity: FLAG,
+        accepts_parameter: false,
+    },
+];
 
 impl Invocation {
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, ParseError> {
@@ -126,6 +435,11 @@ impl Invocation {
                 });
             let name = canonical_option(raw_name)
                 .ok_or_else(|| ParseError::UnsupportedOption(argument_text.to_owned()))?;
+            if parameter.is_some() && !option_spec(name).accepts_parameter {
+                return Err(ParseError::UnexpectedOptionParameter(
+                    argument_text.to_owned(),
+                ));
+            }
             let value =
                 match option_arity(name) {
                     Arity::Flag => None,
@@ -170,77 +484,21 @@ impl Invocation {
 }
 
 fn canonical_option(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "o" | "output" => "output",
-        "crypto" => "crypto",
-        "crypto-config" => "crypto-config",
-        "verbose" => "verbose",
-        "print-crypto-library-errors" => "print-crypto-library-errors",
-        "print-debug" => "print-debug",
-        "print-xml-debug" => "print-xml-debug",
-        "repeat" => "repeat",
-        "keys-file" => "keys-file",
-        "g" | "gen-key" => "gen-key",
-        "privkey" | "privkey-pem" => "privkey-pem",
-        "privkey-der" => "privkey-der",
-        "pkcs8-pem" | "privkey-p8-pem" => "pkcs8-pem",
-        "pkcs8-der" | "privkey-p8-der" => "pkcs8-der",
-        "pubkey" | "pubkey-pem" => "pubkey-pem",
-        "pubkey-der" => "pubkey-der",
-        "pubkey-cert-pem" => "pubkey-cert-pem",
-        "pubkey-cert-der" => "pubkey-cert-der",
-        "trusted-pem" | "trusted" => "trusted-pem",
-        "trusted-der" => "trusted-der",
-        "untrusted-pem" | "untrusted" => "untrusted-pem",
-        "untrusted-der" => "untrusted-der",
-        "aes-key" | "aeskey" => "aes-key",
-        "hmac-key" | "hmackey" => "hmac-key",
-        "pwd" => "pwd",
-        "enabled-key-data" => "enabled-key-data",
-        "enabled-reference-uris" => "enabled-reference-uris",
-        "enabled-retrieval-uris" => "enabled-retrieval-uris",
-        "enabled-cipher-reference-uris" => "enabled-cipher-reference-uris",
-        "ignore-manifests" => "ignore-manifests",
-        "lax-key-search" => "lax-key-search",
-        "verify-keys" => "verify-keys",
-        "verify-crls" => "verify-crls",
-        "X509-skip-time-checks" => "X509-skip-time-checks",
-        "X509-skip-strict-checks" => "X509-skip-strict-checks",
-        "insecure" => "insecure",
-        "verification-time" | "verification-gmt-time" => "verification-time",
-        "depth" => "depth",
-        "node-id" => "node-id",
-        "node-name" => "node-name",
-        "node-xpath" => "node-xpath",
-        "id-attr" => "id-attr",
-        "add-id-attr" => "add-id-attr",
-        "binary-data" => "binary-data",
-        "xml-data" => "xml-data",
-        "session-key" => "session-key",
-        "url-map" => "url-map",
-        "enable-asn1-signatures-hack" => "enable-asn1-signatures-hack",
-        "help" => "help",
-        _ => return None,
-    })
+    OPTION_SPECS
+        .iter()
+        .find(|spec| spec.canonical == name || spec.aliases.contains(&name))
+        .map(|spec| spec.canonical)
 }
 
 fn option_arity(name: &str) -> Arity {
-    match name {
-        "verbose"
-        | "print-crypto-library-errors"
-        | "print-debug"
-        | "print-xml-debug"
-        | "ignore-manifests"
-        | "lax-key-search"
-        | "verify-keys"
-        | "verify-crls"
-        | "X509-skip-time-checks"
-        | "X509-skip-strict-checks"
-        | "insecure"
-        | "enable-asn1-signatures-hack"
-        | "help" => Arity::Flag,
-        _ => Arity::Value,
-    }
+    option_spec(name).arity
+}
+
+fn option_spec(name: &str) -> &'static OptionSpec {
+    OPTION_SPECS
+        .iter()
+        .find(|spec| spec.canonical == name)
+        .expect("canonical options must have metadata")
 }
 
 impl fmt::Display for Command {
@@ -323,6 +581,21 @@ mod tests {
             parse(&["xmlsec1", "verify", "--output"]),
             Err(ParseError::MissingOptionValue(_))
         ));
+        assert!(
+            parse(&["xmlsec1", "verify", "--insecure:false", "input.xml"]).is_err(),
+            "flag parameters must not silently enable the underlying flag"
+        );
+        assert!(
+            parse(&[
+                "xmlsec1",
+                "verify",
+                "--trusted-pem:anchor",
+                "root.pem",
+                "input.xml"
+            ])
+            .is_err(),
+            "only key options with named lookup semantics accept parameters"
+        );
     }
 
     #[test]

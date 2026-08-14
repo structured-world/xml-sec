@@ -13,7 +13,7 @@ use xml_sec::{
     xmldsig::{
         DefaultKeyResolver, DsigStatus, KeyResolver, KeyResolverConfig, SignContext,
         SignatureAlgorithm, UriTypeSet, VerifyContext, X509CertificateKeyInfoWriter,
-        parse_key_info,
+        parse_key_info, uri::UriReferenceResolver,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
@@ -24,6 +24,7 @@ use xml_sec::{
 
 use crate::{
     Command, Invocation,
+    args::{Arity, OPTION_SPECS},
     capabilities::{self, KEY_DATA, TRANSFORMS},
     key_material,
 };
@@ -85,12 +86,11 @@ pub fn execute(
     validate_provider(&invocation)?;
     validate_crypto_config(&invocation)?;
     match invocation.command {
-        Command::Help
-        | Command::HelpAll
-        | Command::HelpDsig
-        | Command::HelpEnc
-        | Command::HelpKeys
-        | Command::HelpX509 => help(stdout),
+        Command::Help => help(stdout),
+        Command::HelpAll => help_all(stdout),
+        Command::HelpDsig | Command::HelpEnc | Command::HelpKeys | Command::HelpX509 => {
+            help(stdout)
+        }
         Command::Version => writeln!(stdout, "xmlsec1 1.3.13 (rustcrypto)").map_err(stdout_error),
         Command::ListTransforms => {
             validate_options(&invocation, &[])?;
@@ -132,6 +132,32 @@ fn help(output: &mut dyn Write) -> Result<(), CommandError> {
          list-key-data check-key-data"
     )
     .map_err(stdout_error)
+}
+
+fn help_all(output: &mut dyn Write) -> Result<(), CommandError> {
+    writeln!(output, "Usage: xmlsec1 <command> [options] [files]").map_err(stdout_error)?;
+    writeln!(
+        output,
+        "Commands: help help-all help-dsig help-enc help-keys help-x509 version \
+         list-key-data check-key-data list-transforms check-transforms keys sign \
+         verify sign-tmpl encrypt decrypt"
+    )
+    .map_err(stdout_error)?;
+    writeln!(output, "Options:").map_err(stdout_error)?;
+    for spec in OPTION_SPECS {
+        let parameter = if spec.accepts_parameter {
+            "[:name]"
+        } else {
+            ""
+        };
+        let value = if matches!(spec.arity, Arity::Value) {
+            " <value>"
+        } else {
+            ""
+        };
+        writeln!(output, "  --{}{parameter}{value}", spec.canonical).map_err(stdout_error)?;
+    }
+    Ok(())
 }
 
 fn validate_provider(invocation: &Invocation) -> Result<(), CommandError> {
@@ -402,10 +428,19 @@ fn select_signing_key<'a>(
 }
 
 fn template_key_name(xml: &str) -> Result<Option<String>, CommandError> {
+    signature_key_name(xml, None)
+}
+
+fn signature_key_name(
+    xml: &str,
+    start_node_id: Option<&str>,
+) -> Result<Option<String>, CommandError> {
     let document =
         Document::parse(xml).map_err(|error| CommandError::Signature(error.to_string()))?;
-    let signature = document
-        .descendants()
+    let selected_root =
+        start_node_id.and_then(|id| UriReferenceResolver::new(&document).node_for_id(id));
+    let signature = selected_root
+        .map_or_else(|| document.descendants(), |node| node.descendants())
         .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")));
     Ok(signature.and_then(|signature| {
         signature
@@ -523,6 +558,15 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let algorithm = key_material::signature_algorithm(&xml, start_node_id)?;
+    if let [direct_key] = direct_keys.as_slice()
+        && let Some(name) = direct_key.parameter.as_deref()
+        && !invocation.flag("lax-key-search")
+        && signature_key_name(&xml, start_node_id)?.as_deref() != Some(name)
+    {
+        return Err(CommandError::Usage(format!(
+            "signature KeyName does not match named public key {name}"
+        )));
+    }
     let result = if let Some(path) = direct_path {
         let key = key_material::load_verification_key(path, algorithm)?;
         verification_context(policy, start_node_id)
@@ -662,7 +706,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let maximum_document_bytes = policy.resources.max_xml_document_bytes;
     let maximum_plaintext_bytes = policy.resources.max_encryption_plaintext_bytes;
     let template = read_input(invocation, policy.resources.max_xml_document_bytes)?;
-    let (algorithm, encrypted_type) = encryption_template(&template)?;
+    let (algorithm, encrypted_type, explicit_encrypted_type) = encryption_template(&template)?;
     let mut builder = EncryptedDataBuilder::new(algorithm).policy(policy);
     let aes_keys = invocation.values("aes-key").collect::<Vec<_>>();
     let public_keys = ["pubkey-pem", "pubkey-der"]
@@ -675,6 +719,15 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         ));
     }
     if let [option] = aes_keys.as_slice() {
+        if let Some(name) = option.parameter.as_deref()
+            && !invocation.flag("lax-key-search")
+            && let Some(template_name) = encrypted_data_key_name(&template)?
+            && template_name != name
+        {
+            return Err(CommandError::Usage(format!(
+                "template KeyName {template_name} does not match named AES key {name}"
+            )));
+        }
         let key = key_material::load_symmetric(
             option.value.as_deref().unwrap_or_default(),
             Some(algorithm.key_len()),
@@ -697,6 +750,11 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     }
     builder = builder.encryption_type(encrypted_type);
     let result = if let Some(path) = invocation.last_value("binary-data") {
+        if explicit_encrypted_type {
+            return Err(CommandError::Usage(
+                "--binary-data cannot be used with an XML Element or Content template Type".into(),
+            ));
+        }
         let data = read_plaintext(path, maximum_plaintext_bytes)?;
         builder.encrypt_binary(&data)
     } else if let Some(path) = invocation.last_value("xml-data") {
@@ -845,11 +903,7 @@ fn apply_encryption_template(template: &str, generated: &str) -> Result<String, 
         (None, Some(generated_key_info)) => {
             let cipher_data = direct_child_element(template_data, XMLENC_NS, "CipherData")
                 .ok_or_else(|| CommandError::Encryption("template has no CipherData".into()))?;
-            let key_info = generated[generated_key_info.range()].replacen(
-                "<ds:KeyInfo",
-                "<ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:xenc11=\"http://www.w3.org/2009/xmlenc11#\"",
-                1,
-            );
+            let key_info = standalone_element(generated, generated_key_info)?;
             replacements.push((
                 cipher_data.range().start..cipher_data.range().start,
                 key_info,
@@ -870,6 +924,40 @@ fn standalone_cipher_value(node: roxmltree::Node<'_, '_>) -> String {
         "<CipherValue xmlns=\"http://www.w3.org/2001/04/xmlenc#\">{}</CipherValue>",
         node.text().unwrap_or_default()
     )
+}
+
+fn standalone_element(source: &str, node: roxmltree::Node<'_, '_>) -> Result<String, CommandError> {
+    let fragment = &source[node.range()];
+    let opening_end = fragment
+        .find('>')
+        .ok_or_else(|| CommandError::Encryption("generated KeyInfo has no opening tag".into()))?;
+    let closing_start = fragment
+        .rfind("</")
+        .ok_or_else(|| CommandError::Encryption("generated KeyInfo has no closing tag".into()))?;
+    let opening = &fragment[..opening_end];
+    let qualified_name_end = opening.find(char::is_whitespace).unwrap_or(opening.len());
+    let qualified_name = &opening[1..qualified_name_end];
+    let attributes = &opening[qualified_name_end..];
+    let mut output = format!("<{qualified_name}{attributes}");
+    for namespace in node.namespaces() {
+        let declaration = namespace
+            .name()
+            .map_or("xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
+        let already_declared = attributes.contains(&format!("{declaration}="));
+        if !already_declared {
+            output.push(' ');
+            output.push_str(&declaration);
+            output.push_str("=\"");
+            output.push_str(&quick_xml::escape::escape(namespace.uri()));
+            output.push('"');
+        }
+    }
+    output.push('>');
+    output.push_str(&fragment[opening_end + 1..closing_start]);
+    output.push_str("</");
+    output.push_str(qualified_name);
+    output.push('>');
+    Ok(output)
 }
 
 fn direct_child_element<'a, 'input>(
@@ -973,7 +1061,7 @@ fn decrypt_input(
 
 fn encryption_template(
     xml: &str,
-) -> Result<(DataEncryptionAlgorithm, EncryptedDataType), CommandError> {
+) -> Result<(DataEncryptionAlgorithm, EncryptedDataType, bool), CommandError> {
     let document =
         Document::parse(xml).map_err(|error| CommandError::Encryption(error.to_string()))?;
     let encrypted_data = document
@@ -987,6 +1075,7 @@ fn encryption_template(
         .ok_or_else(|| CommandError::Encryption("template has no encryption algorithm".into()))?;
     let algorithm = DataEncryptionAlgorithm::from_uri(method)
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let explicit_encrypted_type = encrypted_data.attribute("Type").is_some();
     let encrypted_type = match encrypted_data.attribute("Type") {
         None | Some("http://www.w3.org/2001/04/xmlenc#Element") => EncryptedDataType::Element,
         Some("http://www.w3.org/2001/04/xmlenc#Content") => EncryptedDataType::Content,
@@ -996,7 +1085,20 @@ fn encryption_template(
             )));
         }
     };
-    Ok((algorithm, encrypted_type))
+    Ok((algorithm, encrypted_type, explicit_encrypted_type))
+}
+
+fn encrypted_data_key_name(xml: &str) -> Result<Option<String>, CommandError> {
+    let document =
+        Document::parse(xml).map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let encrypted_data = document
+        .descendants()
+        .find(|node| node.has_tag_name((XMLENC_NS, "EncryptedData")))
+        .ok_or_else(|| CommandError::Encryption("template has no EncryptedData".into()))?;
+    Ok(direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
+        .and_then(|key_info| direct_child_element(key_info, XMLDSIG_NS, "KeyName"))
+        .and_then(|key_name| key_name.text())
+        .map(str::to_owned))
 }
 
 fn keys(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
@@ -1180,6 +1282,56 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, CommandError::UnsupportedOption(_)));
+    }
+
+    #[test]
+    fn help_all_enumerates_the_registered_surface() {
+        let mut output = Vec::new();
+        execute(
+            invocation(&["xmlsec1", "help-all"]),
+            &mut output,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let help = String::from_utf8(output).unwrap();
+        for command in ["help-dsig", "check-key-data", "sign-tmpl", "decrypt"] {
+            assert!(help.contains(command), "missing command {command}");
+        }
+        for option in OPTION_SPECS {
+            assert!(
+                help.contains(&format!("--{}", option.canonical)),
+                "missing option --{}",
+                option.canonical
+            );
+        }
+        assert!(help.contains("--gen-key[:name] <value>"));
+        assert!(help.contains("--insecure\n"));
+    }
+
+    #[test]
+    fn injected_key_info_carries_alternate_prefix_bindings() {
+        // Extracting a subtree must preserve namespace bindings inherited from
+        // the generated EncryptedData root, regardless of the chosen prefixes.
+        let template = format!(
+            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\"><e:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedData>"
+        );
+        let generated = format!(
+            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\" xmlns:n=\"http://www.w3.org/2009/xmlenc11#\"><e:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><s:KeyInfo><e:EncryptedKey><e:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"><n:MGF Algorithm=\"http://www.w3.org/2009/xmlenc11#mgf1sha256\"/></e:EncryptionMethod><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
+        );
+
+        let rendered = apply_encryption_template(&template, &generated).unwrap();
+        let document = Document::parse(&rendered)
+            .expect("injected KeyInfo prefixes must remain namespace-bound");
+        assert!(
+            document
+                .descendants()
+                .any(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+        );
+        assert!(
+            document
+                .descendants()
+                .any(|node| node.has_tag_name(("http://www.w3.org/2009/xmlenc11#", "MGF")))
+        );
     }
 
     #[test]
