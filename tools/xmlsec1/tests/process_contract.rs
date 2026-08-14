@@ -1,4 +1,9 @@
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    io::Write as _,
+    path::Path,
+    process::{Command, Stdio},
+};
 
 use rsa::{
     RsaPrivateKey,
@@ -64,6 +69,144 @@ fn signs_verifies_and_rejects_tampering_through_process_api() {
         .unwrap();
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("invalid"));
+}
+
+#[test]
+fn verification_reads_the_conventional_stdin_marker() {
+    // A lone dash is input data, not an option name; this is the process-level
+    // contract used by shell pipelines and the donor CLI.
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let signed = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(signed.status.success());
+
+    let mut verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    verify
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&signed.stdout)
+        .unwrap();
+    let output = verify.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn verification_node_id_selects_one_signature_subtree() {
+    // libxmlsec1 resolves --node-id to a start node and finds the Signature
+    // below it; unrelated signatures elsewhere in the document are ignored.
+    let temp = tempfile::tempdir().unwrap();
+    let original = fs::read_to_string(
+        project_root()
+            .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl"),
+    )
+    .unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let mut signatures = Vec::new();
+    for id in ["first", "second"] {
+        let template = temp.path().join(format!("{id}.xml"));
+        fs::write(
+            &template,
+            original
+                .replace("#object", &format!("#{id}-object"))
+                .replace("Id=\"object\"", &format!("Id=\"{id}-object\"")),
+        )
+        .unwrap();
+        let output = Command::new(binary())
+            .args(["sign", "--privkey-pem"])
+            .arg(&private_key)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let signed = String::from_utf8(output.stdout).unwrap();
+        let signed = signed
+            .split_once("?>")
+            .map_or(signed.as_str(), |(_, body)| body)
+            .replace(
+                "<Signature xmlns=",
+                &format!("<Signature Id=\"{id}\" xmlns="),
+            );
+        signatures.push(signed);
+    }
+    signatures[1] = signatures[1].replace("some text", "tampered text");
+    let document = temp.path().join("multiple.xml");
+    fs::write(
+        &document,
+        format!("<Document>{}{}</Document>", signatures[0], signatures[1]),
+    )
+    .unwrap();
+
+    let valid = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .args(["--node-id", "first"])
+        .arg(&document)
+        .output()
+        .unwrap();
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+
+    let invalid = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .args(["--node-id", "second"])
+        .arg(&document)
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("signature is invalid"));
+
+    let missing = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .args(["--node-id", "missing"])
+        .arg(&document)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("selected node"));
+
+    let duplicate = temp.path().join("duplicate.xml");
+    fs::write(
+        &duplicate,
+        fs::read_to_string(&document)
+            .unwrap()
+            .replace("Id=\"second\"", "Id=\"first\""),
+    )
+    .unwrap();
+    let ambiguous = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .args(["--node-id", "first"])
+        .arg(&duplicate)
+        .output()
+        .unwrap();
+    assert!(!ambiguous.status.success());
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("ambiguous"));
 }
 
 #[test]
@@ -537,6 +680,78 @@ fn explicit_certificate_pins_the_verification_identity() {
 }
 
 #[test]
+fn signing_embeds_every_certificate_from_the_private_key_option() {
+    // libxmlsec1 treats every comma-separated path after the private key as a
+    // certificate to embed, so recipients can reconstruct the supplied chain.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let leaf = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    let issuer = project_root().join("tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+    let signed = temp.path().join("signed.xml");
+    let compound = format!(
+        "{},{},{}",
+        private_key.display(),
+        leaf.display(),
+        issuer.display()
+    );
+
+    let result = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(compound)
+        .args(["--output"])
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let xml = fs::read_to_string(signed).unwrap();
+    let document = roxmltree::Document::parse(&xml).unwrap();
+    assert_eq!(
+        document
+            .descendants()
+            .filter(
+                |node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "X509Certificate"))
+            )
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn signing_rejects_a_malformed_secondary_certificate() {
+    // Every certificate path is parsed before signing; a malformed trailing
+    // chain member must not be silently omitted from the emitted KeyInfo.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let leaf = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    let malformed = temp.path().join("malformed.pem");
+    fs::write(&malformed, "not a certificate").unwrap();
+    let compound = format!(
+        "{},{},{}",
+        private_key.display(),
+        leaf.display(),
+        malformed.display()
+    );
+
+    let result = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(compound)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("invalid PEM certificate"));
+}
+
+#[test]
 fn explicit_certificate_obeys_trust_anchor_policy() {
     // An explicit leaf pins identity but does not establish trust when callers
     // also supply anchors; --insecure is the explicit compatibility opt-out.
@@ -673,6 +888,36 @@ fn multiple_signing_keys_require_the_matching_template_name() {
         .unwrap();
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown KeyName"));
+}
+
+#[test]
+fn singleton_named_signing_key_obeys_template_key_name() {
+    // Naming one key enables strict KeyName lookup even when the key set has a
+    // single entry; lax lookup is the explicit donor-compatible escape hatch.
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+
+    let strict = Command::new(binary())
+        .args(["sign", "--privkey-pem:unexpected"])
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!strict.status.success());
+    assert!(String::from_utf8_lossy(&strict.stderr).contains("unknown KeyName"));
+
+    let lax = Command::new(binary())
+        .args(["sign", "--lax-key-search", "--privkey-pem:unexpected"])
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        lax.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax.stderr)
+    );
 }
 
 #[cfg(target_os = "linux")]

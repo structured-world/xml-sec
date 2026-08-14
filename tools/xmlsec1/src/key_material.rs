@@ -14,7 +14,7 @@ use rsa::{
 use x509_parser::prelude::FromDer as _;
 use xml_sec::xmldsig::{
     EcdsaP256SigningKey, EcdsaP384SigningKey, RsaSigningKey, SignatureAlgorithm, SigningKey,
-    VerificationKey, find_signature_node, parse_signed_info,
+    VerificationKey, find_signature_node, parse_signed_info, uri::UriReferenceResolver,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +34,8 @@ pub enum KeyMaterialError {
     InvalidCertificate(PathBuf),
     #[error("signature template does not contain a valid SignedInfo")]
     MissingSignedInfo,
+    #[error("selected node ID is missing or ambiguous: {0}")]
+    SelectedNodeUnavailable(String),
     #[error("invalid XML signature: {0}")]
     Signature(String),
     #[error("invalid symmetric key length: expected {expected} bytes, got {actual}")]
@@ -53,10 +55,24 @@ pub fn read_text(path: impl AsRef<Path>) -> Result<String, KeyMaterialError> {
     String::from_utf8(read(path)?).map_err(|_| KeyMaterialError::InvalidPem(path.to_owned()))
 }
 
-pub fn signature_algorithm(xml: &str) -> Result<SignatureAlgorithm, KeyMaterialError> {
+pub fn signature_algorithm(
+    xml: &str,
+    start_node_id: Option<&str>,
+) -> Result<SignatureAlgorithm, KeyMaterialError> {
     let document =
         Document::parse(xml).map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-    let signature = find_signature_node(&document).ok_or(KeyMaterialError::MissingSignedInfo)?;
+    let signature = match start_node_id {
+        Some(id) => {
+            let start = UriReferenceResolver::new(&document)
+                .node_for_id(id)
+                .ok_or_else(|| KeyMaterialError::SelectedNodeUnavailable(id.to_owned()))?;
+            start
+                .descendants()
+                .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Signature")))
+        }
+        None => find_signature_node(&document),
+    }
+    .ok_or(KeyMaterialError::MissingSignedInfo)?;
     let signed_info = signature
         .children()
         .find(|node| node.is_element() && node.tag_name().name() == "SignedInfo")
@@ -267,5 +283,32 @@ mod tests {
         let error = load_verification_key(&path, SignatureAlgorithm::RsaSha256).unwrap_err();
         assert!(error.to_string().contains(path.to_str().unwrap()));
         assert!(!error.to_string().contains("in PUBLIC KEY"));
+    }
+
+    #[test]
+    fn selected_signature_controls_verification_key_algorithm() {
+        // Key decoding must inspect the same selected Signature as verification;
+        // an unrelated earlier signature may use a different key family.
+        let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
+        let signature = |id: &str, algorithm: &str| {
+            format!(
+                r#"<ds:Signature Id="{id}" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+<ds:SignedInfo>
+<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+<ds:SignatureMethod Algorithm="{algorithm}"/>
+<ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference>
+</ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue></ds:Signature>"#
+            )
+        };
+        let xml = format!(
+            "<root>{}{}</root>",
+            signature("rsa", "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"),
+            signature("ec", "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256")
+        );
+
+        assert_eq!(
+            signature_algorithm(&xml, Some("ec")).unwrap(),
+            SignatureAlgorithm::EcdsaSha256
+        );
     }
 }

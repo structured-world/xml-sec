@@ -359,7 +359,11 @@ impl<'a> UriReferenceResolver<'a> {
         self.id_map.get(id).map(|node| node.id())
     }
 
-    pub(crate) fn node_for_id(&self, id: &str) -> Option<Node<'a, 'a>> {
+    /// Resolve an unambiguous XML ID to its element node.
+    ///
+    /// Returns `None` when the ID is absent or duplicated, matching fragment
+    /// dereferencing and operation start-node selection.
+    pub fn node_for_id(&self, id: &str) -> Option<Node<'a, 'a>> {
         self.id_map.get(id).copied()
     }
 

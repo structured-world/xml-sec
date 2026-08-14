@@ -18,6 +18,8 @@ coverage.
 `EncryptedData` and performs in-document replacement, optionally selected by
 `--node-id`. Encryption retains template metadata and RSA-OAEP parameters;
 PKCS#1 RSA and PKCS#8/SPKI/X.509 PEM or DER key material is normalized into the
-same core signing, verification, and encryption pipelines. Output paths support
-the upstream `{inputfile}` basename template, and `--gen-key[:name]` emits both
-named and unnamed AES key-store entries.
+same core signing, verification, and encryption pipelines. Signing options
+embed every certificate from `key,leaf,intermediate,...`; verification accepts
+stdin as `-` and can select one signature subtree with `--node-id`. Output paths
+support the upstream `{inputfile}` basename template, and `--gen-key[:name]`
+emits both named and unnamed AES key-store entries.

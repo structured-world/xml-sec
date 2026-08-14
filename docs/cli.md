@@ -39,6 +39,18 @@ xmlsec1 sign --privkey-pem signing-key.pem --output signed.xml template.xml
 xmlsec1 verify --pubkey-pem signing-key.pub.pem signed.xml
 ```
 
+Signing key options accept libxmlsec1's comma-separated certificate form,
+`key.pem,leaf.pem,intermediate.pem,...`. Every certificate is validated and
+embedded in order under `X509Data`; the first certificate must contain the
+signing key's public key. Named keys are matched against the template's
+`KeyName` even when only one key is supplied. `--lax-key-search` explicitly
+opts out of that name match.
+
+Verification accepts `-` as the conventional stdin marker. For documents with
+multiple signatures, `--node-id <id>` selects an ID-bearing start node and
+verifies the single `Signature` in its subtree; missing and duplicate IDs fail
+closed.
+
 `--output` follows the upstream filename-template contract. The first
 `{inputfile}` token is replaced with the input file's basename after removing
 its final extension, for example `--output 'signed-{inputfile}.xml'` with
@@ -88,6 +100,12 @@ AES-128/256; RSA-OAEP supports both the XMLEnc 1.0 `rsa-oaep-mgf1p` and XMLEnc
 PKCS#8, PKCS#12, platform crypto stores, external DTDs, implicit network access,
 and unsupported CLI policy knobs fail rather than weakening policy or falling
 back.
+
+The compatibility CLI accepts `--X509-skip-strict-checks`. libxmlsec1 uses
+that switch to lower provider security levels for legacy certificate
+signatures; RustCrypto has no corresponding provider strict mode and verifies
+every certificate signature algorithm implemented by the selected provider,
+so no additional policy relaxation is applied.
 
 Filesystem arguments remain native `OsString` values, so Unix paths are not
 required to be UTF-8. Values immediately following valued options are consumed

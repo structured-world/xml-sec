@@ -229,6 +229,7 @@ pub struct VerifyContext<'a> {
     provider: &'a dyn crate::provider::CryptoProvider,
     store_pre_digest: bool,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
+    start_node_id: Option<&'a str>,
 }
 
 impl<'a> VerifyContext<'a> {
@@ -248,6 +249,7 @@ impl<'a> VerifyContext<'a> {
             provider: crate::provider::default_provider(),
             store_pre_digest: false,
             external_resources: None,
+            start_node_id: None,
         }
     }
 
@@ -341,6 +343,16 @@ impl<'a> VerifyContext<'a> {
     /// query or fragment suffixes.
     pub fn external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
         self.external_resources = Some(resources);
+        self
+    }
+
+    /// Select the operation start node by its XML ID value.
+    ///
+    /// Verification searches for exactly one `<Signature>` in that node's
+    /// subtree. This is request context, not a policy decision, and mirrors the
+    /// start-node contract of libxmlsec1's `--node-id` option.
+    pub fn start_node_id(mut self, id: &'a str) -> Self {
+        self.start_node_id = Some(id);
         self
     }
 
@@ -878,6 +890,13 @@ pub enum DsigError {
         reason: &'static str,
     },
 
+    /// The requested operation start node is absent or has a duplicate ID.
+    #[error("selected node ID is missing or ambiguous: {id}")]
+    SelectedNodeUnavailable {
+        /// Caller-provided XML ID value.
+        id: String,
+    },
+
     /// `<SignedInfo>` parsing failed.
     #[error("failed to parse SignedInfo: {0}")]
     ParseSignedInfo(#[from] super::parse::ParseError),
@@ -995,8 +1014,22 @@ fn verify_signature_with_context(
             entity_resolver: None,
         },
     )?;
+    let resolver = UriReferenceResolver::new(&doc).with_external_resource_limits(
+        ctx.policy.resources.max_external_resource_bytes,
+        ctx.policy.resources.max_external_resource_total_bytes,
+    );
+    let resolver = match ctx.external_resources {
+        Some(resources) => resolver.with_external_resources(resources),
+        None => resolver,
+    };
     let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
-    let mut signatures = doc.descendants().filter(|node| {
+    let start_node = match ctx.start_node_id {
+        Some(id) => resolver.node_for_id(id).ok_or_else(|| {
+            SignatureVerificationPipelineError::SelectedNodeUnavailable { id: id.to_owned() }
+        })?,
+        None => doc.root(),
+    };
+    let mut signatures = start_node.descendants().filter(|node| {
         node.is_element()
             && node.tag_name().name() == "Signature"
             && node.tag_name().namespace() == Some(XMLDSIG_NS)
@@ -1108,14 +1141,6 @@ fn verify_signature_with_context(
             .into());
         }
     }
-    let resolver = UriReferenceResolver::new(&doc).with_external_resource_limits(
-        ctx.policy.resources.max_external_resource_bytes,
-        ctx.policy.resources.max_external_resource_total_bytes,
-    );
-    let resolver = match ctx.external_resources {
-        Some(resources) => resolver.with_external_resources(resources),
-        None => resolver,
-    };
     let retrieval_materialization = if let Some(info) = key_info.as_mut() {
         materialize_retrieval_methods(
             info,
@@ -5244,6 +5269,28 @@ mod tests {
             err,
             SignatureVerificationPipelineError::InvalidStructure {
                 reason: "Signature must appear exactly once in document",
+            }
+        ));
+    }
+
+    #[test]
+    fn pipeline_start_node_limits_signature_cardinality_to_its_subtree() {
+        // A start-node selector changes the operation root, not global ID or
+        // reference resolution; another Signature outside the subtree is irrelevant.
+        let xml = r#"
+<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <scope Id="selected"><ds:Signature/></scope>
+  <scope Id="other"><ds:Signature/></scope>
+</root>
+"#;
+        let err = VerifyContext::new()
+            .start_node_id("selected")
+            .verify(xml)
+            .expect_err("the selected Signature remains structurally incomplete");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::MissingElement {
+                element: "SignedInfo"
             }
         ));
     }

@@ -337,6 +337,10 @@ pub enum KeyInfoWriteError {
     #[error("invalid X.509 certificate DER")]
     InvalidCertificateDer,
 
+    /// A certificate-backed KeyInfo writer requires at least one certificate.
+    #[error("X.509 certificate chain must not be empty")]
+    EmptyCertificateChain,
+
     /// The signing key could not expose public-key material for validation.
     #[error("signing key public-key extraction failed: {0}")]
     SigningKey(#[from] SigningKeyError),
@@ -346,43 +350,78 @@ pub enum KeyInfoWriteError {
     CertificateKeyMismatch,
 }
 
-/// `<KeyInfo>` writer that embeds one DER X.509 certificate.
+/// `<KeyInfo>` writer that embeds an ordered DER X.509 certificate chain.
 pub struct X509CertificateKeyInfoWriter {
-    certificate_der: Vec<u8>,
+    certificates_der: Vec<Vec<u8>>,
 }
 
 impl X509CertificateKeyInfoWriter {
     /// Parse a PEM `CERTIFICATE` block for XMLDSig `<X509Certificate>` output.
     pub fn from_pem(certificate_pem: &str) -> Result<Self, KeyInfoWriteError> {
-        let (rest, pem) = x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes())
-            .map_err(|_| KeyInfoWriteError::InvalidCertificatePem)?;
-        if !rest.iter().all(|byte| byte.is_ascii_whitespace()) {
-            return Err(KeyInfoWriteError::InvalidCertificatePem);
+        Self::from_pem_chain([certificate_pem])
+    }
+
+    /// Parse an ordered sequence of PEM `CERTIFICATE` blocks for `<X509Data>`.
+    pub fn from_pem_chain<I, S>(certificate_pems: I) -> Result<Self, KeyInfoWriteError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut certificates_der = Vec::new();
+        for certificate_pem in certificate_pems {
+            certificates_der.push(parse_certificate_pem(certificate_pem.as_ref())?);
         }
-        if pem.label != "CERTIFICATE" {
-            return Err(KeyInfoWriteError::InvalidCertificateFormat { label: pem.label });
-        }
-        Self::from_der(&pem.contents)
+        Self::from_der_chain(certificates_der)
     }
 
     /// Validate and store DER certificate bytes for XMLDSig `<X509Certificate>` output.
     pub fn from_der(certificate_der: &[u8]) -> Result<Self, KeyInfoWriteError> {
-        let (rest, _) = x509_parser::certificate::X509Certificate::from_der(certificate_der)
-            .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
-        if !rest.is_empty() {
-            return Err(KeyInfoWriteError::InvalidCertificateDer);
-        }
-        Ok(Self {
-            certificate_der: certificate_der.to_vec(),
-        })
+        Self::from_der_chain([certificate_der])
     }
+
+    /// Validate and store an ordered DER certificate chain for `<X509Data>`.
+    pub fn from_der_chain<I, B>(certificates_der: I) -> Result<Self, KeyInfoWriteError>
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        let certificates_der = certificates_der
+            .into_iter()
+            .map(|certificate_der| {
+                let certificate_der = certificate_der.as_ref();
+                let (rest, _) =
+                    x509_parser::certificate::X509Certificate::from_der(certificate_der)
+                        .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
+                if !rest.is_empty() {
+                    return Err(KeyInfoWriteError::InvalidCertificateDer);
+                }
+                Ok(certificate_der.to_vec())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if certificates_der.is_empty() {
+            return Err(KeyInfoWriteError::EmptyCertificateChain);
+        }
+        Ok(Self { certificates_der })
+    }
+}
+
+fn parse_certificate_pem(certificate_pem: &str) -> Result<Vec<u8>, KeyInfoWriteError> {
+    let (rest, pem) = x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes())
+        .map_err(|_| KeyInfoWriteError::InvalidCertificatePem)?;
+    if !rest.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err(KeyInfoWriteError::InvalidCertificatePem);
+    }
+    if pem.label != "CERTIFICATE" {
+        return Err(KeyInfoWriteError::InvalidCertificateFormat { label: pem.label });
+    }
+    Ok(pem.contents)
 }
 
 impl KeyInfoWriter for X509CertificateKeyInfoWriter {
     fn write_key_info(&self, signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
-        let (rest, certificate) =
-            x509_parser::certificate::X509Certificate::from_der(&self.certificate_der)
-                .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
+        let leaf_der = &self.certificates_der[0];
+        let (rest, certificate) = x509_parser::certificate::X509Certificate::from_der(leaf_der)
+            .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
         if !rest.is_empty() {
             return Err(KeyInfoWriteError::InvalidCertificateDer);
         }
@@ -391,11 +430,15 @@ impl KeyInfoWriter for X509CertificateKeyInfoWriter {
             return Err(KeyInfoWriteError::CertificateKeyMismatch);
         }
 
-        let certificate_b64 =
-            base64::engine::general_purpose::STANDARD.encode(&self.certificate_der);
-        Ok(format!(
-            "<X509Data xmlns=\"{XMLDSIG_NS}\"><X509Certificate>{certificate_b64}</X509Certificate></X509Data>"
-        ))
+        let mut xml = format!("<X509Data xmlns=\"{XMLDSIG_NS}\">");
+        for certificate_der in &self.certificates_der {
+            let certificate_b64 = base64::engine::general_purpose::STANDARD.encode(certificate_der);
+            xml.push_str("<X509Certificate>");
+            xml.push_str(&certificate_b64);
+            xml.push_str("</X509Certificate>");
+        }
+        xml.push_str("</X509Data>");
+        Ok(xml)
     }
 }
 

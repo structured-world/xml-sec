@@ -327,13 +327,21 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let (key_option, certificate_is_der) = select_signing_key(invocation, &xml)?;
     let value = key_option.value.as_deref().unwrap_or_default();
-    let (key_path, certificate_path) = split_key_and_certificate(value)?;
+    let (key_path, certificate_paths) = split_key_and_certificates(value)?;
     let key = key_material::load_signing_key(key_path)?;
-    let signed = if let Some(certificate_path) = certificate_path {
+    let signed = if !certificate_paths.is_empty() {
         let writer = if certificate_is_der {
-            X509CertificateKeyInfoWriter::from_der(&key_material::read(certificate_path)?)
+            let certificates = certificate_paths
+                .iter()
+                .map(key_material::read)
+                .collect::<Result<Vec<_>, _>>()?;
+            X509CertificateKeyInfoWriter::from_der_chain(&certificates)
         } else {
-            X509CertificateKeyInfoWriter::from_pem(&key_material::read_text(certificate_path)?)
+            let certificates = certificate_paths
+                .iter()
+                .map(key_material::read_text)
+                .collect::<Result<Vec<_>, _>>()?;
+            X509CertificateKeyInfoWriter::from_pem_chain(&certificates)
         }
         .map_err(|error| CommandError::Signature(error.to_string()))?;
         SignContext::new(key.as_ref())
@@ -367,7 +375,9 @@ fn select_signing_key<'a>(
             "sign requires --privkey-pem or --pkcs8-pem/der".into(),
         ));
     }
-    if let [selected] = keys.as_slice() {
+    if let [selected] = keys.as_slice()
+        && (selected.0.parameter.is_none() || invocation.flag("lax-key-search"))
+    {
         return Ok(*selected);
     }
     let requested_name = template_key_name(xml)?;
@@ -411,21 +421,21 @@ fn template_key_name(xml: &str) -> Result<Option<String>, CommandError> {
     }))
 }
 
-fn split_key_and_certificate(value: &OsStr) -> Result<(&OsStr, Option<&OsStr>), CommandError> {
+fn split_key_and_certificates(value: &OsStr) -> Result<(&OsStr, Vec<&OsStr>), CommandError> {
     let bytes = value.as_encoded_bytes();
-    let Some(separator) = bytes.iter().position(|byte| *byte == b',') else {
-        return Ok((value, None));
-    };
-    if bytes[separator + 1..].contains(&b',') {
-        return Err(CommandError::Usage(
-            "private key accepts at most one certificate path".into(),
-        ));
-    }
     // Splitting at an ASCII byte preserves encoded-byte boundaries on every
     // platform covered by OsStr's encoded-byte contract.
-    let key = unsafe { OsStr::from_encoded_bytes_unchecked(&bytes[..separator]) };
-    let certificate = unsafe { OsStr::from_encoded_bytes_unchecked(&bytes[separator + 1..]) };
-    Ok((key, Some(certificate)))
+    let mut components = bytes
+        .split(|byte| *byte == b',')
+        .map(|component| unsafe { OsStr::from_encoded_bytes_unchecked(component) });
+    let key = components.next().unwrap_or(OsStr::new(""));
+    let certificates = components.collect::<Vec<_>>();
+    if key.is_empty() || certificates.iter().any(|path| path.is_empty()) {
+        return Err(CommandError::Usage(
+            "private key and certificate paths must not be empty".into(),
+        ));
+    }
+    Ok((key, certificates))
 }
 
 fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> VerificationPolicy {
@@ -468,6 +478,10 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             "lax-key-search",
             "verify-crls",
             "X509-skip-time-checks",
+            // libxmlsec uses this to relax provider security levels for legacy
+            // certificate signatures. RustCrypto has no provider strict mode and
+            // already verifies every certificate signature algorithm it implements.
+            "X509-skip-strict-checks",
             "insecure",
             "verification-time",
             "depth",
@@ -479,7 +493,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             "url-map",
         ],
     )?;
-    reject_unimplemented_selectors(invocation, &[])?;
+    reject_unimplemented_selectors(invocation, &["node-id"])?;
     reject_unimplemented_verification_policy(invocation)?;
     let direct_keys = ["pubkey-pem", "pubkey-der"]
         .into_iter()
@@ -507,16 +521,23 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     }
     let policy = xmlsec_compatibility_verification_policy(invocation);
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
-    let algorithm = key_material::signature_algorithm(&xml)?;
+    let start_node_id = option_text(invocation, "node-id")?;
+    let algorithm = key_material::signature_algorithm(&xml, start_node_id)?;
     let result = if let Some(path) = direct_path {
         let key = key_material::load_verification_key(path, algorithm)?;
-        VerifyContext::new()
-            .policy(policy)
+        verification_context(policy, start_node_id)
             .key(&key)
             .verify(&xml)
             .map_err(|error| CommandError::Signature(error.to_string()))?
     } else if let [certificate] = explicit_certificates.as_slice() {
-        verify_with_explicit_certificate(invocation, certificate, algorithm, policy, &xml)?
+        verify_with_explicit_certificate(
+            invocation,
+            certificate,
+            algorithm,
+            policy,
+            start_node_id,
+            &xml,
+        )?
     } else {
         let mut config = KeyResolverConfig::default();
         for name in [
@@ -539,8 +560,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             }
         }
         let resolver = DefaultKeyResolver::new(config);
-        VerifyContext::new()
-            .policy(policy)
+        verification_context(policy, start_node_id)
             .key_resolver(&resolver)
             .verify(&xml)
             .map_err(|error| CommandError::Signature(error.to_string()))?
@@ -559,11 +579,23 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     Ok(())
 }
 
+fn verification_context(
+    policy: VerificationPolicy,
+    start_node_id: Option<&str>,
+) -> VerifyContext<'_> {
+    let context = VerifyContext::new().policy(policy);
+    match start_node_id {
+        Some(id) => context.start_node_id(id),
+        None => context,
+    }
+}
+
 fn verify_with_explicit_certificate(
     invocation: &Invocation,
     certificate: &crate::OptionValue,
     algorithm: SignatureAlgorithm,
     policy: VerificationPolicy,
+    start_node_id: Option<&str>,
     xml: &str,
 ) -> Result<xml_sec::xmldsig::VerifyResult, CommandError> {
     let certificate_der =
@@ -601,8 +633,7 @@ fn verify_with_explicit_certificate(
         .resolve_with_policy(Some(&key_info), algorithm, &policy)
         .map_err(|error| CommandError::Signature(error.to_string()))?
         .ok_or_else(|| CommandError::Signature("explicit certificate was not resolved".into()))?;
-    VerifyContext::new()
-        .policy(policy)
+    verification_context(policy, start_node_id)
         .key(key.as_ref())
         .verify(xml)
         .map_err(|error| CommandError::Signature(error.to_string()))

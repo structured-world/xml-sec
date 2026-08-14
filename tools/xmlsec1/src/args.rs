@@ -108,7 +108,10 @@ impl Invocation {
                 continue;
             }
             let option_text = argument.to_str();
-            if options_finished || !option_text.is_some_and(|value| value.starts_with('-')) {
+            if options_finished
+                || argument == OsStr::new("-")
+                || !option_text.is_some_and(|value| value.starts_with('-'))
+            {
                 positional.push(argument.clone());
                 options_finished = true;
                 index += 1;
@@ -331,6 +334,13 @@ mod tests {
             parsed.last_value("pubkey-pem"),
             Some(OsStr::new("-key.pem"))
         );
+    }
+
+    #[test]
+    fn parses_the_stdin_marker_as_positional_input() {
+        let parsed = parse(&["xmlsec1", "verify", "--pubkey-pem", "key.pem", "-"])
+            .expect("a lone dash is the donor stdin marker");
+        assert_eq!(parsed.positional, [OsString::from("-")]);
     }
 
     #[test]
