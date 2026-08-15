@@ -1124,8 +1124,8 @@ fn key_info_writer_requires_direct_template_placeholder() {
         SigningError::XmlMutation(
             xml_sec::xmldsig::mutation::XmlMutationError::ValueCountMismatch {
                 element: "KeyInfo",
-                expected: 0,
-                actual: 1,
+                expected: 1,
+                actual: 0,
             }
         )
     ));
@@ -1168,8 +1168,8 @@ fn key_info_writer_rejects_duplicate_direct_template_placeholders() {
         SigningError::XmlMutation(
             xml_sec::xmldsig::mutation::XmlMutationError::ValueCountMismatch {
                 element: "KeyInfo",
-                expected: 2,
-                actual: 1,
+                expected: 1,
+                actual: 2,
             }
         )
     ));

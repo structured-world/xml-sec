@@ -311,12 +311,12 @@ pub(super) fn fill_key_info_at_index_with_options(
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    let expected = count_direct_key_infos(xml, target_signature, policy)?;
-    if expected != 1 {
+    let actual = count_direct_key_infos(xml, target_signature, policy)?;
+    if actual != 1 {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "KeyInfo",
-            expected,
-            actual: 1,
+            expected: 1,
+            actual,
         });
     }
 
@@ -350,8 +350,8 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     if key_infos.len() != 1 {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "KeyInfo",
-            expected: key_infos.len(),
-            actual: 1,
+            expected: 1,
+            actual: key_infos.len(),
         });
     }
     let key_info = key_infos[0];
@@ -439,8 +439,8 @@ fn merge_one_key_info_source_at_index_with_options(
     if key_infos.len() != 1 {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "KeyInfo",
-            expected: key_infos.len(),
-            actual: 1,
+            expected: 1,
+            actual: key_infos.len(),
         });
     }
     let key_info = key_infos[0];
@@ -455,15 +455,21 @@ fn merge_one_key_info_source_at_index_with_options(
             source
                 .namespaces()
                 .try_fold(String::new(), |mut attributes, namespace| {
-                    let current = placeholder.lookup_namespace_uri(namespace.name());
-                    if current == Some(namespace.uri()) {
+                    if let Some(declared) = placeholder
+                        .namespaces()
+                        .find(|declared| declared.name() == namespace.name())
+                    {
+                        if declared.uri() != namespace.uri() {
+                            return Err(XmlMutationError::InvalidAppendTarget);
+                        }
                         return Ok(attributes);
                     }
-                    let inherited = placeholder
+                    if placeholder
                         .parent_element()
-                        .and_then(|parent| parent.lookup_namespace_uri(namespace.name()));
-                    if current.is_some() && current != inherited {
-                        return Err(XmlMutationError::InvalidAppendTarget);
+                        .and_then(|parent| parent.lookup_namespace_uri(namespace.name()))
+                        == Some(namespace.uri())
+                    {
+                        return Ok(attributes);
                     }
                     let attribute = namespace
                         .name()
@@ -1360,6 +1366,38 @@ mod tests {
     }
 
     #[test]
+    fn key_info_source_merge_reports_required_and_observed_counts() {
+        // Mutation diagnostics are a structured API: expected is the required
+        // singleton count and actual is the number observed in the template.
+        for (source, actual) in [
+            (
+                r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"/>"#,
+                0,
+            ),
+            (
+                r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo/><ds:KeyInfo/></ds:Signature>"#,
+                2,
+            ),
+        ] {
+            let error = merge_key_info_source_at_index_with_options(
+                source,
+                r#"<ds:KeyName xmlns:ds="http://www.w3.org/2000/09/xmldsig#">key</ds:KeyName>"#,
+                0,
+                None,
+            )
+            .expect_err("KeyInfo must be a singleton");
+            assert!(matches!(
+                error,
+                XmlMutationError::ValueCountMismatch {
+                    element: "KeyInfo",
+                    expected: 1,
+                    actual: observed,
+                } if observed == actual
+            ));
+        }
+    }
+
+    #[test]
     fn key_info_source_merge_rejects_conflicting_placeholder_namespaces() {
         // A generated child cannot reuse a prefix that the placeholder owns
         // with another URI; emitting both declarations would create invalid XML.
@@ -1368,6 +1406,19 @@ mod tests {
 
         let error = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect_err("conflicting namespace bindings must fail before serialization");
+
+        assert!(matches!(error, XmlMutationError::InvalidAppendTarget));
+    }
+
+    #[test]
+    fn key_info_source_merge_detects_redundant_owned_namespace_conflicts() {
+        // A direct declaration remains owned by the placeholder even when it
+        // repeats the parent binding; replacing it would duplicate xmlns:ext.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo xmlns:ext="urn:template"><ds:X509Data xmlns:ext="urn:template"/></ds:KeyInfo></ds:Signature>"#;
+        let generated = r#"<X509Data xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:ext="urn:writer"><ext:Metadata/></X509Data>"#;
+
+        let error = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect_err("placeholder-owned namespace conflicts must be typed");
 
         assert!(matches!(error, XmlMutationError::InvalidAppendTarget));
     }
