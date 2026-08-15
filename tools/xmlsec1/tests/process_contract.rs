@@ -132,6 +132,52 @@ fn signs_verifies_and_rejects_tampering_through_process_api() {
 }
 
 #[test]
+fn signing_writes_requested_diagnostics_separately_from_output() {
+    // Diagnostic flags describe the completed signing context; the signed XML
+    // remains exclusively in --output so shell callers can consume both streams.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+
+    for (flag, expected) in [
+        ("--print-debug", "Status: succeeded"),
+        ("--print-xml-debug", "<SignatureContext"),
+    ] {
+        let signed = temp.path().join(format!("signed-{flag}.xml"));
+        let output = Command::new(binary())
+            .args(["sign", flag, "--privkey-pem"])
+            .arg(&private_key)
+            .arg("--output")
+            .arg(&signed)
+            .arg(&template)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            fs::read_to_string(&signed)
+                .unwrap()
+                .contains("SignatureValue")
+        );
+        let diagnostics = String::from_utf8(output.stdout).unwrap();
+        assert!(diagnostics.contains(expected), "{diagnostics}");
+        if flag == "--print-xml-debug" {
+            let document = roxmltree::Document::parse(&diagnostics)
+                .expect("signing XML diagnostics must be well-formed");
+            assert_eq!(
+                document.root_element().attribute("status"),
+                Some("SUCCEEDED")
+            );
+        }
+    }
+}
+
+#[test]
 fn scoped_id_attribute_selects_and_signs_the_registered_element() {
     // libxmlsec1's --id-attr form is element-scoped: the custom attribute must
     // drive both --node-id selection and same-document Reference resolution.
@@ -841,6 +887,85 @@ fn encrypts_decrypts_and_rejects_wrong_symmetric_key() {
         .output()
         .unwrap();
     assert!(!rejected.status.success());
+}
+
+#[test]
+fn encryption_writes_requested_diagnostics_and_rejects_duplicate_methods() {
+    // Encryption diagnostics are a separate stdout contract, and malformed
+    // templates must fail before either diagnostics or ciphertext is emitted.
+    let temp = tempfile::tempdir().unwrap();
+    let plaintext = temp.path().join("plaintext.bin");
+    let key = temp.path().join("key.bin");
+    fs::write(&plaintext, b"diagnostic payload").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    for (flag, expected) in [
+        ("--print-debug", "Status: succeeded"),
+        ("--print-xml-debug", "<DataEncryptionContext"),
+    ] {
+        let template = temp.path().join(format!("template-{flag}.xml"));
+        let encrypted = temp.path().join(format!("encrypted-{flag}.xml"));
+        fs::write(
+            &template,
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+        )
+        .unwrap();
+        let output = Command::new(binary())
+            .args(["encrypt", flag, "--aeskey"])
+            .arg(&key)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&template)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            fs::read_to_string(&encrypted)
+                .unwrap()
+                .contains("CipherValue")
+        );
+        let diagnostics = String::from_utf8(output.stdout).unwrap();
+        assert!(diagnostics.contains(expected), "{diagnostics}");
+        if flag == "--print-xml-debug" {
+            let document = roxmltree::Document::parse(&diagnostics)
+                .expect("encryption XML diagnostics must be well-formed");
+            assert_eq!(
+                document.root_element().attribute("status"),
+                Some("replaced")
+            );
+        }
+    }
+
+    let malformed = temp.path().join("duplicate-method.xml");
+    let rejected_output = temp.path().join("must-not-exist.xml");
+    fs::write(
+        &malformed,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    let rejected = Command::new(binary())
+        .args(["encrypt", "--aeskey"])
+        .arg(&key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&rejected_output)
+        .arg(&malformed)
+        .output()
+        .unwrap();
+
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("more than one direct EncryptionMethod")
+    );
+    assert!(!rejected_output.exists());
 }
 
 #[test]

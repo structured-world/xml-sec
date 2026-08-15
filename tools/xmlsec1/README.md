@@ -16,8 +16,10 @@ coverage.
 
 The parser rejects repeated singleton options, including mixed canonical and
 alias spellings, while preserving donor multi-value key and certificate inputs.
-`--print-debug` is text; `--print-xml-debug` emits a parseable donor-shaped
-`VerificationContext` for both successful and invalid verification results,
+`--print-debug` is text; `--print-xml-debug` emits parseable donor-shaped
+signature, verification, encryption, and decryption contexts. When `--output`
+is present, transformed data goes to the file while diagnostics remain on
+stdout. Verification output covers both successful and invalid results,
 including aggregate failures from authenticated Manifest references.
 
 `--aes-key` files are raw binary key material (`--aeskey` remains a compatible

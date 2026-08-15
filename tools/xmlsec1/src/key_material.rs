@@ -53,6 +53,7 @@ pub struct SignatureMetadata {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct SigningTemplateMetadata {
+    pub algorithm: SignatureAlgorithm,
     pub key_names: Vec<String>,
     pub has_key_info: bool,
 }
@@ -133,7 +134,21 @@ pub fn signing_signature_metadata(
             .rfind(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Signature"))),
     }
     .ok_or(KeyMaterialError::MissingSignedInfo)?;
+    let algorithm_uri = signature
+        .children()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignedInfo")))
+        .and_then(|signed_info| {
+            signed_info.children().find(|node| {
+                node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureMethod"))
+            })
+        })
+        .and_then(|method| method.attribute("Algorithm"))
+        .ok_or(KeyMaterialError::MissingSignedInfo)?;
+    let algorithm = SignatureAlgorithm::from_uri(algorithm_uri).ok_or_else(|| {
+        KeyMaterialError::Signature(format!("unsupported signature algorithm: {algorithm_uri}"))
+    })?;
     Ok(SigningTemplateMetadata {
+        algorithm,
         key_names: signature_key_names(signature),
         has_key_info: signature_key_info(signature).is_some(),
     })

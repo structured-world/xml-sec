@@ -83,7 +83,7 @@ certificate-chain embedding, stdin input, signature selection by node ID, and
 deterministic process statuses. `help-all` enumerates the same registered
 commands and options accepted by the parser; donor option multiplicity is
 enforced across canonical and alias spellings, and `--print-xml-debug` emits
-parseable verification diagnostics. Named signing keys require a
+parseable operation diagnostics separately from `--output`. Named signing keys require a
 template `KeyName`, while repeatable named verification and encryption/decryption
 options form key sets from which the selected XML `KeyName` must identify exactly
 one key unless lax lookup is requested; unnamed templates still use their sole

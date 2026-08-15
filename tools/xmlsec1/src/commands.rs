@@ -597,7 +597,30 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     let signed = context
         .sign_template(&xml)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
-    write_output(invocation, signed.as_bytes(), stdout)
+    write_output(invocation, signed.as_bytes(), stdout)?;
+    write_signing_diagnostics(invocation, signature.algorithm, stdout)
+}
+
+fn write_signing_diagnostics(
+    invocation: &Invocation,
+    algorithm: SignatureAlgorithm,
+    stdout: &mut dyn Write,
+) -> Result<(), CommandError> {
+    if invocation.flag("print-debug") {
+        writeln!(stdout, "== Signature Context").map_err(stdout_error)?;
+        writeln!(stdout, "Status: succeeded").map_err(stdout_error)?;
+        writeln!(stdout, "Signature Method: {}", algorithm.uri()).map_err(stdout_error)?;
+    }
+    if invocation.flag("print-xml-debug") {
+        writeln!(
+            stdout,
+            "<SignatureContext status=\"SUCCEEDED\" failureReason=\"UNKNOWN\">"
+        )
+        .map_err(stdout_error)?;
+        write_debug_transform(stdout, "SignatureMethod", algorithm.uri())?;
+        writeln!(stdout, "</SignatureContext>").map_err(stdout_error)?;
+    }
+    Ok(())
 }
 
 fn select_signing_key<'a>(
@@ -1079,7 +1102,47 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             "encrypted template output exceeds XML document policy".into(),
         ));
     }
-    write_output(invocation, rendered.as_bytes(), stdout)
+    write_output(invocation, rendered.as_bytes(), stdout)?;
+    write_encryption_diagnostics(invocation, algorithm, stdout)
+}
+
+fn write_encryption_diagnostics(
+    invocation: &Invocation,
+    algorithm: DataEncryptionAlgorithm,
+    stdout: &mut dyn Write,
+) -> Result<(), CommandError> {
+    if invocation.flag("print-debug") {
+        writeln!(stdout, "== Data Encryption Context").map_err(stdout_error)?;
+        writeln!(stdout, "Status: succeeded").map_err(stdout_error)?;
+        writeln!(stdout, "Encryption Method: {}", algorithm.uri()).map_err(stdout_error)?;
+    }
+    if invocation.flag("print-xml-debug") {
+        writeln!(
+            stdout,
+            "<DataEncryptionContext status=\"replaced\" failureReason=\"UNKNOWN\">"
+        )
+        .map_err(stdout_error)?;
+        write_debug_transform(stdout, "EncryptionMethod", algorithm.uri())?;
+        writeln!(stdout, "</DataEncryptionContext>").map_err(stdout_error)?;
+    }
+    Ok(())
+}
+
+fn write_debug_transform(
+    stdout: &mut dyn Write,
+    container: &str,
+    uri: &str,
+) -> Result<(), CommandError> {
+    let name = uri.rsplit_once('#').map_or(uri, |(_, name)| name);
+    writeln!(stdout, "<{container}>").map_err(stdout_error)?;
+    writeln!(
+        stdout,
+        "<Transform name=\"{}\" href=\"{}\" />",
+        quick_xml::escape::escape(name),
+        quick_xml::escape::escape(uri)
+    )
+    .map_err(stdout_error)?;
+    writeln!(stdout, "</{container}>").map_err(stdout_error)
 }
 
 fn validate_recipient_key_metadata<'a>(
@@ -1737,10 +1800,15 @@ fn encryption_template(
 ) -> Result<EncryptionTemplateMetadata, CommandError> {
     let document = parse_encryption_document(xml, policy)?;
     let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
-    let method = encrypted_data
-        .children()
-        .find(|node| node.has_tag_name((XMLENC_NS, "EncryptionMethod")))
-        .and_then(|node| node.attribute("Algorithm"))
+    let method_node = singleton_direct_child(
+        encrypted_data,
+        XMLENC_NS,
+        "EncryptionMethod",
+        "EncryptedData contains more than one direct EncryptionMethod",
+    )?
+    .ok_or_else(|| CommandError::Encryption("template has no encryption algorithm".into()))?;
+    let method = method_node
+        .attribute("Algorithm")
         .ok_or_else(|| CommandError::Encryption("template has no encryption algorithm".into()))?;
     let algorithm = DataEncryptionAlgorithm::from_uri(method)
         .map_err(|error| CommandError::Encryption(error.to_string()))?;

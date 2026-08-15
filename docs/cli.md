@@ -23,10 +23,14 @@ non-zero. Commands absent from the pinned 1.3.13 surface are not advertised;
 historical `sign-tmpl` spellings are rejected instead of being routed to `sign`
 without template-generation semantics.
 
-`--print-debug` emits the donor-style text status, while `--print-xml-debug`
-emits a well-formed `VerificationContext` with donor `OK`/`FAILED` status and
-failure-reason vocabulary. XML diagnostics are emitted for invalid signatures
-before the command returns its required non-zero status.
+`--print-debug` emits donor-style text context diagnostics, while
+`--print-xml-debug` emits a well-formed operation context. Signing and
+verification use `SignatureContext` and `VerificationContext`; encryption and
+decryption use `DataEncryptionContext` and `DataDecryptionContext`. With
+`--output`, the transformed payload is written to the requested file and
+diagnostics remain on stdout. Verification diagnostics retain donor
+`OK`/`FAILED` status and failure-reason vocabulary and are emitted for invalid
+signatures before the command returns its required non-zero status.
 
 Capability checks and runtime dispatch use one registry. A transform or key-data
 class absent from `list-*` is not silently substituted and causes `check-*` to
