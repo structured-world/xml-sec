@@ -64,7 +64,9 @@ validated, and the first certificate must contain the signing key. When the
 template contains the optional direct `KeyInfo`
 placeholder, the chain is embedded there in order under `X509Data`. An empty
 `X509Data` child is populated in place, preserving sibling sources such as the
-`KeyName` used to select the signing key and attributes such as an `Id`. KeyInfo
+`KeyName` used to select the signing key. Placeholder attributes are preserved;
+non-conflicting attributes emitted by the writer are added, while conflicting
+expanded names fail closed. KeyInfo
 materialization occurs before reference digest computation, so a template may
 sign its populated `KeyInfo` by ID. Omitting `KeyInfo` leaves the signed output
 without `KeyInfo`. Named signing keys
@@ -76,7 +78,9 @@ template unconstrained when one explicit key is supplied.
 Verification accepts `-` as the conventional stdin marker. For documents with
 multiple signatures, `--node-id <id>` selects an ID-bearing start node and
 verifies the single `Signature` in its subtree; missing and duplicate IDs fail
-closed. Signing applies the same start-node contract and mutates only the
+closed. The standard `ID`, `Id`, and `id` local names are recognized whether
+unqualified or namespace-qualified, including `wsu:Id` and `xml:id`. Signing
+applies the same start-node contract and mutates only the
 selected template's digest, signature, and optional key-info placeholders.
 XPath and XPath Filter 2.0 verification uses libxmlsec1's legacy `here()`
 binding at this CLI compatibility boundary. The Rust library API retains the
@@ -122,7 +126,10 @@ For `--xml-data`, a missing template `Type` is materialized as XML Element
 metadata so a later embedded-document decrypt can perform XML replacement.
 Repeatable AES or RSA key options form a key set. A direct content-key `KeyName`
 must select exactly one AES key, while a recipient `KeyName` inside
-`EncryptedKey` must select exactly one RSA wrapping key. An unnamed template
+each `EncryptedKey` must select exactly one RSA wrapping key. Multi-recipient
+templates build one wrapped content key per recipient, preserving each
+recipient's OAEP parameters and document order; every recipient must resolve
+without missing or duplicate key matches. An unnamed template
 does not constrain the sole explicit key; missing and duplicate matches fail
 unless `--lax-key-search` is supplied.
 RSA private-key decryption accepts the upstream

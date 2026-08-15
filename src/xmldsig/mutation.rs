@@ -474,11 +474,43 @@ fn merge_one_key_info_source_at_index_with_options(
                     ));
                     Ok(attributes)
                 })?;
+        let generated_attributes =
+            source
+                .attributes()
+                .try_fold(String::new(), |mut attributes, attribute| {
+                    let existing = placeholder.attributes().find(|candidate| {
+                        candidate.namespace() == attribute.namespace()
+                            && candidate.name() == attribute.name()
+                    });
+                    if let Some(existing) = existing {
+                        if existing.value() != attribute.value() {
+                            return Err(XmlMutationError::InvalidAppendTarget);
+                        }
+                        return Ok(attributes);
+                    }
+                    let qualified_name = match attribute.namespace() {
+                        None => attribute.name().to_owned(),
+                        Some("http://www.w3.org/XML/1998/namespace") => {
+                            format!("xml:{}", attribute.name())
+                        }
+                        Some(namespace) => {
+                            let prefix = source
+                                .lookup_prefix(namespace)
+                                .ok_or(XmlMutationError::InvalidAppendTarget)?;
+                            format!("{prefix}:{}", attribute.name())
+                        }
+                    };
+                    attributes.push_str(&format!(
+                        " {qualified_name}=\"{}\"",
+                        quick_xml::escape::escape(attribute.value())
+                    ));
+                    Ok(attributes)
+                })?;
         let output = replace_element_content(
             xml,
             placeholder.range(),
             source_content,
-            &generated_namespace_attributes,
+            &format!("{generated_namespace_attributes}{generated_attributes}"),
         )?;
         parse_with_options(&output, policy)?;
         return Ok(output);
@@ -1336,6 +1368,41 @@ mod tests {
 
         let error = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect_err("conflicting namespace bindings must fail before serialization");
+
+        assert!(matches!(error, XmlMutationError::InvalidAppendTarget));
+    }
+
+    #[test]
+    fn key_info_source_merge_preserves_generated_attributes() {
+        // Writer-owned identity must survive placeholder reuse so later
+        // reference resolution observes the same element the writer emitted.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo><ds:X509Data/></ds:KeyInfo></ds:Signature>"#;
+        let generated = r#"<X509Data xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:ext="urn:key-info" Id="generated" ext:role="signing"><X509Certificate>Y2VydA==</X509Certificate></X509Data>"#;
+
+        let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect("generated attributes must populate the placeholder");
+        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let x509_data = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
+            .expect("X509Data");
+
+        assert_eq!(x509_data.attribute("Id"), Some("generated"));
+        assert_eq!(
+            x509_data.attribute(("urn:key-info", "role")),
+            Some("signing")
+        );
+    }
+
+    #[test]
+    fn key_info_source_merge_rejects_conflicting_generated_attributes() {
+        // Silently choosing template or writer identity would make signed
+        // references ambiguous, so incompatible expanded attributes fail.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo><ds:X509Data Id="template"/></ds:KeyInfo></ds:Signature>"#;
+        let generated = r#"<X509Data xmlns="http://www.w3.org/2000/09/xmldsig#" Id="generated"><X509Certificate>Y2VydA==</X509Certificate></X509Data>"#;
+
+        let error = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect_err("conflicting attributes must fail before serialization");
 
         assert!(matches!(error, XmlMutationError::InvalidAppendTarget));
     }

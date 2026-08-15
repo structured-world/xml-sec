@@ -34,10 +34,13 @@ impl<'a> XmlIdIndex<'a> {
         let mut nodes = HashMap::new();
         let mut duplicates = HashSet::new();
         for node in document.descendants().filter(Node::is_element) {
-            for name in &names {
-                let Some(value) = node.attribute(*name) else {
-                    continue;
-                };
+            // ID registration is local-name based: qualified profile attributes
+            // such as wsu:Id and xml:id participate alongside unqualified Id.
+            for value in node
+                .attributes()
+                .filter(|attribute| names.contains(&attribute.name()))
+                .map(|attribute| attribute.value())
+            {
                 if duplicates.contains(value) {
                     continue;
                 }
@@ -157,5 +160,25 @@ mod tests {
             Some("one")
         );
         assert!(index.node("duplicate").is_none());
+    }
+
+    #[test]
+    fn id_index_matches_supported_local_names_in_any_namespace() {
+        // ID registration is defined by local attribute name. Common security
+        // profiles qualify Id with wsu or xml, but the target remains the same.
+        let document = Document::parse(
+            r#"<root xmlns:wsu="urn:wsu"><one wsu:Id="wsu-target"/><two xml:id="xml-target"/></root>"#,
+        )
+        .expect("namespaced ID fixture must parse");
+        let index = XmlIdIndex::new(&document);
+
+        assert_eq!(
+            index.node("wsu-target").map(|node| node.tag_name().name()),
+            Some("one")
+        );
+        assert_eq!(
+            index.node("xml-target").map(|node| node.tag_name().name()),
+            Some("two")
+        );
     }
 }

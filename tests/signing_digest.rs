@@ -1032,6 +1032,68 @@ fn key_info_writer_replaces_stale_cryptographic_sources() {
 }
 
 #[test]
+fn key_info_writer_generated_id_can_be_signed() {
+    // A writer-generated ID on a reused placeholder must exist before the
+    // digest pass so SignedInfo can authenticate the resulting key metadata.
+    struct IdentifiedWriter(X509CertificateKeyInfoWriter);
+
+    impl KeyInfoWriter for IdentifiedWriter {
+        fn write_key_info(
+            &self,
+            signing_key: &dyn SigningKey,
+        ) -> Result<String, xml_sec::xmldsig::KeyInfoWriteError> {
+            Ok(self.0.write_key_info(signing_key)?.replacen(
+                "<X509Data ",
+                "<X509Data Id=\"generated\" ",
+                1,
+            ))
+        }
+    }
+
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let writer = IdentifiedWriter(
+        X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+            "tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+        ))
+        .expect("RSA certificate fixture must parse"),
+    );
+    let template = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        )
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#generated")
+                .transform(Transform::C14n(exclusive_c14n())),
+        )
+        .build_template()
+        .expect("valid signature template")
+        .replace("<KeyInfo/>", "<KeyInfo><X509Data/></KeyInfo>");
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">hello</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+
+    let signed = SignContext::new(&private_key)
+        .key_info_writer(&writer)
+        .sign_template(&xml)
+        .expect("writer-generated ID must resolve during digesting");
+    let result = xml_sec::xmldsig::VerifyContext::new()
+        .key_resolver(&DefaultKeyResolver::default())
+        .verify(&signed)
+        .expect("signed generated KeyInfo source must verify");
+
+    assert_eq!(result.status, DsigStatus::Valid);
+    assert!(signed.contains("Id=\"generated\""));
+}
+
+#[test]
 fn key_info_writer_requires_direct_template_placeholder() {
     // The writer is intentionally opt-in and template-scoped. Without a direct
     // KeyInfo slot, signing fails instead of inventing insertion policy.

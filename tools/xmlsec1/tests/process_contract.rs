@@ -1690,6 +1690,127 @@ fn rsa_encryption_populates_an_existing_key_info_container() {
 }
 
 #[test]
+fn rsa_encryption_builds_every_named_recipient() {
+    // Repeatable public keys map one-for-one to template recipients. Every
+    // generated wrapped key must remain decryptable, while missing or duplicate
+    // matches fail before emitting a partial recipient set.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("multi-recipient-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let public_a = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let public_b = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let private_a = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let private_b = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:xenc11="http://www.w3.org/2009/xmlenc11#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"/><ds:KeyInfo><ds:KeyName>a</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><xenc11:MGF Algorithm="http://www.w3.org/2009/xmlenc11#mgf1sha256"/></EncryptionMethod><ds:KeyInfo><ds:KeyName>b</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"multiple RSA recipients").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem:a"])
+        .arg(&public_a)
+        .args(["--pubkey-pem:b"])
+        .arg(&public_b)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    let encrypted_xml = fs::read_to_string(&encrypted).unwrap();
+    let document = roxmltree::Document::parse(&encrypted_xml).unwrap();
+    assert_eq!(
+        document
+            .descendants()
+            .filter(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "EncryptedKey")))
+            .count(),
+        2
+    );
+
+    for (name, private_key) in [("a", &private_a), ("b", &private_b)] {
+        let decrypt = Command::new(binary())
+            .arg("decrypt")
+            .arg(format!("--privkey-pem:{name}"))
+            .arg(private_key)
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            decrypt.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decrypt.stderr)
+        );
+        assert_eq!(decrypt.stdout, b"multiple RSA recipients");
+    }
+
+    let missing = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem:a"])
+        .arg(&public_a)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown KeyName"));
+
+    let duplicate = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem:a"])
+        .arg(&public_a)
+        .args(["--pubkey-pem:a"])
+        .arg(&public_b)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("multiple RSA recipient key"));
+}
+
+#[test]
+fn encryption_node_id_accepts_namespaced_id_attributes() {
+    // CLI node selection shares local-name ID semantics with reference
+    // resolution, including profile-standard qualified wsu:Id attributes.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("namespaced-node-id-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let aes_key = temp.path().join("aes.key");
+    fs::write(
+        &template,
+        r#"<root xmlns:wsu="urn:wsu"><scope wsu:Id="target"><EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData></scope></root>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"namespaced node ID").unwrap();
+    fs::write(&aes_key, [7_u8; 16]).unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--node-id", "target", "--aes-key"])
+        .arg(&aes_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    assert!(String::from_utf8_lossy(&encrypt.stdout).contains("wsu:Id=\"target\""));
+}
+
+#[test]
 fn named_decryption_key_selects_a_later_recipient() {
     // A document KeyName selects among all EncryptedKey recipients. Checking
     // only the first recipient would reject a valid key before core decryption

@@ -955,30 +955,49 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             builder = builder.direct_key_name(name);
         }
     } else if !public_keys.is_empty() {
-        let requested_names = metadata
-            .recipient_key_name
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let (option, certificate) = select_named_candidate(
-            &public_keys,
-            &requested_names,
-            invocation.flag("lax-key-search"),
-            true,
-            "RSA recipient key",
-        )?;
-        let path = option.value.as_deref().unwrap_or_default();
-        let public_key = if certificate {
-            key_material::load_rsa_certificate_public(path)?
+        let template_recipients = if metadata.recipients.is_empty() {
+            vec![EncryptionTemplateRecipient {
+                key_name: None,
+                oaep_parameters: None,
+            }]
         } else {
-            key_material::load_rsa_public(path)?
+            metadata.recipients
         };
-        validate_recipient_key_metadata(&template, start_node_id, &policy, &public_key)?;
-        let mut recipient = EncryptionRecipient::rsa_oaep(public_key);
-        if let Some(parameters) = metadata.oaep_parameters {
-            recipient = recipient.oaep_parameters(parameters);
+        let mut selected_recipients = Vec::with_capacity(template_recipients.len());
+        for template_recipient in template_recipients {
+            let requested_names = template_recipient
+                .key_name
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let (option, certificate) = select_named_candidate(
+                &public_keys,
+                &requested_names,
+                invocation.flag("lax-key-search"),
+                true,
+                "RSA recipient key",
+            )?;
+            let path = option.value.as_deref().unwrap_or_default();
+            let public_key = if certificate {
+                key_material::load_rsa_certificate_public(path)?
+            } else {
+                key_material::load_rsa_public(path)?
+            };
+            selected_recipients.push((public_key, template_recipient.oaep_parameters));
         }
-        builder = builder.add_recipient(recipient);
+        validate_recipient_key_metadata(
+            &template,
+            start_node_id,
+            &policy,
+            selected_recipients.iter().map(|(key, _)| key),
+        )?;
+        for (public_key, parameters) in selected_recipients {
+            let mut recipient = EncryptionRecipient::rsa_oaep(public_key);
+            if let Some(parameters) = parameters {
+                recipient = recipient.oaep_parameters(parameters);
+            }
+            builder = builder.add_recipient(recipient);
+        }
     } else {
         return Err(CommandError::Usage(
             "encrypt requires --aes-key, an RSA public key, or an RSA certificate".into(),
@@ -1017,21 +1036,33 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     write_output(invocation, rendered.as_bytes(), stdout)
 }
 
-fn validate_recipient_key_metadata(
+fn validate_recipient_key_metadata<'a>(
     template: &str,
     start_node_id: Option<&str>,
     policy: &EncryptionPolicy,
-    selected_key: &RsaPublicKey,
+    selected_keys: impl IntoIterator<Item = &'a RsaPublicKey>,
 ) -> Result<(), CommandError> {
     let document = parse_encryption_document(template, policy)?;
     let encrypted_data = select_encrypted_data(&document, start_node_id)?;
-    let key_infos = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
+    let encrypted_keys = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
         .into_iter()
         .flat_map(|key_info| key_info.children())
         .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
-        .filter_map(|encrypted_key| direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo"));
+        .collect::<Vec<_>>();
+    let selected_keys = selected_keys.into_iter().collect::<Vec<_>>();
+    if encrypted_keys.is_empty() {
+        return Ok(());
+    }
+    if encrypted_keys.len() != selected_keys.len() {
+        return Err(recipient_metadata_error(
+            "selected RSA key count does not match template recipients",
+        ));
+    }
 
-    for key_info_node in key_infos {
+    for (encrypted_key, selected_key) in encrypted_keys.into_iter().zip(selected_keys) {
+        let Some(key_info_node) = direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo") else {
+            continue;
+        };
         let key_info = parse_key_info(key_info_node)
             .map_err(|error| CommandError::Encryption(error.to_string()))?;
         for source in key_info.sources {
@@ -1125,15 +1156,11 @@ fn recipient_metadata_error(message: &str) -> CommandError {
 }
 
 fn template_oaep_parameters(
-    encrypted_data: Node<'_, '_>,
+    encrypted_key: Node<'_, '_>,
 ) -> Result<Option<RsaOaepParameters>, CommandError> {
-    let Some(method) = encrypted_data
-        .descendants()
-        .find(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
-        .and_then(|key| {
-            key.children()
-                .find(|node| node.has_tag_name((XMLENC_NS, "EncryptionMethod")))
-        })
+    let Some(method) = encrypted_key
+        .children()
+        .find(|node| node.has_tag_name((XMLENC_NS, "EncryptionMethod")))
     else {
         return Ok(None);
     };
@@ -1530,7 +1557,11 @@ struct EncryptionTemplateMetadata {
     explicit_encrypted_type: bool,
     has_encrypted_key_recipient: bool,
     content_key_name: Option<String>,
-    recipient_key_name: Option<String>,
+    recipients: Vec<EncryptionTemplateRecipient>,
+}
+
+struct EncryptionTemplateRecipient {
+    key_name: Option<String>,
     oaep_parameters: Option<RsaOaepParameters>,
 }
 
@@ -1558,19 +1589,27 @@ fn encryption_template(
             )));
         }
     };
+    let recipients = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
+        .into_iter()
+        .flat_map(|key_info| key_info.children())
+        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+        .map(|encrypted_key| {
+            Ok(EncryptionTemplateRecipient {
+                key_name: direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo")
+                    .and_then(|key_info| direct_child_element(key_info, XMLDSIG_NS, "KeyName"))
+                    .and_then(|key_name| key_name.text())
+                    .map(str::to_owned),
+                oaep_parameters: template_oaep_parameters(encrypted_key)?,
+            })
+        })
+        .collect::<Result<Vec<_>, CommandError>>()?;
     Ok(EncryptionTemplateMetadata {
         algorithm,
         encrypted_type,
         explicit_encrypted_type,
-        has_encrypted_key_recipient: direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
-            .is_some_and(|key_info| {
-                key_info
-                    .children()
-                    .any(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
-            }),
+        has_encrypted_key_recipient: !recipients.is_empty(),
         content_key_name: encrypted_data_key_name(encrypted_data),
-        recipient_key_name: encrypted_key_recipient_name(encrypted_data),
-        oaep_parameters: template_oaep_parameters(encrypted_data)?,
+        recipients,
     })
 }
 
@@ -1579,12 +1618,6 @@ fn encrypted_data_key_name(encrypted_data: Node<'_, '_>) -> Option<String> {
         .and_then(|key_info| direct_child_element(key_info, XMLDSIG_NS, "KeyName"))
         .and_then(|key_name| key_name.text())
         .map(str::to_owned)
-}
-
-fn encrypted_key_recipient_name(encrypted_data: Node<'_, '_>) -> Option<String> {
-    encrypted_key_recipient_names(encrypted_data)
-        .into_iter()
-        .next()
 }
 
 fn encrypted_key_recipient_names(encrypted_data: Node<'_, '_>) -> Vec<String> {
