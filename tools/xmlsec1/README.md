@@ -42,7 +42,9 @@ without erasing sibling key sources; verification accepts
 stdin as `-` and can select one signature subtree with `--node-id`.
 support request-local custom IDs through global `--add-id-attr NAME` and
 element-scoped `--id-attr[:ATTR] [NAMESPACE-URI:]ELEMENT`; the same
-registrations drive Reference resolution and XMLEnc operation selection.
+registrations drive Reference resolution and XMLEnc operation selection. An
+unqualified element name matches its local name in any namespace; an explicit
+namespace component restricts the match to that expanded name.
 Output paths support the upstream `{inputfile}` basename template, and `--gen-key[:name]`
 emits both named and unnamed AES key-store entries. `help-all` is generated from
 the parser registry. Named signing keys require a template `KeyName`; named

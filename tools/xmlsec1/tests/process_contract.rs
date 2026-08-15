@@ -179,8 +179,8 @@ fn signing_writes_requested_diagnostics_separately_from_output() {
 
 #[test]
 fn scoped_id_attribute_selects_and_signs_the_registered_element() {
-    // libxmlsec1's --id-attr form is element-scoped: the custom attribute must
-    // drive both --node-id selection and same-document Reference resolution.
+    // An unqualified libxmlsec1 --id-attr element name is namespace-agnostic;
+    // the custom attribute must drive selection and Reference resolution.
     let temp = tempfile::tempdir().unwrap();
     let template = temp.path().join("scoped-id.xml");
     let signed = temp.path().join("scoped-id-signed.xml");
@@ -188,7 +188,7 @@ fn scoped_id_attribute_selects_and_signs_the_registered_element() {
     let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
     fs::write(
         &template,
-        r##"<root><Envelope Token="selected"><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#selected"><Transforms><Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference></SignedInfo><SignatureValue/></Signature><payload>registered</payload></Envelope></root>"##,
+        r##"<root xmlns:app="urn:application"><app:Envelope Token="selected"><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#selected"><Transforms><Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference></SignedInfo><SignatureValue/></Signature><payload>registered</payload></app:Envelope></root>"##,
     )
     .unwrap();
 

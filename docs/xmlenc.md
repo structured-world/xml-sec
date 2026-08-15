@@ -34,8 +34,9 @@ fn example() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 For embedded decryption, `DecryptContext::id_attributes` accepts the same immutable global or
-element-scoped `IdAttributeRegistration` request context as XMLDSig. It affects only operation
-start-node lookup; policy remains a separate compiled snapshot.
+element-scoped `IdAttributeRegistration` request context as XMLDSig. Element scope can match a
+local name in any namespace or one exact expanded name. It affects only operation start-node
+lookup; policy remains a separate compiled snapshot.
 
 For recipient transport, add one or more `EncryptionRecipient::rsa_oaep` entries with recipient
 public keys, or use `recipient_aes_kw` with a shared KEK. `EncryptedDataBuilder` obtains each fresh

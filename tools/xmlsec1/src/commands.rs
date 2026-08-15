@@ -481,21 +481,22 @@ fn id_attribute_registrations(
         .collect::<Result<Vec<_>, _>>()?;
     for option in invocation.values("id-attr") {
         let element = option_value_text(option)?;
-        let (namespace, local_name) = element
-            .rsplit_once(':')
-            .map_or((None, element), |(namespace, local_name)| {
-                (Some(namespace), local_name)
-            });
+        let expanded_name = element.rsplit_once(':');
+        let local_name = expanded_name.map_or(element, |(_, local_name)| local_name);
         if local_name.is_empty() {
             return Err(CommandError::Usage(
                 "--id-attr element local name cannot be empty".into(),
             ));
         }
-        registrations.push(IdAttributeRegistration::scoped(
-            option.parameter.as_deref().unwrap_or("id"),
-            local_name,
-            namespace,
-        ));
+        let attribute_name = option.parameter.as_deref().unwrap_or("id");
+        registrations.push(match expanded_name {
+            None => IdAttributeRegistration::scoped_any_namespace(attribute_name, local_name),
+            Some((namespace, _)) => IdAttributeRegistration::scoped(
+                attribute_name,
+                local_name,
+                (!namespace.is_empty()).then_some(namespace),
+            ),
+        });
     }
     Ok(registrations)
 }

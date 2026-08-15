@@ -14,12 +14,24 @@ const DEFAULT_ID_ATTRS: &[&str] = &["ID", "Id", "id"];
 ///
 /// Registrations are request context rather than security policy. A global
 /// registration applies an attribute local name to every element; a scoped
-/// registration applies only to one expanded element name.
+/// registration applies to one element local name in either any namespace or
+/// one exact namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdAttributeRegistration {
     attribute_local_name: String,
-    element_local_name: Option<String>,
-    element_namespace: Option<String>,
+    element_scope: IdAttributeElementScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IdAttributeElementScope {
+    AnyElement,
+    AnyNamespace {
+        local_name: String,
+    },
+    ExpandedName {
+        local_name: String,
+        namespace: Option<String>,
+    },
 }
 
 impl IdAttributeRegistration {
@@ -28,8 +40,23 @@ impl IdAttributeRegistration {
     pub fn global(attribute_local_name: impl Into<String>) -> Self {
         Self {
             attribute_local_name: attribute_local_name.into(),
-            element_local_name: None,
-            element_namespace: None,
+            element_scope: IdAttributeElementScope::AnyElement,
+        }
+    }
+
+    /// Register an attribute as an ID on a local element name in any namespace.
+    ///
+    /// This models libxmlsec1's unqualified `--id-attr` element-name contract.
+    #[must_use]
+    pub fn scoped_any_namespace(
+        attribute_local_name: impl Into<String>,
+        element_local_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            attribute_local_name: attribute_local_name.into(),
+            element_scope: IdAttributeElementScope::AnyNamespace {
+                local_name: element_local_name.into(),
+            },
         }
     }
 
@@ -45,17 +72,30 @@ impl IdAttributeRegistration {
     ) -> Self {
         Self {
             attribute_local_name: attribute_local_name.into(),
-            element_local_name: Some(element_local_name.into()),
-            element_namespace: element_namespace.map(str::to_owned),
+            element_scope: IdAttributeElementScope::ExpandedName {
+                local_name: element_local_name.into(),
+                namespace: element_namespace.map(str::to_owned),
+            },
         }
     }
 
     fn matches(&self, node: Node<'_, '_>, attribute_name: &str) -> bool {
-        self.attribute_local_name == attribute_name
-            && self.element_local_name.as_deref().is_none_or(|name| {
-                node.tag_name().name() == name
-                    && node.tag_name().namespace() == self.element_namespace.as_deref()
-            })
+        if self.attribute_local_name != attribute_name {
+            return false;
+        }
+        match &self.element_scope {
+            IdAttributeElementScope::AnyElement => true,
+            IdAttributeElementScope::AnyNamespace { local_name } => {
+                node.tag_name().name() == local_name
+            }
+            IdAttributeElementScope::ExpandedName {
+                local_name,
+                namespace,
+            } => {
+                node.tag_name().name() == local_name
+                    && node.tag_name().namespace() == namespace.as_deref()
+            }
+        }
     }
 }
 
@@ -163,7 +203,7 @@ pub(crate) fn is_xml_ncname(value: &str) -> bool {
 mod tests {
     use roxmltree::Document;
 
-    use super::{XmlIdIndex, is_xml_1_0_character, is_xml_ncname};
+    use super::{IdAttributeRegistration, XmlIdIndex, is_xml_1_0_character, is_xml_ncname};
 
     #[test]
     fn xml_1_0_character_boundaries_match_production_two() {
@@ -233,5 +273,42 @@ mod tests {
             index.node("xml-target").map(|node| node.tag_name().name()),
             Some("two")
         );
+    }
+
+    #[test]
+    fn id_registration_distinguishes_any_and_exact_element_namespaces() {
+        // Donor --id-attr without a namespace matches the local element name
+        // everywhere, while the public scoped API retains exact-name matching.
+        let document = Document::parse(
+            r#"<root xmlns:n="urn:item"><item Token="plain"/><n:item Token="namespaced"/></root>"#,
+        )
+        .expect("scope fixture must parse");
+
+        let any_namespace = XmlIdIndex::with_registrations(
+            &document,
+            &[IdAttributeRegistration::scoped_any_namespace(
+                "Token", "item",
+            )],
+        );
+        assert!(any_namespace.node("plain").is_some());
+        assert!(any_namespace.node("namespaced").is_some());
+
+        let no_namespace = XmlIdIndex::with_registrations(
+            &document,
+            &[IdAttributeRegistration::scoped("Token", "item", None)],
+        );
+        assert!(no_namespace.node("plain").is_some());
+        assert!(no_namespace.node("namespaced").is_none());
+
+        let exact_namespace = XmlIdIndex::with_registrations(
+            &document,
+            &[IdAttributeRegistration::scoped(
+                "Token",
+                "item",
+                Some("urn:item"),
+            )],
+        );
+        assert!(exact_namespace.node("plain").is_none());
+        assert!(exact_namespace.node("namespaced").is_some());
     }
 }

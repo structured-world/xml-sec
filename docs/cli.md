@@ -89,7 +89,10 @@ selected template's digest, signature, and optional key-info placeholders.
 Custom ID declarations match libxmlsec1's two request-local forms:
 `--add-id-attr NAME` registers an attribute local name on every element, while
 `--id-attr[:ATTR] [NAMESPACE-URI:]ELEMENT` (default `ATTR` is `id`) limits the
-registration to one expanded element name. Registrations affect both
+registration to one element local name. Without `NAMESPACE-URI:`, that local
+name matches elements in any namespace, as in libxmlsec1; with the component
+present, it matches that exact namespace (`:ELEMENT` means no namespace).
+Registrations affect both
 `--node-id` selection and same-document reference resolution; duplicate ID
 values remain ambiguous and fail closed.
 XPath and XPath Filter 2.0 verification uses libxmlsec1's legacy `here()`
