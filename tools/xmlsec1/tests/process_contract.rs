@@ -1119,6 +1119,34 @@ fn direct_aes_key_name_must_match_the_template_unless_lax() {
 }
 
 #[test]
+fn encryption_rejects_duplicate_content_key_names() {
+    // The core XMLEnc parser permits at most one direct KeyName. Reject the
+    // template before encryption rather than emitting ciphertext we cannot read.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("duplicate-key-name.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let key = temp.path().join("key.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><ds:KeyName>first</ds:KeyName><ds:KeyName>second</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"duplicate content key names").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    let rejected = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("more than one direct KeyName"));
+}
+
+#[test]
 fn named_aes_decryption_obeys_encrypted_data_key_name_unless_lax() {
     // Decryption key selection must enforce the same document identity contract
     // as encryption rather than discarding the CLI option's registry name.
@@ -1690,6 +1718,74 @@ fn rsa_encryption_populates_an_existing_key_info_container() {
 }
 
 #[test]
+fn rsa_encryption_preserves_extension_cipher_values() {
+    // CipherValue is meaningful only along an EncryptedKey recipient path.
+    // Extension-owned values must remain caller metadata, not placeholders.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("extension-cipher-value.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:ext="urn:test"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><ext:Metadata><CipherValue>ZXh0ZW5zaW9u</CipherValue></ext:Metadata></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"extension metadata").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    let encrypted_xml = fs::read_to_string(&encrypted).unwrap();
+    let document = roxmltree::Document::parse(&encrypted_xml).unwrap();
+    assert_eq!(
+        document
+            .descendants()
+            .find(|node| node.has_tag_name(("urn:test", "Metadata")))
+            .and_then(|node| {
+                node.children().find(|child| {
+                    child.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherValue"))
+                })
+            })
+            .and_then(|node| node.text()),
+        Some("ZXh0ZW5zaW9u")
+    );
+    assert_eq!(
+        document
+            .descendants()
+            .filter(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "EncryptedKey")))
+            .count(),
+        1
+    );
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--privkey-pem"])
+        .arg(&private_key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"extension metadata");
+}
+
+#[test]
 fn rsa_encryption_builds_every_named_recipient() {
     // Repeatable public keys map one-for-one to template recipients. Every
     // generated wrapped key must remain decryptable, while missing or duplicate
@@ -2081,6 +2177,33 @@ fn honors_legacy_rsa_oaep_parameters_from_the_template() {
         String::from_utf8_lossy(&decrypt.stderr)
     );
     assert_eq!(decrypt.stdout, b"legacy OAEP payload");
+}
+
+#[test]
+fn legacy_rsa_oaep_rejects_xmlenc11_mgf_parameters() {
+    // XML Encryption 1.0 fixes MGF1 to SHA-1. Preserving an XML Encryption 1.1
+    // MGF child would make the emitted structure contradict the wrapping mode.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("legacy-oaep-with-mgf.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:xenc11="http://www.w3.org/2009/xmlenc11#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"><xenc11:MGF Algorithm="http://www.w3.org/2009/xmlenc11#mgf1sha256"/></EncryptionMethod><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"invalid legacy OAEP metadata").unwrap();
+
+    let rejected = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("MGF"));
 }
 
 #[test]

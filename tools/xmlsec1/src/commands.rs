@@ -1173,10 +1173,15 @@ fn template_oaep_parameters(
         .children()
         .find(|node| node.has_tag_name((XMLDSIG_NS, "DigestMethod")))
         .and_then(|node| node.attribute("Algorithm"));
-    let mgf = method
+    let mgf_node = method
         .children()
-        .find(|node| node.has_tag_name((XMLENC11_NS, "MGF")))
-        .and_then(|node| node.attribute("Algorithm"));
+        .find(|node| node.has_tag_name((XMLENC11_NS, "MGF")));
+    if transport == KeyTransportAlgorithm::RsaOaepMgf1p && mgf_node.is_some() {
+        return Err(CommandError::Encryption(
+            "legacy rsa-oaep-mgf1p does not permit an XML Encryption 1.1 MGF parameter".into(),
+        ));
+    }
+    let mgf = mgf_node.and_then(|node| node.attribute("Algorithm"));
     let digest = oaep_digest_from_uri(digest.unwrap_or(OaepDigestAlgorithm::Sha1.uri()))?;
     let mgf_digest = if transport == KeyTransportAlgorithm::RsaOaepMgf1p {
         OaepDigestAlgorithm::Sha1
@@ -1265,14 +1270,8 @@ fn apply_encryption_template(
     let generated_key_info = direct_child_element(generated_data, XMLDSIG_NS, "KeyInfo");
     match (template_key_info, generated_key_info) {
         (Some(template_key_info), Some(generated_key_info)) => {
-            let template_values = template_key_info
-                .descendants()
-                .filter(|node| node.has_tag_name((XMLENC_NS, "CipherValue")))
-                .collect::<Vec<_>>();
-            let generated_values = generated_key_info
-                .descendants()
-                .filter(|node| node.has_tag_name((XMLENC_NS, "CipherValue")))
-                .collect::<Vec<_>>();
+            let template_values = encrypted_key_cipher_values(template_key_info);
+            let generated_values = encrypted_key_cipher_values(generated_key_info);
             if template_values.is_empty() && !generated_values.is_empty() {
                 let generated_keys = generated_key_info
                     .children()
@@ -1425,6 +1424,19 @@ fn encrypted_data_cipher_value<'a, 'input>(
         .and_then(|cipher| direct_child_element(cipher, XMLENC_NS, "CipherValue"))
 }
 
+fn encrypted_key_cipher_values<'a, 'input>(
+    key_info: roxmltree::Node<'a, 'input>,
+) -> Vec<roxmltree::Node<'a, 'input>> {
+    key_info
+        .children()
+        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+        .filter_map(|encrypted_key| {
+            direct_child_element(encrypted_key, XMLENC_NS, "CipherData")
+                .and_then(|cipher| direct_child_element(cipher, XMLENC_NS, "CipherValue"))
+        })
+        .collect()
+}
+
 fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, DECRYPT_OPTIONS)?;
     reject_unimplemented_selectors(invocation, &["node-id"])?;
@@ -1437,7 +1449,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let document = parse_encryption_document(&xml, &policy)?;
     let encrypted_data = select_encrypted_data(&document, encrypted_data_id)?;
     let standalone = encrypted_data == document.root_element();
-    let content_key_name = encrypted_data_key_name(encrypted_data);
+    let content_key_name = encrypted_data_key_name(encrypted_data)?;
     let recipient_key_names = encrypted_key_recipient_names(encrypted_data);
     let aes_keys = invocation.values("aes-key").collect::<Vec<_>>();
     let private_keys = ["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"]
@@ -1608,16 +1620,25 @@ fn encryption_template(
         encrypted_type,
         explicit_encrypted_type,
         has_encrypted_key_recipient: !recipients.is_empty(),
-        content_key_name: encrypted_data_key_name(encrypted_data),
+        content_key_name: encrypted_data_key_name(encrypted_data)?,
         recipients,
     })
 }
 
-fn encrypted_data_key_name(encrypted_data: Node<'_, '_>) -> Option<String> {
-    direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
-        .and_then(|key_info| direct_child_element(key_info, XMLDSIG_NS, "KeyName"))
-        .and_then(|key_name| key_name.text())
-        .map(str::to_owned)
+fn encrypted_data_key_name(encrypted_data: Node<'_, '_>) -> Result<Option<String>, CommandError> {
+    let Some(key_info) = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo") else {
+        return Ok(None);
+    };
+    let mut key_names = key_info
+        .children()
+        .filter(|node| node.has_tag_name((XMLDSIG_NS, "KeyName")));
+    let key_name = key_names.next();
+    if key_names.next().is_some() {
+        return Err(CommandError::Encryption(
+            "KeyInfo contains more than one direct KeyName".into(),
+        ));
+    }
+    Ok(key_name.and_then(|node| node.text()).map(str::to_owned))
 }
 
 fn encrypted_key_recipient_names(encrypted_data: Node<'_, '_>) -> Vec<String> {
