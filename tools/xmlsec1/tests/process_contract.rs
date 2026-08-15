@@ -966,6 +966,47 @@ fn encryption_writes_requested_diagnostics_and_rejects_duplicate_methods() {
         String::from_utf8_lossy(&rejected.stderr).contains("more than one direct EncryptionMethod")
     );
     assert!(!rejected_output.exists());
+
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    for (case, malformed_xml, key_args) in [
+        (
+            "duplicate-cipher-data",
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+            None,
+        ),
+        (
+            "recipient-without-value",
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"/><CipherData/></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+            Some(&public_key),
+        ),
+        (
+            "recipient-cipher-reference",
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"/><CipherData><CipherReference URI="urn:cipher"/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+            Some(&public_key),
+        ),
+    ] {
+        let malformed = temp.path().join(format!("{case}.xml"));
+        let rejected_output = temp.path().join(format!("{case}-output.xml"));
+        fs::write(&malformed, malformed_xml).unwrap();
+        let mut command = Command::new(binary());
+        command.arg("encrypt");
+        if let Some(public_key) = key_args {
+            command.arg("--pubkey-pem").arg(public_key);
+        } else {
+            command.arg("--aeskey").arg(&key);
+        }
+        let rejected = command
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&rejected_output)
+            .arg(&malformed)
+            .output()
+            .unwrap();
+
+        assert!(!rejected.status.success(), "{case} unexpectedly succeeded");
+        assert!(!rejected_output.exists(), "{case} emitted partial output");
+    }
 }
 
 #[test]
@@ -976,6 +1017,28 @@ fn xml_debug_decryption_writes_diagnostics_separately_from_plaintext() {
     let fixtures = project_root().join("tools/xmlsec1/tests/fixtures/upstream");
     let vector = fixtures.join("xmlenc11-interop-2012/xenc11-example-AES128-GCM");
     let decrypted = temp.path().join("decrypted.data");
+
+    let text_decrypted = temp.path().join("text-decrypted.data");
+    let text_output = Command::new(binary())
+        .args(["decrypt", "--print-debug", "--lax-key-search", "--aeskey"])
+        .arg(vector.with_extension("key"))
+        .arg("--output")
+        .arg(&text_decrypted)
+        .arg(vector.with_extension("xml"))
+        .output()
+        .unwrap();
+    assert!(
+        text_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text_output.stderr)
+    );
+    assert_eq!(
+        fs::read(&text_decrypted).unwrap(),
+        fs::read(vector.with_extension("data")).unwrap()
+    );
+    let text_diagnostics = String::from_utf8(text_output.stdout).unwrap();
+    assert!(text_diagnostics.contains("== Data Decryption Context"));
+    assert!(text_diagnostics.contains("Status: succeeded"));
 
     let output = Command::new(binary())
         .args([

@@ -1391,10 +1391,8 @@ fn apply_encryption_template(
     let generated_document = parse_encryption_document(generated, policy)?;
     let template_data = select_encrypted_data(&template_document, start_node_id, id_attributes)?;
     let generated_data = generated_document.root_element();
-    let template_cipher = encrypted_data_cipher_value(template_data)
-        .ok_or_else(|| CommandError::Encryption("template has no CipherValue".into()))?;
-    let generated_cipher = encrypted_data_cipher_value(generated_data)
-        .ok_or_else(|| CommandError::Encryption("generated data has no CipherValue".into()))?;
+    let template_cipher = required_cipher_value(template_data, "template EncryptedData")?;
+    let generated_cipher = required_cipher_value(generated_data, "generated EncryptedData")?;
     let mut replacements = vec![(
         template_cipher.range(),
         standalone_cipher_value(generated_cipher),
@@ -1417,8 +1415,8 @@ fn apply_encryption_template(
     let generated_key_info = direct_child_element(generated_data, XMLDSIG_NS, "KeyInfo");
     match (template_key_info, generated_key_info) {
         (Some(template_key_info), Some(generated_key_info)) => {
-            let template_values = encrypted_key_cipher_values(template_key_info);
-            let generated_values = encrypted_key_cipher_values(generated_key_info);
+            let template_values = encrypted_key_cipher_values(template_key_info, "template")?;
+            let generated_values = encrypted_key_cipher_values(generated_key_info, "generated")?;
             if template_values.is_empty() && !generated_values.is_empty() {
                 let generated_keys = generated_key_info
                     .children()
@@ -1564,22 +1562,39 @@ fn direct_child_element<'a, 'input>(
         .find(|child| child.has_tag_name((namespace, name)))
 }
 
-fn encrypted_data_cipher_value<'a, 'input>(
-    data: roxmltree::Node<'a, 'input>,
-) -> Option<roxmltree::Node<'a, 'input>> {
-    direct_child_element(data, XMLENC_NS, "CipherData")
-        .and_then(|cipher| direct_child_element(cipher, XMLENC_NS, "CipherValue"))
+fn required_cipher_value<'a, 'input>(
+    parent: roxmltree::Node<'a, 'input>,
+    owner: &str,
+) -> Result<roxmltree::Node<'a, 'input>, CommandError> {
+    let cipher_data = singleton_direct_child(
+        parent,
+        XMLENC_NS,
+        "CipherData",
+        &format!("{owner} contains more than one direct CipherData"),
+    )?
+    .ok_or_else(|| CommandError::Encryption(format!("{owner} has no direct CipherData")))?;
+    singleton_direct_child(
+        cipher_data,
+        XMLENC_NS,
+        "CipherValue",
+        &format!("{owner} CipherData contains more than one direct CipherValue"),
+    )?
+    .ok_or_else(|| CommandError::Encryption(format!("{owner} CipherData has no CipherValue")))
 }
 
 fn encrypted_key_cipher_values<'a, 'input>(
     key_info: roxmltree::Node<'a, 'input>,
-) -> Vec<roxmltree::Node<'a, 'input>> {
+    owner: &str,
+) -> Result<Vec<roxmltree::Node<'a, 'input>>, CommandError> {
     key_info
         .children()
         .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
-        .filter_map(|encrypted_key| {
-            direct_child_element(encrypted_key, XMLENC_NS, "CipherData")
-                .and_then(|cipher| direct_child_element(cipher, XMLENC_NS, "CipherValue"))
+        .enumerate()
+        .map(|(index, encrypted_key)| {
+            required_cipher_value(
+                encrypted_key,
+                &format!("{owner} EncryptedKey recipient {}", index + 1),
+            )
         })
         .collect()
 }
@@ -1682,11 +1697,9 @@ fn write_decryption_diagnostics(
     result_replaced: bool,
     stdout: &mut dyn Write,
 ) -> Result<(), CommandError> {
-    if !invocation.flag("print-xml-debug") {
+    if !invocation.flag("print-debug") && !invocation.flag("print-xml-debug") {
         return Ok(());
     }
-    // Donor testEnc.sh routes plaintext through --output and parses stdout as
-    // a separate xmlSecEncCtxDebugXmlDump-compatible diagnostics document.
     let method = direct_child_element(encrypted_data, XMLENC_NS, "EncryptionMethod")
         .and_then(|node| node.attribute("Algorithm"))
         .ok_or_else(|| CommandError::Encryption("template has no encryption algorithm".into()))?;
@@ -1697,6 +1710,17 @@ fn write_decryption_diagnostics(
     } else {
         "not-replaced"
     };
+    if invocation.flag("print-debug") {
+        writeln!(stdout, "== Data Decryption Context").map_err(stdout_error)?;
+        writeln!(stdout, "Status: succeeded").map_err(stdout_error)?;
+        writeln!(stdout, "Result: {status}").map_err(stdout_error)?;
+        writeln!(stdout, "Encryption Method: {method}").map_err(stdout_error)?;
+    }
+    if !invocation.flag("print-xml-debug") {
+        return Ok(());
+    }
+    // Donor testEnc.sh routes plaintext through --output and parses stdout as
+    // a separate xmlSecEncCtxDebugXmlDump-compatible diagnostics document.
     writeln!(
         stdout,
         "<DataDecryptionContext status=\"{status}\" failureReason=\"UNKNOWN\">"

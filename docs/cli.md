@@ -129,10 +129,12 @@ then requires exactly one `EncryptedData` in its subtree.
 Encryption preserves the template's `Id`, `Type`, `MimeType`, `KeyInfo`,
 `EncryptionProperties`, and RSA-OAEP parameters while replacing only the
 cryptographic `CipherValue` payloads.
-Each template `EncryptedKey` must contain exactly one direct
-`EncryptionMethod`; optional `DigestMethod`, `MGF`, and `OAEPparams` children
-must each occur at most once. Ambiguous recipient metadata is rejected before
-key wrapping.
+The selected `EncryptedData` and every existing template `EncryptedKey` must
+contain exactly one direct `CipherData` with one direct `CipherValue`. Each
+`EncryptedKey` must also contain exactly one direct `EncryptionMethod`;
+optional `DigestMethod`, `MGF`, and `OAEPparams` children must each occur at
+most once. Ambiguous or incomplete recipient metadata is rejected before key
+wrapping.
 When nested recipient `KeyInfo` already carries `RSAKeyValue`, an X.509
 certificate, or `DEREncodedKeyValue`, that cryptographic identity must match
 the selected RSA wrapping key. Unmatchable or contradictory metadata is
