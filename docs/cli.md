@@ -104,7 +104,10 @@ Every direct `KeyName` in the selected signature participates in lookup and must
 identify exactly one supplied key; duplicate matches fail as ambiguous.
 `--lax-key-search` is the explicit opt-out. A signature without `KeyName` does
 not request a different identity, so its sole explicit key remains usable even
-when that key has a registry name.
+when that key has a registry name. For a repeated explicit key set, lax lookup
+ignores `KeyName` identity and selects the first compatible option in command-line
+order, matching libxmlsec1's key-type search rather than treating ambiguity as a
+strict lookup failure.
 
 `--output` follows the upstream filename-template contract. The first
 `{inputfile}` token is replaced with the input file's basename after removing
@@ -122,7 +125,8 @@ xmlsec1 decrypt --aes-key:content content.key \
 
 Files passed through `--aes-key` (`--aeskey` is an alias) use libxmlsec1's
 binary-key contract: their
-bytes are consumed verbatim rather than guessed to be Base64 text. `decrypt`
+bytes are consumed verbatim rather than guessed to be Base64 text. Reads are
+bounded to the largest supported AES key before allocation. `decrypt`
 accepts both standalone `EncryptedData` and encrypted elements embedded in a
 larger XML document; `--node-id` selects an ID-bearing operation start node and
 then requires exactly one `EncryptedData` in its subtree.
@@ -134,7 +138,9 @@ contain exactly one direct `CipherData` with one direct `CipherValue`. Each
 `EncryptedKey` must also contain exactly one direct `EncryptionMethod`;
 optional `DigestMethod`, `MGF`, and `OAEPparams` children must each occur at
 most once. Ambiguous or incomplete recipient metadata is rejected before key
-wrapping.
+wrapping. The content `EncryptionMethod` is validated under the same structural
+contract before encryption: optional `KeySize` is singular, positive, and must
+match the fixed AES algorithm URI, while OAEP-only children are rejected.
 When nested recipient `KeyInfo` already carries `RSAKeyValue`, an X.509
 certificate, or `DEREncodedKeyValue`, that cryptographic identity must match
 the selected RSA wrapping key. Unmatchable or contradictory metadata is

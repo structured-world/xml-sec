@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::Read as _,
     path::{Path, PathBuf},
 };
 
@@ -41,6 +42,8 @@ pub enum KeyMaterialError {
     Signature(String),
     #[error("invalid symmetric key length: expected {expected} bytes, got {actual}")]
     SymmetricLength { expected: usize, actual: usize },
+    #[error("symmetric key exceeds maximum {maximum} bytes")]
+    SymmetricTooLarge { maximum: usize },
     #[error("invalid operation policy: {0}")]
     Policy(#[from] PolicyViolation),
 }
@@ -178,8 +181,13 @@ fn signature_key_names(signature: roxmltree::Node<'_, '_>) -> Vec<String> {
         .into_iter()
         .flat_map(|key_info| key_info.children())
         .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
-        .filter_map(|key_name| key_name.text())
-        .map(str::to_owned)
+        .map(|key_name| {
+            key_name
+                .children()
+                .filter(roxmltree::Node::is_text)
+                .filter_map(|child| child.text())
+                .collect()
+        })
         .collect()
 }
 
@@ -353,7 +361,31 @@ pub fn load_symmetric(
 ) -> Result<Vec<u8>, KeyMaterialError> {
     // libxmlsec1's binary-key options consume the file verbatim. In particular,
     // ASCII bytes must not be guessed to be a textual Base64 representation.
-    let key = read(path)?;
+    const MAX_AES_KEY_BYTES: usize = 32;
+
+    let path = path.as_ref();
+    let maximum = expected.unwrap_or(MAX_AES_KEY_BYTES);
+    let mut key = Vec::with_capacity(maximum.saturating_add(1));
+    File::open(path)
+        .map_err(|source| KeyMaterialError::Read {
+            path: path.to_owned(),
+            source,
+        })?
+        .take(maximum.saturating_add(1) as u64)
+        .read_to_end(&mut key)
+        .map_err(|source| KeyMaterialError::Read {
+            path: path.to_owned(),
+            source,
+        })?;
+    if key.len() > maximum {
+        return match expected {
+            Some(expected) => Err(KeyMaterialError::SymmetricLength {
+                expected,
+                actual: key.len(),
+            }),
+            None => Err(KeyMaterialError::SymmetricTooLarge { maximum }),
+        };
+    }
     if let Some(expected) = expected
         && key.len() != expected
     {
@@ -411,6 +443,20 @@ mod tests {
     }
 
     #[test]
+    fn symmetric_key_loader_rejects_input_above_the_supported_ceiling() {
+        // Decryption does not know the exact AES width until it parses the
+        // ciphertext, but the CLI must still reject data beyond every supported
+        // AES key size instead of treating an arbitrary file as key material.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("oversized.key");
+        fs::write(&path, [0_u8; 33]).unwrap();
+
+        let error = load_symmetric(&path, None).unwrap_err();
+
+        assert!(error.to_string().contains("maximum 32 bytes"));
+    }
+
+    #[test]
     fn selected_signature_controls_verification_key_algorithm() {
         // Key decoding must inspect the same selected Signature as verification;
         // an unrelated earlier signature may use a different key family.
@@ -447,7 +493,7 @@ mod tests {
         // first KeyName makes later valid key-manager entries unreachable.
         let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
         let xml = format!(
-            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue><ds:KeyInfo><ds:KeyName>old</ds:KeyName><ds:KeyName>wanted</ds:KeyName></ds:KeyInfo></ds:Signature>"#
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue><ds:KeyInfo><ds:KeyName>old</ds:KeyName><ds:KeyName>wan<!--split-->ted</ds:KeyName></ds:KeyInfo></ds:Signature>"#
         );
 
         let metadata = verification_signature_metadata(

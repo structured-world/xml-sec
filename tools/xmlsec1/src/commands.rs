@@ -508,9 +508,13 @@ fn select_named_candidate<'a, T: Copy>(
     allow_unconstrained_named_singleton: bool,
     key_kind: &str,
 ) -> Result<(&'a crate::OptionValue, T), CommandError> {
+    if lax_key_search {
+        return candidates.first().copied().ok_or_else(|| {
+            CommandError::Usage(format!("no compatible {key_kind} input was supplied"))
+        });
+    }
     if let [selected] = candidates
         && (selected.0.parameter.is_none()
-            || lax_key_search
             || (requested_names.is_empty() && allow_unconstrained_named_singleton))
     {
         return Ok(*selected);
@@ -1321,10 +1325,10 @@ fn template_oaep_parameters(
         "OAEPparams",
         "EncryptionMethod contains more than one direct OAEPparams",
     )?
-    .and_then(|node| node.text())
     .map_or_else(
         || Ok(Vec::new()),
-        |encoded| {
+        |node| {
+            let encoded = direct_simple_text(node, "OAEPparams")?;
             base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
                 encoded.split_ascii_whitespace().collect::<String>(),
@@ -1354,6 +1358,19 @@ fn singleton_direct_child<'a, 'input>(
         return Err(CommandError::Encryption(cardinality_error.into()));
     }
     Ok(child)
+}
+
+fn direct_simple_text(node: Node<'_, '_>, field: &str) -> Result<String, CommandError> {
+    if node.children().any(|child| child.is_element()) {
+        return Err(CommandError::Encryption(format!(
+            "{field} must not contain element children"
+        )));
+    }
+    Ok(node
+        .children()
+        .filter(Node::is_text)
+        .filter_map(|child| child.text())
+        .collect())
 }
 
 fn oaep_digest_from_uri(uri: &str) -> Result<OaepDigestAlgorithm, CommandError> {
@@ -1613,7 +1630,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let encrypted_data = select_encrypted_data(&document, encrypted_data_id, &id_attributes)?;
     let standalone = encrypted_data == document.root_element();
     let content_key_name = encrypted_data_key_name(encrypted_data)?;
-    let recipient_key_names = encrypted_key_recipient_names(encrypted_data);
+    let recipient_key_names = encrypted_key_recipient_names(encrypted_data)?;
     let aes_keys = invocation.values("aes-key").collect::<Vec<_>>();
     let private_keys = ["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"]
         .into_iter()
@@ -1832,11 +1849,7 @@ fn encryption_template(
         "EncryptedData contains more than one direct EncryptionMethod",
     )?
     .ok_or_else(|| CommandError::Encryption("template has no encryption algorithm".into()))?;
-    let method = method_node
-        .attribute("Algorithm")
-        .ok_or_else(|| CommandError::Encryption("template has no encryption algorithm".into()))?;
-    let algorithm = DataEncryptionAlgorithm::from_uri(method)
-        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let algorithm = template_data_encryption_method(method_node)?;
     let explicit_encrypted_type = encrypted_data.attribute("Type").is_some();
     let encrypted_type = match encrypted_data.attribute("Type") {
         None | Some("http://www.w3.org/2001/04/xmlenc#Element") => EncryptedDataType::Element,
@@ -1890,6 +1903,49 @@ fn encrypted_data_key_name(encrypted_data: Node<'_, '_>) -> Result<Option<String
     )
 }
 
+fn template_data_encryption_method(
+    method: Node<'_, '_>,
+) -> Result<DataEncryptionAlgorithm, CommandError> {
+    let uri = method
+        .attribute("Algorithm")
+        .ok_or_else(|| CommandError::Encryption("template has no encryption algorithm".into()))?;
+    let algorithm = DataEncryptionAlgorithm::from_uri(uri)
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let mut key_size = None;
+    for child in method.children().filter(Node::is_element) {
+        if child.has_tag_name((XMLENC_NS, "KeySize")) && key_size.is_none() {
+            let value = direct_simple_text(child, "KeySize")?;
+            let bits = value.trim().parse::<usize>().map_err(|_| {
+                CommandError::Encryption("KeySize must be a positive integer".into())
+            })?;
+            if bits == 0 {
+                return Err(CommandError::Encryption(
+                    "KeySize must be a positive integer".into(),
+                ));
+            }
+            key_size = Some(bits);
+        } else if child.has_tag_name((XMLENC_NS, "KeySize")) {
+            return Err(CommandError::Encryption(
+                "EncryptionMethod contains more than one direct KeySize".into(),
+            ));
+        } else {
+            return Err(CommandError::Encryption(format!(
+                "unsupported EncryptionMethod child {}",
+                child.tag_name().name()
+            )));
+        }
+    }
+    if let Some(actual) = key_size {
+        let expected = algorithm.key_len() * 8;
+        if actual != expected {
+            return Err(CommandError::Encryption(format!(
+                "EncryptionMethod {uri} requires KeySize {expected}, got {actual}"
+            )));
+        }
+    }
+    Ok(algorithm)
+}
+
 fn optional_direct_child_text(
     parent: Node<'_, '_>,
     namespace: &str,
@@ -1901,23 +1957,24 @@ fn optional_direct_child_text(
         .filter(|node| node.has_tag_name((namespace, name)));
     let value = children
         .next()
-        .and_then(|node| node.text())
-        .map(str::to_owned);
+        .map(|node| direct_simple_text(node, name))
+        .transpose()?;
     if children.next().is_some() {
         return Err(CommandError::Encryption(duplicate_error.into()));
     }
     Ok(value)
 }
 
-fn encrypted_key_recipient_names(encrypted_data: Node<'_, '_>) -> Vec<String> {
+fn encrypted_key_recipient_names(
+    encrypted_data: Node<'_, '_>,
+) -> Result<Vec<String>, CommandError> {
     direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
         .into_iter()
         .flat_map(|key_info| key_info.children())
         .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
         .filter_map(|encrypted_key| direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo"))
         .filter_map(|key_info| direct_child_element(key_info, XMLDSIG_NS, "KeyName"))
-        .filter_map(|key_name| key_name.text())
-        .map(str::to_owned)
+        .map(|key_name| direct_simple_text(key_name, "KeyName"))
         .collect()
 }
 

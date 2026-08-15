@@ -22,8 +22,8 @@ is present, transformed data goes to the file while diagnostics remain on
 stdout. Verification output covers both successful and invalid results,
 including aggregate failures from authenticated Manifest references.
 
-`--aes-key` files are raw binary key material (`--aeskey` remains a compatible
-alias). Decrypting a standalone
+`--aes-key` files are bounded raw binary key material (`--aeskey` remains a
+compatible alias); they are never guessed to be Base64 text. Decrypting a standalone
 `EncryptedData` returns opaque decrypted bytes; embedded encrypted data uses
 in-document replacement and supports operation-start selection with
 `--node-id`. Encryption retains template metadata and RSA-OAEP parameters;
@@ -52,7 +52,8 @@ emits both named and unnamed AES key-store entries. `help-all` is generated from
 the parser registry. Named signing keys require a template `KeyName`; named
 verification and encryption/decryption options form key sets and require the
 selected XML `KeyName` to identify exactly one entry, unless lax lookup is
-explicit. Unnamed verification
+explicit. Lax lookup searches compatible entries in command-line order instead
+of enforcing XML identity metadata. Unnamed verification
 and encryption templates leave the sole explicit key unconstrained. Embedded
 X.509 certificates require a caller trust anchor unless `--insecure` is
 explicit; an explicit certificate remains a caller-pinned identity. Binary

@@ -1559,6 +1559,95 @@ fn named_aes_key_ring_selects_one_key_for_encryption_and_decryption() {
         .unwrap();
     assert!(!ambiguous.status.success());
     assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("multiple AES key"));
+
+    // Lax lookup intentionally ignores duplicate identity metadata and searches
+    // by key kind, so the first compatible entry can complete the round trip.
+    let lax_encrypted = temp.path().join("lax-encrypted.xml");
+    let lax_encrypt = Command::new(binary())
+        .args(["encrypt", "--lax-key-search", "--aes-key:selected"])
+        .arg(&matching_key)
+        .args(["--aes-key:selected"])
+        .arg(&wrong_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&lax_encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        lax_encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax_encrypt.stderr)
+    );
+    let lax_decrypt = Command::new(binary())
+        .args(["decrypt", "--lax-key-search", "--aes-key:selected"])
+        .arg(&matching_key)
+        .args(["--aes-key:selected"])
+        .arg(&wrong_key)
+        .arg(&lax_encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        lax_decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax_decrypt.stderr)
+    );
+    assert_eq!(lax_decrypt.stdout, b"selected AES key");
+}
+
+#[test]
+fn encryption_rejects_invalid_content_encryption_method_structure() {
+    // Encrypt must apply the same EncryptionMethod invariants as decrypt;
+    // otherwise it can emit ciphertext that its reciprocal parser rejects.
+    let temp = tempfile::tempdir().unwrap();
+    let plaintext = temp.path().join("plaintext.bin");
+    let key = temp.path().join("key.bin");
+    fs::write(&plaintext, b"method validation").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    for (case, children, expected) in [
+        (
+            "mismatched-key-size",
+            "<KeySize>192</KeySize>",
+            "requires KeySize 128",
+        ),
+        (
+            "duplicate-key-size",
+            "<KeySize>128</KeySize><KeySize>128</KeySize>",
+            "KeySize",
+        ),
+        (
+            "oaep-on-aes",
+            "<OAEPparams>YQ==</OAEPparams>",
+            "unsupported EncryptionMethod child",
+        ),
+    ] {
+        let template = temp.path().join(format!("{case}.xml"));
+        fs::write(
+            &template,
+            format!(
+                r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm">{children}</EncryptionMethod><CipherData><CipherValue/></CipherData></EncryptedData>"#
+            ),
+        )
+        .unwrap();
+
+        let output = Command::new(binary())
+            .args(["encrypt", "--aes-key"])
+            .arg(&key)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg(&template)
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "{case} unexpectedly succeeded");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
@@ -2569,6 +2658,53 @@ fn encryption_rejects_incomplete_or_ambiguous_recipient_methods() {
 }
 
 #[test]
+fn rsa_oaep_label_split_by_comment_round_trips() {
+    // XML simple content spans every direct text node. Keeping only the first
+    // side of a comment makes encryption and decryption use different labels.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("split-label.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    fs::write(&plaintext, b"comment-split OAEP label").unwrap();
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"><OAEPparams>YWJj<!--split-->ZA==</OAEPparams></EncryptionMethod><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--privkey-pem"])
+        .arg(&private_key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"comment-split OAEP label");
+}
+
+#[test]
 fn honors_legacy_rsa_oaep_parameters_from_the_template() {
     // Advertising rsa-oaep-mgf1p requires an actual process round trip, and
     // template parameters must drive key wrapping rather than only survive as XML.
@@ -3261,6 +3397,22 @@ fn multiple_signing_keys_require_the_matching_template_name() {
         .unwrap();
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown KeyName"));
+
+    // Lax lookup is type-based rather than identity-only and therefore remains
+    // effective when the explicit key set contains more than one RSA key.
+    let lax = Command::new(binary())
+        .args(["sign", "--lax-key-search", "--privkey-pem:first"])
+        .arg(&private_key)
+        .args(["--privkey-pem:second"])
+        .arg(&wrong_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        lax.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax.stderr)
+    );
 }
 
 #[test]
