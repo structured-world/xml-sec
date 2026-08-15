@@ -916,6 +916,119 @@ fn key_info_writer_populates_signed_key_info_before_reference_digests() {
         .expect("signed KeyInfo reference must verify without pipeline errors");
 
     assert_eq!(result.status, DsigStatus::Valid);
+    let document = roxmltree::Document::parse(&signed).expect("signed XML must parse");
+    let certificates = document
+        .descendants()
+        .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "X509Certificate")))
+        .collect::<Vec<_>>();
+    assert_eq!(certificates.len(), 1);
+    assert!(certificates[0].text().is_some_and(|text| !text.is_empty()));
+}
+
+#[test]
+fn key_info_writer_accepts_multiple_direct_child_fragments() {
+    // KeyInfoWriter returns child content, so sibling sources are valid output
+    // and must be merged without requiring a synthetic single root from callers.
+    struct MultiSourceWriter(X509CertificateKeyInfoWriter);
+
+    impl KeyInfoWriter for MultiSourceWriter {
+        fn write_key_info(
+            &self,
+            signing_key: &dyn SigningKey,
+        ) -> Result<String, xml_sec::xmldsig::KeyInfoWriteError> {
+            Ok(format!(
+                "<KeyName xmlns=\"{}\">selected</KeyName>{}",
+                "http://www.w3.org/2000/09/xmldsig#",
+                self.0.write_key_info(signing_key)?
+            ))
+        }
+    }
+
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let writer = MultiSourceWriter(
+        X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+            "tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+        ))
+        .expect("RSA certificate fixture must parse"),
+    );
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+
+    let signed = SignContext::new(&private_key)
+        .key_info_writer(&writer)
+        .sign_with_builder(
+            "<root><payload ID=\"payload\">hello</payload></root>",
+            &builder,
+        )
+        .expect("multiple KeyInfo child fragments must be accepted");
+    let result = xml_sec::xmldsig::VerifyContext::new()
+        .key_resolver(&DefaultKeyResolver::default())
+        .verify(&signed)
+        .expect("writer certificate must resolve");
+
+    assert_eq!(result.status, DsigStatus::Valid);
+    assert!(signed.contains(">selected</KeyName>"));
+}
+
+#[test]
+fn key_info_writer_replaces_stale_cryptographic_sources() {
+    // Writer-provided key material is authoritative. Keeping an older source
+    // first would make the default resolver verify with the wrong public key.
+    let stale_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-4096-key.pem"))
+            .expect("stale RSA private key fixture must parse");
+    let stale_writer = X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+        "tests/fixtures/keys/rsa/rsa-4096-cert.pem",
+    ))
+    .expect("stale RSA certificate fixture must parse");
+    let stale_source = stale_writer
+        .write_key_info(&stale_key)
+        .expect("stale KeyInfo source must render");
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let writer = X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+        "tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+    ))
+    .expect("RSA certificate fixture must parse");
+    let template = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        )
+        .build_template()
+        .expect("valid signature template")
+        .replace(
+            "<KeyInfo/>",
+            &format!("<KeyInfo><KeyName>selected</KeyName>{stale_source}</KeyInfo>"),
+        );
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">hello</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+
+    let signed = SignContext::new(&private_key)
+        .key_info_writer(&writer)
+        .sign_template(&xml)
+        .expect("authoritative KeyInfo source must replace stale material");
+    let result = xml_sec::xmldsig::VerifyContext::new()
+        .key_resolver(&DefaultKeyResolver::default())
+        .verify(&signed)
+        .expect("replacement certificate must resolve");
+
+    assert_eq!(result.status, DsigStatus::Valid);
+    assert!(signed.contains(">selected</KeyName>"));
+    assert_eq!(signed.matches("<X509Data").count(), 1);
 }
 
 #[test]

@@ -1104,8 +1104,16 @@ fn validate_recipient_key_metadata(
 }
 
 fn rsa_components_match(key: &RsaPublicKey, modulus: &[u8], exponent: &[u8]) -> bool {
-    key.n().to_be_bytes_trimmed_vartime().as_ref() == modulus
-        && key.e().to_be_bytes_trimmed_vartime().as_ref() == exponent
+    key.n().to_be_bytes_trimmed_vartime().as_ref() == trim_crypto_binary_zeroes(modulus)
+        && key.e().to_be_bytes_trimmed_vartime().as_ref() == trim_crypto_binary_zeroes(exponent)
+}
+
+fn trim_crypto_binary_zeroes(value: &[u8]) -> &[u8] {
+    let first_nonzero = value
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(value.len());
+    &value[first_nonzero..]
 }
 
 fn rsa_public_keys_match(left: &RsaPublicKey, right: &RsaPublicKey) -> bool {
@@ -1238,20 +1246,37 @@ fn apply_encryption_template(
                 .descendants()
                 .filter(|node| node.has_tag_name((XMLENC_NS, "CipherValue")))
                 .collect::<Vec<_>>();
-            if template_values.len() != generated_values.len() {
+            if template_values.is_empty() && !generated_values.is_empty() {
+                let generated_keys = generated_key_info
+                    .children()
+                    .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+                    .map(|node| standalone_element(generated, node))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if generated_keys.len() != generated_values.len() {
+                    return Err(CommandError::Encryption(
+                        "generated KeyInfo does not contain one direct EncryptedKey per recipient"
+                            .into(),
+                    ));
+                }
+                replacements.push((
+                    template_key_info.range(),
+                    append_element_children(template, template_key_info, &generated_keys.concat())?,
+                ));
+            } else if template_values.len() != generated_values.len() {
                 return Err(CommandError::Encryption(
                     "template KeyInfo does not contain one CipherValue per generated recipient"
                         .into(),
                 ));
+            } else {
+                replacements.extend(template_values.into_iter().zip(generated_values).map(
+                    |(template_value, generated_value)| {
+                        (
+                            template_value.range(),
+                            standalone_cipher_value(generated_value),
+                        )
+                    },
+                ));
             }
-            replacements.extend(template_values.into_iter().zip(generated_values).map(
-                |(template_value, generated_value)| {
-                    (
-                        template_value.range(),
-                        standalone_cipher_value(generated_value),
-                    )
-                },
-            ));
         }
         (None, Some(generated_key_info)) => {
             let cipher_data = direct_child_element(template_data, XMLENC_NS, "CipherData")
@@ -1271,6 +1296,36 @@ fn apply_encryption_template(
     }
     parse_encryption_document(&output, policy)?;
     Ok(output)
+}
+
+fn append_element_children(
+    source: &str,
+    node: roxmltree::Node<'_, '_>,
+    children: &str,
+) -> Result<String, CommandError> {
+    let fragment = &source[node.range()];
+    if fragment.trim_end().ends_with("/>") {
+        let empty_end = fragment
+            .rfind("/>")
+            .ok_or_else(|| CommandError::Encryption("template KeyInfo is malformed".into()))?;
+        let name_end = fragment[1..]
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '/' | '>'))
+            .map(|offset| offset + 1)
+            .ok_or_else(|| CommandError::Encryption("template KeyInfo is malformed".into()))?;
+        let qualified_name = &fragment[1..name_end];
+        return Ok(format!(
+            "{}>{children}</{qualified_name}>",
+            &fragment[..empty_end]
+        ));
+    }
+    let closing = fragment
+        .rfind("</")
+        .ok_or_else(|| CommandError::Encryption("template KeyInfo is malformed".into()))?;
+    Ok(format!(
+        "{}{children}{}",
+        &fragment[..closing],
+        &fragment[closing..]
+    ))
 }
 
 fn opening_tag_end(fragment: &str) -> Option<usize> {
@@ -1888,6 +1943,31 @@ mod tests {
             document
                 .descendants()
                 .any(|node| node.has_tag_name(("http://www.w3.org/2009/xmlenc11#", "MGF")))
+        );
+    }
+
+    #[test]
+    fn generated_recipient_expands_an_empty_key_info_placeholder() {
+        // An empty KeyInfo reserves the schema position but not an EncryptedKey
+        // skeleton; generated recipient metadata must expand it in place.
+        let template = format!(
+            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><e:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><s:KeyInfo/><e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedData>"
+        );
+        let generated = format!(
+            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><e:EncryptedKey><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
+        );
+
+        let rendered =
+            apply_encryption_template(&template, &generated, None, &EncryptionPolicy::default())
+                .expect("empty KeyInfo must accept a generated recipient");
+        let document = Document::parse(&rendered).expect("merged output must parse");
+
+        assert_eq!(
+            document
+                .descendants()
+                .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+                .count(),
+            1
         );
     }
 

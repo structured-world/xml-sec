@@ -8,7 +8,9 @@ use std::{
 use base64::Engine as _;
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
-    pkcs8::{DecodePrivateKey as _, DecodePublicKey as _, EncodePrivateKey as _},
+    pkcs8::{
+        DecodePrivateKey as _, DecodePublicKey as _, EncodePrivateKey as _, EncodePublicKey as _,
+    },
     traits::PublicKeyParts as _,
 };
 use xml_sec::{
@@ -44,12 +46,30 @@ fn signature_template_without_key_info() -> &'static str {
 </Signature>"##
 }
 
-fn rsa_key_value(public_key: &RsaPublicKey) -> String {
+fn rsa_key_value_with_leading_zeroes(
+    public_key: &RsaPublicKey,
+    modulus_zeroes: usize,
+    exponent_zeroes: usize,
+) -> String {
     let base64 = &base64::engine::general_purpose::STANDARD;
+    let mut modulus = vec![0; modulus_zeroes];
+    modulus.extend(public_key.n().to_be_bytes_trimmed_vartime());
+    let mut exponent = vec![0; exponent_zeroes];
+    exponent.extend(public_key.e().to_be_bytes_trimmed_vartime());
     format!(
         "<ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{}</ds:Modulus><ds:Exponent>{}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue>",
-        base64.encode(public_key.n().to_be_bytes_trimmed_vartime()),
-        base64.encode(public_key.e().to_be_bytes_trimmed_vartime())
+        base64.encode(modulus),
+        base64.encode(exponent)
+    )
+}
+
+fn der_encoded_key_value(public_key: &RsaPublicKey) -> String {
+    let der = public_key
+        .to_public_key_der()
+        .expect("fixture public key must encode as SPKI");
+    format!(
+        "<dsig11:DEREncodedKeyValue xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\">{}</dsig11:DEREncodedKeyValue>",
+        base64::engine::general_purpose::STANDARD.encode(der.as_bytes())
     )
 }
 
@@ -239,6 +259,24 @@ fn xml_debug_reports_authenticated_manifest_reference_failure_at_the_root() {
     let root = document.root_element();
     assert_eq!(root.attribute("status"), Some("FAILED"));
     assert_eq!(root.attribute("failureReason"), Some("REFERENCE"));
+    let signed_info_statuses = root
+        .children()
+        .find(|node| node.has_tag_name("SignedInfoReferences"))
+        .expect("SignedInfo diagnostics")
+        .children()
+        .filter(|node| node.has_tag_name("ReferenceVerificationContext"))
+        .filter_map(|node| node.attribute("status"))
+        .collect::<Vec<_>>();
+    let manifest_statuses = root
+        .children()
+        .find(|node| node.has_tag_name("ManifestReferences"))
+        .expect("Manifest diagnostics")
+        .children()
+        .filter(|node| node.has_tag_name("ReferenceVerificationContext"))
+        .filter_map(|node| node.attribute("status"))
+        .collect::<Vec<_>>();
+    assert_eq!(signed_info_statuses, ["OK"]);
+    assert_eq!(manifest_statuses, ["FAILED"]);
 }
 
 #[test]
@@ -1404,7 +1442,7 @@ fn rsa_encryption_rejects_stale_recipient_key_value_metadata() {
         &template,
         format!(
             r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo>{}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
-            rsa_key_value(&matching)
+            rsa_key_value_with_leading_zeroes(&matching, 1, 2)
         ),
     )
     .unwrap();
@@ -1438,6 +1476,53 @@ fn rsa_encryption_rejects_stale_recipient_key_value_metadata() {
         "{}",
         String::from_utf8_lossy(&rejected.stderr)
     );
+}
+
+#[test]
+fn rsa_encryption_validates_der_encoded_recipient_metadata() {
+    // DEREncodedKeyValue identifies the wrapping recipient just like
+    // RSAKeyValue and X509Data: matching SPKI is accepted, stale SPKI is not.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("der-recipient-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let matching_path = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let mismatching_path = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let matching =
+        RsaPublicKey::from_public_key_pem(&fs::read_to_string(&matching_path).unwrap()).unwrap();
+    fs::write(
+        &template,
+        format!(
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo>{}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+            der_encoded_key_value(&matching)
+        ),
+    )
+    .unwrap();
+    fs::write(&plaintext, b"DER recipient identity").unwrap();
+
+    let accepted = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&matching_path)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+
+    let rejected = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&mismatching_path)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("recipient key metadata"));
 }
 
 #[test]
@@ -1541,6 +1626,67 @@ fn named_rsa_key_ring_selects_one_recipient_for_encryption_and_decryption() {
         String::from_utf8_lossy(&decrypt.stderr)
     );
     assert_eq!(decrypt.stdout, b"selected RSA recipient");
+}
+
+#[test]
+fn rsa_encryption_populates_an_existing_key_info_container() {
+    // A template may reserve KeyInfo for non-cryptographic metadata without
+    // pre-creating EncryptedKey. Encryption must add the generated recipient
+    // while preserving those sibling sources.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("key-info-container-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><ds:KeyName>content-key</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"existing KeyInfo container").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    let encrypted_xml = fs::read_to_string(&encrypted).unwrap();
+    let document = roxmltree::Document::parse(&encrypted_xml).unwrap();
+    assert!(document.descendants().any(|node| {
+        node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName"))
+            && node.text() == Some("content-key")
+    }));
+    assert_eq!(
+        document
+            .descendants()
+            .filter(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "EncryptedKey")))
+            .count(),
+        1
+    );
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--privkey-pem"])
+        .arg(&private_key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"existing KeyInfo container");
 }
 
 #[test]

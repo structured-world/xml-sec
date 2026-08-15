@@ -336,6 +336,92 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
     let document = parse_with_options(xml, policy)?;
+    let Some(signature) = signature_node(&document, target_signature) else {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "Signature",
+            expected: 1,
+            actual: 0,
+        });
+    };
+    let key_infos = signature
+        .children()
+        .filter(|node| is_dsig_node(*node, "KeyInfo"))
+        .collect::<Vec<_>>();
+    if key_infos.len() != 1 {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "KeyInfo",
+            expected: key_infos.len(),
+            actual: 1,
+        });
+    }
+    let key_info = key_infos[0];
+
+    // The writer contract is XML child content, not a standalone document.
+    // Parse it under the template's namespace context so multiple siblings and
+    // inherited prefixes have exactly the semantics they will have in KeyInfo.
+    let wrapped_source = wrap_key_info_children(key_info_source, key_info);
+    let source_document = roxmltree::Document::parse(&wrapped_source)?;
+    let sources = source_document
+        .root_element()
+        .children()
+        .filter(|node| node.is_element())
+        .map(|node| {
+            Ok((
+                node.tag_name().namespace().map(str::to_owned),
+                node.tag_name().name().to_owned(),
+                standalone_element(&wrapped_source, node)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, XmlMutationError>>()?;
+    if sources.is_empty() {
+        return Err(XmlMutationError::InvalidAppendTarget);
+    }
+
+    let generated_key_sources = sources
+        .iter()
+        .filter(|(namespace, name, _)| is_cryptographic_key_info_source(namespace.as_deref(), name))
+        .map(|(namespace, name, _)| (namespace.as_deref(), name.as_str()))
+        .collect::<Vec<_>>();
+    let mut output = xml.to_owned();
+    if !generated_key_sources.is_empty() {
+        // Writer-provided cryptographic identity is authoritative. Retaining a
+        // populated template source could make a resolver select a stale key;
+        // selection metadata and extension elements remain untouched.
+        let mut stale_ranges = key_info
+            .children()
+            .filter(|node| node.is_element())
+            .filter(|node| {
+                is_cryptographic_key_info_source(
+                    node.tag_name().namespace(),
+                    node.tag_name().name(),
+                ) && !is_matching_empty_placeholder(*node, &generated_key_sources)
+            })
+            .map(|node| node.range())
+            .collect::<Vec<_>>();
+        stale_ranges.sort_by_key(|range| std::cmp::Reverse(range.start));
+        for range in stale_ranges {
+            output.replace_range(range, "");
+        }
+    }
+
+    for (_, _, source) in sources {
+        output = merge_one_key_info_source_at_index_with_options(
+            &output,
+            &source,
+            target_signature,
+            policy,
+        )?;
+    }
+    Ok(output)
+}
+
+fn merge_one_key_info_source_at_index_with_options(
+    xml: &str,
+    key_info_source: &str,
+    target_signature: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError> {
+    let document = parse_with_options(xml, policy)?;
     let source_document = roxmltree::Document::parse(key_info_source)?;
     let source = source_document.root_element();
     let source_content = element_inner_xml(key_info_source, source.range())?;
@@ -359,30 +445,35 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     }
     let key_info = key_infos[0];
 
-    // A writer contributes one KeyInfo source, not the whole KeyInfo value.
-    // Fill an empty matching placeholder when present; otherwise append the
-    // source while preserving every template-provided sibling and its order.
     if let Some(placeholder) = key_info.children().find(|node| {
         node.is_element()
             && node.tag_name() == source.tag_name()
             && !node.children().any(|child| child.is_element())
             && node.text().is_none_or(|text| text.trim().is_empty())
     }) {
-        let generated_namespace_attributes = source
-            .namespaces()
-            .filter(|namespace| {
-                placeholder.lookup_namespace_uri(namespace.name()) != Some(namespace.uri())
-            })
-            .map(|namespace| {
-                let attribute = namespace
-                    .name()
-                    .map_or_else(|| "xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
-                format!(
-                    " {attribute}=\"{}\"",
-                    quick_xml::escape::escape(namespace.uri())
-                )
-            })
-            .collect::<String>();
+        let generated_namespace_attributes =
+            source
+                .namespaces()
+                .try_fold(String::new(), |mut attributes, namespace| {
+                    let current = placeholder.lookup_namespace_uri(namespace.name());
+                    if current == Some(namespace.uri()) {
+                        return Ok(attributes);
+                    }
+                    let inherited = placeholder
+                        .parent_element()
+                        .and_then(|parent| parent.lookup_namespace_uri(namespace.name()));
+                    if current.is_some() && current != inherited {
+                        return Err(XmlMutationError::InvalidAppendTarget);
+                    }
+                    let attribute = namespace
+                        .name()
+                        .map_or_else(|| "xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
+                    attributes.push_str(&format!(
+                        " {attribute}=\"{}\"",
+                        quick_xml::escape::escape(namespace.uri())
+                    ));
+                    Ok(attributes)
+                })?;
         let output = replace_element_content(
             xml,
             placeholder.range(),
@@ -423,6 +514,76 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     }
     parse_with_options(&output, policy)?;
     Ok(output)
+}
+
+fn wrap_key_info_children(source: &str, key_info: roxmltree::Node<'_, '_>) -> String {
+    let mut wrapper = String::from("<KeyInfoFragment");
+    for namespace in key_info.namespaces() {
+        let declaration = namespace
+            .name()
+            .map_or_else(|| "xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
+        wrapper.push_str(&format!(
+            " {declaration}=\"{}\"",
+            quick_xml::escape::escape(namespace.uri())
+        ));
+    }
+    wrapper.push('>');
+    wrapper.push_str(source);
+    wrapper.push_str("</KeyInfoFragment>");
+    wrapper
+}
+
+fn standalone_element(
+    source: &str,
+    node: roxmltree::Node<'_, '_>,
+) -> Result<String, XmlMutationError> {
+    let fragment = &source[node.range()];
+    let opening_end = element_opening_end(fragment).ok_or(XmlMutationError::InvalidAppendTarget)?;
+    let opening = &fragment[..opening_end - 1];
+    let name_end = opening[1..]
+        .find(|character: char| character.is_ascii_whitespace())
+        .map_or(opening.len(), |offset| offset + 1);
+    let namespace_insertion = opening.strip_suffix('/').map_or(opening.len(), str::len);
+    let mut output = opening[..namespace_insertion].to_owned();
+    for namespace in node.namespaces() {
+        let declaration = namespace
+            .name()
+            .map_or_else(|| "xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
+        if !opening[name_end..].contains(&format!("{declaration}=")) {
+            output.push_str(&format!(
+                " {declaration}=\"{}\"",
+                quick_xml::escape::escape(namespace.uri())
+            ));
+        }
+    }
+    output.push_str(&opening[namespace_insertion..]);
+    output.push_str(&fragment[opening_end - 1..]);
+    Ok(output)
+}
+
+fn is_matching_empty_placeholder(
+    node: roxmltree::Node<'_, '_>,
+    generated_sources: &[(Option<&str>, &str)],
+) -> bool {
+    generated_sources.iter().any(|(namespace, name)| {
+        node.tag_name().namespace() == *namespace
+            && node.tag_name().name() == *name
+            && !node.children().any(|child| child.is_element())
+            && node.text().is_none_or(|text| text.trim().is_empty())
+    })
+}
+
+fn is_cryptographic_key_info_source(namespace: Option<&str>, name: &str) -> bool {
+    matches!(
+        (namespace, name),
+        (
+            Some(XMLDSIG_NS),
+            "KeyValue" | "RetrievalMethod" | "X509Data" | "PGPData" | "SPKIData"
+        ) | (
+            Some("http://www.w3.org/2009/xmldsig11#"),
+            "DEREncodedKeyValue" | "KeyInfoReference"
+        )
+    )
 }
 
 fn element_inner_xml(xml: &str, range: Range<usize>) -> Result<&str, XmlMutationError> {
@@ -1164,5 +1325,18 @@ mod tests {
                 .children()
                 .any(|node| node.has_tag_name(("urn:example:key-info", "Metadata")))
         );
+    }
+
+    #[test]
+    fn key_info_source_merge_rejects_conflicting_placeholder_namespaces() {
+        // A generated child cannot reuse a prefix that the placeholder owns
+        // with another URI; emitting both declarations would create invalid XML.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo><ds:X509Data xmlns:ext="urn:template"/></ds:KeyInfo></ds:Signature>"#;
+        let generated = r#"<X509Data xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:ext="urn:writer"><ext:Metadata/></X509Data>"#;
+
+        let error = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect_err("conflicting namespace bindings must fail before serialization");
+
+        assert!(matches!(error, XmlMutationError::InvalidAppendTarget));
     }
 }
