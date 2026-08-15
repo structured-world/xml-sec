@@ -90,6 +90,9 @@ one key unless lax lookup is requested; unnamed templates still use their sole
 explicit verification or encryption key. Certificate companions are validated
 even when no output `KeyInfo` placeholder is present; embedding a chain fills an
 empty `X509Data` placeholder without discarding sibling `KeyInfo` sources.
+Populated `KeyInfo` is materialized before reference digests, allowing it to be
+signed by ID. Preserved XMLEnc recipient key or certificate metadata must match
+the selected RSA wrapping key instead of describing a stale recipient.
 document-supplied X.509 certificates require a caller trust anchor unless
 `--insecure` is explicit. XML payload encryption materializes inferred Element
 metadata, and direct AES keys reject templates containing recipient

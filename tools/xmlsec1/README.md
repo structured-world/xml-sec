@@ -17,7 +17,8 @@ coverage.
 The parser rejects repeated singleton options, including mixed canonical and
 alias spellings, while preserving donor multi-value key and certificate inputs.
 `--print-debug` is text; `--print-xml-debug` emits a parseable donor-shaped
-`VerificationContext` for both successful and invalid verification results.
+`VerificationContext` for both successful and invalid verification results,
+including aggregate failures from authenticated Manifest references.
 
 `--aes-key` files are raw binary key material (`--aeskey` remains a compatible
 alias). Decrypting a standalone
@@ -28,6 +29,9 @@ signing accepts PKCS#1 RSA and unencrypted PKCS#8 private keys, verification
 accepts SPKI, PKCS#1 RSA public keys, and X.509 certificates, and RSA encryption
 accepts public keys or recipient certificates. Supported formats are normalized
 into the corresponding core pipeline from PEM or DER.
+Preserved recipient `RSAKeyValue`, X.509 certificate, and
+`DEREncodedKeyValue` metadata must identify the selected RSA wrapping key;
+contradictory metadata fails before ciphertext is emitted.
 Untyped `--xml-data` templates gain the inferred XML Element type, while direct
 AES keys reject recipient `EncryptedKey` templates they cannot refresh.
 Signing options validate every certificate from `key,leaf,intermediate,...` and embed the chain

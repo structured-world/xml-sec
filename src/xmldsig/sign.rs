@@ -736,9 +736,11 @@ impl<'a> SignContext<'a> {
     /// Sign XML that already contains a `<Signature>` template.
     ///
     /// The template must include empty `<DigestValue>` and `<SignatureValue>`
-    /// targets. The pipeline fills reference digests, reparses the result,
-    /// canonicalizes `<SignedInfo>`, signs those canonical bytes, and fills the
-    /// base64 `<SignatureValue>`.
+    /// targets. The pipeline first materializes configured `<KeyInfo>` content,
+    /// then fills reference digests, reparses the result, canonicalizes
+    /// `<SignedInfo>`, signs those canonical bytes, and fills the base64
+    /// `<SignatureValue>`. This ordering permits `<KeyInfo>` to be referenced
+    /// from `<SignedInfo>` without producing a stale digest.
     pub fn sign_template(&self, xml: &str) -> Result<String, SigningError> {
         self.policy.validate()?;
         self.policy.resources.validate_xml_document_len(xml.len())?;
@@ -757,8 +759,24 @@ impl<'a> SignContext<'a> {
         let transform_options = TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.xpath_here_semantics);
+        let with_key_info = if let Some(writer) = self.key_info_writer {
+            let key_info_content = writer.write_key_info(self.signing_key)?;
+            let populated = merge_key_info_source_at_index_with_options(
+                xml,
+                &key_info_content,
+                target_signature,
+                Some(&self.policy),
+            )?;
+            self.policy
+                .resources
+                .validate_xml_document_len(populated.len())?;
+            Some(populated)
+        } else {
+            None
+        };
+        let prepared_xml = with_key_info.as_deref().unwrap_or(xml);
         let with_digests = fill_reference_digest_values_with_options(
-            xml,
+            prepared_xml,
             transform_options,
             Some(&self.policy),
             self.provider,
@@ -806,21 +824,7 @@ impl<'a> SignContext<'a> {
         self.policy
             .resources
             .validate_xml_document_len(signed.len())?;
-        if let Some(writer) = self.key_info_writer {
-            let key_info_content = writer.write_key_info(self.signing_key)?;
-            let signed = merge_key_info_source_at_index_with_options(
-                &signed,
-                &key_info_content,
-                target_signature,
-                Some(&self.policy),
-            )?;
-            self.policy
-                .resources
-                .validate_xml_document_len(signed.len())?;
-            Ok(signed)
-        } else {
-            Ok(signed)
-        }
+        Ok(signed)
     }
 
     /// Build a signature template, append it to the selected start node (or

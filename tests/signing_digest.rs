@@ -872,6 +872,53 @@ fn signs_rsa_template_with_embedded_x509_key_info() {
 }
 
 #[test]
+fn key_info_writer_populates_signed_key_info_before_reference_digests() {
+    // KeyInfo may itself be a signed reference. Populate its template source
+    // before digesting so the final embedded certificate is what was signed.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let key_info_writer = X509CertificateKeyInfoWriter::from_pem(&read_fixture(
+        "tests/fixtures/keys/rsa/rsa-2048-cert.pem",
+    ))
+    .expect("RSA certificate fixture must parse");
+    let template = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        )
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#key-info")
+                .transform(Transform::C14n(exclusive_c14n())),
+        )
+        .build_template()
+        .expect("valid signature template")
+        .replace(
+            "<KeyInfo/>",
+            "<KeyInfo Id=\"key-info\"><X509Data/></KeyInfo>",
+        );
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">hello</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+
+    let signed = SignContext::new(&private_key)
+        .key_info_writer(&key_info_writer)
+        .sign_template(&xml)
+        .expect("signed KeyInfo template must succeed");
+    let result = xml_sec::xmldsig::VerifyContext::new()
+        .key_resolver(&DefaultKeyResolver::default())
+        .verify(&signed)
+        .expect("signed KeyInfo reference must verify without pipeline errors");
+
+    assert_eq!(result.status, DsigStatus::Valid);
+}
+
+#[test]
 fn key_info_writer_requires_direct_template_placeholder() {
     // The writer is intentionally opt-in and template-scoped. Without a direct
     // KeyInfo slot, signing fails instead of inventing insertion policy.

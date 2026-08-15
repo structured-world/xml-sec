@@ -5,15 +5,18 @@ use std::{
     process::{Command, Stdio},
 };
 
+use base64::Engine as _;
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
     pkcs8::{DecodePrivateKey as _, DecodePublicKey as _, EncodePrivateKey as _},
+    traits::PublicKeyParts as _,
 };
 use xml_sec::{
     c14n::{C14nAlgorithm, C14nMode},
     xmldsig::{
         DigestAlgorithm, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
         SignatureBuilder, Transform, XPathExpression, XPathHereSemantics,
+        mutation::append_signature_to_root,
     },
     xmlenc::{DataEncryptionAlgorithm, EncryptedDataBuilder, EncryptionRecipient},
 };
@@ -39,6 +42,23 @@ fn signature_template_without_key_info() -> &'static str {
 <SignatureValue/>
 <Object Id="object">payload</Object>
 </Signature>"##
+}
+
+fn rsa_key_value(public_key: &RsaPublicKey) -> String {
+    let base64 = &base64::engine::general_purpose::STANDARD;
+    format!(
+        "<ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{}</ds:Modulus><ds:Exponent>{}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue>",
+        base64.encode(public_key.n().to_be_bytes_trimmed_vartime()),
+        base64.encode(public_key.e().to_be_bytes_trimmed_vartime())
+    )
+}
+
+fn x509_certificate_value(path: &Path) -> String {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&fs::read(path).unwrap()).unwrap();
+    format!(
+        "<ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data>",
+        base64::engine::general_purpose::STANDARD.encode(pem.contents)
+    )
 }
 
 #[test]
@@ -150,6 +170,75 @@ fn xml_debug_verification_output_matches_the_donor_xml_contract() {
     let invalid_root = invalid_document.root_element();
     assert_eq!(invalid_root.attribute("status"), Some("FAILED"));
     assert_eq!(invalid_root.attribute("failureReason"), Some("REFERENCE"));
+}
+
+#[test]
+fn xml_debug_reports_authenticated_manifest_reference_failure_at_the_root() {
+    // A Manifest digest failure invalidates the CLI operation even when the
+    // outer SignedInfo and SignatureValue remain cryptographically valid.
+    let temp = tempfile::tempdir().unwrap();
+    let private_key_pem =
+        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .unwrap();
+    let private_key = RsaSigningKey::from_pkcs8_pem(&private_key_pem).unwrap();
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let c14n = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
+    let digest_probe = SignatureBuilder::new(c14n.clone(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#manifest-payload")
+                .transform(Transform::C14n(c14n.clone())),
+        );
+    let probe = SignContext::new(&private_key)
+        .sign_with_builder(
+            "<root><payload Id=\"manifest-payload\">original</payload></root>",
+            &digest_probe,
+        )
+        .unwrap();
+    let probe_document = roxmltree::Document::parse(&probe).unwrap();
+    let manifest_digest = probe_document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue")))
+        .and_then(|node| node.text())
+        .unwrap();
+    let template = SignatureBuilder::new(c14n.clone(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#manifest")
+                .transform(Transform::C14n(c14n)),
+        )
+        .build_template()
+        .unwrap()
+        .replace(
+            "</Signature>",
+            &format!(
+                "<Object><Manifest Id=\"manifest\"><Reference URI=\"#manifest-payload\"><DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/><DigestValue>{manifest_digest}</DigestValue></Reference></Manifest></Object></Signature>"
+            ),
+        );
+    let unsigned = append_signature_to_root(
+        "<root><payload Id=\"manifest-payload\">original</payload></root>",
+        &template,
+    )
+    .unwrap();
+    let signed = SignContext::new(&private_key)
+        .sign_template(&unsigned)
+        .unwrap();
+    let tampered = temp.path().join("manifest-tampered.xml");
+    fs::write(&tampered, signed.replace(">original<", ">tampered<")).unwrap();
+
+    let output = Command::new(binary())
+        .args(["verify", "--print-xml-debug", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&tampered)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let diagnostics = String::from_utf8(output.stdout).unwrap();
+    let document = roxmltree::Document::parse(&diagnostics).unwrap();
+    let root = document.root_element();
+    assert_eq!(root.attribute("status"), Some("FAILED"));
+    assert_eq!(root.attribute("failureReason"), Some("REFERENCE"));
 }
 
 #[test]
@@ -1298,6 +1387,107 @@ fn rsa_recipient_name_must_match_the_template_unless_lax() {
         String::from_utf8_lossy(&lax_decrypt.stderr)
     );
     assert_eq!(lax_decrypt.stdout, b"named recipient");
+}
+
+#[test]
+fn rsa_encryption_rejects_stale_recipient_key_value_metadata() {
+    // A template KeyValue is a cryptographic identity, not a selection hint.
+    // Preserving it while wrapping for another key would emit contradictory XML.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("rsa-key-value-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let matching_path = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let mismatching_path = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let matching =
+        RsaPublicKey::from_public_key_pem(&fs::read_to_string(&matching_path).unwrap()).unwrap();
+    fs::write(
+        &template,
+        format!(
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo>{}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+            rsa_key_value(&matching)
+        ),
+    )
+    .unwrap();
+    fs::write(&plaintext, b"recipient identity").unwrap();
+
+    let accepted = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&matching_path)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+
+    let rejected = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&mismatching_path)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("recipient key metadata"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn rsa_encryption_rejects_stale_recipient_certificate_metadata() {
+    // X509Data identifies the same recipient as the wrapped content key. A
+    // certificate for another key must fail before any contradictory output.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("x509-recipient-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    let matching_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let mismatching_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    fs::write(
+        &template,
+        format!(
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo>{}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+            x509_certificate_value(&certificate)
+        ),
+    )
+    .unwrap();
+    fs::write(&plaintext, b"certificate recipient identity").unwrap();
+
+    let accepted = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&matching_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+
+    let rejected = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&mismatching_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("recipient key metadata"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
 }
 
 #[test]

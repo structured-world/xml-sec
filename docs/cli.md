@@ -64,8 +64,10 @@ validated, and the first certificate must contain the signing key. When the
 template contains the optional direct `KeyInfo`
 placeholder, the chain is embedded there in order under `X509Data`. An empty
 `X509Data` child is populated in place, preserving sibling sources such as the
-`KeyName` used to select the signing key; omitting `KeyInfo` leaves the signed
-output without `KeyInfo`. Named signing keys
+`KeyName` used to select the signing key and attributes such as an `Id`. KeyInfo
+materialization occurs before reference digest computation, so a template may
+sign its populated `KeyInfo` by ID. Omitting `KeyInfo` leaves the signed output
+without `KeyInfo`. Named signing keys
 require a matching template `KeyName` even when only one key is supplied. A
 named key with no template `KeyName` fails unless `--lax-key-search` explicitly
 opts out of lookup. Verification and encryption instead leave a `KeyName`-less
@@ -110,6 +112,12 @@ then requires exactly one `EncryptedData` in its subtree.
 Encryption preserves the template's `Id`, `Type`, `MimeType`, `KeyInfo`,
 `EncryptionProperties`, and RSA-OAEP parameters while replacing only the
 cryptographic `CipherValue` payloads.
+When nested recipient `KeyInfo` already carries `RSAKeyValue`, an X.509
+certificate, or `DEREncodedKeyValue`, that cryptographic identity must match
+the selected RSA wrapping key. Unmatchable or contradictory metadata is
+rejected before encryption rather than being preserved beside ciphertext for
+a different recipient. `KeyName` remains a lookup hint and empty `X509Data`
+remains a non-binding placeholder.
 For `--xml-data`, a missing template `Type` is materialized as XML Element
 metadata so a later embedded-document decrypt can perform XML replacement.
 Repeatable AES or RSA key options form a key set. A direct content-key `KeyName`

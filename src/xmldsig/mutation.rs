@@ -338,6 +338,7 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     let document = parse_with_options(xml, policy)?;
     let source_document = roxmltree::Document::parse(key_info_source)?;
     let source = source_document.root_element();
+    let source_content = element_inner_xml(key_info_source, source.range())?;
     let Some(signature) = signature_node(&document, target_signature) else {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "Signature",
@@ -367,8 +368,27 @@ pub(super) fn merge_key_info_source_at_index_with_options(
             && !node.children().any(|child| child.is_element())
             && node.text().is_none_or(|text| text.trim().is_empty())
     }) {
-        let mut output = xml.to_owned();
-        output.replace_range(placeholder.range(), key_info_source);
+        let generated_namespace_attributes = source
+            .namespaces()
+            .filter(|namespace| {
+                placeholder.lookup_namespace_uri(namespace.name()) != Some(namespace.uri())
+            })
+            .map(|namespace| {
+                let attribute = namespace
+                    .name()
+                    .map_or_else(|| "xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
+                format!(
+                    " {attribute}=\"{}\"",
+                    quick_xml::escape::escape(namespace.uri())
+                )
+            })
+            .collect::<String>();
+        let output = replace_element_content(
+            xml,
+            placeholder.range(),
+            source_content,
+            &generated_namespace_attributes,
+        )?;
         parse_with_options(&output, policy)?;
         return Ok(output);
     }
@@ -403,6 +423,79 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     }
     parse_with_options(&output, policy)?;
     Ok(output)
+}
+
+fn element_inner_xml(xml: &str, range: Range<usize>) -> Result<&str, XmlMutationError> {
+    let element = &xml[range];
+    if element.trim_end().ends_with("/>") {
+        return Ok("");
+    }
+    let content_start =
+        element_opening_end(element).ok_or(XmlMutationError::InvalidAppendTarget)?;
+    let content_end = element
+        .rfind("</")
+        .ok_or(XmlMutationError::InvalidAppendTarget)?;
+    Ok(&element[content_start..content_end])
+}
+
+fn replace_element_content(
+    xml: &str,
+    range: Range<usize>,
+    content: &str,
+    namespace_attributes: &str,
+) -> Result<String, XmlMutationError> {
+    let element = &xml[range.clone()];
+    let mut output = xml.to_owned();
+    if element.trim_end().ends_with("/>") {
+        let name_end = element[1..]
+            .find(|character: char| {
+                character.is_ascii_whitespace() || character == '/' || character == '>'
+            })
+            .map(|offset| offset + 1)
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let qualified_name = &element[1..name_end];
+        let empty_end = element
+            .rfind("/>")
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        output.replace_range(
+            range,
+            &format!(
+                "{}{}>{}</{}>",
+                &element[..empty_end],
+                namespace_attributes,
+                content,
+                qualified_name
+            ),
+        );
+    } else {
+        let content_start =
+            element_opening_end(element).ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let content_end = element
+            .rfind("</")
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let replacement = format!(
+            "{}{}>{}{}",
+            &element[..content_start - 1],
+            namespace_attributes,
+            content,
+            &element[content_end..]
+        );
+        output.replace_range(range, &replacement);
+    }
+    Ok(output)
+}
+
+fn element_opening_end(fragment: &str) -> Option<usize> {
+    let mut quote = None;
+    for (offset, character) in fragment.char_indices() {
+        match (quote, character) {
+            (None, '\'' | '"') => quote = Some(character),
+            (Some(delimiter), current) if delimiter == current => quote = None,
+            (None, '>') => return Some(offset + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn fill_dsig_values<I, S>(
@@ -1041,5 +1134,35 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(values, ["outer-new", "inner-keep"]);
+    }
+
+    #[test]
+    fn key_info_source_merge_preserves_placeholder_attributes() {
+        // Placeholder identity can be referenced from SignedInfo, so filling
+        // its children must not replace the element that owns the ID.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo><ds:X509Data Id="key-info"/></ds:KeyInfo></ds:Signature>"#;
+        let generated = r#"<X509Data xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:ext="urn:example:key-info"><X509Certificate>Y2VydA==</X509Certificate><ext:Metadata/></X509Data>"#;
+
+        let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect("matching source must populate the placeholder");
+        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let x509_data = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
+            .expect("X509Data");
+
+        assert_eq!(x509_data.attribute("Id"), Some("key-info"));
+        assert_eq!(
+            x509_data
+                .children()
+                .find(|node| node.has_tag_name((XMLDSIG_NS, "X509Certificate")))
+                .and_then(|node| node.text()),
+            Some("Y2VydA==")
+        );
+        assert!(
+            x509_data
+                .children()
+                .any(|node| node.has_tag_name(("urn:example:key-info", "Metadata")))
+        );
     }
 }

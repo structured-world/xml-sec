@@ -7,13 +7,15 @@ use std::{
 };
 
 use roxmltree::{Document, Node, ParsingOptions};
+use rsa::{RsaPublicKey, pkcs8::DecodePublicKey as _, traits::PublicKeyParts as _};
+use x509_parser::prelude::FromDer as _;
 use xml_sec::{
     policy::{DecryptionPolicy, EncryptionPolicy, SigningPolicy, VerificationPolicy},
     provider::{CryptoProvider, default_provider},
     xmldsig::{
-        DefaultKeyResolver, DsigStatus, FailureReason, KeyInfoWriter, KeyResolver,
-        KeyResolverConfig, ReferenceResult, SignContext, SignatureAlgorithm, UriTypeSet,
-        VerifyContext, VerifyResult, X509CertificateKeyInfoWriter, XPathHereSemantics,
+        DefaultKeyResolver, DsigStatus, FailureReason, KeyInfoSource, KeyInfoWriter, KeyResolver,
+        KeyResolverConfig, KeyValueInfo, ReferenceResult, SignContext, SignatureAlgorithm,
+        UriTypeSet, VerifyContext, VerifyResult, X509CertificateKeyInfoWriter, XPathHereSemantics,
         parse_key_info, uri::UriReferenceResolver,
     },
     xmlenc::{
@@ -719,12 +721,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             .map_err(|error| CommandError::Signature(error.to_string()))?
     };
     write_verification_diagnostics(invocation, &result, stdout)?;
-    if result.status != DsigStatus::Valid
-        || result
-            .manifest_references
-            .iter()
-            .any(|reference| reference.status != DsigStatus::Valid)
-    {
+    if aggregate_verification_status(&result) != DsigStatus::Valid {
         return Err(CommandError::InvalidSignature);
     }
     Ok(())
@@ -735,8 +732,9 @@ fn write_verification_diagnostics(
     result: &VerifyResult,
     stdout: &mut dyn Write,
 ) -> Result<(), CommandError> {
+    let aggregate_status = aggregate_verification_status(result);
     if invocation.flag("print-debug") {
-        let status = if result.status == DsigStatus::Valid {
+        let status = if aggregate_status == DsigStatus::Valid {
             "valid"
         } else {
             "invalid"
@@ -744,7 +742,7 @@ fn write_verification_diagnostics(
         writeln!(stdout, "Status: {status}").map_err(stdout_error)?;
     }
     if invocation.flag("print-xml-debug") {
-        let (status, failure_reason) = donor_dsig_status(result.status);
+        let (status, failure_reason) = donor_dsig_status(aggregate_status);
         writeln!(
             stdout,
             "<VerificationContext status=\"{status}\" failureReason=\"{failure_reason}\">"
@@ -759,6 +757,29 @@ fn write_verification_diagnostics(
         writeln!(stdout, "</VerificationContext>").map_err(stdout_error)?;
     }
     Ok(())
+}
+
+fn aggregate_verification_status(result: &VerifyResult) -> DsigStatus {
+    aggregate_statuses(
+        result.status,
+        result
+            .manifest_references
+            .iter()
+            .map(|reference| reference.status),
+    )
+}
+
+fn aggregate_statuses(
+    core_status: DsigStatus,
+    manifest_statuses: impl IntoIterator<Item = DsigStatus>,
+) -> DsigStatus {
+    if core_status != DsigStatus::Valid {
+        return core_status;
+    }
+    manifest_statuses
+        .into_iter()
+        .find(|status| *status != DsigStatus::Valid)
+        .unwrap_or(DsigStatus::Valid)
 }
 
 fn write_reference_diagnostics(
@@ -952,6 +973,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         } else {
             key_material::load_rsa_public(path)?
         };
+        validate_recipient_key_metadata(&template, start_node_id, &policy, &public_key)?;
         let mut recipient = EncryptionRecipient::rsa_oaep(public_key);
         if let Some(parameters) = metadata.oaep_parameters {
             recipient = recipient.oaep_parameters(parameters);
@@ -993,6 +1015,105 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         ));
     }
     write_output(invocation, rendered.as_bytes(), stdout)
+}
+
+fn validate_recipient_key_metadata(
+    template: &str,
+    start_node_id: Option<&str>,
+    policy: &EncryptionPolicy,
+    selected_key: &RsaPublicKey,
+) -> Result<(), CommandError> {
+    let document = parse_encryption_document(template, policy)?;
+    let encrypted_data = select_encrypted_data(&document, start_node_id)?;
+    let key_infos = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
+        .into_iter()
+        .flat_map(|key_info| key_info.children())
+        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+        .filter_map(|encrypted_key| direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo"));
+
+    for key_info_node in key_infos {
+        let key_info = parse_key_info(key_info_node)
+            .map_err(|error| CommandError::Encryption(error.to_string()))?;
+        for source in key_info.sources {
+            let matches = match source {
+                KeyInfoSource::KeyName(_) => continue,
+                KeyInfoSource::KeyValue(KeyValueInfo::Rsa { modulus, exponent }) => {
+                    rsa_components_match(selected_key, &modulus, &exponent)
+                }
+                KeyInfoSource::X509Data(data) => {
+                    if data.certificates.is_empty()
+                        && data.subject_names.is_empty()
+                        && data.issuer_serials.is_empty()
+                        && data.skis.is_empty()
+                        && data.digests.is_empty()
+                    {
+                        // An empty placeholder (or CRL-only source) makes no
+                        // recipient identity claim and is safe to preserve.
+                        continue;
+                    }
+                    let Some(certificate_index) = data
+                        .certificate_chain
+                        .first()
+                        .copied()
+                        .or_else(|| (!data.certificates.is_empty()).then_some(0))
+                    else {
+                        return Err(recipient_metadata_error(
+                            "X509Data identity does not contain a certificate that can be matched",
+                        ));
+                    };
+                    let certificate =
+                        data.certificates.get(certificate_index).ok_or_else(|| {
+                            recipient_metadata_error("X509Data certificate chain is inconsistent")
+                        })?;
+                    let (_, certificate) =
+                        x509_parser::certificate::X509Certificate::from_der(certificate)
+                            .map_err(|_| recipient_metadata_error("X509Certificate is invalid"))?;
+                    let public_key = RsaPublicKey::from_public_key_der(
+                        certificate.public_key().raw,
+                    )
+                    .map_err(|_| {
+                        recipient_metadata_error("X509Certificate does not contain an RSA key")
+                    })?;
+                    rsa_public_keys_match(selected_key, &public_key)
+                }
+                KeyInfoSource::DerEncodedKeyValue(der) => {
+                    let public_key = RsaPublicKey::from_public_key_der(&der).map_err(|_| {
+                        recipient_metadata_error("DEREncodedKeyValue is not an RSA public key")
+                    })?;
+                    rsa_public_keys_match(selected_key, &public_key)
+                }
+                KeyInfoSource::KeyValue(_) | KeyInfoSource::RetrievalMethod { .. } => {
+                    return Err(recipient_metadata_error(
+                        "recipient key source cannot be matched to the selected RSA key",
+                    ));
+                }
+                _ => {
+                    return Err(recipient_metadata_error(
+                        "recipient key source cannot be matched to the selected RSA key",
+                    ));
+                }
+            };
+            if !matches {
+                return Err(recipient_metadata_error(
+                    "recipient key metadata does not match the selected RSA key",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rsa_components_match(key: &RsaPublicKey, modulus: &[u8], exponent: &[u8]) -> bool {
+    key.n().to_be_bytes_trimmed_vartime().as_ref() == modulus
+        && key.e().to_be_bytes_trimmed_vartime().as_ref() == exponent
+}
+
+fn rsa_public_keys_match(left: &RsaPublicKey, right: &RsaPublicKey) -> bool {
+    left.n() == right.n() && left.e() == right.e()
+}
+
+fn recipient_metadata_error(message: &str) -> CommandError {
+    CommandError::Encryption(format!("recipient key metadata is inconsistent: {message}"))
 }
 
 fn template_oaep_parameters(
@@ -1851,5 +1972,19 @@ mod tests {
             read_plaintext(path.as_os_str(), 4),
             Err(CommandError::PlaintextTooLarge { maximum: 4 })
         ));
+    }
+
+    #[test]
+    fn verification_diagnostics_aggregate_manifest_failures() {
+        // libxmlsec1 reports the operation as failed when a processed Manifest
+        // reference fails, even though the core SignatureValue remains valid.
+        let aggregate = aggregate_statuses(
+            DsigStatus::Valid,
+            [DsigStatus::Invalid(
+                FailureReason::ReferenceDigestMismatch { ref_index: 0 },
+            )],
+        );
+
+        assert_eq!(donor_dsig_status(aggregate), ("FAILED", "REFERENCE"));
     }
 }
