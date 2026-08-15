@@ -778,6 +778,51 @@ fn encrypts_decrypts_and_rejects_wrong_symmetric_key() {
 }
 
 #[test]
+fn xml_debug_decryption_writes_diagnostics_separately_from_plaintext() {
+    // The unmodified donor runner redirects diagnostics from stdout while
+    // --output receives the decrypted payload, then parses stdout as XML.
+    let temp = tempfile::tempdir().unwrap();
+    let fixtures = project_root().join("tools/xmlsec1/tests/fixtures/upstream");
+    let vector = fixtures.join("xmlenc11-interop-2012/xenc11-example-AES128-GCM");
+    let decrypted = temp.path().join("decrypted.data");
+
+    let output = Command::new(binary())
+        .args([
+            "decrypt",
+            "--print-xml-debug",
+            "--lax-key-search",
+            "--aeskey",
+        ])
+        .arg(vector.with_extension("key"))
+        .arg("--output")
+        .arg(&decrypted)
+        .arg(vector.with_extension("xml"))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(&decrypted).unwrap(),
+        fs::read(vector.with_extension("data")).unwrap()
+    );
+    let diagnostics = String::from_utf8(output.stdout).unwrap();
+    let document = roxmltree::Document::parse(&diagnostics)
+        .expect("--print-xml-debug stdout must be well-formed XML");
+    let root = document.root_element();
+    assert_eq!(root.tag_name().name(), "DataDecryptionContext");
+    assert_eq!(root.attribute("status"), Some("not-replaced"));
+    assert_eq!(root.attribute("failureReason"), Some("UNKNOWN"));
+    assert!(root.descendants().any(|node| {
+        node.has_tag_name("Transform")
+            && node.attribute("href") == Some("http://www.w3.org/2009/xmlenc11#aes128-gcm")
+    }));
+}
+
+#[test]
 fn encryption_preserves_template_metadata_and_supports_id_selection() {
     // Encryption templates are output contracts. Only CipherValue is mutable;
     // caller-owned identifiers, KeyInfo, properties, and extension attributes remain.
@@ -1453,6 +1498,39 @@ fn rsa_recipient_name_must_match_the_template_unless_lax() {
         String::from_utf8_lossy(&lax_decrypt.stderr)
     );
     assert_eq!(lax_decrypt.stdout, b"named recipient");
+}
+
+#[test]
+fn rsa_encryption_rejects_duplicate_recipient_key_names() {
+    // Recipient identity is a singleton selection hint. Silently selecting the
+    // first value would emit ciphertext that the reciprocal parser rejects.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("duplicate-recipient-name.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo><ds:KeyName>first</ds:KeyName><ds:KeyName>second</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"ambiguous recipient").unwrap();
+
+    let output = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem:first"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "ciphertext must not be emitted");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("more than one direct KeyName"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

@@ -1516,7 +1516,64 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             "decrypt requires --aes-key or an RSA private key".into(),
         ));
     };
-    write_output(invocation, &bytes, stdout)
+    write_output(invocation, &bytes, stdout)?;
+    write_decryption_diagnostics(invocation, encrypted_data, !standalone, stdout)
+}
+
+fn write_decryption_diagnostics(
+    invocation: &Invocation,
+    encrypted_data: Node<'_, '_>,
+    result_replaced: bool,
+    stdout: &mut dyn Write,
+) -> Result<(), CommandError> {
+    if !invocation.flag("print-xml-debug") {
+        return Ok(());
+    }
+    // Donor testEnc.sh routes plaintext through --output and parses stdout as
+    // a separate xmlSecEncCtxDebugXmlDump-compatible diagnostics document.
+    let method = direct_child_element(encrypted_data, XMLENC_NS, "EncryptionMethod")
+        .and_then(|node| node.attribute("Algorithm"))
+        .ok_or_else(|| CommandError::Encryption("template has no encryption algorithm".into()))?;
+    let transform_name = method.rsplit_once('#').map_or(method, |(_, name)| name);
+    debug_assert!(TRANSFORMS.contains(&transform_name));
+    let status = if result_replaced {
+        "replaced"
+    } else {
+        "not-replaced"
+    };
+    writeln!(
+        stdout,
+        "<DataDecryptionContext status=\"{status}\" failureReason=\"UNKNOWN\">"
+    )
+    .map_err(stdout_error)?;
+    writeln!(stdout, "<Flags>00000000</Flags>").map_err(stdout_error)?;
+    writeln!(stdout, "<Flags2>00000000</Flags2>").map_err(stdout_error)?;
+    for (element, attribute) in [
+        ("Id", "Id"),
+        ("Type", "Type"),
+        ("MimeType", "MimeType"),
+        ("Encoding", "Encoding"),
+    ] {
+        let value = encrypted_data.attribute(attribute).unwrap_or("NULL");
+        writeln!(
+            stdout,
+            "<{element}>{}</{element}>",
+            quick_xml::escape::escape(value)
+        )
+        .map_err(stdout_error)?;
+    }
+    writeln!(stdout, "<Recipient>NULL</Recipient>").map_err(stdout_error)?;
+    writeln!(stdout, "<CarriedKeyName>NULL</CarriedKeyName>").map_err(stdout_error)?;
+    writeln!(stdout, "<EncryptionMethod>").map_err(stdout_error)?;
+    writeln!(
+        stdout,
+        "<Transform name=\"{}\" href=\"{}\" />",
+        quick_xml::escape::escape(transform_name),
+        quick_xml::escape::escape(method)
+    )
+    .map_err(stdout_error)?;
+    writeln!(stdout, "</EncryptionMethod>").map_err(stdout_error)?;
+    writeln!(stdout, "</DataDecryptionContext>").map_err(stdout_error)
 }
 
 struct NamedRecipientDecryptor<'a> {
@@ -1608,9 +1665,16 @@ fn encryption_template(
         .map(|encrypted_key| {
             Ok(EncryptionTemplateRecipient {
                 key_name: direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo")
-                    .and_then(|key_info| direct_child_element(key_info, XMLDSIG_NS, "KeyName"))
-                    .and_then(|key_name| key_name.text())
-                    .map(str::to_owned),
+                    .map(|key_info| {
+                        optional_direct_child_text(
+                            key_info,
+                            XMLDSIG_NS,
+                            "KeyName",
+                            "EncryptedKey KeyInfo contains more than one direct KeyName",
+                        )
+                    })
+                    .transpose()?
+                    .flatten(),
                 oaep_parameters: template_oaep_parameters(encrypted_key)?,
             })
         })
@@ -1629,16 +1693,31 @@ fn encrypted_data_key_name(encrypted_data: Node<'_, '_>) -> Result<Option<String
     let Some(key_info) = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo") else {
         return Ok(None);
     };
-    let mut key_names = key_info
+    optional_direct_child_text(
+        key_info,
+        XMLDSIG_NS,
+        "KeyName",
+        "KeyInfo contains more than one direct KeyName",
+    )
+}
+
+fn optional_direct_child_text(
+    parent: Node<'_, '_>,
+    namespace: &str,
+    name: &str,
+    duplicate_error: &str,
+) -> Result<Option<String>, CommandError> {
+    let mut children = parent
         .children()
-        .filter(|node| node.has_tag_name((XMLDSIG_NS, "KeyName")));
-    let key_name = key_names.next();
-    if key_names.next().is_some() {
-        return Err(CommandError::Encryption(
-            "KeyInfo contains more than one direct KeyName".into(),
-        ));
+        .filter(|node| node.has_tag_name((namespace, name)));
+    let value = children
+        .next()
+        .and_then(|node| node.text())
+        .map(str::to_owned);
+    if children.next().is_some() {
+        return Err(CommandError::Encryption(duplicate_error.into()));
     }
-    Ok(key_name.and_then(|node| node.text()).map(str::to_owned))
+    Ok(value)
 }
 
 fn encrypted_key_recipient_names(encrypted_data: Node<'_, '_>) -> Vec<String> {
