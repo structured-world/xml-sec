@@ -329,6 +329,82 @@ pub(super) fn fill_key_info_at_index_with_options(
     )
 }
 
+pub(super) fn merge_key_info_source_at_index_with_options(
+    xml: &str,
+    key_info_source: &str,
+    target_signature: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError> {
+    let document = parse_with_options(xml, policy)?;
+    let source_document = roxmltree::Document::parse(key_info_source)?;
+    let source = source_document.root_element();
+    let Some(signature) = signature_node(&document, target_signature) else {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "Signature",
+            expected: 1,
+            actual: 0,
+        });
+    };
+    let key_infos = signature
+        .children()
+        .filter(|node| is_dsig_node(*node, "KeyInfo"))
+        .collect::<Vec<_>>();
+    if key_infos.len() != 1 {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "KeyInfo",
+            expected: key_infos.len(),
+            actual: 1,
+        });
+    }
+    let key_info = key_infos[0];
+
+    // A writer contributes one KeyInfo source, not the whole KeyInfo value.
+    // Fill an empty matching placeholder when present; otherwise append the
+    // source while preserving every template-provided sibling and its order.
+    if let Some(placeholder) = key_info.children().find(|node| {
+        node.is_element()
+            && node.tag_name() == source.tag_name()
+            && !node.children().any(|child| child.is_element())
+            && node.text().is_none_or(|text| text.trim().is_empty())
+    }) {
+        let mut output = xml.to_owned();
+        output.replace_range(placeholder.range(), key_info_source);
+        parse_with_options(&output, policy)?;
+        return Ok(output);
+    }
+
+    let range = key_info.range();
+    let raw_key_info = &xml[range.clone()];
+    let mut output = xml.to_owned();
+    if raw_key_info.trim_end().ends_with("/>") {
+        let name_end = raw_key_info[1..]
+            .find(|character: char| {
+                character.is_ascii_whitespace() || character == '/' || character == '>'
+            })
+            .map(|offset| offset + 1)
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let qualified_name = &raw_key_info[1..name_end];
+        let empty_end = raw_key_info
+            .rfind("/>")
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let expanded = format!(
+            "{}>{}</{}>",
+            &raw_key_info[..empty_end],
+            key_info_source,
+            qualified_name
+        );
+        output.replace_range(range, &expanded);
+    } else {
+        let closing = raw_key_info
+            .rfind("</")
+            .map(|offset| range.start + offset)
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        output.insert_str(closing, key_info_source);
+    }
+    parse_with_options(&output, policy)?;
+    Ok(output)
+}
+
 fn fill_dsig_values<I, S>(
     xml: &str,
     local_name: &'static str,

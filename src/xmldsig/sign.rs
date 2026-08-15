@@ -26,10 +26,9 @@ use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::DigestAlgorithm;
 use super::mutation::{
     XmlMutationError, append_signature_to_element_with_options,
-    append_signature_to_root_with_options, fill_key_info_at_index_with_options,
-    fill_signature_value_at_index_with_options, fill_signed_info_digest_values,
-    fill_signed_info_digest_values_at_index_with_options,
-    fill_signed_info_digest_values_with_options,
+    append_signature_to_root_with_options, fill_signature_value_at_index_with_options,
+    fill_signed_info_digest_values, fill_signed_info_digest_values_at_index_with_options,
+    fill_signed_info_digest_values_with_options, merge_key_info_source_at_index_with_options,
 };
 use super::parse::{
     MAX_REFERENCES_PER_SIGNATURE, SignatureAlgorithm, XMLDSIG_NS, parse_signed_info,
@@ -809,7 +808,7 @@ impl<'a> SignContext<'a> {
             .validate_xml_document_len(signed.len())?;
         if let Some(writer) = self.key_info_writer {
             let key_info_content = writer.write_key_info(self.signing_key)?;
-            let signed = fill_key_info_at_index_with_options(
+            let signed = merge_key_info_source_at_index_with_options(
                 &signed,
                 &key_info_content,
                 target_signature,

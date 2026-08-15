@@ -48,12 +48,12 @@ pub enum KeyMaterialError {
 #[derive(Debug, Eq, PartialEq)]
 pub struct SignatureMetadata {
     pub algorithm: SignatureAlgorithm,
-    pub key_name: Option<String>,
+    pub key_names: Vec<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct SigningTemplateMetadata {
-    pub key_name: Option<String>,
+    pub key_names: Vec<String>,
     pub has_key_info: bool,
 }
 
@@ -102,7 +102,7 @@ pub fn verification_signature_metadata(
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
     Ok(SignatureMetadata {
         algorithm,
-        key_name: signature_key_name(signature),
+        key_names: signature_key_names(signature),
     })
 }
 
@@ -132,7 +132,7 @@ pub fn signing_signature_metadata(
     }
     .ok_or(KeyMaterialError::MissingSignedInfo)?;
     Ok(SigningTemplateMetadata {
-        key_name: signature_key_name(signature),
+        key_names: signature_key_names(signature),
         has_key_info: signature_key_info(signature).is_some(),
     })
 }
@@ -156,15 +156,14 @@ fn parse_signature_document(
     .map_err(|error| KeyMaterialError::Signature(error.to_string()))
 }
 
-fn signature_key_name(signature: roxmltree::Node<'_, '_>) -> Option<String> {
+fn signature_key_names(signature: roxmltree::Node<'_, '_>) -> Vec<String> {
     signature_key_info(signature)
-        .and_then(|key_info| {
-            key_info
-                .children()
-                .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
-        })
-        .and_then(|key_name| key_name.text())
+        .into_iter()
+        .flat_map(|key_info| key_info.children())
+        .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+        .filter_map(|key_name| key_name.text())
         .map(str::to_owned)
+        .collect()
 }
 
 fn signature_key_info<'a, 'input>(
@@ -422,6 +421,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(metadata.algorithm, SignatureAlgorithm::EcdsaSha256);
+    }
+
+    #[test]
+    fn signature_metadata_preserves_every_direct_key_name() {
+        // KeyInfo is an ordered list of lookup sources; collapsing it to the
+        // first KeyName makes later valid key-manager entries unreachable.
+        let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
+        let xml = format!(
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue><ds:KeyInfo><ds:KeyName>old</ds:KeyName><ds:KeyName>wanted</ds:KeyName></ds:KeyInfo></ds:Signature>"#
+        );
+
+        let metadata = verification_signature_metadata(
+            &xml,
+            None,
+            &xml_sec::policy::VerificationPolicy::default(),
+        )
+        .unwrap();
+
+        assert_eq!(metadata.key_names, ["old", "wanted"]);
     }
 
     #[test]

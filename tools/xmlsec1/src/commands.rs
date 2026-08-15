@@ -469,6 +469,48 @@ fn option_value_text(option: &crate::OptionValue) -> Result<&str, CommandError> 
         .ok_or_else(|| CommandError::Usage(format!("--{} value must be valid UTF-8", option.name)))
 }
 
+fn select_named_candidate<'a, T: Copy>(
+    candidates: &[(&'a crate::OptionValue, T)],
+    requested_names: &[String],
+    lax_key_search: bool,
+    allow_unconstrained_named_singleton: bool,
+    key_kind: &str,
+) -> Result<(&'a crate::OptionValue, T), CommandError> {
+    if let [selected] = candidates
+        && (selected.0.parameter.is_none()
+            || lax_key_search
+            || (requested_names.is_empty() && allow_unconstrained_named_singleton))
+    {
+        return Ok(*selected);
+    }
+    if !requested_names.is_empty() {
+        let matching = candidates
+            .iter()
+            .copied()
+            .filter(|(key, _)| {
+                key.parameter
+                    .as_deref()
+                    .is_some_and(|name| requested_names.iter().any(|requested| requested == name))
+            })
+            .collect::<Vec<_>>();
+        return match matching.as_slice() {
+            [selected] => Ok(*selected),
+            [] => Err(CommandError::Usage(format!(
+                "template requests unknown KeyName for supplied {key_kind}"
+            ))),
+            _ => Err(CommandError::Usage(format!(
+                "multiple {key_kind} inputs match template KeyNames"
+            ))),
+        };
+    }
+    let message = if candidates.len() == 1 {
+        format!("a named {key_kind} requires a template KeyName; use --lax-key-search to opt out")
+    } else {
+        format!("multiple {key_kind} inputs require a template KeyName and named options")
+    };
+    Err(CommandError::Usage(message))
+}
+
 fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, SIGN_OPTIONS)?;
     reject_unimplemented_selectors(invocation, &["node-id"])?;
@@ -479,8 +521,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let signature = key_material::signing_signature_metadata(&xml, start_node_id, &policy)?;
-    let (key_option, certificate_is_der) =
-        select_signing_key(invocation, signature.key_name.as_deref())?;
+    let (key_option, certificate_is_der) = select_signing_key(invocation, &signature.key_names)?;
     let value = key_option.value.as_deref().unwrap_or_default();
     let (key_path, certificate_paths) = split_key_and_certificates(value)?;
     let key = key_material::load_signing_key(key_path)?;
@@ -527,7 +568,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
 
 fn select_signing_key<'a>(
     invocation: &'a Invocation,
-    requested_name: Option<&str>,
+    requested_names: &[String],
 ) -> Result<(&'a crate::OptionValue, bool), CommandError> {
     let mut keys = Vec::new();
     for (name, certificate_is_der) in [
@@ -543,32 +584,13 @@ fn select_signing_key<'a>(
             "sign requires --privkey-pem or --pkcs8-pem/der".into(),
         ));
     }
-    if let [selected] = keys.as_slice()
-        && (selected.0.parameter.is_none() || invocation.flag("lax-key-search"))
-    {
-        return Ok(*selected);
-    }
-    if let Some(requested_name) = requested_name {
-        let matching = keys
-            .into_iter()
-            .filter(|(key, _)| key.parameter.as_deref() == Some(requested_name))
-            .collect::<Vec<_>>();
-        return match matching.as_slice() {
-            [selected] => Ok(*selected),
-            [] => Err(CommandError::Usage(format!(
-                "signature template requests unknown KeyName {requested_name}"
-            ))),
-            _ => Err(CommandError::Usage(format!(
-                "multiple private keys use KeyName {requested_name}"
-            ))),
-        };
-    }
-    let message = if keys.len() == 1 {
-        "a named private key requires a template KeyName; use --lax-key-search to opt out"
-    } else {
-        "multiple private keys require a template KeyName and named options"
-    };
-    Err(CommandError::Usage(message.into()))
+    select_named_candidate(
+        &keys,
+        requested_names,
+        invocation.flag("lax-key-search"),
+        false,
+        "private key",
+    )
 }
 
 fn split_key_and_certificates(value: &OsStr) -> Result<(&OsStr, Vec<&OsStr>), CommandError> {
@@ -604,11 +626,14 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         SignatureAlgorithm::DsaSha1,
         SignatureAlgorithm::HmacSha1,
     ]);
-    policy.key_trust.check_crls = invocation.flag("verify-crls");
     // X509Data is controlled by the signed document and therefore cannot
     // establish its own trust. Only an explicit insecure opt-out disables
-    // path validation for resolver-selected certificates.
-    policy.key_trust.verify_x509_chains = !invocation.flag("insecure");
+    // path validation for resolver-selected certificates. libxmlsec1 makes
+    // that opt-out authoritative over --verify-crls as well: CRLs are part of
+    // path validation and cannot remain enabled after trust checks are bypassed.
+    let insecure = invocation.flag("insecure");
+    policy.key_trust.verify_x509_chains = !insecure;
+    policy.key_trust.check_crls = invocation.flag("verify-crls") && !insecure;
     policy
 }
 
@@ -616,28 +641,22 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     validate_options(invocation, VERIFY_OPTIONS)?;
     reject_unimplemented_selectors(invocation, &["node-id"])?;
     reject_unimplemented_verification_policy(invocation)?;
-    let direct_keys = ["pubkey-pem", "pubkey-der"]
-        .into_iter()
-        .flat_map(|name| invocation.values(name))
-        .collect::<Vec<_>>();
-    let explicit_certificates = ["pubkey-cert-pem", "pubkey-cert-der"]
-        .into_iter()
-        .flat_map(|name| invocation.values(name))
-        .collect::<Vec<_>>();
-    if direct_keys.len() + explicit_certificates.len() > 1 {
-        return Err(CommandError::Usage(
-            "verify accepts exactly one explicit public key or certificate".into(),
-        ));
-    }
-    let direct_path = direct_keys
-        .first()
-        .and_then(|option| option.value.as_deref());
+    let explicit_keys = [
+        ("pubkey-pem", false),
+        ("pubkey-der", false),
+        ("pubkey-cert-pem", true),
+        ("pubkey-cert-der", true),
+    ]
+    .into_iter()
+    .flat_map(|(name, certificate)| {
+        invocation
+            .values(name)
+            .map(move |option| (option, certificate))
+    })
+    .collect::<Vec<_>>();
     // With an explicit public key there is no key-manager search to relax.
     // Reject the flag on resolver-backed paths until its semantics exist.
-    if invocation.flag("lax-key-search")
-        && direct_path.is_none()
-        && explicit_certificates.is_empty()
-    {
+    if invocation.flag("lax-key-search") && explicit_keys.is_empty() {
         return Err(CommandError::UnsupportedOption("lax-key-search".into()));
     }
     let policy = xmlsec_compatibility_verification_policy(invocation);
@@ -645,24 +664,25 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     let start_node_id = option_text(invocation, "node-id")?;
     let signature = key_material::verification_signature_metadata(&xml, start_node_id, &policy)?;
     let algorithm = signature.algorithm;
-    if let Some(identity) = direct_keys
-        .first()
-        .or_else(|| explicit_certificates.first())
-    {
-        enforce_named_key_match(
-            identity,
-            signature.key_name.as_deref(),
+    let selected_key = if explicit_keys.is_empty() {
+        None
+    } else {
+        Some(select_named_candidate(
+            &explicit_keys,
+            &signature.key_names,
             invocation.flag("lax-key-search"),
+            true,
             "verification key",
-        )?;
-    }
-    let result = if let Some(path) = direct_path {
+        )?)
+    };
+    let result = if let Some((option, false)) = selected_key {
+        let path = option.value.as_deref().unwrap_or_default();
         let key = key_material::load_verification_key(path, algorithm)?;
         verification_context(policy, start_node_id)
             .key(&key)
             .verify(&xml)
             .map_err(|error| CommandError::Signature(error.to_string()))?
-    } else if let [certificate] = explicit_certificates.as_slice() {
+    } else if let Some((certificate, true)) = selected_key {
         verify_with_explicit_certificate(
             invocation,
             certificate,
@@ -877,21 +897,32 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             .map(move |option| (option, certificate))
     })
     .collect::<Vec<_>>();
-    if aes_keys.len() + public_keys.len() > 1 {
+    if !aes_keys.is_empty() && !public_keys.is_empty() {
         return Err(CommandError::Usage(
-            "encrypt accepts exactly one AES key or RSA public key".into(),
+            "encrypt cannot combine explicit AES and RSA recipient keys".into(),
         ));
     }
-    if let [option] = aes_keys.as_slice() {
+    if !aes_keys.is_empty() {
         if metadata.has_encrypted_key_recipient {
             return Err(CommandError::Usage(
                 "direct AES key cannot satisfy an EncryptedKey recipient in the template".into(),
             ));
         }
-        enforce_named_key_match(
-            option,
-            metadata.content_key_name.as_deref(),
+        let candidates = aes_keys
+            .iter()
+            .copied()
+            .map(|option| (option, ()))
+            .collect::<Vec<_>>();
+        let requested_names = metadata
+            .content_key_name
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let (option, ()) = select_named_candidate(
+            &candidates,
+            &requested_names,
             invocation.flag("lax-key-search"),
+            true,
             "AES key",
         )?;
         let key = key_material::load_symmetric(
@@ -902,15 +933,21 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         if let Some(name) = option.parameter.as_deref() {
             builder = builder.direct_key_name(name);
         }
-    } else if let [(option, certificate)] = public_keys.as_slice() {
-        enforce_named_key_match(
-            option,
-            metadata.recipient_key_name.as_deref(),
+    } else if !public_keys.is_empty() {
+        let requested_names = metadata
+            .recipient_key_name
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let (option, certificate) = select_named_candidate(
+            &public_keys,
+            &requested_names,
             invocation.flag("lax-key-search"),
+            true,
             "RSA recipient key",
         )?;
         let path = option.value.as_deref().unwrap_or_default();
-        let public_key = if *certificate {
+        let public_key = if certificate {
             key_material::load_rsa_certificate_public(path)?
         } else {
             key_material::load_rsa_public(path)?
@@ -1111,6 +1148,7 @@ fn apply_encryption_template(
     for (range, replacement) in replacements {
         output.replace_range(range, &replacement);
     }
+    parse_encryption_document(&output, policy)?;
     Ok(output)
 }
 
@@ -1203,16 +1241,23 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         .into_iter()
         .flat_map(|name| invocation.values(name))
         .collect::<Vec<_>>();
-    if aes_keys.len() + private_keys.len() > 1 {
+    if !aes_keys.is_empty() && !private_keys.is_empty() {
         return Err(CommandError::Usage(
-            "decrypt accepts exactly one AES key or RSA private key".into(),
+            "decrypt cannot combine explicit AES and RSA private keys".into(),
         ));
     }
-    let bytes = if let [option] = aes_keys.as_slice() {
-        enforce_named_key_match(
-            option,
-            content_key_name.as_deref(),
+    let bytes = if !aes_keys.is_empty() {
+        let candidates = aes_keys
+            .iter()
+            .copied()
+            .map(|option| (option, ()))
+            .collect::<Vec<_>>();
+        let requested_names = content_key_name.iter().cloned().collect::<Vec<_>>();
+        let (option, ()) = select_named_candidate(
+            &candidates,
+            &requested_names,
             invocation.flag("lax-key-search"),
+            true,
             "AES key",
         )?;
         let key = key_material::load_symmetric(option.value.as_deref().unwrap_or_default(), None)?;
@@ -1223,7 +1268,19 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             standalone,
             policy,
         )?
-    } else if let [option] = private_keys.as_slice() {
+    } else if !private_keys.is_empty() {
+        let candidates = private_keys
+            .iter()
+            .copied()
+            .map(|option| (option, ()))
+            .collect::<Vec<_>>();
+        let (option, ()) = select_named_candidate(
+            &candidates,
+            &recipient_key_names,
+            invocation.flag("lax-key-search"),
+            true,
+            "RSA private key",
+        )?;
         let recipient_filter = named_recipient_filter(
             option,
             &recipient_key_names,
@@ -1431,32 +1488,6 @@ fn select_encrypted_data<'a>(
         ));
     }
     Ok(selected)
-}
-
-fn enforce_named_key_match(
-    option: &crate::OptionValue,
-    template_name: Option<&str>,
-    lax_key_search: bool,
-    key_kind: &str,
-) -> Result<(), CommandError> {
-    let Some(option_name) = option.parameter.as_deref() else {
-        return Ok(());
-    };
-    // A missing KeyName does not request a different identity: with one
-    // explicit key, libxmlsec uses that key regardless of its registry name.
-    // Strict lookup applies when the document actually names an identity.
-    if lax_key_search {
-        return Ok(());
-    }
-    let Some(template_name) = template_name else {
-        return Ok(());
-    };
-    if template_name == option_name {
-        return Ok(());
-    }
-    Err(CommandError::Usage(format!(
-        "template KeyName {template_name} does not match named {key_kind} {option_name}"
-    )))
 }
 
 fn keys(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
@@ -1737,6 +1768,35 @@ mod tests {
                 .descendants()
                 .any(|node| node.has_tag_name(("http://www.w3.org/2009/xmlenc11#", "MGF")))
         );
+    }
+
+    #[test]
+    fn merged_encryption_template_obeys_the_aggregate_node_ceiling() {
+        // Template and generated output cross the trust boundary separately,
+        // but the returned document must also fit the same operation policy.
+        let extras = "<extra/>".repeat(24);
+        let template = format!(
+            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\">{extras}<e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedData>"
+        );
+        let generated = format!(
+            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><e:EncryptedKey><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
+        );
+        let individual_node_ceiling = [template.as_str(), generated.as_str()]
+            .into_iter()
+            .map(|xml| Document::parse(xml).unwrap().descendants().count())
+            .max()
+            .unwrap();
+        let policy = EncryptionPolicy {
+            resources: xml_sec::policy::ResourcePolicy {
+                max_xml_nodes: individual_node_ceiling,
+                ..xml_sec::policy::ResourcePolicy::default()
+            },
+            ..EncryptionPolicy::default()
+        };
+
+        let error = apply_encryption_template(&template, &generated, None, &policy)
+            .expect_err("the aggregate merged document must be reparsed under policy");
+        assert!(error.to_string().contains("nodes limit"), "{error}");
     }
 
     #[test]

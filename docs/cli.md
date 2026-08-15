@@ -62,8 +62,10 @@ Signing key options accept libxmlsec1's comma-separated certificate form,
 `key.pem,leaf.pem,intermediate.pem,...`. Every certificate is structurally
 validated, and the first certificate must contain the signing key. When the
 template contains the optional direct `KeyInfo`
-placeholder, the chain is embedded there in order under `X509Data`; omitting
-that placeholder leaves the signed output without `KeyInfo`. Named signing keys
+placeholder, the chain is embedded there in order under `X509Data`. An empty
+`X509Data` child is populated in place, preserving sibling sources such as the
+`KeyName` used to select the signing key; omitting `KeyInfo` leaves the signed
+output without `KeyInfo`. Named signing keys
 require a matching template `KeyName` even when only one key is supplied. A
 named key with no template `KeyName` fails unless `--lax-key-search` explicitly
 opts out of lookup. Verification and encryption instead leave a `KeyName`-less
@@ -78,10 +80,12 @@ XPath and XPath Filter 2.0 verification uses libxmlsec1's legacy `here()`
 binding at this CLI compatibility boundary. The Rust library API retains the
 XMLDSig specification binding by default and requires an explicit opt-in for
 legacy documents.
-When the selected signature contains `KeyName`, named raw public-key and
-explicit certificate inputs must match it; `--lax-key-search` is the explicit
-opt-out. A signature without `KeyName` does not request a different identity,
-so its sole explicit key remains usable even when that key has a registry name.
+Repeatable named raw public-key and explicit-certificate options form a key set.
+Every direct `KeyName` in the selected signature participates in lookup and must
+identify exactly one supplied key; duplicate matches fail as ambiguous.
+`--lax-key-search` is the explicit opt-out. A signature without `KeyName` does
+not request a different identity, so its sole explicit key remains usable even
+when that key has a registry name.
 
 `--output` follows the upstream filename-template contract. The first
 `{inputfile}` token is replaced with the input file's basename after removing
@@ -108,10 +112,11 @@ Encryption preserves the template's `Id`, `Type`, `MimeType`, `KeyInfo`,
 cryptographic `CipherValue` payloads.
 For `--xml-data`, a missing template `Type` is materialized as XML Element
 metadata so a later embedded-document decrypt can perform XML replacement.
-When an encryption template contains a direct content-key `KeyName`, a named
-AES key must match it. Likewise, an RSA wrapping key must match a recipient
-`KeyName` inside `EncryptedKey`. An unnamed template does not constrain the sole
-explicit key; an explicit mismatch fails unless `--lax-key-search` is supplied.
+Repeatable AES or RSA key options form a key set. A direct content-key `KeyName`
+must select exactly one AES key, while a recipient `KeyName` inside
+`EncryptedKey` must select exactly one RSA wrapping key. An unnamed template
+does not constrain the sole explicit key; missing and duplicate matches fail
+unless `--lax-key-search` is supplied.
 RSA private-key decryption accepts the upstream
 `key.pem,certificate.pem,...` option syntax, consumes the first component as
 the decryption key, and validates every certificate companion before decrypting.

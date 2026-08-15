@@ -84,10 +84,12 @@ deterministic process statuses. `help-all` enumerates the same registered
 commands and options accepted by the parser; donor option multiplicity is
 enforced across canonical and alias spellings, and `--print-xml-debug` emits
 parseable verification diagnostics. Named signing keys require a
-template `KeyName`, while named verification and encryption/decryption keys
-obey a selected XML `KeyName` unless lax lookup is requested; unnamed templates
-still use their sole explicit verification or encryption key. Certificate
-companions are validated even when no output `KeyInfo` placeholder is present;
+template `KeyName`, while repeatable named verification and encryption/decryption
+options form key sets from which the selected XML `KeyName` must identify exactly
+one key unless lax lookup is requested; unnamed templates still use their sole
+explicit verification or encryption key. Certificate companions are validated
+even when no output `KeyInfo` placeholder is present; embedding a chain fills an
+empty `X509Data` placeholder without discarding sibling `KeyInfo` sources.
 document-supplied X.509 certificates require a caller trust anchor unless
 `--insecure` is explicit. XML payload encryption materializes inferred Element
 metadata, and direct AES keys reject templates containing recipient

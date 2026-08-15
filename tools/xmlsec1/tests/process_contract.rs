@@ -1044,6 +1044,70 @@ fn named_aes_decryption_obeys_encrypted_data_key_name_unless_lax() {
 }
 
 #[test]
+fn named_aes_key_ring_selects_one_key_for_encryption_and_decryption() {
+    // Repeatable AES options form a key ring. The document name must select
+    // exactly one entry rather than making every multi-key invocation invalid.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("named-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let wrong_key = temp.path().join("wrong.bin");
+    let matching_key = temp.path().join("matching.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyName>selected</KeyName></KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"selected AES key").unwrap();
+    fs::write(&wrong_key, b"fedcba9876543210").unwrap();
+    fs::write(&matching_key, b"0123456789abcdef").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--aes-key:wrong"])
+        .arg(&wrong_key)
+        .args(["--aes-key:selected"])
+        .arg(&matching_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--aes-key:wrong"])
+        .arg(&wrong_key)
+        .args(["--aes-key:selected"])
+        .arg(&matching_key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"selected AES key");
+
+    let ambiguous = Command::new(binary())
+        .args(["decrypt", "--aes-key:selected"])
+        .arg(&wrong_key)
+        .args(["--aes-key:selected"])
+        .arg(&matching_key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(!ambiguous.status.success());
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("multiple AES key"));
+}
+
+#[test]
 fn standalone_binary_decryption_accepts_its_root_node_id() {
     // --node-id selects an operation start point; selecting the standalone root
     // must not route opaque bytes through XML document replacement validation.
@@ -1234,6 +1298,59 @@ fn rsa_recipient_name_must_match_the_template_unless_lax() {
         String::from_utf8_lossy(&lax_decrypt.stderr)
     );
     assert_eq!(lax_decrypt.stdout, b"named recipient");
+}
+
+#[test]
+fn named_rsa_key_ring_selects_one_recipient_for_encryption_and_decryption() {
+    // Recipient KeyName selects one public/private key pair from repeatable
+    // options on both sides of the process boundary.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("named-rsa-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let wrong_public = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let matching_public = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let wrong_private = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let matching_private = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo><ds:KeyName>selected</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"selected RSA recipient").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem:wrong"])
+        .arg(&wrong_public)
+        .args(["--pubkey-pem:selected"])
+        .arg(&matching_public)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--privkey-pem:wrong"])
+        .arg(&wrong_private)
+        .args(["--privkey-pem:selected"])
+        .arg(&matching_private)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"selected RSA recipient");
 }
 
 #[test]
@@ -1772,6 +1889,17 @@ fn embedded_certificate_requires_trust_unless_insecure() {
         "{}",
         String::from_utf8_lossy(&insecure.stderr)
     );
+
+    let insecure_with_crls = Command::new(binary())
+        .args(["verify", "--insecure", "--verify-crls"])
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        insecure_with_crls.status.success(),
+        "{}",
+        String::from_utf8_lossy(&insecure_with_crls.stderr)
+    );
 }
 
 #[test]
@@ -1815,6 +1943,75 @@ fn signing_embeds_every_certificate_from_the_private_key_option() {
             )
             .count(),
         2
+    );
+}
+
+#[test]
+fn certificate_embedding_preserves_existing_key_info_sources() {
+    // Populating X509Data must not erase the KeyName that selected the signing
+    // key or create a second X509Data beside the template placeholder.
+    let temp = tempfile::tempdir().unwrap();
+    let source = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let template = temp.path().join("key-info-template.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    let signed = temp.path().join("signed.xml");
+    let template_xml = fs::read_to_string(source).unwrap();
+    fs::write(&template, template_xml).unwrap();
+    let compound = format!("{},{}", private_key.display(), certificate.display());
+
+    let result = Command::new(binary())
+        .args(["sign", "--privkey-pem:TestKeyName-rsa-2048"])
+        .arg(compound)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let xml = fs::read_to_string(&signed).unwrap();
+    let document = roxmltree::Document::parse(&xml).unwrap();
+    assert_eq!(
+        document
+            .descendants()
+            .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+            .filter_map(|node| node.text())
+            .collect::<Vec<_>>(),
+        ["TestKeyName-rsa-2048"]
+    );
+    assert_eq!(
+        document
+            .descendants()
+            .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "X509Data")))
+            .count(),
+        1
+    );
+    assert_eq!(
+        document
+            .descendants()
+            .filter(|node| {
+                node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "X509Certificate"))
+            })
+            .count(),
+        1
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem:TestKeyName-rsa-2048"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
     );
 }
 
@@ -2025,6 +2222,46 @@ fn multiple_signing_keys_require_the_matching_template_name() {
 }
 
 #[test]
+fn verification_selects_a_later_named_key_from_every_template_key_name() {
+    // Repeated public-key inputs model a key manager, and every direct
+    // KeyName is an ordered lookup source rather than only the first one.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let matching_public = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let wrong_public = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let signed = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(signed.status.success());
+    let signed_path = temp.path().join("multiple-key-names.xml");
+    let signed_xml = String::from_utf8(signed.stdout).unwrap().replace(
+        "<KeyName>TestKeyName-rsa-2048</KeyName>",
+        "<KeyName>stale</KeyName><KeyName>selected</KeyName>",
+    );
+    fs::write(&signed_path, signed_xml).unwrap();
+
+    let verified = Command::new(binary())
+        .args(["verify", "--pubkey-pem:wrong"])
+        .arg(&wrong_public)
+        .args(["--pubkey-pem:selected"])
+        .arg(&matching_public)
+        .arg(&signed_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+}
+
+#[test]
 fn singleton_named_signing_key_obeys_template_key_name() {
     // Naming one key enables strict KeyName lookup even when the key set has a
     // single entry; lax lookup is the explicit donor-compatible escape hatch.
@@ -2180,25 +2417,25 @@ fn capability_queries_report_supported_and_unsupported_names() {
 }
 
 #[test]
-fn conflicting_verification_keys_fail_before_input_parsing() {
-    let temp = tempfile::tempdir().unwrap();
-    let malformed = temp.path().join("malformed.xml");
-    fs::write(&malformed, "<Signature>").unwrap();
+fn duplicate_named_verification_keys_are_rejected_as_ambiguous() {
+    // Repeatable keys are a lookup set, but one KeyName must never select two
+    // entries because silently choosing by option order would be unstable.
+    let signed = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml");
+    let first = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let second = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
     let conflicting_keys = Command::new(binary())
-        .args([
-            "verify",
-            "--pubkey-pem",
-            "first.pem",
-            "--pubkey-pem",
-            "second.pem",
-        ])
-        .arg(&malformed)
+        .args(["verify", "--pubkey-pem:TestKeyName-rsa-2048"])
+        .arg(&first)
+        .arg("--pubkey-pem:TestKeyName-rsa-2048")
+        .arg(&second)
+        .arg(&signed)
         .output()
         .unwrap();
     assert!(!conflicting_keys.status.success());
     assert!(
         String::from_utf8_lossy(&conflicting_keys.stderr)
-            .contains("exactly one explicit public key")
+            .contains("multiple verification key inputs match template KeyNames")
     );
 }
 
