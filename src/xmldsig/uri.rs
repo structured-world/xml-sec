@@ -123,6 +123,19 @@ impl<'a> UriReferenceResolver<'a> {
         }
     }
 
+    /// Build a resolver with typed global and element-scoped ID registrations.
+    pub fn with_id_registrations(
+        doc: &'a Document<'a>,
+        registrations: &[crate::IdAttributeRegistration],
+    ) -> Self {
+        Self {
+            doc,
+            id_index: XmlIdIndex::with_registrations(doc, registrations),
+            external_resources: None,
+            external_resource_budget: ExternalResourceBudget::default(),
+        }
+    }
+
     /// Attach an explicit caller-owned external-resource map.
     ///
     /// No network or filesystem access is performed by this resolver. Keys are

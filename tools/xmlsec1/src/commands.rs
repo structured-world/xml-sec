@@ -10,6 +10,7 @@ use roxmltree::{Document, Node, ParsingOptions};
 use rsa::{RsaPublicKey, pkcs8::DecodePublicKey as _, traits::PublicKeyParts as _};
 use x509_parser::prelude::FromDer as _;
 use xml_sec::{
+    IdAttributeRegistration,
     policy::{DecryptionPolicy, EncryptionPolicy, SigningPolicy, VerificationPolicy},
     provider::{CryptoProvider, default_provider},
     xmldsig::{
@@ -471,6 +472,34 @@ fn option_value_text(option: &crate::OptionValue) -> Result<&str, CommandError> 
         .ok_or_else(|| CommandError::Usage(format!("--{} value must be valid UTF-8", option.name)))
 }
 
+fn id_attribute_registrations(
+    invocation: &Invocation,
+) -> Result<Vec<IdAttributeRegistration>, CommandError> {
+    let mut registrations = invocation
+        .values("add-id-attr")
+        .map(|option| option_value_text(option).map(IdAttributeRegistration::global))
+        .collect::<Result<Vec<_>, _>>()?;
+    for option in invocation.values("id-attr") {
+        let element = option_value_text(option)?;
+        let (namespace, local_name) = element
+            .rsplit_once(':')
+            .map_or((None, element), |(namespace, local_name)| {
+                (Some(namespace), local_name)
+            });
+        if local_name.is_empty() {
+            return Err(CommandError::Usage(
+                "--id-attr element local name cannot be empty".into(),
+            ));
+        }
+        registrations.push(IdAttributeRegistration::scoped(
+            option.parameter.as_deref().unwrap_or("id"),
+            local_name,
+            namespace,
+        ));
+    }
+    Ok(registrations)
+}
+
 fn select_named_candidate<'a, T: Copy>(
     candidates: &[(&'a crate::OptionValue, T)],
     requested_names: &[String],
@@ -515,14 +544,16 @@ fn select_named_candidate<'a, T: Copy>(
 
 fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, SIGN_OPTIONS)?;
-    reject_unimplemented_selectors(invocation, &["node-id"])?;
+    reject_unimplemented_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     if invocation.last_value("pwd").is_some() {
         return Err(CommandError::UnsupportedOption("pwd".into()));
     }
     let policy = SigningPolicy::default();
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
-    let signature = key_material::signing_signature_metadata(&xml, start_node_id, &policy)?;
+    let id_attributes = id_attribute_registrations(invocation)?;
+    let signature =
+        key_material::signing_signature_metadata(&xml, start_node_id, &id_attributes, &policy)?;
     let (key_option, certificate_is_der) = select_signing_key(invocation, &signature.key_names)?;
     let value = key_option.value.as_deref().unwrap_or_default();
     let (key_path, certificate_paths) = split_key_and_certificates(value)?;
@@ -551,6 +582,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     if let Some(id) = start_node_id {
         context = context.start_node_id(id);
     }
+    context = context.id_attributes(&id_attributes);
     if let Some(writer) = &writer {
         if signature.has_key_info {
             context = context.key_info_writer(writer);
@@ -641,7 +673,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
 
 fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, VERIFY_OPTIONS)?;
-    reject_unimplemented_selectors(invocation, &["node-id"])?;
+    reject_unimplemented_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     reject_unimplemented_verification_policy(invocation)?;
     let explicit_keys = [
         ("pubkey-pem", false),
@@ -664,7 +696,13 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     let policy = xmlsec_compatibility_verification_policy(invocation);
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
-    let signature = key_material::verification_signature_metadata(&xml, start_node_id, &policy)?;
+    let id_attributes = id_attribute_registrations(invocation)?;
+    let signature = key_material::verification_signature_metadata(
+        &xml,
+        start_node_id,
+        &id_attributes,
+        &policy,
+    )?;
     let algorithm = signature.algorithm;
     let selected_key = if explicit_keys.is_empty() {
         None
@@ -680,7 +718,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     let result = if let Some((option, false)) = selected_key {
         let path = option.value.as_deref().unwrap_or_default();
         let key = key_material::load_verification_key(path, algorithm)?;
-        verification_context(policy, start_node_id)
+        verification_context(policy, start_node_id, &id_attributes)
             .key(&key)
             .verify(&xml)
             .map_err(|error| CommandError::Signature(error.to_string()))?
@@ -691,6 +729,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             algorithm,
             policy,
             start_node_id,
+            &id_attributes,
             &xml,
         )?
     } else {
@@ -715,7 +754,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             }
         }
         let resolver = DefaultKeyResolver::new(config);
-        verification_context(policy, start_node_id)
+        verification_context(policy, start_node_id, &id_attributes)
             .key_resolver(&resolver)
             .verify(&xml)
             .map_err(|error| CommandError::Signature(error.to_string()))?
@@ -817,11 +856,14 @@ fn donor_dsig_status(status: DsigStatus) -> (&'static str, &'static str) {
     }
 }
 
-fn verification_context(
+fn verification_context<'a>(
     policy: VerificationPolicy,
-    start_node_id: Option<&str>,
-) -> VerifyContext<'_> {
-    let context = VerifyContext::new().policy(policy);
+    start_node_id: Option<&'a str>,
+    id_attributes: &'a [IdAttributeRegistration],
+) -> VerifyContext<'a> {
+    let context = VerifyContext::new()
+        .policy(policy)
+        .id_attributes(id_attributes);
     match start_node_id {
         Some(id) => context.start_node_id(id),
         None => context,
@@ -834,6 +876,7 @@ fn verify_with_explicit_certificate(
     algorithm: SignatureAlgorithm,
     policy: VerificationPolicy,
     start_node_id: Option<&str>,
+    id_attributes: &[IdAttributeRegistration],
     xml: &str,
 ) -> Result<xml_sec::xmldsig::VerifyResult, CommandError> {
     let certificate_der =
@@ -878,7 +921,7 @@ fn verify_with_explicit_certificate(
         .resolve_with_policy(Some(&key_info), algorithm, &resolver_policy)
         .map_err(|error| CommandError::Signature(error.to_string()))?
         .ok_or_else(|| CommandError::Signature("explicit certificate was not resolved".into()))?;
-    verification_context(policy, start_node_id)
+    verification_context(policy, start_node_id, id_attributes)
         .key(key.as_ref())
         .verify(xml)
         .map_err(|error| CommandError::Signature(error.to_string()))
@@ -886,7 +929,7 @@ fn verify_with_explicit_certificate(
 
 fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, ENCRYPT_OPTIONS)?;
-    reject_unimplemented_selectors(invocation, &["node-id"])?;
+    reject_unimplemented_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     let has_binary_data = invocation.last_value("binary-data").is_some();
     let has_xml_data = invocation.last_value("xml-data").is_some();
     if has_binary_data == has_xml_data {
@@ -899,7 +942,8 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let maximum_plaintext_bytes = policy.resources.max_encryption_plaintext_bytes;
     let template = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
-    let metadata = encryption_template(&template, start_node_id, &policy)?;
+    let id_attributes = id_attribute_registrations(invocation)?;
+    let metadata = encryption_template(&template, start_node_id, &id_attributes, &policy)?;
     let algorithm = metadata.algorithm;
     let encrypted_type = metadata.encrypted_type;
     let explicit_encrypted_type = metadata.explicit_encrypted_type;
@@ -988,6 +1032,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         validate_recipient_key_metadata(
             &template,
             start_node_id,
+            &id_attributes,
             &policy,
             selected_recipients.iter().map(|(key, _)| key),
         )?;
@@ -1026,6 +1071,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         &template,
         &result.encrypted_data_xml,
         start_node_id,
+        &id_attributes,
         &policy,
     )?;
     if rendered.len() > maximum_document_bytes {
@@ -1039,11 +1085,12 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
 fn validate_recipient_key_metadata<'a>(
     template: &str,
     start_node_id: Option<&str>,
+    id_attributes: &[IdAttributeRegistration],
     policy: &EncryptionPolicy,
     selected_keys: impl IntoIterator<Item = &'a RsaPublicKey>,
 ) -> Result<(), CommandError> {
     let document = parse_encryption_document(template, policy)?;
-    let encrypted_data = select_encrypted_data(&document, start_node_id)?;
+    let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
     let encrypted_keys = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
         .into_iter()
         .flat_map(|key_info| key_info.children())
@@ -1158,24 +1205,40 @@ fn recipient_metadata_error(message: &str) -> CommandError {
 fn template_oaep_parameters(
     encrypted_key: Node<'_, '_>,
 ) -> Result<Option<RsaOaepParameters>, CommandError> {
-    let Some(method) = encrypted_key
-        .children()
-        .find(|node| node.has_tag_name((XMLENC_NS, "EncryptionMethod")))
-    else {
-        return Ok(None);
-    };
+    let method = singleton_direct_child(
+        encrypted_key,
+        XMLENC_NS,
+        "EncryptionMethod",
+        "EncryptedKey contains more than one direct EncryptionMethod",
+    )?
+    .ok_or_else(|| {
+        CommandError::Encryption(
+            "EncryptedKey must contain exactly one direct EncryptionMethod".into(),
+        )
+    })?;
     let algorithm = method
         .attribute("Algorithm")
         .ok_or_else(|| CommandError::Encryption("EncryptedKey has no algorithm".into()))?;
     let transport = KeyTransportAlgorithm::from_uri(algorithm)
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
-    let digest = method
-        .children()
-        .find(|node| node.has_tag_name((XMLDSIG_NS, "DigestMethod")))
-        .and_then(|node| node.attribute("Algorithm"));
-    let mgf_node = method
-        .children()
-        .find(|node| node.has_tag_name((XMLENC11_NS, "MGF")));
+    let digest_node = singleton_direct_child(
+        method,
+        XMLDSIG_NS,
+        "DigestMethod",
+        "EncryptionMethod contains more than one direct DigestMethod",
+    )?;
+    let digest = digest_node
+        .map(|node| {
+            node.attribute("Algorithm")
+                .ok_or_else(|| CommandError::Encryption("DigestMethod has no Algorithm".into()))
+        })
+        .transpose()?;
+    let mgf_node = singleton_direct_child(
+        method,
+        XMLENC11_NS,
+        "MGF",
+        "EncryptionMethod contains more than one direct MGF",
+    )?;
     if transport == KeyTransportAlgorithm::RsaOaepMgf1p && mgf_node.is_some() {
         return Err(CommandError::Encryption(
             "legacy rsa-oaep-mgf1p does not permit an XML Encryption 1.1 MGF parameter".into(),
@@ -1188,26 +1251,45 @@ fn template_oaep_parameters(
     } else {
         oaep_mgf_from_uri(mgf.unwrap_or(OaepDigestAlgorithm::Sha1.mgf_uri()))?
     };
-    let label = method
-        .children()
-        .find(|node| node.has_tag_name((XMLENC_NS, "OAEPparams")))
-        .and_then(|node| node.text())
-        .map_or_else(
-            || Ok(Vec::new()),
-            |encoded| {
-                base64::Engine::decode(
-                    &base64::engine::general_purpose::STANDARD,
-                    encoded.split_ascii_whitespace().collect::<String>(),
-                )
-                .map_err(|error| CommandError::Encryption(format!("invalid OAEPparams: {error}")))
-            },
-        )?;
+    let label = singleton_direct_child(
+        method,
+        XMLENC_NS,
+        "OAEPparams",
+        "EncryptionMethod contains more than one direct OAEPparams",
+    )?
+    .and_then(|node| node.text())
+    .map_or_else(
+        || Ok(Vec::new()),
+        |encoded| {
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                encoded.split_ascii_whitespace().collect::<String>(),
+            )
+            .map_err(|error| CommandError::Encryption(format!("invalid OAEPparams: {error}")))
+        },
+    )?;
     Ok(Some(RsaOaepParameters {
         algorithm: transport,
         digest,
         mgf_digest,
         label,
     }))
+}
+
+fn singleton_direct_child<'a, 'input>(
+    parent: Node<'a, 'input>,
+    namespace: &str,
+    name: &str,
+    cardinality_error: &str,
+) -> Result<Option<Node<'a, 'input>>, CommandError> {
+    let mut children = parent
+        .children()
+        .filter(|node| node.has_tag_name((namespace, name)));
+    let child = children.next();
+    if children.next().is_some() {
+        return Err(CommandError::Encryption(cardinality_error.into()));
+    }
+    Ok(child)
 }
 
 fn oaep_digest_from_uri(uri: &str) -> Result<OaepDigestAlgorithm, CommandError> {
@@ -1238,11 +1320,12 @@ fn apply_encryption_template(
     template: &str,
     generated: &str,
     start_node_id: Option<&str>,
+    id_attributes: &[IdAttributeRegistration],
     policy: &EncryptionPolicy,
 ) -> Result<String, CommandError> {
     let template_document = parse_encryption_document(template, policy)?;
     let generated_document = parse_encryption_document(generated, policy)?;
-    let template_data = select_encrypted_data(&template_document, start_node_id)?;
+    let template_data = select_encrypted_data(&template_document, start_node_id, id_attributes)?;
     let generated_data = generated_document.root_element();
     let template_cipher = encrypted_data_cipher_value(template_data)
         .ok_or_else(|| CommandError::Encryption("template has no CipherValue".into()))?;
@@ -1439,15 +1522,16 @@ fn encrypted_key_cipher_values<'a, 'input>(
 
 fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, DECRYPT_OPTIONS)?;
-    reject_unimplemented_selectors(invocation, &["node-id"])?;
+    reject_unimplemented_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     if invocation.last_value("pwd").is_some() {
         return Err(CommandError::UnsupportedOption("pwd".into()));
     }
     let policy = DecryptionPolicy::default();
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let encrypted_data_id = option_text(invocation, "node-id")?;
+    let id_attributes = id_attribute_registrations(invocation)?;
     let document = parse_encryption_document(&xml, &policy)?;
-    let encrypted_data = select_encrypted_data(&document, encrypted_data_id)?;
+    let encrypted_data = select_encrypted_data(&document, encrypted_data_id, &id_attributes)?;
     let standalone = encrypted_data == document.root_element();
     let content_key_name = encrypted_data_key_name(encrypted_data)?;
     let recipient_key_names = encrypted_key_recipient_names(encrypted_data);
@@ -1482,6 +1566,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             encrypted_data_id,
             standalone,
             policy,
+            &id_attributes,
         )?
     } else if !private_keys.is_empty() {
         let candidates = private_keys
@@ -1510,7 +1595,14 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             inner: PrivateKeyDecryptor::new(key_material::load_rsa_private(path)?),
             key_name: recipient_filter,
         };
-        decrypt_input(&resolver, &xml, encrypted_data_id, standalone, policy)?
+        decrypt_input(
+            &resolver,
+            &xml,
+            encrypted_data_id,
+            standalone,
+            policy,
+            &id_attributes,
+        )?
     } else {
         return Err(CommandError::Usage(
             "decrypt requires --aes-key or an RSA private key".into(),
@@ -1603,8 +1695,11 @@ fn decrypt_input(
     encrypted_data_id: Option<&str>,
     standalone: bool,
     policy: DecryptionPolicy,
+    id_attributes: &[IdAttributeRegistration],
 ) -> Result<Vec<u8>, CommandError> {
-    let context = DecryptContext::new(resolver).policy(policy);
+    let context = DecryptContext::new(resolver)
+        .policy(policy)
+        .id_attributes(id_attributes);
     if standalone {
         return context
             .decrypt(xml)
@@ -1637,10 +1732,11 @@ struct EncryptionTemplateRecipient {
 fn encryption_template(
     xml: &str,
     start_node_id: Option<&str>,
+    id_attributes: &[IdAttributeRegistration],
     policy: &EncryptionPolicy,
 ) -> Result<EncryptionTemplateMetadata, CommandError> {
     let document = parse_encryption_document(xml, policy)?;
-    let encrypted_data = select_encrypted_data(&document, start_node_id)?;
+    let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
     let method = encrypted_data
         .children()
         .find(|node| node.has_tag_name((XMLENC_NS, "EncryptionMethod")))
@@ -1775,9 +1871,10 @@ fn parse_encryption_document<'a>(
 fn select_encrypted_data<'a>(
     document: &'a Document<'a>,
     start_node_id: Option<&str>,
+    id_attributes: &[IdAttributeRegistration],
 ) -> Result<Node<'a, 'a>, CommandError> {
     let start = if let Some(id) = start_node_id {
-        UriReferenceResolver::new(document)
+        UriReferenceResolver::with_id_registrations(document, id_attributes)
             .node_for_id(id)
             .ok_or_else(|| {
                 CommandError::Encryption(format!("selected node ID is missing or ambiguous: {id}"))
@@ -1840,6 +1937,9 @@ fn keys(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         "<?xml version=\"1.0\"?>\n<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">\n\
          {entries}</Keys>\n"
     );
+    Document::parse(&document).map_err(|error| {
+        CommandError::Usage(format!("generated key store is not valid XML: {error}"))
+    })?;
     if invocation.positional.len() > 1 {
         return Err(CommandError::Usage(
             "keys accepts at most one key-store path".into(),
@@ -2062,9 +2162,14 @@ mod tests {
             "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\" xmlns:n=\"http://www.w3.org/2009/xmlenc11#\"><e:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><s:KeyInfo><e:EncryptedKey><e:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"><n:MGF Algorithm=\"http://www.w3.org/2009/xmlenc11#mgf1sha256\"/></e:EncryptionMethod><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
         );
 
-        let rendered =
-            apply_encryption_template(&template, &generated, None, &EncryptionPolicy::default())
-                .unwrap();
+        let rendered = apply_encryption_template(
+            &template,
+            &generated,
+            None,
+            &[],
+            &EncryptionPolicy::default(),
+        )
+        .unwrap();
         let document = Document::parse(&rendered)
             .expect("injected KeyInfo prefixes must remain namespace-bound");
         assert!(
@@ -2090,9 +2195,14 @@ mod tests {
             "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><e:EncryptedKey><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
         );
 
-        let rendered =
-            apply_encryption_template(&template, &generated, None, &EncryptionPolicy::default())
-                .expect("empty KeyInfo must accept a generated recipient");
+        let rendered = apply_encryption_template(
+            &template,
+            &generated,
+            None,
+            &[],
+            &EncryptionPolicy::default(),
+        )
+        .expect("empty KeyInfo must accept a generated recipient");
         let document = Document::parse(&rendered).expect("merged output must parse");
 
         assert_eq!(
@@ -2128,7 +2238,7 @@ mod tests {
             ..EncryptionPolicy::default()
         };
 
-        let error = apply_encryption_template(&template, &generated, None, &policy)
+        let error = apply_encryption_template(&template, &generated, None, &[], &policy)
             .expect_err("the aggregate merged document must be reparsed under policy");
         assert!(error.to_string().contains("nodes limit"), "{error}");
     }
@@ -2164,7 +2274,7 @@ mod tests {
         }
         xml.push_str("</EncryptedData>");
 
-        let error = match encryption_template(&xml, None, &EncryptionPolicy::default()) {
+        let error = match encryption_template(&xml, None, &[], &EncryptionPolicy::default()) {
             Ok(_) => panic!("over-budget template must fail"),
             Err(error) => error,
         };

@@ -73,6 +73,7 @@ pub fn read_text(path: impl AsRef<Path>) -> Result<String, KeyMaterialError> {
 pub fn verification_signature_metadata(
     xml: &str,
     start_node_id: Option<&str>,
+    id_attributes: &[xml_sec::IdAttributeRegistration],
     policy: &VerificationPolicy,
 ) -> Result<SignatureMetadata, KeyMaterialError> {
     policy.validate()?;
@@ -83,7 +84,7 @@ pub fn verification_signature_metadata(
     )?;
     let signature = match start_node_id {
         Some(id) => {
-            let start = UriReferenceResolver::new(&document)
+            let start = UriReferenceResolver::with_id_registrations(&document, id_attributes)
                 .node_for_id(id)
                 .ok_or_else(|| KeyMaterialError::SelectedNodeUnavailable(id.to_owned()))?;
             start
@@ -109,6 +110,7 @@ pub fn verification_signature_metadata(
 pub fn signing_signature_metadata(
     xml: &str,
     start_node_id: Option<&str>,
+    id_attributes: &[xml_sec::IdAttributeRegistration],
     policy: &SigningPolicy,
 ) -> Result<SigningTemplateMetadata, KeyMaterialError> {
     policy.validate()?;
@@ -119,7 +121,7 @@ pub fn signing_signature_metadata(
     )?;
     let signature = match start_node_id {
         Some(id) => {
-            let start = UriReferenceResolver::new(&document)
+            let start = UriReferenceResolver::with_id_registrations(&document, id_attributes)
                 .node_for_id(id)
                 .ok_or_else(|| KeyMaterialError::SelectedNodeUnavailable(id.to_owned()))?;
             start
@@ -417,6 +419,7 @@ mod tests {
         let metadata = verification_signature_metadata(
             &xml,
             Some("ec"),
+            &[],
             &xml_sec::policy::VerificationPolicy::default(),
         )
         .unwrap();
@@ -435,6 +438,7 @@ mod tests {
         let metadata = verification_signature_metadata(
             &xml,
             None,
+            &[],
             &xml_sec::policy::VerificationPolicy::default(),
         )
         .unwrap();
@@ -458,7 +462,7 @@ mod tests {
             ..xml_sec::policy::VerificationPolicy::default()
         };
 
-        let error = verification_signature_metadata(&xml, None, &policy).unwrap_err();
+        let error = verification_signature_metadata(&xml, None, &[], &policy).unwrap_err();
         assert!(error.to_string().contains("nodes limit"));
     }
 }

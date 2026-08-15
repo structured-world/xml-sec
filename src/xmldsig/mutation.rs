@@ -360,7 +360,7 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     // Parse it under the template's namespace context so multiple siblings and
     // inherited prefixes have exactly the semantics they will have in KeyInfo.
     let wrapped_source = wrap_key_info_children(key_info_source, key_info);
-    let source_document = roxmltree::Document::parse(&wrapped_source)?;
+    let source_document = parse_with_options(&wrapped_source, policy)?;
     let sources = source_document
         .root_element()
         .children()
@@ -422,7 +422,7 @@ fn merge_one_key_info_source_at_index_with_options(
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
     let document = parse_with_options(xml, policy)?;
-    let source_document = roxmltree::Document::parse(key_info_source)?;
+    let source_document = parse_with_options(key_info_source, policy)?;
     let source = source_document.root_element();
     let source_content = element_inner_xml(key_info_source, source.range())?;
     let Some(signature) = signature_node(&document, target_signature) else {
@@ -1456,5 +1456,30 @@ mod tests {
             .expect_err("conflicting attributes must fail before serialization");
 
         assert!(matches!(error, XmlMutationError::InvalidAppendTarget));
+    }
+
+    #[test]
+    fn key_info_source_merge_applies_policy_to_writer_fragments() {
+        // A custom writer is an untrusted allocation boundary: its wrapper must
+        // obey the same node ceiling as the caller's signing template.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo/></ds:Signature>"#;
+        let children = (0..64).map(|_| "<part/>").collect::<String>();
+        let generated = format!(
+            r#"<ds:KeyName xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{children}</ds:KeyName>"#
+        );
+        let policy = crate::policy::SigningPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_nodes: 32,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::SigningPolicy::default()
+        };
+
+        let error =
+            merge_key_info_source_at_index_with_options(source, &generated, 0, Some(&policy))
+                .expect_err("writer fragment must obey the signing node ceiling");
+
+        assert!(matches!(error, XmlMutationError::XmlParse(_)));
+        assert!(error.to_string().contains("nodes limit"));
     }
 }

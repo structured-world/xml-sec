@@ -132,6 +132,72 @@ fn signs_verifies_and_rejects_tampering_through_process_api() {
 }
 
 #[test]
+fn scoped_id_attribute_selects_and_signs_the_registered_element() {
+    // libxmlsec1's --id-attr form is element-scoped: the custom attribute must
+    // drive both --node-id selection and same-document Reference resolution.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("scoped-id.xml");
+    let signed = temp.path().join("scoped-id-signed.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(
+        &template,
+        r##"<root><Envelope Token="selected"><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#selected"><Transforms><Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference></SignedInfo><SignatureValue/></Signature><payload>registered</payload></Envelope></root>"##,
+    )
+    .unwrap();
+
+    let sign = Command::new(binary())
+        .args([
+            "sign",
+            "--id-attr:Token",
+            "Envelope",
+            "--node-id",
+            "selected",
+        ])
+        .args(["--privkey-pem"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args([
+            "verify",
+            "--id-attr:Token",
+            "Envelope",
+            "--node-id",
+            "selected",
+        ])
+        .arg("--pubkey-pem")
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    let wrong_element = Command::new(binary())
+        .args(["sign", "--id-attr:Token", "Other", "--node-id", "selected"])
+        .arg("--privkey-pem")
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!wrong_element.status.success());
+    assert!(String::from_utf8_lossy(&wrong_element.stderr).contains("missing or ambiguous"));
+}
+
+#[test]
 fn xml_debug_verification_output_matches_the_donor_xml_contract() {
     // The upstream runner parses --print-xml-debug output with xmllint, so the
     // diagnostic mode must not share the plain-text debug renderer.
@@ -1985,6 +2051,56 @@ fn encryption_node_id_accepts_namespaced_id_attributes() {
 }
 
 #[test]
+fn global_id_attribute_selects_encrypt_and_decrypt_subtrees() {
+    // --add-id-attr applies one local attribute name to every element, and the
+    // registration must survive both CLI-side template parsing and core decrypt.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("custom-id-template.xml");
+    let plaintext = temp.path().join("plaintext.xml");
+    let encrypted = temp.path().join("encrypted.xml");
+    let key = temp.path().join("aes.key");
+    fs::write(
+        &template,
+        r#"<root><scope Token="target"><EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData></scope></root>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"<secret>registered</secret>").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--add-id-attr", "Token", "--node-id", "target"])
+        .arg("--aes-key")
+        .arg(&key)
+        .arg("--xml-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--add-id-attr", "Token", "--node-id", "target"])
+        .arg("--aes-key")
+        .arg(&key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    let output = String::from_utf8(decrypt.stdout).unwrap();
+    assert!(output.contains("<scope Token=\"target\"><secret>registered</secret></scope>"));
+}
+
+#[test]
 fn named_decryption_key_selects_a_later_recipient() {
     // A document KeyName selects among all EncryptedKey recipients. Checking
     // only the first recipient would reject a valid key before core decryption
@@ -2204,6 +2320,67 @@ fn rsa_decryption_accepts_private_key_certificate_companions() {
 }
 
 #[test]
+fn encryption_rejects_incomplete_or_ambiguous_recipient_methods() {
+    // Template metadata must describe exactly one self-consistent wrapping
+    // method; first-match parsing can otherwise emit output our parser rejects.
+    let temp = tempfile::tempdir().unwrap();
+    let plaintext = temp.path().join("plaintext.bin");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(&plaintext, b"recipient metadata").unwrap();
+    let method = |children: &str| {
+        format!(
+            r#"<EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep">{children}</EncryptionMethod>"#
+        )
+    };
+    let digest = r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#;
+    let mgf = r#"<xenc11:MGF Algorithm="http://www.w3.org/2009/xmlenc11#mgf1sha256"/>"#;
+    let label = "<OAEPparams>YQ==</OAEPparams>";
+
+    for (case, recipient_method, expected) in [
+        ("missing", String::new(), "EncryptionMethod"),
+        (
+            "duplicate-method",
+            format!("{}{}", method(""), method("")),
+            "EncryptionMethod",
+        ),
+        (
+            "duplicate-digest",
+            method(&format!("{digest}{digest}")),
+            "DigestMethod",
+        ),
+        ("duplicate-mgf", method(&format!("{mgf}{mgf}")), "MGF"),
+        (
+            "duplicate-label",
+            method(&format!("{label}{label}")),
+            "OAEPparams",
+        ),
+    ] {
+        let template = temp.path().join(format!("{case}.xml"));
+        fs::write(
+            &template,
+            format!(
+                r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:xenc11="http://www.w3.org/2009/xmlenc11#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey>{recipient_method}<CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#
+            ),
+        )
+        .unwrap();
+        let output = Command::new(binary())
+            .args(["encrypt", "--pubkey-pem"])
+            .arg(&public_key)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{case} unexpectedly succeeded");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn honors_legacy_rsa_oaep_parameters_from_the_template() {
     // Advertising rsa-oaep-mgf1p requires an actual process round trip, and
     // template parameters must drive key wrapping rather than only survive as XML.
@@ -2388,6 +2565,25 @@ fn generated_key_store_uses_the_libxmlsec1_xml_shape() {
             .and_then(|node| node.text()),
         Some("integration<&")
     );
+}
+
+#[test]
+fn generated_key_store_rejects_non_xml_key_names_before_writing() {
+    // Escaping handles markup but cannot make XML 1.0-forbidden characters
+    // serializable; a failed command must not leave a malformed secret file.
+    let temp = tempfile::tempdir().unwrap();
+    let key_store = temp.path().join("invalid.xml");
+    let output = Command::new(binary())
+        .arg("keys")
+        .arg("--gen-key:invalid\u{1}name")
+        .arg("aes-128")
+        .arg(&key_store)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("XML"));
+    assert!(!key_store.exists());
 }
 
 #[test]

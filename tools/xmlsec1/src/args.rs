@@ -414,7 +414,7 @@ pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
         canonical: "add-id-attr",
         aliases: &[],
         arity: VALUE,
-        accepts_parameter: true,
+        accepts_parameter: false,
     },
     OptionSpec {
         canonical: "binary-data",

@@ -10,27 +10,75 @@ use roxmltree::NodeId;
 /// Default ID attribute names shared by XMLDSig and XMLEnc selection.
 const DEFAULT_ID_ATTRS: &[&str] = &["ID", "Id", "id"];
 
+/// Caller-declared XML ID attribute registration.
+///
+/// Registrations are request context rather than security policy. A global
+/// registration applies an attribute local name to every element; a scoped
+/// registration applies only to one expanded element name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdAttributeRegistration {
+    attribute_local_name: String,
+    element_local_name: Option<String>,
+    element_namespace: Option<String>,
+}
+
+impl IdAttributeRegistration {
+    /// Register an attribute local name as an ID on every element.
+    #[must_use]
+    pub fn global(attribute_local_name: impl Into<String>) -> Self {
+        Self {
+            attribute_local_name: attribute_local_name.into(),
+            element_local_name: None,
+            element_namespace: None,
+        }
+    }
+
+    /// Register an attribute as an ID only on matching elements.
+    ///
+    /// `element_namespace` is the namespace URI, not an XML prefix. `None`
+    /// matches only elements without a namespace.
+    #[must_use]
+    pub fn scoped(
+        attribute_local_name: impl Into<String>,
+        element_local_name: impl Into<String>,
+        element_namespace: Option<&str>,
+    ) -> Self {
+        Self {
+            attribute_local_name: attribute_local_name.into(),
+            element_local_name: Some(element_local_name.into()),
+            element_namespace: element_namespace.map(str::to_owned),
+        }
+    }
+
+    fn matches(&self, node: Node<'_, '_>, attribute_name: &str) -> bool {
+        self.attribute_local_name == attribute_name
+            && self.element_local_name.as_deref().is_none_or(|name| {
+                node.tag_name().name() == name
+                    && node.tag_name().namespace() == self.element_namespace.as_deref()
+            })
+    }
+}
+
 /// Duplicate-safe index of XML ID attributes in one parsed document.
 pub(crate) struct XmlIdIndex<'a> {
     nodes: HashMap<&'a str, Node<'a, 'a>>,
 }
 
 impl<'a> XmlIdIndex<'a> {
-    /// Index the standard `ID`, `Id`, and `id` spellings.
-    #[cfg(any(feature = "xmlenc", test))]
-    pub(crate) fn new(document: &'a Document<'a>) -> Self {
-        Self::with_extra_attrs(document, &[])
-    }
-
     /// Index standard ID spellings plus caller-declared local attribute names.
     pub(crate) fn with_extra_attrs(document: &'a Document<'a>, extra_attrs: &[&str]) -> Self {
-        let mut names = DEFAULT_ID_ATTRS.to_vec();
-        for name in extra_attrs {
-            if !names.contains(name) {
-                names.push(name);
-            }
-        }
+        let registrations = extra_attrs
+            .iter()
+            .map(|name| IdAttributeRegistration::global(*name))
+            .collect::<Vec<_>>();
+        Self::with_registrations(document, &registrations)
+    }
 
+    /// Index standard ID spellings plus caller-declared registrations.
+    pub(crate) fn with_registrations(
+        document: &'a Document<'a>,
+        registrations: &[IdAttributeRegistration],
+    ) -> Self {
         let mut nodes = HashMap::new();
         let mut duplicates = HashSet::new();
         for node in document.descendants().filter(Node::is_element) {
@@ -38,7 +86,12 @@ impl<'a> XmlIdIndex<'a> {
             // such as wsu:Id and xml:id participate alongside unqualified Id.
             for value in node
                 .attributes()
-                .filter(|attribute| names.contains(&attribute.name()))
+                .filter(|attribute| {
+                    DEFAULT_ID_ATTRS.contains(&attribute.name())
+                        || registrations
+                            .iter()
+                            .any(|registration| registration.matches(node, attribute.name()))
+                })
                 .map(|attribute| attribute.value())
             {
                 if duplicates.contains(value) {
@@ -153,7 +206,7 @@ mod tests {
             r#"<root><one ID="same" Id="same"/><two id="duplicate"/><three ID="duplicate"/></root>"#,
         )
         .expect("ID index fixture must be valid XML");
-        let index = XmlIdIndex::new(&document);
+        let index = XmlIdIndex::with_registrations(&document, &[]);
 
         assert_eq!(
             index.node("same").map(|node| node.tag_name().name()),
@@ -170,7 +223,7 @@ mod tests {
             r#"<root xmlns:wsu="urn:wsu"><one wsu:Id="wsu-target"/><two xml:id="xml-target"/></root>"#,
         )
         .expect("namespaced ID fixture must parse");
-        let index = XmlIdIndex::new(&document);
+        let index = XmlIdIndex::with_registrations(&document, &[]);
 
         assert_eq!(
             index.node("wsu-target").map(|node| node.tag_name().name()),

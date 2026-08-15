@@ -677,6 +677,7 @@ pub struct SignContext<'a> {
     signing_key: &'a dyn SigningKey,
     key_info_writer: Option<&'a dyn KeyInfoWriter>,
     start_node_id: Option<&'a str>,
+    id_attributes: &'a [crate::IdAttributeRegistration],
     policy: crate::policy::SigningPolicy,
     provider: &'a dyn crate::provider::CryptoProvider,
 }
@@ -688,6 +689,7 @@ impl<'a> SignContext<'a> {
             signing_key,
             key_info_writer: None,
             start_node_id: None,
+            id_attributes: &[],
             policy: crate::policy::SigningPolicy::default(),
             provider: crate::provider::default_provider(),
         }
@@ -722,6 +724,13 @@ impl<'a> SignContext<'a> {
         self
     }
 
+    /// Add caller-declared ID attributes for start-node and Reference lookup.
+    #[must_use]
+    pub fn id_attributes(mut self, registrations: &'a [crate::IdAttributeRegistration]) -> Self {
+        self.id_attributes = registrations;
+        self
+    }
+
     /// Select the node returned by XPath's `here()` extension function.
     ///
     /// The default follows XMLDSig and returns the `<XPath>` parameter.
@@ -746,7 +755,8 @@ impl<'a> SignContext<'a> {
         self.policy.resources.validate_xml_document_len(xml.len())?;
         let document = parse_signing_document(xml, Some(&self.policy))
             .map_err(SigningDigestError::XmlParse)?;
-        let target_signature = signing_signature_index(&document, self.start_node_id)?;
+        let target_signature =
+            signing_signature_index(&document, self.start_node_id, self.id_attributes)?;
         self.sign_template_at_index(xml, target_signature)
     }
 
@@ -782,6 +792,7 @@ impl<'a> SignContext<'a> {
             self.provider,
             &execution_budget,
             Some(target_signature),
+            self.id_attributes,
         )?;
         self.policy
             .resources
@@ -840,7 +851,7 @@ impl<'a> SignContext<'a> {
         let templated = if let Some(id) = self.start_node_id {
             let document = parse_signing_document(xml, Some(&self.policy))
                 .map_err(SigningDigestError::XmlParse)?;
-            let start = signing_start_node(&document, id)?;
+            let start = signing_start_node(&document, id, self.id_attributes)?;
             append_signature_to_element_with_options(
                 xml,
                 &template,
@@ -856,7 +867,7 @@ impl<'a> SignContext<'a> {
         let document = parse_signing_document(&templated, Some(&self.policy))
             .map_err(SigningDigestError::XmlParse)?;
         let target_signature = if let Some(id) = self.start_node_id {
-            let start = signing_start_node(&document, id)?;
+            let start = signing_start_node(&document, id, self.id_attributes)?;
             let appended = start
                 .children()
                 .rfind(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
@@ -865,7 +876,7 @@ impl<'a> SignContext<'a> {
                 })?;
             signature_index(&document, appended)?
         } else {
-            signing_signature_index(&document, None)?
+            signing_signature_index(&document, None, self.id_attributes)?
         };
         self.sign_template_at_index(&templated, target_signature)
     }
@@ -895,6 +906,7 @@ pub fn compute_reference_digest_values(
         crate::provider::default_provider(),
         &execution_budget,
         None,
+        &[],
     )
 }
 
@@ -905,6 +917,7 @@ fn compute_reference_digest_values_with_options(
     provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
     target_signature: Option<usize>,
+    id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
     let doc = parse_signing_document(xml, policy)?;
     let signature = find_signing_signature_node(&doc, target_signature)?;
@@ -952,7 +965,7 @@ fn compute_reference_digest_values_with_options(
             }
         }
     }
-    let resolver = UriReferenceResolver::new(&doc);
+    let resolver = UriReferenceResolver::with_id_registrations(&doc, id_attributes);
     references
         .into_iter()
         .enumerate()
@@ -1011,6 +1024,7 @@ pub fn fill_reference_digest_values(xml: &str) -> Result<String, SigningDigestEr
         crate::provider::default_provider(),
         &execution_budget,
         None,
+        &[],
     )
 }
 
@@ -1021,6 +1035,7 @@ fn fill_reference_digest_values_with_options(
     provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
     target_signature: Option<usize>,
+    id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<String, SigningDigestError> {
     let digest_values = compute_reference_digest_values_with_options(
         xml,
@@ -1029,6 +1044,7 @@ fn fill_reference_digest_values_with_options(
         provider,
         execution_budget,
         target_signature,
+        id_attributes,
     )?
     .into_iter()
     .map(|digest| digest.digest_value);
@@ -1136,9 +1152,10 @@ fn find_signing_signature_node<'a>(
 fn signing_signature_index(
     doc: &Document<'_>,
     start_node_id: Option<&str>,
+    id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<usize, SigningDigestError> {
     let selected = if let Some(id) = start_node_id {
-        let start = signing_start_node(doc, id)?;
+        let start = signing_start_node(doc, id, id_attributes)?;
         start
             .descendants()
             .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
@@ -1156,8 +1173,9 @@ fn signing_signature_index(
 fn signing_start_node<'a>(
     doc: &'a Document<'a>,
     id: &str,
+    id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<Node<'a, 'a>, SigningDigestError> {
-    UriReferenceResolver::new(doc)
+    UriReferenceResolver::with_id_registrations(doc, id_attributes)
         .node_for_id(id)
         .ok_or_else(|| {
             SigningDigestError::InvalidStructure(format!(

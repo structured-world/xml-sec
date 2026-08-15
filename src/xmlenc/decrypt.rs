@@ -49,6 +49,7 @@ pub struct DecryptContext<'a> {
     resolver: &'a dyn DecryptionKeyResolver,
     policy: crate::policy::DecryptionPolicy,
     provider: &'a dyn crate::provider::CryptoProvider,
+    id_attributes: &'a [crate::IdAttributeRegistration],
 }
 
 impl<'a> DecryptContext<'a> {
@@ -58,6 +59,7 @@ impl<'a> DecryptContext<'a> {
             resolver,
             policy: crate::policy::DecryptionPolicy::default(),
             provider: crate::provider::default_provider(),
+            id_attributes: &[],
         }
     }
 
@@ -70,6 +72,12 @@ impl<'a> DecryptContext<'a> {
     /// Select the cryptographic provider for this decryption operation.
     pub fn provider(mut self, provider: &'a dyn crate::provider::CryptoProvider) -> Self {
         self.provider = provider;
+        self
+    }
+
+    /// Add caller-declared ID attributes for operation start-node lookup.
+    pub fn id_attributes(mut self, registrations: &'a [crate::IdAttributeRegistration]) -> Self {
+        self.id_attributes = registrations;
         self
     }
 
@@ -472,11 +480,13 @@ fn decrypt_document_with_context(
     let document = Document::parse_with_options(xml, parsing_options())?;
     let start = match selector {
         DocumentEncryptedDataSelector::StartNodeId(Some(id)) => {
-            XmlIdIndex::new(&document).node(id).ok_or_else(|| {
-                XmlEncError::InvalidStructure(format!(
-                    "selected node ID is missing or ambiguous: {id}"
-                ))
-            })?
+            XmlIdIndex::with_registrations(&document, context.id_attributes)
+                .node(id)
+                .ok_or_else(|| {
+                    XmlEncError::InvalidStructure(format!(
+                        "selected node ID is missing or ambiguous: {id}"
+                    ))
+                })?
         }
         DocumentEncryptedDataSelector::StartNodeId(None)
         | DocumentEncryptedDataSelector::EncryptedDataId(_) => document.root(),

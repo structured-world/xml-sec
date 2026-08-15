@@ -37,8 +37,11 @@ AES keys reject recipient `EncryptedKey` templates they cannot refresh.
 Signing options validate every certificate from `key,leaf,intermediate,...` and embed the chain
 when the template provides a `KeyInfo` placeholder, filling an empty `X509Data`
 without erasing sibling key sources; verification accepts
-stdin as `-` and can select one signature subtree with `--node-id`. Output paths
-support the upstream `{inputfile}` basename template, and `--gen-key[:name]`
+stdin as `-` and can select one signature subtree with `--node-id`.
+support request-local custom IDs through global `--add-id-attr NAME` and
+element-scoped `--id-attr[:ATTR] [NAMESPACE-URI:]ELEMENT`; the same
+registrations drive Reference resolution and XMLEnc operation selection.
+Output paths support the upstream `{inputfile}` basename template, and `--gen-key[:name]`
 emits both named and unnamed AES key-store entries. `help-all` is generated from
 the parser registry. Named signing keys require a template `KeyName`; named
 verification and encryption/decryption options form key sets and require the

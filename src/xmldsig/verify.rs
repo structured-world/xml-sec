@@ -230,6 +230,7 @@ pub struct VerifyContext<'a> {
     store_pre_digest: bool,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
     start_node_id: Option<&'a str>,
+    id_attributes: &'a [crate::IdAttributeRegistration],
 }
 
 impl<'a> VerifyContext<'a> {
@@ -250,6 +251,7 @@ impl<'a> VerifyContext<'a> {
             store_pre_digest: false,
             external_resources: None,
             start_node_id: None,
+            id_attributes: &[],
         }
     }
 
@@ -353,6 +355,12 @@ impl<'a> VerifyContext<'a> {
     /// start-node contract of libxmlsec1's `--node-id` option.
     pub fn start_node_id(mut self, id: &'a str) -> Self {
         self.start_node_id = Some(id);
+        self
+    }
+
+    /// Add caller-declared ID attributes for start-node and Reference lookup.
+    pub fn id_attributes(mut self, registrations: &'a [crate::IdAttributeRegistration]) -> Self {
+        self.id_attributes = registrations;
         self
     }
 
@@ -1014,10 +1022,11 @@ fn verify_signature_with_context(
             entity_resolver: None,
         },
     )?;
-    let resolver = UriReferenceResolver::new(&doc).with_external_resource_limits(
-        ctx.policy.resources.max_external_resource_bytes,
-        ctx.policy.resources.max_external_resource_total_bytes,
-    );
+    let resolver = UriReferenceResolver::with_id_registrations(&doc, ctx.id_attributes)
+        .with_external_resource_limits(
+            ctx.policy.resources.max_external_resource_bytes,
+            ctx.policy.resources.max_external_resource_total_bytes,
+        );
     let resolver = match ctx.external_resources {
         Some(resources) => resolver.with_external_resources(resources),
         None => resolver,
