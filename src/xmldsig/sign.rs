@@ -40,6 +40,7 @@ use super::transforms::{
 };
 use super::types::TransformError;
 use super::uri::UriReferenceResolver;
+use super::verify::parse_signature_children;
 
 /// Result for one computed signing-template reference digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -765,6 +766,11 @@ impl<'a> SignContext<'a> {
         xml: &str,
         target_signature: usize,
     ) -> Result<String, SigningError> {
+        let document = parse_signing_document(xml, Some(&self.policy))
+            .map_err(SigningDigestError::XmlParse)?;
+        let signature = find_signing_signature_node(&document, Some(target_signature))?;
+        parse_signature_children(signature)
+            .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
         let execution_budget = TransformExecutionBudget::from_resources(&self.policy.resources);
         let transform_options = TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)

@@ -16,8 +16,9 @@ use xml_sec::{
     xmldsig::{
         DefaultKeyResolver, DsigStatus, FailureReason, KeyInfoSource, KeyInfoWriter, KeyResolver,
         KeyResolverConfig, KeyValueInfo, ReferenceResult, SignContext, SignatureAlgorithm,
-        UriTypeSet, VerifyContext, VerifyResult, X509CertificateKeyInfoWriter, XPathHereSemantics,
-        parse_key_info, uri::UriReferenceResolver,
+        SigningKey, SigningPublicKeyInfo, UriTypeSet, VerifyContext, VerifyResult,
+        X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
+        uri::UriReferenceResolver,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
@@ -504,15 +505,9 @@ fn id_attribute_registrations(
 fn select_named_candidate<'a, T: Copy>(
     candidates: &[(&'a crate::OptionValue, T)],
     requested_names: &[String],
-    lax_key_search: bool,
     allow_unconstrained_named_singleton: bool,
     key_kind: &str,
 ) -> Result<(&'a crate::OptionValue, T), CommandError> {
-    if lax_key_search {
-        return candidates.first().copied().ok_or_else(|| {
-            CommandError::Usage(format!("no compatible {key_kind} input was supplied"))
-        });
-    }
     if let [selected] = candidates
         && (selected.0.parameter.is_none()
             || (requested_names.is_empty() && allow_unconstrained_named_singleton))
@@ -547,6 +542,30 @@ fn select_named_candidate<'a, T: Copy>(
     Err(CommandError::Usage(message))
 }
 
+fn named_candidate_search<'a, T: Copy>(
+    candidates: &[(&'a crate::OptionValue, T)],
+    requested_names: &[String],
+    lax_key_search: bool,
+    allow_unconstrained_named_singleton: bool,
+    key_kind: &str,
+) -> Result<Vec<(&'a crate::OptionValue, T)>, CommandError> {
+    if lax_key_search {
+        if candidates.is_empty() {
+            return Err(CommandError::Usage(format!(
+                "no compatible {key_kind} input was supplied"
+            )));
+        }
+        return Ok(candidates.to_vec());
+    }
+    select_named_candidate(
+        candidates,
+        requested_names,
+        allow_unconstrained_named_singleton,
+        key_kind,
+    )
+    .map(|selected| vec![selected])
+}
+
 fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, SIGN_OPTIONS)?;
     reject_unimplemented_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
@@ -559,10 +578,10 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     let id_attributes = id_attribute_registrations(invocation)?;
     let signature =
         key_material::signing_signature_metadata(&xml, start_node_id, &id_attributes, &policy)?;
-    let (key_option, certificate_is_der) = select_signing_key(invocation, &signature.key_names)?;
+    let (key_option, certificate_is_der, key) =
+        select_signing_key(invocation, &signature.key_names, signature.algorithm)?;
     let value = key_option.value.as_deref().unwrap_or_default();
-    let (key_path, certificate_paths) = split_key_and_certificates(value)?;
-    let key = key_material::load_signing_key(key_path)?;
+    let (_, certificate_paths) = split_key_and_certificates(value)?;
     let writer = if certificate_paths.is_empty() {
         None
     } else {
@@ -631,7 +650,8 @@ fn write_signing_diagnostics(
 fn select_signing_key<'a>(
     invocation: &'a Invocation,
     requested_names: &[String],
-) -> Result<(&'a crate::OptionValue, bool), CommandError> {
+    algorithm: SignatureAlgorithm,
+) -> Result<(&'a crate::OptionValue, bool, Box<dyn SigningKey>), CommandError> {
     let mut keys = Vec::new();
     for (name, certificate_is_der) in [
         ("privkey-pem", false),
@@ -646,12 +666,46 @@ fn select_signing_key<'a>(
             "sign requires --privkey-pem or --pkcs8-pem/der".into(),
         ));
     }
-    select_named_candidate(
+    let candidates = named_candidate_search(
         &keys,
         requested_names,
         invocation.flag("lax-key-search"),
         false,
         "private key",
+    )?;
+    let mut last_error = None;
+    for (option, certificate_is_der) in candidates {
+        let (path, _) = split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
+        match key_material::load_signing_key(path) {
+            Ok(key) if signing_key_supports(key.as_ref(), algorithm) => {
+                return Ok((option, certificate_is_der, key));
+            }
+            Ok(_) => {}
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if let Some(error) = last_error {
+        return Err(error.into());
+    }
+    Err(CommandError::Usage(format!(
+        "no private key input supports {}",
+        algorithm.uri()
+    )))
+}
+
+fn signing_key_supports(key: &dyn SigningKey, algorithm: SignatureAlgorithm) -> bool {
+    matches!(
+        (key.public_key_info(), algorithm),
+        (
+            Ok(SigningPublicKeyInfo::Rsa { .. }),
+            SignatureAlgorithm::RsaSha1
+                | SignatureAlgorithm::RsaSha256
+                | SignatureAlgorithm::RsaSha384
+                | SignatureAlgorithm::RsaSha512
+        ) | (
+            Ok(SigningPublicKeyInfo::Ec { .. }),
+            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384
+        )
     )
 }
 
@@ -732,34 +786,57 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         &policy,
     )?;
     let algorithm = signature.algorithm;
-    let selected_key = if explicit_keys.is_empty() {
-        None
+    let selected_keys = if explicit_keys.is_empty() {
+        Vec::new()
     } else {
-        Some(select_named_candidate(
+        named_candidate_search(
             &explicit_keys,
             &signature.key_names,
             invocation.flag("lax-key-search"),
             true,
             "verification key",
-        )?)
-    };
-    let result = if let Some((option, false)) = selected_key {
-        let path = option.value.as_deref().unwrap_or_default();
-        let key = key_material::load_verification_key(path, algorithm)?;
-        verification_context(policy, start_node_id, &id_attributes)
-            .key(&key)
-            .verify(&xml)
-            .map_err(|error| CommandError::Signature(error.to_string()))?
-    } else if let Some((certificate, true)) = selected_key {
-        verify_with_explicit_certificate(
-            invocation,
-            certificate,
-            algorithm,
-            policy,
-            start_node_id,
-            &id_attributes,
-            &xml,
         )?
+    };
+    let result = if !selected_keys.is_empty() {
+        let mut last_result = None;
+        let mut last_error = None;
+        for (option, certificate) in selected_keys {
+            let attempt = if certificate {
+                verify_with_explicit_certificate(
+                    invocation,
+                    option,
+                    algorithm,
+                    policy.clone(),
+                    start_node_id,
+                    &id_attributes,
+                    &xml,
+                )
+            } else {
+                key_material::load_verification_key(
+                    option.value.as_deref().unwrap_or_default(),
+                    algorithm,
+                )
+                .map_err(CommandError::from)
+                .and_then(|key| {
+                    verification_context(policy.clone(), start_node_id, &id_attributes)
+                        .key(&key)
+                        .verify(&xml)
+                        .map_err(|error| CommandError::Signature(error.to_string()))
+                })
+            };
+            match attempt {
+                Ok(result) if aggregate_verification_status(&result) == DsigStatus::Valid => {
+                    last_result = Some(result);
+                    break;
+                }
+                Ok(result) => last_result = Some(result),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match last_result {
+            Some(result) => result,
+            None => return Err(last_error.unwrap_or(CommandError::InvalidSignature)),
+        }
     } else {
         let mut config = KeyResolverConfig::default();
         for name in [
@@ -1011,17 +1088,32 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        let (option, ()) = select_named_candidate(
+        let candidates = named_candidate_search(
             &candidates,
             &requested_names,
             invocation.flag("lax-key-search"),
             true,
             "AES key",
         )?;
-        let key = key_material::load_symmetric(
-            option.value.as_deref().unwrap_or_default(),
-            Some(algorithm.key_len()),
-        )?;
+        let mut selected = None;
+        let mut last_error = None;
+        for (option, ()) in candidates {
+            match key_material::load_symmetric(
+                option.value.as_deref().unwrap_or_default(),
+                Some(algorithm.key_len()),
+            ) {
+                Ok(key) => {
+                    selected = Some((option, key));
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        let (option, key) = selected.ok_or_else(|| {
+            last_error
+                .map(CommandError::from)
+                .unwrap_or_else(|| CommandError::Usage("no compatible AES key input".into()))
+        })?;
         builder = builder.direct_key(key);
         if let Some(name) = option.parameter.as_deref() {
             builder = builder.direct_key_name(name);
@@ -1042,19 +1134,35 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let (option, certificate) = select_named_candidate(
+            let candidates = named_candidate_search(
                 &public_keys,
                 &requested_names,
                 invocation.flag("lax-key-search"),
                 true,
                 "RSA recipient key",
             )?;
-            let path = option.value.as_deref().unwrap_or_default();
-            let public_key = if certificate {
-                key_material::load_rsa_certificate_public(path)?
-            } else {
-                key_material::load_rsa_public(path)?
-            };
+            let mut public_key = None;
+            let mut last_error = None;
+            for (option, certificate) in candidates {
+                let path = option.value.as_deref().unwrap_or_default();
+                let loaded = if certificate {
+                    key_material::load_rsa_certificate_public(path)
+                } else {
+                    key_material::load_rsa_public(path)
+                };
+                match loaded {
+                    Ok(key) => {
+                        public_key = Some(key);
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            let public_key = public_key.ok_or_else(|| {
+                last_error.map(CommandError::from).unwrap_or_else(|| {
+                    CommandError::Usage("no compatible RSA recipient key input".into())
+                })
+            })?;
             selected_recipients.push((public_key, template_recipient.oaep_parameters));
         }
         validate_recipient_key_metadata(
@@ -1648,48 +1756,61 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             .map(|option| (option, ()))
             .collect::<Vec<_>>();
         let requested_names = content_key_name.iter().cloned().collect::<Vec<_>>();
-        let (option, ()) = select_named_candidate(
+        let candidates = named_candidate_search(
             &candidates,
             &requested_names,
             invocation.flag("lax-key-search"),
             true,
             "AES key",
         )?;
-        let key = key_material::load_symmetric(option.value.as_deref().unwrap_or_default(), None)?;
-        decrypt_input(
-            &SymmetricKeyDecryptor::new(key),
-            &xml,
-            encrypted_data_id,
-            standalone,
-            policy,
-            &id_attributes,
-        )?
+        let mut decrypted = None;
+        let mut last_error = None;
+        for (option, ()) in candidates {
+            let attempt =
+                key_material::load_symmetric(option.value.as_deref().unwrap_or_default(), None)
+                    .map_err(CommandError::from)
+                    .and_then(|key| {
+                        decrypt_input(
+                            &SymmetricKeyDecryptor::new(key),
+                            &xml,
+                            encrypted_data_id,
+                            standalone,
+                            policy.clone(),
+                            &id_attributes,
+                        )
+                    });
+            match attempt {
+                Ok(bytes) => {
+                    decrypted = Some(bytes);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        decrypted.ok_or_else(|| {
+            last_error.unwrap_or_else(|| CommandError::Usage("no compatible AES key input".into()))
+        })?
     } else if !private_keys.is_empty() {
-        let candidates = private_keys
-            .iter()
-            .copied()
-            .map(|option| (option, ()))
-            .collect::<Vec<_>>();
-        let (option, ()) = select_named_candidate(
-            &candidates,
-            &recipient_key_names,
-            invocation.flag("lax-key-search"),
-            true,
-            "RSA private key",
-        )?;
-        let recipient_filter = named_recipient_filter(
-            option,
+        let selected = select_recipient_private_keys(
+            &private_keys,
             &recipient_key_names,
             invocation.flag("lax-key-search"),
         )?;
-        let (path, certificate_paths) =
-            split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
-        for certificate in certificate_paths {
-            key_material::load_certificate(certificate)?;
+        let mut keys = Vec::with_capacity(selected.len());
+        for option in selected {
+            let (path, certificate_paths) =
+                split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
+            for certificate in certificate_paths {
+                key_material::load_certificate(certificate)?;
+            }
+            keys.push(RecipientPrivateKey {
+                inner: PrivateKeyDecryptor::new(key_material::load_rsa_private(path)?),
+                key_name: option.parameter.clone(),
+            });
         }
         let resolver = NamedRecipientDecryptor {
-            inner: PrivateKeyDecryptor::new(key_material::load_rsa_private(path)?),
-            key_name: recipient_filter,
+            keys,
+            lax_key_search: invocation.flag("lax-key-search"),
         };
         decrypt_input(
             &resolver,
@@ -1773,24 +1894,37 @@ fn write_decryption_diagnostics(
     writeln!(stdout, "</DataDecryptionContext>").map_err(stdout_error)
 }
 
-struct NamedRecipientDecryptor<'a> {
+struct RecipientPrivateKey {
     inner: PrivateKeyDecryptor,
-    key_name: Option<&'a str>,
+    key_name: Option<String>,
 }
 
-impl DecryptionKeyResolver for NamedRecipientDecryptor<'_> {
+struct NamedRecipientDecryptor {
+    keys: Vec<RecipientPrivateKey>,
+    lax_key_search: bool,
+}
+
+impl DecryptionKeyResolver for NamedRecipientDecryptor {
     fn resolve_key(
         &self,
         provider: &dyn CryptoProvider,
         algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
     ) -> Result<Vec<u8>, XmlEncError> {
-        if let (Some(expected), Some(candidate)) = (self.key_name, encrypted_key)
-            && candidate.key_name.as_deref() != Some(expected)
-        {
-            return Err(XmlEncError::KeyNotFound);
+        let mut last_error = None;
+        for key in &self.keys {
+            if !self.lax_key_search
+                && let (Some(expected), Some(candidate)) = (key.key_name.as_deref(), encrypted_key)
+                && candidate.key_name.as_deref() != Some(expected)
+            {
+                continue;
+            }
+            match key.inner.resolve_key(provider, algorithm, encrypted_key) {
+                Ok(key) => return Ok(key),
+                Err(error) => last_error = Some(error),
+            }
         }
-        self.inner.resolve_key(provider, algorithm, encrypted_key)
+        Err(last_error.unwrap_or(XmlEncError::KeyNotFound))
     }
 }
 
@@ -1860,13 +1994,25 @@ fn encryption_template(
             )));
         }
     };
-    let recipients = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
+    let key_info = singleton_direct_child(
+        encrypted_data,
+        XMLDSIG_NS,
+        "KeyInfo",
+        "EncryptedData contains more than one direct KeyInfo",
+    )?;
+    let recipients = key_info
         .into_iter()
         .flat_map(|key_info| key_info.children())
         .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
         .map(|encrypted_key| {
+            let recipient_key_info = singleton_direct_child(
+                encrypted_key,
+                XMLDSIG_NS,
+                "KeyInfo",
+                "EncryptedKey contains more than one direct KeyInfo",
+            )?;
             Ok(EncryptionTemplateRecipient {
-                key_name: direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo")
+                key_name: recipient_key_info
                     .map(|key_info| {
                         optional_direct_child_text(
                             key_info,
@@ -1892,7 +2038,13 @@ fn encryption_template(
 }
 
 fn encrypted_data_key_name(encrypted_data: Node<'_, '_>) -> Result<Option<String>, CommandError> {
-    let Some(key_info) = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo") else {
+    let Some(key_info) = singleton_direct_child(
+        encrypted_data,
+        XMLDSIG_NS,
+        "KeyInfo",
+        "EncryptedData contains more than one direct KeyInfo",
+    )?
+    else {
         return Ok(None);
     };
     optional_direct_child_text(
@@ -1968,33 +2120,89 @@ fn optional_direct_child_text(
 fn encrypted_key_recipient_names(
     encrypted_data: Node<'_, '_>,
 ) -> Result<Vec<String>, CommandError> {
-    direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
+    let key_info = singleton_direct_child(
+        encrypted_data,
+        XMLDSIG_NS,
+        "KeyInfo",
+        "EncryptedData contains more than one direct KeyInfo",
+    )?;
+    key_info
         .into_iter()
         .flat_map(|key_info| key_info.children())
         .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
-        .filter_map(|encrypted_key| direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo"))
-        .filter_map(|key_info| direct_child_element(key_info, XMLDSIG_NS, "KeyName"))
-        .map(|key_name| direct_simple_text(key_name, "KeyName"))
+        .map(|encrypted_key| {
+            let key_info = singleton_direct_child(
+                encrypted_key,
+                XMLDSIG_NS,
+                "KeyInfo",
+                "EncryptedKey contains more than one direct KeyInfo",
+            )?;
+            key_info
+                .map(|key_info| {
+                    optional_direct_child_text(
+                        key_info,
+                        XMLDSIG_NS,
+                        "KeyName",
+                        "EncryptedKey KeyInfo contains more than one direct KeyName",
+                    )
+                })
+                .transpose()
+                .map(Option::flatten)
+        })
+        .filter_map(Result::transpose)
         .collect()
 }
 
-fn named_recipient_filter<'a>(
-    option: &'a crate::OptionValue,
+fn select_recipient_private_keys<'a>(
+    candidates: &[&'a crate::OptionValue],
     recipient_names: &[String],
     lax_key_search: bool,
-) -> Result<Option<&'a str>, CommandError> {
-    let Some(option_name) = option.parameter.as_deref() else {
-        return Ok(None);
-    };
-    if lax_key_search || recipient_names.is_empty() {
-        return Ok(None);
+) -> Result<Vec<&'a crate::OptionValue>, CommandError> {
+    if lax_key_search {
+        return Ok(candidates.to_vec());
     }
-    if recipient_names.iter().any(|name| name == option_name) {
-        return Ok(Some(option_name));
+    if let [candidate] = candidates
+        && candidate.parameter.is_none()
+    {
+        return Ok(vec![*candidate]);
     }
-    Err(CommandError::Usage(format!(
-        "template recipient KeyNames do not contain named RSA recipient key {option_name}"
-    )))
+    if recipient_names.is_empty() {
+        let wrapped = candidates
+            .iter()
+            .copied()
+            .map(|candidate| (candidate, ()))
+            .collect::<Vec<_>>();
+        return named_candidate_search(&wrapped, recipient_names, false, true, "RSA private key")
+            .map(|selected| selected.into_iter().map(|(option, ())| option).collect());
+    }
+
+    let matching = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate
+                .parameter
+                .as_deref()
+                .is_some_and(|name| recipient_names.iter().any(|requested| requested == name))
+        })
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Err(CommandError::Usage(
+            "template requests unknown KeyName for supplied RSA private key".into(),
+        ));
+    }
+    let mut seen = HashSet::new();
+    if matching.iter().any(|candidate| {
+        candidate
+            .parameter
+            .as_deref()
+            .is_some_and(|name| !seen.insert(name))
+    }) {
+        return Err(CommandError::Usage(
+            "multiple RSA private key inputs match the same template KeyName".into(),
+        ));
+    }
+    Ok(matching)
 }
 
 fn parse_encryption_document<'a>(

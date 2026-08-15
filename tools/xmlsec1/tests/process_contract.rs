@@ -487,6 +487,47 @@ fn named_public_key_obeys_signature_key_name_unless_lax() {
 }
 
 #[test]
+fn lax_verification_searches_past_incompatible_key_types() {
+    // Lax lookup relaxes KeyName matching, but it must still search by the
+    // signature algorithm instead of treating the first registry entry as final.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-ecdsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/ec/ec-prime256v1-key.pem");
+    let rsa_public_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let ec_public_key = project_root().join("tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem");
+    let signed = temp.path().join("signed.xml");
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--lax-key-search", "--pubkey-pem:rsa"])
+        .arg(&rsa_public_key)
+        .arg("--pubkey-pem:ec")
+        .arg(&ec_public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
 fn named_verification_certificate_obeys_signature_key_name_unless_lax() {
     // Explicit certificates are pinned verification identities, so naming one
     // must use the same strict lookup contract as naming a raw public key.
@@ -1446,6 +1487,37 @@ fn encryption_rejects_duplicate_content_key_names() {
 }
 
 #[test]
+fn encryption_rejects_duplicate_encrypted_data_key_info() {
+    // A generated document must satisfy the same singleton KeyInfo structure
+    // that the reciprocal parser enforces during decryption.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("duplicate-key-info.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let key = temp.path().join("key.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo/><ds:KeyInfo/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"duplicate encrypted data key info").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    let rejected = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("EncryptedData contains more than one direct KeyInfo")
+    );
+}
+
+#[test]
 fn named_aes_decryption_obeys_encrypted_data_key_name_unless_lax() {
     // Decryption key selection must enforce the same document identity contract
     // as encryption rather than discarding the CLI option's registry name.
@@ -1582,9 +1654,9 @@ fn named_aes_key_ring_selects_one_key_for_encryption_and_decryption() {
     );
     let lax_decrypt = Command::new(binary())
         .args(["decrypt", "--lax-key-search", "--aes-key:selected"])
-        .arg(&matching_key)
-        .args(["--aes-key:selected"])
         .arg(&wrong_key)
+        .args(["--aes-key:selected"])
+        .arg(&matching_key)
         .arg(&lax_encrypted)
         .output()
         .unwrap();
@@ -1873,6 +1945,36 @@ fn rsa_encryption_rejects_duplicate_recipient_key_names() {
         String::from_utf8_lossy(&output.stderr).contains("more than one direct KeyName"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn rsa_encryption_rejects_duplicate_recipient_key_info() {
+    // Each EncryptedKey has one optional KeyInfo identity. Selecting the first
+    // duplicate would preserve malformed output that decryption rejects.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("duplicate-recipient-key-info.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo/><ds:KeyInfo/><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"duplicate recipient key info").unwrap();
+
+    let rejected = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("EncryptedKey contains more than one direct KeyInfo")
     );
 }
 
@@ -2268,6 +2370,21 @@ fn rsa_encryption_builds_every_named_recipient() {
         );
         assert_eq!(decrypt.stdout, b"multiple RSA recipients");
     }
+
+    let decrypt_with_key_ring = Command::new(binary())
+        .args(["decrypt", "--privkey-pem:a"])
+        .arg(&private_a)
+        .arg("--privkey-pem:b")
+        .arg(&private_b)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt_with_key_ring.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt_with_key_ring.stderr)
+    );
+    assert_eq!(decrypt_with_key_ring.stdout, b"multiple RSA recipients");
 
     let missing = Command::new(binary())
         .args(["encrypt", "--pubkey-pem:a"])

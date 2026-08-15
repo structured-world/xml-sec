@@ -160,6 +160,9 @@ unless `--lax-key-search` is supplied.
 RSA private-key decryption accepts the upstream
 `key.pem,certificate.pem,...` option syntax, consumes the first component as
 the decryption key, and validates every certificate companion before decrypting.
+Repeatable named private keys form one resolver: each nested `EncryptedKey` is
+matched to its own key, and duplicate keys for the same recipient fail as
+ambiguous instead of preventing distinct recipients from sharing an invocation.
 Named AES and RSA decryption keys obey the selected `EncryptedData` or nested
 `EncryptedKey` name unless lax lookup is requested. Selecting a standalone
 `EncryptedData` by its own `Id` still returns opaque decrypted bytes rather than

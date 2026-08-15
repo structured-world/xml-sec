@@ -42,7 +42,7 @@ Signing options validate every certificate from `key,leaf,intermediate,...` and 
 when the template provides a `KeyInfo` placeholder, filling an empty `X509Data`
 without erasing sibling key sources; verification accepts
 stdin as `-` and can select one signature subtree with `--node-id`.
-support request-local custom IDs through global `--add-id-attr NAME` and
+The CLI supports request-local custom IDs through global `--add-id-attr NAME` and
 element-scoped `--id-attr[:ATTR] [NAMESPACE-URI:]ELEMENT`; the same
 registrations drive Reference resolution and XMLEnc operation selection. An
 unqualified element name matches its local name in any namespace; an explicit

@@ -1889,13 +1889,13 @@ fn enforce_transform_allowed(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SignatureChildNodes<'a, 'input> {
+pub(super) struct SignatureChildNodes<'a, 'input> {
     signed_info_node: Node<'a, 'input>,
     signature_value_node: Node<'a, 'input>,
     key_info_node: Option<Node<'a, 'input>>,
 }
 
-fn parse_signature_children<'a, 'input>(
+pub(super) fn parse_signature_children<'a, 'input>(
     signature_node: Node<'a, 'input>,
 ) -> Result<SignatureChildNodes<'a, 'input>, SignatureVerificationPipelineError> {
     let mut signed_info_node: Option<Node<'_, '_>> = None;

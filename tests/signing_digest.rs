@@ -1165,14 +1165,42 @@ fn key_info_writer_rejects_duplicate_direct_template_placeholders() {
 
     assert!(matches!(
         err,
-        SigningError::XmlMutation(
-            xml_sec::xmldsig::mutation::XmlMutationError::ValueCountMismatch {
-                element: "KeyInfo",
-                expected: 1,
-                actual: 2,
-            }
-        )
+        SigningError::Digest(SigningDigestError::InvalidStructure(message))
+            if message.contains("KeyInfo must appear at most once")
     ));
+}
+
+#[test]
+fn signing_without_key_info_writer_rejects_malformed_signature_children() {
+    // Structural validation is independent of KeyInfo population: signing must
+    // never emit a document that the verification parser necessarily rejects.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    let template = builder.build_template().expect("valid signature template");
+
+    let malformed_templates = [
+        template.replace("</Signature>", "<KeyInfo/></Signature>"),
+        template.replace("<SignatureValue/>", "<KeyInfo/><SignatureValue/>"),
+    ];
+    for malformed in malformed_templates {
+        let xml = append_signature_to_root(
+            "<root><payload ID=\"payload\">hello</payload></root>",
+            &malformed,
+        )
+        .expect("append malformed signature template");
+        let error = SignContext::new(&private_key)
+            .sign_template(&xml)
+            .expect_err("malformed Signature children must fail without a writer");
+        assert!(matches!(error, SigningError::Digest(_)), "{error:?}");
+    }
 }
 
 #[test]
