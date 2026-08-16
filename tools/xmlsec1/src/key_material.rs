@@ -74,6 +74,10 @@ pub fn read_text(path: impl AsRef<Path>) -> Result<String, KeyMaterialError> {
     String::from_utf8(read(path)?).map_err(|_| KeyMaterialError::InvalidPem(path.to_owned()))
 }
 
+/// Read metadata from the first descendant signature below the selected start node.
+///
+/// libxmlsec1 uses a depth-first `xmlSecFindNode` lookup from the operation start
+/// node, so later signatures in the same subtree do not make selection ambiguous.
 pub fn verification_signature_metadata(
     xml: &str,
     start_node_id: Option<&str>,

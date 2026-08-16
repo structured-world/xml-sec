@@ -350,9 +350,9 @@ impl<'a> VerifyContext<'a> {
 
     /// Select the operation start node by its XML ID value.
     ///
-    /// Verification searches for exactly one `<Signature>` in that node's
-    /// subtree. This is request context, not a policy decision, and mirrors the
-    /// start-node contract of libxmlsec1's `--node-id` option.
+    /// Verification selects the first descendant `<Signature>` in document
+    /// order. This is request context, not a policy decision, and mirrors
+    /// libxmlsec1's depth-first `xmlSecFindNode` start-node contract.
     pub fn start_node_id(mut self, id: &'a str) -> Self {
         self.start_node_id = Some(id);
         self
@@ -1043,14 +1043,18 @@ fn verify_signature_with_context(
             && node.tag_name().name() == "Signature"
             && node.tag_name().namespace() == Some(XMLDSIG_NS)
     });
-    let signature_node = match (signatures.next(), signatures.next()) {
+    let signature_node = match (signatures.next(), ctx.start_node_id) {
         (None, _) => {
             return Err(SignatureVerificationPipelineError::MissingElement {
                 element: "Signature",
             });
         }
-        (Some(node), None) => node,
-        (Some(_), Some(_)) => {
+        // libxmlsec1 treats --node-id as an operation start node and performs
+        // a depth-first xmlSecFindNode lookup from there. Without a selector,
+        // the library API retains its fail-closed document-wide cardinality.
+        (Some(node), Some(_)) => node,
+        (Some(node), None) if signatures.next().is_none() => node,
+        (Some(_), None) => {
             return Err(SignatureVerificationPipelineError::InvalidStructure {
                 reason: "Signature must appear exactly once in document",
             });

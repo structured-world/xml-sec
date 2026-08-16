@@ -100,6 +100,7 @@ pub struct OptionValue {
 pub struct Invocation {
     pub command: Command,
     pub options: BTreeMap<String, Vec<OptionValue>>,
+    ordered_options: Vec<OptionValue>,
     pub positional: Vec<OsString>,
 }
 
@@ -466,6 +467,7 @@ impl Invocation {
             .ok_or_else(|| ParseError::UnknownCommand(command_text.clone()))?;
         let remaining = args.collect::<Vec<_>>();
         let mut options = BTreeMap::<String, Vec<OptionValue>>::new();
+        let mut ordered_options = Vec::new();
         let mut positional = Vec::new();
         let mut index = 0;
         let mut options_finished = false;
@@ -515,19 +517,19 @@ impl Invocation {
                         })?)
                     }
                 };
-            options
-                .entry(name.to_owned())
-                .or_default()
-                .push(OptionValue {
-                    name: name.to_owned(),
-                    parameter,
-                    value,
-                });
+            let option = OptionValue {
+                name: name.to_owned(),
+                parameter,
+                value,
+            };
+            ordered_options.push(option.clone());
+            options.entry(name.to_owned()).or_default().push(option);
             index += 1;
         }
         Ok(Self {
             command,
             options,
+            ordered_options,
             positional,
         })
     }
@@ -545,6 +547,15 @@ impl Invocation {
 
     pub fn values(&self, name: &str) -> impl Iterator<Item = &OptionValue> {
         self.options.get(name).into_iter().flatten()
+    }
+
+    pub fn ordered_values<'a>(
+        &'a self,
+        names: &'a [&str],
+    ) -> impl Iterator<Item = &'a OptionValue> {
+        self.ordered_options
+            .iter()
+            .filter(move |option| names.contains(&option.name.as_str()))
     }
 }
 
@@ -609,6 +620,37 @@ mod tests {
             Some("signer")
         );
         assert_eq!(parsed.positional, [OsString::from("input.xml")]);
+    }
+
+    #[test]
+    fn preserves_global_order_across_option_names() {
+        // Lax key lookup consumes compatible options in command-line order, so
+        // grouping occurrences by canonical option name changes key selection.
+        let parsed = parse(&[
+            "xmlsec1",
+            "sign",
+            "--privkey-der",
+            "first.der",
+            "--privkey-pem",
+            "second.pem",
+            "--pkcs8-der",
+            "third.der",
+            "input.xml",
+        ])
+        .expect("mixed key encodings must parse");
+
+        let values = parsed
+            .ordered_values(&["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"])
+            .map(|option| option.value.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            [
+                OsStr::new("first.der"),
+                OsStr::new("second.pem"),
+                OsStr::new("third.der")
+            ]
+        );
     }
 
     #[test]

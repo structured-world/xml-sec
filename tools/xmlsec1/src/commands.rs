@@ -672,15 +672,13 @@ fn select_signing_key<'a>(
     requested_names: &[String],
     algorithm: SignatureAlgorithm,
 ) -> Result<(&'a crate::OptionValue, bool, Box<dyn SigningKey>), CommandError> {
-    let mut keys = Vec::new();
-    for (name, certificate_is_der) in [
-        ("privkey-pem", false),
-        ("privkey-der", true),
-        ("pkcs8-pem", false),
-        ("pkcs8-der", true),
-    ] {
-        keys.extend(invocation.values(name).map(|key| (key, certificate_is_der)));
-    }
+    let keys = invocation
+        .ordered_values(&["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"])
+        .map(|key| {
+            let certificate_is_der = matches!(key.name.as_str(), "privkey-der" | "pkcs8-der");
+            (key, certificate_is_der)
+        })
+        .collect::<Vec<_>>();
     if keys.is_empty() {
         return Err(CommandError::Usage(
             "sign requires --privkey-pem or --pkcs8-pem/der".into(),
@@ -777,19 +775,18 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     validate_options(invocation, VERIFY_OPTIONS)?;
     reject_unimplemented_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     reject_unimplemented_verification_policy(invocation)?;
-    let explicit_keys = [
-        ("pubkey-pem", false),
-        ("pubkey-der", false),
-        ("pubkey-cert-pem", true),
-        ("pubkey-cert-der", true),
-    ]
-    .into_iter()
-    .flat_map(|(name, certificate)| {
-        invocation
-            .values(name)
-            .map(move |option| (option, certificate))
-    })
-    .collect::<Vec<_>>();
+    let explicit_keys = invocation
+        .ordered_values(&[
+            "pubkey-pem",
+            "pubkey-der",
+            "pubkey-cert-pem",
+            "pubkey-cert-der",
+        ])
+        .map(|option| {
+            let certificate = matches!(option.name.as_str(), "pubkey-cert-pem" | "pubkey-cert-der");
+            (option, certificate)
+        })
+        .collect::<Vec<_>>();
     // With an explicit public key there is no key-manager search to relax.
     // Reject the flag on resolver-backed paths until its semantics exist.
     if invocation.flag("lax-key-search") && explicit_keys.is_empty() {
@@ -1074,19 +1071,18 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let explicit_encrypted_type = metadata.explicit_encrypted_type;
     let mut builder = EncryptedDataBuilder::new(algorithm).policy(policy.clone());
     let aes_keys = invocation.values("aes-key").collect::<Vec<_>>();
-    let public_keys = [
-        ("pubkey-pem", false),
-        ("pubkey-der", false),
-        ("pubkey-cert-pem", true),
-        ("pubkey-cert-der", true),
-    ]
-    .into_iter()
-    .flat_map(|(name, certificate)| {
-        invocation
-            .values(name)
-            .map(move |option| (option, certificate))
-    })
-    .collect::<Vec<_>>();
+    let public_keys = invocation
+        .ordered_values(&[
+            "pubkey-pem",
+            "pubkey-der",
+            "pubkey-cert-pem",
+            "pubkey-cert-der",
+        ])
+        .map(|option| {
+            let certificate = matches!(option.name.as_str(), "pubkey-cert-pem" | "pubkey-cert-der");
+            (option, certificate)
+        })
+        .collect::<Vec<_>>();
     if !aes_keys.is_empty() && !public_keys.is_empty() {
         return Err(CommandError::Usage(
             "encrypt cannot combine explicit AES and RSA recipient keys".into(),
@@ -1527,7 +1523,23 @@ fn apply_encryption_template(
         (Some(template_key_info), Some(generated_key_info)) => {
             let template_values = encrypted_key_cipher_values(template_key_info, "template")?;
             let generated_values = encrypted_key_cipher_values(generated_key_info, "generated")?;
-            if template_values.is_empty() && !generated_values.is_empty() {
+            if !template_key_info.children().any(|node| node.is_element()) {
+                let generated_children = generated_key_info
+                    .children()
+                    .filter(|node| node.is_element())
+                    .map(|node| standalone_element(generated, node))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if !generated_children.is_empty() {
+                    replacements.push((
+                        template_key_info.range(),
+                        append_element_children(
+                            template,
+                            template_key_info,
+                            &generated_children.concat(),
+                        )?,
+                    ));
+                }
+            } else if template_values.is_empty() && !generated_values.is_empty() {
                 let generated_keys = generated_key_info
                     .children()
                     .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
@@ -1642,11 +1654,12 @@ fn standalone_element(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Str
     let qualified_name = &opening[1..qualified_name_end];
     let attributes = &opening[qualified_name_end..];
     let mut output = format!("<{qualified_name}{attributes}");
+    let owned_namespaces = owned_namespace_declarations(opening)?;
     for namespace in node.namespaces() {
         let declaration = namespace
             .name()
             .map_or("xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
-        let already_declared = attributes.contains(&format!("{declaration}="));
+        let already_declared = owned_namespaces.contains(namespace.name().unwrap_or_default());
         if !already_declared {
             output.push(' ');
             output.push_str(&declaration);
@@ -1661,6 +1674,39 @@ fn standalone_element(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Str
     output.push_str(qualified_name);
     output.push('>');
     Ok(output)
+}
+
+fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, CommandError> {
+    let standalone = format!("{} />", opening.trim_end_matches('/'));
+    let mut reader = quick_xml::Reader::from_str(&standalone);
+    let event = reader
+        .read_event()
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let element = match event {
+        quick_xml::events::Event::Start(element) | quick_xml::events::Event::Empty(element) => {
+            element
+        }
+        _ => {
+            return Err(CommandError::Encryption(
+                "generated KeyInfo child has no opening element".into(),
+            ));
+        }
+    };
+    element
+        .attributes()
+        .map(|attribute| {
+            let attribute =
+                attribute.map_err(|error| CommandError::Encryption(error.to_string()))?;
+            let name = std::str::from_utf8(attribute.key.as_ref()).map_err(|_| {
+                CommandError::Encryption("generated KeyInfo attribute name is not UTF-8".into())
+            })?;
+            Ok(match name {
+                "xmlns" => Some(String::new()),
+                _ => name.strip_prefix("xmlns:").map(str::to_owned),
+            })
+        })
+        .filter_map(|result| result.transpose())
+        .collect()
 }
 
 fn direct_child_element<'a, 'input>(
@@ -1725,9 +1771,8 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let content_key_name = encrypted_data_key_name(encrypted_data)?;
     let recipient_key_names = encrypted_key_recipient_names(encrypted_data)?;
     let aes_keys = invocation.values("aes-key").collect::<Vec<_>>();
-    let private_keys = ["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"]
-        .into_iter()
-        .flat_map(|name| invocation.values(name))
+    let private_keys = invocation
+        .ordered_values(&["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"])
         .collect::<Vec<_>>();
     if !aes_keys.is_empty() && !private_keys.is_empty() {
         return Err(CommandError::Usage(
@@ -1796,6 +1841,8 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let resolver = NamedRecipientDecryptor {
             keys,
             lax_key_search: invocation.flag("lax-key-search"),
+            unnamed_single_key_fallback: private_keys.len() == 1
+                && private_keys[0].parameter.is_none(),
         };
         decrypt_input(
             &resolver,
@@ -1887,6 +1934,7 @@ struct RecipientPrivateKey {
 struct NamedRecipientDecryptor {
     keys: Vec<RecipientPrivateKey>,
     lax_key_search: bool,
+    unnamed_single_key_fallback: bool,
 }
 
 impl DecryptionKeyResolver for NamedRecipientDecryptor {
@@ -1899,8 +1947,9 @@ impl DecryptionKeyResolver for NamedRecipientDecryptor {
         let mut last_error = None;
         for key in &self.keys {
             if !self.lax_key_search
-                && let (Some(expected), Some(candidate)) = (key.key_name.as_deref(), encrypted_key)
-                && candidate.key_name.as_deref() != Some(expected)
+                && !self.unnamed_single_key_fallback
+                && encrypted_key.and_then(|candidate| candidate.key_name.as_deref())
+                    != key.key_name.as_deref()
             {
                 continue;
             }

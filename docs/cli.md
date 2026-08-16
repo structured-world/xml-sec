@@ -81,8 +81,9 @@ template unconstrained when one explicit key is supplied.
 
 Verification accepts `-` as the conventional stdin marker. For documents with
 multiple signatures, `--node-id <id>` selects an ID-bearing start node and
-verifies the single `Signature` in its subtree; missing and duplicate IDs fail
-closed. The standard `ID`, `Id`, and `id` local names are recognized whether
+verifies the first descendant `Signature` in document order, matching
+libxmlsec1's depth-first `xmlSecFindNode` selection; missing and duplicate IDs
+fail closed. The standard `ID`, `Id`, and `id` local names are recognized whether
 unqualified or namespace-qualified, including `wsu:Id` and `xml:id`. Signing
 applies the same start-node contract and mutates only the
 selected template's digest, signature, and optional key-info placeholders.
@@ -159,6 +160,8 @@ keys are consumed in command-line order rather than reused for every recipient.
 Named and unnamed recipient slots remain distinct identities. An unnamed template
 does not constrain the sole explicit key; missing and duplicate matches fail
 unless `--lax-key-search` is supplied.
+An empty template `KeyInfo` is populated with generated direct-key identity or
+recipient metadata, so strict decryption retains the selected key name.
 RSA private-key decryption accepts the upstream
 `key.pem,certificate.pem,...` option syntax, consumes the first component as
 the decryption key, and validates every certificate companion before decrypting.

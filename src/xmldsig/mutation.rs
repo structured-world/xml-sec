@@ -3,7 +3,7 @@
 //! Signing cannot mutate `roxmltree`'s read-only DOM. These helpers validate
 //! structure with `roxmltree`, then rewrite the document with `quick-xml`.
 
-use std::{io::Write, ops::Range};
+use std::{collections::HashSet, io::Write, ops::Range};
 
 use quick_xml::events::{BytesText, Event};
 use quick_xml::name::{Namespace, ResolveResult};
@@ -578,16 +578,14 @@ fn standalone_element(
     let fragment = &source[node.range()];
     let opening_end = element_opening_end(fragment).ok_or(XmlMutationError::InvalidAppendTarget)?;
     let opening = &fragment[..opening_end - 1];
-    let name_end = opening[1..]
-        .find(|character: char| character.is_ascii_whitespace())
-        .map_or(opening.len(), |offset| offset + 1);
     let namespace_insertion = opening.strip_suffix('/').map_or(opening.len(), str::len);
     let mut output = opening[..namespace_insertion].to_owned();
+    let owned_namespaces = owned_namespace_declarations(opening)?;
     for namespace in node.namespaces() {
         let declaration = namespace
             .name()
             .map_or_else(|| "xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
-        if !opening[name_end..].contains(&format!("{declaration}=")) {
+        if !owned_namespaces.contains(namespace.name().unwrap_or_default()) {
             output.push_str(&format!(
                 " {declaration}=\"{}\"",
                 quick_xml::escape::escape(namespace.uri())
@@ -597,6 +595,29 @@ fn standalone_element(
     output.push_str(&opening[namespace_insertion..]);
     output.push_str(&fragment[opening_end - 1..]);
     Ok(output)
+}
+
+fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, XmlMutationError> {
+    let standalone = format!("{} />", opening.trim_end_matches('/'));
+    let mut reader = Reader::from_str(&standalone);
+    let event = reader.read_event()?;
+    let element = match event {
+        Event::Start(element) | Event::Empty(element) => element,
+        _ => return Err(XmlMutationError::InvalidAppendTarget),
+    };
+    element
+        .attributes()
+        .map(|attribute| {
+            let attribute = attribute.map_err(|_| XmlMutationError::InvalidAppendTarget)?;
+            let name = std::str::from_utf8(attribute.key.as_ref())
+                .map_err(|_| XmlMutationError::InvalidAppendTarget)?;
+            Ok(match name {
+                "xmlns" => Some(String::new()),
+                _ => name.strip_prefix("xmlns:").map(str::to_owned),
+            })
+        })
+        .filter_map(|result| result.transpose())
+        .collect()
 }
 
 fn is_matching_empty_placeholder(
@@ -1442,6 +1463,23 @@ mod tests {
         assert_eq!(
             x509_data.attribute(("urn:key-info", "role")),
             Some("signing")
+        );
+    }
+
+    #[test]
+    fn key_info_source_merge_accepts_whitespace_around_namespace_equals() {
+        // XML permits whitespace around '='. Namespace ownership must come
+        // from the parsed element rather than an exact lexical substring.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo/></ds:Signature>"#;
+        let generated = r#"<ext:Metadata xmlns:ext = "urn:key-info">value</ext:Metadata>"#;
+
+        let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect("valid namespace declaration whitespace must be preserved");
+        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        assert!(
+            document
+                .descendants()
+                .any(|node| node.has_tag_name(("urn:key-info", "Metadata")))
         );
     }
 

@@ -131,6 +131,52 @@ fn signs_verifies_and_rejects_tampering_through_process_api() {
 }
 
 #[test]
+fn lax_signing_preserves_order_across_private_key_option_kinds() {
+    // The first compatible key is determined by CLI occurrence order, not by
+    // the PEM/DER spelling used to supply it.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let first_pem =
+        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem"))
+            .unwrap();
+    let first = RsaPrivateKey::from_pkcs8_pem(&first_pem).unwrap();
+    let first_der = temp.path().join("first.der");
+    fs::write(&first_der, first.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let second = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let first_public = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let signed = temp.path().join("signed.xml");
+
+    let sign = Command::new(binary())
+        .args(["sign", "--lax-key-search", "--privkey-der"])
+        .arg(&first_der)
+        .arg("--privkey-pem")
+        .arg(&second)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&first_public)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
 fn signing_writes_requested_diagnostics_separately_from_output() {
     // Diagnostic flags describe the completed signing context; the signed XML
     // remains exclusively in --output so shell callers can consume both streams.
@@ -684,7 +730,10 @@ fn verification_node_id_selects_one_signature_subtree() {
     let document = temp.path().join("multiple.xml");
     fs::write(
         &document,
-        format!("<Document>{}{}</Document>", signatures[0], signatures[1]),
+        format!(
+            "<Document><Envelope Id=\"both\">{}{}</Envelope></Document>",
+            signatures[0], signatures[1]
+        ),
     )
     .unwrap();
 
@@ -699,6 +748,19 @@ fn verification_node_id_selects_one_signature_subtree() {
         valid.status.success(),
         "{}",
         String::from_utf8_lossy(&valid.stderr)
+    );
+
+    let first_descendant = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .args(["--node-id", "both"])
+        .arg(&document)
+        .output()
+        .unwrap();
+    assert!(
+        first_descendant.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_descendant.stderr)
     );
 
     let invalid = Command::new(binary())
@@ -742,8 +804,8 @@ fn verification_node_id_selects_one_signature_subtree() {
 
 #[test]
 fn signing_node_id_selects_one_signature_subtree() {
-    // The donor treats --node-id as an operation start node. Signing must fill
-    // only the Signature below that node while preserving unrelated templates.
+    // The donor performs a depth-first search from the --node-id start node.
+    // Signing must fill only the first descendant Signature template.
     let temp = tempfile::tempdir().unwrap();
     let original = fs::read_to_string(
         project_root()
@@ -763,7 +825,7 @@ fn signing_node_id_selects_one_signature_subtree() {
     fs::write(
         &template,
         format!(
-            "<Document><Envelope Id=\"first\">{first}</Envelope><Envelope Id=\"second\">{second}</Envelope></Document>"
+            "<Document><Envelope Id=\"first\">{first}{second}</Envelope><Envelope Id=\"second\"/></Document>"
         ),
     )
     .unwrap();
@@ -1690,6 +1752,66 @@ fn named_aes_key_ring_selects_one_key_for_encryption_and_decryption() {
 }
 
 #[test]
+fn named_direct_aes_key_populates_an_empty_key_info() {
+    // An empty placeholder reserves KeyInfo's schema position. The generated
+    // KeyName must survive so strict multi-key decryption can select the key.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("empty-key-info.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let wrong = temp.path().join("wrong.bin");
+    let selected = temp.path().join("selected.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"empty KeyInfo identity").unwrap();
+    fs::write(&wrong, b"fedcba9876543210").unwrap();
+    fs::write(&selected, b"0123456789abcdef").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--aes-key:selected"])
+        .arg(&selected)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    let encrypted_xml = fs::read_to_string(&encrypted).unwrap();
+    let encrypted_document = roxmltree::Document::parse(&encrypted_xml).unwrap();
+    assert_eq!(
+        encrypted_document
+            .descendants()
+            .find(|node| { node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")) })
+            .and_then(|node| node.text()),
+        Some("selected")
+    );
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--aes-key:wrong"])
+        .arg(&wrong)
+        .args(["--aes-key:selected"])
+        .arg(&selected)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"empty KeyInfo identity");
+}
+
+#[test]
 fn encryption_rejects_invalid_content_encryption_method_structure() {
     // Encrypt must apply the same EncryptionMethod invariants as decrypt;
     // otherwise it can emit ciphertext that its reciprocal parser rejects.
@@ -2490,6 +2612,7 @@ fn mixed_named_and_unnamed_rsa_recipients_keep_distinct_key_identities() {
     let encrypted = temp.path().join("encrypted.xml");
     let public_a = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
     let public_b = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let private_a = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
     let private_b = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
     fs::write(
         &template,
@@ -2541,6 +2664,19 @@ fn mixed_named_and_unnamed_rsa_recipients_keep_distinct_key_identities() {
         .unwrap();
     assert!(!ambiguous.status.success());
     assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("recipient identity"));
+
+    let wrong_identity = Command::new(binary())
+        .args(["decrypt", "--privkey-pem:a"])
+        .arg(&private_b)
+        .arg("--privkey-pem")
+        .arg(&private_a)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        !wrong_identity.status.success(),
+        "an unnamed key must not act as a wildcard for named recipient a"
+    );
 }
 
 #[test]
