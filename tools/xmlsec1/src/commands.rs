@@ -1287,11 +1287,7 @@ fn xml_data_plaintext<'a>(
         EncryptedDataType::Content => {
             let mut content = String::new();
             for child in root.children() {
-                if child.is_element() {
-                    content.push_str(&standalone_element(xml, child)?);
-                } else {
-                    content.push_str(&xml[child.range()]);
-                }
+                append_serialized_xml_child(&mut content, xml, child)?;
             }
             Ok(Cow::Owned(content))
         }
@@ -1299,6 +1295,22 @@ fn xml_data_plaintext<'a>(
             "unsupported EncryptedData Type for XML data".into(),
         )),
     }
+}
+
+fn append_serialized_xml_child(
+    output: &mut String,
+    source: &str,
+    node: roxmltree::Node<'_, '_>,
+) -> Result<(), CommandError> {
+    if node.is_element() {
+        output.push_str(&standalone_element(source, node)?);
+        return Ok(());
+    }
+    // roxmltree's source range retains the lexical representation of text,
+    // including entity references and complete CDATA delimiters. Copying that
+    // range preserves text semantics without accidentally creating markup.
+    output.push_str(&source[node.range()]);
+    Ok(())
 }
 
 fn write_encryption_diagnostics(

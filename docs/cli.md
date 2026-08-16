@@ -153,9 +153,11 @@ metadata so a later embedded-document decrypt can perform XML replacement. As
 in libxmlsec1, the input is parsed as an XML document: Element encryption
 serializes its document element, while Content encryption serializes only that
 element's children and materializes inherited namespace bindings on those
-children. XML declarations and document-boundary nodes are not encrypted as
-replacement plaintext. The source document and resulting plaintext are checked
-against their respective compiled resource ceilings.
+children. Text children retain their XML lexical representation, including
+entity references and CDATA sections, so text cannot become markup. XML
+declarations and document-boundary nodes are not encrypted as replacement
+plaintext. The source document and resulting plaintext are checked against
+their respective compiled resource ceilings.
 Repeatable AES or RSA key options form a key set. A direct content-key `KeyName`
 must select exactly one AES key, while a recipient `KeyName` inside
 each `EncryptedKey` must select exactly one RSA wrapping key. Multi-recipient

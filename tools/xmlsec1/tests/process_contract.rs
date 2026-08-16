@@ -1549,6 +1549,65 @@ fn xml_data_encrypts_the_parsed_document_node() {
 }
 
 #[test]
+fn xml_data_content_preserves_cdata_as_text() {
+    // CDATA is exposed as a text node, but its source range retains the complete
+    // lexical construct. Content serialization must preserve both that form and
+    // its text semantics rather than accidentally turning payload into markup.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.xml");
+    let encrypted = temp.path().join("encrypted.xml");
+    let key = temp.path().join("key.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Content"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(
+        &plaintext,
+        b"<wrapper><![CDATA[<secret/> & text]]></wrapper>",
+    )
+    .unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    let encryption = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .arg("--xml-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encryption.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encryption.stderr)
+    );
+
+    let decryption = Command::new(binary())
+        .args(["decrypt", "--aes-key"])
+        .arg(&key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decryption.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decryption.stderr)
+    );
+    let decrypted = String::from_utf8(decryption.stdout).unwrap();
+    assert_eq!(decrypted, "<![CDATA[<secret/> & text]]>");
+    let wrapped = format!("<probe>{decrypted}</probe>");
+    let document = roxmltree::Document::parse(&wrapped)
+        .expect("decrypted Content plaintext must remain well-formed XML content");
+    let root = document.root_element();
+    assert_eq!(root.text(), Some("<secret/> & text"));
+    assert!(!root.children().any(|node| node.is_element()));
+}
+
+#[test]
 fn xml_data_applies_plaintext_limit_after_document_node_serialization() {
     // The source document and encrypted plaintext are distinct resources. A
     // large wrapper may fit the document ceiling while its tiny child content

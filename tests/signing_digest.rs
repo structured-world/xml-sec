@@ -509,6 +509,56 @@ fn signing_policy_rechecks_document_bytes_after_mutation() {
 }
 
 #[test]
+fn signing_policy_bounds_key_info_writer_bytes_before_parsing() {
+    // Writer output is untrusted XML input. Its byte ceiling must win before
+    // parsing, even when an oversized fragment is also malformed at its tail.
+    struct OversizedWriter(String);
+
+    impl KeyInfoWriter for OversizedWriter {
+        fn write_key_info(
+            &self,
+            _signing_key: &dyn SigningKey,
+        ) -> Result<String, xml_sec::xmldsig::KeyInfoWriteError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(""))
+        .build_template()
+        .expect("valid signature template");
+    let xml = append_signature_to_root("<root/>", &template).expect("append signature");
+    let maximum = xml.len() + 64;
+    let writer = OversizedWriter(format!("<KeyName>{}", "x".repeat(maximum)));
+    let writer_len = writer.0.len();
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: maximum,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(policy)
+            .key_info_writer(&writer)
+            .sign_template(&xml),
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "XML document",
+                maximum: observed_maximum,
+                actual,
+            }
+        )) if observed_maximum == maximum && actual == writer_len
+    ));
+}
+
+#[test]
 fn signing_policy_shares_canonicalization_budget_with_signed_info() {
     // Reference transforms and SignedInfo consume one operation-wide C14N
     // allowance, preventing a template from multiplying the configured cap.

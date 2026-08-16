@@ -43,9 +43,10 @@ distinct lax-search wrapping keys in command-line order.
 Untyped `--xml-data` templates gain the inferred XML Element type. XML payloads
 are parsed as documents: Element encrypts the root element and Content encrypts
 its children with inherited namespace bindings materialized, excluding the
-declaration and document-boundary nodes. Source-document and encrypted-plaintext
-limits are enforced independently. Direct AES keys reject recipient
-`EncryptedKey` templates they cannot refresh.
+declaration and document-boundary nodes. Text children preserve entity and
+CDATA lexical forms rather than becoming markup. Source-document and
+encrypted-plaintext limits are enforced independently. Direct AES keys reject
+recipient `EncryptedKey` templates they cannot refresh.
 Signing options validate every certificate from `key,leaf,intermediate,...` and embed the chain
 when the template provides a `KeyInfo` placeholder, filling an empty `X509Data`
 without erasing sibling key sources; verification accepts

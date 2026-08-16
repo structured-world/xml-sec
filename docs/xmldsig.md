@@ -40,7 +40,9 @@ occurs during rendering rather than after an oversized buffer has already been a
 The same immutable policy controls every signing parse and mutation reparse, including source
 validation in `sign_with_builder`, digest filling, `SignedInfo` parsing, signature filling, and
 optional `KeyInfo` filling. An internal-DTD opt-in and XML node ceiling therefore cannot be lost
-between stages.
+between stages. Custom `KeyInfoWriter` output is treated as a separate untrusted XML input: its
+byte ceiling is enforced before namespace wrapping or parsing, and the populated document is
+checked again after mutation.
 `IdAttributeRegistration` supplies immutable request context for non-standard ID attributes.
 `SignContext::id_attributes` and `VerifyContext::id_attributes` apply the same global or
 element-scoped registrations to operation start-node selection and every same-document Reference.

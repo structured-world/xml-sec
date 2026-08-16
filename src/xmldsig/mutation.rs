@@ -451,14 +451,21 @@ fn merge_one_key_info_source_at_index_with_options(
             && !node.children().any(|child| child.is_element())
             && node.text().is_none_or(|text| text.trim().is_empty())
     }) {
+        let placeholder_fragment = &xml[placeholder.range()];
+        let placeholder_opening_end = element_opening_end(placeholder_fragment)
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let placeholder_owned_namespaces =
+            owned_namespace_declarations(&placeholder_fragment[..placeholder_opening_end - 1])?;
         let generated_namespace_attributes =
             source
                 .namespaces()
                 .try_fold(String::new(), |mut attributes, namespace| {
-                    if let Some(declared) = placeholder
-                        .namespaces()
-                        .find(|declared| declared.name() == namespace.name())
-                    {
+                    let prefix = namespace.name().unwrap_or_default();
+                    if placeholder_owned_namespaces.contains(prefix) {
+                        let declared = placeholder
+                            .namespaces()
+                            .find(|declared| declared.name() == namespace.name())
+                            .ok_or(XmlMutationError::InvalidAppendTarget)?;
                         if declared.uri() != namespace.uri() {
                             return Err(XmlMutationError::InvalidAppendTarget);
                         }
@@ -1429,6 +1436,32 @@ mod tests {
             .expect_err("conflicting namespace bindings must fail before serialization");
 
         assert!(matches!(error, XmlMutationError::InvalidAppendTarget));
+    }
+
+    #[test]
+    fn key_info_source_merge_allows_shadowing_inherited_namespaces() {
+        // An ancestor binding is context, not an attribute owned by the empty
+        // placeholder. The generated source may validly shadow it locally.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:ext="urn:inherited"><ds:KeyInfo><ds:X509Data/></ds:KeyInfo></ds:Signature>"#;
+        let generated = r#"<X509Data xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:ext="urn:generated"><ext:Metadata/></X509Data>"#;
+
+        let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect("generated source may shadow an inherited namespace");
+        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let x509_data = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
+            .expect("X509Data");
+
+        assert_eq!(
+            x509_data.lookup_namespace_uri(Some("ext")),
+            Some("urn:generated")
+        );
+        assert!(
+            x509_data
+                .children()
+                .any(|node| node.has_tag_name(("urn:generated", "Metadata")))
+        );
     }
 
     #[test]

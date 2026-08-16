@@ -780,6 +780,11 @@ impl<'a> SignContext<'a> {
             .xpath_here_semantics(self.policy.xpath_here_semantics);
         let with_key_info = if let Some(writer) = self.key_info_writer {
             let key_info_content = writer.write_key_info(self.signing_key)?;
+            // Writer output is a separate untrusted XML input. Bound it before
+            // namespace wrapping or parsing, then bound the merged document below.
+            self.policy
+                .resources
+                .validate_xml_document_len(key_info_content.len())?;
             let populated = merge_key_info_source_at_index_with_options(
                 xml,
                 &key_info_content,
