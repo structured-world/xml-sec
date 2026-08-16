@@ -19,7 +19,7 @@ use xml_sec::{
         KeyResolverConfig, KeyValueInfo, ReferenceResult, SignContext, SignatureAlgorithm,
         SigningKey, SigningPublicKeyInfo, UriTypeSet, VerifyContext, VerifyResult,
         X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
-        uri::UriReferenceResolver,
+        uri::UriReferenceResolver, x509_certificate_matches_selectors,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
@@ -1182,9 +1182,17 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             for (option, certificate) in candidates {
                 let path = option.value.as_deref().unwrap_or_default();
                 let loaded = if certificate {
-                    key_material::load_rsa_certificate_public(path)
+                    key_material::load_rsa_certificate_public(path).map(
+                        |(public_key, certificate_der)| RecipientPublicKey {
+                            public_key,
+                            certificate_der: Some(certificate_der),
+                        },
+                    )
                 } else {
-                    key_material::load_rsa_public(path)
+                    key_material::load_rsa_public(path).map(|public_key| RecipientPublicKey {
+                        public_key,
+                        certificate_der: None,
+                    })
                 };
                 match loaded {
                     Ok(key) => {
@@ -1224,7 +1232,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             selected_recipients.iter().map(|(key, _)| key),
         )?;
         for (public_key, parameters) in selected_recipients {
-            let mut recipient = EncryptionRecipient::rsa_oaep(public_key);
+            let mut recipient = EncryptionRecipient::rsa_oaep(public_key.public_key);
             if let Some(parameters) = parameters {
                 recipient = recipient.oaep_parameters(parameters);
             }
@@ -1352,12 +1360,17 @@ fn write_debug_transform(
     writeln!(stdout, "</{container}>").map_err(stdout_error)
 }
 
+struct RecipientPublicKey {
+    public_key: RsaPublicKey,
+    certificate_der: Option<Vec<u8>>,
+}
+
 fn validate_recipient_key_metadata<'a>(
     template: &str,
     start_node_id: Option<&str>,
     id_attributes: &[IdAttributeRegistration],
     policy: &EncryptionPolicy,
-    selected_keys: impl IntoIterator<Item = &'a RsaPublicKey>,
+    selected_keys: impl IntoIterator<Item = &'a RecipientPublicKey>,
 ) -> Result<(), CommandError> {
     let document = parse_encryption_document(template, policy)?;
     let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
@@ -1386,7 +1399,7 @@ fn validate_recipient_key_metadata<'a>(
             let matches = match source {
                 KeyInfoSource::KeyName(_) => continue,
                 KeyInfoSource::KeyValue(KeyValueInfo::Rsa { modulus, exponent }) => {
-                    rsa_components_match(selected_key, &modulus, &exponent)
+                    rsa_components_match(&selected_key.public_key, &modulus, &exponent)
                 }
                 KeyInfoSource::X509Data(data) => {
                     if data.certificates.is_empty()
@@ -1399,36 +1412,47 @@ fn validate_recipient_key_metadata<'a>(
                         // recipient identity claim and is safe to preserve.
                         continue;
                     }
-                    let Some(certificate_index) = data
+                    let certificate_index = data
                         .certificate_chain
                         .first()
                         .copied()
-                        .or_else(|| (!data.certificates.is_empty()).then_some(0))
-                    else {
-                        return Err(recipient_metadata_error(
-                            "X509Data identity does not contain a certificate that can be matched",
-                        ));
-                    };
-                    let certificate =
-                        data.certificates.get(certificate_index).ok_or_else(|| {
-                            recipient_metadata_error("X509Data certificate chain is inconsistent")
-                        })?;
-                    let (_, certificate) =
-                        x509_parser::certificate::X509Certificate::from_der(certificate)
-                            .map_err(|_| recipient_metadata_error("X509Certificate is invalid"))?;
-                    let public_key = RsaPublicKey::from_public_key_der(
-                        certificate.public_key().raw,
-                    )
-                    .map_err(|_| {
-                        recipient_metadata_error("X509Certificate does not contain an RSA key")
-                    })?;
-                    rsa_public_keys_match(selected_key, &public_key)
+                        .or_else(|| (!data.certificates.is_empty()).then_some(0));
+                    if let Some(certificate_index) = certificate_index {
+                        let certificate =
+                            data.certificates.get(certificate_index).ok_or_else(|| {
+                                recipient_metadata_error(
+                                    "X509Data certificate chain is inconsistent",
+                                )
+                            })?;
+                        let (_, certificate) =
+                            x509_parser::certificate::X509Certificate::from_der(certificate)
+                                .map_err(|_| {
+                                    recipient_metadata_error("X509Certificate is invalid")
+                                })?;
+                        let public_key =
+                            RsaPublicKey::from_public_key_der(certificate.public_key().raw)
+                                .map_err(|_| {
+                                    recipient_metadata_error(
+                                        "X509Certificate does not contain an RSA key",
+                                    )
+                                })?;
+                        rsa_public_keys_match(&selected_key.public_key, &public_key)
+                    } else {
+                        let certificate =
+                            selected_key.certificate_der.as_deref().ok_or_else(|| {
+                                recipient_metadata_error(
+                                    "X509Data selectors require a selected RSA certificate",
+                                )
+                            })?;
+                        x509_certificate_matches_selectors(&data, certificate, default_provider())
+                            .map_err(|error| CommandError::Encryption(error.to_string()))?
+                    }
                 }
                 KeyInfoSource::DerEncodedKeyValue(der) => {
                     let public_key = RsaPublicKey::from_public_key_der(&der).map_err(|_| {
                         recipient_metadata_error("DEREncodedKeyValue is not an RSA public key")
                     })?;
-                    rsa_public_keys_match(selected_key, &public_key)
+                    rsa_public_keys_match(&selected_key.public_key, &public_key)
                 }
                 KeyInfoSource::KeyValue(_) | KeyInfoSource::RetrievalMethod { .. } => {
                     return Err(recipient_metadata_error(
@@ -1584,6 +1608,17 @@ fn apply_encryption_template(
         (Some(template_key_info), Some(generated_key_info)) => {
             let template_values = encrypted_key_cipher_values(template_key_info, "template")?;
             let generated_values = encrypted_key_cipher_values(generated_key_info, "generated")?;
+            let missing_generated_children = generated_key_info
+                .children()
+                .filter(|node| node.is_element() && !node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+                .filter(|generated_child| {
+                    !template_key_info.children().any(|template_child| {
+                        template_child.is_element()
+                            && template_child.tag_name() == generated_child.tag_name()
+                    })
+                })
+                .map(|node| standalone_element(generated, node))
+                .collect::<Result<Vec<_>, _>>()?;
             if !template_key_info.children().any(|node| node.is_element()) {
                 let generated_children = generated_key_info
                     .children()
@@ -1600,36 +1635,48 @@ fn apply_encryption_template(
                         )?,
                     ));
                 }
-            } else if template_values.is_empty() && !generated_values.is_empty() {
-                let generated_keys = generated_key_info
-                    .children()
-                    .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
-                    .map(|node| standalone_element(generated, node))
-                    .collect::<Result<Vec<_>, _>>()?;
-                if generated_keys.len() != generated_values.len() {
-                    return Err(CommandError::Encryption(
-                        "generated KeyInfo does not contain one direct EncryptedKey per recipient"
-                            .into(),
+            } else {
+                let mut children_to_append = missing_generated_children;
+                if template_values.is_empty() && !generated_values.is_empty() {
+                    let generated_keys = generated_key_info
+                        .children()
+                        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+                        .map(|node| standalone_element(generated, node))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if generated_keys.len() != generated_values.len() {
+                        return Err(CommandError::Encryption(
+                            "generated KeyInfo does not contain one direct EncryptedKey per recipient"
+                                .into(),
+                        ));
+                    }
+                    children_to_append.extend(generated_keys);
+                }
+                if !children_to_append.is_empty() {
+                    replacements.push((
+                        template_key_info.range(),
+                        append_element_children(
+                            template,
+                            template_key_info,
+                            &children_to_append.concat(),
+                        )?,
                     ));
                 }
-                replacements.push((
-                    template_key_info.range(),
-                    append_element_children(template, template_key_info, &generated_keys.concat())?,
-                ));
-            } else if template_values.len() != generated_values.len() {
-                return Err(CommandError::Encryption(
-                    "template KeyInfo does not contain one CipherValue per generated recipient"
-                        .into(),
-                ));
-            } else {
-                replacements.extend(template_values.into_iter().zip(generated_values).map(
-                    |(template_value, generated_value)| {
-                        (
-                            template_value.range(),
-                            standalone_cipher_value(generated_value),
-                        )
-                    },
-                ));
+                if !template_values.is_empty() {
+                    if template_values.len() != generated_values.len() {
+                        return Err(CommandError::Encryption(
+                            "template KeyInfo does not contain one CipherValue per generated recipient"
+                                .into(),
+                        ));
+                    }
+                    replacements.extend(template_values.into_iter().zip(generated_values).map(
+                        |(template_value, generated_value)| {
+                            (
+                                template_value.range(),
+                                standalone_cipher_value(generated_value),
+                            )
+                        },
+                    ));
+                }
             }
         }
         (None, Some(generated_key_info)) => {

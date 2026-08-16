@@ -160,9 +160,7 @@ pub fn signing_signature_metadata(
                 .descendants()
                 .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Signature")))
         }
-        None => document
-            .descendants()
-            .rfind(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Signature"))),
+        None => find_signature_node(&document),
     }
     .ok_or(KeyMaterialError::MissingSignedInfo)?;
     let algorithm_uri = signature
@@ -374,13 +372,14 @@ pub fn load_rsa_public(path: impl AsRef<Path>) -> Result<RsaPublicKey, KeyMateri
 
 pub fn load_rsa_certificate_public(
     path: impl AsRef<Path>,
-) -> Result<RsaPublicKey, KeyMaterialError> {
+) -> Result<(RsaPublicKey, Vec<u8>), KeyMaterialError> {
     let path = path.as_ref();
     let der = load_certificate(path)?;
     let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(&der)
         .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
-    RsaPublicKey::from_public_key_der(certificate.public_key().raw)
-        .map_err(|_| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))
+    let public_key = RsaPublicKey::from_public_key_der(certificate.public_key().raw)
+        .map_err(|_| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))?;
+    Ok((public_key, der))
 }
 
 pub fn load_symmetric(

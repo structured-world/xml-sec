@@ -394,7 +394,8 @@ pub(super) fn merge_key_info_source_at_index_with_options(
                 is_cryptographic_key_info_source(
                     node.tag_name().namespace(),
                     node.tag_name().name(),
-                ) && !is_matching_empty_placeholder(*node, &generated_key_sources)
+                ) && has_cryptographic_identity_content(*node)
+                    && !is_matching_empty_placeholder(*node, &generated_key_sources)
             })
             .map(|node| node.range())
             .collect::<Vec<_>>();
@@ -446,10 +447,7 @@ fn merge_one_key_info_source_at_index_with_options(
     let key_info = key_infos[0];
 
     if let Some(placeholder) = key_info.children().find(|node| {
-        node.is_element()
-            && node.tag_name() == source.tag_name()
-            && !node.children().any(|child| child.is_element())
-            && node.text().is_none_or(|text| text.trim().is_empty())
+        node.is_element() && node.tag_name() == source.tag_name() && is_reusable_placeholder(*node)
     }) {
         let placeholder_fragment = &xml[placeholder.range()];
         let placeholder_opening_end = element_opening_end(placeholder_fragment)
@@ -634,8 +632,19 @@ fn is_matching_empty_placeholder(
     generated_sources.iter().any(|(namespace, name)| {
         node.tag_name().namespace() == *namespace
             && node.tag_name().name() == *name
-            && !node.children().any(|child| child.is_element())
-            && node.text().is_none_or(|text| text.trim().is_empty())
+            && is_reusable_placeholder(node)
+    })
+}
+
+fn is_reusable_placeholder(node: roxmltree::Node<'_, '_>) -> bool {
+    node.children()
+        .all(|child| child.is_text() && child.text().is_some_and(|text| text.trim().is_empty()))
+}
+
+fn has_cryptographic_identity_content(node: roxmltree::Node<'_, '_>) -> bool {
+    node.children().any(|child| {
+        child.is_element()
+            || (child.is_text() && child.text().is_some_and(|text| !text.trim().is_empty()))
     })
 }
 
@@ -1391,6 +1400,31 @@ mod tests {
                 .children()
                 .any(|node| node.has_tag_name(("urn:example:key-info", "Metadata")))
         );
+    }
+
+    #[test]
+    fn key_info_source_merge_preserves_comment_and_processing_instruction() {
+        // Comments and processing instructions are caller-owned content, not an
+        // empty placeholder that the generated identity may silently replace.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo><ds:X509Data><!--keep--><?audit preserve?></ds:X509Data></ds:KeyInfo></ds:Signature>"#;
+        let generated = r#"<X509Data xmlns="http://www.w3.org/2000/09/xmldsig#"><X509Certificate>Y2VydA==</X509Certificate></X509Data>"#;
+
+        let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect("generated identity must be appended without erasing caller content");
+
+        assert!(merged.contains("<!--keep-->"));
+        assert!(merged.contains("<?audit preserve?>"));
+        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let x509_sources = document
+            .descendants()
+            .filter(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
+            .collect::<Vec<_>>();
+        assert_eq!(x509_sources.len(), 2);
+        assert!(x509_sources.iter().any(|source| {
+            source
+                .children()
+                .any(|node| node.has_tag_name((XMLDSIG_NS, "X509Certificate")))
+        }));
     }
 
     #[test]

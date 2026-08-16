@@ -146,8 +146,11 @@ When nested recipient `KeyInfo` already carries `RSAKeyValue`, an X.509
 certificate, or `DEREncodedKeyValue`, that cryptographic identity must match
 the selected RSA wrapping key. Unmatchable or contradictory metadata is
 rejected before encryption rather than being preserved beside ciphertext for
-a different recipient. `KeyName` remains a lookup hint and empty `X509Data`
-remains a non-binding placeholder.
+a different recipient. Selector-only `X509Data` (`X509SubjectName`,
+`X509IssuerSerial`, `X509SKI`, or `X509Digest`) is matched against certificates
+supplied through `--pubkey-cert-pem` or `--pubkey-cert-der`; a bare public key
+cannot satisfy certificate identity metadata. `KeyName` remains a lookup hint
+and empty `X509Data` remains a non-binding placeholder.
 For `--xml-data`, a missing template `Type` is materialized as XML Element
 metadata so a later embedded-document decrypt can perform XML replacement. As
 in libxmlsec1, the input is parsed as an XML document: Element encryption

@@ -890,7 +890,14 @@ impl<'a> SignContext<'a> {
                 })?;
             signature_index(&document, appended)?
         } else {
-            signing_signature_index(&document, None, self.id_attributes)?
+            let appended = document
+                .root_element()
+                .children()
+                .rfind(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
+                .ok_or(SigningDigestError::MissingElement {
+                    element: "Signature",
+                })?;
+            signature_index(&document, appended)?
         };
         self.sign_template_at_index(&templated, target_signature)
     }
@@ -1156,7 +1163,7 @@ fn find_signing_signature_node<'a>(
     });
     match target_signature {
         Some(index) => signatures.nth(index),
-        None => signatures.next_back(),
+        None => signatures.next(),
     }
     .ok_or(SigningDigestError::MissingElement {
         element: "Signature",

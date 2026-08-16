@@ -76,7 +76,7 @@ pub use keys::{
 pub use parse::{
     KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, RetrievalMethodTransforms,
     SignatureAlgorithm, SignedInfo, X509DataInfo, find_signature_node, parse_key_info,
-    parse_reference, parse_signed_info,
+    parse_reference, parse_signed_info, x509_certificate_matches_selectors,
 };
 pub use sign::{
     ComputedReferenceDigest, EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriteError,

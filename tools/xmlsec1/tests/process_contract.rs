@@ -13,9 +13,11 @@ use rsa::{
     },
     traits::PublicKeyParts as _,
 };
+use x509_parser::{extensions::ParsedExtension, prelude::FromDer as _};
 use xml_sec::{
     c14n::{C14nAlgorithm, C14nMode},
     policy::EncryptionPolicy,
+    provider::default_provider,
     xmldsig::{
         DigestAlgorithm, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
         SignatureBuilder, Transform, XPathExpression, mutation::append_signature_to_root,
@@ -882,6 +884,45 @@ fn signing_node_id_selects_one_signature_subtree() {
         .unwrap();
     assert!(!ambiguous.status.success());
     assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("missing or ambiguous"));
+}
+
+#[test]
+fn signing_without_node_selector_uses_first_signature_template() {
+    // Default sign selection follows document order, matching verification and
+    // libxmlsec1 rather than unexpectedly targeting the last Signature.
+    let temp = tempfile::tempdir().unwrap();
+    let body = signature_template_without_key_info();
+    let first = body
+        .replace("#object", "#first")
+        .replace("Id=\"object\"", "Id=\"first\"");
+    let second = body
+        .replace("#object", "#second")
+        .replace("Id=\"object\"", "Id=\"second\"");
+    let template = temp.path().join("default-signature-selection.xml");
+    fs::write(&template, format!("<Document>{first}{second}</Document>")).unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+
+    let output = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let signed = String::from_utf8(output.stdout).unwrap();
+    let document = roxmltree::Document::parse(&signed).unwrap();
+    let values = document
+        .descendants()
+        .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue")))
+        .map(|node| node.text().unwrap_or_default().trim().to_owned())
+        .collect::<Vec<_>>();
+    assert!(!values[0].is_empty());
+    assert!(values[1].is_empty());
 }
 
 #[test]
@@ -1985,6 +2026,60 @@ fn named_direct_aes_key_populates_an_empty_key_info() {
 }
 
 #[test]
+fn named_direct_aes_key_extends_extension_only_key_info() {
+    // Foreign KeyInfo extensions are preserved, but they cannot suppress the
+    // generated KeyName needed for strict recipient selection during decrypt.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("extension-key-info.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let wrong = temp.path().join("wrong.bin");
+    let selected = temp.path().join("selected.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:ext="urn:recipient"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><ext:Metadata>keep</ext:Metadata></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"extension KeyInfo identity").unwrap();
+    fs::write(&wrong, b"fedcba9876543210").unwrap();
+    fs::write(&selected, b"0123456789abcdef").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--aes-key:selected"])
+        .arg(&selected)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    let encrypted_xml = fs::read_to_string(&encrypted).unwrap();
+    assert!(encrypted_xml.contains("<ext:Metadata>keep</ext:Metadata>"));
+    assert!(encrypted_xml.contains(">selected</"));
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--aes-key:wrong"])
+        .arg(&wrong)
+        .args(["--aes-key:selected"])
+        .arg(&selected)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"extension KeyInfo identity");
+}
+
+#[test]
 fn encryption_rejects_invalid_content_encryption_method_structure() {
     // Encrypt must apply the same EncryptionMethod invariants as decrypt;
     // otherwise it can emit ciphertext that its reciprocal parser rejects.
@@ -2440,6 +2535,96 @@ fn rsa_encryption_rejects_stale_recipient_certificate_metadata() {
         "{}",
         String::from_utf8_lossy(&rejected.stderr)
     );
+}
+
+#[test]
+fn rsa_encryption_matches_selector_only_x509data_to_configured_certificate() {
+    // Selector-only X509Data resolves against --pubkey-cert-pem certificate
+    // metadata; a bare public key cannot satisfy that certificate identity.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("x509-selector-recipient.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+    let bare_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let (_, certificate_pem) =
+        x509_parser::pem::parse_x509_pem(&fs::read(&certificate).unwrap()).unwrap();
+    let (_, parsed_certificate) =
+        x509_parser::certificate::X509Certificate::from_der(&certificate_pem.contents).unwrap();
+    let ski = parsed_certificate
+        .extensions()
+        .iter()
+        .find_map(|extension| match extension.parsed_extension() {
+            ParsedExtension::SubjectKeyIdentifier(value) => Some(value.0),
+            _ => None,
+        })
+        .unwrap();
+    let digest = default_provider()
+        .digest(DigestAlgorithm::Sha256, &certificate_pem.contents)
+        .unwrap();
+    fs::write(&plaintext, b"selector recipient identity").unwrap();
+    let selectors = [
+        (
+            "subject",
+            "<ds:X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</ds:X509SubjectName>".to_owned(),
+        ),
+        (
+            "issuer-serial",
+            "<ds:X509IssuerSerial><ds:X509IssuerName>Email=xmlsec@aleksey.com,CN=Aleksey Sanin,OU=Second level CA,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</ds:X509IssuerName><ds:X509SerialNumber>680572598617295163017172295025714171905498632019</ds:X509SerialNumber></ds:X509IssuerSerial>".to_owned(),
+        ),
+        (
+            "ski",
+            format!(
+                "<ds:X509SKI>{}</ds:X509SKI>",
+                base64::engine::general_purpose::STANDARD.encode(ski)
+            ),
+        ),
+        (
+            "digest",
+            format!(
+                "<dsig11:X509Digest Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\">{}</dsig11:X509Digest>",
+                base64::engine::general_purpose::STANDARD.encode(digest)
+            ),
+        ),
+    ];
+    for (name, selector) in selectors {
+        fs::write(
+            &template,
+            format!(
+                r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo><ds:X509Data>{selector}</ds:X509Data></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+            ),
+        )
+        .unwrap();
+        let accepted = Command::new(binary())
+            .args(["encrypt", "--pubkey-cert-pem"])
+            .arg(&certificate)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            accepted.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&accepted.stderr)
+        );
+    }
+
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo><ds:X509Data><ds:X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</ds:X509SubjectName></ds:X509Data></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+
+    let rejected = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&bare_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("certificate"));
 }
 
 #[test]
