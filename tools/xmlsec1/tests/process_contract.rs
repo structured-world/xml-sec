@@ -1302,7 +1302,11 @@ fn binary_encryption_rejects_xml_typed_templates() {
         .output()
         .unwrap();
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("binary-data"));
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("binary-data"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 }
 
 #[test]
@@ -1709,7 +1713,7 @@ fn encryption_rejects_invalid_content_encryption_method_structure() {
         (
             "oaep-on-aes",
             "<OAEPparams>YQ==</OAEPparams>",
-            "unsupported EncryptionMethod child",
+            "only valid for RSA-OAEP",
         ),
     ] {
         let template = temp.path().join(format!("{case}.xml"));
@@ -2899,6 +2903,77 @@ fn encryption_rejects_incomplete_or_ambiguous_recipient_methods() {
             "{case}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[test]
+fn encryption_rejects_templates_the_decryption_parser_cannot_consume() {
+    // Encryption preserves template metadata, so it must reject every structure
+    // that the reciprocal parser would reject instead of emitting dead output.
+    let temp = tempfile::tempdir().unwrap();
+    let plaintext = temp.path().join("plaintext.bin");
+    let aes_key = temp.path().join("aes-key.bin");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(&plaintext, b"template validation").unwrap();
+    fs::write(&aes_key, b"0123456789abcdef").unwrap();
+
+    let oversized_id = "x".repeat(4 * 1024 + 1);
+    let cases = [
+        (
+            "recipient-child-order",
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><ds:KeyInfo><ds:KeyName>recipient</ds:KeyName></ds:KeyInfo><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#.to_owned(),
+            true,
+        ),
+        (
+            "unsupported-recipient-method-child",
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:ext="urn:test"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"><ext:Parameters/></EncryptionMethod><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#.to_owned(),
+            true,
+        ),
+        (
+            "empty-content-key-name",
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><ds:KeyName/></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#.to_owned(),
+            false,
+        ),
+        (
+            "empty-recipient-key-name",
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo><ds:KeyName/></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#.to_owned(),
+            true,
+        ),
+        (
+            "oversized-encrypted-data-id",
+            format!(
+                r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Id="{oversized_id}"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#
+            ),
+            false,
+        ),
+        (
+            "agreement-only-key-info",
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><AgreementMethod Algorithm="urn:test:agreement"/></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#.to_owned(),
+            false,
+        ),
+    ];
+
+    for (case, xml, uses_rsa_recipient) in cases {
+        let template = temp.path().join(format!("{case}.xml"));
+        let output_path = temp.path().join(format!("{case}-output.xml"));
+        fs::write(&template, xml).unwrap();
+        let mut command = Command::new(binary());
+        command.arg("encrypt");
+        if uses_rsa_recipient {
+            command.arg("--pubkey-pem").arg(&public_key);
+        } else {
+            command.arg("--aes-key").arg(&aes_key);
+        }
+        let output = command
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&output_path)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{case} unexpectedly succeeded");
+        assert!(!output_path.exists(), "{case} emitted partial output");
     }
 }
 

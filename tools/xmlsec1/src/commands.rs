@@ -22,9 +22,10 @@ use xml_sec::{
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
-        EncryptedDataBuilder, EncryptedDataType, EncryptedKey, EncryptionRecipient,
-        KeyTransportAlgorithm, OaepDigestAlgorithm, PrivateKeyDecryptor, RsaOaepParameters,
-        SymmetricKeyDecryptor, XmlEncError,
+        EncryptedDataBuilder, EncryptedDataType, EncryptedKey, EncryptionMethod,
+        EncryptionRecipient, KeyTransportAlgorithm, OaepDigestAlgorithm, PrivateKeyDecryptor,
+        RsaOaepParameters, SymmetricKeyDecryptor, XmlEncError,
+        parse_encrypted_data_template_node_with_policy,
     },
 };
 
@@ -120,7 +121,6 @@ const DECRYPT_OPTIONS: &[&str] = &[
 const KEYS_OPTIONS: &[&str] = &["gen-key"];
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const XMLENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";
-const XMLENC11_NS: &str = "http://www.w3.org/2009/xmlenc11#";
 const XMLSEC_COMPATIBILITY_HERE_SEMANTICS: XPathHereSemantics = XPathHereSemantics::XmlSecLegacy;
 const PRIMARY_COMMANDS: &[Command] = &[
     Command::Sign,
@@ -1416,76 +1416,31 @@ fn recipient_metadata_error(message: &str) -> CommandError {
 }
 
 fn template_oaep_parameters(
-    encrypted_key: Node<'_, '_>,
+    method: &EncryptionMethod,
 ) -> Result<Option<RsaOaepParameters>, CommandError> {
-    let method = singleton_direct_child(
-        encrypted_key,
-        XMLENC_NS,
-        "EncryptionMethod",
-        "EncryptedKey contains more than one direct EncryptionMethod",
-    )?
-    .ok_or_else(|| {
-        CommandError::Encryption(
-            "EncryptedKey must contain exactly one direct EncryptionMethod".into(),
-        )
-    })?;
-    let algorithm = method
-        .attribute("Algorithm")
-        .ok_or_else(|| CommandError::Encryption("EncryptedKey has no algorithm".into()))?;
-    let transport = KeyTransportAlgorithm::from_uri(algorithm)
+    let transport = KeyTransportAlgorithm::from_uri(&method.algorithm)
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
-    let digest_node = singleton_direct_child(
-        method,
-        XMLDSIG_NS,
-        "DigestMethod",
-        "EncryptionMethod contains more than one direct DigestMethod",
+    let digest = oaep_digest_from_uri(
+        method
+            .oaep_digest
+            .as_deref()
+            .unwrap_or(OaepDigestAlgorithm::Sha1.uri()),
     )?;
-    let digest = digest_node
-        .map(|node| {
-            node.attribute("Algorithm")
-                .ok_or_else(|| CommandError::Encryption("DigestMethod has no Algorithm".into()))
-        })
-        .transpose()?;
-    let mgf_node = singleton_direct_child(
-        method,
-        XMLENC11_NS,
-        "MGF",
-        "EncryptionMethod contains more than one direct MGF",
-    )?;
-    if transport == KeyTransportAlgorithm::RsaOaepMgf1p && mgf_node.is_some() {
-        return Err(CommandError::Encryption(
-            "legacy rsa-oaep-mgf1p does not permit an XML Encryption 1.1 MGF parameter".into(),
-        ));
-    }
-    let mgf = mgf_node.and_then(|node| node.attribute("Algorithm"));
-    let digest = oaep_digest_from_uri(digest.unwrap_or(OaepDigestAlgorithm::Sha1.uri()))?;
     let mgf_digest = if transport == KeyTransportAlgorithm::RsaOaepMgf1p {
         OaepDigestAlgorithm::Sha1
     } else {
-        oaep_mgf_from_uri(mgf.unwrap_or(OaepDigestAlgorithm::Sha1.mgf_uri()))?
+        oaep_mgf_from_uri(
+            method
+                .mgf_algorithm
+                .as_deref()
+                .unwrap_or(OaepDigestAlgorithm::Sha1.mgf_uri()),
+        )?
     };
-    let label = singleton_direct_child(
-        method,
-        XMLENC_NS,
-        "OAEPparams",
-        "EncryptionMethod contains more than one direct OAEPparams",
-    )?
-    .map_or_else(
-        || Ok(Vec::new()),
-        |node| {
-            let encoded = direct_simple_text(node, "OAEPparams")?;
-            base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                encoded.split_ascii_whitespace().collect::<String>(),
-            )
-            .map_err(|error| CommandError::Encryption(format!("invalid OAEPparams: {error}")))
-        },
-    )?;
     Ok(Some(RsaOaepParameters {
         algorithm: transport,
         digest,
         mgf_digest,
-        label,
+        label: method.oaep_params.clone().unwrap_or_default(),
     }))
 }
 
@@ -2006,55 +1961,30 @@ fn encryption_template(
 ) -> Result<EncryptionTemplateMetadata, CommandError> {
     let document = parse_encryption_document(xml, policy)?;
     let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
-    let method_node = singleton_direct_child(
-        encrypted_data,
-        XMLENC_NS,
-        "EncryptionMethod",
-        "EncryptedData contains more than one direct EncryptionMethod",
-    )?
-    .ok_or_else(|| CommandError::Encryption("template has no encryption algorithm".into()))?;
-    let key_info = singleton_direct_child(
-        encrypted_data,
-        XMLDSIG_NS,
-        "KeyInfo",
-        "EncryptedData contains more than one direct KeyInfo",
-    )?;
-    validate_encrypted_data_child_sequence(encrypted_data, method_node, key_info)?;
-    let algorithm = template_data_encryption_method(method_node)?;
+    // Templates preserve every non-cipher field. Parse the selected node through
+    // the reciprocal core path first so encryption cannot emit a document that
+    // the same policy snapshot would reject during decryption.
+    let parsed = parse_encrypted_data_template_node_with_policy(encrypted_data, policy)
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let algorithm = DataEncryptionAlgorithm::from_uri(&parsed.encryption_method.algorithm)
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
     let explicit_encrypted_type = encrypted_data.attribute("Type").is_some();
-    let encrypted_type = match encrypted_data.attribute("Type") {
-        None | Some("http://www.w3.org/2001/04/xmlenc#Element") => EncryptedDataType::Element,
-        Some("http://www.w3.org/2001/04/xmlenc#Content") => EncryptedDataType::Content,
-        Some(other) => {
+    let encrypted_type = match parsed.encrypted_type {
+        None | Some(EncryptedDataType::Element) => EncryptedDataType::Element,
+        Some(EncryptedDataType::Content) => EncryptedDataType::Content,
+        Some(EncryptedDataType::Other(other)) => {
             return Err(CommandError::Encryption(format!(
                 "unsupported EncryptedData Type: {other}"
             )));
         }
     };
-    let recipients = key_info
+    let recipients = parsed
+        .encrypted_keys
         .into_iter()
-        .flat_map(|key_info| key_info.children())
-        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
         .map(|encrypted_key| {
-            let recipient_key_info = singleton_direct_child(
-                encrypted_key,
-                XMLDSIG_NS,
-                "KeyInfo",
-                "EncryptedKey contains more than one direct KeyInfo",
-            )?;
             Ok(EncryptionTemplateRecipient {
-                key_name: recipient_key_info
-                    .map(|key_info| {
-                        optional_direct_child_text(
-                            key_info,
-                            XMLDSIG_NS,
-                            "KeyName",
-                            "EncryptedKey KeyInfo contains more than one direct KeyName",
-                        )
-                    })
-                    .transpose()?
-                    .flatten(),
-                oaep_parameters: template_oaep_parameters(encrypted_key)?,
+                key_name: encrypted_key.key_name,
+                oaep_parameters: template_oaep_parameters(&encrypted_key.encryption_method)?,
             })
         })
         .collect::<Result<Vec<_>, CommandError>>()?;
@@ -2063,49 +1993,9 @@ fn encryption_template(
         encrypted_type,
         explicit_encrypted_type,
         has_encrypted_key_recipient: !recipients.is_empty(),
-        content_key_name: encrypted_data_key_name(encrypted_data)?,
+        content_key_name: parsed.key_name,
         recipients,
     })
-}
-
-fn validate_encrypted_data_child_sequence(
-    encrypted_data: Node<'_, '_>,
-    method_node: Node<'_, '_>,
-    key_info: Option<Node<'_, '_>>,
-) -> Result<(), CommandError> {
-    let mut children = encrypted_data.children().filter(Node::is_element);
-    if children.next() != Some(method_node) {
-        return Err(CommandError::Encryption(
-            "EncryptedData must begin with EncryptionMethod".into(),
-        ));
-    }
-    if let Some(key_info) = key_info
-        && children.next() != Some(key_info)
-    {
-        return Err(CommandError::Encryption(
-            "EncryptedData KeyInfo must precede CipherData".into(),
-        ));
-    }
-    let Some(cipher_data) = children.next() else {
-        return Err(CommandError::Encryption(
-            "EncryptedData must contain CipherData after EncryptionMethod and optional KeyInfo"
-                .into(),
-        ));
-    };
-    if !cipher_data.has_tag_name((XMLENC_NS, "CipherData")) {
-        return Err(CommandError::Encryption(
-            "EncryptedData must contain CipherData after EncryptionMethod and optional KeyInfo"
-                .into(),
-        ));
-    }
-    if let Some(child) = children.next()
-        && (!child.has_tag_name((XMLENC_NS, "EncryptionProperties")) || children.next().is_some())
-    {
-        return Err(CommandError::Encryption(
-            "EncryptedData has unexpected child after CipherData".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn encrypted_data_key_name(encrypted_data: Node<'_, '_>) -> Result<Option<String>, CommandError> {
@@ -2124,49 +2014,6 @@ fn encrypted_data_key_name(encrypted_data: Node<'_, '_>) -> Result<Option<String
         "KeyName",
         "KeyInfo contains more than one direct KeyName",
     )
-}
-
-fn template_data_encryption_method(
-    method: Node<'_, '_>,
-) -> Result<DataEncryptionAlgorithm, CommandError> {
-    let uri = method
-        .attribute("Algorithm")
-        .ok_or_else(|| CommandError::Encryption("template has no encryption algorithm".into()))?;
-    let algorithm = DataEncryptionAlgorithm::from_uri(uri)
-        .map_err(|error| CommandError::Encryption(error.to_string()))?;
-    let mut key_size = None;
-    for child in method.children().filter(Node::is_element) {
-        if child.has_tag_name((XMLENC_NS, "KeySize")) && key_size.is_none() {
-            let value = direct_simple_text(child, "KeySize")?;
-            let bits = value.trim().parse::<usize>().map_err(|_| {
-                CommandError::Encryption("KeySize must be a positive integer".into())
-            })?;
-            if bits == 0 {
-                return Err(CommandError::Encryption(
-                    "KeySize must be a positive integer".into(),
-                ));
-            }
-            key_size = Some(bits);
-        } else if child.has_tag_name((XMLENC_NS, "KeySize")) {
-            return Err(CommandError::Encryption(
-                "EncryptionMethod contains more than one direct KeySize".into(),
-            ));
-        } else {
-            return Err(CommandError::Encryption(format!(
-                "unsupported EncryptionMethod child {}",
-                child.tag_name().name()
-            )));
-        }
-    }
-    if let Some(actual) = key_size {
-        let expected = algorithm.key_len() * 8;
-        if actual != expected {
-            return Err(CommandError::Encryption(format!(
-                "EncryptionMethod {uri} requires KeySize {expected}, got {actual}"
-            )));
-        }
-    }
-    Ok(algorithm)
 }
 
 fn optional_direct_child_text(

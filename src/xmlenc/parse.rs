@@ -35,9 +35,37 @@ pub(super) fn parse_encrypted_data_with_policy(
     parse_encrypted_data_node_with_policy(document.root_element(), policy)
 }
 
-pub(super) fn parse_encrypted_data_node_with_policy(
+/// Parse a selected `xenc:EncryptedData` node under an immutable policy snapshot.
+///
+/// This is the node-oriented counterpart to [`parse_encrypted_data`]. It lets
+/// callers that already parsed a containing document validate the complete
+/// encrypted-data structure without serializing the selected subtree and losing
+/// namespace declarations inherited from its ancestors.
+pub fn parse_encrypted_data_node_with_policy(
     node: Node<'_, '_>,
     policy: &crate::policy::DecryptionPolicy,
+) -> Result<EncryptedData, XmlEncError> {
+    policy.validate()?;
+    parse_encrypted_data_node(node, policy, false)
+}
+
+/// Parse an `xenc:EncryptedData` template under an immutable policy snapshot.
+///
+/// This applies the complete encrypted-data grammar and metadata limits while
+/// permitting empty `CipherValue` placeholders that encryption will replace.
+/// Non-empty placeholders must still be well-formed base64.
+pub fn parse_encrypted_data_template_node_with_policy(
+    node: Node<'_, '_>,
+    policy: &crate::policy::EncryptionPolicy,
+) -> Result<EncryptedData, XmlEncError> {
+    policy.validate()?;
+    parse_encrypted_data_node(node, policy, true)
+}
+
+fn parse_encrypted_data_node(
+    node: Node<'_, '_>,
+    policy: &crate::policy::DecryptionPolicy,
+    allow_empty_cipher_values: bool,
 ) -> Result<EncryptedData, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedData")?;
     let mut children = element_children(node);
@@ -45,18 +73,39 @@ pub(super) fn parse_encrypted_data_node_with_policy(
         next_required(&mut children, "EncryptionMethod")?,
         policy.resources.max_encryption_metadata_bytes,
     )?;
+    if children
+        .peek()
+        .is_some_and(|child| child.has_tag_name((XMLENC_NS, "EncryptionMethod")))
+    {
+        return Err(XmlEncError::InvalidStructure(
+            "EncryptedData contains more than one direct EncryptionMethod".into(),
+        ));
+    }
 
     let key_info = match children.peek() {
-        Some(child) if child.has_tag_name((XMLDSIG_NS, "KeyInfo")) => {
-            parse_key_info(next_required(&mut children, "KeyInfo")?, policy)?
-        }
+        Some(child) if child.has_tag_name((XMLDSIG_NS, "KeyInfo")) => parse_key_info(
+            next_required(&mut children, "KeyInfo")?,
+            policy,
+            allow_empty_cipher_values,
+        )?,
         _ => ParsedKeyInfo {
             key_name: None,
             encrypted_keys: Vec::new(),
         },
     };
+    if children
+        .peek()
+        .is_some_and(|child| child.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+    {
+        return Err(XmlEncError::InvalidStructure(
+            "EncryptedData contains more than one direct KeyInfo".into(),
+        ));
+    }
 
-    let cipher_data = parse_cipher_data(next_required(&mut children, "CipherData")?)?;
+    let cipher_data = parse_cipher_data(
+        next_required(&mut children, "CipherData")?,
+        allow_empty_cipher_values,
+    )?;
     consume_encryption_properties(&mut children);
     if children.next().is_some() {
         return Err(XmlEncError::InvalidStructure(
@@ -79,6 +128,7 @@ pub(super) fn parse_encrypted_data_node_with_policy(
 fn parse_key_info(
     node: Node<'_, '_>,
     policy: &crate::policy::DecryptionPolicy,
+    allow_empty_cipher_values: bool,
 ) -> Result<ParsedKeyInfo, XmlEncError> {
     require_element(node, XMLDSIG_NS, "KeyInfo")?;
     let mut key_name = None;
@@ -101,7 +151,11 @@ fn parse_key_info(
                 }
                 .into());
             }
-            encrypted_keys.push(parse_encrypted_key(child, policy)?);
+            encrypted_keys.push(parse_encrypted_key(
+                child,
+                policy,
+                allow_empty_cipher_values,
+            )?);
         } else if child.has_tag_name((XMLENC_NS, "AgreementMethod")) {
             // Agreement methods require a separate key-derivation trust boundary.
             // Keep the URI as a fallback error while allowing another advertised
@@ -134,6 +188,7 @@ fn parse_key_info(
 fn parse_encrypted_key(
     node: Node<'_, '_>,
     policy: &crate::policy::DecryptionPolicy,
+    allow_empty_cipher_values: bool,
 ) -> Result<EncryptedKey, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedKey")?;
     let mut children = element_children(node);
@@ -141,6 +196,14 @@ fn parse_encrypted_key(
         next_required(&mut children, "EncryptionMethod")?,
         policy.resources.max_encryption_metadata_bytes,
     )?;
+    if children
+        .peek()
+        .is_some_and(|child| child.has_tag_name((XMLENC_NS, "EncryptionMethod")))
+    {
+        return Err(XmlEncError::InvalidStructure(
+            "EncryptedKey contains more than one direct EncryptionMethod".into(),
+        ));
+    }
     let key_name = if children
         .peek()
         .is_some_and(|child| child.has_tag_name((XMLDSIG_NS, "KeyInfo")))
@@ -149,7 +212,18 @@ fn parse_encrypted_key(
     } else {
         None
     };
-    let cipher_data = parse_cipher_data(next_required(&mut children, "CipherData")?)?;
+    if children
+        .peek()
+        .is_some_and(|child| child.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+    {
+        return Err(XmlEncError::InvalidStructure(
+            "EncryptedKey contains more than one direct KeyInfo".into(),
+        ));
+    }
+    let cipher_data = parse_cipher_data(
+        next_required(&mut children, "CipherData")?,
+        allow_empty_cipher_values,
+    )?;
     consume_encryption_properties(&mut children);
     let reference_list = if children
         .peek()
@@ -374,7 +448,7 @@ fn parse_key_size(node: Node<'_, '_>, metadata_limit: usize) -> Result<usize, Xm
     Ok(bits)
 }
 
-fn parse_cipher_data(node: Node<'_, '_>) -> Result<CipherData, XmlEncError> {
+fn parse_cipher_data(node: Node<'_, '_>, allow_empty: bool) -> Result<CipherData, XmlEncError> {
     require_element(node, XMLENC_NS, "CipherData")?;
     let mut children = element_children(node);
     let value = next_required(&mut children, "CipherValue")?;
@@ -385,7 +459,7 @@ fn parse_cipher_data(node: Node<'_, '_>) -> Result<CipherData, XmlEncError> {
         ));
     }
     Ok(CipherData {
-        value: normalize_base64(&simple_text(value, "CipherValue")?)?,
+        value: normalize_base64_with_empty(&simple_text(value, "CipherValue")?, allow_empty)?,
     })
 }
 
@@ -581,11 +655,6 @@ fn decode_bounded_base64_text(node: Node<'_, '_>, maximum: usize) -> Result<Vec<
     Ok(decoded)
 }
 
-/// Normalize XML base64 whitespace while applying a pre-allocation bound.
-pub(super) fn normalize_base64(value: &str) -> Result<String, XmlEncError> {
-    normalize_base64_with_empty(value, false)
-}
-
 fn normalize_base64_with_empty(value: &str, allow_empty: bool) -> Result<String, XmlEncError> {
     let mut normalized = String::with_capacity(value.len().min(MAX_CIPHER_VALUE_BASE64_LEN));
     for character in value.chars() {
@@ -607,6 +676,11 @@ fn normalize_base64_with_empty(value: &str, allow_empty: bool) -> Result<String,
         return Err(XmlEncError::Base64("CipherValue is empty".into()));
     }
     Ok(normalized)
+}
+
+#[cfg(test)]
+fn normalize_base64(value: &str) -> Result<String, XmlEncError> {
+    normalize_base64_with_empty(value, false)
 }
 
 fn require_element(node: Node<'_, '_>, namespace: &str, name: &str) -> Result<(), XmlEncError> {

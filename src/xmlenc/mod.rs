@@ -25,7 +25,10 @@ pub use decrypt::{
     decrypt_document_with_options,
 };
 pub use encrypt::EncryptedDataBuilder;
-pub use parse::parse_encrypted_data;
+pub use parse::{
+    parse_encrypted_data, parse_encrypted_data_node_with_policy,
+    parse_encrypted_data_template_node_with_policy,
+};
 pub use types::{
     CipherData, DataEncryptionAlgorithm, DecryptedContent, DocumentEncryptionOptions,
     EncryptedData, EncryptedDataType, EncryptedKey, EncryptionMethod, EncryptionRecipient,
