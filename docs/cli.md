@@ -168,6 +168,9 @@ templates build one wrapped content key per recipient, preserving each
 recipient's OAEP parameters and document order; every recipient must resolve
 without missing or duplicate key matches. Under lax lookup, compatible wrapping
 keys are consumed in command-line order rather than reused for every recipient.
+Compatibility includes any preserved `RSAKeyValue`, X.509, or
+`DEREncodedKeyValue` identity, so lax lookup skips an earlier syntactically
+valid key when it contradicts the recipient metadata.
 Named and unnamed recipient slots remain distinct identities. An unnamed template
 does not constrain the sole explicit key; missing and duplicate matches fail
 unless `--lax-key-search` is supplied.
@@ -177,7 +180,9 @@ RSA private-key decryption accepts the upstream
 `key.pem,certificate.pem,...` option syntax, consumes the first component as
 the decryption key, and validates every certificate companion before decrypting.
 All asymmetric key and certificate files are read through one absolute
-process-safety ceiling before format decoding.
+process-safety ceiling before format decoding. Verification also deduplicates
+repeated certificates within each lookup or trust role and applies the compiled
+aggregate external-resource budget to all retained configured certificate DER.
 Repeatable named private keys form one resolver: each nested `EncryptedKey` is
 matched to its own key, and duplicate keys for the same recipient fail as
 ambiguous instead of preventing distinct recipients from sharing an invocation.

@@ -2681,6 +2681,98 @@ fn named_rsa_key_ring_selects_one_recipient_for_encryption_and_decryption() {
 }
 
 #[test]
+fn named_rsa_option_identifies_a_generated_recipient() {
+    // With no EncryptedKey skeleton, the selected option name is the only
+    // recipient identity available to the reciprocal strict key-ring lookup.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("generated-named-recipient.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"generated named recipient").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem:recipient"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    let encrypted_xml = fs::read_to_string(&encrypted).unwrap();
+    let document = roxmltree::Document::parse(&encrypted_xml).unwrap();
+    assert!(document.descendants().any(|node| {
+        node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName"))
+            && node.text() == Some("recipient")
+    }));
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--privkey-pem:recipient"])
+        .arg(&private_key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"generated named recipient");
+}
+
+#[test]
+fn lax_rsa_search_skips_candidates_that_conflict_with_recipient_metadata() {
+    // Lax name matching does not make preserved KeyValue metadata advisory: a
+    // syntactically valid but mismatching key must be skipped in favor of the
+    // later candidate whose public components satisfy the template identity.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("lax-recipient-metadata.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let wrong = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let matching = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let matching_key =
+        RsaPublicKey::from_public_key_pem(&fs::read_to_string(&matching).unwrap()).unwrap();
+    fs::write(
+        &template,
+        format!(
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo>{}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+            rsa_key_value_with_leading_zeroes(&matching_key, 0, 0)
+        ),
+    )
+    .unwrap();
+    fs::write(&plaintext, b"metadata-selected recipient").unwrap();
+
+    let accepted = Command::new(binary())
+        .args(["encrypt", "--lax-key-search", "--pubkey-pem:first"])
+        .arg(&wrong)
+        .args(["--pubkey-pem:second"])
+        .arg(&matching)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+}
+
+#[test]
 fn rsa_encryption_populates_an_existing_key_info_container() {
     // A template may reserve KeyInfo for non-cryptographic metadata without
     // pre-creating EncryptedKey. Encryption must add the generated recipient

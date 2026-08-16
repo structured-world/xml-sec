@@ -15,10 +15,10 @@ use xml_sec::{
     policy::{DecryptionPolicy, EncryptionPolicy, SigningPolicy, VerificationPolicy},
     provider::{CryptoProvider, default_provider},
     xmldsig::{
-        DefaultKeyResolver, DsigStatus, FailureReason, KeyInfoSource, KeyInfoWriter, KeyResolver,
-        KeyResolverConfig, KeyValueInfo, ReferenceResult, SignContext, SignatureAlgorithm,
-        SigningKey, SigningPublicKeyInfo, UriTypeSet, VerifyContext, VerifyResult,
-        X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
+        DefaultKeyResolver, DsigStatus, FailureReason, KeyInfo, KeyInfoSource, KeyInfoWriter,
+        KeyResolver, KeyResolverConfig, KeyValueInfo, ReferenceResult, SignContext,
+        SignatureAlgorithm, SigningKey, SigningPublicKeyInfo, UriTypeSet, VerifyContext,
+        VerifyResult, X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
         uri::UriReferenceResolver, x509_certificate_matches_selectors,
     },
     xmlenc::{
@@ -154,6 +154,8 @@ pub enum CommandError {
     InvalidUtf8Input,
     #[error("encryption plaintext exceeds policy limit of {maximum} bytes")]
     PlaintextTooLarge { maximum: usize },
+    #[error("configured certificate material exceeds policy limit of {maximum} bytes")]
+    CertificateMaterialTooLarge { maximum: usize },
     #[error(transparent)]
     Key(#[from] key_material::KeyMaterialError),
     #[error("XML signature operation failed: {0}")]
@@ -874,6 +876,8 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         }
     } else {
         let mut config = KeyResolverConfig::default();
+        let mut certificate_bytes = 0;
+        let maximum_certificate_bytes = policy.resources.max_external_resource_total_bytes;
         for name in [
             "pubkey-cert-pem",
             "pubkey-cert-der",
@@ -881,16 +885,22 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             "untrusted-der",
         ] {
             for option in invocation.values(name) {
-                config.lookup_certs.push(key_material::load_certificate(
-                    option.value.as_deref().unwrap_or_default(),
-                )?);
+                push_configured_certificate(
+                    &mut config.lookup_certs,
+                    key_material::load_certificate(option.value.as_deref().unwrap_or_default())?,
+                    &mut certificate_bytes,
+                    maximum_certificate_bytes,
+                )?;
             }
         }
         for name in ["trusted-pem", "trusted-der"] {
             for option in invocation.values(name) {
-                config.trusted_certs.push(key_material::load_certificate(
-                    option.value.as_deref().unwrap_or_default(),
-                )?);
+                push_configured_certificate(
+                    &mut config.trusted_certs,
+                    key_material::load_certificate(option.value.as_deref().unwrap_or_default())?,
+                    &mut certificate_bytes,
+                    maximum_certificate_bytes,
+                )?;
             }
         }
         let resolver = DefaultKeyResolver::new(config);
@@ -903,6 +913,26 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     if aggregate_verification_status(&result) != DsigStatus::Valid {
         return Err(CommandError::InvalidSignature);
     }
+    Ok(())
+}
+
+fn push_configured_certificate(
+    certificates: &mut Vec<Vec<u8>>,
+    certificate: Vec<u8>,
+    total_bytes: &mut usize,
+    maximum_bytes: usize,
+) -> Result<(), CommandError> {
+    if certificates.iter().any(|existing| existing == &certificate) {
+        return Ok(());
+    }
+    let next_total = total_bytes
+        .checked_add(certificate.len())
+        .filter(|total| *total <= maximum_bytes)
+        .ok_or(CommandError::CertificateMaterialTooLarge {
+            maximum: maximum_bytes,
+        })?;
+    certificates.push(certificate);
+    *total_bytes = next_total;
     Ok(())
 }
 
@@ -1164,7 +1194,16 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let lax_key_search = invocation.flag("lax-key-search");
         let mut available_public_keys = public_keys.clone();
         let mut selected_recipients = Vec::with_capacity(template_recipients.len());
-        for template_recipient in template_recipients {
+        let recipient_metadata = recipient_key_metadata(
+            &template,
+            start_node_id,
+            &id_attributes,
+            &policy,
+            template_recipients.len(),
+        )?;
+        for (template_recipient, metadata) in
+            template_recipients.into_iter().zip(recipient_metadata)
+        {
             let requested_names = template_recipient
                 .key_name
                 .iter()
@@ -1178,7 +1217,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                 "RSA recipient key",
             )?;
             let mut selected = None;
-            let mut last_error = None;
+            let mut last_error: Option<CommandError> = None;
             for (option, certificate) in candidates {
                 let path = option.value.as_deref().unwrap_or_default();
                 let loaded = if certificate {
@@ -1194,7 +1233,10 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                         certificate_der: None,
                     })
                 };
-                match loaded {
+                match loaded.map_err(CommandError::from).and_then(|key| {
+                    validate_recipient_key_metadata(metadata.as_ref(), &key)?;
+                    Ok(key)
+                }) {
                     Ok(key) => {
                         selected = Some((option, certificate, key));
                         break;
@@ -1204,7 +1246,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             }
             let (selected_option, selected_certificate, public_key) =
                 selected.ok_or_else(|| {
-                    last_error.map(CommandError::from).unwrap_or_else(|| {
+                    last_error.unwrap_or_else(|| {
                         CommandError::Usage("no compatible RSA recipient key input".into())
                     })
                 })?;
@@ -1222,19 +1264,18 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                     })?;
                 available_public_keys.remove(selected_index);
             }
-            selected_recipients.push((public_key, template_recipient.oaep_parameters));
+            let key_name = template_recipient
+                .key_name
+                .or_else(|| selected_option.parameter.clone());
+            selected_recipients.push((public_key, template_recipient.oaep_parameters, key_name));
         }
-        validate_recipient_key_metadata(
-            &template,
-            start_node_id,
-            &id_attributes,
-            &policy,
-            selected_recipients.iter().map(|(key, _)| key),
-        )?;
-        for (public_key, parameters) in selected_recipients {
+        for (public_key, parameters, key_name) in selected_recipients {
             let mut recipient = EncryptionRecipient::rsa_oaep(public_key.public_key);
             if let Some(parameters) = parameters {
                 recipient = recipient.oaep_parameters(parameters);
+            }
+            if let Some(key_name) = key_name {
+                recipient = recipient.key_name(key_name);
             }
             builder = builder.add_recipient(recipient);
         }
@@ -1291,11 +1332,19 @@ fn xml_data_plaintext<'a>(
     let root = document.root_element();
     let element = &xml[root.range()];
     match encrypted_type {
-        EncryptedDataType::Element => Ok(Cow::Borrowed(element)),
+        EncryptedDataType::Element => {
+            ensure_plaintext_capacity(
+                0,
+                element.len(),
+                policy.resources.max_encryption_plaintext_bytes,
+            )?;
+            Ok(Cow::Borrowed(element))
+        }
         EncryptedDataType::Content => {
-            let mut content = String::new();
+            let maximum = policy.resources.max_encryption_plaintext_bytes;
+            let mut content = String::with_capacity(element.len().min(maximum));
             for child in root.children() {
-                append_serialized_xml_child(&mut content, xml, child)?;
+                append_serialized_xml_child(&mut content, xml, child, maximum)?;
             }
             Ok(Cow::Owned(content))
         }
@@ -1309,16 +1358,15 @@ fn append_serialized_xml_child(
     output: &mut String,
     source: &str,
     node: roxmltree::Node<'_, '_>,
+    maximum: usize,
 ) -> Result<(), CommandError> {
     if node.is_element() {
-        output.push_str(&standalone_element(source, node)?);
-        return Ok(());
+        return append_standalone_element(output, source, node, maximum);
     }
     // roxmltree's source range retains the lexical representation of text,
     // including entity references and complete CDATA delimiters. Copying that
     // range preserves text semantics without accidentally creating markup.
-    output.push_str(&source[node.range()]);
-    Ok(())
+    push_plaintext(output, &source[node.range()], maximum)
 }
 
 fn write_encryption_diagnostics(
@@ -1365,13 +1413,13 @@ struct RecipientPublicKey {
     certificate_der: Option<Vec<u8>>,
 }
 
-fn validate_recipient_key_metadata<'a>(
+fn recipient_key_metadata(
     template: &str,
     start_node_id: Option<&str>,
     id_attributes: &[IdAttributeRegistration],
     policy: &EncryptionPolicy,
-    selected_keys: impl IntoIterator<Item = &'a RecipientPublicKey>,
-) -> Result<(), CommandError> {
+    expected_recipients: usize,
+) -> Result<Vec<Option<KeyInfo>>, CommandError> {
     let document = parse_encryption_document(template, policy)?;
     let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
     let encrypted_keys = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
@@ -1379,27 +1427,36 @@ fn validate_recipient_key_metadata<'a>(
         .flat_map(|key_info| key_info.children())
         .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
         .collect::<Vec<_>>();
-    let selected_keys = selected_keys.into_iter().collect::<Vec<_>>();
     if encrypted_keys.is_empty() {
-        return Ok(());
+        return Ok(vec![None; expected_recipients]);
     }
-    if encrypted_keys.len() != selected_keys.len() {
+    if encrypted_keys.len() != expected_recipients {
         return Err(recipient_metadata_error(
             "selected RSA key count does not match template recipients",
         ));
     }
 
-    for (encrypted_key, selected_key) in encrypted_keys.into_iter().zip(selected_keys) {
-        let Some(key_info_node) = direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo") else {
-            continue;
-        };
-        let key_info = parse_key_info(key_info_node)
-            .map_err(|error| CommandError::Encryption(error.to_string()))?;
-        for source in key_info.sources {
+    encrypted_keys
+        .into_iter()
+        .map(|encrypted_key| {
+            direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo")
+                .map(parse_key_info)
+                .transpose()
+                .map_err(|error| CommandError::Encryption(error.to_string()))
+        })
+        .collect()
+}
+
+fn validate_recipient_key_metadata(
+    metadata: Option<&KeyInfo>,
+    selected_key: &RecipientPublicKey,
+) -> Result<(), CommandError> {
+    if let Some(metadata) = metadata {
+        for source in &metadata.sources {
             let matches = match source {
                 KeyInfoSource::KeyName(_) => continue,
                 KeyInfoSource::KeyValue(KeyValueInfo::Rsa { modulus, exponent }) => {
-                    rsa_components_match(&selected_key.public_key, &modulus, &exponent)
+                    rsa_components_match(&selected_key.public_key, modulus, exponent)
                 }
                 KeyInfoSource::X509Data(data) => {
                     if data.certificates.is_empty()
@@ -1444,12 +1501,12 @@ fn validate_recipient_key_metadata<'a>(
                                     "X509Data selectors require a selected RSA certificate",
                                 )
                             })?;
-                        x509_certificate_matches_selectors(&data, certificate, default_provider())
+                        x509_certificate_matches_selectors(data, certificate, default_provider())
                             .map_err(|error| CommandError::Encryption(error.to_string()))?
                     }
                 }
                 KeyInfoSource::DerEncodedKeyValue(der) => {
-                    let public_key = RsaPublicKey::from_public_key_der(&der).map_err(|_| {
+                    let public_key = RsaPublicKey::from_public_key_der(der).map_err(|_| {
                         recipient_metadata_error("DEREncodedKeyValue is not an RSA public key")
                     })?;
                     rsa_public_keys_match(&selected_key.public_key, &public_key)
@@ -1750,6 +1807,17 @@ fn standalone_cipher_value(node: roxmltree::Node<'_, '_>) -> String {
 }
 
 fn standalone_element(source: &str, node: roxmltree::Node<'_, '_>) -> Result<String, CommandError> {
+    let mut output = String::new();
+    append_standalone_element(&mut output, source, node, usize::MAX)?;
+    Ok(output)
+}
+
+fn append_standalone_element(
+    output: &mut String,
+    source: &str,
+    node: roxmltree::Node<'_, '_>,
+    maximum: usize,
+) -> Result<(), CommandError> {
     let fragment = &source[node.range()];
     let opening_end = opening_tag_end(fragment)
         .ok_or_else(|| CommandError::Encryption("element has no opening tag".into()))?;
@@ -1759,7 +1827,9 @@ fn standalone_element(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Str
     let qualified_name_end = opening.find(char::is_whitespace).unwrap_or(opening.len());
     let qualified_name = &opening[1..qualified_name_end];
     let attributes = &opening[qualified_name_end..];
-    let mut output = format!("<{qualified_name}{attributes}");
+    push_plaintext(output, "<", maximum)?;
+    push_plaintext(output, qualified_name, maximum)?;
+    push_plaintext(output, attributes, maximum)?;
     let owned_namespaces = owned_namespace_declarations(opening)?;
     for namespace in node.namespaces() {
         let declaration = namespace
@@ -1767,26 +1837,44 @@ fn standalone_element(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Str
             .map_or("xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
         let already_declared = owned_namespaces.contains(namespace.name().unwrap_or_default());
         if !already_declared {
-            output.push(' ');
-            output.push_str(&declaration);
-            output.push_str("=\"");
-            output.push_str(&quick_xml::escape::escape(namespace.uri()));
-            output.push('"');
+            push_plaintext(output, " ", maximum)?;
+            push_plaintext(output, &declaration, maximum)?;
+            push_plaintext(output, "=\"", maximum)?;
+            push_plaintext(output, &quick_xml::escape::escape(namespace.uri()), maximum)?;
+            push_plaintext(output, "\"", maximum)?;
         }
     }
     if self_closing {
-        output.push_str("/>");
+        push_plaintext(output, "/>", maximum)?;
     } else {
         let closing_start = fragment
             .rfind("</")
             .ok_or_else(|| CommandError::Encryption("element has no closing tag".into()))?;
-        output.push('>');
-        output.push_str(&fragment[opening_end + 1..closing_start]);
-        output.push_str("</");
-        output.push_str(qualified_name);
-        output.push('>');
+        push_plaintext(output, ">", maximum)?;
+        push_plaintext(output, &fragment[opening_end + 1..closing_start], maximum)?;
+        push_plaintext(output, "</", maximum)?;
+        push_plaintext(output, qualified_name, maximum)?;
+        push_plaintext(output, ">", maximum)?;
     }
-    Ok(output)
+    Ok(())
+}
+
+fn push_plaintext(output: &mut String, fragment: &str, maximum: usize) -> Result<(), CommandError> {
+    ensure_plaintext_capacity(output.len(), fragment.len(), maximum)?;
+    output.push_str(fragment);
+    Ok(())
+}
+
+fn ensure_plaintext_capacity(
+    current: usize,
+    additional: usize,
+    maximum: usize,
+) -> Result<(), CommandError> {
+    current
+        .checked_add(additional)
+        .filter(|length| *length <= maximum)
+        .map(|_| ())
+        .ok_or(CommandError::PlaintextTooLarge { maximum })
 }
 
 fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, CommandError> {
@@ -2729,6 +2817,45 @@ mod tests {
         assert!(matches!(
             read_plaintext(path.as_os_str(), 4),
             Err(CommandError::PlaintextTooLarge { maximum: 4 })
+        ));
+    }
+
+    #[test]
+    fn configured_certificates_are_deduplicated_and_aggregate_bounded() {
+        // Repeated CLI options must not multiply retained DER, while distinct
+        // trust material must be rejected before crossing the compiled total.
+        let mut certificates = Vec::new();
+        let mut total = 0;
+        push_configured_certificate(&mut certificates, vec![1, 2], &mut total, 3).unwrap();
+        push_configured_certificate(&mut certificates, vec![1, 2], &mut total, 3).unwrap();
+        assert_eq!(certificates, [vec![1, 2]]);
+        assert_eq!(total, 2);
+
+        assert!(matches!(
+            push_configured_certificate(&mut certificates, vec![3, 4], &mut total, 3),
+            Err(CommandError::CertificateMaterialTooLarge { maximum: 3 })
+        ));
+        assert_eq!(certificates, [vec![1, 2]]);
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn xml_content_serialization_enforces_the_plaintext_limit_while_rendering() {
+        // Inherited namespaces can expand every serialized child. The Content
+        // path must stop at the operation budget rather than constructing the
+        // complete expanded plaintext before the builder checks its length.
+        let xml = r#"<root xmlns:a="urn:one" xmlns:b="urn:two"><a:item/><b:item/></root>"#;
+        let policy = EncryptionPolicy {
+            resources: xml_sec::policy::ResourcePolicy {
+                max_encryption_plaintext_bytes: 32,
+                ..xml_sec::policy::ResourcePolicy::default()
+            },
+            ..EncryptionPolicy::default()
+        };
+
+        assert!(matches!(
+            xml_data_plaintext(xml, &EncryptedDataType::Content, &policy),
+            Err(CommandError::PlaintextTooLarge { maximum: 32 })
         ));
     }
 

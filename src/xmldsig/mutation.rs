@@ -11,6 +11,7 @@ use quick_xml::reader::NsReader;
 use quick_xml::{Reader, Writer};
 
 use super::parse::XMLDSIG_NS;
+use super::whitespace::is_xml_whitespace_only;
 
 pub(super) fn parse_with_options<'a>(
     xml: &'a str,
@@ -638,14 +639,21 @@ fn is_matching_empty_placeholder(
 
 fn is_reusable_placeholder(node: roxmltree::Node<'_, '_>) -> bool {
     node.children()
-        .all(|child| child.is_text() && child.text().is_some_and(|text| text.trim().is_empty()))
+        .all(|child| child.is_text() && child.text().is_some_and(is_xml_whitespace_only))
 }
 
 fn has_cryptographic_identity_content(node: roxmltree::Node<'_, '_>) -> bool {
-    node.children().any(|child| {
-        child.is_element()
-            || (child.is_text() && child.text().is_some_and(|text| !text.trim().is_empty()))
-    })
+    if node.children().any(|child| child.is_element()) {
+        return true;
+    }
+    match (node.tag_name().namespace(), node.tag_name().name()) {
+        (Some(XMLDSIG_NS), "RetrievalMethod") => node.attribute("URI").is_some(),
+        (Some("http://www.w3.org/2009/xmldsig11#"), "DEREncodedKeyValue") => node
+            .children()
+            .filter_map(|child| child.text())
+            .any(|text| !is_xml_whitespace_only(text)),
+        _ => false,
+    }
 }
 
 fn is_cryptographic_key_info_source(namespace: Option<&str>, name: &str) -> bool {
@@ -1425,6 +1433,30 @@ mod tests {
                 .children()
                 .any(|node| node.has_tag_name((XMLDSIG_NS, "X509Certificate")))
         }));
+    }
+
+    #[test]
+    fn key_info_source_merge_preserves_non_xml_whitespace_text() {
+        // XML only classifies space, tab, CR, and LF as whitespace. A non-breaking
+        // space is caller-owned character data and must not turn X509Data into a
+        // reusable placeholder that signing silently overwrites.
+        let source = "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:KeyInfo><ds:X509Data>\u{00a0}</ds:X509Data></ds:KeyInfo></ds:Signature>";
+        let generated = r#"<X509Data xmlns="http://www.w3.org/2000/09/xmldsig#"><X509Certificate>Y2VydA==</X509Certificate></X509Data>"#;
+
+        let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect("generated identity must not replace non-whitespace character data");
+        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let x509_sources = document
+            .descendants()
+            .filter(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
+            .collect::<Vec<_>>();
+
+        assert_eq!(x509_sources.len(), 2);
+        assert!(
+            x509_sources
+                .iter()
+                .any(|source| source.text() == Some("\u{00a0}"))
+        );
     }
 
     #[test]
