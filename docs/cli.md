@@ -95,10 +95,10 @@ present, it matches that exact namespace (`:ELEMENT` means no namespace).
 Registrations affect both
 `--node-id` selection and same-document reference resolution; duplicate ID
 values remain ambiguous and fail closed.
-XPath and XPath Filter 2.0 verification uses libxmlsec1's legacy `here()`
-binding at this CLI compatibility boundary. The Rust library API retains the
-XMLDSig specification binding by default and requires an explicit opt-in for
-legacy documents.
+XPath and XPath Filter 2.0 signing and verification use libxmlsec1's legacy
+`here()` binding at this CLI compatibility boundary, so CLI-produced signatures
+round-trip with the donor. The Rust library API retains the XMLDSig specification
+binding by default and requires an explicit opt-in for legacy documents.
 Repeatable named raw public-key and explicit-certificate options form a key set.
 Every direct `KeyName` in the selected signature participates in lookup and must
 identify exactly one supplied key; duplicate matches fail as ambiguous.
@@ -154,7 +154,9 @@ must select exactly one AES key, while a recipient `KeyName` inside
 each `EncryptedKey` must select exactly one RSA wrapping key. Multi-recipient
 templates build one wrapped content key per recipient, preserving each
 recipient's OAEP parameters and document order; every recipient must resolve
-without missing or duplicate key matches. An unnamed template
+without missing or duplicate key matches. Under lax lookup, compatible wrapping
+keys are consumed in command-line order rather than reused for every recipient.
+Named and unnamed recipient slots remain distinct identities. An unnamed template
 does not constrain the sole explicit key; missing and duplicate matches fail
 unless `--lax-key-search` is supplied.
 RSA private-key decryption accepts the upstream

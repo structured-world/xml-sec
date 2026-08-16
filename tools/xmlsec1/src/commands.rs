@@ -121,6 +121,7 @@ const KEYS_OPTIONS: &[&str] = &["gen-key"];
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const XMLENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";
 const XMLENC11_NS: &str = "http://www.w3.org/2009/xmlenc11#";
+const XMLSEC_COMPATIBILITY_HERE_SEMANTICS: XPathHereSemantics = XPathHereSemantics::XmlSecLegacy;
 const PRIMARY_COMMANDS: &[Command] = &[
     Command::Sign,
     Command::Verify,
@@ -534,6 +535,20 @@ fn select_named_candidate<'a, T: Copy>(
             ))),
         };
     }
+    let unnamed = candidates
+        .iter()
+        .copied()
+        .filter(|(key, _)| key.parameter.is_none())
+        .collect::<Vec<_>>();
+    match unnamed.as_slice() {
+        [selected] => return Ok(*selected),
+        [] => {}
+        _ => {
+            return Err(CommandError::Usage(format!(
+                "multiple unnamed {key_kind} inputs match the template recipient"
+            )));
+        }
+    }
     let message = if candidates.len() == 1 {
         format!("a named {key_kind} requires a template KeyName; use --lax-key-search to opt out")
     } else {
@@ -572,7 +587,12 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     if invocation.last_value("pwd").is_some() {
         return Err(CommandError::UnsupportedOption("pwd".into()));
     }
-    let policy = SigningPolicy::default();
+    // This binary is an explicit libxmlsec1 compatibility boundary. Its sign
+    // and verify commands must bind XPath here() identically for round trips.
+    let policy = SigningPolicy {
+        xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
+        ..SigningPolicy::default()
+    };
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
@@ -728,13 +748,13 @@ fn split_key_and_certificates(value: &OsStr) -> Result<(&OsStr, Vec<&OsStr>), Co
 
 fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> VerificationPolicy {
     // Running the xmlsec1-compatible binary is the explicit compatibility
-    // boundary: donor verification accepts legacy signatures, while the core
-    // library's default policy and every signing path remain secure by default.
+    // boundary: both CLI signing and verification use the donor interpretation,
+    // while the core library retains the XMLDSig binding by default.
     let mut policy = VerificationPolicy {
         process_manifests: !invocation.flag("ignore-manifests"),
         reference_uri_types: UriTypeSet::ALL,
         retrieval_uri_types: UriTypeSet::ALL,
-        xpath_here_semantics: XPathHereSemantics::XmlSecLegacy,
+        xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
         ..VerificationPolicy::default()
     };
     policy.key_trust.allowed_legacy_signature_algorithms = HashSet::from([
@@ -1127,6 +1147,8 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         } else {
             metadata.recipients
         };
+        let lax_key_search = invocation.flag("lax-key-search");
+        let mut available_public_keys = public_keys.clone();
         let mut selected_recipients = Vec::with_capacity(template_recipients.len());
         for template_recipient in template_recipients {
             let requested_names = template_recipient
@@ -1135,13 +1157,13 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                 .cloned()
                 .collect::<Vec<_>>();
             let candidates = named_candidate_search(
-                &public_keys,
+                &available_public_keys,
                 &requested_names,
-                invocation.flag("lax-key-search"),
+                lax_key_search,
                 true,
                 "RSA recipient key",
             )?;
-            let mut public_key = None;
+            let mut selected = None;
             let mut last_error = None;
             for (option, certificate) in candidates {
                 let path = option.value.as_deref().unwrap_or_default();
@@ -1152,17 +1174,32 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                 };
                 match loaded {
                     Ok(key) => {
-                        public_key = Some(key);
+                        selected = Some((option, certificate, key));
                         break;
                     }
                     Err(error) => last_error = Some(error),
                 }
             }
-            let public_key = public_key.ok_or_else(|| {
-                last_error.map(CommandError::from).unwrap_or_else(|| {
-                    CommandError::Usage("no compatible RSA recipient key input".into())
-                })
-            })?;
+            let (selected_option, selected_certificate, public_key) =
+                selected.ok_or_else(|| {
+                    last_error.map(CommandError::from).unwrap_or_else(|| {
+                        CommandError::Usage("no compatible RSA recipient key input".into())
+                    })
+                })?;
+            if lax_key_search {
+                let selected_index = available_public_keys
+                    .iter()
+                    .position(|(option, certificate)| {
+                        std::ptr::eq(*option, selected_option)
+                            && *certificate == selected_certificate
+                    })
+                    .ok_or_else(|| {
+                        CommandError::Encryption(
+                            "selected recipient key is absent from the candidate set".into(),
+                        )
+                    })?;
+                available_public_keys.remove(selected_index);
+            }
             selected_recipients.push((public_key, template_recipient.oaep_parameters));
         }
         validate_recipient_key_metadata(
@@ -1482,15 +1519,8 @@ fn direct_simple_text(node: Node<'_, '_>, field: &str) -> Result<String, Command
 }
 
 fn oaep_digest_from_uri(uri: &str) -> Result<OaepDigestAlgorithm, CommandError> {
-    [
-        OaepDigestAlgorithm::Sha1,
-        OaepDigestAlgorithm::Sha256,
-        OaepDigestAlgorithm::Sha384,
-        OaepDigestAlgorithm::Sha512,
-    ]
-    .into_iter()
-    .find(|digest| digest.uri() == uri)
-    .ok_or_else(|| CommandError::Encryption(format!("unsupported OAEP digest: {uri}")))
+    OaepDigestAlgorithm::from_uri(uri)
+        .ok_or_else(|| CommandError::Encryption(format!("unsupported OAEP digest: {uri}")))
 }
 
 fn oaep_mgf_from_uri(uri: &str) -> Result<OaepDigestAlgorithm, CommandError> {
@@ -1983,6 +2013,13 @@ fn encryption_template(
         "EncryptedData contains more than one direct EncryptionMethod",
     )?
     .ok_or_else(|| CommandError::Encryption("template has no encryption algorithm".into()))?;
+    let key_info = singleton_direct_child(
+        encrypted_data,
+        XMLDSIG_NS,
+        "KeyInfo",
+        "EncryptedData contains more than one direct KeyInfo",
+    )?;
+    validate_encrypted_data_child_sequence(encrypted_data, method_node, key_info)?;
     let algorithm = template_data_encryption_method(method_node)?;
     let explicit_encrypted_type = encrypted_data.attribute("Type").is_some();
     let encrypted_type = match encrypted_data.attribute("Type") {
@@ -1994,12 +2031,6 @@ fn encryption_template(
             )));
         }
     };
-    let key_info = singleton_direct_child(
-        encrypted_data,
-        XMLDSIG_NS,
-        "KeyInfo",
-        "EncryptedData contains more than one direct KeyInfo",
-    )?;
     let recipients = key_info
         .into_iter()
         .flat_map(|key_info| key_info.children())
@@ -2035,6 +2066,46 @@ fn encryption_template(
         content_key_name: encrypted_data_key_name(encrypted_data)?,
         recipients,
     })
+}
+
+fn validate_encrypted_data_child_sequence(
+    encrypted_data: Node<'_, '_>,
+    method_node: Node<'_, '_>,
+    key_info: Option<Node<'_, '_>>,
+) -> Result<(), CommandError> {
+    let mut children = encrypted_data.children().filter(Node::is_element);
+    if children.next() != Some(method_node) {
+        return Err(CommandError::Encryption(
+            "EncryptedData must begin with EncryptionMethod".into(),
+        ));
+    }
+    if let Some(key_info) = key_info
+        && children.next() != Some(key_info)
+    {
+        return Err(CommandError::Encryption(
+            "EncryptedData KeyInfo must precede CipherData".into(),
+        ));
+    }
+    let Some(cipher_data) = children.next() else {
+        return Err(CommandError::Encryption(
+            "EncryptedData must contain CipherData after EncryptionMethod and optional KeyInfo"
+                .into(),
+        ));
+    };
+    if !cipher_data.has_tag_name((XMLENC_NS, "CipherData")) {
+        return Err(CommandError::Encryption(
+            "EncryptedData must contain CipherData after EncryptionMethod and optional KeyInfo"
+                .into(),
+        ));
+    }
+    if let Some(child) = children.next()
+        && (!child.has_tag_name((XMLENC_NS, "EncryptionProperties")) || children.next().is_some())
+    {
+        return Err(CommandError::Encryption(
+            "EncryptedData has unexpected child after CipherData".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn encrypted_data_key_name(encrypted_data: Node<'_, '_>) -> Result<Option<String>, CommandError> {
@@ -2119,7 +2190,7 @@ fn optional_direct_child_text(
 
 fn encrypted_key_recipient_names(
     encrypted_data: Node<'_, '_>,
-) -> Result<Vec<String>, CommandError> {
+) -> Result<Vec<Option<String>>, CommandError> {
     let key_info = singleton_direct_child(
         encrypted_data,
         XMLDSIG_NS,
@@ -2149,13 +2220,12 @@ fn encrypted_key_recipient_names(
                 .transpose()
                 .map(Option::flatten)
         })
-        .filter_map(Result::transpose)
         .collect()
 }
 
 fn select_recipient_private_keys<'a>(
     candidates: &[&'a crate::OptionValue],
-    recipient_names: &[String],
+    recipient_names: &[Option<String>],
     lax_key_search: bool,
 ) -> Result<Vec<&'a crate::OptionValue>, CommandError> {
     if lax_key_search {
@@ -2167,12 +2237,13 @@ fn select_recipient_private_keys<'a>(
         return Ok(vec![*candidate]);
     }
     if recipient_names.is_empty() {
+        let requested_names = Vec::new();
         let wrapped = candidates
             .iter()
             .copied()
             .map(|candidate| (candidate, ()))
             .collect::<Vec<_>>();
-        return named_candidate_search(&wrapped, recipient_names, false, true, "RSA private key")
+        return named_candidate_search(&wrapped, &requested_names, false, true, "RSA private key")
             .map(|selected| selected.into_iter().map(|(option, ())| option).collect());
     }
 
@@ -2180,10 +2251,9 @@ fn select_recipient_private_keys<'a>(
         .iter()
         .copied()
         .filter(|candidate| {
-            candidate
-                .parameter
-                .as_deref()
-                .is_some_and(|name| recipient_names.iter().any(|requested| requested == name))
+            recipient_names
+                .iter()
+                .any(|requested| requested.as_deref() == candidate.parameter.as_deref())
         })
         .collect::<Vec<_>>();
     if matching.is_empty() {
@@ -2192,14 +2262,12 @@ fn select_recipient_private_keys<'a>(
         ));
     }
     let mut seen = HashSet::new();
-    if matching.iter().any(|candidate| {
-        candidate
-            .parameter
-            .as_deref()
-            .is_some_and(|name| !seen.insert(name))
-    }) {
+    if matching
+        .iter()
+        .any(|candidate| !seen.insert(candidate.parameter.as_deref()))
+    {
         return Err(CommandError::Usage(
-            "multiple RSA private key inputs match the same template KeyName".into(),
+            "multiple RSA private key inputs match the same template recipient identity".into(),
         ));
     }
     Ok(matching)

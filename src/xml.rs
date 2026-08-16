@@ -106,6 +106,7 @@ pub(crate) struct XmlIdIndex<'a> {
 
 impl<'a> XmlIdIndex<'a> {
     /// Index standard ID spellings plus caller-declared local attribute names.
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn with_extra_attrs(document: &'a Document<'a>, extra_attrs: &[&str]) -> Self {
         let registrations = extra_attrs
             .iter()

@@ -376,14 +376,9 @@ impl PrivateKeyDecryptor {
 }
 
 fn parse_oaep_digest(uri: Option<&str>) -> Result<OaepDigestAlgorithm, XmlEncError> {
-    match uri.unwrap_or("http://www.w3.org/2000/09/xmldsig#sha1") {
-        "http://www.w3.org/2000/09/xmldsig#sha1" => Ok(OaepDigestAlgorithm::Sha1),
-        "http://www.w3.org/2001/04/xmlenc#sha256" => Ok(OaepDigestAlgorithm::Sha256),
-        "http://www.w3.org/2001/04/xmlenc#sha384"
-        | "http://www.w3.org/2001/04/xmldsig-more#sha384" => Ok(OaepDigestAlgorithm::Sha384),
-        "http://www.w3.org/2001/04/xmlenc#sha512" => Ok(OaepDigestAlgorithm::Sha512),
-        unsupported => Err(XmlEncError::UnsupportedAlgorithm(unsupported.to_owned())),
-    }
+    let uri = uri.unwrap_or("http://www.w3.org/2000/09/xmldsig#sha1");
+    OaepDigestAlgorithm::from_uri(uri)
+        .ok_or_else(|| XmlEncError::UnsupportedAlgorithm(uri.to_owned()))
 }
 
 fn parse_oaep_mgf_digest(uri: Option<&str>) -> Result<OaepDigestAlgorithm, XmlEncError> {

@@ -17,8 +17,7 @@ use xml_sec::{
     c14n::{C14nAlgorithm, C14nMode},
     xmldsig::{
         DigestAlgorithm, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
-        SignatureBuilder, Transform, XPathExpression, XPathHereSemantics,
-        mutation::append_signature_to_root,
+        SignatureBuilder, Transform, XPathExpression, mutation::append_signature_to_root,
     },
     xmlenc::{DataEncryptionAlgorithm, EncryptedDataBuilder, EncryptionRecipient},
 };
@@ -404,15 +403,13 @@ fn short_command_help_alias_reaches_process_dispatch() {
 }
 
 #[test]
-fn verifies_libxmlsec_legacy_here_semantics_through_process_api() {
+fn signs_and_verifies_libxmlsec_legacy_here_semantics_through_process_api() {
     // The expression selects different nodes under specification and libxmlsec
-    // semantics, so process success proves the CLI policy reaches transforms.
+    // semantics, so this round trip proves both CLI policies reach transforms.
     let temp = tempfile::tempdir().unwrap();
+    let template_path = temp.path().join("legacy-here-template.xml");
     let signed_path = temp.path().join("legacy-here.xml");
-    let private_key =
-        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
-            .unwrap();
-    let key = RsaSigningKey::from_pkcs8_pem(&private_key).unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
     let builder = SignatureBuilder::new(
         C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
         SignatureAlgorithm::RsaSha256,
@@ -424,11 +421,26 @@ fn verifies_libxmlsec_legacy_here_semantics_through_process_api() {
                 "count(. | here()) = 1",
             ))),
     );
-    let signed = SignContext::new(&key)
-        .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy)
-        .sign_with_builder("<root><payload>legacy here</payload></root>", &builder)
+    let template = append_signature_to_root(
+        "<root><payload>legacy here</payload></root>",
+        &builder.build_template().unwrap(),
+    )
+    .unwrap();
+    fs::write(&template_path, template).unwrap();
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&signed_path)
+        .arg(&template_path)
+        .output()
         .unwrap();
-    fs::write(&signed_path, signed).unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
 
     let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
     let verify = Command::new(binary())
@@ -1013,6 +1025,11 @@ fn encryption_writes_requested_diagnostics_and_rejects_duplicate_methods() {
         (
             "duplicate-cipher-data",
             r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+            None,
+        ),
+        (
+            "key-info-after-cipher-data",
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData><ds:KeyInfo><ds:KeyName>late</ds:KeyName></ds:KeyInfo></EncryptedData>"#,
             None,
         ),
         (
@@ -2409,6 +2426,117 @@ fn rsa_encryption_builds_every_named_recipient() {
         .unwrap();
     assert!(!duplicate.status.success());
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("multiple RSA recipient key"));
+
+    let lax_encrypted = temp.path().join("lax-encrypted.xml");
+    let lax_encrypt = Command::new(binary())
+        .args(["encrypt", "--lax-key-search", "--pubkey-pem:ignored-a"])
+        .arg(&public_a)
+        .arg("--pubkey-pem:ignored-b")
+        .arg(&public_b)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&lax_encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        lax_encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax_encrypt.stderr)
+    );
+    for (name, private_key) in [("a", &private_a), ("b", &private_b)] {
+        let decrypt = Command::new(binary())
+            .arg("decrypt")
+            .arg(format!("--privkey-pem:{name}"))
+            .arg(private_key)
+            .arg(&lax_encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            decrypt.status.success(),
+            "lax recipient {name}: {}",
+            String::from_utf8_lossy(&decrypt.stderr)
+        );
+        assert_eq!(decrypt.stdout, b"multiple RSA recipients");
+    }
+
+    let insufficient_output = temp.path().join("insufficient-lax.xml");
+    let insufficient = Command::new(binary())
+        .args(["encrypt", "--lax-key-search", "--pubkey-pem:ignored"])
+        .arg(&public_a)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&insufficient_output)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!insufficient.status.success());
+    assert!(!insufficient_output.exists());
+}
+
+#[test]
+fn mixed_named_and_unnamed_rsa_recipients_keep_distinct_key_identities() {
+    // A mixed template must retain the unnamed slot through both encryption and
+    // decryption selection instead of collapsing all recipients to KeyName.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("mixed-recipient-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let public_a = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let public_b = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let private_b = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo><ds:KeyName>a</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"mixed recipient identities").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem:a"])
+        .arg(&public_a)
+        .arg("--pubkey-pem")
+        .arg(&public_b)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--privkey-pem:a"])
+        .arg(&private_b)
+        .arg("--privkey-pem")
+        .arg(&private_b)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"mixed recipient identities");
+
+    let ambiguous = Command::new(binary())
+        .args(["decrypt", "--privkey-pem"])
+        .arg(&private_b)
+        .arg("--privkey-pem")
+        .arg(&private_b)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(!ambiguous.status.success());
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("recipient identity"));
 }
 
 #[test]
@@ -2873,6 +3001,53 @@ fn honors_legacy_rsa_oaep_parameters_from_the_template() {
         String::from_utf8_lossy(&decrypt.stderr)
     );
     assert_eq!(decrypt.stdout, b"legacy OAEP payload");
+}
+
+#[test]
+fn rsa_oaep_accepts_the_xmldsig_more_sha384_digest_uri() {
+    // libxmlsec1 emits the XMLDSig-more spelling for SHA-384. Encryption and
+    // decryption must share one alias mapping for this interoperable template.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("sha384-alias.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:xenc11="http://www.w3.org/2009/xmlenc11#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/><xenc11:MGF Algorithm="http://www.w3.org/2009/xmlenc11#mgf1sha384"/></EncryptionMethod><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"SHA-384 OAEP alias").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--privkey-pem"])
+        .arg(&private_key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"SHA-384 OAEP alias");
 }
 
 #[test]

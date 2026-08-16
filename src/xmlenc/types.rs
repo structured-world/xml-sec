@@ -192,6 +192,18 @@ pub enum OaepDigestAlgorithm {
 }
 
 impl OaepDigestAlgorithm {
+    /// Parse a digest URI accepted by XML Encryption and libxmlsec1.
+    pub fn from_uri(uri: &str) -> Option<Self> {
+        match uri {
+            "http://www.w3.org/2000/09/xmldsig#sha1" => Some(Self::Sha1),
+            "http://www.w3.org/2001/04/xmlenc#sha256" => Some(Self::Sha256),
+            "http://www.w3.org/2001/04/xmlenc#sha384"
+            | "http://www.w3.org/2001/04/xmldsig-more#sha384" => Some(Self::Sha384),
+            "http://www.w3.org/2001/04/xmlenc#sha512" => Some(Self::Sha512),
+            _ => None,
+        }
+    }
+
     /// Return the standard digest URI.
     pub const fn uri(self) -> &'static str {
         match self {
@@ -209,6 +221,26 @@ impl OaepDigestAlgorithm {
             Self::Sha256 => "http://www.w3.org/2009/xmlenc11#mgf1sha256",
             Self::Sha384 => "http://www.w3.org/2009/xmlenc11#mgf1sha384",
             Self::Sha512 => "http://www.w3.org/2009/xmlenc11#mgf1sha512",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OaepDigestAlgorithm;
+
+    #[test]
+    fn oaep_sha384_accepts_both_interoperable_digest_uris() {
+        // The canonical XML Encryption spelling and libxmlsec1's XMLDSig-more
+        // spelling identify the same OAEP digest algorithm.
+        for uri in [
+            "http://www.w3.org/2001/04/xmlenc#sha384",
+            "http://www.w3.org/2001/04/xmldsig-more#sha384",
+        ] {
+            assert_eq!(
+                OaepDigestAlgorithm::from_uri(uri),
+                Some(OaepDigestAlgorithm::Sha384)
+            );
         }
     }
 }

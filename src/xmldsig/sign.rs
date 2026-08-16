@@ -719,6 +719,9 @@ impl<'a> SignContext<'a> {
 
     /// Select an operation start node by ID and sign the first XMLDSig
     /// `<Signature>` in that node's subtree.
+    ///
+    /// [`Self::sign_with_builder`] instead uses the selected node as the append
+    /// location and signs the newly appended direct `<Signature>` child.
     #[must_use]
     pub fn start_node_id(mut self, id: &'a str) -> Self {
         self.start_node_id = Some(id);

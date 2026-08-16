@@ -1199,7 +1199,13 @@ fn signing_without_key_info_writer_rejects_malformed_signature_children() {
         let error = SignContext::new(&private_key)
             .sign_template(&xml)
             .expect_err("malformed Signature children must fail without a writer");
-        assert!(matches!(error, SigningError::Digest(_)), "{error:?}");
+        assert!(
+            matches!(
+                error,
+                SigningError::Digest(SigningDigestError::InvalidStructure(_))
+            ),
+            "{error:?}"
+        );
     }
 }
 

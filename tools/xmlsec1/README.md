@@ -35,7 +35,10 @@ Preserved recipient `RSAKeyValue`, X.509 certificate, and
 `DEREncodedKeyValue` metadata must identify the selected RSA wrapping key;
 contradictory metadata fails before ciphertext is emitted.
 Content and recipient templates require exactly one direct `CipherData` and
-`CipherValue`; incomplete or duplicate payload containers fail before output.
+`CipherValue`; `EncryptedData` children must follow the XML Encryption sequence,
+and incomplete, duplicate, or out-of-order payload containers fail before output.
+Multi-recipient RSA templates preserve named and unnamed identities and consume
+distinct lax-search wrapping keys in command-line order.
 Untyped `--xml-data` templates gain the inferred XML Element type, while direct
 AES keys reject recipient `EncryptedKey` templates they cannot refresh.
 Signing options validate every certificate from `key,leaf,intermediate,...` and embed the chain
