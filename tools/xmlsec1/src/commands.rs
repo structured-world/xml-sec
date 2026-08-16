@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashSet,
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
@@ -434,6 +435,23 @@ fn expand_output_path(invocation: &Invocation, template: &OsStr) -> Result<PathB
 }
 
 fn read_plaintext(path: &OsStr, maximum: usize) -> Result<Vec<u8>, CommandError> {
+    read_bounded_file(path, maximum, |maximum| CommandError::PlaintextTooLarge {
+        maximum,
+    })
+}
+
+fn read_xml_data(path: &OsStr, maximum: usize) -> Result<String, CommandError> {
+    String::from_utf8(read_bounded_file(path, maximum, |maximum| {
+        CommandError::InputTooLarge { maximum }
+    })?)
+    .map_err(|_| CommandError::InvalidUtf8Input)
+}
+
+fn read_bounded_file(
+    path: &OsStr,
+    maximum: usize,
+    too_large: impl FnOnce(usize) -> CommandError,
+) -> Result<Vec<u8>, CommandError> {
     let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
     File::open(path)
         .map_err(|source| CommandError::Io {
@@ -447,7 +465,7 @@ fn read_plaintext(path: &OsStr, maximum: usize) -> Result<Vec<u8>, CommandError>
             source,
         })?;
     if bytes.len() > maximum {
-        return Err(CommandError::PlaintextTooLarge { maximum });
+        return Err(too_large(maximum));
     }
     Ok(bytes)
 }
@@ -1227,10 +1245,9 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let data = read_plaintext(path, maximum_plaintext_bytes)?;
         builder.encrypt_binary(&data)
     } else if let Some(path) = invocation.last_value("xml-data") {
-        let data = String::from_utf8(read_plaintext(path, maximum_plaintext_bytes)?)
-            .map_err(|_| CommandError::InvalidUtf8Input)?;
+        let data = read_xml_data(path, maximum_document_bytes)?;
         let plaintext = xml_data_plaintext(&data, &encrypted_type, &policy)?;
-        builder.encrypt_xml(plaintext)
+        builder.encrypt_xml(plaintext.as_ref())
     } else {
         return Err(CommandError::Usage(
             "encrypt requires --binary-data or --xml-data".into(),
@@ -1257,7 +1274,7 @@ fn xml_data_plaintext<'a>(
     xml: &'a str,
     encrypted_type: &EncryptedDataType,
     policy: &EncryptionPolicy,
-) -> Result<&'a str, CommandError> {
+) -> Result<Cow<'a, str>, CommandError> {
     // libxmlsec1 parses --xml-data into a document and passes its root node to
     // xmlSecEncCtxXmlEncrypt. Element serializes that node; Content serializes
     // only its children. The document declaration and boundary nodes therefore
@@ -1266,18 +1283,17 @@ fn xml_data_plaintext<'a>(
     let root = document.root_element();
     let element = &xml[root.range()];
     match encrypted_type {
-        EncryptedDataType::Element => Ok(element),
+        EncryptedDataType::Element => Ok(Cow::Borrowed(element)),
         EncryptedDataType::Content => {
-            let opening_end = opening_tag_end(element).ok_or_else(|| {
-                CommandError::Encryption("XML data root element is malformed".into())
-            })?;
-            if element[..=opening_end].trim_end().ends_with("/>") {
-                return Ok("");
+            let mut content = String::new();
+            for child in root.children() {
+                if child.is_element() {
+                    content.push_str(&standalone_element(xml, child)?);
+                } else {
+                    content.push_str(&xml[child.range()]);
+                }
             }
-            let closing_start = element.rfind("</").ok_or_else(|| {
-                CommandError::Encryption("XML data root element is malformed".into())
-            })?;
-            Ok(&element[opening_end + 1..closing_start])
+            Ok(Cow::Owned(content))
         }
         EncryptedDataType::Other(_) => Err(CommandError::Encryption(
             "unsupported EncryptedData Type for XML data".into(),
@@ -1676,13 +1692,11 @@ fn standalone_cipher_value(node: roxmltree::Node<'_, '_>) -> String {
 
 fn standalone_element(source: &str, node: roxmltree::Node<'_, '_>) -> Result<String, CommandError> {
     let fragment = &source[node.range()];
-    let opening_end = fragment
-        .find('>')
-        .ok_or_else(|| CommandError::Encryption("generated KeyInfo has no opening tag".into()))?;
-    let closing_start = fragment
-        .rfind("</")
-        .ok_or_else(|| CommandError::Encryption("generated KeyInfo has no closing tag".into()))?;
-    let opening = &fragment[..opening_end];
+    let opening_end = opening_tag_end(fragment)
+        .ok_or_else(|| CommandError::Encryption("element has no opening tag".into()))?;
+    let opening = fragment[..opening_end].trim_end();
+    let self_closing = opening.ends_with('/');
+    let opening = opening.strip_suffix('/').unwrap_or(opening).trim_end();
     let qualified_name_end = opening.find(char::is_whitespace).unwrap_or(opening.len());
     let qualified_name = &opening[1..qualified_name_end];
     let attributes = &opening[qualified_name_end..];
@@ -1701,11 +1715,18 @@ fn standalone_element(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Str
             output.push('"');
         }
     }
-    output.push('>');
-    output.push_str(&fragment[opening_end + 1..closing_start]);
-    output.push_str("</");
-    output.push_str(qualified_name);
-    output.push('>');
+    if self_closing {
+        output.push_str("/>");
+    } else {
+        let closing_start = fragment
+            .rfind("</")
+            .ok_or_else(|| CommandError::Encryption("element has no closing tag".into()))?;
+        output.push('>');
+        output.push_str(&fragment[opening_end + 1..closing_start]);
+        output.push_str("</");
+        output.push_str(qualified_name);
+        output.push('>');
+    }
     Ok(output)
 }
 

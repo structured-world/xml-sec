@@ -15,6 +15,7 @@ use rsa::{
 };
 use xml_sec::{
     c14n::{C14nAlgorithm, C14nMode},
+    policy::EncryptionPolicy,
     xmldsig::{
         DigestAlgorithm, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
         SignatureBuilder, Transform, XPathExpression, mutation::append_signature_to_root,
@@ -1483,15 +1484,12 @@ fn xml_data_encrypts_the_parsed_document_node() {
     let key = temp.path().join("key.bin");
     fs::write(
         &plaintext,
-        b"<?xml version=\"1.0\"?>\n<!--outside--><secret><value>payload</value></secret>\n",
+        b"<?xml version=\"1.0\"?>\n<!--outside--><secret xmlns=\"urn:default\" xmlns:p=\"urn:prefixed\"><value>payload</value><p:item/></secret>\n",
     )
     .unwrap();
     fs::write(&key, b"0123456789abcdef").unwrap();
 
-    for (encrypted_type, expected) in [
-        ("Element", "<secret><value>payload</value></secret>"),
-        ("Content", "<value>payload</value>"),
-    ] {
+    for encrypted_type in ["Element", "Content"] {
         let template = temp.path().join(format!("template-{encrypted_type}.xml"));
         let encrypted = temp.path().join(format!("encrypted-{encrypted_type}.xml"));
         fs::write(
@@ -1529,8 +1527,64 @@ fn xml_data_encrypts_the_parsed_document_node() {
             "{encrypted_type}: {}",
             String::from_utf8_lossy(&decryption.stderr)
         );
-        assert_eq!(String::from_utf8(decryption.stdout).unwrap(), expected);
+        let decrypted = String::from_utf8(decryption.stdout).unwrap();
+        let wrapped = if encrypted_type == "Element" {
+            decrypted
+        } else {
+            format!("<probe>{decrypted}</probe>")
+        };
+        let document = roxmltree::Document::parse(&wrapped)
+            .expect("decrypted XML must preserve inherited namespace bindings");
+        let value = document
+            .descendants()
+            .find(|node| node.tag_name().name() == "value")
+            .expect("default-namespaced child must survive");
+        let item = document
+            .descendants()
+            .find(|node| node.tag_name().name() == "item")
+            .expect("prefixed child must survive");
+        assert_eq!(value.tag_name().namespace(), Some("urn:default"));
+        assert_eq!(item.tag_name().namespace(), Some("urn:prefixed"));
     }
+}
+
+#[test]
+fn xml_data_applies_plaintext_limit_after_document_node_serialization() {
+    // The source document and encrypted plaintext are distinct resources. A
+    // large wrapper may fit the document ceiling while its tiny child content
+    // remains far below the encryption plaintext ceiling.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.xml");
+    let key = temp.path().join("key.bin");
+    let policy = EncryptionPolicy::default();
+    let padding = "x".repeat(policy.resources.max_encryption_plaintext_bytes);
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Content"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(
+        &plaintext,
+        format!("<wrapper padding=\"{padding}\"><child/></wrapper>"),
+    )
+    .unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    let output = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .arg("--xml-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

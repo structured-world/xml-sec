@@ -48,8 +48,11 @@ pub enum KeyMaterialError {
     SymmetricLength { expected: usize, actual: usize },
     #[error("symmetric key exceeds maximum {maximum} bytes")]
     SymmetricTooLarge { maximum: usize },
-    #[error("key material exceeds maximum {maximum} bytes")]
-    KeyMaterialTooLarge { maximum: usize },
+    #[error(
+        "key material in {} exceeds maximum {maximum} bytes",
+        path.display()
+    )]
+    KeyMaterialTooLarge { path: PathBuf, maximum: usize },
     #[error("invalid operation policy: {0}")]
     Policy(#[from] PolicyViolation),
 }
@@ -83,6 +86,7 @@ pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialError> {
         })?;
     if bytes.len() > KEY_MATERIAL_BYTE_CEILING {
         return Err(KeyMaterialError::KeyMaterialTooLarge {
+            path: path.to_owned(),
             maximum: KEY_MATERIAL_BYTE_CEILING,
         });
     }
@@ -495,7 +499,9 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("key material exceeds maximum"));
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()));
+        assert!(message.contains(&format!("maximum {KEY_MATERIAL_BYTE_CEILING} bytes")));
     }
 
     #[test]
