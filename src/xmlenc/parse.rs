@@ -46,6 +46,7 @@ pub fn parse_encrypted_data_node_with_policy(
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
+    validate_node_document_len(node, &policy.resources)?;
     parse_encrypted_data_node(node, policy, false)
 }
 
@@ -59,7 +60,17 @@ pub fn parse_encrypted_data_template_node_with_policy(
     policy: &crate::policy::EncryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
+    validate_node_document_len(node, &policy.resources)?;
     parse_encrypted_data_node(node, policy, true)
+}
+
+fn validate_node_document_len(
+    node: Node<'_, '_>,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<(), XmlEncError> {
+    resources
+        .validate_xml_document_len(node.document().input_text().len())
+        .map_err(XmlEncError::from)
 }
 
 fn parse_encrypted_data_node(
@@ -675,6 +686,11 @@ fn normalize_base64_with_empty(value: &str, allow_empty: bool) -> Result<String,
     if normalized.is_empty() && !allow_empty {
         return Err(XmlEncError::Base64("CipherValue is empty".into()));
     }
+    if !normalized.is_empty() {
+        STANDARD
+            .decode(&normalized)
+            .map_err(|error| XmlEncError::Base64(error.to_string()))?;
+    }
     Ok(normalized)
 }
 
@@ -723,6 +739,73 @@ mod tests {
         let parsed = parse_encrypted_data(DATA).expect("valid XMLEnc data must parse");
         assert_eq!(parsed.cipher_data.value, "YWJjZA==");
         assert_eq!(parsed.encrypted_type, Some(EncryptedDataType::Element));
+    }
+
+    #[test]
+    fn node_parsers_enforce_the_containing_document_byte_limit() {
+        // A caller-selected node retains its complete source document. Passing a
+        // small subtree must not bypass the operation's document-byte ceiling.
+        let containing = format!("<root>{}<payload/></root>", DATA);
+        let document = Document::parse(&containing).expect("containing document must parse");
+        let encrypted_data = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLENC_NS, "EncryptedData")))
+            .expect("selected EncryptedData");
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_document_bytes: DATA.len(),
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let decryption = crate::policy::DecryptionPolicy {
+            resources: resources.clone(),
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        let encryption = crate::policy::EncryptionPolicy {
+            resources,
+            ..crate::policy::EncryptionPolicy::default()
+        };
+
+        for result in [
+            parse_encrypted_data_node_with_policy(encrypted_data, &decryption),
+            parse_encrypted_data_template_node_with_policy(encrypted_data, &encryption),
+        ] {
+            assert!(matches!(
+                result,
+                Err(XmlEncError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "XML document",
+                        ..
+                    }
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn template_parser_rejects_nonempty_invalid_cipher_values() {
+        // Empty placeholders are intentional template slots, but every nonempty
+        // direct or recipient value must already satisfy the base64Binary syntax.
+        let invalid_direct = DATA.replace(" YWJj\nZA== ", "!!!!");
+        let invalid_recipient = format!(
+            "<xenc:EncryptedData xmlns:xenc=\"{XMLENC_NS}\" xmlns:ds=\"{XMLDSIG_NS}\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo><xenc:EncryptedKey><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p\"/><xenc:CipherData><xenc:CipherValue>!!!!</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue/></xenc:CipherData></xenc:EncryptedData>"
+        );
+        for xml in [&invalid_direct, &invalid_recipient] {
+            let document = Document::parse(xml).expect("template must be well-formed XML");
+            assert!(matches!(
+                parse_encrypted_data_template_node_with_policy(
+                    document.root_element(),
+                    &crate::policy::EncryptionPolicy::default(),
+                ),
+                Err(XmlEncError::Base64(_))
+            ));
+        }
+
+        let empty = DATA.replace(" YWJj\nZA== ", "");
+        let document = Document::parse(&empty).expect("empty template must be XML");
+        parse_encrypted_data_template_node_with_policy(
+            document.root_element(),
+            &crate::policy::EncryptionPolicy::default(),
+        )
+        .expect("an explicit empty template placeholder remains valid");
     }
 
     #[test]

@@ -62,7 +62,8 @@ the parser registry. Named signing keys require a template `KeyName`; named
 verification and encryption/decryption options form key sets and require the
 selected XML `KeyName` to identify exactly one entry, unless lax lookup is
 explicit. Lax lookup searches compatible entries in command-line order instead
-of enforcing XML identity metadata. Unnamed verification
+of enforcing `KeyName`; preserved RSA, DER, and X.509 cryptographic identity
+metadata must still match the selected key. Unnamed verification
 and encryption templates leave the sole explicit key unconstrained. Embedded
 X.509 certificates require a caller trust anchor unless `--insecure` is
 explicit; an explicit certificate remains a caller-pinned identity. Binary

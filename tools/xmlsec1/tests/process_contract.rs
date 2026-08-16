@@ -2734,6 +2734,127 @@ fn named_rsa_option_identifies_a_generated_recipient() {
 }
 
 #[test]
+fn named_rsa_option_populates_existing_unnamed_recipients() {
+    // Existing recipient skeletons keep their template metadata, but a missing
+    // nested identity must receive the selected option name for strict decrypt.
+    let temp = tempfile::tempdir().unwrap();
+    let plaintext = temp.path().join("plaintext.bin");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    fs::write(&plaintext, b"existing named recipient").unwrap();
+
+    for (case, nested_key_info) in [("absent", ""), ("empty", "<ds:KeyInfo/>")] {
+        let template = temp.path().join(format!("{case}-recipient-template.xml"));
+        let encrypted = temp.path().join(format!("{case}-recipient.xml"));
+        fs::write(
+            &template,
+            format!(
+                r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/>{nested_key_info}<CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#
+            ),
+        )
+        .unwrap();
+
+        let encrypt = Command::new(binary())
+            .args(["encrypt", "--pubkey-pem:recipient"])
+            .arg(&public_key)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            encrypt.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&encrypt.stderr)
+        );
+        let encrypted_xml = fs::read_to_string(&encrypted).unwrap();
+        let document = roxmltree::Document::parse(&encrypted_xml).unwrap();
+        let encrypted_key = document
+            .descendants()
+            .find(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "EncryptedKey")))
+            .unwrap();
+        assert!(encrypted_key.descendants().any(|node| {
+            node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName"))
+                && node.text() == Some("recipient")
+        }));
+
+        let decrypt = Command::new(binary())
+            .args(["decrypt", "--privkey-pem:recipient"])
+            .arg(&private_key)
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            decrypt.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&decrypt.stderr)
+        );
+        assert_eq!(decrypt.stdout, b"existing named recipient");
+    }
+}
+
+#[test]
+fn lax_rsa_decryption_skips_malformed_private_key_candidates() {
+    // Lax lookup is an ordered compatibility search. A malformed entry must not
+    // prevent a later or earlier usable key from unwrapping the recipient.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("lax-private-key-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let malformed = temp.path().join("malformed.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"skip malformed private key").unwrap();
+    fs::write(&malformed, b"not a private key").unwrap();
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(encrypt.status.success());
+
+    for candidates in [[&malformed, &private_key], [&private_key, &malformed]] {
+        let decrypt = Command::new(binary())
+            .args(["decrypt", "--lax-key-search", "--privkey-pem:first"])
+            .arg(candidates[0])
+            .args(["--privkey-pem:second"])
+            .arg(candidates[1])
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            decrypt.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decrypt.stderr)
+        );
+        assert_eq!(decrypt.stdout, b"skip malformed private key");
+    }
+
+    let rejected = Command::new(binary())
+        .args(["decrypt", "--lax-key-search", "--privkey-pem:first"])
+        .arg(&malformed)
+        .args(["--privkey-pem:second"])
+        .arg(&malformed)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("private key"));
+}
+
+#[test]
 fn lax_rsa_search_skips_candidates_that_conflict_with_recipient_metadata() {
     // Lax name matching does not make preserved KeyValue metadata advisory: a
     // syntactically valid but mismatching key must be skipped in favor of the

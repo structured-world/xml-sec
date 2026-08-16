@@ -622,6 +622,8 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         select_signing_key(invocation, &signature.key_names, signature.algorithm)?;
     let value = key_option.value.as_deref().unwrap_or_default();
     let (_, certificate_paths) = split_key_and_certificates(value)?;
+    let mut certificate_budget =
+        CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
     let writer = if certificate_paths.is_empty() {
         None
     } else {
@@ -629,13 +631,21 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
             if certificate_is_der {
                 let certificates = certificate_paths
                     .iter()
-                    .map(key_material::read)
+                    .map(|path| -> Result<Vec<u8>, CommandError> {
+                        let certificate = key_material::read(path)?;
+                        certificate_budget.charge(certificate.len())?;
+                        Ok(certificate)
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 X509CertificateKeyInfoWriter::from_der_chain(&certificates)
             } else {
                 let certificates = certificate_paths
                     .iter()
-                    .map(key_material::read_text)
+                    .map(|path| -> Result<String, CommandError> {
+                        let certificate = key_material::read_text(path)?;
+                        certificate_budget.charge(certificate.len())?;
+                        Ok(certificate)
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 X509CertificateKeyInfoWriter::from_pem_chain(&certificates)
             }
@@ -876,8 +886,8 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         }
     } else {
         let mut config = KeyResolverConfig::default();
-        let mut certificate_bytes = 0;
-        let maximum_certificate_bytes = policy.resources.max_external_resource_total_bytes;
+        let mut certificate_budget =
+            CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
         for name in [
             "pubkey-cert-pem",
             "pubkey-cert-der",
@@ -888,8 +898,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
                 push_configured_certificate(
                     &mut config.lookup_certs,
                     key_material::load_certificate(option.value.as_deref().unwrap_or_default())?,
-                    &mut certificate_bytes,
-                    maximum_certificate_bytes,
+                    &mut certificate_budget,
                 )?;
             }
         }
@@ -898,8 +907,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
                 push_configured_certificate(
                     &mut config.trusted_certs,
                     key_material::load_certificate(option.value.as_deref().unwrap_or_default())?,
-                    &mut certificate_bytes,
-                    maximum_certificate_bytes,
+                    &mut certificate_budget,
                 )?;
             }
         }
@@ -916,23 +924,41 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     Ok(())
 }
 
+struct CertificateBudget {
+    total_bytes: usize,
+    maximum_bytes: usize,
+}
+
+impl CertificateBudget {
+    fn new(maximum_bytes: usize) -> Self {
+        Self {
+            total_bytes: 0,
+            maximum_bytes,
+        }
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), CommandError> {
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= self.maximum_bytes)
+            .ok_or(CommandError::CertificateMaterialTooLarge {
+                maximum: self.maximum_bytes,
+            })?;
+        Ok(())
+    }
+}
+
 fn push_configured_certificate(
     certificates: &mut Vec<Vec<u8>>,
     certificate: Vec<u8>,
-    total_bytes: &mut usize,
-    maximum_bytes: usize,
+    budget: &mut CertificateBudget,
 ) -> Result<(), CommandError> {
     if certificates.iter().any(|existing| existing == &certificate) {
         return Ok(());
     }
-    let next_total = total_bytes
-        .checked_add(certificate.len())
-        .filter(|total| *total <= maximum_bytes)
-        .ok_or(CommandError::CertificateMaterialTooLarge {
-            maximum: maximum_bytes,
-        })?;
+    budget.charge(certificate.len())?;
     certificates.push(certificate);
-    *total_bytes = next_total;
     Ok(())
 }
 
@@ -1051,6 +1077,9 @@ fn verify_with_explicit_certificate(
 ) -> Result<xml_sec::xmldsig::VerifyResult, CommandError> {
     let certificate_der =
         key_material::load_certificate(certificate.value.as_deref().unwrap_or_default())?;
+    let mut certificate_budget =
+        CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
+    certificate_budget.charge(certificate_der.len())?;
     // Model the caller-pinned leaf as the sole document key source. The core
     // resolver can then build its path through caller-supplied intermediates
     // and anchors without allowing the document's embedded KeyInfo to replace
@@ -1067,16 +1096,20 @@ fn verify_with_explicit_certificate(
     let mut config = KeyResolverConfig::default();
     for name in ["untrusted-pem", "untrusted-der"] {
         for option in invocation.values(name) {
-            config.lookup_certs.push(key_material::load_certificate(
-                option.value.as_deref().unwrap_or_default(),
-            )?);
+            push_configured_certificate(
+                &mut config.lookup_certs,
+                key_material::load_certificate(option.value.as_deref().unwrap_or_default())?,
+                &mut certificate_budget,
+            )?;
         }
     }
     for name in ["trusted-pem", "trusted-der"] {
         for option in invocation.values(name) {
-            config.trusted_certs.push(key_material::load_certificate(
-                option.value.as_deref().unwrap_or_default(),
-            )?);
+            push_configured_certificate(
+                &mut config.trusted_certs,
+                key_material::load_certificate(option.value.as_deref().unwrap_or_default())?,
+                &mut certificate_budget,
+            )?;
         }
     }
     let mut resolver_policy = policy.clone();
@@ -1663,6 +1696,8 @@ fn apply_encryption_template(
     let generated_key_info = direct_child_element(generated_data, XMLDSIG_NS, "KeyInfo");
     match (template_key_info, generated_key_info) {
         (Some(template_key_info), Some(generated_key_info)) => {
+            let template_keys = direct_encrypted_keys(template_key_info);
+            let generated_keys = direct_encrypted_keys(generated_key_info);
             let template_values = encrypted_key_cipher_values(template_key_info, "template")?;
             let generated_values = encrypted_key_cipher_values(generated_key_info, "generated")?;
             let missing_generated_children = generated_key_info
@@ -1683,14 +1718,11 @@ fn apply_encryption_template(
                     .map(|node| standalone_element(generated, node))
                     .collect::<Result<Vec<_>, _>>()?;
                 if !generated_children.is_empty() {
-                    replacements.push((
-                        template_key_info.range(),
-                        append_element_children(
-                            template,
-                            template_key_info,
-                            &generated_children.concat(),
-                        )?,
-                    ));
+                    replacements.push(append_element_children_replacement(
+                        template,
+                        template_key_info,
+                        &generated_children.concat(),
+                    )?);
                 }
             } else {
                 let mut children_to_append = missing_generated_children;
@@ -1709,14 +1741,11 @@ fn apply_encryption_template(
                     children_to_append.extend(generated_keys);
                 }
                 if !children_to_append.is_empty() {
-                    replacements.push((
-                        template_key_info.range(),
-                        append_element_children(
-                            template,
-                            template_key_info,
-                            &children_to_append.concat(),
-                        )?,
-                    ));
+                    replacements.push(append_element_children_replacement(
+                        template,
+                        template_key_info,
+                        &children_to_append.concat(),
+                    )?);
                 }
                 if !template_values.is_empty() {
                     if template_values.len() != generated_values.len() {
@@ -1724,6 +1753,18 @@ fn apply_encryption_template(
                             "template KeyInfo does not contain one CipherValue per generated recipient"
                                 .into(),
                         ));
+                    }
+                    for (template_key, generated_key) in
+                        template_keys.into_iter().zip(generated_keys)
+                    {
+                        if let Some(replacement) = merge_generated_recipient_key_name(
+                            template,
+                            template_key,
+                            generated,
+                            generated_key,
+                        )? {
+                            replacements.push(replacement);
+                        }
                     }
                     replacements.extend(template_values.into_iter().zip(generated_values).map(
                         |(template_value, generated_value)| {
@@ -1756,11 +1797,11 @@ fn apply_encryption_template(
     Ok(output)
 }
 
-fn append_element_children(
+fn append_element_children_replacement(
     source: &str,
     node: roxmltree::Node<'_, '_>,
     children: &str,
-) -> Result<String, CommandError> {
+) -> Result<(std::ops::Range<usize>, String), CommandError> {
     let fragment = &source[node.range()];
     if fragment.trim_end().ends_with("/>") {
         let empty_end = fragment
@@ -1771,19 +1812,50 @@ fn append_element_children(
             .map(|offset| offset + 1)
             .ok_or_else(|| CommandError::Encryption("template KeyInfo is malformed".into()))?;
         let qualified_name = &fragment[1..name_end];
-        return Ok(format!(
-            "{}>{children}</{qualified_name}>",
-            &fragment[..empty_end]
+        return Ok((
+            node.range(),
+            format!("{}>{children}</{qualified_name}>", &fragment[..empty_end]),
         ));
     }
     let closing = fragment
         .rfind("</")
         .ok_or_else(|| CommandError::Encryption("template KeyInfo is malformed".into()))?;
-    Ok(format!(
-        "{}{children}{}",
-        &fragment[..closing],
-        &fragment[closing..]
-    ))
+    let insertion = node.range().start + closing;
+    Ok((insertion..insertion, children.to_owned()))
+}
+
+fn merge_generated_recipient_key_name(
+    template: &str,
+    template_key: Node<'_, '_>,
+    generated: &str,
+    generated_key: Node<'_, '_>,
+) -> Result<Option<(std::ops::Range<usize>, String)>, CommandError> {
+    let Some(generated_key_info) = direct_child_element(generated_key, XMLDSIG_NS, "KeyInfo")
+    else {
+        return Ok(None);
+    };
+    let Some(generated_key_name) = direct_child_element(generated_key_info, XMLDSIG_NS, "KeyName")
+    else {
+        return Ok(None);
+    };
+    let key_name = standalone_element(generated, generated_key_name)?;
+
+    if let Some(template_key_info) = direct_child_element(template_key, XMLDSIG_NS, "KeyInfo") {
+        if direct_child_element(template_key_info, XMLDSIG_NS, "KeyName").is_some() {
+            return Ok(None);
+        }
+        return append_element_children_replacement(template, template_key_info, &key_name)
+            .map(Some);
+    }
+
+    let cipher_data =
+        direct_child_element(template_key, XMLENC_NS, "CipherData").ok_or_else(|| {
+            CommandError::Encryption("template EncryptedKey has no CipherData".into())
+        })?;
+    Ok(Some((
+        cipher_data.range().start..cipher_data.range().start,
+        format!("<KeyInfo xmlns=\"{XMLDSIG_NS}\">{key_name}</KeyInfo>"),
+    )))
 }
 
 fn opening_tag_end(fragment: &str) -> Option<usize> {
@@ -1943,9 +2015,8 @@ fn encrypted_key_cipher_values<'a, 'input>(
     key_info: roxmltree::Node<'a, 'input>,
     owner: &str,
 ) -> Result<Vec<roxmltree::Node<'a, 'input>>, CommandError> {
-    key_info
-        .children()
-        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+    direct_encrypted_keys(key_info)
+        .into_iter()
         .enumerate()
         .map(|(index, encrypted_key)| {
             required_cipher_value(
@@ -1953,6 +2024,15 @@ fn encrypted_key_cipher_values<'a, 'input>(
                 &format!("{owner} EncryptedKey recipient {}", index + 1),
             )
         })
+        .collect()
+}
+
+fn direct_encrypted_keys<'a, 'input>(
+    key_info: roxmltree::Node<'a, 'input>,
+) -> Vec<roxmltree::Node<'a, 'input>> {
+    key_info
+        .children()
+        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
         .collect()
 }
 
@@ -2028,20 +2108,34 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             invocation.flag("lax-key-search"),
         )?;
         let mut keys = Vec::with_capacity(selected.len());
+        let lax_key_search = invocation.flag("lax-key-search");
+        let mut last_load_error = None;
         for option in selected {
-            let (path, certificate_paths) =
-                split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
-            for certificate in certificate_paths {
-                key_material::load_certificate(certificate)?;
+            let loaded = (|| {
+                let (path, certificate_paths) =
+                    split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
+                for certificate in certificate_paths {
+                    key_material::load_certificate(certificate)?;
+                }
+                Ok::<_, CommandError>(RecipientPrivateKey {
+                    inner: PrivateKeyDecryptor::new(key_material::load_rsa_private(path)?),
+                    key_name: option.parameter.clone(),
+                })
+            })();
+            match loaded {
+                Ok(key) => keys.push(key),
+                Err(error) if lax_key_search => last_load_error = Some(error),
+                Err(error) => return Err(error),
             }
-            keys.push(RecipientPrivateKey {
-                inner: PrivateKeyDecryptor::new(key_material::load_rsa_private(path)?),
-                key_name: option.parameter.clone(),
-            });
+        }
+        if keys.is_empty() {
+            return Err(last_load_error.unwrap_or_else(|| {
+                CommandError::Usage("no compatible RSA private key input".into())
+            }));
         }
         let resolver = NamedRecipientDecryptor {
             keys,
-            lax_key_search: invocation.flag("lax-key-search"),
+            lax_key_search,
             unnamed_single_key_fallback: private_keys.len() == 1
                 && private_keys[0].parameter.is_none(),
         };
@@ -2738,6 +2832,57 @@ mod tests {
     }
 
     #[test]
+    fn recipient_merge_keeps_parent_and_nested_insertions_disjoint() {
+        // Outer key metadata, nested recipient identity, and ciphertext can all
+        // be generated in one pass; their edits must not replace overlapping XML.
+        let template = format!(
+            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><e:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><s:KeyInfo><e:EncryptedKey><s:KeyInfo/><e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedData>"
+        );
+        let generated = format!(
+            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><s:KeyName>outer</s:KeyName><e:EncryptedKey><s:KeyInfo><s:KeyName>recipient</s:KeyName></s:KeyInfo><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
+        );
+
+        let rendered = apply_encryption_template(
+            &template,
+            &generated,
+            None,
+            &[],
+            &EncryptionPolicy::default(),
+        )
+        .expect("all generated key metadata must merge without overlapping edits");
+        let document = Document::parse(&rendered).expect("merged output must remain XML");
+        let outer_key_info = document
+            .descendants()
+            .find(|node| {
+                node.has_tag_name((XMLDSIG_NS, "KeyInfo"))
+                    && node
+                        .parent()
+                        .is_some_and(|parent| parent.has_tag_name((XMLENC_NS, "EncryptedData")))
+            })
+            .expect("outer KeyInfo");
+        assert_eq!(
+            direct_child_element(outer_key_info, XMLDSIG_NS, "KeyName")
+                .and_then(|node| node.text()),
+            Some("outer")
+        );
+        let encrypted_key = direct_child_element(outer_key_info, XMLENC_NS, "EncryptedKey")
+            .expect("generated recipient");
+        let recipient_key_info =
+            direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo").expect("recipient KeyInfo");
+        assert_eq!(
+            direct_child_element(recipient_key_info, XMLDSIG_NS, "KeyName")
+                .and_then(|node| node.text()),
+            Some("recipient")
+        );
+        let values = document
+            .descendants()
+            .filter(|node| node.has_tag_name((XMLENC_NS, "CipherValue")))
+            .filter_map(|node| node.text())
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["a2V5", "ZGF0YQ=="]);
+    }
+
+    #[test]
     fn merged_encryption_template_obeys_the_aggregate_node_ceiling() {
         // Template and generated output cross the trust boundary separately,
         // but the returned document must also fit the same operation policy.
@@ -2825,18 +2970,24 @@ mod tests {
         // Repeated CLI options must not multiply retained DER, while distinct
         // trust material must be rejected before crossing the compiled total.
         let mut certificates = Vec::new();
-        let mut total = 0;
-        push_configured_certificate(&mut certificates, vec![1, 2], &mut total, 3).unwrap();
-        push_configured_certificate(&mut certificates, vec![1, 2], &mut total, 3).unwrap();
+        let mut budget = CertificateBudget::new(3);
+        push_configured_certificate(&mut certificates, vec![1, 2], &mut budget).unwrap();
+        push_configured_certificate(&mut certificates, vec![1, 2], &mut budget).unwrap();
         assert_eq!(certificates, [vec![1, 2]]);
-        assert_eq!(total, 2);
+        assert_eq!(budget.total_bytes, 2);
 
         assert!(matches!(
-            push_configured_certificate(&mut certificates, vec![3, 4], &mut total, 3),
+            push_configured_certificate(&mut certificates, vec![3, 4], &mut budget),
             Err(CommandError::CertificateMaterialTooLarge { maximum: 3 })
         ));
         assert_eq!(certificates, [vec![1, 2]]);
-        assert_eq!(total, 2);
+        assert_eq!(budget.total_bytes, 2);
+
+        assert!(matches!(
+            budget.charge(2),
+            Err(CommandError::CertificateMaterialTooLarge { maximum: 3 })
+        ));
+        assert_eq!(budget.total_bytes, 2);
     }
 
     #[test]
