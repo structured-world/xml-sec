@@ -771,7 +771,10 @@ impl<'a> SignContext<'a> {
     ) -> Result<String, SigningError> {
         let document = parse_signing_document(xml, Some(&self.policy))
             .map_err(SigningDigestError::XmlParse)?;
-        let signature = find_signing_signature_node(&document, Some(target_signature))?;
+        let signature = find_signing_signature_node(
+            &document,
+            SigningSignatureTarget::Index(target_signature),
+        )?;
         parse_signature_children(signature)
             .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
         let execution_budget = TransformExecutionBudget::from_resources(&self.policy.resources);
@@ -941,7 +944,10 @@ fn compute_reference_digest_values_with_options(
     id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
     let doc = parse_signing_document(xml, policy)?;
-    let signature = find_signing_signature_node(&doc, target_signature)?;
+    let signature = find_signing_signature_node(
+        &doc,
+        target_signature.map_or(SigningSignatureTarget::Last, SigningSignatureTarget::Index),
+    )?;
     let signed_info = find_required_child(signature, "SignedInfo")?;
     let references = parse_signing_references(signed_info)?;
     if let Some(policy) = policy {
@@ -1091,7 +1097,8 @@ fn canonicalize_signed_info(
 ) -> Result<(SignatureAlgorithm, Vec<u8>), SigningError> {
     let doc = parse_signing_document(xml, Some(policy)).map_err(SigningDigestError::XmlParse)?;
     let signature =
-        find_signing_signature_node(&doc, Some(target_signature)).map_err(SigningError::Digest)?;
+        find_signing_signature_node(&doc, SigningSignatureTarget::Index(target_signature))
+            .map_err(SigningError::Digest)?;
     let signed_info_node =
         find_required_child(signature, "SignedInfo").map_err(SigningError::Digest)?;
     let signed_info = parse_signed_info(signed_info_node)?;
@@ -1152,18 +1159,25 @@ fn parse_private_key_pem(private_key_pem: &str) -> Result<Vec<u8>, SigningKeyErr
     Ok(pem.contents)
 }
 
+enum SigningSignatureTarget {
+    First,
+    Last,
+    Index(usize),
+}
+
 fn find_signing_signature_node<'a>(
     doc: &'a Document<'a>,
-    target_signature: Option<usize>,
+    target: SigningSignatureTarget,
 ) -> Result<Node<'a, 'a>, SigningDigestError> {
     let mut signatures = doc.descendants().filter(|node| {
         node.is_element()
             && node.tag_name().name() == "Signature"
             && node.tag_name().namespace() == Some(XMLDSIG_NS)
     });
-    match target_signature {
-        Some(index) => signatures.nth(index),
-        None => signatures.next(),
+    match target {
+        SigningSignatureTarget::First => signatures.next(),
+        SigningSignatureTarget::Last => signatures.next_back(),
+        SigningSignatureTarget::Index(index) => signatures.nth(index),
     }
     .ok_or(SigningDigestError::MissingElement {
         element: "Signature",
@@ -1186,7 +1200,7 @@ fn signing_signature_index(
                 ))
             })?
     } else {
-        find_signing_signature_node(doc, None)?
+        find_signing_signature_node(doc, SigningSignatureTarget::First)?
     };
     signature_index(doc, selected)
 }

@@ -399,6 +399,58 @@ fn preserves_multiple_reference_digest_order() {
 }
 
 #[test]
+fn public_digest_helpers_target_the_last_signature() {
+    // These public helpers predate indexed signing and intentionally operate on
+    // the last template, matching append-then-fill callers with existing signatures.
+    let first = template_with_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#first")
+            .transform(Transform::C14n(exclusive_c14n())),
+    );
+    let second = template_with_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#second")
+            .transform(Transform::C14n(exclusive_c14n())),
+    );
+    let with_first = append_signature_to_root(
+        "<root><payload ID=\"first\">one</payload><payload ID=\"second\">two</payload></root>",
+        &first,
+    )
+    .expect("first signature template must append");
+    let xml = append_signature_to_root(&with_first, &second)
+        .expect("second signature template must append");
+
+    let digests = compute_reference_digest_values(&xml).expect("last digest must compute");
+    let filled = fill_reference_digest_values(&xml).expect("last digest must fill");
+    let document = roxmltree::Document::parse(&filled).expect("filled XML must parse");
+    let signatures = document
+        .descendants()
+        .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Signature")))
+        .collect::<Vec<_>>();
+    assert_eq!(signatures.len(), 2);
+    assert_eq!(digests.len(), 1);
+    assert_eq!(digests[0].uri, "#second");
+    assert_eq!(
+        signatures[0]
+            .descendants()
+            .find(|node| {
+                node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue"))
+            })
+            .and_then(|node| node.text()),
+        None
+    );
+    assert_eq!(
+        signatures[1]
+            .descendants()
+            .find(|node| {
+                node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue"))
+            })
+            .and_then(|node| node.text()),
+        Some(digests[0].digest_value.as_str())
+    );
+}
+
+#[test]
 fn computes_enveloped_signature_digest_for_whole_document() {
     // URI="" signs the full document; the enveloped transform must exclude the
     // generated Signature subtree before digesting, matching verification.
