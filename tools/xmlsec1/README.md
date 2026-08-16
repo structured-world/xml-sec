@@ -22,8 +22,9 @@ is present, transformed data goes to the file while diagnostics remain on
 stdout. Verification output covers both successful and invalid results,
 including aggregate failures from authenticated Manifest references.
 
-`--aes-key` files are bounded raw binary key material (`--aeskey` remains a
-compatible alias); they are never guessed to be Base64 text. Decrypting a standalone
+All key and certificate files are bounded before decoding. `--aes-key` consumes
+raw binary key material (`--aeskey` remains a compatible alias); it is never
+guessed to be Base64 text. Decrypting a standalone
 `EncryptedData` returns opaque decrypted bytes; embedded encrypted data uses
 in-document replacement and supports operation-start selection with
 `--node-id`. Encryption retains template metadata and RSA-OAEP parameters;
@@ -39,8 +40,10 @@ Content and recipient templates require exactly one direct `CipherData` and
 and incomplete, duplicate, or out-of-order payload containers fail before output.
 Multi-recipient RSA templates preserve named and unnamed identities and consume
 distinct lax-search wrapping keys in command-line order.
-Untyped `--xml-data` templates gain the inferred XML Element type, while direct
-AES keys reject recipient `EncryptedKey` templates they cannot refresh.
+Untyped `--xml-data` templates gain the inferred XML Element type. XML payloads
+are parsed as documents: Element encrypts the root element and Content encrypts
+its children, excluding the declaration and document-boundary nodes. Direct AES
+keys reject recipient `EncryptedKey` templates they cannot refresh.
 Signing options validate every certificate from `key,leaf,intermediate,...` and embed the chain
 when the template provides a `KeyInfo` placeholder, filling an empty `X509Data`
 without erasing sibling key sources; verification accepts

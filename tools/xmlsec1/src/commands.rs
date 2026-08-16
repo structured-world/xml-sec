@@ -1217,7 +1217,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             "encrypt requires --aes-key, an RSA public key, or an RSA certificate".into(),
         ));
     }
-    builder = builder.encryption_type(encrypted_type);
+    builder = builder.encryption_type(encrypted_type.clone());
     let result = if let Some(path) = invocation.last_value("binary-data") {
         if explicit_encrypted_type {
             return Err(CommandError::Usage(
@@ -1229,7 +1229,8 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     } else if let Some(path) = invocation.last_value("xml-data") {
         let data = String::from_utf8(read_plaintext(path, maximum_plaintext_bytes)?)
             .map_err(|_| CommandError::InvalidUtf8Input)?;
-        builder.encrypt_xml(&data)
+        let plaintext = xml_data_plaintext(&data, &encrypted_type, &policy)?;
+        builder.encrypt_xml(plaintext)
     } else {
         return Err(CommandError::Usage(
             "encrypt requires --binary-data or --xml-data".into(),
@@ -1250,6 +1251,38 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     }
     write_output(invocation, rendered.as_bytes(), stdout)?;
     write_encryption_diagnostics(invocation, algorithm, stdout)
+}
+
+fn xml_data_plaintext<'a>(
+    xml: &'a str,
+    encrypted_type: &EncryptedDataType,
+    policy: &EncryptionPolicy,
+) -> Result<&'a str, CommandError> {
+    // libxmlsec1 parses --xml-data into a document and passes its root node to
+    // xmlSecEncCtxXmlEncrypt. Element serializes that node; Content serializes
+    // only its children. The document declaration and boundary nodes therefore
+    // never become encrypted replacement plaintext.
+    let document = parse_encryption_document(xml, policy)?;
+    let root = document.root_element();
+    let element = &xml[root.range()];
+    match encrypted_type {
+        EncryptedDataType::Element => Ok(element),
+        EncryptedDataType::Content => {
+            let opening_end = opening_tag_end(element).ok_or_else(|| {
+                CommandError::Encryption("XML data root element is malformed".into())
+            })?;
+            if element[..=opening_end].trim_end().ends_with("/>") {
+                return Ok("");
+            }
+            let closing_start = element.rfind("</").ok_or_else(|| {
+                CommandError::Encryption("XML data root element is malformed".into())
+            })?;
+            Ok(&element[opening_end + 1..closing_start])
+        }
+        EncryptedDataType::Other(_) => Err(CommandError::Encryption(
+            "unsupported EncryptedData Type for XML data".into(),
+        )),
+    }
 }
 
 fn write_encryption_diagnostics(

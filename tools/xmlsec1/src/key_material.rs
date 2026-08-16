@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File},
+    fs::File,
     io::Read as _,
     path::{Path, PathBuf},
 };
@@ -18,6 +18,10 @@ use xml_sec::xmldsig::{
     EcdsaP256SigningKey, EcdsaP384SigningKey, RsaSigningKey, SignatureAlgorithm, SigningKey,
     VerificationKey, find_signature_node, parse_signed_info, uri::UriReferenceResolver,
 };
+
+// This is an absolute process-safety ceiling, not deployment policy. Parsed
+// key sizes remain governed by the operation policy after bounded ingestion.
+const KEY_MATERIAL_BYTE_CEILING: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KeyMaterialError {
@@ -44,6 +48,8 @@ pub enum KeyMaterialError {
     SymmetricLength { expected: usize, actual: usize },
     #[error("symmetric key exceeds maximum {maximum} bytes")]
     SymmetricTooLarge { maximum: usize },
+    #[error("key material exceeds maximum {maximum} bytes")]
+    KeyMaterialTooLarge { maximum: usize },
     #[error("invalid operation policy: {0}")]
     Policy(#[from] PolicyViolation),
 }
@@ -63,10 +69,24 @@ pub struct SigningTemplateMetadata {
 
 pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialError> {
     let path = path.as_ref();
-    fs::read(path).map_err(|source| KeyMaterialError::Read {
-        path: path.to_owned(),
-        source,
-    })
+    let mut bytes = Vec::with_capacity(KEY_MATERIAL_BYTE_CEILING.min(64 * 1024));
+    File::open(path)
+        .map_err(|source| KeyMaterialError::Read {
+            path: path.to_owned(),
+            source,
+        })?
+        .take(KEY_MATERIAL_BYTE_CEILING.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| KeyMaterialError::Read {
+            path: path.to_owned(),
+            source,
+        })?;
+    if bytes.len() > KEY_MATERIAL_BYTE_CEILING {
+        return Err(KeyMaterialError::KeyMaterialTooLarge {
+            maximum: KEY_MATERIAL_BYTE_CEILING,
+        });
+    }
+    Ok(bytes)
 }
 
 pub fn read_text(path: impl AsRef<Path>) -> Result<String, KeyMaterialError> {
@@ -403,6 +423,8 @@ pub fn load_symmetric(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
     use rsa::pkcs1::{EncodeRsaPrivateKey as _, EncodeRsaPublicKey as _};
 
@@ -458,6 +480,22 @@ mod tests {
         let error = load_symmetric(&path, None).unwrap_err();
 
         assert!(error.to_string().contains("maximum 32 bytes"));
+    }
+
+    #[test]
+    fn oversized_asymmetric_material_is_rejected_before_decoding() {
+        // Key and certificate inputs are caller-controlled files. An invalid
+        // oversized file must hit the read ceiling before a decoder sees it.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("oversized.pem");
+        fs::write(&path, vec![b'x'; KEY_MATERIAL_BYTE_CEILING + 1]).unwrap();
+
+        let error = match load_signing_key(&path) {
+            Ok(_) => panic!("oversized key material must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("key material exceeds maximum"));
     }
 
     #[test]

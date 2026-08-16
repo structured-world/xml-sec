@@ -1474,6 +1474,66 @@ fn untyped_xml_template_round_trips_when_embedded() {
 }
 
 #[test]
+fn xml_data_encrypts_the_parsed_document_node() {
+    // libxmlsec1 parses --xml-data and serializes either the document element
+    // or its children. The declaration and document-boundary trivia are not
+    // plaintext nodes in either encryption mode.
+    let temp = tempfile::tempdir().unwrap();
+    let plaintext = temp.path().join("plaintext.xml");
+    let key = temp.path().join("key.bin");
+    fs::write(
+        &plaintext,
+        b"<?xml version=\"1.0\"?>\n<!--outside--><secret><value>payload</value></secret>\n",
+    )
+    .unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    for (encrypted_type, expected) in [
+        ("Element", "<secret><value>payload</value></secret>"),
+        ("Content", "<value>payload</value>"),
+    ] {
+        let template = temp.path().join(format!("template-{encrypted_type}.xml"));
+        let encrypted = temp.path().join(format!("encrypted-{encrypted_type}.xml"));
+        fs::write(
+            &template,
+            format!(
+                r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#{encrypted_type}"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+            ),
+        )
+        .unwrap();
+
+        let encryption = Command::new(binary())
+            .args(["encrypt", "--aes-key"])
+            .arg(&key)
+            .arg("--xml-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            encryption.status.success(),
+            "{encrypted_type}: {}",
+            String::from_utf8_lossy(&encryption.stderr)
+        );
+
+        let decryption = Command::new(binary())
+            .args(["decrypt", "--aes-key"])
+            .arg(&key)
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            decryption.status.success(),
+            "{encrypted_type}: {}",
+            String::from_utf8_lossy(&decryption.stderr)
+        );
+        assert_eq!(String::from_utf8(decryption.stdout).unwrap(), expected);
+    }
+}
+
+#[test]
 fn direct_aes_encryption_rejects_recipient_templates() {
     // A direct content key cannot refresh an EncryptedKey recipient. Emitting
     // the untouched wrapped key would create internally inconsistent XML.

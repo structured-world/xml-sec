@@ -149,7 +149,11 @@ rejected before encryption rather than being preserved beside ciphertext for
 a different recipient. `KeyName` remains a lookup hint and empty `X509Data`
 remains a non-binding placeholder.
 For `--xml-data`, a missing template `Type` is materialized as XML Element
-metadata so a later embedded-document decrypt can perform XML replacement.
+metadata so a later embedded-document decrypt can perform XML replacement. As
+in libxmlsec1, the input is parsed as an XML document: Element encryption
+serializes its document element, while Content encryption serializes only that
+element's children. XML declarations and document-boundary nodes are not
+encrypted as replacement plaintext.
 Repeatable AES or RSA key options form a key set. A direct content-key `KeyName`
 must select exactly one AES key, while a recipient `KeyName` inside
 each `EncryptedKey` must select exactly one RSA wrapping key. Multi-recipient
@@ -165,6 +169,8 @@ recipient metadata, so strict decryption retains the selected key name.
 RSA private-key decryption accepts the upstream
 `key.pem,certificate.pem,...` option syntax, consumes the first component as
 the decryption key, and validates every certificate companion before decrypting.
+All asymmetric key and certificate files are read through one absolute
+process-safety ceiling before format decoding.
 Repeatable named private keys form one resolver: each nested `EncryptedKey` is
 matched to its own key, and duplicate keys for the same recipient fail as
 ambiguous instead of preventing distinct recipients from sharing an invocation.
