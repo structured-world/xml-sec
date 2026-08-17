@@ -40,7 +40,19 @@ occurs during rendering rather than after an oversized buffer has already been a
 The same immutable policy controls every signing parse and mutation reparse, including source
 validation in `sign_with_builder`, digest filling, `SignedInfo` parsing, signature filling, and
 optional `KeyInfo` filling. An internal-DTD opt-in and XML node ceiling therefore cannot be lost
-between stages.
+between stages. Custom `KeyInfoWriter` output is treated as a separate untrusted XML input: its
+byte ceiling is enforced before namespace wrapping or parsing, and the populated document is
+checked again after mutation.
+`IdAttributeRegistration` supplies immutable request context for non-standard ID attributes.
+`SignContext::id_attributes` and `VerifyContext::id_attributes` apply the same global or
+element-scoped registrations to operation start-node selection and every same-document Reference.
+`scoped_any_namespace` matches one element local name across namespaces, while `scoped` matches
+one exact expanded name and uses `None` for no namespace. The registration is not stored in policy
+and never comes from document content.
+`SignContext::sign_template` selects the last descendant `Signature` template by default, preserving
+append-then-sign workflows when a document already contains signatures. Process compatibility
+boundaries that use donor document-order lookup can explicitly select
+`SignatureTemplateSelection::FirstDescendant`; `start_node_id` scopes that selection to one subtree.
 `SigningPolicy::rsa_keys` validates normalized modulus width and public exponent before provider
 dispatch. The default accepts 2048-8192-bit RSA keys for new signatures; compatibility callers can
 raise or lower the minimum explicitly, while the 8192-bit implementation ceiling cannot be relaxed.

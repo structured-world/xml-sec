@@ -13,24 +13,16 @@
 //! module never performs network or filesystem I/O.
 
 use std::cell::Cell;
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use roxmltree::{Document, Node, NodeId};
 
 use crate::c14n::xml_base::{
     XmlBaseResolutionBudget, XmlBaseResolutionError, resolve_uri_from_node_with_budget,
 };
+use crate::xml::XmlIdIndex;
 
 use super::types::{NodeSet, NodeSetMaterializationBudget, TransformData, TransformError};
-
-/// Default ID attribute names to scan when building the ID index.
-///
-/// These cover the most common conventions:
-/// - `ID` — SAML 2.0 (`<saml:Assertion ID="...">`)
-/// - `Id` — XMLDSig (`<ds:Signature Id="...">`)
-/// - `id` — general XML
-const DEFAULT_ID_ATTRS: &[&str] = &["ID", "Id", "id"];
 
 struct ExternalResourceBudget {
     remaining_total_bytes: Cell<usize>,
@@ -101,8 +93,7 @@ impl ExternalResourceBudget {
 /// ```
 pub struct UriReferenceResolver<'a> {
     doc: &'a Document<'a>,
-    /// ID → element node mapping for O(1) fragment lookups.
-    id_map: HashMap<&'a str, Node<'a, 'a>>,
+    id_index: XmlIdIndex<'a>,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
     external_resource_budget: ExternalResourceBudget,
 }
@@ -110,7 +101,7 @@ pub struct UriReferenceResolver<'a> {
 impl<'a> UriReferenceResolver<'a> {
     /// Build a resolver with default ID attribute names (`ID`, `Id`, `id`).
     pub fn new(doc: &'a Document<'a>) -> Self {
-        Self::with_id_attrs(doc, DEFAULT_ID_ATTRS)
+        Self::with_id_attrs(doc, &[])
     }
 
     /// Build a resolver scanning additional ID attribute names beyond the defaults.
@@ -124,56 +115,22 @@ impl<'a> UriReferenceResolver<'a> {
     /// simply `Id` by `roxmltree`, so callers **must** pass `"Id"`, not
     /// `"wsu:Id"` or `"{namespace}Id"`.
     pub fn with_id_attrs(doc: &'a Document<'a>, extra_attrs: &[&str]) -> Self {
-        let mut id_map = HashMap::new();
-        // Track IDs seen more than once so they are never reinserted
-        // after being removed (handles 3+ occurrences correctly).
-        let mut duplicate_ids: HashSet<&'a str> = HashSet::new();
-
-        // Merge default + extra attribute names, dedup
-        let mut attr_names: Vec<&str> = DEFAULT_ID_ATTRS.to_vec();
-        for name in extra_attrs {
-            if !attr_names.contains(name) {
-                attr_names.push(name);
-            }
-        }
-
-        // Scan all elements for ID attributes
-        for node in doc.descendants() {
-            if node.is_element() {
-                for attr_name in &attr_names {
-                    if let Some(value) = node.attribute(*attr_name) {
-                        // Skip IDs already marked as duplicate
-                        if duplicate_ids.contains(value) {
-                            continue;
-                        }
-
-                        // Duplicate IDs are invalid per XML spec and can enable
-                        // signature-wrapping attacks. Remove the entry so that
-                        // lookups for ambiguous IDs fail with ElementNotFound
-                        // rather than silently picking an arbitrary node.
-                        match id_map.entry(value) {
-                            Entry::Vacant(v) => {
-                                v.insert(node);
-                            }
-                            Entry::Occupied(o) => {
-                                // Only treat as duplicate if a *different* element
-                                // maps the same ID value. The same element can
-                                // expose the same value via multiple scanned attrs
-                                // (e.g., both `ID="x"` and `Id="x"`).
-                                if o.get().id() != node.id() {
-                                    o.remove();
-                                    duplicate_ids.insert(value);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         Self {
             doc,
-            id_map,
+            id_index: XmlIdIndex::with_extra_attrs(doc, extra_attrs),
+            external_resources: None,
+            external_resource_budget: ExternalResourceBudget::default(),
+        }
+    }
+
+    /// Build a resolver with typed global and element-scoped ID registrations.
+    pub fn with_id_registrations(
+        doc: &'a Document<'a>,
+        registrations: &[crate::IdAttributeRegistration],
+    ) -> Self {
+        Self {
+            doc,
+            id_index: XmlIdIndex::with_registrations(doc, registrations),
             external_resources: None,
             external_resource_budget: ExternalResourceBudget::default(),
         }
@@ -330,8 +287,8 @@ impl<'a> UriReferenceResolver<'a> {
         budget: Option<&NodeSetMaterializationBudget>,
         with_comments: bool,
     ) -> Result<TransformData<'a>, TransformError> {
-        match self.id_map.get(id) {
-            Some(&element) => {
+        match self.id_index.node(id) {
+            Some(element) => {
                 let nodes = if with_comments {
                     match budget {
                         Some(budget) => NodeSet::subtree_with_budget(element, budget)?,
@@ -348,7 +305,7 @@ impl<'a> UriReferenceResolver<'a> {
 
     /// Check if an ID is registered in the resolver's index.
     pub fn has_id(&self, id: &str) -> bool {
-        self.id_map.contains_key(id)
+        self.id_index.contains(id)
     }
 
     /// Resolve a same-document ID token to a stable node identity.
@@ -356,11 +313,15 @@ impl<'a> UriReferenceResolver<'a> {
     /// Returns `None` when the ID is absent or ambiguous (duplicate ID collision),
     /// matching the resolver behavior used by `dereference()`.
     pub(crate) fn node_id_for_id(&self, id: &str) -> Option<NodeId> {
-        self.id_map.get(id).map(|node| node.id())
+        self.id_index.node_id(id)
     }
 
-    pub(crate) fn node_for_id(&self, id: &str) -> Option<Node<'a, 'a>> {
-        self.id_map.get(id).copied()
+    /// Resolve an unambiguous XML ID to its element node.
+    ///
+    /// Returns `None` when the ID is absent or duplicated, matching fragment
+    /// dereferencing and operation start-node selection.
+    pub fn node_for_id(&self, id: &str) -> Option<Node<'a, 'a>> {
+        self.id_index.node(id)
     }
 
     pub(crate) fn node_for_node_id(&self, id: NodeId) -> Option<Node<'a, 'a>> {
@@ -369,7 +330,7 @@ impl<'a> UriReferenceResolver<'a> {
 
     /// Get the number of registered IDs.
     pub fn id_count(&self) -> usize {
-        self.id_map.len()
+        self.id_index.len()
     }
 }
 

@@ -161,7 +161,7 @@ fn complete_surface_categories_are_stable() {
         "https://github.com/lsh123/xmlsec"
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
-    assert_eq!(ledger.classifications.len(), 13);
+    assert_eq!(ledger.classifications.len(), 16);
     assert_eq!(ledger.availability.len(), 427);
 
     let counts = ledger
@@ -338,10 +338,11 @@ fn native_algorithm_claims_match_the_rust_api() {
         .items
         .iter()
         .filter(|item| {
-            matches!(
-                classification(&ledger, item).outcome.as_str(),
-                "behavior-compatible" | "compatibility-profile-only"
-            )
+            item.kind == "algorithm-uri"
+                && matches!(
+                    classification(&ledger, item).outcome.as_str(),
+                    "behavior-compatible" | "compatibility-profile-only"
+                )
         })
         .collect();
     assert_eq!(claims.len(), 41);
@@ -760,11 +761,80 @@ fn planned_surface_is_never_reported_as_supported() {
         .filter(|item| classification(&ledger, item).outcome == "planned")
         .collect();
     assert!(!planned.is_empty());
-    assert!(planned.iter().any(|item| item.kind == "cli-command"));
     assert!(planned.iter().any(|item| item.kind == "cli-option"));
     assert!(planned.iter().any(|item| item.kind == "algorithm-uri"));
     assert!(planned.iter().any(|item| item.kind == "test-family"));
     assert!(planned.iter().any(|item| item.kind == "registry"));
+}
+
+#[test]
+fn native_cli_claims_match_process_and_upstream_runner_tests() {
+    // Commands are complete dispatch entries; individual options remain explicit
+    // when their format or policy mapping has not been implemented yet.
+    let ledger = ledger();
+    for command in [
+        "sign",
+        "verify",
+        "encrypt",
+        "decrypt",
+        "keys",
+        "check-transforms",
+        "check-key-data",
+    ] {
+        let item = ledger
+            .items
+            .iter()
+            .find(|item| item.kind == "cli-command" && item.name == command)
+            .unwrap_or_else(|| panic!("missing CLI command {command}"));
+        assert_eq!(classification(&ledger, item).outcome, "behavior-compatible");
+    }
+    for option in [
+        "--aes-key",
+        "--binary-data",
+        "--crypto",
+        "--gen-key",
+        "--help",
+        "--ignore-manifests",
+        "--insecure",
+        "--node-id",
+        "--output",
+        "--pkcs8-der",
+        "--pkcs8-pem",
+        "--privkey-der",
+        "--privkey-pem",
+        "--pubkey-cert-der",
+        "--pubkey-cert-pem",
+        "--pubkey-der",
+        "--pubkey-pem",
+        "--trusted-der",
+        "--trusted-pem",
+        "--untrusted-der",
+        "--untrusted-pem",
+        "--xml-data",
+    ] {
+        let item = ledger
+            .items
+            .iter()
+            .find(|item| item.kind == "cli-option" && item.name == option)
+            .unwrap_or_else(|| panic!("missing CLI option {option}"));
+        assert_eq!(classification(&ledger, item).outcome, "provider-limited");
+    }
+    for (status, outcome, code) in [
+        ("success", "behavior-compatible", "0"),
+        ("failure", "behavior-compatible", "1"),
+        ("unknown-command", "planned", "0"),
+    ] {
+        let item = ledger
+            .items
+            .iter()
+            .find(|item| item.kind == "cli-exit-status" && item.name == status)
+            .unwrap_or_else(|| panic!("missing CLI status {status}"));
+        assert_eq!(classification(&ledger, item).outcome, outcome);
+        assert!(
+            item.detail.contains(code),
+            "{status} must record exit code {code}"
+        );
+    }
 }
 
 #[test]

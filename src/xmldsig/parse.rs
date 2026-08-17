@@ -1603,6 +1603,23 @@ pub(crate) fn x509_certificate_matches_any_selector(
     Ok(subject_match || issuer_serial_match || ski_match || digest_match)
 }
 
+/// Match every selector asserted by `X509Data` against one configured certificate.
+///
+/// This supports XMLDSig lookup-only `X509Data`, where the document identifies a
+/// certificate without embedding it. All selector values are constraints and must
+/// match the same candidate certificate.
+pub fn x509_certificate_matches_selectors(
+    info: &X509DataInfo,
+    certificate_der: &[u8],
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<bool, ParseError> {
+    let mut candidate = info.clone();
+    candidate.certificates = vec![certificate_der.to_vec()];
+    candidate.parsed_certificates = vec![parse_x509_certificate(certificate_der)?];
+    candidate.certificate_chain = vec![0];
+    x509_selector_categories_match_chain(&candidate, provider)
+}
+
 pub(crate) fn x509_selector_categories_match_chain(
     info: &X509DataInfo,
     provider: &dyn crate::provider::CryptoProvider,
@@ -3244,6 +3261,68 @@ BA== </Modulus>
         assert!(
             matches!(err, ParseError::InvalidStructure(message) if message.contains("lookup identifiers match multiple certificates"))
         );
+    }
+
+    #[test]
+    fn configured_certificate_matching_requires_every_x509_selector_category() {
+        // A configured certificate is the lookup candidate for selector-only
+        // X509Data. Every asserted category must match that same certificate.
+        let certificate = base64::engine::general_purpose::STANDARD
+            .decode(fixture_rsa_cert_base64())
+            .unwrap();
+        let parsed = parse_x509_certificate(&certificate).unwrap();
+        let digest = compute_digest_with_provider(
+            crate::provider::default_provider(),
+            DigestAlgorithm::Sha256,
+            &certificate,
+        )
+        .unwrap();
+        let matching = X509DataInfo {
+            subject_names: vec![parsed.subject_dn.clone()],
+            issuer_serials: vec![(
+                parsed.issuer_dn.clone(),
+                "680572598617295163017172295025714171905498632019".into(),
+            )],
+            skis: vec![parsed.subject_key_identifier.clone().unwrap()],
+            digests: vec![(DigestAlgorithm::Sha256.uri().into(), digest)],
+            ..X509DataInfo::default()
+        };
+
+        assert!(
+            x509_certificate_matches_selectors(
+                &matching,
+                &certificate,
+                crate::provider::default_provider()
+            )
+            .unwrap()
+        );
+        for mismatching in [
+            X509DataInfo {
+                subject_names: vec!["CN=other".into()],
+                ..matching.clone()
+            },
+            X509DataInfo {
+                issuer_serials: vec![(parsed.issuer_dn.clone(), "1".into())],
+                ..matching.clone()
+            },
+            X509DataInfo {
+                skis: vec![vec![0]],
+                ..matching.clone()
+            },
+            X509DataInfo {
+                digests: vec![(DigestAlgorithm::Sha256.uri().into(), vec![0; 32])],
+                ..matching.clone()
+            },
+        ] {
+            assert!(
+                !x509_certificate_matches_selectors(
+                    &mismatching,
+                    &certificate,
+                    crate::provider::default_provider()
+                )
+                .unwrap()
+            );
+        }
     }
 
     #[test]

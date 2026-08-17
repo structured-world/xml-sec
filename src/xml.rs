@@ -1,5 +1,178 @@
 //! Shared XML lexical invariants used before serialization.
 
+use std::collections::{HashMap, HashSet, hash_map::Entry};
+
+use roxmltree::{Document, Node};
+
+#[cfg(feature = "xmldsig")]
+use roxmltree::NodeId;
+
+/// Default ID attribute names shared by XMLDSig and XMLEnc selection.
+const DEFAULT_ID_ATTRS: &[&str] = &["ID", "Id", "id"];
+
+/// Caller-declared XML ID attribute registration.
+///
+/// Registrations are request context rather than security policy. A global
+/// registration applies an attribute local name to every element; a scoped
+/// registration applies to one element local name in either any namespace or
+/// one exact namespace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdAttributeRegistration {
+    attribute_local_name: String,
+    element_scope: IdAttributeElementScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IdAttributeElementScope {
+    AnyElement,
+    AnyNamespace {
+        local_name: String,
+    },
+    ExpandedName {
+        local_name: String,
+        namespace: Option<String>,
+    },
+}
+
+impl IdAttributeRegistration {
+    /// Register an attribute local name as an ID on every element.
+    #[must_use]
+    pub fn global(attribute_local_name: impl Into<String>) -> Self {
+        Self {
+            attribute_local_name: attribute_local_name.into(),
+            element_scope: IdAttributeElementScope::AnyElement,
+        }
+    }
+
+    /// Register an attribute as an ID on a local element name in any namespace.
+    ///
+    /// This models libxmlsec1's unqualified `--id-attr` element-name contract.
+    #[must_use]
+    pub fn scoped_any_namespace(
+        attribute_local_name: impl Into<String>,
+        element_local_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            attribute_local_name: attribute_local_name.into(),
+            element_scope: IdAttributeElementScope::AnyNamespace {
+                local_name: element_local_name.into(),
+            },
+        }
+    }
+
+    /// Register an attribute as an ID only on matching elements.
+    ///
+    /// `element_namespace` is the namespace URI, not an XML prefix. `None`
+    /// matches only elements without a namespace.
+    #[must_use]
+    pub fn scoped(
+        attribute_local_name: impl Into<String>,
+        element_local_name: impl Into<String>,
+        element_namespace: Option<&str>,
+    ) -> Self {
+        Self {
+            attribute_local_name: attribute_local_name.into(),
+            element_scope: IdAttributeElementScope::ExpandedName {
+                local_name: element_local_name.into(),
+                namespace: element_namespace.map(str::to_owned),
+            },
+        }
+    }
+
+    fn matches(&self, node: Node<'_, '_>, attribute_name: &str) -> bool {
+        if self.attribute_local_name != attribute_name {
+            return false;
+        }
+        match &self.element_scope {
+            IdAttributeElementScope::AnyElement => true,
+            IdAttributeElementScope::AnyNamespace { local_name } => {
+                node.tag_name().name() == local_name
+            }
+            IdAttributeElementScope::ExpandedName {
+                local_name,
+                namespace,
+            } => {
+                node.tag_name().name() == local_name
+                    && node.tag_name().namespace() == namespace.as_deref()
+            }
+        }
+    }
+}
+
+/// Duplicate-safe index of XML ID attributes in one parsed document.
+pub(crate) struct XmlIdIndex<'a> {
+    nodes: HashMap<&'a str, Node<'a, 'a>>,
+}
+
+impl<'a> XmlIdIndex<'a> {
+    /// Index standard ID spellings plus caller-declared local attribute names.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn with_extra_attrs(document: &'a Document<'a>, extra_attrs: &[&str]) -> Self {
+        let registrations = extra_attrs
+            .iter()
+            .map(|name| IdAttributeRegistration::global(*name))
+            .collect::<Vec<_>>();
+        Self::with_registrations(document, &registrations)
+    }
+
+    /// Index standard ID spellings plus caller-declared registrations.
+    pub(crate) fn with_registrations(
+        document: &'a Document<'a>,
+        registrations: &[IdAttributeRegistration],
+    ) -> Self {
+        let mut nodes = HashMap::new();
+        let mut duplicates = HashSet::new();
+        for node in document.descendants().filter(Node::is_element) {
+            // ID registration is local-name based: qualified profile attributes
+            // such as wsu:Id and xml:id participate alongside unqualified Id.
+            for value in node
+                .attributes()
+                .filter(|attribute| {
+                    DEFAULT_ID_ATTRS.contains(&attribute.name())
+                        || registrations
+                            .iter()
+                            .any(|registration| registration.matches(node, attribute.name()))
+                })
+                .map(|attribute| attribute.value())
+            {
+                if duplicates.contains(value) {
+                    continue;
+                }
+                match nodes.entry(value) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(node);
+                    }
+                    Entry::Occupied(entry) if entry.get().id() != node.id() => {
+                        entry.remove();
+                        duplicates.insert(value);
+                    }
+                    Entry::Occupied(_) => {}
+                }
+            }
+        }
+        Self { nodes }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.nodes.contains_key(id)
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn node_id(&self, id: &str) -> Option<NodeId> {
+        self.nodes.get(id).map(Node::id)
+    }
+
+    pub(crate) fn node(&self, id: &str) -> Option<Node<'a, 'a>> {
+        self.nodes.get(id).copied()
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
 /// Return whether a Unicode scalar is permitted by XML 1.0 Fifth Edition [2].
 pub(crate) fn is_xml_1_0_character(character: char) -> bool {
     // Rust `char` cannot represent the surrogate range between D7FF and E000,
@@ -29,7 +202,9 @@ pub(crate) fn is_xml_ncname(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_xml_1_0_character, is_xml_ncname};
+    use roxmltree::Document;
+
+    use super::{IdAttributeRegistration, XmlIdIndex, is_xml_1_0_character, is_xml_ncname};
 
     #[test]
     fn xml_1_0_character_boundaries_match_production_two() {
@@ -62,5 +237,79 @@ mod tests {
         for invalid in ["", "1leading", "bad id", "qualified:name"] {
             assert!(!is_xml_ncname(invalid), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn id_index_rejects_duplicate_values_but_not_duplicate_attributes_on_one_node() {
+        // Ambiguous IDs must fail closed across every consumer, while one node
+        // carrying equivalent ID spellings still denotes one stable target.
+        let document = Document::parse(
+            r#"<root><one ID="same" Id="same"/><two id="duplicate"/><three ID="duplicate"/></root>"#,
+        )
+        .expect("ID index fixture must be valid XML");
+        let index = XmlIdIndex::with_registrations(&document, &[]);
+
+        assert_eq!(
+            index.node("same").map(|node| node.tag_name().name()),
+            Some("one")
+        );
+        assert!(index.node("duplicate").is_none());
+    }
+
+    #[test]
+    fn id_index_matches_supported_local_names_in_any_namespace() {
+        // ID registration is defined by local attribute name. Common security
+        // profiles qualify Id with wsu or xml, but the target remains the same.
+        let document = Document::parse(
+            r#"<root xmlns:wsu="urn:wsu"><one wsu:Id="wsu-target"/><two xml:id="xml-target"/></root>"#,
+        )
+        .expect("namespaced ID fixture must parse");
+        let index = XmlIdIndex::with_registrations(&document, &[]);
+
+        assert_eq!(
+            index.node("wsu-target").map(|node| node.tag_name().name()),
+            Some("one")
+        );
+        assert_eq!(
+            index.node("xml-target").map(|node| node.tag_name().name()),
+            Some("two")
+        );
+    }
+
+    #[test]
+    fn id_registration_distinguishes_any_and_exact_element_namespaces() {
+        // Donor --id-attr without a namespace matches the local element name
+        // everywhere, while the public scoped API retains exact-name matching.
+        let document = Document::parse(
+            r#"<root xmlns:n="urn:item"><item Token="plain"/><n:item Token="namespaced"/></root>"#,
+        )
+        .expect("scope fixture must parse");
+
+        let any_namespace = XmlIdIndex::with_registrations(
+            &document,
+            &[IdAttributeRegistration::scoped_any_namespace(
+                "Token", "item",
+            )],
+        );
+        assert!(any_namespace.node("plain").is_some());
+        assert!(any_namespace.node("namespaced").is_some());
+
+        let no_namespace = XmlIdIndex::with_registrations(
+            &document,
+            &[IdAttributeRegistration::scoped("Token", "item", None)],
+        );
+        assert!(no_namespace.node("plain").is_some());
+        assert!(no_namespace.node("namespaced").is_none());
+
+        let exact_namespace = XmlIdIndex::with_registrations(
+            &document,
+            &[IdAttributeRegistration::scoped(
+                "Token",
+                "item",
+                Some("urn:item"),
+            )],
+        );
+        assert!(exact_namespace.node("plain").is_none());
+        assert!(exact_namespace.node("namespaced").is_some());
     }
 }

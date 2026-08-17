@@ -25,9 +25,10 @@ use crate::c14n::{canonicalize_bounded_with_xml_base_budget, is_output_limit_err
 use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::DigestAlgorithm;
 use super::mutation::{
-    XmlMutationError, append_signature_to_root_with_options, fill_key_info_with_options,
-    fill_signature_value_with_options, fill_signed_info_digest_values,
-    fill_signed_info_digest_values_with_options,
+    XmlMutationError, append_signature_to_element_with_options,
+    append_signature_to_root_with_options, fill_signature_value_at_index_with_options,
+    fill_signed_info_digest_values, fill_signed_info_digest_values_at_index_with_options,
+    fill_signed_info_digest_values_with_options, merge_key_info_source_at_index_with_options,
 };
 use super::parse::{
     MAX_REFERENCES_PER_SIGNATURE, SignatureAlgorithm, XMLDSIG_NS, parse_signed_info,
@@ -39,6 +40,7 @@ use super::transforms::{
 };
 use super::types::TransformError;
 use super::uri::UriReferenceResolver;
+use super::verify::parse_signature_children;
 
 /// Result for one computed signing-template reference digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +227,24 @@ impl SigningPublicKeyInfo {
     }
 }
 
+/// Validate that a key can produce the requested algorithm under `policy`.
+///
+/// Key registries can use this preflight before selecting a candidate, ensuring
+/// lax ordered searches skip keys that the signing operation would reject.
+pub fn validate_signing_key(
+    key: &dyn SigningKey,
+    algorithm: SignatureAlgorithm,
+    policy: &crate::policy::SigningPolicy,
+) -> Result<(), SigningError> {
+    if !algorithm.signing_allowed() {
+        return Err(SigningKeyError::UnsupportedAlgorithm {
+            uri: algorithm.uri().to_owned(),
+        }
+        .into());
+    }
+    expected_signature_output_len(key, algorithm, policy).map(|_| ())
+}
+
 fn expected_signature_output_len(
     key: &dyn SigningKey,
     algorithm: SignatureAlgorithm,
@@ -337,6 +357,10 @@ pub enum KeyInfoWriteError {
     #[error("invalid X.509 certificate DER")]
     InvalidCertificateDer,
 
+    /// A certificate-backed KeyInfo writer requires at least one certificate.
+    #[error("X.509 certificate chain must not be empty")]
+    EmptyCertificateChain,
+
     /// The signing key could not expose public-key material for validation.
     #[error("signing key public-key extraction failed: {0}")]
     SigningKey(#[from] SigningKeyError),
@@ -346,43 +370,78 @@ pub enum KeyInfoWriteError {
     CertificateKeyMismatch,
 }
 
-/// `<KeyInfo>` writer that embeds one DER X.509 certificate.
+/// `<KeyInfo>` writer that embeds an ordered DER X.509 certificate chain.
 pub struct X509CertificateKeyInfoWriter {
-    certificate_der: Vec<u8>,
+    certificates_der: Vec<Vec<u8>>,
 }
 
 impl X509CertificateKeyInfoWriter {
     /// Parse a PEM `CERTIFICATE` block for XMLDSig `<X509Certificate>` output.
     pub fn from_pem(certificate_pem: &str) -> Result<Self, KeyInfoWriteError> {
-        let (rest, pem) = x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes())
-            .map_err(|_| KeyInfoWriteError::InvalidCertificatePem)?;
-        if !rest.iter().all(|byte| byte.is_ascii_whitespace()) {
-            return Err(KeyInfoWriteError::InvalidCertificatePem);
+        Self::from_pem_chain([certificate_pem])
+    }
+
+    /// Parse an ordered sequence of PEM `CERTIFICATE` blocks for `<X509Data>`.
+    pub fn from_pem_chain<I, S>(certificate_pems: I) -> Result<Self, KeyInfoWriteError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut certificates_der = Vec::new();
+        for certificate_pem in certificate_pems {
+            certificates_der.push(parse_certificate_pem(certificate_pem.as_ref())?);
         }
-        if pem.label != "CERTIFICATE" {
-            return Err(KeyInfoWriteError::InvalidCertificateFormat { label: pem.label });
-        }
-        Self::from_der(&pem.contents)
+        Self::from_der_chain(certificates_der)
     }
 
     /// Validate and store DER certificate bytes for XMLDSig `<X509Certificate>` output.
     pub fn from_der(certificate_der: &[u8]) -> Result<Self, KeyInfoWriteError> {
-        let (rest, _) = x509_parser::certificate::X509Certificate::from_der(certificate_der)
-            .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
-        if !rest.is_empty() {
-            return Err(KeyInfoWriteError::InvalidCertificateDer);
-        }
-        Ok(Self {
-            certificate_der: certificate_der.to_vec(),
-        })
+        Self::from_der_chain([certificate_der])
     }
+
+    /// Validate and store an ordered DER certificate chain for `<X509Data>`.
+    pub fn from_der_chain<I, B>(certificates_der: I) -> Result<Self, KeyInfoWriteError>
+    where
+        I: IntoIterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        let certificates_der = certificates_der
+            .into_iter()
+            .map(|certificate_der| {
+                let certificate_der = certificate_der.as_ref();
+                let (rest, _) =
+                    x509_parser::certificate::X509Certificate::from_der(certificate_der)
+                        .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
+                if !rest.is_empty() {
+                    return Err(KeyInfoWriteError::InvalidCertificateDer);
+                }
+                Ok(certificate_der.to_vec())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if certificates_der.is_empty() {
+            return Err(KeyInfoWriteError::EmptyCertificateChain);
+        }
+        Ok(Self { certificates_der })
+    }
+}
+
+fn parse_certificate_pem(certificate_pem: &str) -> Result<Vec<u8>, KeyInfoWriteError> {
+    let (rest, pem) = x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes())
+        .map_err(|_| KeyInfoWriteError::InvalidCertificatePem)?;
+    if !rest.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err(KeyInfoWriteError::InvalidCertificatePem);
+    }
+    if pem.label != "CERTIFICATE" {
+        return Err(KeyInfoWriteError::InvalidCertificateFormat { label: pem.label });
+    }
+    Ok(pem.contents)
 }
 
 impl KeyInfoWriter for X509CertificateKeyInfoWriter {
     fn write_key_info(&self, signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
-        let (rest, certificate) =
-            x509_parser::certificate::X509Certificate::from_der(&self.certificate_der)
-                .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
+        let leaf_der = &self.certificates_der[0];
+        let (rest, certificate) = x509_parser::certificate::X509Certificate::from_der(leaf_der)
+            .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
         if !rest.is_empty() {
             return Err(KeyInfoWriteError::InvalidCertificateDer);
         }
@@ -391,11 +450,15 @@ impl KeyInfoWriter for X509CertificateKeyInfoWriter {
             return Err(KeyInfoWriteError::CertificateKeyMismatch);
         }
 
-        let certificate_b64 =
-            base64::engine::general_purpose::STANDARD.encode(&self.certificate_der);
-        Ok(format!(
-            "<X509Data xmlns=\"{XMLDSIG_NS}\"><X509Certificate>{certificate_b64}</X509Certificate></X509Data>"
-        ))
+        let mut xml = format!("<X509Data xmlns=\"{XMLDSIG_NS}\">");
+        for certificate_der in &self.certificates_der {
+            let certificate_b64 = base64::engine::general_purpose::STANDARD.encode(certificate_der);
+            xml.push_str("<X509Certificate>");
+            xml.push_str(&certificate_b64);
+            xml.push_str("</X509Certificate>");
+        }
+        xml.push_str("</X509Data>");
+        Ok(xml)
     }
 }
 
@@ -628,10 +691,32 @@ impl SigningKey for EcdsaP384SigningKey {
     }
 }
 
+/// Select which existing XMLDSig template [`SignContext::sign_template`] signs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SignatureTemplateSelection {
+    /// Select the first descendant template in document order.
+    FirstDescendant,
+    /// Select the last descendant template, matching append-then-sign workflows.
+    #[default]
+    LastDescendant,
+}
+
+impl SignatureTemplateSelection {
+    const fn target(self) -> SigningSignatureTarget {
+        match self {
+            Self::FirstDescendant => SigningSignatureTarget::First,
+            Self::LastDescendant => SigningSignatureTarget::Last,
+        }
+    }
+}
+
 /// XMLDSig signing context.
 pub struct SignContext<'a> {
     signing_key: &'a dyn SigningKey,
     key_info_writer: Option<&'a dyn KeyInfoWriter>,
+    start_node_id: Option<&'a str>,
+    id_attributes: &'a [crate::IdAttributeRegistration],
+    template_selection: SignatureTemplateSelection,
     policy: crate::policy::SigningPolicy,
     provider: &'a dyn crate::provider::CryptoProvider,
 }
@@ -642,6 +727,9 @@ impl<'a> SignContext<'a> {
         Self {
             signing_key,
             key_info_writer: None,
+            start_node_id: None,
+            id_attributes: &[],
+            template_selection: SignatureTemplateSelection::default(),
             policy: crate::policy::SigningPolicy::default(),
             provider: crate::provider::default_provider(),
         }
@@ -668,6 +756,34 @@ impl<'a> SignContext<'a> {
         self
     }
 
+    /// Select an operation start node by ID and scope template selection to its subtree.
+    ///
+    /// [`Self::sign_with_builder`] instead uses the selected node as the append
+    /// location and signs the newly appended direct `<Signature>` child.
+    #[must_use]
+    pub fn start_node_id(mut self, id: &'a str) -> Self {
+        self.start_node_id = Some(id);
+        self
+    }
+
+    /// Select which existing `<Signature>` template [`Self::sign_template`] signs.
+    ///
+    /// The default is [`SignatureTemplateSelection::LastDescendant`], preserving
+    /// append-then-sign behavior. Compatibility boundaries that model donor
+    /// document-order lookup can explicitly select `FirstDescendant`.
+    #[must_use]
+    pub fn signature_template_selection(mut self, selection: SignatureTemplateSelection) -> Self {
+        self.template_selection = selection;
+        self
+    }
+
+    /// Add caller-declared ID attributes for start-node and Reference lookup.
+    #[must_use]
+    pub fn id_attributes(mut self, registrations: &'a [crate::IdAttributeRegistration]) -> Self {
+        self.id_attributes = registrations;
+        self
+    }
+
     /// Select the node returned by XPath's `here()` extension function.
     ///
     /// The default follows XMLDSig and returns the `<XPath>` parameter.
@@ -682,28 +798,81 @@ impl<'a> SignContext<'a> {
     /// Sign XML that already contains a `<Signature>` template.
     ///
     /// The template must include empty `<DigestValue>` and `<SignatureValue>`
-    /// targets. The pipeline fills reference digests, reparses the result,
-    /// canonicalizes `<SignedInfo>`, signs those canonical bytes, and fills the
-    /// base64 `<SignatureValue>`.
+    /// targets. The pipeline first materializes configured `<KeyInfo>` content,
+    /// then fills reference digests, reparses the result, canonicalizes
+    /// `<SignedInfo>`, signs those canonical bytes, and fills the base64
+    /// `<SignatureValue>`. This ordering permits `<KeyInfo>` to be referenced
+    /// from `<SignedInfo>` without producing a stale digest.
     pub fn sign_template(&self, xml: &str) -> Result<String, SigningError> {
         self.policy.validate()?;
         self.policy.resources.validate_xml_document_len(xml.len())?;
+        let document = parse_signing_document(xml, Some(&self.policy))
+            .map_err(SigningDigestError::XmlParse)?;
+        let target_signature = signing_signature_index(
+            &document,
+            self.start_node_id,
+            self.id_attributes,
+            self.template_selection,
+        )?;
+        self.sign_template_at_index(xml, target_signature)
+    }
+
+    fn sign_template_at_index(
+        &self,
+        xml: &str,
+        target_signature: usize,
+    ) -> Result<String, SigningError> {
+        let document = parse_signing_document(xml, Some(&self.policy))
+            .map_err(SigningDigestError::XmlParse)?;
+        let signature = find_signing_signature_node(
+            &document,
+            SigningSignatureTarget::Index(target_signature),
+        )?;
+        parse_signature_children(signature)
+            .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
         let execution_budget = TransformExecutionBudget::from_resources(&self.policy.resources);
         let transform_options = TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.xpath_here_semantics);
+        let with_key_info = if let Some(writer) = self.key_info_writer {
+            let key_info_content = writer.write_key_info(self.signing_key)?;
+            // Writer output is a separate untrusted XML input. Bound it before
+            // namespace wrapping or parsing, then bound the merged document below.
+            self.policy
+                .resources
+                .validate_xml_document_len(key_info_content.len())?;
+            let populated = merge_key_info_source_at_index_with_options(
+                xml,
+                &key_info_content,
+                target_signature,
+                Some(&self.policy),
+            )?;
+            self.policy
+                .resources
+                .validate_xml_document_len(populated.len())?;
+            Some(populated)
+        } else {
+            None
+        };
+        let prepared_xml = with_key_info.as_deref().unwrap_or(xml);
         let with_digests = fill_reference_digest_values_with_options(
-            xml,
+            prepared_xml,
             transform_options,
             Some(&self.policy),
             self.provider,
             &execution_budget,
+            Some(target_signature),
+            self.id_attributes,
         )?;
         self.policy
             .resources
             .validate_xml_document_len(with_digests.len())?;
-        let (algorithm, canonical_signed_info) =
-            canonicalize_signed_info(&with_digests, &self.policy, &execution_budget)?;
+        let (algorithm, canonical_signed_info) = canonicalize_signed_info(
+            &with_digests,
+            &self.policy,
+            &execution_budget,
+            target_signature,
+        )?;
         execution_budget
             .charge_c14n_output(canonical_signed_info.len())
             .map_err(SigningDigestError::Transform)?;
@@ -727,25 +896,20 @@ impl<'a> SignContext<'a> {
                 .sign(self.signing_key, algorithm, &canonical_signed_info)?;
         validate_signature_output(expected_signature_len, &signature_value)?;
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature_value);
-        let signed =
-            fill_signature_value_with_options(&with_digests, &signature_b64, Some(&self.policy))?;
+        let signed = fill_signature_value_at_index_with_options(
+            &with_digests,
+            &signature_b64,
+            target_signature,
+            Some(&self.policy),
+        )?;
         self.policy
             .resources
             .validate_xml_document_len(signed.len())?;
-        if let Some(writer) = self.key_info_writer {
-            let key_info_content = writer.write_key_info(self.signing_key)?;
-            let signed =
-                fill_key_info_with_options(&signed, &key_info_content, Some(&self.policy))?;
-            self.policy
-                .resources
-                .validate_xml_document_len(signed.len())?;
-            Ok(signed)
-        } else {
-            Ok(signed)
-        }
+        Ok(signed)
     }
 
-    /// Build a signature template, append it to the source root, then sign it.
+    /// Build a signature template, append it to the selected start node (or
+    /// the document root when no selector is set), then sign that new template.
     pub fn sign_with_builder(
         &self,
         xml: &str,
@@ -754,8 +918,44 @@ impl<'a> SignContext<'a> {
         self.policy.validate()?;
         self.policy.resources.validate_xml_document_len(xml.len())?;
         let template = builder.build_template()?;
-        let templated = append_signature_to_root_with_options(xml, &template, Some(&self.policy))?;
-        self.sign_template(&templated)
+        let templated = if let Some(id) = self.start_node_id {
+            let document = parse_signing_document(xml, Some(&self.policy))
+                .map_err(SigningDigestError::XmlParse)?;
+            let start = signing_start_node(&document, id, self.id_attributes)?;
+            append_signature_to_element_with_options(
+                xml,
+                &template,
+                start.range(),
+                Some(&self.policy),
+            )?
+        } else {
+            append_signature_to_root_with_options(xml, &template, Some(&self.policy))?
+        };
+        self.policy
+            .resources
+            .validate_xml_document_len(templated.len())?;
+        let document = parse_signing_document(&templated, Some(&self.policy))
+            .map_err(SigningDigestError::XmlParse)?;
+        let target_signature = if let Some(id) = self.start_node_id {
+            let start = signing_start_node(&document, id, self.id_attributes)?;
+            let appended = start
+                .children()
+                .rfind(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
+                .ok_or(SigningDigestError::MissingElement {
+                    element: "Signature",
+                })?;
+            signature_index(&document, appended)?
+        } else {
+            let appended = document
+                .root_element()
+                .children()
+                .rfind(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
+                .ok_or(SigningDigestError::MissingElement {
+                    element: "Signature",
+                })?;
+            signature_index(&document, appended)?
+        };
+        self.sign_template_at_index(&templated, target_signature)
     }
 }
 
@@ -782,6 +982,8 @@ pub fn compute_reference_digest_values(
         None,
         crate::provider::default_provider(),
         &execution_budget,
+        None,
+        &[],
     )
 }
 
@@ -791,9 +993,14 @@ fn compute_reference_digest_values_with_options(
     policy: Option<&crate::policy::SigningPolicy>,
     provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
+    target_signature: Option<usize>,
+    id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
     let doc = parse_signing_document(xml, policy)?;
-    let signature = find_signing_signature_node(&doc)?;
+    let signature = find_signing_signature_node(
+        &doc,
+        target_signature.map_or(SigningSignatureTarget::Last, SigningSignatureTarget::Index),
+    )?;
     let signed_info = find_required_child(signature, "SignedInfo")?;
     let references = parse_signing_references(signed_info)?;
     if let Some(policy) = policy {
@@ -838,7 +1045,7 @@ fn compute_reference_digest_values_with_options(
             }
         }
     }
-    let resolver = UriReferenceResolver::new(&doc);
+    let resolver = UriReferenceResolver::with_id_registrations(&doc, id_attributes);
     references
         .into_iter()
         .enumerate()
@@ -896,6 +1103,8 @@ pub fn fill_reference_digest_values(xml: &str) -> Result<String, SigningDigestEr
         None,
         crate::provider::default_provider(),
         &execution_budget,
+        None,
+        &[],
     )
 }
 
@@ -905,6 +1114,8 @@ fn fill_reference_digest_values_with_options(
     policy: Option<&crate::policy::SigningPolicy>,
     provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
+    target_signature: Option<usize>,
+    id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<String, SigningDigestError> {
     let digest_values = compute_reference_digest_values_with_options(
         xml,
@@ -912,10 +1123,19 @@ fn fill_reference_digest_values_with_options(
         policy,
         provider,
         execution_budget,
+        target_signature,
+        id_attributes,
     )?
     .into_iter()
     .map(|digest| digest.digest_value);
-    Ok(if let Some(policy) = policy {
+    Ok(if let Some(target_signature) = target_signature {
+        fill_signed_info_digest_values_at_index_with_options(
+            xml,
+            digest_values,
+            target_signature,
+            policy,
+        )?
+    } else if let Some(policy) = policy {
         fill_signed_info_digest_values_with_options(xml, digest_values, Some(policy))?
     } else {
         fill_signed_info_digest_values(xml, digest_values)?
@@ -926,9 +1146,12 @@ fn canonicalize_signed_info(
     xml: &str,
     policy: &crate::policy::SigningPolicy,
     execution_budget: &TransformExecutionBudget,
+    target_signature: usize,
 ) -> Result<(SignatureAlgorithm, Vec<u8>), SigningError> {
     let doc = parse_signing_document(xml, Some(policy)).map_err(SigningDigestError::XmlParse)?;
-    let signature = find_signing_signature_node(&doc).map_err(SigningError::Digest)?;
+    let signature =
+        find_signing_signature_node(&doc, SigningSignatureTarget::Index(target_signature))
+            .map_err(SigningError::Digest)?;
     let signed_info_node =
         find_required_child(signature, "SignedInfo").map_err(SigningError::Digest)?;
     let signed_info = parse_signed_info(signed_info_node)?;
@@ -989,15 +1212,79 @@ fn parse_private_key_pem(private_key_pem: &str) -> Result<Vec<u8>, SigningKeyErr
     Ok(pem.contents)
 }
 
+enum SigningSignatureTarget {
+    First,
+    Last,
+    Index(usize),
+}
+
 fn find_signing_signature_node<'a>(
     doc: &'a Document<'a>,
+    target: SigningSignatureTarget,
 ) -> Result<Node<'a, 'a>, SigningDigestError> {
-    doc.descendants()
-        .rfind(|node| {
-            node.is_element()
-                && node.tag_name().name() == "Signature"
-                && node.tag_name().namespace() == Some(XMLDSIG_NS)
+    let mut signatures = doc.descendants().filter(|node| {
+        node.is_element()
+            && node.tag_name().name() == "Signature"
+            && node.tag_name().namespace() == Some(XMLDSIG_NS)
+    });
+    match target {
+        SigningSignatureTarget::First => signatures.next(),
+        SigningSignatureTarget::Last => signatures.next_back(),
+        SigningSignatureTarget::Index(index) => signatures.nth(index),
+    }
+    .ok_or(SigningDigestError::MissingElement {
+        element: "Signature",
+    })
+}
+
+fn signing_signature_index(
+    doc: &Document<'_>,
+    start_node_id: Option<&str>,
+    id_attributes: &[crate::IdAttributeRegistration],
+    selection: SignatureTemplateSelection,
+) -> Result<usize, SigningDigestError> {
+    let selected = if let Some(id) = start_node_id {
+        let start = signing_start_node(doc, id, id_attributes)?;
+        let mut signatures = start
+            .descendants()
+            .filter(|node| node.has_tag_name((XMLDSIG_NS, "Signature")));
+        match selection.target() {
+            SigningSignatureTarget::First => signatures.next(),
+            SigningSignatureTarget::Last => signatures.next_back(),
+            SigningSignatureTarget::Index(_) => unreachable!("public selection is not indexed"),
+        }
+        .ok_or_else(|| {
+            SigningDigestError::InvalidStructure(format!(
+                "selected node subtree has no Signature: {id}"
+            ))
+        })?
+    } else {
+        find_signing_signature_node(doc, selection.target())?
+    };
+    signature_index(doc, selected)
+}
+
+fn signing_start_node<'a>(
+    doc: &'a Document<'a>,
+    id: &str,
+    id_attributes: &[crate::IdAttributeRegistration],
+) -> Result<Node<'a, 'a>, SigningDigestError> {
+    UriReferenceResolver::with_id_registrations(doc, id_attributes)
+        .node_for_id(id)
+        .ok_or_else(|| {
+            SigningDigestError::InvalidStructure(format!(
+                "selected node ID is missing or ambiguous: {id}"
+            ))
         })
+}
+
+fn signature_index(
+    doc: &Document<'_>,
+    selected: Node<'_, '_>,
+) -> Result<usize, SigningDigestError> {
+    doc.descendants()
+        .filter(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
+        .position(|node| node == selected)
         .ok_or(SigningDigestError::MissingElement {
             element: "Signature",
         })

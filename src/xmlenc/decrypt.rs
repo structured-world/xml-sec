@@ -16,6 +16,7 @@ use super::{
     KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm, RsaOaepParameters, XmlEncError,
     has_single_element_with_boundary_trivia,
 };
+use crate::xml::XmlIdIndex;
 
 #[cfg(test)]
 use super::parse_encrypted_data;
@@ -48,6 +49,7 @@ pub struct DecryptContext<'a> {
     resolver: &'a dyn DecryptionKeyResolver,
     policy: crate::policy::DecryptionPolicy,
     provider: &'a dyn crate::provider::CryptoProvider,
+    id_attributes: &'a [crate::IdAttributeRegistration],
 }
 
 impl<'a> DecryptContext<'a> {
@@ -57,6 +59,7 @@ impl<'a> DecryptContext<'a> {
             resolver,
             policy: crate::policy::DecryptionPolicy::default(),
             provider: crate::provider::default_provider(),
+            id_attributes: &[],
         }
     }
 
@@ -69,6 +72,12 @@ impl<'a> DecryptContext<'a> {
     /// Select the cryptographic provider for this decryption operation.
     pub fn provider(mut self, provider: &'a dyn crate::provider::CryptoProvider) -> Self {
         self.provider = provider;
+        self
+    }
+
+    /// Add caller-declared ID attributes for operation start-node lookup.
+    pub fn id_attributes(mut self, registrations: &'a [crate::IdAttributeRegistration]) -> Self {
+        self.id_attributes = registrations;
         self
     }
 
@@ -151,7 +160,25 @@ impl<'a> DecryptContext<'a> {
         xml: &str,
         encrypted_data_id: Option<&str>,
     ) -> Result<String, XmlEncError> {
-        decrypt_document_with_context(xml, encrypted_data_id, self)
+        decrypt_document_with_context(
+            xml,
+            DocumentEncryptedDataSelector::EncryptedDataId(encrypted_data_id),
+            self,
+        )
+    }
+
+    /// Decrypt and replace the sole `EncryptedData` below an operation start
+    /// node selected by ID.
+    pub fn decrypt_document_from_start_node(
+        &self,
+        xml: &str,
+        start_node_id: Option<&str>,
+    ) -> Result<String, XmlEncError> {
+        decrypt_document_with_context(
+            xml,
+            DocumentEncryptedDataSelector::StartNodeId(start_node_id),
+            self,
+        )
     }
 }
 
@@ -349,14 +376,9 @@ impl PrivateKeyDecryptor {
 }
 
 fn parse_oaep_digest(uri: Option<&str>) -> Result<OaepDigestAlgorithm, XmlEncError> {
-    match uri.unwrap_or("http://www.w3.org/2000/09/xmldsig#sha1") {
-        "http://www.w3.org/2000/09/xmldsig#sha1" => Ok(OaepDigestAlgorithm::Sha1),
-        "http://www.w3.org/2001/04/xmlenc#sha256" => Ok(OaepDigestAlgorithm::Sha256),
-        "http://www.w3.org/2001/04/xmlenc#sha384"
-        | "http://www.w3.org/2001/04/xmldsig-more#sha384" => Ok(OaepDigestAlgorithm::Sha384),
-        "http://www.w3.org/2001/04/xmlenc#sha512" => Ok(OaepDigestAlgorithm::Sha512),
-        unsupported => Err(XmlEncError::UnsupportedAlgorithm(unsupported.to_owned())),
-    }
+    let uri = uri.unwrap_or("http://www.w3.org/2000/09/xmldsig#sha1");
+    OaepDigestAlgorithm::from_uri(uri)
+        .ok_or_else(|| XmlEncError::UnsupportedAlgorithm(uri.to_owned()))
 }
 
 fn parse_oaep_mgf_digest(uri: Option<&str>) -> Result<OaepDigestAlgorithm, XmlEncError> {
@@ -436,16 +458,39 @@ pub fn decrypt_document_with_options(
         .decrypt_document(xml, options.encrypted_data_id)
 }
 
+#[derive(Clone, Copy)]
+enum DocumentEncryptedDataSelector<'a> {
+    EncryptedDataId(Option<&'a str>),
+    StartNodeId(Option<&'a str>),
+}
+
 fn decrypt_document_with_context(
     xml: &str,
-    encrypted_data_id: Option<&str>,
+    selector: DocumentEncryptedDataSelector<'_>,
     context: &DecryptContext<'_>,
 ) -> Result<String, XmlEncError> {
     context.policy.resources.validate()?;
     validate_encryption_document_len(xml.len(), &context.policy)?;
     let parsing_options = || decryption_parsing_options(&context.policy);
     let document = Document::parse_with_options(xml, parsing_options())?;
-    let mut matches = document.descendants().filter(|node| {
+    let start = match selector {
+        DocumentEncryptedDataSelector::StartNodeId(Some(id)) => {
+            XmlIdIndex::with_registrations(&document, context.id_attributes)
+                .node(id)
+                .ok_or_else(|| {
+                    XmlEncError::InvalidStructure(format!(
+                        "selected node ID is missing or ambiguous: {id}"
+                    ))
+                })?
+        }
+        DocumentEncryptedDataSelector::StartNodeId(None)
+        | DocumentEncryptedDataSelector::EncryptedDataId(_) => document.root(),
+    };
+    let encrypted_data_id = match selector {
+        DocumentEncryptedDataSelector::EncryptedDataId(id) => id,
+        DocumentEncryptedDataSelector::StartNodeId(_) => None,
+    };
+    let mut matches = start.descendants().filter(|node| {
         node.has_tag_name((XMLENC_NS, "EncryptedData"))
             && encrypted_data_id.is_none_or(|id| node.attribute("Id") == Some(id))
     });
@@ -2354,6 +2399,54 @@ mod tests {
         assert!(matches!(
             decrypt_document(&document, Some("missing"), &resolver),
             Err(XmlEncError::EncryptedDataNotFound)
+        ));
+    }
+
+    #[test]
+    fn selects_encrypted_data_below_a_unique_operation_start_node() {
+        // CLI-compatible selection starts at an arbitrary ID-bearing ancestor;
+        // missing/duplicate IDs and multiple encrypted descendants fail closed.
+        let key = [0x42_u8; 16];
+        let first = encrypted_gcm_element(
+            "http://www.w3.org/2001/04/xmlenc#Content",
+            "first",
+            None,
+            false,
+            &key,
+        );
+        let second = encrypted_gcm_element(
+            "http://www.w3.org/2001/04/xmlenc#Content",
+            "second",
+            None,
+            false,
+            &key,
+        );
+        let document = format!(
+            "<root xmlns:xenc=\"{XMLENC_NS}\"><scope Id=\"first\">{first}</scope><scope Id=\"second\">{second}</scope></root>"
+        );
+        let resolver = SymmetricKeyDecryptor::new(key);
+        let context = DecryptContext::new(&resolver);
+        let replaced = context
+            .decrypt_document_from_start_node(&document, Some("second"))
+            .expect("ancestor ID must select its encrypted descendant");
+        assert!(replaced.contains("<scope Id=\"second\">second</scope>"));
+        assert!(replaced.contains("<scope Id=\"first\"><xenc:EncryptedData"));
+
+        assert!(matches!(
+            context.decrypt_document_from_start_node(&document, Some("missing")),
+            Err(XmlEncError::InvalidStructure(message)) if message.contains("missing or ambiguous")
+        ));
+        let duplicate = document.replace("Id=\"second\"", "Id=\"first\"");
+        assert!(matches!(
+            context.decrypt_document_from_start_node(&duplicate, Some("first")),
+            Err(XmlEncError::InvalidStructure(message)) if message.contains("missing or ambiguous")
+        ));
+        let ambiguous = format!(
+            "<root xmlns:xenc=\"{XMLENC_NS}\"><scope Id=\"selected\">{first}{second}</scope></root>"
+        );
+        assert!(matches!(
+            context.decrypt_document_from_start_node(&ambiguous, Some("selected")),
+            Err(XmlEncError::AmbiguousEncryptedData)
         ));
     }
 

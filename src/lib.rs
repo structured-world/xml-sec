@@ -40,6 +40,9 @@ pub mod provider;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 mod xml;
 
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub use xml::IdAttributeRegistration;
+
 #[cfg(feature = "xmldsig")]
 pub mod xmldsig;
 

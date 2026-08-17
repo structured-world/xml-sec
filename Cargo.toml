@@ -13,7 +13,7 @@ categories = ["cryptography", "web-programming", "authentication"]
 readme = "README.md"
 
 [workspace]
-members = [".", "tools/capability-ledger"]
+members = [".", "tools/capability-ledger", "tools/xmlsec1"]
 resolver = "3"
 
 [[example]]

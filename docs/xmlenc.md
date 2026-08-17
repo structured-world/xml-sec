@@ -33,6 +33,11 @@ fn example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+For embedded decryption, `DecryptContext::id_attributes` accepts the same immutable global or
+element-scoped `IdAttributeRegistration` request context as XMLDSig. Element scope can match a
+local name in any namespace or one exact expanded name. It affects only operation start-node
+lookup; policy remains a separate compiled snapshot.
+
 For recipient transport, add one or more `EncryptionRecipient::rsa_oaep` entries with recipient
 public keys, or use `recipient_aes_kw` with a shared KEK. `EncryptedDataBuilder` obtains each fresh
 content key through `CryptoProvider::fill_random` and wraps it once per recipient. The default
@@ -46,6 +51,8 @@ through explicit parameters. The legacy `rsa-oaep-mgf1p` URI fixes MGF1 to SHA-1
 `EncryptionPolicy::rsa_keys` validates every recipient modulus and exponent before provider
 dispatch. New output defaults to 2048-8192-bit RSA keys; callers can explicitly tighten or relax
 the minimum for a deployment profile, but cannot exceed the implementation ceiling.
+`validate_rsa_recipient_key` exposes that same preflight to ordered key registries, allowing them
+to skip policy-invalid candidates before committing to one without duplicating policy limits.
 Configuration validation rejects any non-SHA-1 MGF digest for the legacy URI before provider
 dispatch because its wire format cannot represent an alternative.
 AES-KW configuration similarly validates the KEK size fixed by its algorithm URI before provider
@@ -84,6 +91,13 @@ fn example(encrypted_xml: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+Callers that already parsed a containing XML document can use
+`parse_encrypted_data_node_with_policy` on the selected `roxmltree::Node`. Encryption frontends
+that inspect caller-owned templates use `parse_encrypted_data_template_node_with_policy`, which
+applies the same complete structure and metadata limits but permits empty `CipherValue`
+placeholders. Both node-oriented APIs avoid serializing a subtree and losing namespace declarations
+inherited from its ancestors.
 
 `PrivateKeyDecryptor` unwraps embedded RSA-OAEP `EncryptedKey` values and `KekDecryptor`
 unwraps AES-KW values. RSA PKCS#1 v1.5 transport, `CipherReference`, and unauthenticated external
