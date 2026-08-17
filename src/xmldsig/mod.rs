@@ -80,8 +80,8 @@ pub use parse::{
 };
 pub use sign::{
     ComputedReferenceDigest, EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriteError,
-    KeyInfoWriter, RsaSigningKey, SignContext, SigningDigestError, SigningError, SigningKey,
-    SigningKeyError, SigningPublicKeyInfo, X509CertificateKeyInfoWriter,
+    KeyInfoWriter, RsaSigningKey, SignContext, SignatureTemplateSelection, SigningDigestError,
+    SigningError, SigningKey, SigningKeyError, SigningPublicKeyInfo, X509CertificateKeyInfoWriter,
     compute_reference_digest_values, fill_reference_digest_values, validate_signing_key,
 };
 pub use signature::{

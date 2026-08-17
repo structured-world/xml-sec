@@ -49,6 +49,10 @@ element-scoped registrations to operation start-node selection and every same-do
 `scoped_any_namespace` matches one element local name across namespaces, while `scoped` matches
 one exact expanded name and uses `None` for no namespace. The registration is not stored in policy
 and never comes from document content.
+`SignContext::sign_template` selects the last descendant `Signature` template by default, preserving
+append-then-sign workflows when a document already contains signatures. Process compatibility
+boundaries that use donor document-order lookup can explicitly select
+`SignatureTemplateSelection::FirstDescendant`; `start_node_id` scopes that selection to one subtree.
 `SigningPolicy::rsa_keys` validates normalized modulus width and public exponent before provider
 dispatch. The default accepts 2048-8192-bit RSA keys for new signatures; compatibility callers can
 raise or lower the minimum explicitly, while the 8192-bit implementation ceiling cannot be relaxed.

@@ -17,8 +17,8 @@ use xml_sec::{
     xmldsig::{
         DefaultKeyResolver, DsigStatus, FailureReason, KeyInfo, KeyInfoSource, KeyInfoWriter,
         KeyResolver, KeyResolverConfig, KeyValueInfo, ReferenceResult, SignContext,
-        SignatureAlgorithm, SigningKey, UriTypeSet, VerifyContext, VerifyResult,
-        X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
+        SignatureAlgorithm, SignatureTemplateSelection, SigningKey, UriTypeSet, VerifyContext,
+        VerifyResult, X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
         uri::UriReferenceResolver, validate_signing_key, x509_certificate_matches_selectors,
     },
     xmlenc::{
@@ -656,7 +656,9 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
             .map_err(|error| CommandError::Signature(error.to_string()))?,
         )
     };
-    let mut context = SignContext::new(key.as_ref()).policy(policy);
+    let mut context = SignContext::new(key.as_ref())
+        .policy(policy)
+        .signature_template_selection(SignatureTemplateSelection::FirstDescendant);
     if let Some(id) = start_node_id {
         context = context.start_node_id(id);
     }

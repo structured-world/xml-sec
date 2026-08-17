@@ -691,12 +691,32 @@ impl SigningKey for EcdsaP384SigningKey {
     }
 }
 
+/// Select which existing XMLDSig template [`SignContext::sign_template`] signs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SignatureTemplateSelection {
+    /// Select the first descendant template in document order.
+    FirstDescendant,
+    /// Select the last descendant template, matching append-then-sign workflows.
+    #[default]
+    LastDescendant,
+}
+
+impl SignatureTemplateSelection {
+    const fn target(self) -> SigningSignatureTarget {
+        match self {
+            Self::FirstDescendant => SigningSignatureTarget::First,
+            Self::LastDescendant => SigningSignatureTarget::Last,
+        }
+    }
+}
+
 /// XMLDSig signing context.
 pub struct SignContext<'a> {
     signing_key: &'a dyn SigningKey,
     key_info_writer: Option<&'a dyn KeyInfoWriter>,
     start_node_id: Option<&'a str>,
     id_attributes: &'a [crate::IdAttributeRegistration],
+    template_selection: SignatureTemplateSelection,
     policy: crate::policy::SigningPolicy,
     provider: &'a dyn crate::provider::CryptoProvider,
 }
@@ -709,6 +729,7 @@ impl<'a> SignContext<'a> {
             key_info_writer: None,
             start_node_id: None,
             id_attributes: &[],
+            template_selection: SignatureTemplateSelection::default(),
             policy: crate::policy::SigningPolicy::default(),
             provider: crate::provider::default_provider(),
         }
@@ -735,14 +756,24 @@ impl<'a> SignContext<'a> {
         self
     }
 
-    /// Select an operation start node by ID and sign the first XMLDSig
-    /// `<Signature>` in that node's subtree.
+    /// Select an operation start node by ID and scope template selection to its subtree.
     ///
     /// [`Self::sign_with_builder`] instead uses the selected node as the append
     /// location and signs the newly appended direct `<Signature>` child.
     #[must_use]
     pub fn start_node_id(mut self, id: &'a str) -> Self {
         self.start_node_id = Some(id);
+        self
+    }
+
+    /// Select which existing `<Signature>` template [`Self::sign_template`] signs.
+    ///
+    /// The default is [`SignatureTemplateSelection::LastDescendant`], preserving
+    /// append-then-sign behavior. Compatibility boundaries that model donor
+    /// document-order lookup can explicitly select `FirstDescendant`.
+    #[must_use]
+    pub fn signature_template_selection(mut self, selection: SignatureTemplateSelection) -> Self {
+        self.template_selection = selection;
         self
     }
 
@@ -777,8 +808,12 @@ impl<'a> SignContext<'a> {
         self.policy.resources.validate_xml_document_len(xml.len())?;
         let document = parse_signing_document(xml, Some(&self.policy))
             .map_err(SigningDigestError::XmlParse)?;
-        let target_signature =
-            signing_signature_index(&document, self.start_node_id, self.id_attributes)?;
+        let target_signature = signing_signature_index(
+            &document,
+            self.start_node_id,
+            self.id_attributes,
+            self.template_selection,
+        )?;
         self.sign_template_at_index(xml, target_signature)
     }
 
@@ -1206,19 +1241,25 @@ fn signing_signature_index(
     doc: &Document<'_>,
     start_node_id: Option<&str>,
     id_attributes: &[crate::IdAttributeRegistration],
+    selection: SignatureTemplateSelection,
 ) -> Result<usize, SigningDigestError> {
     let selected = if let Some(id) = start_node_id {
         let start = signing_start_node(doc, id, id_attributes)?;
-        start
+        let mut signatures = start
             .descendants()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
-            .ok_or_else(|| {
-                SigningDigestError::InvalidStructure(format!(
-                    "selected node subtree has no Signature: {id}"
-                ))
-            })?
+            .filter(|node| node.has_tag_name((XMLDSIG_NS, "Signature")));
+        match selection.target() {
+            SigningSignatureTarget::First => signatures.next(),
+            SigningSignatureTarget::Last => signatures.next_back(),
+            SigningSignatureTarget::Index(_) => unreachable!("public selection is not indexed"),
+        }
+        .ok_or_else(|| {
+            SigningDigestError::InvalidStructure(format!(
+                "selected node subtree has no Signature: {id}"
+            ))
+        })?
     } else {
-        find_signing_signature_node(doc, SigningSignatureTarget::First)?
+        find_signing_signature_node(doc, selection.target())?
     };
     signature_index(doc, selected)
 }

@@ -470,6 +470,45 @@ fn public_digest_helpers_target_the_last_signature() {
 }
 
 #[test]
+fn sign_context_targets_the_last_signature_template_by_default() {
+    // Core callers commonly append a new template to a document that already
+    // contains signatures. The default must sign that newly appended template.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let first = template_with_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#first")
+            .transform(Transform::C14n(exclusive_c14n())),
+    );
+    let second = template_with_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#second")
+            .transform(Transform::C14n(exclusive_c14n())),
+    );
+    let with_first = append_signature_to_root(
+        "<root><payload ID=\"first\">one</payload><payload ID=\"second\">two</payload></root>",
+        &first,
+    )
+    .expect("first signature template must append");
+    let xml = append_signature_to_root(&with_first, &second)
+        .expect("second signature template must append");
+
+    let signed = SignContext::new(&private_key)
+        .sign_template(&xml)
+        .expect("last signature template must sign");
+    let document = roxmltree::Document::parse(&signed).expect("signed XML must parse");
+    let values = document
+        .descendants()
+        .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue")))
+        .map(|node| node.text().unwrap_or_default().trim().to_owned())
+        .collect::<Vec<_>>();
+
+    assert!(values[0].is_empty());
+    assert!(!values[1].is_empty());
+}
+
+#[test]
 fn computes_enveloped_signature_digest_for_whole_document() {
     // URI="" signs the full document; the enveloped transform must exclude the
     // generated Signature subtree before digesting, matching verification.
