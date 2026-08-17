@@ -204,6 +204,17 @@ impl OaepDigestAlgorithm {
         }
     }
 
+    /// Parse an XML Encryption 1.1 MGF1 URI.
+    pub fn from_mgf_uri(uri: &str) -> Option<Self> {
+        match uri {
+            "http://www.w3.org/2009/xmlenc11#mgf1sha1" => Some(Self::Sha1),
+            "http://www.w3.org/2009/xmlenc11#mgf1sha256" => Some(Self::Sha256),
+            "http://www.w3.org/2009/xmlenc11#mgf1sha384" => Some(Self::Sha384),
+            "http://www.w3.org/2009/xmlenc11#mgf1sha512" => Some(Self::Sha512),
+            _ => None,
+        }
+    }
+
     /// Return the standard digest URI.
     pub const fn uri(self) -> &'static str {
         match self {
@@ -242,6 +253,25 @@ mod tests {
                 Some(OaepDigestAlgorithm::Sha384)
             );
         }
+    }
+
+    #[test]
+    fn oaep_mgf_uris_round_trip() {
+        for algorithm in [
+            OaepDigestAlgorithm::Sha1,
+            OaepDigestAlgorithm::Sha256,
+            OaepDigestAlgorithm::Sha384,
+            OaepDigestAlgorithm::Sha512,
+        ] {
+            assert_eq!(
+                OaepDigestAlgorithm::from_mgf_uri(algorithm.mgf_uri()),
+                Some(algorithm)
+            );
+        }
+        assert_eq!(
+            OaepDigestAlgorithm::from_mgf_uri("urn:unsupported-mgf"),
+            None
+        );
     }
 }
 
@@ -584,6 +614,12 @@ pub enum XmlEncError {
     /// The XML element order or namespace is invalid for the XMLEnc profile.
     #[error("invalid encrypted structure: {0}")]
     InvalidStructure(String),
+    /// The selected operation-start node ID is absent or resolves ambiguously.
+    #[error("selected node ID is missing or ambiguous: {id}")]
+    SelectedNodeUnavailable {
+        /// Caller-supplied node identifier.
+        id: String,
+    },
     /// An algorithm URI is not supported by this build.
     #[error("unsupported encryption algorithm: {0}")]
     UnsupportedAlgorithm(String),

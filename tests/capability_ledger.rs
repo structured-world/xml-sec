@@ -1,6 +1,9 @@
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "../tools/xmlsec1/src/args.rs"]
+mod cli_args;
+
 const LEDGER_JSON: &str = include_str!("../compatibility/libxmlsec1-1.3.13.json");
 const DONOR_COMMIT: &str = include_str!("../compatibility/libxmlsec1-1.3.13-donor-commit.txt");
 
@@ -161,7 +164,7 @@ fn complete_surface_categories_are_stable() {
         "https://github.com/lsh123/xmlsec"
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
-    assert_eq!(ledger.classifications.len(), 16);
+    assert_eq!(ledger.classifications.len(), 17);
     assert_eq!(ledger.availability.len(), 427);
 
     let counts = ledger
@@ -772,52 +775,78 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
     // Commands are complete dispatch entries; individual options remain explicit
     // when their format or policy mapping has not been implemented yet.
     let ledger = ledger();
-    for command in [
-        "sign",
-        "verify",
-        "encrypt",
-        "decrypt",
-        "keys",
-        "check-transforms",
-        "check-key-data",
-    ] {
-        let item = ledger
-            .items
-            .iter()
-            .find(|item| item.kind == "cli-command" && item.name == command)
-            .unwrap_or_else(|| panic!("missing CLI command {command}"));
+    let runtime_commands: BTreeSet<_> = cli_args::Command::ALL
+        .iter()
+        .map(|command| command.canonical_name())
+        .collect();
+    for item in ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "cli-command" && !item.name.starts_with("--"))
+    {
+        assert!(
+            runtime_commands.contains(item.name.as_str()),
+            "missing runtime command {}",
+            item.name
+        );
         assert_eq!(classification(&ledger, item).outcome, "behavior-compatible");
     }
-    for option in [
-        "--aes-key",
-        "--binary-data",
-        "--crypto",
-        "--gen-key",
-        "--help",
-        "--ignore-manifests",
-        "--insecure",
-        "--node-id",
-        "--output",
-        "--pkcs8-der",
-        "--pkcs8-pem",
-        "--privkey-der",
-        "--privkey-pem",
-        "--pubkey-cert-der",
-        "--pubkey-cert-pem",
-        "--pubkey-der",
-        "--pubkey-pem",
-        "--trusted-der",
-        "--trusted-pem",
-        "--untrusted-der",
-        "--untrusted-pem",
-        "--xml-data",
-    ] {
+    let behavior_compatible = BTreeSet::from([
+        "add-id-attr",
+        "binary-data",
+        "help",
+        "id-attr",
+        "ignore-manifests",
+        "insecure",
+        "lax-key-search",
+        "node-id",
+        "output",
+        "print-crypto-library-errors",
+        "print-debug",
+        "print-xml-debug",
+        "verbose",
+        "verify-crls",
+        "xml-data",
+    ]);
+    let provider_limited = BTreeSet::from([
+        "X509-skip-strict-checks",
+        "aes-key",
+        "crypto",
+        "crypto-config",
+        "gen-key",
+        "pkcs8-der",
+        "pkcs8-pem",
+        "privkey-der",
+        "privkey-pem",
+        "pubkey-cert-der",
+        "pubkey-cert-pem",
+        "pubkey-der",
+        "pubkey-pem",
+        "pwd",
+        "trusted-der",
+        "trusted-pem",
+        "untrusted-der",
+        "untrusted-pem",
+    ]);
+    for spec in cli_args::OPTION_SPECS {
+        let option = format!("--{}", spec.canonical);
         let item = ledger
             .items
             .iter()
             .find(|item| item.kind == "cli-option" && item.name == option)
             .unwrap_or_else(|| panic!("missing CLI option {option}"));
-        assert_eq!(classification(&ledger, item).outcome, "provider-limited");
+        let expected = if behavior_compatible.contains(spec.canonical) {
+            "behavior-compatible"
+        } else if provider_limited.contains(spec.canonical) {
+            "provider-limited"
+        } else {
+            "planned"
+        };
+        assert_eq!(
+            classification(&ledger, item).outcome,
+            expected,
+            "CLI option {option} has the wrong compatibility classification"
+        );
     }
     for (status, outcome, code) in [
         ("success", "behavior-compatible", "0"),

@@ -114,18 +114,7 @@ pub fn verification_signature_metadata(
         policy.xml.allow_internal_dtd,
         policy.resources.max_xml_nodes,
     )?;
-    let signature = match start_node_id {
-        Some(id) => {
-            let start = UriReferenceResolver::with_id_registrations(&document, id_attributes)
-                .node_for_id(id)
-                .ok_or_else(|| KeyMaterialError::SelectedNodeUnavailable(id.to_owned()))?;
-            start
-                .descendants()
-                .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Signature")))
-        }
-        None => find_signature_node(&document),
-    }
-    .ok_or(KeyMaterialError::MissingSignedInfo)?;
+    let signature = select_signature(&document, start_node_id, id_attributes)?;
     let signed_info = signature
         .children()
         .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignedInfo")))
@@ -151,18 +140,7 @@ pub fn signing_signature_metadata(
         policy.xml.allow_internal_dtd,
         policy.resources.max_xml_nodes,
     )?;
-    let signature = match start_node_id {
-        Some(id) => {
-            let start = UriReferenceResolver::with_id_registrations(&document, id_attributes)
-                .node_for_id(id)
-                .ok_or_else(|| KeyMaterialError::SelectedNodeUnavailable(id.to_owned()))?;
-            start
-                .descendants()
-                .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Signature")))
-        }
-        None => find_signature_node(&document),
-    }
-    .ok_or(KeyMaterialError::MissingSignedInfo)?;
+    let signature = select_signature(&document, start_node_id, id_attributes)?;
     let algorithm_uri = signature
         .children()
         .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignedInfo")))
@@ -181,6 +159,22 @@ pub fn signing_signature_metadata(
         key_names: signature_key_names(signature),
         has_key_info: signature_key_info(signature).is_some(),
     })
+}
+
+fn select_signature<'a>(
+    document: &'a Document<'a>,
+    start_node_id: Option<&str>,
+    id_attributes: &[xml_sec::IdAttributeRegistration],
+) -> Result<roxmltree::Node<'a, 'a>, KeyMaterialError> {
+    match start_node_id {
+        Some(id) => UriReferenceResolver::with_id_registrations(document, id_attributes)
+            .node_for_id(id)
+            .ok_or_else(|| KeyMaterialError::SelectedNodeUnavailable(id.to_owned()))?
+            .descendants()
+            .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "Signature"))),
+        None => find_signature_node(document),
+    }
+    .ok_or(KeyMaterialError::MissingSignedInfo)
 }
 
 fn parse_signature_document(
@@ -269,17 +263,17 @@ pub fn load_verification_key(
 ) -> Result<VerificationKey, KeyMaterialError> {
     let path = path.as_ref();
     let bytes = read(path)?;
-    let public_key_bytes = if let Ok(text) = std::str::from_utf8(&bytes) {
-        if let Ok(spki) = parse_pem(text, "PUBLIC KEY", path) {
-            spki
-        } else if let Ok(key) = RsaPublicKey::from_pkcs1_pem(text) {
-            key.to_public_key_der()
-                .map_err(|_| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))?
-                .as_bytes()
-                .to_vec()
-        } else {
-            return Err(KeyMaterialError::UnsupportedPublicKey(path.to_owned()));
-        }
+    let pem_key = std::str::from_utf8(&bytes).ok().and_then(|text| {
+        parse_pem(text, "PUBLIC KEY", path).ok().or_else(|| {
+            RsaPublicKey::from_pkcs1_pem(text)
+                .ok()?
+                .to_public_key_der()
+                .ok()
+                .map(|der| der.as_bytes().to_vec())
+        })
+    });
+    let public_key_bytes = if let Some(pem_key) = pem_key {
+        pem_key
     } else if valid_spki(&bytes) {
         bytes
     } else if let Ok(key) = RsaPublicKey::from_pkcs1_der(&bytes) {
@@ -308,22 +302,23 @@ fn valid_spki(bytes: &[u8]) -> bool {
 pub fn load_certificate(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialError> {
     let path = path.as_ref();
     let bytes = read(path)?;
-    let der = if std::str::from_utf8(&bytes).is_ok() {
-        let (rest, pem) = x509_parser::pem::parse_x509_pem(&bytes)
-            .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
-        if !rest.iter().all(u8::is_ascii_whitespace) || pem.label != "CERTIFICATE" {
-            return Err(KeyMaterialError::InvalidCertificate(path.to_owned()));
-        }
-        pem.contents
-    } else {
-        bytes
-    };
+    let der = certificate_container_der(bytes);
     let (rest, _) = x509_parser::certificate::X509Certificate::from_der(&der)
         .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
     if !rest.is_empty() {
         return Err(KeyMaterialError::InvalidCertificate(path.to_owned()));
     }
     Ok(der)
+}
+
+fn certificate_container_der(bytes: Vec<u8>) -> Vec<u8> {
+    let pem_contents = x509_parser::pem::parse_x509_pem(&bytes)
+        .ok()
+        .and_then(|(rest, pem)| {
+            (rest.iter().all(u8::is_ascii_whitespace) && pem.label == "CERTIFICATE")
+                .then_some(pem.contents)
+        });
+    pem_contents.unwrap_or(bytes)
 }
 
 fn parse_pem(text: &str, expected_label: &str, path: &Path) -> Result<Vec<u8>, KeyMaterialError> {
@@ -469,6 +464,32 @@ mod tests {
         let error = load_verification_key(&path, SignatureAlgorithm::RsaSha256).unwrap_err();
         assert!(error.to_string().contains(path.to_str().unwrap()));
         assert!(!error.to_string().contains("in PUBLIC KEY"));
+    }
+
+    #[test]
+    fn utf8_spki_der_is_not_misclassified_as_pem() {
+        // Container detection follows successful decoding, not UTF-8 validity.
+        // This minimal unknown-algorithm SPKI is entirely ASCII/control bytes.
+        let spki = [
+            0x30, 0x0a, 0x30, 0x05, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x03, 0x01, 0x00,
+        ];
+        assert!(std::str::from_utf8(&spki).is_ok());
+        assert!(valid_spki(&spki));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("public.der");
+        fs::write(&path, spki).unwrap();
+
+        let key = load_verification_key(&path, SignatureAlgorithm::RsaSha256)
+            .expect("valid UTF-8 DER must reach the DER decoder");
+        assert_eq!(key.public_key_bytes, spki);
+    }
+
+    #[test]
+    fn utf8_non_pem_certificate_input_falls_through_to_der() {
+        // A textual byte sequence is not automatically PEM; the DER validator
+        // remains authoritative after the container probe fails.
+        let bytes = b"not a PEM container".to_vec();
+        assert_eq!(certificate_container_der(bytes.clone()), bytes);
     }
 
     #[test]

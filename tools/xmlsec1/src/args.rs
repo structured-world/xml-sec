@@ -130,9 +130,10 @@ pub(crate) enum Arity {
 
 pub(crate) struct OptionSpec {
     pub canonical: &'static str,
-    aliases: &'static [&'static str],
+    pub aliases: &'static [&'static str],
     pub arity: Arity,
     pub accepts_parameter: bool,
+    repeatability: Repeatability,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -141,318 +142,79 @@ enum Repeatability {
     Multiple,
 }
 
-impl OptionSpec {
-    fn repeatability(&self) -> Repeatability {
-        match self.canonical {
-            "keys-file" | "gen-key" | "privkey-pem" | "privkey-der" | "pkcs8-pem" | "pkcs8-der"
-            | "pubkey-pem" | "pubkey-der" | "pubkey-cert-pem" | "pubkey-cert-der"
-            | "trusted-pem" | "trusted-der" | "untrusted-pem" | "untrusted-der" | "aes-key"
-            | "hmac-key" | "enabled-key-data" | "id-attr" | "add-id-attr" | "url-map" => {
-                Repeatability::Multiple
-            }
-            _ => Repeatability::Singleton,
-        }
-    }
-}
-
 const FLAG: Arity = Arity::Flag;
 const VALUE: Arity = Arity::Value;
+const SINGLE: Repeatability = Repeatability::Singleton;
+const MULTIPLE: Repeatability = Repeatability::Multiple;
+
+macro_rules! option_spec {
+    ($canonical:literal, [$($alias:literal),* $(,)?], $arity:expr, $parameter:expr, $repeatability:expr) => {
+        OptionSpec {
+            canonical: $canonical,
+            aliases: &[$($alias),*],
+            arity: $arity,
+            accepts_parameter: $parameter,
+            repeatability: $repeatability,
+        }
+    };
+}
 
 pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
-    OptionSpec {
-        canonical: "output",
-        aliases: &["o"],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "crypto",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "crypto-config",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "verbose",
-        aliases: &[],
-        arity: FLAG,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "print-crypto-library-errors",
-        aliases: &[],
-        arity: FLAG,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "print-debug",
-        aliases: &[],
-        arity: FLAG,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "print-xml-debug",
-        aliases: &[],
-        arity: FLAG,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "repeat",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "keys-file",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "gen-key",
-        aliases: &["g"],
-        arity: VALUE,
-        accepts_parameter: true,
-    },
-    OptionSpec {
-        canonical: "privkey-pem",
-        aliases: &["privkey"],
-        arity: VALUE,
-        accepts_parameter: true,
-    },
-    OptionSpec {
-        canonical: "privkey-der",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: true,
-    },
-    OptionSpec {
-        canonical: "pkcs8-pem",
-        aliases: &["privkey-p8-pem"],
-        arity: VALUE,
-        accepts_parameter: true,
-    },
-    OptionSpec {
-        canonical: "pkcs8-der",
-        aliases: &["privkey-p8-der"],
-        arity: VALUE,
-        accepts_parameter: true,
-    },
-    OptionSpec {
-        canonical: "pubkey-pem",
-        aliases: &["pubkey"],
-        arity: VALUE,
-        accepts_parameter: true,
-    },
-    OptionSpec {
-        canonical: "pubkey-der",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: true,
-    },
-    OptionSpec {
-        canonical: "pubkey-cert-pem",
-        aliases: &["pubkey-cert"],
-        arity: VALUE,
-        accepts_parameter: true,
-    },
-    OptionSpec {
-        canonical: "pubkey-cert-der",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: true,
-    },
-    OptionSpec {
-        canonical: "trusted-pem",
-        aliases: &["trusted"],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "trusted-der",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "untrusted-pem",
-        aliases: &["untrusted"],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "untrusted-der",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "aes-key",
-        aliases: &["aeskey"],
-        arity: VALUE,
-        accepts_parameter: true,
-    },
-    OptionSpec {
-        canonical: "hmac-key",
-        aliases: &["hmackey"],
-        arity: VALUE,
-        accepts_parameter: true,
-    },
-    OptionSpec {
-        canonical: "pwd",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "enabled-key-data",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "enabled-reference-uris",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "enabled-retrieval-uris",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "enabled-cipher-reference-uris",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "ignore-manifests",
-        aliases: &[],
-        arity: FLAG,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "lax-key-search",
-        aliases: &[],
-        arity: FLAG,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "verify-keys",
-        aliases: &[],
-        arity: FLAG,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "verify-crls",
-        aliases: &[],
-        arity: FLAG,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "X509-skip-time-checks",
-        aliases: &[],
-        arity: FLAG,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "X509-skip-strict-checks",
-        aliases: &[],
-        arity: FLAG,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "insecure",
-        aliases: &[],
-        arity: FLAG,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "verification-time",
-        aliases: &["verification-gmt-time"],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "depth",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "node-id",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "node-name",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "node-xpath",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "id-attr",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: true,
-    },
-    OptionSpec {
-        canonical: "add-id-attr",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "binary-data",
-        aliases: &["binary"],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "xml-data",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "session-key",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "url-map",
-        aliases: &[],
-        arity: VALUE,
-        accepts_parameter: true,
-    },
-    OptionSpec {
-        canonical: "enable-asn1-signatures-hack",
-        aliases: &[],
-        arity: FLAG,
-        accepts_parameter: false,
-    },
-    OptionSpec {
-        canonical: "help",
-        aliases: &["h"],
-        arity: FLAG,
-        accepts_parameter: false,
-    },
+    option_spec!("output", ["o"], VALUE, false, SINGLE),
+    option_spec!("crypto", [], VALUE, false, SINGLE),
+    option_spec!("crypto-config", [], VALUE, false, SINGLE),
+    option_spec!("verbose", [], FLAG, false, SINGLE),
+    option_spec!("print-crypto-library-errors", [], FLAG, false, SINGLE),
+    option_spec!("print-debug", [], FLAG, false, SINGLE),
+    option_spec!("print-xml-debug", [], FLAG, false, SINGLE),
+    option_spec!("repeat", [], VALUE, false, SINGLE),
+    option_spec!("keys-file", [], VALUE, false, MULTIPLE),
+    option_spec!("gen-key", ["g"], VALUE, true, MULTIPLE),
+    option_spec!("privkey-pem", ["privkey"], VALUE, true, MULTIPLE),
+    option_spec!("privkey-der", [], VALUE, true, MULTIPLE),
+    option_spec!("pkcs8-pem", ["privkey-p8-pem"], VALUE, true, MULTIPLE),
+    option_spec!("pkcs8-der", ["privkey-p8-der"], VALUE, true, MULTIPLE),
+    option_spec!("pubkey-pem", ["pubkey"], VALUE, true, MULTIPLE),
+    option_spec!("pubkey-der", [], VALUE, true, MULTIPLE),
+    option_spec!("pubkey-cert-pem", ["pubkey-cert"], VALUE, true, MULTIPLE),
+    option_spec!("pubkey-cert-der", [], VALUE, true, MULTIPLE),
+    option_spec!("trusted-pem", ["trusted"], VALUE, false, MULTIPLE),
+    option_spec!("trusted-der", [], VALUE, false, MULTIPLE),
+    option_spec!("untrusted-pem", ["untrusted"], VALUE, false, MULTIPLE),
+    option_spec!("untrusted-der", [], VALUE, false, MULTIPLE),
+    option_spec!("aes-key", ["aeskey"], VALUE, true, MULTIPLE),
+    option_spec!("hmac-key", ["hmackey"], VALUE, true, MULTIPLE),
+    option_spec!("pwd", [], VALUE, false, SINGLE),
+    option_spec!("enabled-key-data", [], VALUE, false, MULTIPLE),
+    option_spec!("enabled-reference-uris", [], VALUE, false, SINGLE),
+    option_spec!("enabled-retrieval-method-uris", [], VALUE, false, SINGLE),
+    option_spec!("enabled-cipher-reference-uris", [], VALUE, false, SINGLE),
+    option_spec!("ignore-manifests", [], FLAG, false, SINGLE),
+    option_spec!("lax-key-search", [], FLAG, false, SINGLE),
+    option_spec!("verify-keys", [], FLAG, false, SINGLE),
+    option_spec!("verify-crls", [], FLAG, false, SINGLE),
+    option_spec!("X509-skip-time-checks", [], FLAG, false, SINGLE),
+    option_spec!("X509-skip-strict-checks", [], FLAG, false, SINGLE),
+    option_spec!("insecure", [], FLAG, false, SINGLE),
+    option_spec!(
+        "verification-time",
+        ["verification-gmt-time"],
+        VALUE,
+        false,
+        SINGLE
+    ),
+    option_spec!("depth", [], VALUE, false, SINGLE),
+    option_spec!("node-id", [], VALUE, false, SINGLE),
+    option_spec!("node-name", [], VALUE, false, SINGLE),
+    option_spec!("node-xpath", [], VALUE, false, SINGLE),
+    option_spec!("id-attr", [], VALUE, true, MULTIPLE),
+    option_spec!("add-id-attr", [], VALUE, false, MULTIPLE),
+    option_spec!("binary-data", ["binary"], VALUE, false, SINGLE),
+    option_spec!("xml-data", [], VALUE, false, SINGLE),
+    option_spec!("session-key", [], VALUE, false, SINGLE),
+    option_spec!("url-map", [], VALUE, true, MULTIPLE),
+    option_spec!("enable-asn1-signatures-hack", [], FLAG, false, SINGLE),
+    option_spec!("help", ["h"], FLAG, false, SINGLE),
 ];
 
 impl Invocation {
@@ -488,21 +250,32 @@ impl Invocation {
                 index += 1;
                 continue;
             }
-            let argument_text = option_text.ok_or(ParseError::NonUtf8)?;
-            let stripped = argument_text.trim_start_matches('-');
+            // libxmlsec1 distinguishes long names from short aliases by their
+            // exact prefix; accepting arbitrary leading dashes changes argv.
+            let argument_text = option_text.expect("option-shaped arguments are valid UTF-8");
+            let (stripped, alias_only) = if let Some(long) = argument_text.strip_prefix("--") {
+                (long, false)
+            } else {
+                (
+                    argument_text
+                        .strip_prefix('-')
+                        .expect("option-shaped arguments start with a dash"),
+                    true,
+                )
+            };
             let (raw_name, parameter) = stripped
                 .split_once(':')
                 .map_or((stripped, None), |(name, parameter)| {
                     (name, Some(parameter.to_owned()))
                 });
-            let name = canonical_option(raw_name)
+            let name = canonical_option(raw_name, alias_only)
                 .ok_or_else(|| ParseError::UnsupportedOption(argument_text.to_owned()))?;
             if parameter.is_some() && !option_spec(name).accepts_parameter {
                 return Err(ParseError::UnexpectedOptionParameter(
                     argument_text.to_owned(),
                 ));
             }
-            if option_spec(name).repeatability() == Repeatability::Singleton
+            if option_spec(name).repeatability == Repeatability::Singleton
                 && options.contains_key(name)
             {
                 return Err(ParseError::RepeatedOption(format!("--{name}")));
@@ -559,10 +332,16 @@ impl Invocation {
     }
 }
 
-fn canonical_option(name: &str) -> Option<&'static str> {
+fn canonical_option(name: &str, alias_only: bool) -> Option<&'static str> {
     OPTION_SPECS
         .iter()
-        .find(|spec| spec.canonical == name || spec.aliases.contains(&name))
+        .find(|spec| {
+            if alias_only {
+                name.len() == 1 && spec.aliases.contains(&name)
+            } else {
+                spec.canonical == name || (name.len() > 1 && spec.aliases.contains(&name))
+            }
+        })
         .map(|spec| spec.canonical)
 }
 
@@ -579,7 +358,7 @@ fn option_spec(name: &str) -> &'static OptionSpec {
 
 impl fmt::Display for Command {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:?}", self)
+        formatter.write_str(self.canonical_name())
     }
 }
 
@@ -703,6 +482,39 @@ mod tests {
             .is_err(),
             "only key options with named lookup semantics accept parameters"
         );
+    }
+
+    #[test]
+    fn rejects_non_donor_option_prefixes() {
+        for option in ["---output", "-output", "--o"] {
+            assert!(
+                matches!(
+                    parse(&["xmlsec1", "verify", option, "value", "input.xml"]),
+                    Err(ParseError::UnsupportedOption(rejected)) if rejected == option
+                ),
+                "unexpectedly accepted {option}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_registered_alias_resolves_to_its_canonical_option() {
+        for spec in OPTION_SPECS {
+            for alias in spec.aliases {
+                let short = alias.len() == 1;
+                assert_eq!(canonical_option(alias, short), Some(spec.canonical));
+                assert_eq!(canonical_option(alias, !short), None);
+            }
+            assert_eq!(
+                canonical_option(spec.canonical, false),
+                Some(spec.canonical)
+            );
+        }
+    }
+
+    #[test]
+    fn command_display_uses_donor_vocabulary() {
+        assert_eq!(Command::ListKeyData.to_string(), "list-key-data");
     }
 
     #[test]

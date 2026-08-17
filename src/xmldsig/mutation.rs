@@ -64,6 +64,21 @@ pub enum XmlMutationError {
     /// The selected source element cannot receive an appended signature.
     #[error("selected source element cannot receive a signature")]
     InvalidAppendTarget,
+    /// A key-info writer emitted no element child to merge.
+    #[error("key-info writer emitted no element child")]
+    EmptyKeyInfoSource,
+    /// A reusable placeholder binds a generated namespace prefix differently.
+    #[error("key-info placeholder conflicts with generated namespace prefix {prefix}")]
+    ConflictingKeyInfoNamespace {
+        /// The prefix whose namespace URI differs.
+        prefix: String,
+    },
+    /// A reusable placeholder carries a different value for a generated attribute.
+    #[error("key-info placeholder conflicts with generated attribute {name}")]
+    ConflictingKeyInfoAttribute {
+        /// The expanded-name local component of the conflicting attribute.
+        name: String,
+    },
 }
 
 /// Append a generated XMLDSig `<Signature>` template as the last child of the
@@ -148,7 +163,9 @@ pub(super) fn append_signature_to_element_with_options(
     let mut output = xml.to_owned();
     if fragment[..opening_end].trim_end().ends_with('/') {
         let slash = fragment[..opening_end]
-            .rfind('/')
+            .trim_end()
+            .strip_suffix('/')
+            .map(str::len)
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
         let name_end = fragment[1..]
             .find(|character: char| character.is_whitespace() || matches!(character, '/' | '>'))
@@ -375,7 +392,7 @@ pub(super) fn merge_key_info_source_at_index_with_options(
         })
         .collect::<Result<Vec<_>, XmlMutationError>>()?;
     if sources.is_empty() {
-        return Err(XmlMutationError::InvalidAppendTarget);
+        return Err(XmlMutationError::EmptyKeyInfoSource);
     }
 
     let generated_key_material_sources = sources
@@ -474,7 +491,9 @@ fn merge_one_key_info_source_at_index_with_options(
                             .find(|declared| declared.name() == namespace.name())
                             .ok_or(XmlMutationError::InvalidAppendTarget)?;
                         if declared.uri() != namespace.uri() {
-                            return Err(XmlMutationError::InvalidAppendTarget);
+                            return Err(XmlMutationError::ConflictingKeyInfoNamespace {
+                                prefix: prefix.to_owned(),
+                            });
                         }
                         return Ok(attributes);
                     }
@@ -504,7 +523,9 @@ fn merge_one_key_info_source_at_index_with_options(
                     });
                     if let Some(existing) = existing {
                         if existing.value() != attribute.value() {
-                            return Err(XmlMutationError::InvalidAppendTarget);
+                            return Err(XmlMutationError::ConflictingKeyInfoAttribute {
+                                name: attribute.name().to_owned(),
+                            });
                         }
                         return Ok(attributes);
                     }
@@ -1252,11 +1273,11 @@ mod tests {
     fn appends_signature_template_to_selected_empty_element() {
         // Selected builder targets may be self-closing; insertion must expand
         // the element without dropping its qualified name or attributes.
-        let source = r#"<root xmlns:s="urn:scope"><s:scope Id="selected"/></root>"#;
+        let source = r#"<root xmlns:s="urn:scope"><s:scope Id="urn:selected/item"/></root>"#;
         let document = roxmltree::Document::parse(source).expect("source must parse");
         let scope = document
             .descendants()
-            .find(|node| node.attribute("Id") == Some("selected"))
+            .find(|node| node.attribute("Id") == Some("urn:selected/item"))
             .expect("selected scope");
         let signed =
             append_signature_to_element_with_options(source, &template(1), scope.range(), None)
@@ -1272,6 +1293,7 @@ mod tests {
                 .children()
                 .any(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
         );
+        assert_eq!(scope.attribute("Id"), Some("urn:selected/item"));
     }
 
     #[test]
@@ -1537,7 +1559,10 @@ mod tests {
         let error = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect_err("conflicting namespace bindings must fail before serialization");
 
-        assert!(matches!(error, XmlMutationError::InvalidAppendTarget));
+        assert!(matches!(
+            error,
+            XmlMutationError::ConflictingKeyInfoNamespace { prefix } if prefix == "ext"
+        ));
     }
 
     #[test]
@@ -1576,7 +1601,10 @@ mod tests {
         let error = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect_err("placeholder-owned namespace conflicts must be typed");
 
-        assert!(matches!(error, XmlMutationError::InvalidAppendTarget));
+        assert!(matches!(
+            error,
+            XmlMutationError::ConflictingKeyInfoNamespace { prefix } if prefix == "ext"
+        ));
     }
 
     #[test]
@@ -1628,7 +1656,22 @@ mod tests {
         let error = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect_err("conflicting attributes must fail before serialization");
 
-        assert!(matches!(error, XmlMutationError::InvalidAppendTarget));
+        assert!(matches!(
+            error,
+            XmlMutationError::ConflictingKeyInfoAttribute { name } if name == "Id"
+        ));
+    }
+
+    #[test]
+    fn key_info_source_merge_rejects_empty_writer_output() {
+        // An empty writer result is a writer-contract violation, not a malformed
+        // signature append target, and callers need to distinguish the two.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo/></ds:Signature>"#;
+
+        let error = merge_key_info_source_at_index_with_options(source, "  ", 0, None)
+            .expect_err("a key-info writer must emit an element child");
+
+        assert!(matches!(error, XmlMutationError::EmptyKeyInfoSource));
     }
 
     #[test]

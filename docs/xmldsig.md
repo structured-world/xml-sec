@@ -53,6 +53,9 @@ and never comes from document content.
 append-then-sign workflows when a document already contains signatures. Process compatibility
 boundaries that use donor document-order lookup can explicitly select
 `SignatureTemplateSelection::FirstDescendant`; `start_node_id` scopes that selection to one subtree.
+`VerifyContext` instead requires one unique document-level `Signature` by default and rejects
+documents containing multiple candidates. Callers that intentionally consume multi-signature
+documents must choose `first_document_signature()` or scope lookup with `start_node_id()`.
 `SigningPolicy::rsa_keys` validates normalized modulus width and public exponent before provider
 dispatch. The default accepts 2048-8192-bit RSA keys for new signatures; compatibility callers can
 raise or lower the minimum explicitly, while the 8192-bit implementation ceiling cannot be relaxed.

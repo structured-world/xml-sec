@@ -77,35 +77,15 @@ xmlsec1 list-transforms
 xmlsec1 list-key-data
 ```
 
-The native binary supports sign/verify, template-preserving encrypt/decrypt,
-AES key generation, capability checks, libxmlsec1 key aliases and option syntax,
-certificate-chain embedding, stdin input, signature selection by node ID, and
-deterministic process statuses. `help-all` enumerates the same registered
-commands and options accepted by the parser; donor option multiplicity is
-enforced across canonical and alias spellings, and `--print-xml-debug` emits
-parseable operation diagnostics separately from `--output`. Named signing keys require a
-template `KeyName`, while repeatable named verification and encryption/decryption
-options form key sets from which the selected XML `KeyName` must identify exactly
-one key unless lax lookup is requested; unnamed templates still use their sole
-explicit verification or encryption key. Certificate companions are validated
-even when no output `KeyInfo` placeholder is present; embedding a chain fills an
-empty `X509Data` placeholder without discarding sibling `KeyInfo` sources.
-Populated `KeyInfo` is materialized before reference digests, allowing it to be
-signed by ID; writer attributes are merged without overwriting conflicting
-template identity. Preserved XMLEnc recipient key or certificate metadata must
-match its selected RSA wrapping key, and multi-recipient templates wrap the
-content key independently for every named or unnamed recipient without reusing
-a lax-search key across recipient slots.
-Document-supplied X.509 certificates require a caller trust anchor unless
-`--insecure` is explicit. XML payload encryption materializes inferred Element
-metadata, and direct AES keys reject templates containing recipient
-`EncryptedKey` metadata they cannot refresh. Its process tests run a minimal
-checked-in
-snapshot of the unmodified upstream DSig, Enc, and Keys runners without network
-access or a system `xmlsec1` installation.
-Unsupported algorithms, key formats, providers, and policy controls fail closed
-instead of being silently ignored. See the [CLI compatibility guide](docs/cli.md)
-for commands, examples, current format coverage, and upstream runner validation.
+The native binary covers sign/verify, template-preserving encrypt/decrypt, AES
+key generation, capability queries, donor option syntax, and deterministic
+process statuses through the same policy and provider pipelines as the library.
+Unsupported algorithms, formats, providers, and policy controls fail closed;
+document-selected certificates require explicit trust unless `--insecure` is
+chosen. Selected unmodified upstream DSig, Enc, and Keys scenarios run against
+the Rust binary without network access or a system `xmlsec1`. See the
+[CLI compatibility guide](docs/cli.md) for exact commands, formats, key lookup,
+diagnostics, and interoperability boundaries.
 
 ## XMLDSig Usage
 

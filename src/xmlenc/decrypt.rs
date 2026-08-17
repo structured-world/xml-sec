@@ -382,13 +382,9 @@ fn parse_oaep_digest(uri: Option<&str>) -> Result<OaepDigestAlgorithm, XmlEncErr
 }
 
 fn parse_oaep_mgf_digest(uri: Option<&str>) -> Result<OaepDigestAlgorithm, XmlEncError> {
-    match uri.unwrap_or("http://www.w3.org/2009/xmlenc11#mgf1sha1") {
-        "http://www.w3.org/2009/xmlenc11#mgf1sha1" => Ok(OaepDigestAlgorithm::Sha1),
-        "http://www.w3.org/2009/xmlenc11#mgf1sha256" => Ok(OaepDigestAlgorithm::Sha256),
-        "http://www.w3.org/2009/xmlenc11#mgf1sha384" => Ok(OaepDigestAlgorithm::Sha384),
-        "http://www.w3.org/2009/xmlenc11#mgf1sha512" => Ok(OaepDigestAlgorithm::Sha512),
-        unsupported => Err(XmlEncError::UnsupportedAlgorithm(unsupported.to_owned())),
-    }
+    let uri = uri.unwrap_or("http://www.w3.org/2009/xmlenc11#mgf1sha1");
+    OaepDigestAlgorithm::from_mgf_uri(uri)
+        .ok_or_else(|| XmlEncError::UnsupportedAlgorithm(uri.to_owned()))
 }
 
 fn recover_rsa_oaep(
@@ -477,11 +473,7 @@ fn decrypt_document_with_context(
         DocumentEncryptedDataSelector::StartNodeId(Some(id)) => {
             XmlIdIndex::with_registrations(&document, context.id_attributes)
                 .node(id)
-                .ok_or_else(|| {
-                    XmlEncError::InvalidStructure(format!(
-                        "selected node ID is missing or ambiguous: {id}"
-                    ))
-                })?
+                .ok_or_else(|| XmlEncError::SelectedNodeUnavailable { id: id.to_owned() })?
         }
         DocumentEncryptedDataSelector::StartNodeId(None)
         | DocumentEncryptedDataSelector::EncryptedDataId(_) => document.root(),
@@ -2434,12 +2426,12 @@ mod tests {
 
         assert!(matches!(
             context.decrypt_document_from_start_node(&document, Some("missing")),
-            Err(XmlEncError::InvalidStructure(message)) if message.contains("missing or ambiguous")
+            Err(XmlEncError::SelectedNodeUnavailable { id }) if id == "missing"
         ));
         let duplicate = document.replace("Id=\"second\"", "Id=\"first\"");
         assert!(matches!(
             context.decrypt_document_from_start_node(&duplicate, Some("first")),
-            Err(XmlEncError::InvalidStructure(message)) if message.contains("missing or ambiguous")
+            Err(XmlEncError::SelectedNodeUnavailable { id }) if id == "first"
         ));
         let ambiguous = format!(
             "<root xmlns:xenc=\"{XMLENC_NS}\"><scope Id=\"selected\">{first}{second}</scope></root>"

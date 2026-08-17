@@ -17,9 +17,10 @@ xmlsec1 list-key-data
 The binary recognizes libxmlsec1's command names and leading-dash aliases for
 `sign`, `verify`, `encrypt`, `decrypt`, `keys`, `list-transforms`,
 `check-transforms`, `list-key-data`, `check-key-data`, `help`, and `version`.
-Successful operations exit zero. Invalid arguments, unavailable capabilities,
-policy violations, invalid signatures, decryption failures, and I/O errors exit
-non-zero. Commands absent from the pinned 1.3.13 surface are not advertised;
+Successful operations exit `0`. Invalid arguments, unavailable capabilities,
+policy violations, invalid signatures, decryption failures, and I/O errors all
+exit `1`; the current CLI does not assign category-specific failure statuses.
+Commands absent from the pinned 1.3.13 surface are not advertised;
 historical `sign-tmpl` spellings are rejected instead of being routed to `sign`
 without template-generation semantics.
 
@@ -52,6 +53,10 @@ The same metadata enforces option multiplicity: key, certificate, ID-attribute,
 and key-generation options may repeat where libxmlsec1 marks them as
 multi-value; repeating singleton output, provider, payload, selector, password,
 or policy options is rejected even when canonical and alias spellings are mixed.
+Only exact donor prefixes are accepted: canonical and long alias names use `--`,
+while one-character aliases use `-`. A standalone `--` explicitly ends option
+parsing. The first positional argument also ends option parsing, so every later
+argument is positional even when it begins with `-`.
 
 ## Examples
 
@@ -234,11 +239,11 @@ PKCS#8, PKCS#12, platform crypto stores, external DTDs, implicit network access,
 and unsupported CLI policy knobs fail rather than weakening policy or falling
 back.
 
-The compatibility CLI accepts `--X509-skip-strict-checks`. libxmlsec1 uses
-that switch to lower provider security levels for legacy certificate
-signatures; RustCrypto has no corresponding provider strict mode and verifies
-every certificate signature algorithm implemented by the selected provider,
-so no additional policy relaxation is applied.
+The compatibility CLI accepts `--X509-skip-strict-checks` at the explicit donor
+boundary. libxmlsec1 uses that switch to lower provider security levels for
+legacy certificate signatures; RustCrypto has no corresponding strict mode and
+already verifies every certificate signature algorithm implemented by the
+selected provider, so no additional relaxation is applied.
 
 Filesystem arguments remain native `OsString` values, so Unix paths are not
 required to be UTF-8. Values immediately following valued options are consumed

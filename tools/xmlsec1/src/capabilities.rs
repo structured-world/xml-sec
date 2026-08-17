@@ -30,7 +30,8 @@ pub const TRANSFORMS: &[&str] = &[
     "rsa-oaep-enc11",
 ];
 
-// Key-data names describe complete CLI loading paths, not provider primitives.
+// Key-data names describe complete CLI loading/resolution paths. They do not
+// advertise `keys --gen-key` algorithms; that command has a separate registry.
 pub const KEY_DATA: &[&str] = &[
     "key-value",
     "der-encoded-key-value",
@@ -41,8 +42,20 @@ pub const KEY_DATA: &[&str] = &[
     "raw-x509-cert",
 ];
 
+pub const KEY_GENERATION_ALGORITHMS: &[(&str, usize)] =
+    &[("aes-128", 16), ("aes-192", 24), ("aes-256", 32)];
+
+pub fn generated_key_len(algorithm: &str) -> Option<usize> {
+    KEY_GENERATION_ALGORITHMS
+        .iter()
+        .find_map(|(name, bytes)| (*name == algorithm).then_some(*bytes))
+}
+
 pub fn list(label: &str, values: &[&str], output: &mut dyn Write) -> std::io::Result<()> {
     writeln!(output, "Registered {label}:")?;
+    if values.is_empty() {
+        return writeln!(output, "(none)");
+    }
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
             write!(output, ",")?;
@@ -89,5 +102,23 @@ mod tests {
     fn empty_queries_match_the_donor_vacuous_success_contract() {
         // No requested names means no missing capabilities in libxmlsec1.
         assert!(all_requested_available(TRANSFORMS, &[]));
+    }
+
+    #[test]
+    fn key_data_capabilities_are_distinct_from_generation_algorithms() {
+        assert!(KEY_DATA.contains(&"rsa"));
+        assert_eq!(generated_key_len("aes-128"), Some(16));
+        assert_eq!(generated_key_len("rsa-1024"), None);
+    }
+
+    #[test]
+    fn list_has_stable_empty_and_non_empty_representations() {
+        let mut output = Vec::new();
+        list("transforms", &[], &mut output).unwrap();
+        assert_eq!(output, b"Registered transforms:\n(none)\n");
+
+        output.clear();
+        list("transforms", &["c14n", "sha256"], &mut output).unwrap();
+        assert_eq!(output, b"Registered transforms:\n\"c14n\",\"sha256\"\n");
     }
 }

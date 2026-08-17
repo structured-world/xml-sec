@@ -381,7 +381,11 @@ impl X509CertificateKeyInfoWriter {
         Self::from_pem_chain([certificate_pem])
     }
 
-    /// Parse an ordered sequence of PEM `CERTIFICATE` blocks for `<X509Data>`.
+    /// Parse a leaf-first sequence of PEM `CERTIFICATE` blocks for `<X509Data>`.
+    ///
+    /// The first certificate must identify the signing key. Remaining issuer
+    /// certificates are emitted in caller order; this writer does not build or
+    /// validate issuer relationships because trust remains caller-owned.
     pub fn from_pem_chain<I, S>(certificate_pems: I) -> Result<Self, KeyInfoWriteError>
     where
         I: IntoIterator<Item = S>,
@@ -399,7 +403,11 @@ impl X509CertificateKeyInfoWriter {
         Self::from_der_chain([certificate_der])
     }
 
-    /// Validate and store an ordered DER certificate chain for `<X509Data>`.
+    /// Validate and store a leaf-first DER certificate chain for `<X509Data>`.
+    ///
+    /// The first certificate must identify the signing key. Remaining issuer
+    /// certificates are emitted in caller order; this writer does not build or
+    /// validate issuer relationships because trust remains caller-owned.
     pub fn from_der_chain<I, B>(certificates_der: I) -> Result<Self, KeyInfoWriteError>
     where
         I: IntoIterator<Item = B>,
@@ -936,25 +944,21 @@ impl<'a> SignContext<'a> {
             .validate_xml_document_len(templated.len())?;
         let document = parse_signing_document(&templated, Some(&self.policy))
             .map_err(SigningDigestError::XmlParse)?;
-        let target_signature = if let Some(id) = self.start_node_id {
-            let start = signing_start_node(&document, id, self.id_attributes)?;
-            let appended = start
-                .children()
-                .rfind(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
-                .ok_or(SigningDigestError::MissingElement {
-                    element: "Signature",
-                })?;
-            signature_index(&document, appended)?
+        // Nodes and ranges are document-bound: the pre-mutation parse selects
+        // the insertion range, while this post-mutation parse identifies the
+        // newly appended Signature in the resulting document.
+        let signature_parent = if let Some(id) = self.start_node_id {
+            signing_start_node(&document, id, self.id_attributes)?
         } else {
-            let appended = document
-                .root_element()
-                .children()
-                .rfind(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
-                .ok_or(SigningDigestError::MissingElement {
-                    element: "Signature",
-                })?;
-            signature_index(&document, appended)?
+            document.root_element()
         };
+        let appended = signature_parent
+            .children()
+            .rfind(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
+            .ok_or(SigningDigestError::MissingElement {
+                element: "Signature",
+            })?;
+        let target_signature = signature_index(&document, appended)?;
         self.sign_template_at_index(&templated, target_signature)
     }
 }

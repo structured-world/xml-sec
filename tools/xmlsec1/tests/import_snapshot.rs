@@ -7,13 +7,17 @@ fn project_root() -> &'static Path {
         .unwrap()
 }
 
+fn donor_tests() -> std::path::PathBuf {
+    project_root().join("donors/xmlsec/tests")
+}
+
 #[test]
 fn check_mode_detects_drift_without_replacing_the_snapshot() {
     // The CI reproducibility gate must be observational: drift fails the check
     // and leaves the candidate snapshot untouched for diagnosis.
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("snapshot");
-    let donor = project_root().join("tools/xmlsec1/tests/fixtures/upstream");
+    let donor = donor_tests();
     let script = project_root().join("scripts/import-xmlsec1-cli-fixtures.sh");
     let imported = Command::new(&script)
         .env("XMLSEC_DONOR_ROOT", &donor)
@@ -51,7 +55,7 @@ fn importer_rejects_missing_and_empty_donor_pins() {
         &script,
     )
     .unwrap();
-    let donor = project_root().join("tools/xmlsec1/tests/fixtures/upstream");
+    let donor = donor_tests();
 
     for (case, write_empty_pin) in [("missing", false), ("empty", true)] {
         let pin = compatibility.join("libxmlsec1-1.3.13-donor-commit.txt");
@@ -71,6 +75,43 @@ fn importer_rejects_missing_and_empty_donor_pins() {
             .unwrap();
         assert!(!status.success(), "{case} donor pin must fail closed");
     }
+}
+
+#[test]
+fn importer_rejects_a_checkout_at_another_revision() {
+    // A syntactically valid pin is not provenance evidence unless it equals the
+    // checkout whose bytes are copied into the committed snapshot.
+    let temp = tempfile::tempdir().unwrap();
+    let isolated_root = temp.path().join("isolated");
+    let scripts = isolated_root.join("scripts");
+    let compatibility = isolated_root.join("compatibility");
+    fs::create_dir_all(&scripts).unwrap();
+    fs::create_dir_all(&compatibility).unwrap();
+    let script = scripts.join("import-xmlsec1-cli-fixtures.sh");
+    fs::copy(
+        project_root().join("scripts/import-xmlsec1-cli-fixtures.sh"),
+        &script,
+    )
+    .unwrap();
+    fs::write(
+        compatibility.join("libxmlsec1-1.3.13-donor-commit.txt"),
+        format!("{}\n", "0".repeat(40)),
+    )
+    .unwrap();
+
+    let output = Command::new("bash")
+        .arg(script)
+        .env("XMLSEC_DONOR_ROOT", donor_tests())
+        .env("XMLSEC_FIXTURE_TARGET", temp.path().join("snapshot"))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not match pin"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(unix)]
@@ -109,10 +150,7 @@ exec /bin/mv "$@"
         std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(&inherited_path)))
             .unwrap();
     let status = Command::new(project_root().join("scripts/import-xmlsec1-cli-fixtures.sh"))
-        .env(
-            "XMLSEC_DONOR_ROOT",
-            project_root().join("tools/xmlsec1/tests/fixtures/upstream"),
-        )
+        .env("XMLSEC_DONOR_ROOT", donor_tests())
         .env("XMLSEC_FIXTURE_TARGET", &target)
         .env("MV_COUNT_FILE", temp.path().join("mv-count"))
         .env("PATH", path)

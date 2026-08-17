@@ -4251,6 +4251,22 @@ fn explicit_certificate_pins_the_verification_identity() {
             .unwrap()
             .success()
     );
+    assert_eq!(
+        Command::new(binary())
+            .arg("check-key-data")
+            .status()
+            .unwrap()
+            .code(),
+        Some(0)
+    );
+    assert_eq!(
+        Command::new(binary())
+            .args(["check-key-data", "unknown-key-data"])
+            .status()
+            .unwrap()
+            .code(),
+        Some(1)
+    );
 }
 
 #[test]

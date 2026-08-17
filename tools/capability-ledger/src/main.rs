@@ -117,6 +117,8 @@ fn main() -> Result<(), String> {
     }
 
     verify_donor(&donor)?;
+    let donor_snapshot = snapshot_donor(&donor, EXPECTED_COMMIT.trim())?;
+    verify_donor_version(donor_snapshot.path())?;
     let rules: RulesFile = serde_json::from_slice(
         &fs::read(&rules_path)
             .map_err(|error| format!("read {}: {error}", rules_path.display()))?,
@@ -126,7 +128,7 @@ fn main() -> Result<(), String> {
         return Err(format!("unsupported rules schema {}", rules.schema_version));
     }
 
-    let surface = extract_surface(&donor)?;
+    let surface = extract_surface(donor_snapshot.path())?;
     let ledger = classify(surface, rules)?;
     let mut bytes = serde_json::to_vec_pretty(&ledger).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
@@ -178,7 +180,10 @@ fn verify_donor(donor: &Path) -> Result<(), String> {
             "libxmlsec donor revision mismatch: expected {expected_commit}, got {commit}"
         ));
     }
-    verify_clean_donor(donor)?;
+    Ok(())
+}
+
+fn verify_donor_version(donor: &Path) -> Result<(), String> {
     let configure = fs::read_to_string(donor.join("configure.ac"))
         .map_err(|error| format!("read donor configure.ac: {error}"))?;
     if !configure.contains(&format!("AC_INIT([xmlsec1],[{EXPECTED_VERSION}]")) {
@@ -187,30 +192,34 @@ fn verify_donor(donor: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_clean_donor(donor: &Path) -> Result<(), String> {
+fn snapshot_donor(donor: &Path, commit: &str) -> Result<tempfile::TempDir, String> {
+    let snapshot =
+        tempfile::tempdir().map_err(|error| format!("create donor snapshot: {error}"))?;
     let output = Command::new("git")
-        .args([
-            "-C",
-            donor.to_str().ok_or("donor path is not UTF-8")?,
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-            "--ignored=matching",
-        ])
+        .args(["clone", "--quiet", "--no-checkout"])
+        .arg(donor)
+        .arg(snapshot.path())
         .output()
-        .map_err(|error| format!("inspect donor worktree: {error}"))?;
+        .map_err(|error| format!("clone donor snapshot: {error}"))?;
     if !output.status.success() {
-        return Err("cannot inspect donor worktree cleanliness".into());
-    }
-    let status =
-        String::from_utf8(output.stdout).map_err(|_| "donor worktree status is not UTF-8")?;
-    if !status.is_empty() {
         return Err(format!(
-            "libxmlsec donor worktree is not pristine:\n{}",
-            status.trim_end()
+            "clone donor snapshot: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(())
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(snapshot.path())
+        .args(["checkout", "--quiet", "--detach", commit])
+        .output()
+        .map_err(|error| format!("checkout donor snapshot: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "checkout donor snapshot: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(snapshot)
 }
 
 fn extract_surface(donor: &Path) -> Result<Vec<SurfaceItem>, String> {
@@ -1825,8 +1834,9 @@ XMLSEC_VERSION_INFO="${XMLSEC_VERSION_CURRENT}:0:0""#;
     }
 
     #[test]
-    fn donor_cleanliness_rejects_tracked_and_ignored_changes() {
-        // HEAD identity is insufficient when extraction reads worktree files.
+    fn donor_snapshot_ignores_tracked_and_generated_worktree_changes() {
+        // Extraction is commit-based: configure/build output and local edits in
+        // the caller's checkout must neither contaminate nor block the ledger.
         let directory =
             env::temp_dir().join(format!("xml-sec-ledger-dirty-donor-{}", std::process::id()));
         if directory.exists() {
@@ -1874,24 +1884,27 @@ XMLSEC_VERSION_INFO="${XMLSEC_VERSION_CURRENT}:0:0""#;
                 .unwrap()
                 .success()
         );
-        verify_clean_donor(&directory).expect("committed fixture must be clean");
-
         fs::create_dir_all(directory.join("generated")).expect("ignored fixture must be creatable");
         fs::write(directory.join("generated/header.h"), "generated\n")
             .expect("ignored fixture must be writable");
-        assert!(verify_clean_donor(&directory).is_err());
-        fs::remove_dir_all(directory.join("generated")).expect("ignored fixture must be removable");
-
         fs::write(directory.join("tracked.h"), "modified\n").expect("fixture must be writable");
-        assert!(verify_clean_donor(&directory).is_err());
-        assert!(
-            Command::new("git")
-                .args(["-C", directory.to_str().unwrap(), "add", "tracked.h"])
-                .status()
-                .unwrap()
-                .success()
+        let commit = Command::new("git")
+            .args(["-C", directory.to_str().unwrap(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let commit = String::from_utf8(commit.stdout).unwrap();
+        let snapshot = snapshot_donor(&directory, commit.trim())
+            .expect("dirty caller checkout must produce an immutable commit snapshot");
+        assert_eq!(
+            fs::read_to_string(snapshot.path().join("tracked.h")).unwrap(),
+            "original\n"
         );
-        assert!(verify_clean_donor(&directory).is_err());
+        assert!(!snapshot.path().join("generated").exists());
+        assert_eq!(
+            fs::read_to_string(directory.join("tracked.h")).unwrap(),
+            "modified\n"
+        );
+        assert!(directory.join("generated/header.h").exists());
         fs::remove_dir_all(directory).expect("donor fixture must be removable");
     }
 

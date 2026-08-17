@@ -69,5 +69,8 @@ fn unmodified_enc_runner_round_trips_aes_gcm() {
 
 #[test]
 fn unmodified_keys_runner_generates_aes_key_store() {
+    // The complete donor script is retained byte-for-byte, but this test claims
+    // only the selected AES generation scenario. `check-key-data rsa` describes
+    // RSA loading/resolution and does not imply `keys --gen-key rsa-*` support.
     let _ = run_upstream("testKeys.sh", "test-aes128");
 }
