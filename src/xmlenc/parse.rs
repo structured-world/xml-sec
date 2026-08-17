@@ -46,7 +46,7 @@ pub fn parse_encrypted_data_node_with_policy(
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
-    validate_node_document_len(node, &policy.resources)?;
+    validate_node_document_resources(node, &policy.resources)?;
     parse_encrypted_data_node(node, policy, false)
 }
 
@@ -60,17 +60,27 @@ pub fn parse_encrypted_data_template_node_with_policy(
     policy: &crate::policy::EncryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
-    validate_node_document_len(node, &policy.resources)?;
+    validate_node_document_resources(node, &policy.resources)?;
     parse_encrypted_data_node(node, policy, true)
 }
 
-fn validate_node_document_len(
+fn validate_node_document_resources(
     node: Node<'_, '_>,
     resources: &crate::policy::ResourcePolicy,
 ) -> Result<(), XmlEncError> {
     resources
         .validate_xml_document_len(node.document().input_text().len())
-        .map_err(XmlEncError::from)
+        .map_err(XmlEncError::from)?;
+    let actual = node.document().root().descendants().count();
+    if actual > resources.max_xml_nodes {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "XML document nodes",
+            maximum: resources.max_xml_nodes,
+            actual,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn parse_encrypted_data_node(
@@ -778,6 +788,58 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    #[test]
+    fn node_parsers_enforce_the_containing_document_node_limit() {
+        // A selected EncryptedData subtree must not hide sibling nodes from the
+        // immutable resource policy supplied for the containing document.
+        let containing = format!("<root>{}<payload/></root>", DATA);
+        let document = Document::parse(&containing).expect("containing document must parse");
+        let encrypted_data = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLENC_NS, "EncryptedData")))
+            .expect("selected EncryptedData");
+        let actual_nodes = document.root().descendants().count();
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_nodes: actual_nodes - 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let decryption = crate::policy::DecryptionPolicy {
+            resources: resources.clone(),
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        let encryption = crate::policy::EncryptionPolicy {
+            resources,
+            ..crate::policy::EncryptionPolicy::default()
+        };
+
+        for result in [
+            parse_encrypted_data_node_with_policy(encrypted_data, &decryption),
+            parse_encrypted_data_template_node_with_policy(encrypted_data, &encryption),
+        ] {
+            assert!(matches!(
+                result,
+                Err(XmlEncError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "XML document nodes",
+                        maximum,
+                        actual,
+                    }
+                )) if maximum == actual_nodes - 1 && actual == actual_nodes
+            ));
+        }
+
+        let exact_resources = crate::policy::ResourcePolicy {
+            max_xml_nodes: actual_nodes,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let exact_policy = crate::policy::DecryptionPolicy {
+            resources: exact_resources,
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        parse_encrypted_data_node_with_policy(encrypted_data, &exact_policy)
+            .expect("a document exactly at the node ceiling must parse");
     }
 
     #[test]

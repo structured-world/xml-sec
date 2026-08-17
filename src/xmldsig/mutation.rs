@@ -378,25 +378,33 @@ pub(super) fn merge_key_info_source_at_index_with_options(
         return Err(XmlMutationError::InvalidAppendTarget);
     }
 
-    let generated_key_sources = sources
+    let generated_key_material_sources = sources
         .iter()
         .filter(|(namespace, name, _)| is_cryptographic_key_info_source(namespace.as_deref(), name))
         .map(|(namespace, name, _)| (namespace.as_deref(), name.as_str()))
         .collect::<Vec<_>>();
+    let generated_key_name = sources
+        .iter()
+        .any(|(namespace, name, _)| is_dsig_key_name(namespace.as_deref(), name));
     let mut output = xml.to_owned();
-    if !generated_key_sources.is_empty() {
-        // Writer-provided cryptographic identity is authoritative. Retaining a
-        // populated template source could make a resolver select a stale key;
-        // selection metadata and extension elements remain untouched.
+    if !generated_key_material_sources.is_empty() || generated_key_name {
+        // Writer-provided identity is authoritative within its own group.
+        // Generated key material replaces stale material, while KeyName is
+        // replaced only by a generated KeyName; extension elements remain.
         let mut stale_ranges = key_info
             .children()
             .filter(|node| node.is_element())
             .filter(|node| {
-                is_cryptographic_key_info_source(
-                    node.tag_name().namespace(),
-                    node.tag_name().name(),
-                ) && has_cryptographic_identity_content(*node)
-                    && !is_matching_empty_placeholder(*node, &generated_key_sources)
+                let replaces_key_material = !generated_key_material_sources.is_empty()
+                    && is_cryptographic_key_info_source(
+                        node.tag_name().namespace(),
+                        node.tag_name().name(),
+                    );
+                let replaces_key_name = generated_key_name
+                    && is_dsig_key_name(node.tag_name().namespace(), node.tag_name().name());
+                (replaces_key_material || replaces_key_name)
+                    && has_cryptographic_identity_content(*node)
+                    && !is_matching_empty_placeholder(*node, &generated_key_material_sources)
             })
             .map(|node| node.range())
             .collect::<Vec<_>>();
@@ -647,6 +655,10 @@ fn has_cryptographic_identity_content(node: roxmltree::Node<'_, '_>) -> bool {
         return true;
     }
     match (node.tag_name().namespace(), node.tag_name().name()) {
+        (Some(XMLDSIG_NS), "KeyName") => node
+            .children()
+            .filter_map(|child| child.text())
+            .any(|text| !is_xml_whitespace_only(text)),
         (Some(XMLDSIG_NS), "RetrievalMethod") => node.attribute("URI").is_some(),
         (Some("http://www.w3.org/2009/xmldsig11#"), "DEREncodedKeyValue") => node
             .children()
@@ -667,6 +679,10 @@ fn is_cryptographic_key_info_source(namespace: Option<&str>, name: &str) -> bool
             "DEREncodedKeyValue" | "KeyInfoReference"
         )
     )
+}
+
+fn is_dsig_key_name(namespace: Option<&str>, name: &str) -> bool {
+    namespace == Some(XMLDSIG_NS) && name == "KeyName"
 }
 
 fn element_inner_xml(xml: &str, range: Range<usize>) -> Result<&str, XmlMutationError> {
@@ -1457,6 +1473,26 @@ mod tests {
                 .iter()
                 .any(|source| source.text() == Some("\u{00a0}"))
         );
+    }
+
+    #[test]
+    fn key_info_source_merge_replaces_populated_key_name_identity() {
+        // A generated key name is authoritative identity metadata. Retaining a
+        // populated template value would let document-order resolvers select it.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo><ds:KeyName>stale</ds:KeyName></ds:KeyInfo></ds:Signature>"#;
+        let generated =
+            r#"<ds:KeyName xmlns:ds="http://www.w3.org/2000/09/xmldsig#">generated</ds:KeyName>"#;
+
+        let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect("generated KeyName must replace stale template identity");
+        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let key_names = document
+            .descendants()
+            .filter(|node| node.has_tag_name((XMLDSIG_NS, "KeyName")))
+            .filter_map(|node| node.text())
+            .collect::<Vec<_>>();
+
+        assert_eq!(key_names, ["generated"]);
     }
 
     #[test]

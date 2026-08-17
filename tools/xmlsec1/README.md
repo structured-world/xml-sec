@@ -56,8 +56,9 @@ element-scoped `--id-attr[:ATTR] [NAMESPACE-URI:]ELEMENT`; the same
 registrations drive Reference resolution and XMLEnc operation selection. An
 unqualified element name matches its local name in any namespace; an explicit
 namespace component restricts the match to that expanded name.
-Output paths support the upstream `{inputfile}` basename template, and `--gen-key[:name]`
-emits both named and unnamed AES key-store entries. `help-all` is generated from
+Output paths support the upstream `{inputfile}` basename template. `--gen-key`
+emits one unnamed AES key-store entry, while `--gen-key:<name>` emits one named
+entry. `help-all` is generated from
 the parser registry. Named signing keys require a template `KeyName`; named
 verification and encryption/decryption options form key sets and require the
 selected XML `KeyName` to identify exactly one entry, unless lax lookup is
