@@ -6,6 +6,7 @@ use std::{
 };
 
 use base64::Engine as _;
+use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
     pkcs8::{
@@ -131,6 +132,103 @@ fn signs_verifies_and_rejects_tampering_through_process_api() {
         .unwrap();
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("invalid"));
+}
+
+#[test]
+fn verification_without_a_selector_uses_the_first_signature() {
+    // libxmlsec1 treats the document root as the operation start node and verifies
+    // its first descendant Signature rather than imposing global cardinality.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("multiple-signatures.xml");
+    let signed = temp.path().join("signed.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(
+        &template,
+        format!(
+            "<root>{}<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"/></root>",
+            signature_template_without_key_info()
+        ),
+    )
+    .unwrap();
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
+fn binary_encryption_round_trips_a_custom_type_uri() {
+    // Custom Type URIs classify opaque application data, so binary mode must
+    // preserve the URI and reciprocal decryption must return the original bytes.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("custom-type.xml");
+    let plaintext = temp.path().join("payload.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let key = temp.path().join("content.key");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="urn:example:opaque"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"opaque application bytes").unwrap();
+    fs::write(&key, [0x57_u8; 16]).unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    assert!(
+        fs::read_to_string(&encrypted)
+            .unwrap()
+            .contains("Type=\"urn:example:opaque\"")
+    );
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--aes-key"])
+        .arg(&key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"opaque application bytes");
 }
 
 #[test]
@@ -4486,6 +4584,41 @@ fn multiple_signing_keys_require_the_matching_template_name() {
         lax.status.success(),
         "{}",
         String::from_utf8_lossy(&lax.stderr)
+    );
+}
+
+#[test]
+fn lax_signing_skips_keys_rejected_by_the_signing_policy() {
+    // Lax lookup is an ordered search for a usable key, not permission to select
+    // a weak key and fail before trying a later policy-compliant candidate.
+    let temp = tempfile::tempdir().unwrap();
+    let weak_key_path = temp.path().join("rsa-1024.pem");
+    let weak_key = RsaPrivateKey::new(&mut ChaCha8Rng::from_seed([0x71; 32]), 1024).unwrap();
+    fs::write(
+        &weak_key_path,
+        weak_key
+            .to_pkcs8_pem(Default::default())
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let compliant_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+
+    let signed = Command::new(binary())
+        .args(["sign", "--lax-key-search", "--privkey-pem:weak"])
+        .arg(&weak_key_path)
+        .args(["--privkey-pem:compliant"])
+        .arg(&compliant_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
     );
 }
 

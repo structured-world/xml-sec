@@ -134,10 +134,17 @@ impl EncryptedDataBuilder {
             .map(|generated| generated.result)
     }
 
-    /// Encrypt opaque bytes without an XML `Type` attribute.
+    /// Encrypt opaque bytes, preserving a configured non-XML `Type` hint.
+    ///
+    /// Element and Content are XML replacement semantics and are omitted from
+    /// binary output. Any other URI remains application metadata.
     pub fn encrypt_binary(&self, data: &[u8]) -> Result<EncryptionResult, XmlEncError> {
         self.policy.validate()?;
-        self.encrypt_payload(data, None)
+        let encrypted_type = match &self.encrypted_type {
+            EncryptedDataType::Other(uri) => Some(EncryptedDataType::Other(uri.clone())),
+            EncryptedDataType::Element | EncryptedDataType::Content => None,
+        };
+        self.encrypt_payload(data, encrypted_type)
             .map(|generated| generated.result)
     }
 
@@ -287,11 +294,6 @@ impl EncryptedDataBuilder {
                 algorithm: self.algorithm.to_string(),
             }
             .into());
-        }
-        if matches!(self.encrypted_type, EncryptedDataType::Other(_)) {
-            return Err(XmlEncError::InvalidEncryptionConfig(
-                "Other Type hints are not valid for XML encryption".into(),
-            ));
         }
         if self.recipients.len() > self.policy.resources.max_encryption_recipients {
             return Err(XmlEncError::TooManyRecipients {
@@ -1400,6 +1402,23 @@ mod tests {
                 Err(XmlEncError::DocumentTooLarge { .. })
             ));
         }
+    }
+
+    #[test]
+    fn binary_encryption_preserves_an_opaque_type_hint() {
+        // A non-XML Type URI describes opaque application bytes. It must survive
+        // binary encryption so decryption can continue returning byte content.
+        let result = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .encryption_type(EncryptedDataType::Other("urn:example:binary".into()))
+            .direct_key([0x42_u8; 16])
+            .encrypt_binary(b"opaque payload")
+            .expect("opaque binary Type must be accepted");
+
+        assert!(
+            result
+                .encrypted_data_xml
+                .contains("Type=\"urn:example:binary\"")
+        );
     }
 
     #[test]

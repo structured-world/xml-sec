@@ -100,6 +100,10 @@ fn parse_encrypted_data_node(
     allow_empty_cipher_values: bool,
 ) -> Result<EncryptedData, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedData")?;
+    // MimeType and Encoding are preserved lexically by template mutation even
+    // though the cryptographic model does not interpret them.
+    bounded_attribute(node, "MimeType", "EncryptedData MimeType", policy)?;
+    bounded_attribute(node, "Encoding", "EncryptedData Encoding", policy)?;
     let mut children = element_children(node);
     let encryption_method = parse_encryption_method_with_limit(
         next_required(&mut children, "EncryptionMethod")?,
@@ -1283,6 +1287,14 @@ mod tests {
         let oversized = "x".repeat(65);
         for xml in [
             DATA.replace("<xenc:EncryptedData ", &format!("<xenc:EncryptedData Id=\"{oversized}\" ")),
+            DATA.replace(
+                "<xenc:EncryptedData ",
+                &format!("<xenc:EncryptedData MimeType=\"{oversized}\" "),
+            ),
+            DATA.replace(
+                "<xenc:EncryptedData ",
+                &format!("<xenc:EncryptedData Encoding=\"{oversized}\" "),
+            ),
             DATA.replace(
                 "<xenc:CipherData>",
                 &format!("<ds:KeyInfo xmlns:ds=\"{XMLDSIG_NS}\"><ds:KeyName>{oversized}</ds:KeyName></ds:KeyInfo><xenc:CipherData>"),

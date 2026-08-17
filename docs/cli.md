@@ -77,13 +77,16 @@ without `KeyInfo`. Named signing keys
 require a matching template `KeyName` even when only one key is supplied. A
 named key with no template `KeyName` fails unless `--lax-key-search` explicitly
 opts out of lookup. Verification and encryption instead leave a `KeyName`-less
-template unconstrained when one explicit key is supplied.
+template unconstrained when one explicit key is supplied. Lax signing continues
+past malformed, algorithm-incompatible, or policy-rejected keys until it finds a
+usable candidate; it never weakens the compiled signing policy.
 
-Verification accepts `-` as the conventional stdin marker. For documents with
-multiple signatures, `--node-id <id>` selects an ID-bearing start node and
-verifies the first descendant `Signature` in document order, matching
-libxmlsec1's depth-first `xmlSecFindNode` selection; missing and duplicate IDs
-fail closed. The standard `ID`, `Id`, and `id` local names are recognized whether
+Verification accepts `-` as the conventional stdin marker. Verification starts
+at the document root and uses the first descendant `Signature` in document order.
+For documents with multiple operation subtrees, `--node-id <id>` moves that start
+node and verifies its first descendant `Signature`, matching libxmlsec1's
+depth-first `xmlSecFindNode` selection; missing and duplicate IDs fail closed.
+The standard `ID`, `Id`, and `id` local names are recognized whether
 unqualified or namespace-qualified, including `wsu:Id` and `xml:id`. Signing
 applies the same start-node contract and mutates only the
 selected template's digest, signature, and optional key-info placeholders.

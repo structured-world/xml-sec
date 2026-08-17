@@ -17,9 +17,9 @@ use xml_sec::{
     xmldsig::{
         DefaultKeyResolver, DsigStatus, FailureReason, KeyInfo, KeyInfoSource, KeyInfoWriter,
         KeyResolver, KeyResolverConfig, KeyValueInfo, ReferenceResult, SignContext,
-        SignatureAlgorithm, SigningKey, SigningPublicKeyInfo, UriTypeSet, VerifyContext,
-        VerifyResult, X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
-        uri::UriReferenceResolver, x509_certificate_matches_selectors,
+        SignatureAlgorithm, SigningKey, UriTypeSet, VerifyContext, VerifyResult,
+        X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
+        uri::UriReferenceResolver, validate_signing_key, x509_certificate_matches_selectors,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
@@ -618,8 +618,12 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     let id_attributes = id_attribute_registrations(invocation)?;
     let signature =
         key_material::signing_signature_metadata(&xml, start_node_id, &id_attributes, &policy)?;
-    let (key_option, certificate_is_der, key) =
-        select_signing_key(invocation, &signature.key_names, signature.algorithm)?;
+    let (key_option, certificate_is_der, key) = select_signing_key(
+        invocation,
+        &signature.key_names,
+        signature.algorithm,
+        &policy,
+    )?;
     let value = key_option.value.as_deref().unwrap_or_default();
     let (_, certificate_paths) = split_key_and_certificates(value)?;
     let mut certificate_budget =
@@ -701,6 +705,7 @@ fn select_signing_key<'a>(
     invocation: &'a Invocation,
     requested_names: &[String],
     algorithm: SignatureAlgorithm,
+    policy: &SigningPolicy,
 ) -> Result<(&'a crate::OptionValue, bool, Box<dyn SigningKey>), CommandError> {
     let keys = invocation
         .ordered_values(&["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"])
@@ -721,40 +726,24 @@ fn select_signing_key<'a>(
         false,
         "private key",
     )?;
-    let mut last_error = None;
+    let mut last_error: Option<CommandError> = None;
     for (option, certificate_is_der) in candidates {
         let (path, _) = split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
-        match key_material::load_signing_key(path) {
-            Ok(key) if signing_key_supports(key.as_ref(), algorithm) => {
-                return Ok((option, certificate_is_der, key));
-            }
-            Ok(_) => {}
+        match key_material::load_signing_key(path).map_err(CommandError::from) {
+            Ok(key) => match validate_signing_key(key.as_ref(), algorithm, policy) {
+                Ok(()) => return Ok((option, certificate_is_der, key)),
+                Err(error) => last_error = Some(CommandError::Signature(error.to_string())),
+            },
             Err(error) => last_error = Some(error),
         }
     }
     if let Some(error) = last_error {
-        return Err(error.into());
+        return Err(error);
     }
     Err(CommandError::Usage(format!(
         "no private key input supports {}",
         algorithm.uri()
     )))
-}
-
-fn signing_key_supports(key: &dyn SigningKey, algorithm: SignatureAlgorithm) -> bool {
-    matches!(
-        (key.public_key_info(), algorithm),
-        (
-            Ok(SigningPublicKeyInfo::Rsa { .. }),
-            SignatureAlgorithm::RsaSha1
-                | SignatureAlgorithm::RsaSha256
-                | SignatureAlgorithm::RsaSha384
-                | SignatureAlgorithm::RsaSha512
-        ) | (
-            Ok(SigningPublicKeyInfo::Ec { .. }),
-            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384
-        )
-    )
 }
 
 fn split_key_and_certificates(value: &OsStr) -> Result<(&OsStr, Vec<&OsStr>), CommandError> {
@@ -1062,7 +1051,7 @@ fn verification_context<'a>(
         .id_attributes(id_attributes);
     match start_node_id {
         Some(id) => context.start_node_id(id),
-        None => context,
+        None => context.first_document_signature(),
     }
 }
 
@@ -1149,7 +1138,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let metadata = encryption_template(&template, start_node_id, &id_attributes, &policy)?;
     let algorithm = metadata.algorithm;
     let encrypted_type = metadata.encrypted_type;
-    let explicit_encrypted_type = metadata.explicit_encrypted_type;
+    let explicit_xml_type = metadata.explicit_xml_type;
     let mut builder = EncryptedDataBuilder::new(algorithm).policy(policy.clone());
     let aes_keys = invocation.values("aes-key").collect::<Vec<_>>();
     let public_keys = invocation
@@ -1255,15 +1244,17 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                 let path = option.value.as_deref().unwrap_or_default();
                 let loaded = if certificate {
                     key_material::load_rsa_certificate_public(path).map(
-                        |(public_key, certificate_der)| RecipientPublicKey {
+                        |(public_key, certificate_der)| RecipientPublicKeyCandidate {
                             public_key,
                             certificate_der: Some(certificate_der),
                         },
                     )
                 } else {
-                    key_material::load_rsa_public(path).map(|public_key| RecipientPublicKey {
-                        public_key,
-                        certificate_der: None,
+                    key_material::load_rsa_public(path).map(|public_key| {
+                        RecipientPublicKeyCandidate {
+                            public_key,
+                            certificate_der: None,
+                        }
                     })
                 };
                 match loaded.map_err(CommandError::from).and_then(|key| {
@@ -1271,7 +1262,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                     Ok(key)
                 }) {
                     Ok(key) => {
-                        selected = Some((option, certificate, key));
+                        selected = Some((option, certificate, key.public_key));
                         break;
                     }
                     Err(error) => last_error = Some(error),
@@ -1303,7 +1294,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             selected_recipients.push((public_key, template_recipient.oaep_parameters, key_name));
         }
         for (public_key, parameters, key_name) in selected_recipients {
-            let mut recipient = EncryptionRecipient::rsa_oaep(public_key.public_key);
+            let mut recipient = EncryptionRecipient::rsa_oaep(public_key);
             if let Some(parameters) = parameters {
                 recipient = recipient.oaep_parameters(parameters);
             }
@@ -1319,7 +1310,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     }
     builder = builder.encryption_type(encrypted_type.clone());
     let result = if let Some(path) = invocation.last_value("binary-data") {
-        if explicit_encrypted_type {
+        if explicit_xml_type {
             return Err(CommandError::Usage(
                 "--binary-data cannot be used with an XML Element or Content template Type".into(),
             ));
@@ -1441,7 +1432,7 @@ fn write_debug_transform(
     writeln!(stdout, "</{container}>").map_err(stdout_error)
 }
 
-struct RecipientPublicKey {
+struct RecipientPublicKeyCandidate {
     public_key: RsaPublicKey,
     certificate_der: Option<Vec<u8>>,
 }
@@ -1482,7 +1473,7 @@ fn recipient_key_metadata(
 
 fn validate_recipient_key_metadata(
     metadata: Option<&KeyInfo>,
-    selected_key: &RecipientPublicKey,
+    selected_key: &RecipientPublicKeyCandidate,
 ) -> Result<(), CommandError> {
     if let Some(metadata) = metadata {
         for source in &metadata.sources {
@@ -2286,7 +2277,7 @@ fn decrypt_input(
 struct EncryptionTemplateMetadata {
     algorithm: DataEncryptionAlgorithm,
     encrypted_type: EncryptedDataType,
-    explicit_encrypted_type: bool,
+    explicit_xml_type: bool,
     has_encrypted_key_recipient: bool,
     content_key_name: Option<String>,
     recipients: Vec<EncryptionTemplateRecipient>,
@@ -2312,15 +2303,14 @@ fn encryption_template(
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
     let algorithm = DataEncryptionAlgorithm::from_uri(&parsed.encryption_method.algorithm)
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
-    let explicit_encrypted_type = encrypted_data.attribute("Type").is_some();
+    let explicit_xml_type = matches!(
+        parsed.encrypted_type,
+        Some(EncryptedDataType::Element | EncryptedDataType::Content)
+    );
     let encrypted_type = match parsed.encrypted_type {
         None | Some(EncryptedDataType::Element) => EncryptedDataType::Element,
         Some(EncryptedDataType::Content) => EncryptedDataType::Content,
-        Some(EncryptedDataType::Other(other)) => {
-            return Err(CommandError::Encryption(format!(
-                "unsupported EncryptedData Type: {other}"
-            )));
-        }
+        Some(EncryptedDataType::Other(other)) => EncryptedDataType::Other(other),
     };
     let recipients = parsed
         .encrypted_keys
@@ -2335,7 +2325,7 @@ fn encryption_template(
     Ok(EncryptionTemplateMetadata {
         algorithm,
         encrypted_type,
-        explicit_encrypted_type,
+        explicit_xml_type,
         has_encrypted_key_recipient: !recipients.is_empty(),
         content_key_name: parsed.key_name,
         recipients,

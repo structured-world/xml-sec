@@ -220,6 +220,18 @@ impl Default for UriTypeSet {
     }
 }
 
+/// Request-scoped selection of the XMLDSig operation node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SignatureSelection<'a> {
+    /// Require exactly one `Signature` in the complete document.
+    #[default]
+    UniqueDocumentSignature,
+    /// Select the first descendant `Signature` from the document root.
+    FirstDocumentSignature,
+    /// Select the first descendant `Signature` below the element with this ID.
+    FirstSignatureUnderId(&'a str),
+}
+
 /// Verification builder/configuration.
 #[must_use = "configure the context and call verify(), or store it for reuse"]
 pub struct VerifyContext<'a> {
@@ -229,7 +241,7 @@ pub struct VerifyContext<'a> {
     provider: &'a dyn crate::provider::CryptoProvider,
     store_pre_digest: bool,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
-    start_node_id: Option<&'a str>,
+    signature_selection: SignatureSelection<'a>,
     id_attributes: &'a [crate::IdAttributeRegistration],
 }
 
@@ -250,7 +262,7 @@ impl<'a> VerifyContext<'a> {
             provider: crate::provider::default_provider(),
             store_pre_digest: false,
             external_resources: None,
-            start_node_id: None,
+            signature_selection: SignatureSelection::UniqueDocumentSignature,
             id_attributes: &[],
         }
     }
@@ -354,7 +366,16 @@ impl<'a> VerifyContext<'a> {
     /// order. This is request context, not a policy decision, and mirrors
     /// libxmlsec1's depth-first `xmlSecFindNode` start-node contract.
     pub fn start_node_id(mut self, id: &'a str) -> Self {
-        self.start_node_id = Some(id);
+        self.signature_selection = SignatureSelection::FirstSignatureUnderId(id);
+        self
+    }
+
+    /// Select the first descendant `<Signature>` from the document root.
+    ///
+    /// This is the libxmlsec1 command-line operation-root contract. The library
+    /// default remains fail-closed and requires a unique document signature.
+    pub fn first_document_signature(mut self) -> Self {
+        self.signature_selection = SignatureSelection::FirstDocumentSignature;
         self
     }
 
@@ -1032,18 +1053,21 @@ fn verify_signature_with_context(
         None => resolver,
     };
     let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
-    let start_node = match ctx.start_node_id {
-        Some(id) => resolver.node_for_id(id).ok_or_else(|| {
-            SignatureVerificationPipelineError::SelectedNodeUnavailable { id: id.to_owned() }
-        })?,
-        None => doc.root(),
+    let start_node = match ctx.signature_selection {
+        SignatureSelection::FirstSignatureUnderId(id) => {
+            resolver.node_for_id(id).ok_or_else(|| {
+                SignatureVerificationPipelineError::SelectedNodeUnavailable { id: id.to_owned() }
+            })?
+        }
+        SignatureSelection::UniqueDocumentSignature
+        | SignatureSelection::FirstDocumentSignature => doc.root(),
     };
     let mut signatures = start_node.descendants().filter(|node| {
         node.is_element()
             && node.tag_name().name() == "Signature"
             && node.tag_name().namespace() == Some(XMLDSIG_NS)
     });
-    let signature_node = match (signatures.next(), ctx.start_node_id) {
+    let signature_node = match (signatures.next(), ctx.signature_selection) {
         (None, _) => {
             return Err(SignatureVerificationPipelineError::MissingElement {
                 element: "Signature",
@@ -1052,9 +1076,17 @@ fn verify_signature_with_context(
         // libxmlsec1 treats --node-id as an operation start node and performs
         // a depth-first xmlSecFindNode lookup from there. Without a selector,
         // the library API retains its fail-closed document-wide cardinality.
-        (Some(node), Some(_)) => node,
-        (Some(node), None) if signatures.next().is_none() => node,
-        (Some(_), None) => {
+        (
+            Some(node),
+            SignatureSelection::FirstDocumentSignature
+            | SignatureSelection::FirstSignatureUnderId(_),
+        ) => node,
+        (Some(node), SignatureSelection::UniqueDocumentSignature)
+            if signatures.next().is_none() =>
+        {
+            node
+        }
+        (Some(_), SignatureSelection::UniqueDocumentSignature) => {
             return Err(SignatureVerificationPipelineError::InvalidStructure {
                 reason: "Signature must appear exactly once in document",
             });

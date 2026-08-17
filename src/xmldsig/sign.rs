@@ -227,6 +227,18 @@ impl SigningPublicKeyInfo {
     }
 }
 
+/// Validate that a key can produce the requested algorithm under `policy`.
+///
+/// Key registries can use this preflight before selecting a candidate, ensuring
+/// lax ordered searches skip keys that the signing operation would reject.
+pub fn validate_signing_key(
+    key: &dyn SigningKey,
+    algorithm: SignatureAlgorithm,
+    policy: &crate::policy::SigningPolicy,
+) -> Result<(), SigningError> {
+    expected_signature_output_len(key, algorithm, policy).map(|_| ())
+}
+
 fn expected_signature_output_len(
     key: &dyn SigningKey,
     algorithm: SignatureAlgorithm,
