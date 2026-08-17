@@ -22,7 +22,7 @@ pub(super) fn parse_encrypted_data_with_policy(
     xml: &str,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
-    policy.resources.validate()?;
+    policy.validate()?;
     policy.resources.validate_xml_document_len(xml.len())?;
     let document = Document::parse_with_options(
         xml,
@@ -32,7 +32,7 @@ pub(super) fn parse_encrypted_data_with_policy(
             entity_resolver: None,
         },
     )?;
-    parse_encrypted_data_node_with_policy(document.root_element(), policy)
+    parse_encrypted_data_node(document.root_element(), policy, false)
 }
 
 /// Parse a selected `xenc:EncryptedData` node under an immutable policy snapshot.
@@ -40,13 +40,14 @@ pub(super) fn parse_encrypted_data_with_policy(
 /// This is the node-oriented counterpart to [`parse_encrypted_data`]. It lets
 /// callers that already parsed a containing document validate the complete
 /// encrypted-data structure without serializing the selected subtree and losing
-/// namespace declarations inherited from its ancestors.
+/// namespace declarations inherited from its ancestors. The containing source
+/// document is reparsed because [`Node`] does not expose its parser provenance.
 pub fn parse_encrypted_data_node_with_policy(
     node: Node<'_, '_>,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
-    validate_node_document_resources(node, &policy.resources)?;
+    validate_node_document_policy(node, policy)?;
     parse_encrypted_data_node(node, policy, false)
 }
 
@@ -54,20 +55,22 @@ pub fn parse_encrypted_data_node_with_policy(
 ///
 /// This applies the complete encrypted-data grammar and metadata limits while
 /// permitting empty `CipherValue` placeholders that encryption will replace.
-/// Non-empty placeholders must still be well-formed base64.
+/// Non-empty placeholders must still be well-formed base64. The containing
+/// source document is reparsed under this policy before template inspection.
 pub fn parse_encrypted_data_template_node_with_policy(
     node: Node<'_, '_>,
     policy: &crate::policy::EncryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
-    validate_node_document_resources(node, &policy.resources)?;
+    validate_node_document_policy(node, policy)?;
     parse_encrypted_data_node(node, policy, true)
 }
 
-fn validate_node_document_resources(
+fn validate_node_document_policy(
     node: Node<'_, '_>,
-    resources: &crate::policy::ResourcePolicy,
+    policy: &crate::policy::EncryptionPolicy,
 ) -> Result<(), XmlEncError> {
+    let resources = &policy.resources;
     resources
         .validate_xml_document_len(node.document().input_text().len())
         .map_err(XmlEncError::from)?;
@@ -80,6 +83,14 @@ fn validate_node_document_resources(
         }
         .into());
     }
+    Document::parse_with_options(
+        node.document().input_text(),
+        ParsingOptions {
+            allow_dtd: policy.xml.allow_internal_dtd,
+            nodes_limit: resources.effective_xml_nodes(),
+            entity_resolver: None,
+        },
+    )?;
     Ok(())
 }
 
@@ -840,6 +851,47 @@ mod tests {
         };
         parse_encrypted_data_node_with_policy(encrypted_data, &exact_policy)
             .expect("a document exactly at the node ceiling must parse");
+    }
+
+    #[test]
+    fn node_parsers_revalidate_the_containing_documents_dtd_policy() {
+        // Node parse provenance is not available through roxmltree. Both public
+        // entry points must therefore validate the source document themselves.
+        let containing = format!(
+            r#"<!DOCTYPE root [<!ENTITY marker "allowed">]><root>{DATA}<payload>&marker;</payload></root>"#
+        );
+        let document = Document::parse_with_options(
+            &containing,
+            ParsingOptions {
+                allow_dtd: true,
+                ..ParsingOptions::default()
+            },
+        )
+        .expect("the caller can parse a document under a more permissive policy");
+        let encrypted_data = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLENC_NS, "EncryptedData")))
+            .expect("selected EncryptedData");
+
+        for result in [
+            parse_encrypted_data_node_with_policy(
+                encrypted_data,
+                &crate::policy::DecryptionPolicy::default(),
+            ),
+            parse_encrypted_data_template_node_with_policy(
+                encrypted_data,
+                &crate::policy::EncryptionPolicy::default(),
+            ),
+        ] {
+            assert!(matches!(result, Err(XmlEncError::XmlParse(_))));
+        }
+
+        let mut allowed = crate::policy::EncryptionPolicy::default();
+        allowed.xml.allow_internal_dtd = true;
+        parse_encrypted_data_node_with_policy(encrypted_data, &allowed)
+            .expect("explicitly permitted internal DTD must remain accepted");
+        parse_encrypted_data_template_node_with_policy(encrypted_data, &allowed)
+            .expect("template parsing must share the same explicit DTD policy");
     }
 
     #[test]
