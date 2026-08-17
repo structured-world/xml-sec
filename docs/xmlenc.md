@@ -51,6 +51,8 @@ through explicit parameters. The legacy `rsa-oaep-mgf1p` URI fixes MGF1 to SHA-1
 `EncryptionPolicy::rsa_keys` validates every recipient modulus and exponent before provider
 dispatch. New output defaults to 2048-8192-bit RSA keys; callers can explicitly tighten or relax
 the minimum for a deployment profile, but cannot exceed the implementation ceiling.
+`validate_rsa_recipient_key` exposes that same preflight to ordered key registries, allowing them
+to skip policy-invalid candidates before committing to one without duplicating policy limits.
 Configuration validation rejects any non-SHA-1 MGF digest for the legacy URI before provider
 dispatch because its wire format cannot represent an alternative.
 AES-KW configuration similarly validates the KEK size fixed by its algorithm URI before provider

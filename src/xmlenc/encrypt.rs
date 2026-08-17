@@ -21,6 +21,22 @@ use super::{
 
 const XML_WHITESPACE: &[char] = &[' ', '\t', '\n', '\r'];
 
+/// Validate an RSA recipient key against the compiled encryption policy.
+///
+/// Key registries can use this preflight before selecting a candidate, ensuring
+/// ordered searches skip keys that the encryption operation would reject.
+pub fn validate_rsa_recipient_key(
+    key: &RsaPublicKey,
+    policy: &crate::policy::EncryptionPolicy,
+) -> Result<(), XmlEncError> {
+    policy.rsa_keys.validate_components(
+        "encryption",
+        &key.n().to_be_bytes_trimmed_vartime(),
+        &key.e().to_be_bytes_trimmed_vartime(),
+    )?;
+    Ok(())
+}
+
 /// Builder for complete `EncryptedData` fragments and document replacement.
 #[derive(Clone)]
 pub struct EncryptedDataBuilder {
@@ -319,11 +335,7 @@ impl EncryptedDataBuilder {
                     recipient,
                     key_name,
                 } => {
-                    self.policy.rsa_keys.validate_components(
-                        "encryption",
-                        &public_key.n().to_be_bytes_trimmed_vartime(),
-                        &public_key.e().to_be_bytes_trimmed_vartime(),
-                    )?;
+                    validate_rsa_recipient_key(public_key, &self.policy)?;
                     if parameters.algorithm == super::KeyTransportAlgorithm::RsaOaepMgf1p
                         && parameters.mgf_digest != super::OaepDigestAlgorithm::Sha1
                     {

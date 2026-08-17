@@ -26,7 +26,7 @@ use xml_sec::{
         EncryptedDataBuilder, EncryptedDataType, EncryptedKey, EncryptionMethod,
         EncryptionRecipient, KeyTransportAlgorithm, OaepDigestAlgorithm, PrivateKeyDecryptor,
         RsaOaepParameters, SymmetricKeyDecryptor, XmlEncError,
-        parse_encrypted_data_template_node_with_policy,
+        parse_encrypted_data_template_node_with_policy, validate_rsa_recipient_key,
     },
 };
 
@@ -1260,6 +1260,8 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                     })
                 };
                 match loaded.map_err(CommandError::from).and_then(|key| {
+                    validate_rsa_recipient_key(&key.public_key, &policy)
+                        .map_err(|error| CommandError::Encryption(error.to_string()))?;
                     validate_recipient_key_metadata(metadata.as_ref(), &key)?;
                     Ok(key)
                 }) {

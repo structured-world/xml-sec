@@ -2992,6 +2992,63 @@ fn lax_rsa_search_skips_candidates_that_conflict_with_recipient_metadata() {
 }
 
 #[test]
+fn lax_rsa_encryption_skips_keys_rejected_by_policy() {
+    // Lax lookup searches for a usable RSA recipient. A parseable weak key must
+    // not prevent a later policy-compliant key from reaching encryption.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("lax-recipient-policy.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let weak_public_key = temp.path().join("rsa-1024-pubkey.pem");
+    let weak_key = RsaPrivateKey::new(&mut ChaCha8Rng::from_seed([0x72; 32]), 1024).unwrap();
+    fs::write(
+        &weak_public_key,
+        weak_key
+            .to_public_key()
+            .to_public_key_pem(Default::default())
+            .unwrap(),
+    )
+    .unwrap();
+    let compliant_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"policy-selected recipient").unwrap();
+
+    let accepted = Command::new(binary())
+        .args(["encrypt", "--lax-key-search", "--pubkey-pem:weak"])
+        .arg(&weak_public_key)
+        .args(["--pubkey-pem:compliant"])
+        .arg(&compliant_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+
+    let rejected = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&weak_public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("requires RSA keys between 2048 and 8192 bits: got 1024")
+    );
+}
+
+#[test]
 fn rsa_encryption_populates_an_existing_key_info_container() {
     // A template may reserve KeyInfo for non-cryptographic metadata without
     // pre-creating EncryptedKey. Encryption must add the generated recipient
