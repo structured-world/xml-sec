@@ -16,7 +16,7 @@ use xml_sec::xmldsig::{
     SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError,
     SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, X509CertificateKeyInfoWriter,
     compute_reference_digest_values, fill_reference_digest_values, parse_key_info,
-    verify_signature_with_pem_key,
+    validate_signing_key, verify_signature_with_pem_key,
 };
 
 fn exclusive_c14n() -> C14nAlgorithm {
@@ -86,6 +86,25 @@ fn rsa_signing_key_exposes_structured_public_key_info() {
         SigningPublicKeyInfo::Ec { .. } => panic!("RSA key must expose RSA public-key info"),
         _ => panic!("RSA key must expose known public-key info"),
     }
+}
+
+#[test]
+fn signing_key_preflight_rejects_verify_only_algorithms() {
+    // Candidate search must not classify RSA-SHA1 as usable and then fail only
+    // after choosing that key; the shared preflight owns signing capability.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let policy = SigningPolicy::default();
+
+    assert!(matches!(
+        validate_signing_key(&key, SignatureAlgorithm::RsaSha1, &policy),
+        Err(SigningError::Key(
+            SigningKeyError::UnsupportedAlgorithm { .. }
+        ))
+    ));
+    validate_signing_key(&key, SignatureAlgorithm::RsaSha256, &policy)
+        .expect("secure signing algorithm must remain usable");
 }
 
 #[test]

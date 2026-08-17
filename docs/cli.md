@@ -134,9 +134,10 @@ bounded to the largest supported AES key before allocation. `decrypt`
 accepts both standalone `EncryptedData` and encrypted elements embedded in a
 larger XML document; `--node-id` selects an ID-bearing operation start node and
 then requires exactly one `EncryptedData` in its subtree.
-Encryption preserves the template's `Id`, `Type`, `MimeType`, `KeyInfo`,
-`EncryptionProperties`, and RSA-OAEP parameters while replacing only the
-cryptographic `CipherValue` payloads.
+Encryption preserves the template's `Id`, `Type`, `MimeType`, existing `KeyInfo`
+metadata, `EncryptionProperties`, and RSA-OAEP parameters. It may populate an
+empty `KeyInfo` placeholder with generated key or recipient metadata while
+replacing the cryptographic `CipherValue` payloads.
 The selected `EncryptedData` and every existing template `EncryptedKey` must
 contain exactly one direct `CipherData` with one direct `CipherValue`. Each
 `EncryptedKey` must also contain exactly one direct `EncryptionMethod`;

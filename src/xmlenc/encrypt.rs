@@ -283,6 +283,9 @@ impl EncryptedDataBuilder {
 
     fn validate_configuration(&self) -> Result<(), XmlEncError> {
         self.policy.validate()?;
+        if let EncryptedDataType::Other(uri) = &self.encrypted_type {
+            self.validate_metadata("EncryptedData Type", Some(uri))?;
+        }
         if self
             .policy
             .data_algorithms
@@ -1419,6 +1422,38 @@ mod tests {
                 .encrypted_data_xml
                 .contains("Type=\"urn:example:binary\"")
         );
+    }
+
+    #[test]
+    fn binary_encryption_bounds_an_opaque_type_hint() {
+        // Generated metadata must obey the same policy as reciprocal parsing so
+        // the builder cannot emit an EncryptedData document it would reject.
+        let maximum = 64;
+        let policy = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_encryption_metadata_bytes: maximum,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let encrypt = |uri: String| {
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .encryption_type(EncryptedDataType::Other(uri))
+                .direct_key([0x42_u8; 16])
+                .policy(policy.clone())
+                .encrypt_binary(b"opaque payload")
+        };
+
+        encrypt(format!("urn:{}", "x".repeat(maximum - 4)))
+            .expect("metadata at the configured boundary must remain accepted");
+        assert!(matches!(
+            encrypt(format!("urn:{}", "x".repeat(maximum - 3))),
+            Err(XmlEncError::EncryptionMetadataTooLarge {
+                field: "EncryptedData Type",
+                maximum: 64,
+                actual: 65,
+            })
+        ));
     }
 
     #[test]

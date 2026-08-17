@@ -236,6 +236,12 @@ pub fn validate_signing_key(
     algorithm: SignatureAlgorithm,
     policy: &crate::policy::SigningPolicy,
 ) -> Result<(), SigningError> {
+    if !algorithm.signing_allowed() {
+        return Err(SigningKeyError::UnsupportedAlgorithm {
+            uri: algorithm.uri().to_owned(),
+        }
+        .into());
+    }
     expected_signature_output_len(key, algorithm, policy).map(|_| ())
 }
 
