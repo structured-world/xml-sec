@@ -550,6 +550,24 @@ fn short_command_help_alias_reaches_process_dispatch() {
 }
 
 #[test]
+fn donor_help_command_targets_one_runtime_command() {
+    // libxmlsec1 accepts help-<cmd>, not topic aliases such as help-dsig.
+    let output = Command::new(binary()).arg("help-sign").output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("Usage: xmlsec1 sign"));
+
+    let output = Command::new(binary()).arg("help-dsig").output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Unknown command"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Usage: xmlsec1 sign"));
+
+    for command in ["---h", "---?"] {
+        let output = Command::new(binary()).arg(command).output().unwrap();
+        assert!(!output.status.success(), "unexpectedly accepted {command}");
+    }
+}
+
+#[test]
 fn signs_and_verifies_libxmlsec_legacy_here_semantics_through_process_api() {
     // The expression selects different nodes under specification and libxmlsec
     // semantics, so this round trip proves both CLI policies reach transforms.
@@ -745,6 +763,52 @@ fn named_verification_certificate_obeys_signature_key_name_unless_lax() {
             lax.status.success(),
             "{}",
             String::from_utf8_lossy(&lax.stderr)
+        );
+    }
+}
+
+#[test]
+fn asymmetric_option_names_enforce_their_declared_encoding() {
+    // Automation must fail closed when a PEM file is wired to a DER option;
+    // accepting it would make the public xmlsec1 option contract misleading.
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+
+    let rejected_sign = Command::new(binary())
+        .args(["sign", "--privkey-der"])
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected_sign.status.success());
+
+    let signed = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(signed.status.success());
+    let temp = tempfile::tempdir().unwrap();
+    let signed_path = temp.path().join("signed.xml");
+    fs::write(&signed_path, signed.stdout).unwrap();
+
+    for (option, path) in [
+        ("pubkey-der", public_key.as_path()),
+        ("pubkey-cert-der", certificate.as_path()),
+    ] {
+        let rejected = Command::new(binary())
+            .args(["verify", &format!("--{option}")])
+            .arg(path)
+            .arg(&signed_path)
+            .output()
+            .unwrap();
+        assert!(
+            !rejected.status.success(),
+            "unexpectedly accepted --{option}"
         );
     }
 }

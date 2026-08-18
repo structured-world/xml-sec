@@ -8,10 +8,6 @@ use std::{
 pub enum Command {
     Help,
     HelpAll,
-    HelpDsig,
-    HelpEnc,
-    HelpKeys,
-    HelpX509,
     Version,
     ListKeyData,
     CheckKeyData,
@@ -28,10 +24,6 @@ impl Command {
     pub(crate) const ALL: &[Self] = &[
         Self::Help,
         Self::HelpAll,
-        Self::HelpDsig,
-        Self::HelpEnc,
-        Self::HelpKeys,
-        Self::HelpX509,
         Self::Version,
         Self::ListKeyData,
         Self::CheckKeyData,
@@ -48,10 +40,6 @@ impl Command {
         match self {
             Self::Help => "help",
             Self::HelpAll => "help-all",
-            Self::HelpDsig => "help-dsig",
-            Self::HelpEnc => "help-enc",
-            Self::HelpKeys => "help-keys",
-            Self::HelpX509 => "help-x509",
             Self::Version => "version",
             Self::ListKeyData => "list-key-data",
             Self::CheckKeyData => "check-key-data",
@@ -65,15 +53,10 @@ impl Command {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
-        let value = value.strip_prefix("--").unwrap_or(value);
+    fn parse_direct(value: &str) -> Option<Self> {
         Some(match value {
-            "help" | "-h" | "-?" => Self::Help,
+            "help" => Self::Help,
             "help-all" => Self::HelpAll,
-            "help-dsig" => Self::HelpDsig,
-            "help-enc" => Self::HelpEnc,
-            "help-keys" => Self::HelpKeys,
-            "help-x509" => Self::HelpX509,
             "version" => Self::Version,
             "list-key-data" | "list-key-data-klasses" => Self::ListKeyData,
             "check-key-data" | "check-key-data-klass" => Self::CheckKeyData,
@@ -87,6 +70,34 @@ impl Command {
             _ => return None,
         })
     }
+
+    fn parse(value: &str) -> Option<(Self, Option<HelpTarget>)> {
+        let value = if let Some(long) = value.strip_prefix("--") {
+            if long.starts_with('-') {
+                return None;
+            }
+            long
+        } else {
+            if value.starts_with('-') {
+                return None;
+            }
+            value
+        };
+        if let Some(command) = Self::parse_direct(value) {
+            return Some((command, None));
+        }
+        let target = value.strip_prefix("help-")?;
+        let target = Self::parse_direct(target)
+            .map(HelpTarget::Command)
+            .unwrap_or(HelpTarget::Unknown);
+        Some((Self::Help, Some(target)))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelpTarget {
+    Command(Command),
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +110,7 @@ pub struct OptionValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
     pub command: Command,
+    pub(crate) help_target: Option<HelpTarget>,
     pub options: BTreeMap<String, Vec<OptionValue>>,
     ordered_options: Vec<OptionValue>,
     pub positional: Vec<OsString>,
@@ -225,7 +237,7 @@ impl Invocation {
         let command_text = command_text
             .into_string()
             .map_err(|_| ParseError::NonUtf8)?;
-        let command = Command::parse(&command_text)
+        let (command, help_target) = Command::parse(&command_text)
             .ok_or_else(|| ParseError::UnknownCommand(command_text.clone()))?;
         let remaining = args.collect::<Vec<_>>();
         let mut options = BTreeMap::<String, Vec<OptionValue>>::new();
@@ -301,6 +313,7 @@ impl Invocation {
         }
         Ok(Self {
             command,
+            help_target,
             options,
             ordered_options,
             positional,
@@ -515,6 +528,40 @@ mod tests {
     #[test]
     fn command_display_uses_donor_vocabulary() {
         assert_eq!(Command::ListKeyData.to_string(), "list-key-data");
+    }
+
+    #[test]
+    fn command_parser_uses_exact_donor_help_grammar() {
+        for target in Command::ALL
+            .iter()
+            .copied()
+            .filter(|target| !matches!(target, Command::Help | Command::HelpAll))
+        {
+            for command in [
+                format!("help-{}", target.canonical_name()),
+                format!("--help-{}", target.canonical_name()),
+            ] {
+                let parsed = Invocation::parse([OsString::from("xmlsec1"), command.into()])
+                    .expect("donor help command");
+                assert_eq!(parsed.command, Command::Help);
+                assert_eq!(parsed.help_target, Some(HelpTarget::Command(target)));
+            }
+        }
+
+        for command in ["help-dsig", "help-enc", "help-x509"] {
+            let parsed = parse(&["xmlsec1", command]).expect("donor help prefix");
+            assert_eq!(parsed.command, Command::Help);
+            assert_eq!(parsed.help_target, Some(HelpTarget::Unknown));
+        }
+        for command in ["---h", "---?"] {
+            assert!(
+                matches!(
+                    parse(&["xmlsec1", command]),
+                    Err(ParseError::UnknownCommand(rejected)) if rejected == command
+                ),
+                "unexpectedly accepted {command}"
+            );
+        }
     }
 
     #[test]

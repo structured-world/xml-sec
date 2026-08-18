@@ -32,7 +32,7 @@ use xml_sec::{
 
 use crate::{
     Command, Invocation,
-    args::{Arity, OPTION_SPECS},
+    args::{Arity, HelpTarget, OPTION_SPECS},
     capabilities::{self, KEY_DATA, TRANSFORMS},
     key_material,
 };
@@ -173,7 +173,7 @@ pub enum CommandError {
 pub fn execute(
     invocation: Invocation,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<(), CommandError> {
     if invocation.flag("help") {
         return command_help(invocation.command, stdout);
@@ -181,15 +181,15 @@ pub fn execute(
     validate_provider(&invocation)?;
     validate_crypto_config(&invocation)?;
     match invocation.command {
-        Command::Help => help(stdout),
+        Command::Help => match invocation.help_target {
+            Some(HelpTarget::Command(command)) => command_help(command, stdout),
+            Some(HelpTarget::Unknown) => {
+                writeln!(stderr, "Unknown command").map_err(stdout_error)?;
+                help(stdout)
+            }
+            None => help(stdout),
+        },
         Command::HelpAll => help_all(stdout),
-        Command::HelpDsig => topic_help(&[Command::Sign, Command::Verify], stdout),
-        Command::HelpEnc => topic_help(&[Command::Encrypt, Command::Decrypt], stdout),
-        Command::HelpKeys => topic_help(
-            &[Command::Keys, Command::ListKeyData, Command::CheckKeyData],
-            stdout,
-        ),
-        Command::HelpX509 => topic_help(&[Command::Verify], stdout),
         Command::Version => writeln!(stdout, "xmlsec1 1.3.13 (rustcrypto)").map_err(stdout_error),
         Command::ListTransforms => {
             validate_options(&invocation, &[])?;
@@ -257,6 +257,15 @@ fn write_command_list(commands: &[Command], output: &mut dyn Write) -> Result<()
 }
 
 fn command_help(command: Command, output: &mut dyn Write) -> Result<(), CommandError> {
+    if command == Command::Help {
+        return help(output);
+    }
+    if command == Command::HelpAll {
+        return help_all(output);
+    }
+    if command == Command::Version {
+        return writeln!(output, "Usage: xmlsec1 version").map_err(stdout_error);
+    }
     let Some((name, options)) = command_contract(command) else {
         return help(output);
     };
@@ -280,16 +289,6 @@ fn command_help(command: Command, output: &mut dyn Write) -> Result<(), CommandE
             ""
         };
         writeln!(output, "  --{}{parameter}{value}", spec.canonical).map_err(stdout_error)?;
-    }
-    Ok(())
-}
-
-fn topic_help(commands: &[Command], output: &mut dyn Write) -> Result<(), CommandError> {
-    for (index, command) in commands.iter().copied().enumerate() {
-        if index != 0 {
-            writeln!(output).map_err(stdout_error)?;
-        }
-        command_help(command, output)?;
     }
     Ok(())
 }
@@ -731,7 +730,9 @@ fn select_signing_key<'a>(
     let mut last_error: Option<CommandError> = None;
     for (option, certificate_is_der) in candidates {
         let (path, _) = split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
-        match key_material::load_signing_key(path).map_err(CommandError::from) {
+        match key_material::load_signing_key(path, private_key_format(option))
+            .map_err(CommandError::from)
+        {
             Ok(key) => match validate_signing_key(key.as_ref(), algorithm, policy) {
                 Ok(()) => return Ok((option, certificate_is_der, key)),
                 Err(error) => last_error = Some(CommandError::Signature(error.to_string())),
@@ -763,6 +764,36 @@ fn split_key_and_certificates(value: &OsStr) -> Result<(&OsStr, Vec<&OsStr>), Co
         ));
     }
     Ok((key, certificates))
+}
+
+fn private_key_format(option: &crate::OptionValue) -> key_material::PrivateKeyFormat {
+    match option.name.as_str() {
+        "privkey-pem" => key_material::PrivateKeyFormat::Pem,
+        "privkey-der" => key_material::PrivateKeyFormat::Der,
+        "pkcs8-pem" => key_material::PrivateKeyFormat::Pkcs8Pem,
+        "pkcs8-der" => key_material::PrivateKeyFormat::Pkcs8Der,
+        _ => unreachable!("private key loader called for a non-private-key option"),
+    }
+}
+
+fn public_key_encoding(option: &crate::OptionValue) -> key_material::PublicKeyEncoding {
+    match option.name.as_str() {
+        "pubkey-pem" => key_material::PublicKeyEncoding::Pem,
+        "pubkey-der" => key_material::PublicKeyEncoding::Der,
+        _ => unreachable!("public key loader called for a non-public-key option"),
+    }
+}
+
+fn certificate_encoding(option: &crate::OptionValue) -> key_material::CertificateEncoding {
+    match option.name.as_str() {
+        "pubkey-cert-pem" | "trusted-pem" | "untrusted-pem" => {
+            key_material::CertificateEncoding::Pem
+        }
+        "pubkey-cert-der" | "trusted-der" | "untrusted-der" => {
+            key_material::CertificateEncoding::Der
+        }
+        _ => unreachable!("certificate loader called for a non-certificate option"),
+    }
 }
 
 fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> VerificationPolicy {
@@ -835,23 +866,39 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             "verification key",
         )?
     };
+    let mut certificate_budget =
+        CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
     let result = if !selected_keys.is_empty() {
         let mut last_result = None;
         let mut last_error = None;
+        let mut configured_certificates = None;
         for (option, certificate) in selected_keys {
             let attempt = if certificate {
+                if configured_certificates.is_none() {
+                    configured_certificates = Some(load_configured_certificates(
+                        invocation,
+                        false,
+                        &mut certificate_budget,
+                    )?);
+                }
                 verify_with_explicit_certificate(
-                    invocation,
                     option,
                     algorithm,
                     policy.clone(),
                     start_node_id,
                     &id_attributes,
                     &xml,
+                    CertificateAttemptContext {
+                        configured: configured_certificates
+                            .as_ref()
+                            .expect("certificate inputs were initialized"),
+                        budget: &mut certificate_budget,
+                    },
                 )
             } else {
                 key_material::load_verification_key(
                     option.value.as_deref().unwrap_or_default(),
+                    public_key_encoding(option),
                     algorithm,
                 )
                 .map_err(CommandError::from)
@@ -876,32 +923,9 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             None => return Err(last_error.unwrap_or(CommandError::InvalidSignature)),
         }
     } else {
-        let mut config = KeyResolverConfig::default();
-        let mut certificate_budget =
-            CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
-        for name in [
-            "pubkey-cert-pem",
-            "pubkey-cert-der",
-            "untrusted-pem",
-            "untrusted-der",
-        ] {
-            for option in invocation.values(name) {
-                push_configured_certificate(
-                    &mut config.lookup_certs,
-                    key_material::load_certificate(option.value.as_deref().unwrap_or_default())?,
-                    &mut certificate_budget,
-                )?;
-            }
-        }
-        for name in ["trusted-pem", "trusted-der"] {
-            for option in invocation.values(name) {
-                push_configured_certificate(
-                    &mut config.trusted_certs,
-                    key_material::load_certificate(option.value.as_deref().unwrap_or_default())?,
-                    &mut certificate_budget,
-                )?;
-            }
-        }
+        let configured_certificates =
+            load_configured_certificates(invocation, true, &mut certificate_budget)?;
+        let config = configured_certificates.into_resolver_config();
         let resolver = DefaultKeyResolver::new(config);
         verification_context(policy, start_node_id, &id_attributes)
             .key_resolver(&resolver)
@@ -918,6 +942,65 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
 struct CertificateBudget {
     total_bytes: usize,
     maximum_bytes: usize,
+}
+
+#[derive(Clone, Default)]
+struct ConfiguredCertificates {
+    lookup: Vec<Vec<u8>>,
+    trusted: Vec<Vec<u8>>,
+}
+
+impl ConfiguredCertificates {
+    fn into_resolver_config(self) -> KeyResolverConfig {
+        KeyResolverConfig {
+            lookup_certs: self.lookup,
+            trusted_certs: self.trusted,
+            ..KeyResolverConfig::default()
+        }
+    }
+}
+
+fn load_configured_certificates(
+    invocation: &Invocation,
+    include_explicit_keys: bool,
+    budget: &mut CertificateBudget,
+) -> Result<ConfiguredCertificates, CommandError> {
+    let mut certificates = ConfiguredCertificates::default();
+    let lookup_names: &[&str] = if include_explicit_keys {
+        &[
+            "pubkey-cert-pem",
+            "pubkey-cert-der",
+            "untrusted-pem",
+            "untrusted-der",
+        ]
+    } else {
+        &["untrusted-pem", "untrusted-der"]
+    };
+    for name in lookup_names {
+        for option in invocation.values(name) {
+            push_configured_certificate(
+                &mut certificates.lookup,
+                key_material::load_certificate(
+                    option.value.as_deref().unwrap_or_default(),
+                    certificate_encoding(option),
+                )?,
+                budget,
+            )?;
+        }
+    }
+    for name in ["trusted-pem", "trusted-der"] {
+        for option in invocation.values(name) {
+            push_configured_certificate(
+                &mut certificates.trusted,
+                key_material::load_certificate(
+                    option.value.as_deref().unwrap_or_default(),
+                    certificate_encoding(option),
+                )?,
+                budget,
+            )?;
+        }
+    }
+    Ok(certificates)
 }
 
 impl CertificateBudget {
@@ -1057,20 +1140,25 @@ fn verification_context<'a>(
     }
 }
 
+struct CertificateAttemptContext<'a> {
+    configured: &'a ConfiguredCertificates,
+    budget: &'a mut CertificateBudget,
+}
+
 fn verify_with_explicit_certificate(
-    invocation: &Invocation,
     certificate: &crate::OptionValue,
     algorithm: SignatureAlgorithm,
     policy: VerificationPolicy,
     start_node_id: Option<&str>,
     id_attributes: &[IdAttributeRegistration],
     xml: &str,
+    certificates: CertificateAttemptContext<'_>,
 ) -> Result<xml_sec::xmldsig::VerifyResult, CommandError> {
-    let certificate_der =
-        key_material::load_certificate(certificate.value.as_deref().unwrap_or_default())?;
-    let mut certificate_budget =
-        CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
-    certificate_budget.charge(certificate_der.len())?;
+    let certificate_der = key_material::load_certificate(
+        certificate.value.as_deref().unwrap_or_default(),
+        certificate_encoding(certificate),
+    )?;
+    certificates.budget.charge(certificate_der.len())?;
     // Model the caller-pinned leaf as the sole document key source. The core
     // resolver can then build its path through caller-supplied intermediates
     // and anchors without allowing the document's embedded KeyInfo to replace
@@ -1084,25 +1172,7 @@ fn verify_with_explicit_certificate(
         .map_err(|error| CommandError::Signature(error.to_string()))?;
     let key_info = parse_key_info(document.root_element())
         .map_err(|error| CommandError::Signature(error.to_string()))?;
-    let mut config = KeyResolverConfig::default();
-    for name in ["untrusted-pem", "untrusted-der"] {
-        for option in invocation.values(name) {
-            push_configured_certificate(
-                &mut config.lookup_certs,
-                key_material::load_certificate(option.value.as_deref().unwrap_or_default())?,
-                &mut certificate_budget,
-            )?;
-        }
-    }
-    for name in ["trusted-pem", "trusted-der"] {
-        for option in invocation.values(name) {
-            push_configured_certificate(
-                &mut config.trusted_certs,
-                key_material::load_certificate(option.value.as_deref().unwrap_or_default())?,
-                &mut certificate_budget,
-            )?;
-        }
-    }
+    let config = certificates.configured.clone().into_resolver_config();
     let mut resolver_policy = policy.clone();
     if config.trusted_certs.is_empty() {
         // An explicit certificate pins the caller-selected identity. In the
@@ -1245,19 +1315,20 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             for (option, certificate) in candidates {
                 let path = option.value.as_deref().unwrap_or_default();
                 let loaded = if certificate {
-                    key_material::load_rsa_certificate_public(path).map(
-                        |(public_key, certificate_der)| RecipientPublicKeyCandidate {
-                            public_key,
-                            certificate_der: Some(certificate_der),
-                        },
-                    )
+                    key_material::load_rsa_certificate_public(path, certificate_encoding(option))
+                        .map(
+                            |(public_key, certificate_der)| RecipientPublicKeyCandidate {
+                                public_key,
+                                certificate_der: Some(certificate_der),
+                            },
+                        )
                 } else {
-                    key_material::load_rsa_public(path).map(|public_key| {
-                        RecipientPublicKeyCandidate {
+                    key_material::load_rsa_public(path, public_key_encoding(option)).map(
+                        |public_key| RecipientPublicKeyCandidate {
                             public_key,
                             certificate_der: None,
-                        }
-                    })
+                        },
+                    )
                 };
                 match loaded.map_err(CommandError::from).and_then(|key| {
                     validate_rsa_recipient_key(&key.public_key, &policy)
@@ -2110,10 +2181,23 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                 let (path, certificate_paths) =
                     split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
                 for certificate in certificate_paths {
-                    key_material::load_certificate(certificate)?;
+                    let encoding = match private_key_format(option) {
+                        key_material::PrivateKeyFormat::Pem
+                        | key_material::PrivateKeyFormat::Pkcs8Pem => {
+                            key_material::CertificateEncoding::Pem
+                        }
+                        key_material::PrivateKeyFormat::Der
+                        | key_material::PrivateKeyFormat::Pkcs8Der => {
+                            key_material::CertificateEncoding::Der
+                        }
+                    };
+                    key_material::load_certificate(certificate, encoding)?;
                 }
                 Ok::<_, CommandError>(RecipientPrivateKey {
-                    inner: PrivateKeyDecryptor::new(key_material::load_rsa_private(path)?),
+                    inner: PrivateKeyDecryptor::new(key_material::load_rsa_private(
+                        path,
+                        private_key_format(option),
+                    )?),
                     key_name: option.parameter.clone(),
                 })
             })();
@@ -2683,18 +2767,17 @@ mod tests {
         assert!(help.contains("--pubkey-cert-pem"));
         assert!(!help.contains("--binary-data"));
 
-        let mut topic = Vec::new();
+        let mut command = Vec::new();
         execute(
-            invocation(&["xmlsec1", "help-enc"]),
-            &mut topic,
+            invocation(&["xmlsec1", "help-encrypt"]),
+            &mut command,
             &mut Vec::new(),
         )
         .unwrap();
-        let topic = String::from_utf8(topic).unwrap();
-        assert!(topic.contains("Usage: xmlsec1 encrypt"));
-        assert!(topic.contains("Usage: xmlsec1 decrypt"));
-        assert!(topic.contains("--binary-data"));
-        assert!(topic.contains("--privkey-pem"));
+        let command = String::from_utf8(command).unwrap();
+        assert!(command.contains("Usage: xmlsec1 encrypt"));
+        assert!(command.contains("--binary-data"));
+        assert!(!command.contains("Usage: xmlsec1 decrypt"));
 
         let error = execute(
             invocation(&["xmlsec1", "verify", "--lax-key-search", "input.xml"]),

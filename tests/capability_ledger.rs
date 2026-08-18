@@ -779,6 +779,14 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
         .iter()
         .map(|command| command.canonical_name())
         .collect();
+    let ledger_commands: BTreeSet<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "cli-command" && !item.name.starts_with("--"))
+        .map(|item| item.name.as_str())
+        .collect();
+    assert_eq!(runtime_commands, ledger_commands);
+
     for item in ledger
         .items
         .iter()
@@ -801,7 +809,6 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
         "lax-key-search",
         "node-id",
         "output",
-        "print-crypto-library-errors",
         "print-debug",
         "print-xml-debug",
         "verbose",
@@ -816,6 +823,7 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
         "gen-key",
         "pkcs8-der",
         "pkcs8-pem",
+        "print-crypto-library-errors",
         "privkey-der",
         "privkey-pem",
         "pubkey-cert-der",

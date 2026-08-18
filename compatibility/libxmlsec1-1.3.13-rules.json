@@ -124,7 +124,7 @@
     {
       "id": "native-cli-behavior-options",
       "kinds": ["cli-option"],
-      "name_regex": "^--(?:add-id-attr|binary-data|help|id-attr|ignore-manifests|insecure|lax-key-search|node-id|output|print-crypto-library-errors|print-debug|print-xml-debug|verbose|verify-crls|xml-data)$",
+      "name_regex": "^--(?:add-id-attr|binary-data|help|id-attr|ignore-manifests|insecure|lax-key-search|node-id|output|print-debug|print-xml-debug|verbose|verify-crls|xml-data)$",
       "outcome": "behavior-compatible",
       "rationale": "The native CLI implements this provider-independent option with donor-compatible parsing and command behavior.",
       "evidence": "native-cli-tests"
@@ -132,7 +132,7 @@
     {
       "id": "native-cli-provider-options",
       "kinds": ["cli-option"],
-      "name_regex": "^--(?:X509-skip-strict-checks|aes-key|crypto|crypto-config|gen-key|pkcs8-der|pkcs8-pem|privkey-der|privkey-pem|pubkey-cert-der|pubkey-cert-pem|pubkey-der|pubkey-pem|pwd|trusted-der|trusted-pem|untrusted-der|untrusted-pem)$",
+      "name_regex": "^--(?:X509-skip-strict-checks|aes-key|crypto|crypto-config|gen-key|pkcs8-der|pkcs8-pem|print-crypto-library-errors|privkey-der|privkey-pem|pubkey-cert-der|pubkey-cert-pem|pubkey-der|pubkey-pem|pwd|trusted-der|trusted-pem|untrusted-der|untrusted-pem)$",
       "outcome": "provider-limited",
       "rationale": "The native CLI implements this option only for the formats, algorithms, or fixed RustCrypto provider behavior advertised by its capability registry.",
       "evidence": "native-cli-tests"

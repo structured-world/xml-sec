@@ -22154,7 +22154,7 @@
       "source": "apps/xmlsec.c",
       "line": 248,
       "detail": "static xmlSecAppCmdLineParam printCryptoErrorsParam = { xmlSecAppCmdLineTopicGeneral, \"--print-crypto-library-errors\", NULL, \"--print-crypto-library-errors\" \"\\n\\tprint errors from crypto library (OpenSSL only)\", xmlSecAppCmdLineParamTypeFlag, xmlSecAppCmdLineParamFlagNone, NULL };",
-      "classification": "native-cli-behavior-options"
+      "classification": "native-cli-provider-options"
     },
     {
       "kind": "cli-option",

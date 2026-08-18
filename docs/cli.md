@@ -16,7 +16,9 @@ xmlsec1 list-key-data
 
 The binary recognizes libxmlsec1's command names and leading-dash aliases for
 `sign`, `verify`, `encrypt`, `decrypt`, `keys`, `list-transforms`,
-`check-transforms`, `list-key-data`, `check-key-data`, `help`, and `version`.
+`check-transforms`, `list-key-data`, `check-key-data`, `help`, `help-all`, and
+`version`. Command-specific help uses the donor's `help-<command>` grammar, such
+as `help-sign`, `help-verify`, `help-encrypt`, and `help-keys`.
 Successful operations exit `0`. Invalid arguments, unavailable capabilities,
 policy violations, invalid signatures, decryption failures, and I/O errors all
 exit `1`; the current CLI does not assign category-specific failure statuses.
@@ -32,6 +34,13 @@ decryption use `DataEncryptionContext` and `DataDecryptionContext`. With
 diagnostics remain on stdout. Verification diagnostics retain donor
 `OK`/`FAILED` status and failure-reason vocabulary and are emitted for invalid
 signatures before the command returns its required non-zero status.
+`--print-crypto-library-errors` is accepted for donor argv compatibility. The
+fixed RustCrypto provider has no process-global OpenSSL error queue, so the flag
+does not add a second diagnostic stream beyond the operation error already
+reported by the CLI.
+PEM, DER, and PKCS#8 key and certificate options enforce the encoding and
+container named by the selected option; the CLI does not guess another format
+when decoding fails.
 
 Capability checks and runtime dispatch use one registry. A transform or key-data
 class absent from `list-*` is not silently substituted and causes `check-*` to

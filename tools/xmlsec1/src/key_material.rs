@@ -70,6 +70,26 @@ pub struct SigningTemplateMetadata {
     pub has_key_info: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateKeyFormat {
+    Pem,
+    Der,
+    Pkcs8Pem,
+    Pkcs8Der,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicKeyEncoding {
+    Pem,
+    Der,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertificateEncoding {
+    Pem,
+    Der,
+}
+
 pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialError> {
     let path = path.as_ref();
     let mut bytes = Vec::with_capacity(KEY_MATERIAL_BYTE_CEILING.min(64 * 1024));
@@ -219,10 +239,15 @@ fn signature_key_info<'a, 'input>(
         .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
 }
 
-pub fn load_signing_key(path: impl AsRef<Path>) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+pub fn load_signing_key(
+    path: impl AsRef<Path>,
+    format: PrivateKeyFormat,
+) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
     let path = path.as_ref();
     let bytes = read(path)?;
-    if let Ok(text) = std::str::from_utf8(&bytes) {
+    if matches!(format, PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem)
+        && let Ok(text) = std::str::from_utf8(&bytes)
+    {
         if let Ok(key) = RsaSigningKey::from_pkcs8_pem(text) {
             return Ok(Box::new(key));
         }
@@ -232,57 +257,68 @@ pub fn load_signing_key(path: impl AsRef<Path>) -> Result<Box<dyn SigningKey>, K
         if let Ok(key) = EcdsaP384SigningKey::from_pkcs8_pem(text) {
             return Ok(Box::new(key));
         }
+        if format == PrivateKeyFormat::Pem
+            && let Ok(rsa) = RsaPrivateKey::from_pkcs1_pem(text)
+        {
+            return normalize_rsa_signing_key(rsa, path);
+        }
     }
-    if let Ok(key) = RsaSigningKey::from_pkcs8_der(&bytes) {
-        return Ok(Box::new(key));
-    }
-    if let Ok(key) = EcdsaP256SigningKey::from_pkcs8_der(&bytes) {
-        return Ok(Box::new(key));
-    }
-    if let Ok(key) = EcdsaP384SigningKey::from_pkcs8_der(&bytes) {
-        return Ok(Box::new(key));
-    }
-    let rsa = std::str::from_utf8(&bytes)
-        .ok()
-        .and_then(|text| RsaPrivateKey::from_pkcs1_pem(text).ok())
-        .or_else(|| RsaPrivateKey::from_pkcs1_der(&bytes).ok());
-    if let Some(rsa) = rsa {
-        let der = rsa
-            .to_pkcs8_der()
-            .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
-        return RsaSigningKey::from_pkcs8_der(der.as_bytes())
-            .map(|key| Box::new(key) as Box<dyn SigningKey>)
-            .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    if matches!(format, PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der) {
+        if let Ok(key) = RsaSigningKey::from_pkcs8_der(&bytes) {
+            return Ok(Box::new(key));
+        }
+        if let Ok(key) = EcdsaP256SigningKey::from_pkcs8_der(&bytes) {
+            return Ok(Box::new(key));
+        }
+        if let Ok(key) = EcdsaP384SigningKey::from_pkcs8_der(&bytes) {
+            return Ok(Box::new(key));
+        }
+        if format == PrivateKeyFormat::Der
+            && let Ok(rsa) = RsaPrivateKey::from_pkcs1_der(&bytes)
+        {
+            return normalize_rsa_signing_key(rsa, path);
+        }
     }
     Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
 }
 
+fn normalize_rsa_signing_key(
+    rsa: RsaPrivateKey,
+    path: &Path,
+) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+    let der = rsa
+        .to_pkcs8_der()
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    RsaSigningKey::from_pkcs8_der(der.as_bytes())
+        .map(|key| Box::new(key) as Box<dyn SigningKey>)
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+}
+
 pub fn load_verification_key(
     path: impl AsRef<Path>,
+    encoding: PublicKeyEncoding,
     algorithm: SignatureAlgorithm,
 ) -> Result<VerificationKey, KeyMaterialError> {
     let path = path.as_ref();
     let bytes = read(path)?;
-    let pem_key = std::str::from_utf8(&bytes).ok().and_then(|text| {
-        parse_pem(text, "PUBLIC KEY", path).ok().or_else(|| {
-            RsaPublicKey::from_pkcs1_pem(text)
-                .ok()?
-                .to_public_key_der()
-                .ok()
-                .map(|der| der.as_bytes().to_vec())
-        })
-    });
-    let public_key_bytes = if let Some(pem_key) = pem_key {
-        pem_key
-    } else if valid_spki(&bytes) {
-        bytes
-    } else if let Ok(key) = RsaPublicKey::from_pkcs1_der(&bytes) {
-        key.to_public_key_der()
-            .map_err(|_| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))?
-            .as_bytes()
-            .to_vec()
-    } else {
-        return Err(KeyMaterialError::UnsupportedPublicKey(path.to_owned()));
+    let public_key_bytes = match encoding {
+        PublicKeyEncoding::Pem => {
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))?;
+            parse_pem(text, "PUBLIC KEY", path).or_else(|_| {
+                RsaPublicKey::from_pkcs1_pem(text)
+                    .ok()
+                    .and_then(|key| key.to_public_key_der().ok())
+                    .map(|der| der.as_bytes().to_vec())
+                    .ok_or_else(|| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))
+            })?
+        }
+        PublicKeyEncoding::Der if valid_spki(&bytes) => bytes,
+        PublicKeyEncoding::Der => RsaPublicKey::from_pkcs1_der(&bytes)
+            .ok()
+            .and_then(|key| key.to_public_key_der().ok())
+            .map(|der| der.as_bytes().to_vec())
+            .ok_or_else(|| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))?,
     };
     if !valid_spki(&public_key_bytes) {
         return Err(KeyMaterialError::UnsupportedPublicKey(path.to_owned()));
@@ -299,26 +335,27 @@ fn valid_spki(bytes: &[u8]) -> bool {
     x509_parser::x509::SubjectPublicKeyInfo::from_der(bytes).is_ok_and(|(rest, _)| rest.is_empty())
 }
 
-pub fn load_certificate(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialError> {
+pub fn load_certificate(
+    path: impl AsRef<Path>,
+    encoding: CertificateEncoding,
+) -> Result<Vec<u8>, KeyMaterialError> {
     let path = path.as_ref();
     let bytes = read(path)?;
-    let der = certificate_container_der(bytes);
+    let der = match encoding {
+        CertificateEncoding::Pem => {
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
+            parse_pem(text, "CERTIFICATE", path)
+                .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?
+        }
+        CertificateEncoding::Der => bytes,
+    };
     let (rest, _) = x509_parser::certificate::X509Certificate::from_der(&der)
         .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
     if !rest.is_empty() {
         return Err(KeyMaterialError::InvalidCertificate(path.to_owned()));
     }
     Ok(der)
-}
-
-fn certificate_container_der(bytes: Vec<u8>) -> Vec<u8> {
-    let pem_contents = x509_parser::pem::parse_x509_pem(&bytes)
-        .ok()
-        .and_then(|(rest, pem)| {
-            (rest.iter().all(u8::is_ascii_whitespace) && pem.label == "CERTIFICATE")
-                .then_some(pem.contents)
-        });
-    pem_contents.unwrap_or(bytes)
 }
 
 fn parse_pem(text: &str, expected_label: &str, path: &Path) -> Result<Vec<u8>, KeyMaterialError> {
@@ -330,46 +367,54 @@ fn parse_pem(text: &str, expected_label: &str, path: &Path) -> Result<Vec<u8>, K
     Ok(pem.contents)
 }
 
-pub fn load_rsa_private(path: impl AsRef<Path>) -> Result<RsaPrivateKey, KeyMaterialError> {
+pub fn load_rsa_private(
+    path: impl AsRef<Path>,
+    format: PrivateKeyFormat,
+) -> Result<RsaPrivateKey, KeyMaterialError> {
     let path = path.as_ref();
     let bytes = read(path)?;
-    if let Ok(text) = std::str::from_utf8(&bytes) {
-        if let Ok(key) = RsaPrivateKey::from_pkcs8_pem(text) {
-            return Ok(key);
-        }
-        if let Ok(key) = RsaPrivateKey::from_pkcs1_pem(text) {
-            return Ok(key);
-        }
+    match format {
+        PrivateKeyFormat::Pem => std::str::from_utf8(&bytes).ok().and_then(|text| {
+            RsaPrivateKey::from_pkcs8_pem(text)
+                .or_else(|_| RsaPrivateKey::from_pkcs1_pem(text))
+                .ok()
+        }),
+        PrivateKeyFormat::Der => RsaPrivateKey::from_pkcs8_der(&bytes)
+            .or_else(|_| RsaPrivateKey::from_pkcs1_der(&bytes))
+            .ok(),
+        PrivateKeyFormat::Pkcs8Pem => std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| RsaPrivateKey::from_pkcs8_pem(text).ok()),
+        PrivateKeyFormat::Pkcs8Der => RsaPrivateKey::from_pkcs8_der(&bytes).ok(),
     }
-    RsaPrivateKey::from_pkcs8_der(&bytes)
-        .or_else(|_| RsaPrivateKey::from_pkcs1_der(&bytes))
-        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+    .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
 }
 
-pub fn load_rsa_public(path: impl AsRef<Path>) -> Result<RsaPublicKey, KeyMaterialError> {
+pub fn load_rsa_public(
+    path: impl AsRef<Path>,
+    encoding: PublicKeyEncoding,
+) -> Result<RsaPublicKey, KeyMaterialError> {
     let path = path.as_ref();
     let bytes = read(path)?;
-    if let Ok(text) = std::str::from_utf8(&bytes) {
-        if let Ok(key) = RsaPublicKey::from_public_key_pem(text) {
-            return Ok(key);
-        }
-        if let Ok(key) = RsaPublicKey::from_pkcs1_pem(text) {
-            return Ok(key);
-        }
-        if let Ok(private) = RsaPrivateKey::from_pkcs8_pem(text) {
-            return Ok(private.to_public_key());
-        }
+    match encoding {
+        PublicKeyEncoding::Pem => std::str::from_utf8(&bytes).ok().and_then(|text| {
+            RsaPublicKey::from_public_key_pem(text)
+                .or_else(|_| RsaPublicKey::from_pkcs1_pem(text))
+                .ok()
+        }),
+        PublicKeyEncoding::Der => RsaPublicKey::from_public_key_der(&bytes)
+            .or_else(|_| RsaPublicKey::from_pkcs1_der(&bytes))
+            .ok(),
     }
-    RsaPublicKey::from_public_key_der(&bytes)
-        .or_else(|_| RsaPublicKey::from_pkcs1_der(&bytes))
-        .map_err(|_| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))
+    .ok_or_else(|| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))
 }
 
 pub fn load_rsa_certificate_public(
     path: impl AsRef<Path>,
+    encoding: CertificateEncoding,
 ) -> Result<(RsaPublicKey, Vec<u8>), KeyMaterialError> {
     let path = path.as_ref();
-    let der = load_certificate(path)?;
+    let der = load_certificate(path, encoding)?;
     let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(&der)
         .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
     let public_key = RsaPublicKey::from_public_key_der(certificate.public_key().raw)
@@ -444,11 +489,68 @@ mod tests {
         )
         .unwrap();
 
-        load_signing_key(&private).expect("PKCS#1 private key must normalize");
-        let key = load_verification_key(&public, SignatureAlgorithm::RsaSha256)
-            .expect("PKCS#1 public key must normalize");
+        load_signing_key(&private, PrivateKeyFormat::Pem)
+            .expect("PKCS#1 private key must normalize");
+        let key = load_verification_key(
+            &public,
+            PublicKeyEncoding::Der,
+            SignatureAlgorithm::RsaSha256,
+        )
+        .expect("PKCS#1 public key must normalize");
         RsaPublicKey::from_public_key_der(&key.public_key_bytes)
             .expect("verification key must use SPKI DER");
+    }
+
+    #[test]
+    fn asymmetric_loaders_enforce_the_selected_option_format() {
+        // CLI option names are format contracts: accepting a different
+        // container would hide configuration errors and diverge from xmlsec1.
+        let original = RsaPrivateKey::new(&mut ChaCha20Rng::from_seed([8; 32]), 1024).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let private_pem = temp.path().join("private.pem");
+        let private_der = temp.path().join("private.der");
+        let public_pem = temp.path().join("public.pem");
+        let public_der = temp.path().join("public.der");
+        fs::write(
+            &private_pem,
+            original.to_pkcs1_pem(Default::default()).unwrap(),
+        )
+        .unwrap();
+        fs::write(&private_der, original.to_pkcs1_der().unwrap().as_bytes()).unwrap();
+        fs::write(
+            &public_pem,
+            original
+                .to_public_key()
+                .to_pkcs1_pem(Default::default())
+                .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &public_der,
+            original.to_public_key().to_pkcs1_der().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        assert!(load_signing_key(&private_pem, PrivateKeyFormat::Der).is_err());
+        assert!(load_signing_key(&private_der, PrivateKeyFormat::Pem).is_err());
+        assert!(load_signing_key(&private_pem, PrivateKeyFormat::Pkcs8Pem).is_err());
+        assert!(load_signing_key(&private_der, PrivateKeyFormat::Pkcs8Der).is_err());
+        assert!(
+            load_verification_key(
+                &public_pem,
+                PublicKeyEncoding::Der,
+                SignatureAlgorithm::RsaSha256,
+            )
+            .is_err()
+        );
+        assert!(
+            load_verification_key(
+                &public_der,
+                PublicKeyEncoding::Pem,
+                SignatureAlgorithm::RsaSha256,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -461,7 +563,9 @@ mod tests {
             "-----BEGIN PUBLIC KEY-----\ninvalid\n-----END PUBLIC KEY-----",
         )
         .unwrap();
-        let error = load_verification_key(&path, SignatureAlgorithm::RsaSha256).unwrap_err();
+        let error =
+            load_verification_key(&path, PublicKeyEncoding::Pem, SignatureAlgorithm::RsaSha256)
+                .unwrap_err();
         assert!(error.to_string().contains(path.to_str().unwrap()));
         assert!(!error.to_string().contains("in PUBLIC KEY"));
     }
@@ -479,17 +583,20 @@ mod tests {
         let path = temp.path().join("public.der");
         fs::write(&path, spki).unwrap();
 
-        let key = load_verification_key(&path, SignatureAlgorithm::RsaSha256)
-            .expect("valid UTF-8 DER must reach the DER decoder");
+        let key =
+            load_verification_key(&path, PublicKeyEncoding::Der, SignatureAlgorithm::RsaSha256)
+                .expect("valid UTF-8 DER must reach the DER decoder");
         assert_eq!(key.public_key_bytes, spki);
     }
 
     #[test]
-    fn utf8_non_pem_certificate_input_falls_through_to_der() {
-        // A textual byte sequence is not automatically PEM; the DER validator
-        // remains authoritative after the container probe fails.
-        let bytes = b"not a PEM container".to_vec();
-        assert_eq!(certificate_container_der(bytes.clone()), bytes);
+    fn certificate_loader_does_not_guess_an_encoding() {
+        // The selected option, not UTF-8 validity, controls the decoder.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("certificate.pem");
+        fs::write(&path, b"not a PEM container").unwrap();
+        assert!(load_certificate(&path, CertificateEncoding::Pem).is_err());
+        assert!(load_certificate(&path, CertificateEncoding::Der).is_err());
     }
 
     #[test]
@@ -514,7 +621,7 @@ mod tests {
         let path = temp.path().join("oversized.pem");
         fs::write(&path, vec![b'x'; KEY_MATERIAL_BYTE_CEILING + 1]).unwrap();
 
-        let error = match load_signing_key(&path) {
+        let error = match load_signing_key(&path, PrivateKeyFormat::Pem) {
             Ok(_) => panic!("oversized key material must be rejected"),
             Err(error) => error,
         };
