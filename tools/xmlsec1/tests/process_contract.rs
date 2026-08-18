@@ -5040,6 +5040,23 @@ fn parser_input_and_output_failures_are_nonzero() {
 }
 
 #[test]
+fn positional_sentinel_after_input_is_not_silently_discarded() {
+    // Once a filename has ended option parsing, a later `--` is a second
+    // filename and must fail the one-input process contract before file access.
+    let output = Command::new(binary())
+        .args(["verify", "signed.xml", "--"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("expects exactly one input file"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn nonempty_crypto_config_is_rejected_with_the_expected_diagnostic() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("crypto-config");

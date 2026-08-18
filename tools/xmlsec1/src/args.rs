@@ -247,14 +247,18 @@ impl Invocation {
         let mut options_finished = false;
         while index < remaining.len() {
             let argument = &remaining[index];
+            if options_finished {
+                positional.push(argument.clone());
+                index += 1;
+                continue;
+            }
             if argument == OsStr::new("--") {
                 options_finished = true;
                 index += 1;
                 continue;
             }
             let option_text = argument.to_str();
-            if options_finished
-                || argument == OsStr::new("-")
+            if argument == OsStr::new("-")
                 || !option_text.is_some_and(|value| value.starts_with('-'))
             {
                 positional.push(argument.clone());
@@ -468,6 +472,20 @@ mod tests {
             [OsString::from("input.xml"), OsString::from("--verbose")]
         );
         assert!(!parsed.flag("verbose"));
+    }
+
+    #[test]
+    fn preserves_sentinels_after_option_parsing_has_finished() {
+        // Only the first sentinel changes parser state; later tokens named `--`
+        // are filenames and must reach command-level input cardinality checks.
+        let after_sentinel = parse(&["xmlsec1", "verify", "--", "--"]).unwrap();
+        assert_eq!(after_sentinel.positional, [OsString::from("--")]);
+
+        let after_input = parse(&["xmlsec1", "verify", "input.xml", "--"]).unwrap();
+        assert_eq!(
+            after_input.positional,
+            [OsString::from("input.xml"), OsString::from("--")]
+        );
     }
 
     #[test]
