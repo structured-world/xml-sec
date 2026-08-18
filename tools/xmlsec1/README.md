@@ -17,9 +17,10 @@ coverage.
 ## Options and output
 
 Exact donor long names and short aliases are accepted; singleton and repeatable
-options are enforced by the parser registry. `--print-debug` emits text,
-`--print-xml-debug` emits parseable operation contexts, and `--output` keeps
-diagnostics on stdout while routing transformed data to a file.
+options are enforced by the parser registry. `--print-debug` emits text and
+`--print-xml-debug` emits parseable operation contexts. As in libxmlsec1,
+diagnostics follow transformed data on stdout when `--output` is absent;
+selecting `--output` routes the data to a file and leaves diagnostics on stdout.
 
 ## Keys and certificates
 

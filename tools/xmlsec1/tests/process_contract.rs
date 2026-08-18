@@ -324,6 +324,36 @@ fn signing_writes_requested_diagnostics_separately_from_output() {
 }
 
 #[test]
+fn signing_without_output_preserves_donor_stdout_order() {
+    // libxmlsec1 multiplexes a stdout result and requested debug context when
+    // --output is absent; preserve the result-first order for drop-in callers.
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let output = Command::new(binary())
+        .args(["sign", "--print-debug", "--privkey-pem"])
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let diagnostics = stdout
+        .find("== Signature Context")
+        .expect("debug context must follow the signed result");
+    let signed_xml = stdout[..diagnostics].trim_end();
+    let document = roxmltree::Document::parse(signed_xml)
+        .expect("the result prefix before diagnostics must remain valid XML");
+    assert_eq!(document.root_element().tag_name().name(), "Signature");
+    assert!(stdout[diagnostics..].contains("Status: succeeded"));
+}
+
+#[test]
 fn scoped_id_attribute_selects_and_signs_the_registered_element() {
     // An unqualified libxmlsec1 --id-attr element name is namespace-agnostic;
     // the custom attribute must drive selection and Reference resolution.

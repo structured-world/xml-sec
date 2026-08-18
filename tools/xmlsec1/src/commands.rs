@@ -406,6 +406,19 @@ fn write_output(
     }
 }
 
+fn write_result_then_stdout_diagnostics(
+    invocation: &Invocation,
+    bytes: &[u8],
+    stdout: &mut dyn Write,
+    diagnostics: impl FnOnce(&mut dyn Write) -> Result<(), CommandError>,
+) -> Result<(), CommandError> {
+    // libxmlsec1's sign/encrypt/decrypt commands write the result first and
+    // debug dumps second on stdout. Keep that compatibility boundary here;
+    // callers that need an unmixed stream select --output for the result.
+    write_output(invocation, bytes, stdout)?;
+    diagnostics(stdout)
+}
+
 fn expand_output_path(invocation: &Invocation, template: &OsStr) -> Result<PathBuf, CommandError> {
     const PLACEHOLDER: &[u8] = b"{inputfile}";
     let template_bytes = template.as_encoded_bytes();
@@ -676,8 +689,9 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     let signed = context
         .sign_template(&xml)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
-    write_output(invocation, signed.as_bytes(), stdout)?;
-    write_signing_diagnostics(invocation, signature.algorithm, stdout)
+    write_result_then_stdout_diagnostics(invocation, signed.as_bytes(), stdout, |stdout| {
+        write_signing_diagnostics(invocation, signature.algorithm, stdout)
+    })
 }
 
 fn write_signing_diagnostics(
@@ -1414,8 +1428,9 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             "encrypted template output exceeds XML document policy".into(),
         ));
     }
-    write_output(invocation, rendered.as_bytes(), stdout)?;
-    write_encryption_diagnostics(invocation, algorithm, stdout)
+    write_result_then_stdout_diagnostics(invocation, rendered.as_bytes(), stdout, |stdout| {
+        write_encryption_diagnostics(invocation, algorithm, stdout)
+    })
 }
 
 fn xml_data_plaintext<'a>(
@@ -2231,8 +2246,9 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             "decrypt requires --aes-key or an RSA private key".into(),
         ));
     };
-    write_output(invocation, &bytes, stdout)?;
-    write_decryption_diagnostics(invocation, encrypted_data, !standalone, stdout)
+    write_result_then_stdout_diagnostics(invocation, &bytes, stdout, |stdout| {
+        write_decryption_diagnostics(invocation, encrypted_data, !standalone, stdout)
+    })
 }
 
 fn write_decryption_diagnostics(

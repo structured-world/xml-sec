@@ -34,6 +34,10 @@ decryption use `DataEncryptionContext` and `DataDecryptionContext`. With
 diagnostics remain on stdout. Verification diagnostics retain donor
 `OK`/`FAILED` status and failure-reason vocabulary and are emitted for invalid
 signatures before the command returns its required non-zero status.
+Without `--output`, signing, encryption, and decryption preserve libxmlsec1's
+stdout ordering: the transformed payload is followed by requested diagnostics
+on the same stream. Select `--output` whenever a downstream process requires a
+standalone XML or binary payload while diagnostics are enabled.
 `--print-crypto-library-errors` is accepted for donor argv compatibility. The
 fixed RustCrypto provider has no process-global OpenSSL error queue, so the flag
 does not add a second diagnostic stream beyond the operation error already
