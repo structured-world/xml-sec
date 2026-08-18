@@ -198,10 +198,7 @@ fn verify_donor_version(donor: &Path) -> Result<(), String> {
 fn snapshot_donor(donor: &Path, commit: &str) -> Result<tempfile::TempDir, String> {
     let snapshot =
         tempfile::tempdir().map_err(|error| format!("create donor snapshot: {error}"))?;
-    let output = Command::new("git")
-        .args(["clone", "--quiet", "--no-checkout"])
-        .arg(donor)
-        .arg(snapshot.path())
+    let output = donor_clone_command(donor, snapshot.path())
         .output()
         .map_err(|error| format!("clone donor snapshot: {error}"))?;
     if !output.status.success() {
@@ -223,6 +220,15 @@ fn snapshot_donor(donor: &Path, commit: &str) -> Result<tempfile::TempDir, Strin
         ));
     }
     Ok(snapshot)
+}
+
+fn donor_clone_command(donor: &Path, snapshot: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(["clone", "--quiet", "--no-checkout", "--"])
+        .arg(donor)
+        .arg(snapshot);
+    command
 }
 
 fn extract_surface(donor: &Path) -> Result<Vec<SurfaceItem>, String> {
@@ -1920,6 +1926,28 @@ XMLSEC_VERSION_INFO="${XMLSEC_VERSION_CURRENT}:0:0""#;
         );
         assert!(directory.join("generated/header.h").exists());
         fs::remove_dir_all(directory).expect("donor fixture must be removable");
+    }
+
+    #[test]
+    fn donor_clone_terminates_options_before_caller_paths() {
+        // Caller-controlled paths must follow `--` so a leading dash cannot become a Git option.
+        let command = donor_clone_command(Path::new("-donor"), Path::new("snapshot"));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            args,
+            [
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                "--",
+                "-donor",
+                "snapshot"
+            ]
+        );
     }
 
     #[test]

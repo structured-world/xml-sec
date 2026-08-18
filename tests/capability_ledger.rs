@@ -880,6 +880,17 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
             "CLI option {option} has the wrong compatibility classification"
         );
     }
+    let ledger_statuses: BTreeSet<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "cli-exit-status")
+        .map(|item| item.name.as_str())
+        .collect();
+    assert_eq!(
+        ledger_statuses,
+        BTreeSet::from(["failure", "success", "unknown-command"])
+    );
+
     for (status, outcome, code) in [
         ("success", "behavior-compatible", 0),
         ("failure", "behavior-compatible", 1),
