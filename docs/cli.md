@@ -124,13 +124,16 @@ round-trip with the donor. The Rust library API retains the XMLDSig specificatio
 binding by default and requires an explicit opt-in for legacy documents.
 Repeatable named raw public-key and explicit-certificate options form a key set.
 Every direct `KeyName` in the selected signature participates in lookup and must
-identify exactly one supplied key; duplicate matches fail as ambiguous.
+identify exactly one supplied key; duplicate matches for the same name fail as
+ambiguous, while distinct names are searched in document order.
 `--lax-key-search` is the explicit opt-out. A signature without `KeyName` does
 not request a different identity, so its sole explicit key remains usable even
 when that key has a registry name. For a repeated explicit key set, lax lookup
 ignores `KeyName` identity and selects the first compatible option in command-line
 order, matching libxmlsec1's key-type search rather than treating ambiguity as a
-strict lookup failure.
+strict lookup failure. Both strict and lax searches parse the document, process
+References, and canonicalize `SignedInfo` once; only the final signature
+primitive is retried across candidates.
 
 `--output` follows the upstream filename-template contract. The first
 `{inputfile}` token is replaced with the input file's basename after removing
@@ -246,7 +249,9 @@ discovered from document-controlled `X509Data` require a path through any
 `--trusted-der` anchor. They are accepted without an anchor only when
 `--insecure` explicitly disables trust validation. An explicit certificate
 remains a caller-pinned identity; when separate anchors are supplied, it must
-also build a valid path to one of them. Direct XMLEnc keys accept
+also build a valid path to one of them. `--verify-crls` applies to that validated
+path and does not turn a pinned certificate without anchors into a chain-based
+trust source. Direct XMLEnc keys accept
 AES-128/256; RSA-OAEP supports both the XMLEnc 1.0 `rsa-oaep-mgf1p` and XMLEnc
 1.1 parameter contracts. Encrypted
 PKCS#8, PKCS#12, platform crypto stores, external DTDs, implicit network access,

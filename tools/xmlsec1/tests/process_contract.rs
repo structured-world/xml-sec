@@ -735,6 +735,53 @@ fn lax_verification_searches_past_incompatible_key_types() {
 }
 
 #[test]
+fn strict_verification_searches_each_distinct_template_key_name() {
+    // Separate KeyNames identify separate key-manager entries. A unique match
+    // for each name is a search order, not an ambiguity across the whole set.
+    let temp = tempfile::tempdir().unwrap();
+    let source_template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let template_path = temp.path().join("template.xml");
+    let signed_path = temp.path().join("signed.xml");
+    let template = fs::read_to_string(source_template).unwrap().replace(
+        "<KeyName>TestKeyName-rsa-2048</KeyName>",
+        "<KeyName>wrong</KeyName><KeyName>valid</KeyName>",
+    );
+    fs::write(&template_path, template).unwrap();
+
+    let valid_private = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let wrong_public = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let valid_public = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(valid_private)
+        .arg("--output")
+        .arg(&signed_path)
+        .arg(&template_path)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem:wrong"])
+        .arg(wrong_public)
+        .arg("--pubkey-pem:valid")
+        .arg(valid_public)
+        .arg(signed_path)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
 fn named_verification_certificate_obeys_signature_key_name_unless_lax() {
     // Explicit certificates are pinned verification identities, so naming one
     // must use the same strict lookup contract as naming a raw public key.
@@ -795,6 +842,40 @@ fn named_verification_certificate_obeys_signature_key_name_unless_lax() {
             String::from_utf8_lossy(&lax.stderr)
         );
     }
+}
+
+#[test]
+fn pinned_verification_certificate_ignores_crls_without_trust_anchors() {
+    // CRL processing belongs to path validation. A caller-pinned certificate
+    // without separate anchors remains a direct verification key even when a
+    // generic compatibility invocation also supplies --verify-crls.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    let signed = temp.path().join("signed.xml");
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(template)
+        .output()
+        .unwrap();
+    assert!(sign.status.success());
+
+    let verify = Command::new(binary())
+        .args(["verify", "--verify-crls", "--pubkey-cert-pem"])
+        .arg(certificate)
+        .arg(signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
 }
 
 #[test]

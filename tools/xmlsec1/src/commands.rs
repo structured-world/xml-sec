@@ -15,11 +15,12 @@ use xml_sec::{
     policy::{DecryptionPolicy, EncryptionPolicy, SigningPolicy, VerificationPolicy},
     provider::{CryptoProvider, default_provider},
     xmldsig::{
-        DefaultKeyResolver, DsigStatus, FailureReason, KeyInfo, KeyInfoSource, KeyInfoWriter,
-        KeyResolver, KeyResolverConfig, KeyValueInfo, ReferenceResult, SignContext,
-        SignatureAlgorithm, SignatureTemplateSelection, SigningKey, UriTypeSet, VerifyContext,
-        VerifyResult, X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
-        uri::UriReferenceResolver, validate_signing_key, x509_certificate_matches_selectors,
+        DefaultKeyResolver, DsigError, DsigStatus, FailureReason, KeyInfo, KeyInfoSource,
+        KeyInfoWriter, KeyResolver, KeyResolverConfig, KeyValueInfo, ReferenceResult, SignContext,
+        SignatureAlgorithm, SignatureTemplateSelection, SigningKey, UriTypeSet, VerificationKey,
+        VerifyContext, VerifyResult, VerifyingKey, X509CertificateKeyInfoWriter,
+        XPathHereSemantics, parse_key_info, uri::UriReferenceResolver, validate_signing_key,
+        x509_certificate_matches_selectors,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
@@ -535,36 +536,46 @@ fn id_attribute_registrations(
     Ok(registrations)
 }
 
-fn select_named_candidate<'a, T: Copy>(
+fn select_named_candidates<'a, T: Copy>(
     candidates: &[(&'a crate::OptionValue, T)],
     requested_names: &[String],
     allow_unconstrained_named_singleton: bool,
     key_kind: &str,
-) -> Result<(&'a crate::OptionValue, T), CommandError> {
+) -> Result<Vec<(&'a crate::OptionValue, T)>, CommandError> {
     if let [selected] = candidates
         && (selected.0.parameter.is_none()
             || (requested_names.is_empty() && allow_unconstrained_named_singleton))
     {
-        return Ok(*selected);
+        return Ok(vec![*selected]);
     }
     if !requested_names.is_empty() {
-        let matching = candidates
-            .iter()
-            .copied()
-            .filter(|(key, _)| {
-                key.parameter
-                    .as_deref()
-                    .is_some_and(|name| requested_names.iter().any(|requested| requested == name))
-            })
-            .collect::<Vec<_>>();
-        return match matching.as_slice() {
-            [selected] => Ok(*selected),
-            [] => Err(CommandError::Usage(format!(
+        let mut selected = Vec::new();
+        let mut selected_indices = HashSet::new();
+        for requested in requested_names {
+            let matching = candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, (key, _))| key.parameter.as_deref() == Some(requested.as_str()))
+                .collect::<Vec<_>>();
+            match matching.as_slice() {
+                [(index, candidate)] if selected_indices.insert(*index) => {
+                    selected.push(**candidate);
+                }
+                [(_index, _candidate)] => {}
+                [] => {}
+                _ => {
+                    return Err(CommandError::Usage(format!(
+                        "multiple {key_kind} inputs match template KeyNames"
+                    )));
+                }
+            }
+        }
+        return if selected.is_empty() {
+            Err(CommandError::Usage(format!(
                 "template requests unknown KeyName for supplied {key_kind}"
-            ))),
-            _ => Err(CommandError::Usage(format!(
-                "multiple {key_kind} inputs match template KeyNames"
-            ))),
+            )))
+        } else {
+            Ok(selected)
         };
     }
     let unnamed = candidates
@@ -573,7 +584,7 @@ fn select_named_candidate<'a, T: Copy>(
         .filter(|(key, _)| key.parameter.is_none())
         .collect::<Vec<_>>();
     match unnamed.as_slice() {
-        [selected] => return Ok(*selected),
+        [selected] => return Ok(vec![*selected]),
         [] => {}
         _ => {
             return Err(CommandError::Usage(format!(
@@ -604,13 +615,12 @@ fn named_candidate_search<'a, T: Copy>(
         }
         return Ok(candidates.to_vec());
     }
-    select_named_candidate(
+    select_named_candidates(
         candidates,
         requested_names,
         allow_unconstrained_named_singleton,
         key_kind,
     )
-    .map(|selected| vec![selected])
 }
 
 fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
@@ -883,32 +893,18 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     let mut certificate_budget =
         CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
     let result = if !selected_keys.is_empty() {
-        let mut last_result = None;
-        let mut last_error = None;
-        let mut configured_certificates = None;
+        let has_certificate_candidates = selected_keys.iter().any(|(_, certificate)| *certificate);
+        let configured_certificates = if has_certificate_candidates {
+            load_configured_certificates(invocation, false, &mut certificate_budget)?
+        } else {
+            ConfiguredCertificates::default()
+        };
+        let mut candidates = Vec::with_capacity(selected_keys.len());
+        let mut last_load_error = None;
         for (option, certificate) in selected_keys {
-            let attempt = if certificate {
-                if configured_certificates.is_none() {
-                    configured_certificates = Some(load_configured_certificates(
-                        invocation,
-                        false,
-                        &mut certificate_budget,
-                    )?);
-                }
-                verify_with_explicit_certificate(
-                    option,
-                    algorithm,
-                    policy.clone(),
-                    start_node_id,
-                    &id_attributes,
-                    &xml,
-                    CertificateAttemptContext {
-                        configured: configured_certificates
-                            .as_ref()
-                            .expect("certificate inputs were initialized"),
-                        budget: &mut certificate_budget,
-                    },
-                )
+            let candidate = if certificate {
+                load_explicit_certificate_key_info(option, &mut certificate_budget)
+                    .map(ExplicitVerificationCandidate::Certificate)
             } else {
                 key_material::load_verification_key(
                     option.value.as_deref().unwrap_or_default(),
@@ -916,26 +912,21 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
                     algorithm,
                 )
                 .map_err(CommandError::from)
-                .and_then(|key| {
-                    verification_context(policy.clone(), start_node_id, &id_attributes)
-                        .key(&key)
-                        .verify(&xml)
-                        .map_err(|error| CommandError::Signature(error.to_string()))
-                })
+                .map(ExplicitVerificationCandidate::Direct)
             };
-            match attempt {
-                Ok(result) if aggregate_verification_status(&result) == DsigStatus::Valid => {
-                    last_result = Some(result);
-                    break;
-                }
-                Ok(result) => last_result = Some(result),
-                Err(error) => last_error = Some(error),
+            match candidate {
+                Ok(candidate) => candidates.push(candidate),
+                Err(error) => last_load_error = Some(error),
             }
         }
-        match last_result {
-            Some(result) => result,
-            None => return Err(last_error.unwrap_or(CommandError::InvalidSignature)),
+        if candidates.is_empty() {
+            return Err(last_load_error.unwrap_or(CommandError::InvalidSignature));
         }
+        let resolver = CandidateVerificationResolver::new(candidates, configured_certificates);
+        verification_context(policy, start_node_id, &id_attributes)
+            .key_resolver(&resolver)
+            .verify(&xml)
+            .map_err(|error| CommandError::Signature(error.to_string()))?
     } else {
         let configured_certificates =
             load_configured_certificates(invocation, true, &mut certificate_budget)?;
@@ -1154,25 +1145,165 @@ fn verification_context<'a>(
     }
 }
 
-struct CertificateAttemptContext<'a> {
-    configured: &'a ConfiguredCertificates,
-    budget: &'a mut CertificateBudget,
+enum ExplicitVerificationCandidate {
+    Direct(VerificationKey),
+    Certificate(KeyInfo),
 }
 
-fn verify_with_explicit_certificate(
+struct CandidateVerificationResolver {
+    candidates: Vec<ExplicitVerificationCandidate>,
+    certificate_resolver: DefaultKeyResolver,
+    has_trusted_certificates: bool,
+}
+
+impl CandidateVerificationResolver {
+    fn new(
+        candidates: Vec<ExplicitVerificationCandidate>,
+        configured: ConfiguredCertificates,
+    ) -> Self {
+        let has_trusted_certificates = !configured.trusted.is_empty();
+        Self {
+            candidates,
+            certificate_resolver: DefaultKeyResolver::new(configured.into_resolver_config()),
+            has_trusted_certificates,
+        }
+    }
+}
+
+impl KeyResolver for CandidateVerificationResolver {
+    fn resolve<'a>(
+        &'a self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+        self.resolve_with_policy_and_provider(
+            key_info,
+            algorithm,
+            &VerificationPolicy::default(),
+            default_provider(),
+        )
+    }
+
+    fn resolve_with_policy_and_provider<'a>(
+        &'a self,
+        _key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &VerificationPolicy,
+        provider: &dyn CryptoProvider,
+    ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+        let mut certificate_policy = policy.clone();
+        if !self.has_trusted_certificates {
+            // A caller-pinned certificate without a separate trust anchor is
+            // a direct key source. Chain-dependent CRL checks therefore do
+            // not apply to this candidate path.
+            certificate_policy.key_trust.verify_x509_chains = false;
+            certificate_policy.key_trust.check_crls = false;
+        }
+        let mut resolved = Vec::with_capacity(self.candidates.len());
+        let mut last_error = None;
+        for candidate in &self.candidates {
+            let key = match candidate {
+                ExplicitVerificationCandidate::Direct(key) => {
+                    Some(Box::new(key.clone()) as Box<dyn VerifyingKey>)
+                }
+                ExplicitVerificationCandidate::Certificate(info) => {
+                    match self.certificate_resolver.resolve_with_policy_and_provider(
+                        Some(info),
+                        algorithm,
+                        &certificate_policy,
+                        provider,
+                    ) {
+                        Ok(key) => key,
+                        Err(error) => {
+                            last_error = Some(error);
+                            continue;
+                        }
+                    }
+                }
+            };
+            if let Some(key) = key {
+                match key.validate_policy(policy) {
+                    Ok(()) => resolved.push(key),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+        }
+        if resolved.is_empty() {
+            return match last_error {
+                Some(error) => Err(error),
+                None => Ok(None),
+            };
+        }
+        Ok(Some(Box::new(CandidateVerifyingKey {
+            candidates: resolved,
+        })))
+    }
+}
+
+struct CandidateVerifyingKey<'a> {
+    candidates: Vec<Box<dyn VerifyingKey + 'a>>,
+}
+
+impl VerifyingKey for CandidateVerifyingKey<'_> {
+    fn validate_signature_value(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        let mut saw_mismatch = false;
+        let mut last_error = None;
+        for candidate in &self.candidates {
+            match candidate.validate_signature_value(algorithm, signature_value) {
+                Ok(true) => return Ok(true),
+                Ok(false) => saw_mismatch = true,
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if saw_mismatch {
+            Ok(false)
+        } else {
+            match last_error {
+                Some(error) => Err(error),
+                None => Ok(false),
+            }
+        }
+    }
+
+    fn verify(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        let mut saw_mismatch = false;
+        let mut last_error = None;
+        for candidate in &self.candidates {
+            match candidate.verify(algorithm, signed_data, signature_value) {
+                Ok(true) => return Ok(true),
+                Ok(false) => saw_mismatch = true,
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if saw_mismatch {
+            Ok(false)
+        } else {
+            match last_error {
+                Some(error) => Err(error),
+                None => Ok(false),
+            }
+        }
+    }
+}
+
+fn load_explicit_certificate_key_info(
     certificate: &crate::OptionValue,
-    algorithm: SignatureAlgorithm,
-    policy: VerificationPolicy,
-    start_node_id: Option<&str>,
-    id_attributes: &[IdAttributeRegistration],
-    xml: &str,
-    certificates: CertificateAttemptContext<'_>,
-) -> Result<xml_sec::xmldsig::VerifyResult, CommandError> {
+    budget: &mut CertificateBudget,
+) -> Result<KeyInfo, CommandError> {
     let certificate_der = key_material::load_certificate(
         certificate.value.as_deref().unwrap_or_default(),
         certificate_encoding(certificate),
     )?;
-    certificates.budget.charge(certificate_der.len())?;
+    budget.charge(certificate_der.len())?;
     // Model the caller-pinned leaf as the sole document key source. The core
     // resolver can then build its path through caller-supplied intermediates
     // and anchors without allowing the document's embedded KeyInfo to replace
@@ -1184,24 +1315,7 @@ fn verify_with_explicit_certificate(
     );
     let document = Document::parse(&key_info_xml)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
-    let key_info = parse_key_info(document.root_element())
-        .map_err(|error| CommandError::Signature(error.to_string()))?;
-    let config = certificates.configured.clone().into_resolver_config();
-    let mut resolver_policy = policy.clone();
-    if config.trusted_certs.is_empty() {
-        // An explicit certificate pins the caller-selected identity. In the
-        // absence of separate anchors this path is direct key verification,
-        // unlike document-controlled X509Data discovery.
-        resolver_policy.key_trust.verify_x509_chains = false;
-    }
-    let resolver = DefaultKeyResolver::new(config);
-    let key = resolver
-        .resolve_with_policy(Some(&key_info), algorithm, &resolver_policy)
-        .map_err(|error| CommandError::Signature(error.to_string()))?
-        .ok_or_else(|| CommandError::Signature("explicit certificate was not resolved".into()))?;
-    verification_context(policy, start_node_id, id_attributes)
-        .key(key.as_ref())
-        .verify(xml)
+    parse_key_info(document.root_element())
         .map_err(|error| CommandError::Signature(error.to_string()))
 }
 
@@ -2735,12 +2849,62 @@ fn stdout_error(source: std::io::Error) -> CommandError {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::{cell::Cell, ffi::OsString, rc::Rc};
 
     use super::*;
 
     fn invocation(arguments: &[&str]) -> Invocation {
         Invocation::parse(arguments.iter().map(OsString::from)).unwrap()
+    }
+
+    struct CountingVerificationKey {
+        accepts: bool,
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl VerifyingKey for CountingVerificationKey {
+        fn verify(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _signed_data: &[u8],
+            _signature_value: &[u8],
+        ) -> Result<bool, DsigError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.accepts)
+        }
+    }
+
+    #[test]
+    fn candidate_verifier_retries_only_the_signature_primitive() {
+        // The outer VerifyContext sees one verifier, so XML parsing, Reference
+        // transforms and SignedInfo C14N are not repeated per candidate.
+        let first_calls = Rc::new(Cell::new(0));
+        let second_calls = Rc::new(Cell::new(0));
+        let candidates = CandidateVerifyingKey {
+            candidates: vec![
+                Box::new(CountingVerificationKey {
+                    accepts: false,
+                    calls: Rc::clone(&first_calls),
+                }),
+                Box::new(CountingVerificationKey {
+                    accepts: true,
+                    calls: Rc::clone(&second_calls),
+                }),
+            ],
+        };
+        let xml = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
+        ))
+        .unwrap();
+
+        let result = VerifyContext::new()
+            .key(&candidates)
+            .first_document_signature()
+            .verify(&xml)
+            .unwrap();
+        assert_eq!(result.status, DsigStatus::Valid);
+        assert_eq!(first_calls.get(), 1);
+        assert_eq!(second_calls.get(), 1);
     }
 
     #[test]

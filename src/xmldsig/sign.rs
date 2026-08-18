@@ -63,7 +63,11 @@ pub enum SigningDigestError {
     #[error("cryptographic provider error: {0}")]
     Provider(#[from] crate::provider::ProviderError),
 
-    /// The compiled signing policy rejected an operation input.
+    /// The compiled signing policy rejected input while processing References.
+    ///
+    /// The full signing pipeline preserves this digest-stage context as
+    /// [`SigningError::Digest`]. Policy failures raised by later XML mutation
+    /// stages use [`SigningError::Policy`] instead.
     #[error("signing policy violation: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),
 
@@ -108,7 +112,7 @@ pub enum SigningDigestError {
 /// Errors returned by the full XMLDSig signing pipeline.
 #[derive(Debug, thiserror::Error)]
 pub enum SigningError {
-    /// The compiled signing policy rejected an operation input.
+    /// The compiled signing policy rejected input outside the Reference digest stage.
     #[error("signing policy violation: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),
 
@@ -154,6 +158,7 @@ impl From<SigningDigestError> for SigningError {
     fn from(error: SigningDigestError) -> Self {
         match error {
             SigningDigestError::XmlMutation(XmlMutationError::Policy(error)) => Self::Policy(error),
+            SigningDigestError::Policy(error) => Self::Digest(SigningDigestError::Policy(error)),
             error => Self::Digest(error),
         }
     }
@@ -1454,4 +1459,33 @@ fn required_algorithm_attr<'a>(
             "missing Algorithm attribute on <{element_name}>"
         ))
     })
+}
+
+#[cfg(test)]
+mod error_conversion_tests {
+    use super::*;
+    use crate::policy::PolicyViolation;
+
+    #[test]
+    fn signing_error_preserves_policy_failure_stage() {
+        // Reference policy failures retain digest-stage context, while a
+        // mutation policy failure is promoted to the pipeline-level variant.
+        let digest = SigningError::from(SigningDigestError::Policy(PolicyViolation::Algorithm {
+            operation: "signing",
+            algorithm: "urn:test:digest".into(),
+        }));
+        assert!(matches!(
+            digest,
+            SigningError::Digest(SigningDigestError::Policy(_))
+        ));
+
+        let mutation = SigningError::from(SigningDigestError::XmlMutation(
+            XmlMutationError::Policy(PolicyViolation::ResourceLimit {
+                resource: "signed XML bytes",
+                maximum: 1,
+                actual: 2,
+            }),
+        ));
+        assert!(matches!(mutation, SigningError::Policy(_)));
+    }
 }

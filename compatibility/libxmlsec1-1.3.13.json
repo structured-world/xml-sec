@@ -22261,7 +22261,7 @@
       "source": "apps/xmlsec.c",
       "line": 529,
       "detail": "static xmlSecAppCmdLineParam pwdParam = { xmlSecAppCmdLineTopicKeysMngr, \"--pwd\", NULL, \"--pwd <password>\" \"\\n\\tthe password to use for reading keys and certs\", xmlSecAppCmdLineParamTypeString, xmlSecAppCmdLineParamFlagNone, NULL };",
-      "classification": "native-cli-provider-options"
+      "classification": "planned-cli-surface"
     },
     {
       "kind": "cli-option",

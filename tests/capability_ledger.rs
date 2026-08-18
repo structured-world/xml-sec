@@ -831,7 +831,6 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
         "pubkey-cert-pem",
         "pubkey-der",
         "pubkey-pem",
-        "pwd",
         "trusted-der",
         "trusted-pem",
         "untrusted-der",
