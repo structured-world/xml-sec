@@ -30,9 +30,22 @@ pub(super) fn parse_with_options<'a>(
     )
 }
 
+fn parse_mutation_output_with_options<'a>(
+    xml: &'a str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<roxmltree::Document<'a>, XmlMutationError> {
+    if let Some(policy) = policy {
+        policy.resources.validate_xml_document_len(xml.len())?;
+    }
+    parse_with_options(xml, policy).map_err(Into::into)
+}
+
 /// Errors produced by XMLDSig XML mutation helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum XmlMutationError {
+    /// The compiled signing policy rejected an intermediate XML document.
+    #[error("signing policy violation: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
     /// Input XML or generated template is not parseable XML.
     #[error("XML parsing error: {0}")]
     XmlParse(#[from] roxmltree::Error),
@@ -144,7 +157,7 @@ pub(super) fn append_signature_to_root_with_options(
     }
 
     let output = String::from_utf8(writer.into_inner())?;
-    parse_with_options(&output, policy)?;
+    parse_mutation_output_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -183,7 +196,7 @@ pub(super) fn append_signature_to_element_with_options(
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
         output.insert_str(target.start + closing_start, signature_template);
     }
-    parse_with_options(&output, policy)?;
+    parse_mutation_output_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -553,7 +566,7 @@ fn merge_one_key_info_source_at_index_with_options(
             source_content,
             &format!("{generated_namespace_attributes}{generated_attributes}"),
         )?;
-        parse_with_options(&output, policy)?;
+        parse_mutation_output_with_options(&output, policy)?;
         return Ok(output);
     }
 
@@ -585,7 +598,7 @@ fn merge_one_key_info_source_at_index_with_options(
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
         output.insert_str(closing, key_info_source);
     }
-    parse_with_options(&output, policy)?;
+    parse_mutation_output_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -911,7 +924,7 @@ fn fill_dsig_values_matching(
     }
 
     let output = String::from_utf8(writer.into_inner())?;
-    parse_with_options(&output, policy)?;
+    parse_mutation_output_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -1011,7 +1024,7 @@ fn fill_dsig_element_raw_matching(
     }
 
     let output = String::from_utf8(writer.into_inner())?;
-    parse_with_options(&output, policy)?;
+    parse_mutation_output_with_options(&output, policy)?;
     Ok(output)
 }
 

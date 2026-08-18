@@ -67,9 +67,10 @@ and key-generation options may repeat where libxmlsec1 marks them as
 multi-value; repeating singleton output, provider, payload, selector, password,
 or policy options is rejected even when canonical and alias spellings are mixed.
 Only exact donor prefixes are accepted: canonical and long alias names use `--`,
-while one-character aliases use `-`. A standalone `--` explicitly ends option
-parsing. The first positional argument also ends option parsing, so every later
-argument is positional even when it begins with `-`.
+while one-character aliases use `-`. The first standalone `--` explicitly ends
+option parsing. The first positional argument also ends option parsing. After
+either event, every later argument, including `--`, is positional even when it
+begins with `-`.
 
 ## Examples
 

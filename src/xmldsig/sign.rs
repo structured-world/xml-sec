@@ -114,7 +114,7 @@ pub enum SigningError {
 
     /// Reference digest computation failed.
     #[error("signing digest pass failed: {0}")]
-    Digest(#[from] SigningDigestError),
+    Digest(SigningDigestError),
 
     /// Parsing the digest-filled `<SignedInfo>` failed.
     #[error("failed to parse SignedInfo after digest fill: {0}")]
@@ -139,7 +139,7 @@ pub enum SigningError {
 
     /// Writing `<SignatureValue>` failed.
     #[error("XML mutation error: {0}")]
-    XmlMutation(#[from] XmlMutationError),
+    XmlMutation(XmlMutationError),
 
     /// Writing `<KeyInfo>` failed.
     #[error("KeyInfo writer error: {0}")]
@@ -148,6 +148,24 @@ pub enum SigningError {
     /// Signature template generation failed.
     #[error("signature template error: {0}")]
     Template(#[from] SignatureBuilderError),
+}
+
+impl From<SigningDigestError> for SigningError {
+    fn from(error: SigningDigestError) -> Self {
+        match error {
+            SigningDigestError::XmlMutation(XmlMutationError::Policy(error)) => Self::Policy(error),
+            error => Self::Digest(error),
+        }
+    }
+}
+
+impl From<XmlMutationError> for SigningError {
+    fn from(error: XmlMutationError) -> Self {
+        match error {
+            XmlMutationError::Policy(error) => Self::Policy(error),
+            error => Self::XmlMutation(error),
+        }
+    }
 }
 
 /// Errors while parsing or using XMLDSig signing keys.

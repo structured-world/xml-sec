@@ -669,6 +669,62 @@ fn signing_policy_bounds_key_info_writer_bytes_before_parsing() {
 }
 
 #[test]
+fn signing_policy_bounds_merged_key_info_before_reparsing() {
+    // The template and writer fragment can each fit independently while their
+    // merged document exceeds the byte ceiling. Byte policy must reject that
+    // composition before the mutation helper reparses its additional nodes.
+    struct KeyNameWriter(String);
+
+    impl KeyInfoWriter for KeyNameWriter {
+        fn write_key_info(
+            &self,
+            _signing_key: &dyn SigningKey,
+        ) -> Result<String, xml_sec::xmldsig::KeyInfoWriteError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(""))
+        .build_template()
+        .expect("valid signature template");
+    let xml = append_signature_to_root("<root/>", &template).expect("append signature");
+    let writer = KeyNameWriter(
+        r#"<KeyName xmlns="http://www.w3.org/2000/09/xmldsig#">recipient</KeyName>"#.into(),
+    );
+    let maximum = xml.len() + 1;
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: maximum,
+            max_xml_nodes: roxmltree::Document::parse(&xml)
+                .expect("template must parse")
+                .descendants()
+                .count(),
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(policy)
+            .key_info_writer(&writer)
+            .sign_template(&xml),
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "XML document",
+                maximum: observed_maximum,
+                actual,
+            }
+        )) if observed_maximum == maximum && actual > maximum
+    ));
+}
+
+#[test]
 fn signing_policy_shares_canonicalization_budget_with_signed_info() {
     // Reference transforms and SignedInfo consume one operation-wide C14N
     // allowance, preventing a template from multiplying the configured cap.

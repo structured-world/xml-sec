@@ -2730,6 +2730,46 @@ fn rsa_encryption_rejects_stale_recipient_certificate_metadata() {
 }
 
 #[test]
+fn rsa_encryption_rejects_embedded_certificate_with_stale_selectors() {
+    // An embedded certificate and its selectors form one identity assertion.
+    // A matching wrapping key must not make contradictory selectors ignorable.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("x509-recipient-selector-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    let matching_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let certificate_with_stale_selector = x509_certificate_value(&certificate).replace(
+        "</ds:X509Data>",
+        "<ds:X509SubjectName>CN=not-the-recipient</ds:X509SubjectName></ds:X509Data>",
+    );
+    fs::write(
+        &template,
+        format!(
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo>{certificate_with_stale_selector}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+        ),
+    )
+    .unwrap();
+    fs::write(&plaintext, b"certificate selector identity").unwrap();
+
+    let rejected = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&matching_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("lookup identifiers do not match the embedded certificate chain"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
 fn rsa_encryption_matches_selector_only_x509data_to_configured_certificate() {
     // Selector-only X509Data resolves against --pubkey-cert-pem certificate
     // metadata; a bare public key cannot satisfy that certificate identity.

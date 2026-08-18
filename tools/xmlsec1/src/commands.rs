@@ -1423,11 +1423,6 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         &id_attributes,
         &policy,
     )?;
-    if rendered.len() > maximum_document_bytes {
-        return Err(CommandError::Encryption(
-            "encrypted template output exceeds XML document policy".into(),
-        ));
-    }
     write_result_then_stdout_diagnostics(invocation, rendered.as_bytes(), stdout, |stdout| {
         write_encryption_diagnostics(invocation, algorithm, stdout)
     })
@@ -1527,13 +1522,16 @@ struct RecipientPublicKeyCandidate {
     certificate_der: Option<Vec<u8>>,
 }
 
+#[derive(Clone)]
+struct ParsedRecipientKeyMetadata(KeyInfo);
+
 fn recipient_key_metadata(
     template: &str,
     start_node_id: Option<&str>,
     id_attributes: &[IdAttributeRegistration],
     policy: &EncryptionPolicy,
     expected_recipients: usize,
-) -> Result<Vec<Option<KeyInfo>>, CommandError> {
+) -> Result<Vec<Option<ParsedRecipientKeyMetadata>>, CommandError> {
     let document = parse_encryption_document(template, policy)?;
     let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
     let encrypted_keys = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
@@ -1554,7 +1552,7 @@ fn recipient_key_metadata(
         .into_iter()
         .map(|encrypted_key| {
             direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo")
-                .map(parse_key_info)
+                .map(|node| parse_key_info(node).map(ParsedRecipientKeyMetadata))
                 .transpose()
                 .map_err(|error| CommandError::Encryption(error.to_string()))
         })
@@ -1562,11 +1560,11 @@ fn recipient_key_metadata(
 }
 
 fn validate_recipient_key_metadata(
-    metadata: Option<&KeyInfo>,
+    metadata: Option<&ParsedRecipientKeyMetadata>,
     selected_key: &RecipientPublicKeyCandidate,
 ) -> Result<(), CommandError> {
     if let Some(metadata) = metadata {
-        for source in &metadata.sources {
+        for source in &metadata.0.sources {
             let matches = match source {
                 KeyInfoSource::KeyName(_) => continue,
                 KeyInfoSource::KeyValue(KeyValueInfo::Rsa { modulus, exponent }) => {
@@ -1589,6 +1587,9 @@ fn validate_recipient_key_metadata(
                         .copied()
                         .or_else(|| (!data.certificates.is_empty()).then_some(0));
                     if let Some(certificate_index) = certificate_index {
+                        // ParsedRecipientKeyMetadata proves parse_key_info has
+                        // already matched every selector category against this
+                        // one embedded certificate chain.
                         let certificate =
                             data.certificates.get(certificate_index).ok_or_else(|| {
                                 recipient_metadata_error(
@@ -1873,6 +1874,11 @@ fn apply_encryption_template(
     let mut output = template.to_owned();
     for (range, replacement) in replacements {
         output.replace_range(range, &replacement);
+    }
+    if output.len() > policy.resources.max_xml_document_bytes {
+        return Err(CommandError::Encryption(
+            "encrypted template output exceeds XML document policy".into(),
+        ));
     }
     parse_encryption_document(&output, policy)?;
     Ok(output)
@@ -2998,6 +3004,35 @@ mod tests {
         let error = apply_encryption_template(&template, &generated, None, &[], &policy)
             .expect_err("the aggregate merged document must be reparsed under policy");
         assert!(error.to_string().contains("nodes limit"), "{error}");
+    }
+
+    #[test]
+    fn merged_encryption_template_checks_bytes_before_reparsing() {
+        // Both inputs fit independently, but adding generated recipient data to
+        // the padded template crosses the document ceiling before a merged DOM
+        // may be allocated.
+        let padding = "x".repeat(256);
+        let template = format!(
+            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" padding=\"{padding}\"><e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedData>"
+        );
+        let generated = format!(
+            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><e:EncryptedKey><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
+        );
+        let maximum = template.len().max(generated.len());
+        let policy = EncryptionPolicy {
+            resources: xml_sec::policy::ResourcePolicy {
+                max_xml_document_bytes: maximum,
+                ..xml_sec::policy::ResourcePolicy::default()
+            },
+            ..EncryptionPolicy::default()
+        };
+
+        let error = apply_encryption_template(&template, &generated, None, &[], &policy)
+            .expect_err("merged output must be bounded before reparsing");
+        assert!(
+            matches!(&error, CommandError::Encryption(message) if message.contains("encrypted template output exceeds XML document policy")),
+            "{error}"
+        );
     }
 
     #[test]
