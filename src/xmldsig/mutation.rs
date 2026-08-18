@@ -30,7 +30,7 @@ pub(super) fn parse_with_options<'a>(
     )
 }
 
-fn parse_mutation_output_with_options<'a>(
+fn parse_synthesized_xml_with_options<'a>(
     xml: &'a str,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<roxmltree::Document<'a>, XmlMutationError> {
@@ -157,7 +157,7 @@ pub(super) fn append_signature_to_root_with_options(
     }
 
     let output = String::from_utf8(writer.into_inner())?;
-    parse_mutation_output_with_options(&output, policy)?;
+    parse_synthesized_xml_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -196,7 +196,7 @@ pub(super) fn append_signature_to_element_with_options(
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
         output.insert_str(target.start + closing_start, signature_template);
     }
-    parse_mutation_output_with_options(&output, policy)?;
+    parse_synthesized_xml_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -391,7 +391,7 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     // Parse it under the template's namespace context so multiple siblings and
     // inherited prefixes have exactly the semantics they will have in KeyInfo.
     let wrapped_source = wrap_key_info_children(key_info_source, key_info);
-    let source_document = parse_with_options(&wrapped_source, policy)?;
+    let source_document = parse_synthesized_xml_with_options(&wrapped_source, policy)?;
     let sources = source_document
         .root_element()
         .children()
@@ -566,7 +566,7 @@ fn merge_one_key_info_source_at_index_with_options(
             source_content,
             &format!("{generated_namespace_attributes}{generated_attributes}"),
         )?;
-        parse_mutation_output_with_options(&output, policy)?;
+        parse_synthesized_xml_with_options(&output, policy)?;
         return Ok(output);
     }
 
@@ -598,7 +598,7 @@ fn merge_one_key_info_source_at_index_with_options(
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
         output.insert_str(closing, key_info_source);
     }
-    parse_mutation_output_with_options(&output, policy)?;
+    parse_synthesized_xml_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -924,7 +924,7 @@ fn fill_dsig_values_matching(
     }
 
     let output = String::from_utf8(writer.into_inner())?;
-    parse_mutation_output_with_options(&output, policy)?;
+    parse_synthesized_xml_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -1024,7 +1024,7 @@ fn fill_dsig_element_raw_matching(
     }
 
     let output = String::from_utf8(writer.into_inner())?;
-    parse_mutation_output_with_options(&output, policy)?;
+    parse_synthesized_xml_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -1710,5 +1710,44 @@ mod tests {
 
         assert!(matches!(error, XmlMutationError::XmlParse(_)));
         assert!(error.to_string().contains("nodes limit"));
+    }
+
+    #[test]
+    fn key_info_source_merge_bounds_synthesized_wrapper_before_parsing() {
+        // The template and writer fragment can each fit while the namespace-
+        // complete wrapper synthesized for fragment parsing crosses the byte
+        // ceiling. Report that allocation boundary before parsing or merging.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:ext="urn:inherited"><ds:KeyInfo/></ds:Signature>"#;
+        let generated =
+            r#"<ds:KeyName xmlns:ds="http://www.w3.org/2000/09/xmldsig#">recipient</ds:KeyName>"#;
+        let document = roxmltree::Document::parse(source).expect("source must parse");
+        let key_info = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .expect("KeyInfo");
+        let wrapped = wrap_key_info_children(generated, key_info);
+        let maximum = wrapped.len() - 1;
+        assert!(source.len() <= maximum);
+        assert!(generated.len() <= maximum);
+        let policy = crate::policy::SigningPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_document_bytes: maximum,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::SigningPolicy::default()
+        };
+
+        let error =
+            merge_key_info_source_at_index_with_options(source, generated, 0, Some(&policy))
+                .expect_err("synthesized wrapper must be bounded before parsing");
+
+        assert!(matches!(
+            error,
+            XmlMutationError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "XML document",
+                maximum: observed_maximum,
+                actual,
+            }) if observed_maximum == maximum && actual == wrapped.len()
+        ));
     }
 }
