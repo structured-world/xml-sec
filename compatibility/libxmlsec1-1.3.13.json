@@ -21794,6 +21794,7 @@
       "source": "apps/xmlsec.c",
       "line": 1338,
       "detail": "1 for invalid parameters, missing input, initialization, or processing failure",
+      "exit_code": 1,
       "classification": "native-cli-exit-status"
     },
     {
@@ -21802,6 +21803,7 @@
       "source": "apps/xmlsec.c",
       "line": 1430,
       "detail": "0",
+      "exit_code": 0,
       "classification": "native-cli-exit-status"
     },
     {
@@ -21810,6 +21812,7 @@
       "source": "apps/xmlsec.c",
       "line": 1377,
       "detail": "0 after printing usage",
+      "exit_code": 0,
       "classification": "planned-cli-surface"
     },
     {

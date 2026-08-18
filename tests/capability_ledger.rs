@@ -41,6 +41,7 @@ struct Item {
     source: String,
     line: usize,
     detail: String,
+    exit_code: Option<i32>,
     classification: String,
 }
 
@@ -836,6 +837,29 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
         "untrusted-der",
         "untrusted-pem",
     ]);
+    let runtime_options: BTreeSet<_> = cli_args::OPTION_SPECS
+        .iter()
+        .map(|spec| spec.canonical)
+        .collect();
+    let runtime_supported_options: BTreeSet<_> = runtime_options
+        .iter()
+        .copied()
+        .filter(|option| behavior_compatible.contains(option) || provider_limited.contains(option))
+        .collect();
+    let ledger_supported_options: BTreeSet<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "cli-option")
+        .filter(|item| {
+            matches!(
+                classification(&ledger, item).outcome.as_str(),
+                "behavior-compatible" | "provider-limited"
+            )
+        })
+        .map(|item| item.name.trim_start_matches("--"))
+        .collect();
+    assert_eq!(runtime_supported_options, ledger_supported_options);
+
     for spec in cli_args::OPTION_SPECS {
         let option = format!("--{}", spec.canonical);
         let item = ledger
@@ -857,9 +881,9 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
         );
     }
     for (status, outcome, code) in [
-        ("success", "behavior-compatible", "0"),
-        ("failure", "behavior-compatible", "1"),
-        ("unknown-command", "planned", "0"),
+        ("success", "behavior-compatible", 0),
+        ("failure", "behavior-compatible", 1),
+        ("unknown-command", "planned", 0),
     ] {
         let item = ledger
             .items
@@ -867,10 +891,7 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
             .find(|item| item.kind == "cli-exit-status" && item.name == status)
             .unwrap_or_else(|| panic!("missing CLI status {status}"));
         assert_eq!(classification(&ledger, item).outcome, outcome);
-        assert!(
-            item.detail.contains(code),
-            "{status} must record exit code {code}"
-        );
+        assert_eq!(item.exit_code, Some(code), "wrong exit code for {status}");
     }
 }
 

@@ -602,7 +602,7 @@ fn named_candidate_search<'a, T: Copy>(
 
 fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, SIGN_OPTIONS)?;
-    reject_unsupported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
+    validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     if invocation.last_value("pwd").is_some() {
         return Err(CommandError::UnsupportedOption("pwd".into()));
     }
@@ -825,7 +825,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
 
 fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, VERIFY_OPTIONS)?;
-    reject_unsupported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
+    validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     reject_unimplemented_verification_policy(invocation)?;
     let explicit_keys = invocation
         .ordered_values(&[
@@ -1193,7 +1193,7 @@ fn verify_with_explicit_certificate(
 
 fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, ENCRYPT_OPTIONS)?;
-    reject_unsupported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
+    validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     let has_binary_data = invocation.last_value("binary-data").is_some();
     let has_xml_data = invocation.last_value("xml-data").is_some();
     if has_binary_data == has_xml_data {
@@ -2104,7 +2104,7 @@ fn direct_encrypted_keys<'a, 'input>(
 
 fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, DECRYPT_OPTIONS)?;
-    reject_unsupported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
+    validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     if invocation.last_value("pwd").is_some() {
         return Err(CommandError::UnsupportedOption("pwd".into()));
     }
@@ -2670,7 +2670,7 @@ fn write_secret_file(path: &OsStr, bytes: &[u8]) -> Result<(), CommandError> {
     })
 }
 
-fn reject_unsupported_selectors(
+fn validate_supported_selectors(
     invocation: &Invocation,
     supported: &[&str],
 ) -> Result<(), CommandError> {

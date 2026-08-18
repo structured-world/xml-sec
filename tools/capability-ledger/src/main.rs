@@ -75,6 +75,7 @@ struct SurfaceItem {
     source: String,
     line: usize,
     detail: String,
+    exit_code: Option<i32>,
     conditions: Vec<String>,
 }
 
@@ -85,6 +86,8 @@ struct LedgerItem {
     source: String,
     line: usize,
     detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
     classification: String,
 }
 
@@ -859,21 +862,24 @@ fn extract_cli_exit_statuses(content: &str) -> Result<Vec<SurfaceItem>, String> 
             "success",
             r"(?m)^[ \t]*/\* sucecss! \*/\r?\n(?P<target>[ \t]*res = 0;)$",
             "0",
+            0,
         ),
         (
             "unknown-command",
             r"(?s)if\(command == xmlSecAppCommandUnknown\) \{.*?\n(?P<target>[ \t]*res = 0;)\r?\n[ \t]*goto done;",
             "0 after printing usage",
+            0,
         ),
         (
             "failure",
             r"(?m)^(?P<target>[ \t]*int res = 1;)$",
             "1 for invalid parameters, missing input, initialization, or processing failure",
+            1,
         ),
     ];
     definitions
         .into_iter()
-        .map(|(name, pattern, detail)| {
+        .map(|(name, pattern, detail, exit_code)| {
             let regex = Regex::new(pattern).expect("valid CLI evidence regex");
             let mut matches = regex.captures_iter(content);
             let capture = matches
@@ -884,7 +890,9 @@ fn extract_cli_exit_statuses(content: &str) -> Result<Vec<SurfaceItem>, String> 
             }
             let target = capture.name("target").expect("CLI target capture");
             let line = content[..target.start()].lines().count() + 1;
-            Ok(item("cli-exit-status", name, "apps/xmlsec.c", line, detail))
+            let mut status = item("cli-exit-status", name, "apps/xmlsec.c", line, detail);
+            status.exit_code = Some(exit_code);
+            Ok(status)
         })
         .collect()
 }
@@ -1001,6 +1009,7 @@ fn classify(surface: Vec<SurfaceItem>, rules: RulesFile) -> Result<Ledger, Strin
             source: entry.source,
             line: entry.line,
             detail: entry.detail,
+            exit_code: entry.exit_code,
             classification: rule.id.clone(),
         });
     }
@@ -1348,6 +1357,7 @@ fn item(kind: &str, name: &str, source: &str, line: usize, detail: &str) -> Surf
         source: source.into(),
         line,
         detail: detail.into(),
+        exit_code: None,
         conditions: Vec::new(),
     }
 }
@@ -1445,9 +1455,13 @@ done:
         assert_eq!(
             entries
                 .iter()
-                .map(|entry| (entry.name.as_str(), entry.line))
+                .map(|entry| (entry.name.as_str(), entry.line, entry.exit_code))
                 .collect::<Vec<_>>(),
-            vec![("success", 9), ("unknown-command", 5), ("failure", 2)]
+            vec![
+                ("success", 9, Some(0)),
+                ("unknown-command", 5, Some(0)),
+                ("failure", 2, Some(1)),
+            ]
         );
 
         let error = extract_cli_exit_statuses(&content.replace("/* sucecss! */", "/* done */"))
