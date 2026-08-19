@@ -214,7 +214,10 @@ The first companion certificate must contain the private key's public key;
 remaining companions must be structurally valid certificates. Lax lookup skips
 an invalid compound candidate as a unit rather than retaining its private key.
 All asymmetric key and certificate files are read through one absolute
-process-safety ceiling before format decoding. Verification also deduplicates
+process-safety ceiling before format decoding. Certificate companions are
+charged by source bytes before decoded DER is retained, so PEM padding and
+repeated paths cannot bypass the aggregate external-resource budget.
+Verification also deduplicates
 repeated certificates within each lookup or trust role, validates every
 explicit trust input even when a raw public key is selected, and charges every
 read certificate source to the compiled aggregate external-resource budget

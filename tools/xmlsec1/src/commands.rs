@@ -787,8 +787,9 @@ fn load_certificate_companions(
     paths
         .iter()
         .map(|path| {
-            let certificate = key_material::load_certificate(path, encoding)?;
-            budget.charge(certificate.len())?;
+            let (certificate, source_len) =
+                key_material::load_certificate_with_source_len(path, encoding)?;
+            budget.charge(source_len)?;
             Ok(certificate)
         })
         .collect()
@@ -2571,21 +2572,69 @@ impl DecryptionKeyResolver for NamedRecipientDecryptor {
         algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
     ) -> Result<Vec<u8>, XmlEncError> {
+        let Some(encrypted_key) = encrypted_key else {
+            return Err(XmlEncError::KeyNotFound);
+        };
         let mut last_error = None;
-        for key in &self.keys {
-            if !self.lax_key_search
-                && !self.unnamed_single_key_fallback
-                && encrypted_key.and_then(|candidate| candidate.key_name.as_deref())
-                    != key.key_name.as_deref()
+        for key in self.applicable_keys(encrypted_key) {
+            match key
+                .inner
+                .resolve_key(provider, algorithm, Some(encrypted_key))
             {
-                continue;
-            }
-            match key.inner.resolve_key(provider, algorithm, encrypted_key) {
                 Ok(key) => return Ok(key),
                 Err(error) => last_error = Some(error),
             }
         }
         Err(last_error.unwrap_or(XmlEncError::KeyNotFound))
+    }
+
+    fn resolve_key_candidates(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        maximum_candidates: usize,
+    ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+        let Some(encrypted_key) = encrypted_key else {
+            return Err(XmlEncError::KeyNotFound);
+        };
+        let candidates = self.applicable_keys(encrypted_key).collect::<Vec<_>>();
+        if candidates.len() > maximum_candidates {
+            return Err(xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "RSA private-key candidates",
+                maximum: maximum_candidates,
+                actual: candidates.len(),
+            }
+            .into());
+        }
+        let mut resolved = Vec::new();
+        let mut last_error = None;
+        for key in candidates {
+            match key
+                .inner
+                .resolve_key(provider, algorithm, Some(encrypted_key))
+            {
+                Ok(key) => resolved.push(key),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if resolved.is_empty() {
+            return Err(last_error.unwrap_or(XmlEncError::KeyNotFound));
+        }
+        Ok(resolved)
+    }
+}
+
+impl NamedRecipientDecryptor {
+    fn applicable_keys<'a>(
+        &'a self,
+        encrypted_key: &'a EncryptedKey,
+    ) -> impl Iterator<Item = &'a RecipientPrivateKey> {
+        self.keys.iter().filter(|key| {
+            self.lax_key_search
+                || self.unnamed_single_key_fallback
+                || encrypted_key.key_name.as_deref() == key.key_name.as_deref()
+        })
     }
 }
 
@@ -3446,6 +3495,95 @@ mod tests {
         assert!(matches!(
             load_configured_certificates(&invocation, false, &mut budget),
             Err(CommandError::CertificateMaterialTooLarge { maximum }) if maximum == source_len
+        ));
+    }
+
+    #[test]
+    fn certificate_companions_charge_source_bytes_before_retention() {
+        // PEM whitespace is still processed input even though it disappears
+        // from decoded DER, so the source size must drive aggregate charging.
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let temp = tempfile::tempdir().unwrap();
+        let padded = temp.path().join("padded-cert.pem");
+        let mut source = fs::read(&fixture).unwrap();
+        source.extend(std::iter::repeat_n(b' ', 4096));
+        fs::write(&padded, &source).unwrap();
+        let der_len =
+            key_material::load_certificate(&padded, key_material::CertificateEncoding::Pem)
+                .unwrap()
+                .len();
+        let mut budget = CertificateBudget::new(der_len);
+
+        assert!(matches!(
+            load_certificate_companions(
+                &[padded.as_os_str()],
+                key_material::CertificateEncoding::Pem,
+                &mut budget,
+            ),
+            Err(CommandError::CertificateMaterialTooLarge { maximum }) if maximum == der_len
+        ));
+    }
+
+    #[test]
+    fn recipient_resolver_bounds_applicable_private_keys_before_unwrap() {
+        // Lax lookup must not hide an unbounded RSA-OAEP loop behind the single
+        // content key eventually returned to the core decryption context.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+        let private_key =
+            key_material::load_rsa_private(&path, key_material::PrivateKeyFormat::Pem).unwrap();
+        let resolver = NamedRecipientDecryptor {
+            keys: vec![
+                RecipientPrivateKey {
+                    inner: PrivateKeyDecryptor::new(private_key.clone()),
+                    key_name: None,
+                },
+                RecipientPrivateKey {
+                    inner: PrivateKeyDecryptor::new(private_key),
+                    key_name: None,
+                },
+            ],
+            lax_key_search: true,
+            unnamed_single_key_fallback: false,
+        };
+        let encrypted_key = EncryptedKey {
+            id: None,
+            recipient: None,
+            key_name: None,
+            encryption_method: EncryptionMethod {
+                algorithm: KeyTransportAlgorithm::RsaOaep11.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            cipher_data: xml_sec::xmlenc::CipherData {
+                value: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    [0_u8; 256],
+                ),
+            },
+            reference_list: None,
+            carried_key_name: None,
+        };
+
+        let error = resolver
+            .resolve_key_candidates(
+                default_provider(),
+                DataEncryptionAlgorithm::Aes128Gcm,
+                Some(&encrypted_key),
+                1,
+            )
+            .expect_err("oversized applicable RSA key sets must fail before unwrap");
+
+        assert!(matches!(
+            error,
+            XmlEncError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "RSA private-key candidates",
+                maximum: 1,
+                actual: 2,
+            })
         ));
     }
 
