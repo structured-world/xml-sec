@@ -1679,9 +1679,9 @@ fn load_rsa_recipient_candidate(
             certificate_der: None,
         },
         RecipientPublicKeySource::Certificate(encoding) => {
-            let (public_key, certificate_der) =
+            let (public_key, certificate_der, source_len) =
                 key_material::load_rsa_certificate_public(path, encoding)?;
-            certificate_budget.charge(certificate_der.len())?;
+            certificate_budget.charge(source_len)?;
             RecipientPublicKeyCandidate {
                 public_key,
                 certificate_der: Some(certificate_der),
@@ -3060,6 +3060,12 @@ mod tests {
         Invocation::parse(arguments.iter().map(OsString::from)).unwrap()
     }
 
+    fn testdata(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(name)
+    }
+
     struct CountingVerificationKey {
         accepts: bool,
         calls: Rc<Cell<usize>>,
@@ -3095,10 +3101,7 @@ mod tests {
                 }),
             ],
         };
-        let xml = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../../tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
-        ))
-        .unwrap();
+        let xml = fs::read_to_string(testdata("enveloping-sha256-rsa-sha256.xml")).unwrap();
 
         let result = VerifyContext::new()
             .key(&candidates)
@@ -3485,8 +3488,7 @@ mod tests {
     fn duplicate_configured_certificate_sources_consume_aggregate_budget() {
         // Deduplicating retained DER must not make repeated external file reads
         // free: every explicitly supplied source consumes invocation work.
-        let certificate = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let certificate = testdata("rsa-2048-cert.pem");
         let source_len = fs::read(&certificate).unwrap().len();
         let invocation = Invocation::parse([
             OsString::from("xmlsec1"),
@@ -3510,17 +3512,19 @@ mod tests {
     fn certificate_companions_charge_source_bytes_before_retention() {
         // PEM whitespace is still processed input even though it disappears
         // from decoded DER, so the source size must drive aggregate charging.
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let fixture = testdata("rsa-2048-cert.pem");
         let temp = tempfile::tempdir().unwrap();
         let padded = temp.path().join("padded-cert.pem");
         let mut source = fs::read(&fixture).unwrap();
         source.extend(std::iter::repeat_n(b' ', 4096));
         fs::write(&padded, &source).unwrap();
-        let der_len =
-            key_material::load_certificate(&padded, key_material::CertificateEncoding::Pem)
-                .unwrap()
-                .len();
+        let der_len = key_material::load_certificate_with_source_len(
+            &padded,
+            key_material::CertificateEncoding::Pem,
+        )
+        .unwrap()
+        .0
+        .len();
         let mut budget = CertificateBudget::new(der_len);
 
         assert!(matches!(
@@ -3537,17 +3541,19 @@ mod tests {
     fn explicit_verification_certificate_charges_source_bytes() {
         // Explicit leaf certificates share the invocation budget with trust
         // inputs, including PEM bytes discarded while decoding the DER value.
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let fixture = testdata("rsa-2048-cert.pem");
         let temp = tempfile::tempdir().unwrap();
         let padded = temp.path().join("padded-explicit-cert.pem");
         let mut source = fs::read(&fixture).unwrap();
         source.extend(std::iter::repeat_n(b' ', 4096));
         fs::write(&padded, &source).unwrap();
-        let der_len =
-            key_material::load_certificate(&padded, key_material::CertificateEncoding::Pem)
-                .unwrap()
-                .len();
+        let der_len = key_material::load_certificate_with_source_len(
+            &padded,
+            key_material::CertificateEncoding::Pem,
+        )
+        .unwrap()
+        .0
+        .len();
         let option = crate::OptionValue {
             name: "pubkey-cert-pem".into(),
             parameter: None,
@@ -3565,8 +3571,7 @@ mod tests {
     fn recipient_resolver_bounds_applicable_private_keys_before_unwrap() {
         // Lax lookup must not hide an unbounded RSA-OAEP loop behind the single
         // content key eventually returned to the core decryption context.
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+        let path = testdata("rsa-2048-key.pem");
         let private_key =
             key_material::load_rsa_private(&path, key_material::PrivateKeyFormat::Pem).unwrap();
         let resolver = NamedRecipientDecryptor {
@@ -3627,8 +3632,7 @@ mod tests {
     fn recipient_certificate_loader_charges_the_invocation_budget() {
         // Recipient certificates are external inputs even when used only to
         // extract an RSA wrapping key, so they share the operation-wide budget.
-        let certificate = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let certificate = testdata("rsa-2048-cert.pem");
         let mut budget = CertificateBudget::new(1);
 
         let error = load_rsa_recipient_candidate(
@@ -3646,12 +3650,43 @@ mod tests {
     }
 
     #[test]
+    fn recipient_certificate_loader_charges_pem_source_bytes() {
+        // PEM whitespace is processed external input even though decoding drops
+        // it, so recipient certificate accounting must use the source length.
+        let fixture = testdata("rsa-2048-cert.pem");
+        let temp = tempfile::tempdir().unwrap();
+        let padded = temp.path().join("padded-recipient-cert.pem");
+        let mut source = fs::read(&fixture).unwrap();
+        source.extend(std::iter::repeat_n(b' ', 4096));
+        fs::write(&padded, source).unwrap();
+        let der_len = key_material::load_certificate_with_source_len(
+            &padded,
+            key_material::CertificateEncoding::Pem,
+        )
+        .unwrap()
+        .0
+        .len();
+        let mut budget = CertificateBudget::new(der_len);
+
+        assert!(matches!(
+            load_rsa_recipient_candidate(
+                padded.as_os_str(),
+                RecipientPublicKeySource::Certificate(
+                    key_material::CertificateEncoding::Pem,
+                ),
+                &EncryptionPolicy::default(),
+                &mut budget,
+            ),
+            Err(CommandError::CertificateMaterialTooLarge { maximum }) if maximum == der_len
+        ));
+    }
+
+    #[test]
     fn recipient_certificate_cache_reuses_one_budget_charge() {
         // Repeated recipient selection may reuse one CLI option, but external
         // certificate bytes belong to the invocation and are charged once.
-        let certificate = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
-        let der = key_material::load_certificate(
+        let certificate = testdata("rsa-2048-cert.pem");
+        let (_, source_len) = key_material::load_certificate_with_source_len(
             certificate.as_os_str(),
             key_material::CertificateEncoding::Pem,
         )
@@ -3668,7 +3703,7 @@ mod tests {
         .unwrap();
         let option = invocation.values("pubkey-cert-pem").next().unwrap();
         let mut cache = HashMap::new();
-        let mut budget = CertificateBudget::new(der.len());
+        let mut budget = CertificateBudget::new(source_len);
 
         cached_rsa_recipient_candidate(
             &mut cache,

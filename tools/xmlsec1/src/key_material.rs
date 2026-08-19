@@ -330,13 +330,6 @@ fn valid_spki(bytes: &[u8]) -> bool {
     x509_parser::x509::SubjectPublicKeyInfo::from_der(bytes).is_ok_and(|(rest, _)| rest.is_empty())
 }
 
-pub fn load_certificate(
-    path: impl AsRef<Path>,
-    encoding: CertificateEncoding,
-) -> Result<Vec<u8>, KeyMaterialError> {
-    load_certificate_with_source_len(path, encoding).map(|(der, _)| der)
-}
-
 pub(crate) fn load_certificate_with_source_len(
     path: impl AsRef<Path>,
     encoding: CertificateEncoding,
@@ -415,14 +408,14 @@ pub fn load_rsa_public(
 pub fn load_rsa_certificate_public(
     path: impl AsRef<Path>,
     encoding: CertificateEncoding,
-) -> Result<(RsaPublicKey, Vec<u8>), KeyMaterialError> {
+) -> Result<(RsaPublicKey, Vec<u8>, usize), KeyMaterialError> {
     let path = path.as_ref();
-    let der = load_certificate(path, encoding)?;
+    let (der, source_len) = load_certificate_with_source_len(path, encoding)?;
     let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(&der)
         .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
     let public_key = RsaPublicKey::from_public_key_der(certificate.public_key().raw)
         .map_err(|_| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))?;
-    Ok((public_key, der))
+    Ok((public_key, der, source_len))
 }
 
 pub fn load_symmetric(
@@ -598,8 +591,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("certificate.pem");
         fs::write(&path, b"not a PEM container").unwrap();
-        assert!(load_certificate(&path, CertificateEncoding::Pem).is_err());
-        assert!(load_certificate(&path, CertificateEncoding::Der).is_err());
+        assert!(load_certificate_with_source_len(&path, CertificateEncoding::Pem).is_err());
+        assert!(load_certificate_with_source_len(&path, CertificateEncoding::Der).is_err());
     }
 
     #[test]
