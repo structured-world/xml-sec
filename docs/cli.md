@@ -229,6 +229,10 @@ XML `Element` or `Content`; embedded templates require `--xml-data` so every
 successful encryption has a reciprocal document-replacement decryption path.
 Supplying `--binary-data` and `--xml-data` together is rejected before either
 payload is read; encryption requires exactly one payload mode.
+Lax AES-GCM lookup retries a bounded key set inside one authenticated
+decryption operation. AES-CBC provides no key authentication, so decryption
+requires metadata to select exactly one key and rejects unordered candidate
+sets rather than treating valid padding as proof of the correct key.
 A direct `--aes-key` cannot satisfy an `EncryptedKey` recipient embedded in the
 template, so that inconsistent combination is rejected rather than preserving
 a stale wrapped key.

@@ -2543,8 +2543,17 @@ impl DecryptionKeyResolver for CandidateSymmetricKeyDecryptor {
         _provider: &dyn CryptoProvider,
         _algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
+        maximum_candidates: usize,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
         if encrypted_key.is_none() {
+            if self.keys.len() > maximum_candidates {
+                return Err(xml_sec::policy::PolicyViolation::ResourceLimit {
+                    resource: "decryption key candidates",
+                    maximum: maximum_candidates,
+                    actual: self.keys.len(),
+                }
+                .into());
+            }
             Ok(self.keys.clone())
         } else {
             Err(XmlEncError::KeyNotFound)
@@ -3451,17 +3460,15 @@ mod tests {
             key_material::CertificateEncoding::Pem,
         )
         .unwrap();
-        let invocation = Invocation::parse(
-            [
-                OsString::from("xmlsec1"),
-                OsString::from("encrypt"),
-                OsString::from("--pubkey-cert-pem"),
-                certificate.as_os_str().to_owned(),
-                OsString::from("--binary-data"),
-                OsString::from("payload.bin"),
-                OsString::from("template.xml"),
-            ],
-        )
+        let invocation = Invocation::parse([
+            OsString::from("xmlsec1"),
+            OsString::from("encrypt"),
+            OsString::from("--pubkey-cert-pem"),
+            certificate.as_os_str().to_owned(),
+            OsString::from("--binary-data"),
+            OsString::from("payload.bin"),
+            OsString::from("template.xml"),
+        ])
         .unwrap();
         let option = invocation.values("pubkey-cert-pem").next().unwrap();
         let mut cache = HashMap::new();

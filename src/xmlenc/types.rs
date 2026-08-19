@@ -658,6 +658,16 @@ pub enum XmlEncError {
         /// Actual key size.
         actual: usize,
     },
+    /// An unauthenticated content algorithm cannot safely select among keys.
+    #[error(
+        "{algorithm:?} cannot safely select among {actual} unordered decryption key candidates"
+    )]
+    AmbiguousKeyCandidates {
+        /// Unauthenticated algorithm for which key success is ambiguous.
+        algorithm: DataEncryptionAlgorithm,
+        /// Number of unresolved candidate keys.
+        actual: usize,
+    },
     /// A supplied AES key-encryption key is not the size declared by EncryptedKey.
     #[error("{algorithm:?} requires a {expected}-byte KEK, got {actual}")]
     InvalidKekSize {

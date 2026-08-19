@@ -35,13 +35,17 @@ pub trait DecryptionKeyResolver {
     ///
     /// The default preserves single-key resolver behavior. Key rings override
     /// this method so parsing, policy validation, and ciphertext decoding occur
-    /// once while only authenticated primitive decryption is retried.
+    /// once while only authenticated primitive decryption is retried. Overrides
+    /// must reject results larger than the supplied maximum; the context also
+    /// enforces that ceiling before cryptographic work.
     fn resolve_key_candidates(
         &self,
         provider: &dyn crate::provider::CryptoProvider,
         algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
+        maximum_candidates: usize,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+        let _ = maximum_candidates;
         self.resolve_key(provider, algorithm, encrypted_key)
             .map(|key| vec![key])
     }
@@ -161,6 +165,7 @@ impl<'a> DecryptContext<'a> {
             self.resolver,
             &self.policy,
         )?;
+        validate_decryption_key_candidates(algorithm, keys.len())?;
         let mut decrypted = Vec::new();
         let mut last_error = None;
         for key in keys {
@@ -695,7 +700,8 @@ fn resolve_content_key_candidates(
     resolver: &dyn DecryptionKeyResolver,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<Vec<Vec<u8>>, XmlEncError> {
-    match resolver.resolve_key_candidates(provider, algorithm, None) {
+    let maximum = crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING;
+    match resolver.resolve_key_candidates(provider, algorithm, None, maximum) {
         Ok(keys) if !keys.is_empty() => return Ok(keys),
         Ok(_) => {}
         Err(XmlEncError::KeyNotFound) => {}
@@ -708,13 +714,37 @@ fn resolve_content_key_candidates(
             last_error = Some(error);
             continue;
         }
-        match resolver.resolve_key_candidates(provider, algorithm, Some(encrypted_key)) {
+        match resolver.resolve_key_candidates(provider, algorithm, Some(encrypted_key), maximum) {
             Ok(keys) if !keys.is_empty() => return Ok(keys),
             Ok(_) => {}
             Err(error) => last_error = Some(error),
         }
     }
     Err(last_error.unwrap_or(XmlEncError::KeyNotFound))
+}
+
+fn validate_decryption_key_candidates(
+    algorithm: DataEncryptionAlgorithm,
+    actual: usize,
+) -> Result<(), XmlEncError> {
+    let maximum = crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING;
+    if actual > maximum {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "decryption key candidates",
+            maximum,
+            actual,
+        }
+        .into());
+    }
+    if actual > 1
+        && matches!(
+            algorithm,
+            DataEncryptionAlgorithm::Aes128Cbc | DataEncryptionAlgorithm::Aes256Cbc
+        )
+    {
+        return Err(XmlEncError::AmbiguousKeyCandidates { algorithm, actual });
+    }
+    Ok(())
 }
 
 fn validate_encrypted_key_policy(
@@ -1040,8 +1070,17 @@ mod tests {
             _provider: &dyn crate::provider::CryptoProvider,
             _algorithm: DataEncryptionAlgorithm,
             encrypted_key: Option<&EncryptedKey>,
+            maximum_candidates: usize,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
             if encrypted_key.is_none() {
+                if self.keys.len() > maximum_candidates {
+                    return Err(crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "decryption key candidates",
+                        maximum: maximum_candidates,
+                        actual: self.keys.len(),
+                    }
+                    .into());
+                }
                 Ok(self.keys.clone())
             } else {
                 Err(XmlEncError::KeyNotFound)
@@ -1306,6 +1345,90 @@ mod tests {
             decrypted,
             DecryptedContent::Bytes(b"candidate plaintext".to_vec())
         );
+    }
+
+    #[test]
+    fn cbc_rejects_multiple_unordered_key_candidates() {
+        // CBC padding cannot authenticate which candidate key is correct. A
+        // resolver must select one key from trusted metadata before decryption.
+        let encrypted = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            encryption_method: EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Cbc.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            key_name: None,
+            encrypted_keys: Vec::new(),
+            cipher_data: CipherData {
+                value: STANDARD.encode(
+                    crate::provider::default_provider()
+                        .encrypt_data(
+                            DataEncryptionAlgorithm::Aes128Cbc,
+                            &[7_u8; 16],
+                            b"opaque plaintext",
+                        )
+                        .expect("test encryption must succeed"),
+                ),
+            },
+        };
+        let resolver = CandidateResolver {
+            keys: vec![vec![1_u8; 16], vec![7_u8; 16]],
+        };
+
+        let error = DecryptContext::new(&resolver)
+            .decrypt_data(&encrypted)
+            .expect_err("unauthenticated CBC must not guess among candidate keys");
+
+        assert!(matches!(
+            error,
+            XmlEncError::AmbiguousKeyCandidates {
+                algorithm: DataEncryptionAlgorithm::Aes128Cbc,
+                actual: 2,
+            }
+        ));
+    }
+
+    #[test]
+    fn candidate_keys_are_bounded_before_cryptographic_processing() {
+        // A resolver is caller-controlled; its result cannot multiply one
+        // prepared operation beyond the implementation safety ceiling.
+        let encrypted = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            encryption_method: EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            key_name: None,
+            encrypted_keys: Vec::new(),
+            cipher_data: CipherData {
+                value: STANDARD.encode(vec![0_u8; 28]),
+            },
+        };
+        let actual = crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING + 1;
+        let resolver = CandidateResolver {
+            keys: vec![vec![0_u8; 16]; actual],
+        };
+
+        let error = DecryptContext::new(&resolver)
+            .decrypt_data(&encrypted)
+            .expect_err("oversized candidate sets must fail before decryption");
+
+        assert!(matches!(
+            error,
+            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "decryption key candidates",
+                maximum: crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING,
+                actual: observed,
+            }) if observed == actual
+        ));
     }
 
     #[test]
