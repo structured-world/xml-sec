@@ -235,7 +235,10 @@ successful encryption has a reciprocal document-replacement decryption path.
 Supplying `--binary-data` and `--xml-data` together is rejected before either
 payload is read; encryption requires exactly one payload mode.
 Lax AES-GCM lookup retries a bounded key set inside one authenticated
-decryption operation. AES-CBC provides no key authentication, so decryption
+decryption operation and releases each rejected plaintext before trying the
+next key. Standalone decryption stops at the first authenticated plaintext;
+document replacement stops at the first plaintext that also satisfies the XML
+replacement contract. AES-CBC provides no key authentication, so decryption
 requires metadata to select exactly one key and rejects unordered candidate
 sets rather than treating valid padding as proof of the correct key.
 A direct `--aes-key` cannot satisfy an `EncryptedKey` recipient embedded in the

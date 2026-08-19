@@ -1318,11 +1318,11 @@ fn load_explicit_certificate_key_info(
     certificate: &crate::OptionValue,
     budget: &mut CertificateBudget,
 ) -> Result<KeyInfo, CommandError> {
-    let certificate_der = key_material::load_certificate(
+    let (certificate_der, source_len) = key_material::load_certificate_with_source_len(
         certificate.value.as_deref().unwrap_or_default(),
         certificate_encoding(certificate),
     )?;
-    budget.charge(certificate_der.len())?;
+    budget.charge(source_len)?;
     // Model the caller-pinned leaf as the sole document key source. The core
     // resolver can then build its path through caller-supplied intermediates
     // and anchors without allowing the document's embedded KeyInfo to replace
@@ -3521,6 +3521,34 @@ mod tests {
                 key_material::CertificateEncoding::Pem,
                 &mut budget,
             ),
+            Err(CommandError::CertificateMaterialTooLarge { maximum }) if maximum == der_len
+        ));
+    }
+
+    #[test]
+    fn explicit_verification_certificate_charges_source_bytes() {
+        // Explicit leaf certificates share the invocation budget with trust
+        // inputs, including PEM bytes discarded while decoding the DER value.
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let temp = tempfile::tempdir().unwrap();
+        let padded = temp.path().join("padded-explicit-cert.pem");
+        let mut source = fs::read(&fixture).unwrap();
+        source.extend(std::iter::repeat_n(b' ', 4096));
+        fs::write(&padded, &source).unwrap();
+        let der_len =
+            key_material::load_certificate(&padded, key_material::CertificateEncoding::Pem)
+                .unwrap()
+                .len();
+        let option = crate::OptionValue {
+            name: "pubkey-cert-pem".into(),
+            parameter: None,
+            value: Some(padded.into_os_string()),
+        };
+        let mut budget = CertificateBudget::new(der_len);
+
+        assert!(matches!(
+            load_explicit_certificate_key_info(&option, &mut budget),
             Err(CommandError::CertificateMaterialTooLarge { maximum }) if maximum == der_len
         ));
     }

@@ -108,16 +108,14 @@ impl<'a> DecryptContext<'a> {
 
     /// Decrypt an already parsed `EncryptedData` value.
     pub fn decrypt_data(&self, encrypted: &EncryptedData) -> Result<DecryptedContent, XmlEncError> {
-        self.decrypt_data_candidates(encrypted)?
-            .into_iter()
-            .next()
-            .ok_or(XmlEncError::KeyNotFound)
+        self.process_decryption_candidates(encrypted, Ok)
     }
 
-    fn decrypt_data_candidates(
+    fn process_decryption_candidates<T>(
         &self,
         encrypted: &EncryptedData,
-    ) -> Result<Vec<DecryptedContent>, XmlEncError> {
+        mut accept: impl FnMut(DecryptedContent) -> Result<T, XmlEncError>,
+    ) -> Result<T, XmlEncError> {
         self.policy.resources.validate()?;
         validate_encrypted_data_metadata(encrypted, &self.policy)?;
         encrypted.encryption_method.validate_structure()?;
@@ -166,7 +164,6 @@ impl<'a> DecryptContext<'a> {
             &self.policy,
         )?;
         validate_decryption_key_candidates(algorithm, keys.len())?;
-        let mut decrypted = Vec::new();
         let mut last_error = None;
         for key in keys {
             let attempt = (|| {
@@ -192,14 +189,14 @@ impl<'a> DecryptContext<'a> {
                 }
             })();
             match attempt {
-                Ok(content) => decrypted.push(content),
+                Ok(content) => match accept(content) {
+                    Ok(result) => return Ok(result),
+                    Err(error) => last_error = Some(error),
+                },
                 Err(error) => last_error = Some(error),
             }
         }
-        if decrypted.is_empty() {
-            return Err(last_error.unwrap_or(XmlEncError::KeyNotFound));
-        }
-        Ok(decrypted)
+        Err(last_error.unwrap_or(XmlEncError::KeyNotFound))
     }
 
     /// Decrypt and replace one selected `EncryptedData` in a caller-owned document.
@@ -541,21 +538,15 @@ fn decrypt_document_with_context(
 
     let range = selected.range();
     let encrypted = parse_encrypted_data_node_with_policy(selected, &context.policy)?;
-    let candidates = context.decrypt_data_candidates(&encrypted)?;
-    let mut last_error = None;
-    for candidate in candidates {
-        match replace_decrypted_content(
+    context.process_decryption_candidates(&encrypted, |candidate| {
+        replace_decrypted_content(
             xml,
             range.clone(),
             candidate,
             encrypted.encrypted_type.as_ref(),
             &context.policy,
-        ) {
-            Ok(output) => return Ok(output),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or(XmlEncError::KeyNotFound))
+        )
+    })
 }
 
 fn replace_decrypted_content(
@@ -1094,6 +1085,7 @@ mod tests {
         unwrap_calls: AtomicUsize,
         recover_calls: AtomicUsize,
         plaintext: Vec<u8>,
+        candidate_plaintexts: Vec<Vec<u8>>,
     }
 
     impl crate::provider::CryptoProvider for PermissiveUnwrapProvider {
@@ -1177,8 +1169,12 @@ mod tests {
             _key: &[u8],
             _ciphertext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
-            self.decrypt_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(self.plaintext.clone())
+            let index = self.decrypt_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self
+                .candidate_plaintexts
+                .get(index)
+                .unwrap_or(&self.plaintext)
+                .clone())
         }
 
         fn wrap_key(
@@ -1345,6 +1341,69 @@ mod tests {
             decrypted,
             DecryptedContent::Bytes(b"candidate plaintext".to_vec())
         );
+    }
+
+    #[test]
+    fn standalone_decryption_stops_after_first_successful_candidate() {
+        // A successful authenticated candidate is the final standalone result;
+        // later keys must not cause redundant decryptions or retained plaintexts.
+        let provider = PermissiveUnwrapProvider {
+            plaintext: b"accepted".to_vec(),
+            ..PermissiveUnwrapProvider::default()
+        };
+        let resolver = CandidateResolver {
+            keys: vec![vec![1_u8; 16], vec![2_u8; 16], vec![3_u8; 16]],
+        };
+        let encrypted = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            encryption_method: EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            key_name: None,
+            encrypted_keys: Vec::new(),
+            cipher_data: CipherData {
+                value: STANDARD.encode([0_u8; 36]),
+            },
+        };
+
+        let result = DecryptContext::new(&resolver)
+            .provider(&provider)
+            .decrypt_data(&encrypted)
+            .expect("the first successful candidate must be returned");
+
+        assert_eq!(result, DecryptedContent::Bytes(b"accepted".to_vec()));
+        assert_eq!(provider.decrypt_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn document_decryption_discards_rejected_plaintext_before_next_candidate() {
+        // Replacement validation may reject authenticated plaintext. The next
+        // key is then tried, but candidates after the first valid XML stay unused.
+        let provider = PermissiveUnwrapProvider {
+            candidate_plaintexts: vec![b"<bad".to_vec(), b"<x/>".to_vec(), b"<u/>".to_vec()],
+            ..PermissiveUnwrapProvider::default()
+        };
+        let resolver = CandidateResolver {
+            keys: vec![vec![1_u8; 16], vec![2_u8; 16], vec![3_u8; 16]],
+        };
+        let encrypted = format!(
+            "<xenc:EncryptedData xmlns:xenc=\"{XMLENC_NS}\" Type=\"{XMLENC_NS}Element\"><xenc:EncryptionMethod Algorithm=\"{}\"/><xenc:CipherData><xenc:CipherValue>{}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>",
+            DataEncryptionAlgorithm::Aes128Gcm.uri(),
+            STANDARD.encode([0_u8; 32]),
+        );
+
+        let result = DecryptContext::new(&resolver)
+            .provider(&provider)
+            .decrypt_document(&encrypted, None)
+            .expect("a later candidate with valid replacement XML must succeed");
+
+        assert_eq!(result, "<x/>");
+        assert_eq!(provider.decrypt_calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]
