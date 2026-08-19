@@ -135,6 +135,46 @@ fn signs_verifies_and_rejects_tampering_through_process_api() {
 }
 
 #[test]
+fn direct_public_key_verification_rejects_invalid_trust_inputs() {
+    // Explicit trust inputs are configuration, not optional resolver hints:
+    // validate them even when a raw public key verifies the signature.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let malformed_trust = temp.path().join("malformed-trust.pem");
+    let signed = temp.path().join("signed.xml");
+    fs::write(&malformed_trust, b"not a certificate").unwrap();
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg("--trusted-pem")
+        .arg(&malformed_trust)
+        .arg(&signed)
+        .output()
+        .unwrap();
+
+    assert!(!verify.status.success());
+    assert!(String::from_utf8_lossy(&verify.stderr).contains("certificate"));
+}
+
+#[test]
 fn verification_without_a_selector_uses_the_first_signature() {
     // libxmlsec1 treats the document root as the operation start node and verifies
     // its first descendant Signature rather than imposing global cardinality.

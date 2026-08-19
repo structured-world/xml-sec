@@ -334,8 +334,16 @@ pub fn load_certificate(
     path: impl AsRef<Path>,
     encoding: CertificateEncoding,
 ) -> Result<Vec<u8>, KeyMaterialError> {
+    load_certificate_with_source_len(path, encoding).map(|(der, _)| der)
+}
+
+pub(crate) fn load_certificate_with_source_len(
+    path: impl AsRef<Path>,
+    encoding: CertificateEncoding,
+) -> Result<(Vec<u8>, usize), KeyMaterialError> {
     let path = path.as_ref();
     let bytes = read(path)?;
+    let source_len = bytes.len();
     let der = match encoding {
         CertificateEncoding::Pem => {
             let text = std::str::from_utf8(&bytes)
@@ -350,7 +358,7 @@ pub fn load_certificate(
     if !rest.is_empty() {
         return Err(KeyMaterialError::InvalidCertificate(path.to_owned()));
     }
-    Ok(der)
+    Ok((der, source_len))
 }
 
 fn parse_pem(text: &str, expected_label: &str, path: &Path) -> Result<Vec<u8>, KeyMaterialError> {

@@ -913,13 +913,12 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     };
     let mut certificate_budget =
         CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
+    let configured_certificates = load_configured_certificates(
+        invocation,
+        selected_keys.is_empty(),
+        &mut certificate_budget,
+    )?;
     let result = if !selected_keys.is_empty() {
-        let has_certificate_candidates = selected_keys.iter().any(|(_, certificate)| *certificate);
-        let configured_certificates = if has_certificate_candidates {
-            load_configured_certificates(invocation, false, &mut certificate_budget)?
-        } else {
-            ConfiguredCertificates::default()
-        };
         let mut candidates = Vec::with_capacity(selected_keys.len());
         let mut last_load_error = None;
         for (option, certificate) in selected_keys {
@@ -949,8 +948,6 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             .verify(&xml)
             .map_err(|error| CommandError::Signature(error.to_string()))?
     } else {
-        let configured_certificates =
-            load_configured_certificates(invocation, true, &mut certificate_budget)?;
         let config = configured_certificates.into_resolver_config();
         let resolver = DefaultKeyResolver::new(config);
         verification_context(policy, start_node_id, &id_attributes)
@@ -1004,24 +1001,23 @@ fn load_configured_certificates(
     };
     for name in lookup_names {
         for option in invocation.values(name) {
-            push_configured_certificate(
-                &mut certificates.lookup,
-                key_material::load_certificate(
-                    option.value.as_deref().unwrap_or_default(),
-                    certificate_encoding(option),
-                )?,
-                budget,
+            let (certificate, source_len) = key_material::load_certificate_with_source_len(
+                option.value.as_deref().unwrap_or_default(),
+                certificate_encoding(option),
             )?;
+            push_configured_certificate(&mut certificates.lookup, certificate, source_len, budget)?;
         }
     }
     for name in ["trusted-pem", "trusted-der"] {
         for option in invocation.values(name) {
+            let (certificate, source_len) = key_material::load_certificate_with_source_len(
+                option.value.as_deref().unwrap_or_default(),
+                certificate_encoding(option),
+            )?;
             push_configured_certificate(
                 &mut certificates.trusted,
-                key_material::load_certificate(
-                    option.value.as_deref().unwrap_or_default(),
-                    certificate_encoding(option),
-                )?,
+                certificate,
+                source_len,
                 budget,
             )?;
         }
@@ -1052,12 +1048,13 @@ impl CertificateBudget {
 fn push_configured_certificate(
     certificates: &mut Vec<Vec<u8>>,
     certificate: Vec<u8>,
+    source_bytes: usize,
     budget: &mut CertificateBudget,
 ) -> Result<(), CommandError> {
+    budget.charge(source_bytes)?;
     if certificates.iter().any(|existing| existing == &certificate) {
         return Ok(());
     }
-    budget.charge(certificate.len())?;
     certificates.push(certificate);
     Ok(())
 }
@@ -3407,24 +3404,49 @@ mod tests {
         // Repeated CLI options must not multiply retained DER, while distinct
         // trust material must be rejected before crossing the compiled total.
         let mut certificates = Vec::new();
-        let mut budget = CertificateBudget::new(3);
-        push_configured_certificate(&mut certificates, vec![1, 2], &mut budget).unwrap();
-        push_configured_certificate(&mut certificates, vec![1, 2], &mut budget).unwrap();
+        let mut budget = CertificateBudget::new(5);
+        push_configured_certificate(&mut certificates, vec![1, 2], 2, &mut budget).unwrap();
+        push_configured_certificate(&mut certificates, vec![1, 2], 2, &mut budget).unwrap();
         assert_eq!(certificates, [vec![1, 2]]);
-        assert_eq!(budget.total_bytes, 2);
+        assert_eq!(budget.total_bytes, 4);
 
         assert!(matches!(
-            push_configured_certificate(&mut certificates, vec![3, 4], &mut budget),
-            Err(CommandError::CertificateMaterialTooLarge { maximum: 3 })
+            push_configured_certificate(&mut certificates, vec![3, 4], 2, &mut budget),
+            Err(CommandError::CertificateMaterialTooLarge { maximum: 5 })
         ));
         assert_eq!(certificates, [vec![1, 2]]);
-        assert_eq!(budget.total_bytes, 2);
+        assert_eq!(budget.total_bytes, 4);
 
         assert!(matches!(
             budget.charge(2),
-            Err(CommandError::CertificateMaterialTooLarge { maximum: 3 })
+            Err(CommandError::CertificateMaterialTooLarge { maximum: 5 })
         ));
-        assert_eq!(budget.total_bytes, 2);
+        assert_eq!(budget.total_bytes, 4);
+    }
+
+    #[test]
+    fn duplicate_configured_certificate_sources_consume_aggregate_budget() {
+        // Deduplicating retained DER must not make repeated external file reads
+        // free: every explicitly supplied source consumes invocation work.
+        let certificate = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let source_len = fs::read(&certificate).unwrap().len();
+        let invocation = Invocation::parse([
+            OsString::from("xmlsec1"),
+            OsString::from("verify"),
+            OsString::from("--trusted-pem"),
+            certificate.as_os_str().to_owned(),
+            OsString::from("--trusted-pem"),
+            certificate.as_os_str().to_owned(),
+            OsString::from("signed.xml"),
+        ])
+        .unwrap();
+        let mut budget = CertificateBudget::new(source_len);
+
+        assert!(matches!(
+            load_configured_certificates(&invocation, false, &mut budget),
+            Err(CommandError::CertificateMaterialTooLarge { maximum }) if maximum == source_len
+        ));
     }
 
     #[test]

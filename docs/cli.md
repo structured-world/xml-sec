@@ -215,8 +215,10 @@ remaining companions must be structurally valid certificates. Lax lookup skips
 an invalid compound candidate as a unit rather than retaining its private key.
 All asymmetric key and certificate files are read through one absolute
 process-safety ceiling before format decoding. Verification also deduplicates
-repeated certificates within each lookup or trust role and applies the compiled
-aggregate external-resource budget to all retained configured certificate DER.
+repeated certificates within each lookup or trust role, validates every
+explicit trust input even when a raw public key is selected, and charges every
+read certificate source to the compiled aggregate external-resource budget
+before retained DER is deduplicated.
 Repeatable named private keys form one resolver: each nested `EncryptedKey` is
 matched to its own key, and duplicate keys for the same recipient fail as
 ambiguous instead of preventing distinct recipients from sharing an invocation.
