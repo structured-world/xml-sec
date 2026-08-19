@@ -21,10 +21,10 @@ use xml_sec::{
     xmldsig::{
         DefaultKeyResolver, DsigError, DsigStatus, FailureReason, KeyInfo, KeyInfoSource,
         KeyInfoWriter, KeyResolver, KeyResolverConfig, KeyValueInfo, ReferenceResult, SignContext,
-        SignatureAlgorithm, SignatureTemplateSelection, SigningKey, UriTypeSet, VerificationKey,
-        VerifyContext, VerifyResult, VerifyingKey, X509CertificateKeyInfoWriter,
-        XPathHereSemantics, parse_key_info, uri::UriReferenceResolver, validate_signing_key,
-        x509_certificate_matches_selectors,
+        SignatureAlgorithm, SignatureTemplateSelection, SigningKey, SigningPublicKeyInfo,
+        UriTypeSet, VerificationKey, VerifyContext, VerifyResult, VerifyingKey,
+        X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
+        uri::UriReferenceResolver, validate_signing_key, x509_certificate_matches_selectors,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionCandidateBudget,
@@ -650,6 +650,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         signature.algorithm,
         &policy,
     )?;
+    validate_signing_key_info(signature.key_info.as_ref(), &selected)?;
     let mut context = SignContext::new(selected.key.as_ref())
         .policy(policy)
         .signature_template_selection(SignatureTemplateSelection::FirstDescendant);
@@ -658,7 +659,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     }
     context = context.id_attributes(&id_attributes);
     if let Some(writer) = &selected.certificate_writer
-        && signature.has_key_info
+        && signature.key_info.is_some()
     {
         context = context.key_info_writer(writer);
     }
@@ -695,6 +696,7 @@ fn write_signing_diagnostics(
 struct SigningKeyCandidate {
     key: Box<dyn SigningKey>,
     certificate_writer: Option<X509CertificateKeyInfoWriter>,
+    leaf_certificate_der: Option<Vec<u8>>,
 }
 
 fn select_signing_key(
@@ -755,8 +757,8 @@ fn prepare_signing_key_candidate(
         key_material::decode_signing_key(Path::new(path), &key_bytes, private_key_format(option))?;
     validate_signing_key(key.as_ref(), algorithm, policy)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
-    let certificate_writer = if certificate_paths.is_empty() {
-        None
+    let (certificate_writer, leaf_certificate_der) = if certificate_paths.is_empty() {
+        (None, None)
     } else {
         let certificates = load_certificate_companions(
             &certificate_paths,
@@ -774,12 +776,93 @@ fn prepare_signing_key_candidate(
         writer
             .write_key_info(key.as_ref())
             .map_err(|error| CommandError::Signature(error.to_string()))?;
-        Some(writer)
+        (Some(writer), certificates.first().cloned())
     };
     Ok(SigningKeyCandidate {
         key,
         certificate_writer,
+        leaf_certificate_der,
     })
+}
+
+fn validate_signing_key_info(
+    key_info: Option<&KeyInfo>,
+    selected: &SigningKeyCandidate,
+) -> Result<(), CommandError> {
+    let Some(key_info) = key_info else {
+        return Ok(());
+    };
+    let public = selected
+        .key
+        .public_key_info()
+        .map_err(|error| CommandError::Signature(error.to_string()))?;
+    for source in &key_info.sources {
+        let matches = match source {
+            KeyInfoSource::KeyName(_) => continue,
+            KeyInfoSource::KeyValue(KeyValueInfo::Rsa { modulus, exponent }) => matches!(
+                &public,
+                SigningPublicKeyInfo::Rsa { modulus: expected_modulus, exponent: expected_exponent, .. }
+                    if expected_modulus == modulus && expected_exponent == exponent
+            ),
+            KeyInfoSource::KeyValue(KeyValueInfo::Ec {
+                curve_oid,
+                public_key,
+            }) => matches!(
+                &public,
+                SigningPublicKeyInfo::Ec { curve_oid: expected_curve, public_key: expected_key, .. }
+                    if *expected_curve == curve_oid && expected_key == public_key
+            ),
+            KeyInfoSource::DerEncodedKeyValue(der) => public.spki_der() == der,
+            KeyInfoSource::X509Data(data) => {
+                let has_identity = !data.certificates.is_empty()
+                    || !data.subject_names.is_empty()
+                    || !data.issuer_serials.is_empty()
+                    || !data.skis.is_empty()
+                    || !data.digests.is_empty();
+                if !has_identity {
+                    continue;
+                }
+                if let Some(index) = data
+                    .certificate_chain
+                    .first()
+                    .copied()
+                    .or_else(|| (!data.certificates.is_empty()).then_some(0))
+                {
+                    let certificate = data.certificates.get(index).ok_or_else(|| {
+                        signing_key_info_error("X509Data certificate chain is inconsistent")
+                    })?;
+                    let (_, certificate) =
+                        x509_parser::certificate::X509Certificate::from_der(certificate)
+                            .map_err(|_| signing_key_info_error("X509Certificate is invalid"))?;
+                    certificate.public_key().raw == public.spki_der()
+                } else {
+                    let certificate =
+                        selected.leaf_certificate_der.as_deref().ok_or_else(|| {
+                            signing_key_info_error(
+                                "X509Data selectors require a signing certificate companion",
+                            )
+                        })?;
+                    x509_certificate_matches_selectors(data, certificate, default_provider())
+                        .map_err(|error| CommandError::Signature(error.to_string()))?
+                }
+            }
+            _ => {
+                return Err(signing_key_info_error(
+                    "preserved KeyInfo identity cannot be matched to the selected signing key",
+                ));
+            }
+        };
+        if !matches {
+            return Err(signing_key_info_error(
+                "preserved KeyInfo does not match the selected signing key",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn signing_key_info_error(message: &str) -> CommandError {
+    CommandError::Signature(message.into())
 }
 
 fn load_certificate_companions(
@@ -1693,7 +1776,11 @@ fn load_rsa_recipient_candidate(
 ) -> Result<RecipientPublicKeyCandidate, CommandError> {
     let candidate = match source {
         RecipientPublicKeySource::Public(encoding) => RecipientPublicKeyCandidate {
-            public_key: key_material::load_rsa_public(path, encoding)?,
+            public_key: {
+                let bytes = key_material::read(path)?;
+                certificate_budget.charge(bytes.len())?;
+                key_material::decode_rsa_public(Path::new(path), &bytes, encoding)?
+            },
             certificate_der: None,
         },
         RecipientPublicKeySource::Certificate(encoding) => {
@@ -3186,6 +3273,25 @@ mod tests {
                 maximum: 1,
                 actual: 2,
             })
+        ));
+    }
+
+    #[test]
+    fn raw_recipient_key_is_charged_before_decode() {
+        // Raw keys and certificates share one invocation budget; bytes must be
+        // charged before an asymmetric format decoder receives them.
+        let path = testdata("rsa-2048-cert.pem");
+        let mut budget = ExternalMaterialBudget::new(1);
+        let error = load_rsa_recipient_candidate(
+            path.as_os_str(),
+            RecipientPublicKeySource::Public(key_material::PublicKeyEncoding::Pem),
+            &EncryptionPolicy::default(),
+            &mut budget,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CommandError::ExternalMaterialTooLarge { maximum: 1 }
         ));
     }
 

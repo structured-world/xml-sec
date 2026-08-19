@@ -95,7 +95,10 @@ non-conflicting attributes emitted by the writer are added, while conflicting
 expanded names fail closed. KeyInfo
 materialization occurs before reference digest computation, so a template may
 sign its populated `KeyInfo` by ID. Omitting `KeyInfo` leaves the signed output
-without `KeyInfo`. Named signing keys
+without `KeyInfo`. Preserved RSA/EC `KeyValue`, `DEREncodedKeyValue`, and X.509
+identity sources must identify the selected signing key; selector-only
+`X509Data` additionally requires a matching signing-certificate companion.
+Named signing keys
 require a matching template `KeyName` even when only one key is supplied. A
 named key with no template `KeyName` fails unless `--lax-key-search` explicitly
 opts out of lookup. Verification and encryption instead leave a `KeyName`-less

@@ -28,7 +28,8 @@ Bounded PEM and DER loaders support RSA, P-256/P-384, SPKI, PKCS#1, PKCS#8, and
 X.509 inputs for their corresponding operations. Signing certificate lists are
 leaf-first and can populate an existing `KeyInfo`; document-selected
 certificates require caller trust unless `--insecure` is explicit. Named and
-lax key lookup remains fail-closed on ambiguous or contradictory identity data.
+lax key lookup remains fail-closed on ambiguous or contradictory identity data,
+including preserved signing `KeyValue`, `DEREncodedKeyValue`, and `X509Data`.
 
 ## Encryption
 

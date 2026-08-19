@@ -15,8 +15,9 @@ use rsa::{
 use x509_parser::prelude::FromDer as _;
 use xml_sec::policy::{PolicyViolation, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
-    EcdsaP256SigningKey, EcdsaP384SigningKey, RsaSigningKey, SignatureAlgorithm, SigningKey,
-    VerificationKey, find_signature_node, parse_signed_info, uri::UriReferenceResolver,
+    EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfo, RsaSigningKey, SignatureAlgorithm,
+    SigningKey, VerificationKey, find_signature_node, parse_key_info, parse_signed_info,
+    uri::UriReferenceResolver,
 };
 
 // This is an absolute process-safety ceiling, not deployment policy. Parsed
@@ -67,7 +68,7 @@ pub struct SignatureMetadata {
 pub struct SigningTemplateMetadata {
     pub algorithm: SignatureAlgorithm,
     pub key_names: Vec<String>,
-    pub has_key_info: bool,
+    pub key_info: Option<KeyInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,10 +170,14 @@ pub fn signing_signature_metadata(
     let algorithm = SignatureAlgorithm::from_uri(algorithm_uri).ok_or_else(|| {
         KeyMaterialError::Signature(format!("unsupported signature algorithm: {algorithm_uri}"))
     })?;
+    let key_info = signature_key_info(signature)
+        .map(parse_key_info)
+        .transpose()
+        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
     Ok(SigningTemplateMetadata {
         algorithm,
         key_names: signature_key_names(signature),
-        has_key_info: signature_key_info(signature).is_some(),
+        key_info,
     })
 }
 
@@ -410,20 +415,21 @@ pub fn decode_rsa_private(
     .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
 }
 
-pub fn load_rsa_public(
-    path: impl AsRef<Path>,
+/// Decode caller-owned RSA public-key bytes after the operation layer has
+/// charged their source length to its aggregate external-material budget.
+pub fn decode_rsa_public(
+    path: &Path,
+    bytes: &[u8],
     encoding: PublicKeyEncoding,
 ) -> Result<RsaPublicKey, KeyMaterialError> {
-    let path = path.as_ref();
-    let bytes = read(path)?;
     match encoding {
-        PublicKeyEncoding::Pem => std::str::from_utf8(&bytes).ok().and_then(|text| {
+        PublicKeyEncoding::Pem => std::str::from_utf8(bytes).ok().and_then(|text| {
             RsaPublicKey::from_public_key_pem(text)
                 .or_else(|_| RsaPublicKey::from_pkcs1_pem(text))
                 .ok()
         }),
-        PublicKeyEncoding::Der => RsaPublicKey::from_public_key_der(&bytes)
-            .or_else(|_| RsaPublicKey::from_pkcs1_der(&bytes))
+        PublicKeyEncoding::Der => RsaPublicKey::from_public_key_der(bytes)
+            .or_else(|_| RsaPublicKey::from_pkcs1_der(bytes))
             .ok(),
     }
     .ok_or_else(|| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))

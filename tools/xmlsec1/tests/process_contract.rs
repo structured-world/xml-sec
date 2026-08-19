@@ -135,6 +135,71 @@ fn signs_verifies_and_rejects_tampering_through_process_api() {
 }
 
 #[test]
+fn signing_rejects_preserved_key_info_for_another_key() {
+    // A successful signature must not retain a cryptographic identity that
+    // directs ordinary KeyInfo resolution to a different public key.
+    let temp = tempfile::tempdir().unwrap();
+    let source = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let template = temp.path().join("stale-key-info.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let stale_public = RsaPublicKey::from_public_key_pem(
+        &fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
+            .unwrap(),
+    )
+    .unwrap();
+    let identities = [
+        rsa_key_value_with_leading_zeroes(&stale_public, 0, 0).replace("ds:", ""),
+        der_encoded_key_value(&stale_public),
+        x509_certificate_value(
+            &project_root().join("tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+        )
+        .replace("ds:", ""),
+        "<KeyValue><ECKeyValue xmlns=\"http://www.w3.org/2009/xmldsig11#\"><NamedCurve URI=\"urn:oid:1.2.840.10045.3.1.7\"/><PublicKey>BJ/yaXNlq4FRObyJCBhb5jAz8GVzinK3bBGLjSDfjbJwNfydtgjnlS4EsDmxSRhWyJWq6GIqy5wvnaiARK04uB4=</PublicKey></ECKeyValue></KeyValue>".into(),
+    ];
+    let source_xml = fs::read_to_string(source).unwrap();
+    for (index, identity) in identities.iter().enumerate() {
+        fs::write(&template, source_xml.replace("<X509Data/>", identity)).unwrap();
+        let output = Command::new(binary())
+            .args(["sign", "--privkey-pem:TestKeyName-rsa-2048"])
+            .arg(&private_key)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "identity {index} was accepted");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("does not match the selected signing key"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let matching_public = RsaPublicKey::from(
+        &RsaPrivateKey::from_pkcs8_pem(&fs::read_to_string(&private_key).unwrap()).unwrap(),
+    );
+    fs::write(
+        &template,
+        source_xml.replace(
+            "<X509Data/>",
+            &rsa_key_value_with_leading_zeroes(&matching_public, 0, 0).replace("ds:", ""),
+        ),
+    )
+    .unwrap();
+    let matching = Command::new(binary())
+        .args(["sign", "--privkey-pem:TestKeyName-rsa-2048"])
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        matching.status.success(),
+        "{}",
+        String::from_utf8_lossy(&matching.stderr)
+    );
+}
+
+#[test]
 fn direct_public_key_verification_rejects_invalid_trust_inputs() {
     // Explicit trust inputs are configuration, not optional resolver hints:
     // validate them even when a raw public key verifies the signature.
