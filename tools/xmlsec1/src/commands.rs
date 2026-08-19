@@ -159,8 +159,8 @@ pub enum CommandError {
     InvalidUtf8Input,
     #[error("encryption plaintext exceeds policy limit of {maximum} bytes")]
     PlaintextTooLarge { maximum: usize },
-    #[error("configured certificate material exceeds policy limit of {maximum} bytes")]
-    CertificateMaterialTooLarge { maximum: usize },
+    #[error("configured external key/certificate material exceeds policy limit of {maximum} bytes")]
+    ExternalMaterialTooLarge { maximum: usize },
     #[error(transparent)]
     Key(#[from] key_material::KeyMaterialError),
     #[error("XML signature operation failed: {0}")]
@@ -721,11 +721,11 @@ fn select_signing_key(
     )?;
     let lax_key_search = invocation.flag("lax-key-search");
     let mut last_error: Option<CommandError> = None;
-    let mut certificate_budget =
-        CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
+    let mut material_budget =
+        ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
     for (option, ()) in candidates {
         let attempt =
-            prepare_signing_key_candidate(option, algorithm, policy, &mut certificate_budget);
+            prepare_signing_key_candidate(option, algorithm, policy, &mut material_budget);
         match attempt {
             Ok(candidate) => return Ok(candidate),
             Err(error) if lax_key_search => last_error = Some(error),
@@ -745,11 +745,14 @@ fn prepare_signing_key_candidate(
     option: &crate::OptionValue,
     algorithm: SignatureAlgorithm,
     policy: &SigningPolicy,
-    certificate_budget: &mut CertificateBudget,
+    material_budget: &mut ExternalMaterialBudget,
 ) -> Result<SigningKeyCandidate, CommandError> {
     let (path, certificate_paths) =
         split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
-    let key = key_material::load_signing_key(path, private_key_format(option))?;
+    let key_bytes = key_material::read(path)?;
+    material_budget.charge(key_bytes.len())?;
+    let key =
+        key_material::decode_signing_key(Path::new(path), &key_bytes, private_key_format(option))?;
     validate_signing_key(key.as_ref(), algorithm, policy)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
     let certificate_writer = if certificate_paths.is_empty() {
@@ -762,7 +765,7 @@ fn prepare_signing_key_candidate(
             } else {
                 key_material::CertificateEncoding::Pem
             },
-            certificate_budget,
+            material_budget,
         )?;
         let writer = X509CertificateKeyInfoWriter::from_der_chain(&certificates)
             .map_err(|error| CommandError::Signature(error.to_string()))?;
@@ -782,7 +785,7 @@ fn prepare_signing_key_candidate(
 fn load_certificate_companions(
     paths: &[&OsStr],
     encoding: key_material::CertificateEncoding,
-    budget: &mut CertificateBudget,
+    budget: &mut ExternalMaterialBudget,
 ) -> Result<Vec<Vec<u8>>, CommandError> {
     paths
         .iter()
@@ -914,7 +917,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         )?
     };
     let mut certificate_budget =
-        CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
+        ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
     let configured_certificates = load_configured_certificates(
         invocation,
         selected_keys.is_empty(),
@@ -966,7 +969,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     Ok(())
 }
 
-struct CertificateBudget {
+struct ExternalMaterialBudget {
     total_bytes: usize,
     maximum_bytes: usize,
 }
@@ -990,7 +993,7 @@ impl ConfiguredCertificates {
 fn load_configured_certificates(
     invocation: &Invocation,
     include_explicit_keys: bool,
-    budget: &mut CertificateBudget,
+    budget: &mut ExternalMaterialBudget,
 ) -> Result<ConfiguredCertificates, CommandError> {
     let mut certificates = ConfiguredCertificates::default();
     let lookup_names: &[&str] = if include_explicit_keys {
@@ -1029,7 +1032,7 @@ fn load_configured_certificates(
     Ok(certificates)
 }
 
-impl CertificateBudget {
+impl ExternalMaterialBudget {
     fn new(maximum_bytes: usize) -> Self {
         Self {
             total_bytes: 0,
@@ -1042,7 +1045,7 @@ impl CertificateBudget {
             .total_bytes
             .checked_add(bytes)
             .filter(|total| *total <= self.maximum_bytes)
-            .ok_or(CommandError::CertificateMaterialTooLarge {
+            .ok_or(CommandError::ExternalMaterialTooLarge {
                 maximum: self.maximum_bytes,
             })?;
         Ok(())
@@ -1053,7 +1056,7 @@ fn push_configured_certificate(
     certificates: &mut Vec<Vec<u8>>,
     certificate: Vec<u8>,
     source_bytes: usize,
-    budget: &mut CertificateBudget,
+    budget: &mut ExternalMaterialBudget,
 ) -> Result<(), CommandError> {
     budget.charge(source_bytes)?;
     if certificates.iter().any(|existing| existing == &certificate) {
@@ -1324,7 +1327,7 @@ impl VerifyingKey for CandidateVerifyingKey<'_> {
 
 fn load_explicit_certificate_key_info(
     certificate: &crate::OptionValue,
-    budget: &mut CertificateBudget,
+    budget: &mut ExternalMaterialBudget,
 ) -> Result<KeyInfo, CommandError> {
     let (certificate_der, source_len) = key_material::load_certificate_with_source_len(
         certificate.value.as_deref().unwrap_or_default(),
@@ -1445,7 +1448,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let mut available_public_keys = public_keys.clone();
         let mut loaded_public_keys = HashMap::new();
         let mut certificate_budget =
-            CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
         let mut selected_recipients = Vec::with_capacity(template_recipients.len());
         let recipient_metadata = recipient_key_metadata(
             &template,
@@ -1671,7 +1674,7 @@ fn load_rsa_recipient_candidate(
     path: &OsStr,
     source: RecipientPublicKeySource,
     policy: &EncryptionPolicy,
-    certificate_budget: &mut CertificateBudget,
+    certificate_budget: &mut ExternalMaterialBudget,
 ) -> Result<RecipientPublicKeyCandidate, CommandError> {
     let candidate = match source {
         RecipientPublicKeySource::Public(encoding) => RecipientPublicKeyCandidate {
@@ -1698,7 +1701,7 @@ fn cached_rsa_recipient_candidate(
     option: &crate::OptionValue,
     certificate: bool,
     policy: &EncryptionPolicy,
-    certificate_budget: &mut CertificateBudget,
+    certificate_budget: &mut ExternalMaterialBudget,
 ) -> Result<RecipientPublicKeyCandidate, CommandError> {
     let identity = std::ptr::from_ref(option);
     if let Some(cached) = cache.get(&identity) {
@@ -2397,7 +2400,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let lax_key_search = invocation.flag("lax-key-search");
         let mut last_load_error = None;
         let mut certificate_budget =
-            CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
         for option in selected {
             let loaded = (|| {
                 let (path, certificate_paths) =
@@ -3449,7 +3452,7 @@ mod tests {
         // Repeated CLI options must not multiply retained DER, while distinct
         // trust material must be rejected before crossing the compiled total.
         let mut certificates = Vec::new();
-        let mut budget = CertificateBudget::new(5);
+        let mut budget = ExternalMaterialBudget::new(5);
         push_configured_certificate(&mut certificates, vec![1, 2], 2, &mut budget).unwrap();
         push_configured_certificate(&mut certificates, vec![1, 2], 2, &mut budget).unwrap();
         assert_eq!(certificates, [vec![1, 2]]);
@@ -3457,16 +3460,45 @@ mod tests {
 
         assert!(matches!(
             push_configured_certificate(&mut certificates, vec![3, 4], 2, &mut budget),
-            Err(CommandError::CertificateMaterialTooLarge { maximum: 5 })
+            Err(CommandError::ExternalMaterialTooLarge { maximum: 5 })
         ));
         assert_eq!(certificates, [vec![1, 2]]);
         assert_eq!(budget.total_bytes, 4);
 
         assert!(matches!(
             budget.charge(2),
-            Err(CommandError::CertificateMaterialTooLarge { maximum: 5 })
+            Err(CommandError::ExternalMaterialTooLarge { maximum: 5 })
         ));
         assert_eq!(budget.total_bytes, 4);
+    }
+
+    #[test]
+    fn signing_key_source_is_charged_before_private_key_decoding() {
+        // Aggregate source limits must stop a candidate before malformed key
+        // bytes reach the comparatively expensive private-key decoders.
+        let temp = tempfile::tempdir().unwrap();
+        let key_path = temp.path().join("malformed.pem");
+        fs::write(&key_path, b"xx").unwrap();
+        let parsed = Invocation::parse([
+            OsString::from("xmlsec1"),
+            OsString::from("sign"),
+            OsString::from("--privkey-pem"),
+            key_path.into_os_string(),
+            OsString::from("template.xml"),
+        ])
+        .unwrap();
+        let option = parsed.values("privkey-pem").next().unwrap();
+        let mut budget = ExternalMaterialBudget::new(1);
+
+        assert!(matches!(
+            prepare_signing_key_candidate(
+                option,
+                SignatureAlgorithm::RsaSha256,
+                &SigningPolicy::default(),
+                &mut budget,
+            ),
+            Err(CommandError::ExternalMaterialTooLarge { maximum: 1 })
+        ));
     }
 
     #[test]
@@ -3485,11 +3517,11 @@ mod tests {
             OsString::from("signed.xml"),
         ])
         .unwrap();
-        let mut budget = CertificateBudget::new(source_len);
+        let mut budget = ExternalMaterialBudget::new(source_len);
 
         assert!(matches!(
             load_configured_certificates(&invocation, false, &mut budget),
-            Err(CommandError::CertificateMaterialTooLarge { maximum }) if maximum == source_len
+            Err(CommandError::ExternalMaterialTooLarge { maximum }) if maximum == source_len
         ));
     }
 
@@ -3510,7 +3542,7 @@ mod tests {
         .unwrap()
         .0
         .len();
-        let mut budget = CertificateBudget::new(der_len);
+        let mut budget = ExternalMaterialBudget::new(der_len);
 
         assert!(matches!(
             load_certificate_companions(
@@ -3518,7 +3550,7 @@ mod tests {
                 key_material::CertificateEncoding::Pem,
                 &mut budget,
             ),
-            Err(CommandError::CertificateMaterialTooLarge { maximum }) if maximum == der_len
+            Err(CommandError::ExternalMaterialTooLarge { maximum }) if maximum == der_len
         ));
     }
 
@@ -3544,11 +3576,11 @@ mod tests {
             parameter: None,
             value: Some(padded.into_os_string()),
         };
-        let mut budget = CertificateBudget::new(der_len);
+        let mut budget = ExternalMaterialBudget::new(der_len);
 
         assert!(matches!(
             load_explicit_certificate_key_info(&option, &mut budget),
-            Err(CommandError::CertificateMaterialTooLarge { maximum }) if maximum == der_len
+            Err(CommandError::ExternalMaterialTooLarge { maximum }) if maximum == der_len
         ));
     }
 
@@ -3624,7 +3656,7 @@ mod tests {
         // Recipient certificates are external inputs even when used only to
         // extract an RSA wrapping key, so they share the operation-wide budget.
         let certificate = testdata("rsa-2048-cert.pem");
-        let mut budget = CertificateBudget::new(1);
+        let mut budget = ExternalMaterialBudget::new(1);
 
         let error = load_rsa_recipient_candidate(
             certificate.as_os_str(),
@@ -3636,7 +3668,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            CommandError::CertificateMaterialTooLarge { maximum: 1 }
+            CommandError::ExternalMaterialTooLarge { maximum: 1 }
         ));
     }
 
@@ -3657,7 +3689,7 @@ mod tests {
         .unwrap()
         .0
         .len();
-        let mut budget = CertificateBudget::new(der_len);
+        let mut budget = ExternalMaterialBudget::new(der_len);
 
         assert!(matches!(
             load_rsa_recipient_candidate(
@@ -3668,7 +3700,7 @@ mod tests {
                 &EncryptionPolicy::default(),
                 &mut budget,
             ),
-            Err(CommandError::CertificateMaterialTooLarge { maximum }) if maximum == der_len
+            Err(CommandError::ExternalMaterialTooLarge { maximum }) if maximum == der_len
         ));
     }
 
@@ -3694,7 +3726,7 @@ mod tests {
         .unwrap();
         let option = invocation.values("pubkey-cert-pem").next().unwrap();
         let mut cache = HashMap::new();
-        let mut budget = CertificateBudget::new(source_len);
+        let mut budget = ExternalMaterialBudget::new(source_len);
 
         cached_rsa_recipient_candidate(
             &mut cache,

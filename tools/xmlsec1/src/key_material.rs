@@ -234,14 +234,15 @@ fn signature_key_info<'a, 'input>(
         .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
 }
 
-pub fn load_signing_key(
-    path: impl AsRef<Path>,
+/// Decode caller-owned signing key bytes after the operation layer has charged
+/// their source length to its aggregate external-material budget.
+pub fn decode_signing_key(
+    path: &Path,
+    bytes: &[u8],
     format: PrivateKeyFormat,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
-    let path = path.as_ref();
-    let bytes = read(path)?;
     if matches!(format, PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem)
-        && let Ok(text) = std::str::from_utf8(&bytes)
+        && let Ok(text) = std::str::from_utf8(bytes)
     {
         if let Ok(key) = RsaSigningKey::from_pkcs8_pem(text) {
             return Ok(Box::new(key));
@@ -259,17 +260,17 @@ pub fn load_signing_key(
         }
     }
     if matches!(format, PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der) {
-        if let Ok(key) = RsaSigningKey::from_pkcs8_der(&bytes) {
+        if let Ok(key) = RsaSigningKey::from_pkcs8_der(bytes) {
             return Ok(Box::new(key));
         }
-        if let Ok(key) = EcdsaP256SigningKey::from_pkcs8_der(&bytes) {
+        if let Ok(key) = EcdsaP256SigningKey::from_pkcs8_der(bytes) {
             return Ok(Box::new(key));
         }
-        if let Ok(key) = EcdsaP384SigningKey::from_pkcs8_der(&bytes) {
+        if let Ok(key) = EcdsaP384SigningKey::from_pkcs8_der(bytes) {
             return Ok(Box::new(key));
         }
         if format == PrivateKeyFormat::Der
-            && let Ok(rsa) = RsaPrivateKey::from_pkcs1_der(&bytes)
+            && let Ok(rsa) = RsaPrivateKey::from_pkcs1_der(bytes)
         {
             return normalize_rsa_signing_key(rsa, path);
         }
@@ -468,6 +469,15 @@ mod tests {
     use rsa::pkcs1::{EncodeRsaPrivateKey as _, EncodeRsaPublicKey as _};
 
     use super::*;
+
+    fn load_signing_key(
+        path: impl AsRef<Path>,
+        format: PrivateKeyFormat,
+    ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+        let path = path.as_ref();
+        let bytes = read(path)?;
+        decode_signing_key(path, &bytes, format)
+    }
 
     #[test]
     fn normalizes_pkcs1_private_and_public_keys() {

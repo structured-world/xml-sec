@@ -103,7 +103,9 @@ template unconstrained when one explicit key is supplied. Lax signing treats
 each comma-separated key and certificate chain as one candidate and continues
 past malformed, mismatched, algorithm-incompatible, or policy-rejected
 candidates until it finds a usable one; it never weakens the compiled signing
-policy.
+policy. Every private-key source and certificate companion is charged to one
+invocation-wide external-material byte budget before private-key decoding, so
+lax search cannot multiply bounded per-file parsing work without bound.
 
 Verification accepts `-` as the conventional stdin marker. Verification starts
 at the document root and uses the first descendant `Signature` in document order.
@@ -242,8 +244,10 @@ decryption operation and releases each rejected plaintext before trying the
 next key. Standalone decryption stops at the first authenticated plaintext;
 document replacement stops at the first plaintext that also satisfies the XML
 replacement contract. AES-CBC provides no key authentication, so decryption
-requires metadata to select exactly one key and rejects unordered candidate
-sets rather than treating valid padding as proof of the correct key.
+requires metadata to select exactly one distinct key identity and rejects
+unordered distinct candidates rather than treating valid padding as proof of
+the correct key. Repeated copies of identical key bytes remain one identity,
+while every source lookup or unwrap still consumes the operation work budget.
 A direct `--aes-key` cannot satisfy an `EncryptedKey` recipient embedded in the
 template, so that inconsistent combination is rejected rather than preserving
 a stale wrapped key.

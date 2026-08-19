@@ -829,7 +829,10 @@ fn compatible_decryption_key_candidates(
     let mut last_error = None;
     for key in keys {
         match validate_key_len(algorithm, &key) {
-            Ok(()) => compatible.push(key),
+            Ok(()) if !compatible.iter().any(|existing| existing == &key) => {
+                compatible.push(key);
+            }
+            Ok(()) => {}
             Err(error) => last_error = Some(error),
         }
     }
@@ -1689,6 +1692,47 @@ mod tests {
                 actual: 2,
             }
         ));
+    }
+
+    #[test]
+    fn cbc_accepts_duplicate_copies_of_one_key_identity() {
+        // Repeated sources containing the same key do not create the ambiguity
+        // that unauthenticated CBC must reject between distinct key identities.
+        let key = vec![0x27_u8; 16];
+        let encrypted = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            encryption_method: EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Cbc.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            key_name: None,
+            encrypted_keys: Vec::new(),
+            cipher_data: CipherData {
+                value: STANDARD.encode(
+                    crate::provider::default_provider()
+                        .encrypt_data(
+                            DataEncryptionAlgorithm::Aes128Cbc,
+                            &key,
+                            b"duplicate identity",
+                        )
+                        .expect("test encryption must succeed"),
+                ),
+            },
+        };
+        let resolver = CandidateResolver {
+            keys: vec![key.clone(), key],
+        };
+
+        assert_eq!(
+            DecryptContext::new(&resolver)
+                .decrypt_data(&encrypted)
+                .expect("one distinct CBC key identity must decrypt"),
+            DecryptedContent::Bytes(b"duplicate identity".to_vec())
+        );
     }
 
     #[test]
