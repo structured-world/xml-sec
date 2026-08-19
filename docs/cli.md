@@ -225,6 +225,9 @@ before retained DER is deduplicated.
 Repeatable named private keys form one resolver: each nested `EncryptedKey` is
 matched to its own key, and duplicate keys for the same recipient fail as
 ambiguous instead of preventing distinct recipients from sharing an invocation.
+Strict verification treats every selected public-key option as explicit
+configuration and fails on any load, certificate-resolution, or key-policy
+error. Only `--lax-key-search` may skip an unusable verification candidate.
 Named AES and RSA decryption keys obey the selected `EncryptedData` or nested
 `EncryptedKey` name unless lax lookup is requested. Selecting a standalone
 `EncryptedData` by its own `Id` still returns opaque decrypted bytes rather than

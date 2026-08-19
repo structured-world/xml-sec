@@ -887,7 +887,8 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         .collect::<Vec<_>>();
     // With an explicit public key there is no key-manager search to relax.
     // Reject the flag on resolver-backed paths until its semantics exist.
-    if invocation.flag("lax-key-search") && explicit_keys.is_empty() {
+    let lax_key_search = invocation.flag("lax-key-search");
+    if lax_key_search && explicit_keys.is_empty() {
         return Err(CommandError::UnsupportedOption("lax-key-search".into()));
     }
     let policy = xmlsec_compatibility_verification_policy(invocation);
@@ -907,7 +908,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         named_candidate_search(
             &explicit_keys,
             &signature.key_names,
-            invocation.flag("lax-key-search"),
+            lax_key_search,
             true,
             "verification key",
         )?
@@ -937,13 +938,15 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             };
             match candidate {
                 Ok(candidate) => candidates.push(candidate),
-                Err(error) => last_load_error = Some(error),
+                Err(error) if lax_key_search => last_load_error = Some(error),
+                Err(error) => return Err(error),
             }
         }
         if candidates.is_empty() {
             return Err(last_load_error.unwrap_or(CommandError::InvalidSignature));
         }
-        let resolver = CandidateVerificationResolver::new(candidates, configured_certificates);
+        let resolver =
+            CandidateVerificationResolver::new(candidates, configured_certificates, lax_key_search);
         verification_context(policy, start_node_id, &id_attributes)
             .key_resolver(&resolver)
             .verify(&xml)
@@ -1173,18 +1176,21 @@ struct CandidateVerificationResolver {
     candidates: Vec<ExplicitVerificationCandidate>,
     certificate_resolver: DefaultKeyResolver,
     has_trusted_certificates: bool,
+    lax_key_search: bool,
 }
 
 impl CandidateVerificationResolver {
     fn new(
         candidates: Vec<ExplicitVerificationCandidate>,
         configured: ConfiguredCertificates,
+        lax_key_search: bool,
     ) -> Self {
         let has_trusted_certificates = !configured.trusted.is_empty();
         Self {
             candidates,
             certificate_resolver: DefaultKeyResolver::new(configured.into_resolver_config()),
             has_trusted_certificates,
+            lax_key_search,
         }
     }
 }
@@ -1233,17 +1239,19 @@ impl KeyResolver for CandidateVerificationResolver {
                         provider,
                     ) {
                         Ok(key) => key,
-                        Err(error) => {
+                        Err(error) if self.lax_key_search => {
                             last_error = Some(error);
                             continue;
                         }
+                        Err(error) => return Err(error),
                     }
                 }
             };
             if let Some(key) = key {
                 match key.validate_policy(policy) {
                     Ok(()) => resolved.push(key),
-                    Err(error) => last_error = Some(error),
+                    Err(error) if self.lax_key_search => last_error = Some(error),
+                    Err(error) => return Err(error),
                 }
             }
         }

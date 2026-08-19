@@ -822,6 +822,93 @@ fn strict_verification_searches_each_distinct_template_key_name() {
 }
 
 #[test]
+fn strict_verification_rejects_a_selected_key_load_failure() {
+    // Every strict named option is explicit configuration and must load. Lax
+    // search alone may skip an unreadable candidate and continue to a valid key.
+    let temp = tempfile::tempdir().unwrap();
+    let source_template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let template_path = temp.path().join("template.xml");
+    let signed_path = temp.path().join("signed.xml");
+    let missing_key = temp.path().join("missing-public-key.pem");
+    let template = fs::read_to_string(source_template).unwrap().replace(
+        "<KeyName>TestKeyName-rsa-2048</KeyName>",
+        "<KeyName>missing</KeyName><KeyName>valid</KeyName>",
+    );
+    fs::write(&template_path, template).unwrap();
+
+    let valid_private = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let valid_public = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(valid_private)
+        .arg("--output")
+        .arg(&signed_path)
+        .arg(&template_path)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = |lax: bool| {
+        let mut command = Command::new(binary());
+        command.arg("verify");
+        if lax {
+            command.arg("--lax-key-search");
+        }
+        command
+            .arg("--pubkey-pem:missing")
+            .arg(&missing_key)
+            .arg("--pubkey-pem:valid")
+            .arg(&valid_public)
+            .arg(&signed_path)
+            .output()
+            .unwrap()
+    };
+
+    let strict = verify(false);
+    assert!(!strict.status.success());
+    assert!(String::from_utf8_lossy(&strict.stderr).contains("missing-public-key.pem"));
+
+    let lax = verify(true);
+    assert!(
+        lax.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax.stderr)
+    );
+
+    let incompatible_certificate =
+        project_root().join("tests/fixtures/keys/ec/ec-prime256v1-cert.pem");
+    let verify_certificate = |lax: bool| {
+        let mut command = Command::new(binary());
+        command.arg("verify");
+        if lax {
+            command.arg("--lax-key-search");
+        }
+        command
+            .arg("--pubkey-cert-pem:missing")
+            .arg(&incompatible_certificate)
+            .arg("--pubkey-pem:valid")
+            .arg(&valid_public)
+            .arg(&signed_path)
+            .output()
+            .unwrap()
+    };
+
+    let strict_certificate = verify_certificate(false);
+    assert!(!strict_certificate.status.success());
+    let lax_certificate = verify_certificate(true);
+    assert!(
+        lax_certificate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax_certificate.stderr)
+    );
+}
+
+#[test]
 fn named_verification_certificate_obeys_signature_key_name_unless_lax() {
     // Explicit certificates are pinned verification identities, so naming one
     // must use the same strict lookup contract as naming a raw public key.
