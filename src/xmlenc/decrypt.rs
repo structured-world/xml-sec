@@ -21,6 +21,61 @@ use crate::xml::XmlIdIndex;
 #[cfg(test)]
 use super::parse_encrypted_data;
 
+/// Aggregate key-candidate work allowance for one decryption operation.
+///
+/// Resolver implementations must consume one unit before each key lookup or
+/// unwrap attempt. A single budget is shared across direct and recipient keys.
+#[derive(Debug)]
+pub struct DecryptionCandidateBudget {
+    maximum: usize,
+    remaining: usize,
+}
+
+impl DecryptionCandidateBudget {
+    /// Create the fixed implementation-wide budget for one operation.
+    pub fn for_operation() -> Self {
+        let maximum = crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING;
+        Self {
+            maximum,
+            remaining: maximum,
+        }
+    }
+
+    /// Number of candidate attempts still available to this operation.
+    pub const fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    /// Charge attempted candidate work before performing it.
+    pub fn consume(&mut self, count: usize, resource: &'static str) -> Result<(), XmlEncError> {
+        if count > self.remaining {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource,
+                maximum: self.maximum,
+                actual: self
+                    .maximum
+                    .saturating_sub(self.remaining)
+                    .saturating_add(count),
+            }
+            .into());
+        }
+        self.remaining -= count;
+        Ok(())
+    }
+
+    fn account_returned_candidates(
+        &mut self,
+        remaining_before: usize,
+        returned: usize,
+    ) -> Result<(), XmlEncError> {
+        let resolver_charged = remaining_before.saturating_sub(self.remaining);
+        self.consume(
+            returned.saturating_sub(resolver_charged),
+            "decryption key candidates",
+        )
+    }
+}
+
 /// Supplies a content-encryption key for parsed XMLEnc data.
 pub trait DecryptionKeyResolver {
     /// Resolve the symmetric key for `algorithm`, optionally unwrapping `encrypted_key`.
@@ -36,16 +91,17 @@ pub trait DecryptionKeyResolver {
     /// The default preserves single-key resolver behavior. Key rings override
     /// this method so parsing, policy validation, and ciphertext decoding occur
     /// once while only authenticated primitive decryption is retried. Overrides
-    /// must reject results larger than the supplied maximum; the context also
-    /// enforces that ceiling before cryptographic work.
+    /// must consume the shared budget before every lookup or unwrap attempt.
+    /// The context also accounts for any returned candidates an implementation
+    /// did not explicitly charge.
     fn resolve_key_candidates(
         &self,
         provider: &dyn crate::provider::CryptoProvider,
         algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
-        maximum_candidates: usize,
+        budget: &mut DecryptionCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
-        let _ = maximum_candidates;
+        budget.consume(1, "decryption key candidates")?;
         self.resolve_key(provider, algorithm, encrypted_key)
             .map(|key| vec![key])
     }
@@ -159,10 +215,11 @@ impl<'a> DecryptContext<'a> {
         let keys = resolve_content_key_candidates(
             self.provider,
             algorithm,
-            &encrypted.encrypted_keys,
+            encrypted,
             self.resolver,
             &self.policy,
         )?;
+        let keys = compatible_decryption_key_candidates(algorithm, keys)?;
         validate_decryption_key_candidates(algorithm, keys.len())?;
         let mut last_error = None;
         for key in keys {
@@ -687,12 +744,12 @@ pub fn decrypt_data(
 fn resolve_content_key_candidates(
     provider: &dyn crate::provider::CryptoProvider,
     algorithm: DataEncryptionAlgorithm,
-    encrypted_keys: &[EncryptedKey],
+    encrypted: &EncryptedData,
     resolver: &dyn DecryptionKeyResolver,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<Vec<Vec<u8>>, XmlEncError> {
-    let maximum = crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING;
-    match resolver.resolve_key_candidates(provider, algorithm, None, maximum) {
+    let mut budget = DecryptionCandidateBudget::for_operation();
+    match resolve_candidates_with_budget(resolver, provider, algorithm, None, &mut budget) {
         Ok(keys) if !keys.is_empty() => return Ok(keys),
         Ok(_) => {}
         Err(XmlEncError::KeyNotFound) => {}
@@ -700,18 +757,86 @@ fn resolve_content_key_candidates(
     }
 
     let mut last_error = None;
-    for encrypted_key in encrypted_keys {
+    for encrypted_key in &encrypted.encrypted_keys {
+        if !encrypted_key_applies_to_data(encrypted_key, encrypted) {
+            continue;
+        }
         if let Err(error) = validate_encrypted_key_policy(encrypted_key, policy) {
             last_error = Some(error);
             continue;
         }
-        match resolver.resolve_key_candidates(provider, algorithm, Some(encrypted_key), maximum) {
+        match resolve_candidates_with_budget(
+            resolver,
+            provider,
+            algorithm,
+            Some(encrypted_key),
+            &mut budget,
+        ) {
             Ok(keys) if !keys.is_empty() => return Ok(keys),
             Ok(_) => {}
             Err(error) => last_error = Some(error),
         }
     }
     Err(last_error.unwrap_or(XmlEncError::KeyNotFound))
+}
+
+fn resolve_candidates_with_budget(
+    resolver: &dyn DecryptionKeyResolver,
+    provider: &dyn crate::provider::CryptoProvider,
+    algorithm: DataEncryptionAlgorithm,
+    encrypted_key: Option<&EncryptedKey>,
+    budget: &mut DecryptionCandidateBudget,
+) -> Result<Vec<Vec<u8>>, XmlEncError> {
+    let remaining_before = budget.remaining();
+    let keys = resolver.resolve_key_candidates(provider, algorithm, encrypted_key, budget)?;
+    budget.account_returned_candidates(remaining_before, keys.len())?;
+    Ok(keys)
+}
+
+fn encrypted_key_applies_to_data(
+    encrypted_key: &EncryptedKey,
+    encrypted_data: &EncryptedData,
+) -> bool {
+    // XMLEnc association metadata is optional, but authoritative when present:
+    // DataReference identifies encrypted objects and CarriedKeyName identifies
+    // the transported key referenced by the enclosing ds:KeyName.
+    if let Some(references) = encrypted_key.reference_list.as_ref()
+        && !references.data_references.is_empty()
+    {
+        let Some(id) = encrypted_data.id.as_deref() else {
+            return false;
+        };
+        let target = format!("#{id}");
+        if !references.data_references.iter().any(|uri| uri == &target) {
+            return false;
+        }
+    }
+    if let (Some(carried), Some(expected)) = (
+        encrypted_key.carried_key_name.as_deref(),
+        encrypted_data.key_name.as_deref(),
+    ) && carried != expected
+    {
+        return false;
+    }
+    true
+}
+
+fn compatible_decryption_key_candidates(
+    algorithm: DataEncryptionAlgorithm,
+    keys: Vec<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>, XmlEncError> {
+    let mut compatible = Vec::with_capacity(keys.len());
+    let mut last_error = None;
+    for key in keys {
+        match validate_key_len(algorithm, &key) {
+            Ok(()) => compatible.push(key),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if compatible.is_empty() {
+        return Err(last_error.unwrap_or(XmlEncError::KeyNotFound));
+    }
+    Ok(compatible)
 }
 
 fn validate_decryption_key_candidates(
@@ -1010,7 +1135,7 @@ fn map_data_decryption_error(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use aes_gcm::{
@@ -1046,6 +1171,16 @@ mod tests {
         keys: Vec<Vec<u8>>,
     }
 
+    struct AggregateRecipientResolver {
+        attempts: Cell<usize>,
+        key: Vec<u8>,
+    }
+
+    struct AssociationRecordingResolver {
+        visited: RefCell<Vec<String>>,
+        key: Vec<u8>,
+    }
+
     impl DecryptionKeyResolver for CandidateResolver {
         fn resolve_key(
             &self,
@@ -1061,21 +1196,126 @@ mod tests {
             _provider: &dyn crate::provider::CryptoProvider,
             _algorithm: DataEncryptionAlgorithm,
             encrypted_key: Option<&EncryptedKey>,
-            maximum_candidates: usize,
+            budget: &mut DecryptionCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
             if encrypted_key.is_none() {
-                if self.keys.len() > maximum_candidates {
-                    return Err(crate::policy::PolicyViolation::ResourceLimit {
-                        resource: "decryption key candidates",
-                        maximum: maximum_candidates,
-                        actual: self.keys.len(),
-                    }
-                    .into());
-                }
+                budget.consume(self.keys.len(), "decryption key candidates")?;
                 Ok(self.keys.clone())
             } else {
                 Err(XmlEncError::KeyNotFound)
             }
+        }
+    }
+
+    impl DecryptionKeyResolver for AggregateRecipientResolver {
+        fn resolve_key(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            _encrypted_key: Option<&EncryptedKey>,
+        ) -> Result<Vec<u8>, XmlEncError> {
+            Err(XmlEncError::KeyNotFound)
+        }
+
+        fn resolve_key_candidates(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+            budget: &mut DecryptionCandidateBudget,
+        ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+            let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
+            let attempts = budget.remaining();
+            if attempts == 0 {
+                budget.consume(1, "decryption key candidates")?;
+            }
+            budget.consume(attempts, "decryption key candidates")?;
+            self.attempts.set(self.attempts.get() + attempts);
+            if encrypted_key.id.as_deref() == Some("first") {
+                Err(XmlEncError::KeyNotFound)
+            } else {
+                Ok(vec![self.key.clone()])
+            }
+        }
+    }
+
+    impl DecryptionKeyResolver for AssociationRecordingResolver {
+        fn resolve_key(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            _encrypted_key: Option<&EncryptedKey>,
+        ) -> Result<Vec<u8>, XmlEncError> {
+            Err(XmlEncError::KeyNotFound)
+        }
+
+        fn resolve_key_candidates(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+            budget: &mut DecryptionCandidateBudget,
+        ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+            let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
+            budget.consume(1, "decryption key candidates")?;
+            self.visited
+                .borrow_mut()
+                .push(encrypted_key.id.clone().unwrap_or_default());
+            Ok(vec![self.key.clone()])
+        }
+    }
+
+    fn associated_encrypted_key(
+        id: &str,
+        data_reference: Option<&str>,
+        carried_key_name: Option<&str>,
+    ) -> EncryptedKey {
+        EncryptedKey {
+            id: Some(id.into()),
+            recipient: None,
+            key_name: None,
+            encryption_method: EncryptionMethod {
+                algorithm: KeyTransportAlgorithm::RsaOaep11.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            cipher_data: CipherData {
+                value: STANDARD.encode([0_u8; 256]),
+            },
+            reference_list: data_reference.map(|uri| crate::xmlenc::ReferenceList {
+                data_references: vec![uri.into()],
+                key_references: Vec::new(),
+            }),
+            carried_key_name: carried_key_name.map(str::to_owned),
+        }
+    }
+
+    fn encrypted_data_with_recipients(
+        key: &[u8],
+        encrypted_keys: Vec<EncryptedKey>,
+        key_name: Option<&str>,
+    ) -> EncryptedData {
+        EncryptedData {
+            id: Some("target".into()),
+            encrypted_type: None,
+            encryption_method: EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            key_name: key_name.map(str::to_owned),
+            encrypted_keys,
+            cipher_data: CipherData {
+                value: STANDARD.encode(
+                    crate::provider::default_provider()
+                        .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, key, b"payload")
+                        .expect("test encryption must succeed"),
+                ),
+            },
         }
     }
 
@@ -1488,6 +1728,139 @@ mod tests {
                 actual: observed,
             }) if observed == actual
         ));
+    }
+
+    #[test]
+    fn candidate_work_ceiling_is_shared_across_recipients() {
+        // The candidate ceiling bounds the complete decryption operation, not
+        // each EncryptedKey independently.
+        let key = vec![0x39_u8; 16];
+        let resolver = AggregateRecipientResolver {
+            attempts: Cell::new(0),
+            key: key.clone(),
+        };
+        let encrypted = encrypted_data_with_recipients(
+            &key,
+            vec![
+                associated_encrypted_key("first", None, None),
+                associated_encrypted_key("second", None, None),
+            ],
+            None,
+        );
+
+        DecryptContext::new(&resolver)
+            .decrypt_data(&encrypted)
+            .expect_err("a second recipient must not receive a fresh candidate allowance");
+        assert_eq!(
+            resolver.attempts.get(),
+            crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING
+        );
+    }
+
+    #[test]
+    fn cbc_ambiguity_ignores_algorithm_incompatible_key_widths() {
+        // A wrong-width key cannot reach AES-CBC and therefore cannot make one
+        // width-compatible candidate ambiguous.
+        let key = vec![0x47_u8; 16];
+        let ciphertext = crate::provider::default_provider()
+            .encrypt_data(DataEncryptionAlgorithm::Aes128Cbc, &key, b"payload")
+            .expect("test encryption must succeed");
+        let encrypted = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            encryption_method: EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Cbc.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            key_name: None,
+            encrypted_keys: Vec::new(),
+            cipher_data: CipherData {
+                value: STANDARD.encode(ciphertext),
+            },
+        };
+        let resolver = CandidateResolver {
+            keys: vec![vec![0_u8; 32], key],
+        };
+
+        assert_eq!(
+            DecryptContext::new(&resolver)
+                .decrypt_data(&encrypted)
+                .expect("the sole width-compatible CBC key must be selected"),
+            DecryptedContent::Bytes(b"payload".to_vec())
+        );
+    }
+
+    #[test]
+    fn data_reference_selects_the_associated_encrypted_key() {
+        // An explicit DataReference to another object contradicts this
+        // EncryptedData even when that recipient can be unwrapped.
+        let key = vec![0x51_u8; 16];
+        let resolver = AssociationRecordingResolver {
+            visited: RefCell::new(Vec::new()),
+            key: key.clone(),
+        };
+        let encrypted = encrypted_data_with_recipients(
+            &key,
+            vec![
+                associated_encrypted_key("unrelated", Some("#other"), None),
+                associated_encrypted_key("matching", Some("#target"), None),
+            ],
+            None,
+        );
+
+        DecryptContext::new(&resolver)
+            .decrypt_data(&encrypted)
+            .expect("the associated recipient must decrypt");
+        assert_eq!(resolver.visited.into_inner(), ["matching"]);
+    }
+
+    #[test]
+    fn carried_key_name_selects_the_named_content_key() {
+        // CarriedKeyName identifies the transported key named by the enclosing
+        // EncryptedData KeyInfo; a contradictory label must be skipped.
+        let key = vec![0x52_u8; 16];
+        let resolver = AssociationRecordingResolver {
+            visited: RefCell::new(Vec::new()),
+            key: key.clone(),
+        };
+        let encrypted = encrypted_data_with_recipients(
+            &key,
+            vec![
+                associated_encrypted_key("unrelated", None, Some("other")),
+                associated_encrypted_key("matching", None, Some("wanted")),
+            ],
+            Some("wanted"),
+        );
+
+        DecryptContext::new(&resolver)
+            .decrypt_data(&encrypted)
+            .expect("the matching carried key name must decrypt");
+        assert_eq!(resolver.visited.into_inner(), ["matching"]);
+    }
+
+    #[test]
+    fn contradictory_encrypted_key_associations_fail_closed() {
+        // Association metadata is authoritative when present. The resolver must
+        // not see a recipient that explicitly names another encrypted object.
+        let key = vec![0x53_u8; 16];
+        let resolver = AssociationRecordingResolver {
+            visited: RefCell::new(Vec::new()),
+            key: key.clone(),
+        };
+        let encrypted = encrypted_data_with_recipients(
+            &key,
+            vec![associated_encrypted_key("unrelated", Some("#other"), None)],
+            None,
+        );
+
+        assert!(matches!(
+            DecryptContext::new(&resolver).decrypt_data(&encrypted),
+            Err(XmlEncError::KeyNotFound)
+        ));
+        assert!(resolver.visited.into_inner().is_empty());
     }
 
     #[test]

@@ -27,11 +27,11 @@ use xml_sec::{
         x509_certificate_matches_selectors,
     },
     xmlenc::{
-        DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
-        EncryptedDataBuilder, EncryptedDataType, EncryptedKey, EncryptionMethod,
-        EncryptionRecipient, KeyTransportAlgorithm, OaepDigestAlgorithm, PrivateKeyDecryptor,
-        RsaOaepParameters, XmlEncError, parse_encrypted_data_template_node_with_policy,
-        validate_rsa_recipient_key,
+        DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionCandidateBudget,
+        DecryptionKeyResolver, EncryptedDataBuilder, EncryptedDataType, EncryptedKey,
+        EncryptionMethod, EncryptionRecipient, KeyTransportAlgorithm, OaepDigestAlgorithm,
+        PrivateKeyDecryptor, RsaOaepParameters, XmlEncError,
+        parse_encrypted_data_template_node_with_policy, validate_rsa_recipient_key,
     },
 };
 
@@ -2549,17 +2549,10 @@ impl DecryptionKeyResolver for CandidateSymmetricKeyDecryptor {
         _provider: &dyn CryptoProvider,
         _algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
-        maximum_candidates: usize,
+        budget: &mut DecryptionCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
         if encrypted_key.is_none() {
-            if self.keys.len() > maximum_candidates {
-                return Err(xml_sec::policy::PolicyViolation::ResourceLimit {
-                    resource: "decryption key candidates",
-                    maximum: maximum_candidates,
-                    actual: self.keys.len(),
-                }
-                .into());
-            }
+            budget.consume(self.keys.len(), "decryption key candidates")?;
             Ok(self.keys.clone())
         } else {
             Err(XmlEncError::KeyNotFound)
@@ -2601,23 +2594,15 @@ impl DecryptionKeyResolver for NamedRecipientDecryptor {
         provider: &dyn CryptoProvider,
         algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
-        maximum_candidates: usize,
+        budget: &mut DecryptionCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
         let Some(encrypted_key) = encrypted_key else {
             return Err(XmlEncError::KeyNotFound);
         };
-        let candidates = self.applicable_keys(encrypted_key).collect::<Vec<_>>();
-        if candidates.len() > maximum_candidates {
-            return Err(xml_sec::policy::PolicyViolation::ResourceLimit {
-                resource: "RSA private-key candidates",
-                maximum: maximum_candidates,
-                actual: candidates.len(),
-            }
-            .into());
-        }
         let mut resolved = Vec::new();
         let mut last_error = None;
-        for key in candidates {
+        for key in self.applicable_keys(encrypted_key) {
+            budget.consume(1, "RSA private-key candidates")?;
             match key
                 .inner
                 .resolve_key(provider, algorithm, Some(encrypted_key))
@@ -3609,12 +3594,18 @@ mod tests {
             carried_key_name: None,
         };
 
+        let mut candidate_budget = DecryptionCandidateBudget::for_operation();
+        let maximum = candidate_budget.remaining();
+        let reserved = maximum - 1;
+        candidate_budget
+            .consume(reserved, "prior recipient candidates")
+            .unwrap();
         let error = resolver
             .resolve_key_candidates(
                 default_provider(),
                 DataEncryptionAlgorithm::Aes128Gcm,
                 Some(&encrypted_key),
-                1,
+                &mut candidate_budget,
             )
             .expect_err("oversized applicable RSA key sets must fail before unwrap");
 
@@ -3622,9 +3613,9 @@ mod tests {
             error,
             XmlEncError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
                 resource: "RSA private-key candidates",
-                maximum: 1,
-                actual: 2,
-            })
+                maximum: observed_maximum,
+                actual,
+            }) if observed_maximum == maximum && actual == maximum + 1
         ));
     }
 

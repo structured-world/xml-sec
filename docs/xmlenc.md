@@ -115,6 +115,14 @@ For multiple recipients, `DecryptContext` validates transport, wrap, digest, and
 each `EncryptedKey` becomes a resolver candidate. A malformed or disallowed key for another
 recipient therefore cannot suppress a later matching candidate. A resolver that supplies a direct
 symmetric key remains authoritative and does not consult unrelated embedded key hints.
+The operation shares one `DecryptionCandidateBudget` across the direct lookup and every recipient;
+custom `DecryptionKeyResolver` implementations must charge it before each lookup or unwrap attempt.
+The context additionally accounts for returned candidates, so a resolver cannot multiply work by
+resetting a per-recipient allowance. Explicit `ReferenceList/DataReference` and `CarriedKeyName`
+metadata restricts an embedded key to the referenced `EncryptedData` or matching `ds:KeyName`.
+Association metadata may be omitted, but an explicit contradiction is skipped rather than tried.
+Wrong-width symmetric candidates are discarded before AES-CBC ambiguity checks because they cannot
+reach the selected primitive.
 Unknown key transport and wrap URIs fail closed before an application resolver is invoked.
 
 AES-CBC framing is bounded before decryption and the exact plaintext bound is checked again after
