@@ -113,11 +113,6 @@ pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialError> {
     Ok(bytes)
 }
 
-pub fn read_text(path: impl AsRef<Path>) -> Result<String, KeyMaterialError> {
-    let path = path.as_ref();
-    String::from_utf8(read(path)?).map_err(|_| KeyMaterialError::InvalidPem(path.to_owned()))
-}
-
 /// Read metadata from the first descendant signature below the selected start node.
 ///
 /// libxmlsec1 uses a depth-first `xmlSecFindNode` lookup from the operation start

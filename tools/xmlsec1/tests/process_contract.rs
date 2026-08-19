@@ -1581,7 +1581,7 @@ fn encryption_node_id_selects_one_template_subtree() {
     let key = temp.path().join("key.bin");
     let encrypted_data = |id: &str| {
         format!(
-            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Id="{id}"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Id="{id}" Type="http://www.w3.org/2001/04/xmlenc#Element"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#
         )
     };
     fs::write(
@@ -1593,13 +1593,13 @@ fn encryption_node_id_selects_one_template_subtree() {
         ),
     )
     .unwrap();
-    fs::write(&plaintext, b"selected payload").unwrap();
+    fs::write(&plaintext, b"<selected>payload</selected>").unwrap();
     fs::write(&key, b"0123456789abcdef").unwrap();
 
     let output = Command::new(binary())
         .args(["encrypt", "--aes-key"])
         .arg(&key)
-        .args(["--binary-data"])
+        .args(["--xml-data"])
         .arg(&plaintext)
         .args(["--node-id", "first"])
         .arg(&template)
@@ -1624,7 +1624,7 @@ fn encryption_node_id_selects_one_template_subtree() {
     let missing = Command::new(binary())
         .args(["encrypt", "--aes-key"])
         .arg(&key)
-        .args(["--binary-data"])
+        .args(["--xml-data"])
         .arg(&plaintext)
         .args(["--node-id", "missing"])
         .arg(&template)
@@ -1644,7 +1644,7 @@ fn encryption_node_id_selects_one_template_subtree() {
     let ambiguous = Command::new(binary())
         .args(["encrypt", "--aes-key"])
         .arg(&key)
-        .args(["--binary-data"])
+        .args(["--xml-data"])
         .arg(&plaintext)
         .args(["--node-id", "first"])
         .arg(&duplicate)
@@ -1684,6 +1684,50 @@ fn binary_encryption_rejects_xml_typed_templates() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+}
+
+#[test]
+fn binary_encryption_rejects_embedded_opaque_templates() {
+    // Embedded decryption replaces the selected node in its containing XML
+    // document, so accepting opaque bytes here would create output that the
+    // reciprocal CLI path cannot represent.
+    let temp = tempfile::tempdir().unwrap();
+    let plaintext = temp.path().join("plaintext.bin");
+    let key = temp.path().join("key.bin");
+    fs::write(&plaintext, [0xff, 0x00, 0xfe]).unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    for encrypted_type in [None, Some("urn:example:opaque")] {
+        let type_attribute = encrypted_type
+            .map(|value| format!(" Type=\"{value}\""))
+            .unwrap_or_default();
+        let template = temp.path().join(format!(
+            "embedded-{}.xml",
+            encrypted_type.map_or("untyped", |_| "custom")
+        ));
+        fs::write(
+            &template,
+            format!(
+                r#"<Document><EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"{type_attribute}><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData></Document>"#
+            ),
+        )
+        .unwrap();
+
+        let result = Command::new(binary())
+            .args(["encrypt", "--aes-key"])
+            .arg(&key)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(!result.status.success(), "{encrypted_type:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("embedded"),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 }
 
 #[test]
@@ -3630,16 +3674,16 @@ fn encryption_node_id_accepts_namespaced_id_attributes() {
     let aes_key = temp.path().join("aes.key");
     fs::write(
         &template,
-        r#"<root xmlns:wsu="urn:wsu"><scope wsu:Id="target"><EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData></scope></root>"#,
+        r#"<root xmlns:wsu="urn:wsu"><scope wsu:Id="target"><EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData></scope></root>"#,
     )
     .unwrap();
-    fs::write(&plaintext, b"namespaced node ID").unwrap();
+    fs::write(&plaintext, b"<selected>namespaced node ID</selected>").unwrap();
     fs::write(&aes_key, [7_u8; 16]).unwrap();
 
     let encrypt = Command::new(binary())
         .args(["encrypt", "--node-id", "target", "--aes-key"])
         .arg(&aes_key)
-        .arg("--binary-data")
+        .arg("--xml-data")
         .arg(&plaintext)
         .arg(&template)
         .output()
@@ -3894,6 +3938,37 @@ fn rsa_decryption_accepts_private_key_certificate_companions() {
         String::from_utf8_lossy(&decrypt.stderr)
     );
     assert_eq!(decrypt.stdout, b"certificate companion");
+
+    let unrelated_certificate = project_root().join("tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+    let mismatched_compound = format!(
+        "{},{}",
+        private_key.display(),
+        unrelated_certificate.display()
+    );
+    let mismatched = Command::new(binary())
+        .args(["decrypt", "--privkey-pem"])
+        .arg(&mismatched_compound)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(!mismatched.status.success());
+    assert!(String::from_utf8_lossy(&mismatched.stderr).contains("does not match"));
+
+    let valid_compound = format!("{},{}", private_key.display(), certificate.display());
+    let lax = Command::new(binary())
+        .args(["decrypt", "--lax-key-search", "--privkey-pem:first"])
+        .arg(mismatched_compound)
+        .args(["--privkey-pem:second"])
+        .arg(valid_compound)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        lax.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lax.stderr)
+    );
+    assert_eq!(lax.stdout, b"certificate companion");
 
     let malformed = temp.path().join("malformed.pem");
     fs::write(&malformed, "not a certificate").unwrap();
@@ -4678,7 +4753,7 @@ fn signing_rejects_a_malformed_secondary_certificate() {
         .output()
         .unwrap();
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("invalid PEM certificate"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("certificate"));
 }
 
 #[test]
@@ -4899,6 +4974,42 @@ fn lax_signing_skips_keys_rejected_by_the_signing_policy() {
         .arg(&weak_key_path)
         .args(["--privkey-pem:compliant"])
         .arg(&compliant_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+}
+
+#[test]
+fn lax_signing_skips_a_key_with_a_mismatched_certificate_companion() {
+    // A comma-separated key and certificate chain is one candidate. Lax search
+    // must reject the complete candidate before considering the next option.
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let matching_certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    let unrelated_certificate = project_root().join("tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+    let mismatched = format!(
+        "{},{}",
+        private_key.display(),
+        unrelated_certificate.display()
+    );
+    let matching = format!(
+        "{},{}",
+        private_key.display(),
+        matching_certificate.display()
+    );
+
+    let signed = Command::new(binary())
+        .args(["sign", "--lax-key-search", "--privkey-pem:first"])
+        .arg(mismatched)
+        .args(["--privkey-pem:second"])
+        .arg(matching)
         .arg(&template)
         .output()
         .unwrap();

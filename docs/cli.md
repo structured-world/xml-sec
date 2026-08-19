@@ -96,9 +96,11 @@ without `KeyInfo`. Named signing keys
 require a matching template `KeyName` even when only one key is supplied. A
 named key with no template `KeyName` fails unless `--lax-key-search` explicitly
 opts out of lookup. Verification and encryption instead leave a `KeyName`-less
-template unconstrained when one explicit key is supplied. Lax signing continues
-past malformed, algorithm-incompatible, or policy-rejected keys until it finds a
-usable candidate; it never weakens the compiled signing policy.
+template unconstrained when one explicit key is supplied. Lax signing treats
+each comma-separated key and certificate chain as one candidate and continues
+past malformed, mismatched, algorithm-incompatible, or policy-rejected
+candidates until it finds a usable one; it never weakens the compiled signing
+policy.
 
 Verification accepts `-` as the conventional stdin marker. Verification starts
 at the document root and uses the first descendant `Signature` in document order.
@@ -205,6 +207,9 @@ recipient metadata, so strict decryption retains the selected key name.
 RSA private-key decryption accepts the upstream
 `key.pem,certificate.pem,...` option syntax, consumes the first component as
 the decryption key, and validates every certificate companion before decrypting.
+The first companion certificate must contain the private key's public key;
+remaining companions must be structurally valid certificates. Lax lookup skips
+an invalid compound candidate as a unit rather than retaining its private key.
 All asymmetric key and certificate files are read through one absolute
 process-safety ceiling before format decoding. Verification also deduplicates
 repeated certificates within each lookup or trust role and applies the compiled
@@ -215,9 +220,10 @@ ambiguous instead of preventing distinct recipients from sharing an invocation.
 Named AES and RSA decryption keys obey the selected `EncryptedData` or nested
 `EncryptedKey` name unless lax lookup is requested. Selecting a standalone
 `EncryptedData` by its own `Id` still returns opaque decrypted bytes rather than
-routing them through XML document replacement. `--binary-data` rejects
-templates explicitly typed as XML `Element` or `Content`; use `--xml-data` for
-those templates so ciphertext metadata cannot mislabel arbitrary bytes as XML.
+routing them through XML document replacement. `--binary-data` requires a
+standalone `EncryptedData` template and rejects templates explicitly typed as
+XML `Element` or `Content`; embedded templates require `--xml-data` so every
+successful encryption has a reciprocal document-replacement decryption path.
 Supplying `--binary-data` and `--xml-data` together is rejected before either
 payload is read; encryption requires exactly one payload mode.
 A direct `--aes-key` cannot satisfy an `EncryptedKey` recipient embedded in the

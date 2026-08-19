@@ -8,7 +8,11 @@ use std::{
 };
 
 use roxmltree::{Document, Node, ParsingOptions};
-use rsa::{RsaPublicKey, pkcs8::DecodePublicKey as _, traits::PublicKeyParts as _};
+use rsa::{
+    RsaPublicKey,
+    pkcs8::{DecodePublicKey as _, EncodePublicKey as _},
+    traits::PublicKeyParts as _,
+};
 use x509_parser::prelude::FromDer as _;
 use xml_sec::{
     IdAttributeRegistration,
@@ -640,61 +644,23 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     let id_attributes = id_attribute_registrations(invocation)?;
     let signature =
         key_material::signing_signature_metadata(&xml, start_node_id, &id_attributes, &policy)?;
-    let (key_option, certificate_is_der, key) = select_signing_key(
+    let selected = select_signing_key(
         invocation,
         &signature.key_names,
         signature.algorithm,
         &policy,
     )?;
-    let value = key_option.value.as_deref().unwrap_or_default();
-    let (_, certificate_paths) = split_key_and_certificates(value)?;
-    let mut certificate_budget =
-        CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
-    let writer = if certificate_paths.is_empty() {
-        None
-    } else {
-        Some(
-            if certificate_is_der {
-                let certificates = certificate_paths
-                    .iter()
-                    .map(|path| -> Result<Vec<u8>, CommandError> {
-                        let certificate = key_material::read(path)?;
-                        certificate_budget.charge(certificate.len())?;
-                        Ok(certificate)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                X509CertificateKeyInfoWriter::from_der_chain(&certificates)
-            } else {
-                let certificates = certificate_paths
-                    .iter()
-                    .map(|path| -> Result<String, CommandError> {
-                        let certificate = key_material::read_text(path)?;
-                        certificate_budget.charge(certificate.len())?;
-                        Ok(certificate)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                X509CertificateKeyInfoWriter::from_pem_chain(&certificates)
-            }
-            .map_err(|error| CommandError::Signature(error.to_string()))?,
-        )
-    };
-    let mut context = SignContext::new(key.as_ref())
+    let mut context = SignContext::new(selected.key.as_ref())
         .policy(policy)
         .signature_template_selection(SignatureTemplateSelection::FirstDescendant);
     if let Some(id) = start_node_id {
         context = context.start_node_id(id);
     }
     context = context.id_attributes(&id_attributes);
-    if let Some(writer) = &writer {
-        if signature.has_key_info {
-            context = context.key_info_writer(writer);
-        } else {
-            // Companions remain key-bound inputs even when the optional output
-            // placeholder is absent; validate the chain without injecting XML.
-            writer
-                .write_key_info(key.as_ref())
-                .map_err(|error| CommandError::Signature(error.to_string()))?;
-        }
+    if let Some(writer) = &selected.certificate_writer
+        && signature.has_key_info
+    {
+        context = context.key_info_writer(writer);
     }
     let signed = context
         .sign_template(&xml)
@@ -726,18 +692,20 @@ fn write_signing_diagnostics(
     Ok(())
 }
 
-fn select_signing_key<'a>(
-    invocation: &'a Invocation,
+struct SigningKeyCandidate {
+    key: Box<dyn SigningKey>,
+    certificate_writer: Option<X509CertificateKeyInfoWriter>,
+}
+
+fn select_signing_key(
+    invocation: &Invocation,
     requested_names: &[String],
     algorithm: SignatureAlgorithm,
     policy: &SigningPolicy,
-) -> Result<(&'a crate::OptionValue, bool, Box<dyn SigningKey>), CommandError> {
+) -> Result<SigningKeyCandidate, CommandError> {
     let keys = invocation
         .ordered_values(&["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"])
-        .map(|key| {
-            let certificate_is_der = matches!(key.name.as_str(), "privkey-der" | "pkcs8-der");
-            (key, certificate_is_der)
-        })
+        .map(|key| (key, ()))
         .collect::<Vec<_>>();
     if keys.is_empty() {
         return Err(CommandError::Usage(
@@ -751,17 +719,17 @@ fn select_signing_key<'a>(
         false,
         "private key",
     )?;
+    let lax_key_search = invocation.flag("lax-key-search");
     let mut last_error: Option<CommandError> = None;
-    for (option, certificate_is_der) in candidates {
-        let (path, _) = split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
-        match key_material::load_signing_key(path, private_key_format(option))
-            .map_err(CommandError::from)
-        {
-            Ok(key) => match validate_signing_key(key.as_ref(), algorithm, policy) {
-                Ok(()) => return Ok((option, certificate_is_der, key)),
-                Err(error) => last_error = Some(CommandError::Signature(error.to_string())),
-            },
-            Err(error) => last_error = Some(error),
+    let mut certificate_budget =
+        CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
+    for (option, ()) in candidates {
+        let attempt =
+            prepare_signing_key_candidate(option, algorithm, policy, &mut certificate_budget);
+        match attempt {
+            Ok(candidate) => return Ok(candidate),
+            Err(error) if lax_key_search => last_error = Some(error),
+            Err(error) => return Err(error),
         }
     }
     if let Some(error) = last_error {
@@ -771,6 +739,59 @@ fn select_signing_key<'a>(
         "no private key input supports {}",
         algorithm.uri()
     )))
+}
+
+fn prepare_signing_key_candidate(
+    option: &crate::OptionValue,
+    algorithm: SignatureAlgorithm,
+    policy: &SigningPolicy,
+    certificate_budget: &mut CertificateBudget,
+) -> Result<SigningKeyCandidate, CommandError> {
+    let (path, certificate_paths) =
+        split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
+    let key = key_material::load_signing_key(path, private_key_format(option))?;
+    validate_signing_key(key.as_ref(), algorithm, policy)
+        .map_err(|error| CommandError::Signature(error.to_string()))?;
+    let certificate_writer = if certificate_paths.is_empty() {
+        None
+    } else {
+        let certificates = load_certificate_companions(
+            &certificate_paths,
+            if matches!(option.name.as_str(), "privkey-der" | "pkcs8-der") {
+                key_material::CertificateEncoding::Der
+            } else {
+                key_material::CertificateEncoding::Pem
+            },
+            certificate_budget,
+        )?;
+        let writer = X509CertificateKeyInfoWriter::from_der_chain(&certificates)
+            .map_err(|error| CommandError::Signature(error.to_string()))?;
+        // Companion validation belongs to candidate preparation even when the
+        // template has no KeyInfo output slot: the option is one key identity.
+        writer
+            .write_key_info(key.as_ref())
+            .map_err(|error| CommandError::Signature(error.to_string()))?;
+        Some(writer)
+    };
+    Ok(SigningKeyCandidate {
+        key,
+        certificate_writer,
+    })
+}
+
+fn load_certificate_companions(
+    paths: &[&OsStr],
+    encoding: key_material::CertificateEncoding,
+    budget: &mut CertificateBudget,
+) -> Result<Vec<Vec<u8>>, CommandError> {
+    paths
+        .iter()
+        .map(|path| {
+            let certificate = key_material::load_certificate(path, encoding)?;
+            budget.charge(certificate.len())?;
+            Ok(certificate)
+        })
+        .collect()
 }
 
 fn split_key_and_certificates(value: &OsStr) -> Result<(&OsStr, Vec<&OsStr>), CommandError> {
@@ -1339,6 +1360,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let algorithm = metadata.algorithm;
     let encrypted_type = metadata.encrypted_type;
     let explicit_xml_type = metadata.explicit_xml_type;
+    let template_placement = metadata.placement;
     let mut builder = EncryptedDataBuilder::new(algorithm).policy(policy.clone());
     let aes_keys = invocation.values("aes-key").collect::<Vec<_>>();
     let public_keys = invocation
@@ -1513,6 +1535,11 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     }
     builder = builder.encryption_type(encrypted_type.clone());
     let result = if let Some(path) = invocation.last_value("binary-data") {
+        if template_placement == EncryptionTemplatePlacement::Embedded {
+            return Err(CommandError::Usage(
+                "--binary-data requires a standalone EncryptedData template; embedded templates require --xml-data so decryption can replace XML".into(),
+            ));
+        }
         if explicit_xml_type {
             return Err(CommandError::Usage(
                 "--binary-data cannot be used with an XML Element or Content template Type".into(),
@@ -2311,28 +2338,32 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let mut keys = Vec::with_capacity(selected.len());
         let lax_key_search = invocation.flag("lax-key-search");
         let mut last_load_error = None;
+        let mut certificate_budget =
+            CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
         for option in selected {
             let loaded = (|| {
                 let (path, certificate_paths) =
                     split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
-                for certificate in certificate_paths {
-                    let encoding = match private_key_format(option) {
-                        key_material::PrivateKeyFormat::Pem
-                        | key_material::PrivateKeyFormat::Pkcs8Pem => {
-                            key_material::CertificateEncoding::Pem
-                        }
+                let private_key = key_material::load_rsa_private(path, private_key_format(option))?;
+                if !certificate_paths.is_empty() {
+                    let encoding = if matches!(
+                        private_key_format(option),
                         key_material::PrivateKeyFormat::Der
-                        | key_material::PrivateKeyFormat::Pkcs8Der => {
-                            key_material::CertificateEncoding::Der
-                        }
+                            | key_material::PrivateKeyFormat::Pkcs8Der
+                    ) {
+                        key_material::CertificateEncoding::Der
+                    } else {
+                        key_material::CertificateEncoding::Pem
                     };
-                    key_material::load_certificate(certificate, encoding)?;
+                    let certificates = load_certificate_companions(
+                        &certificate_paths,
+                        encoding,
+                        &mut certificate_budget,
+                    )?;
+                    ensure_leaf_certificate_matches_rsa_key(&certificates[0], &private_key)?;
                 }
                 Ok::<_, CommandError>(RecipientPrivateKey {
-                    inner: PrivateKeyDecryptor::new(key_material::load_rsa_private(
-                        path,
-                        private_key_format(option),
-                    )?),
+                    inner: PrivateKeyDecryptor::new(private_key),
                     key_name: option.parameter.clone(),
                 })
             })();
@@ -2502,9 +2533,16 @@ struct EncryptionTemplateMetadata {
     algorithm: DataEncryptionAlgorithm,
     encrypted_type: EncryptedDataType,
     explicit_xml_type: bool,
+    placement: EncryptionTemplatePlacement,
     has_encrypted_key_recipient: bool,
     content_key_name: Option<String>,
     recipients: Vec<EncryptionTemplateRecipient>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum EncryptionTemplatePlacement {
+    Standalone,
+    Embedded,
 }
 
 struct EncryptionTemplateRecipient {
@@ -2550,10 +2588,32 @@ fn encryption_template(
         algorithm,
         encrypted_type,
         explicit_xml_type,
+        placement: if encrypted_data == document.root_element() {
+            EncryptionTemplatePlacement::Standalone
+        } else {
+            EncryptionTemplatePlacement::Embedded
+        },
         has_encrypted_key_recipient: !recipients.is_empty(),
         content_key_name: parsed.key_name,
         recipients,
     })
+}
+
+fn ensure_leaf_certificate_matches_rsa_key(
+    certificate_der: &[u8],
+    private_key: &rsa::RsaPrivateKey,
+) -> Result<(), CommandError> {
+    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(certificate_der)
+        .map_err(|_| CommandError::Encryption("invalid X.509 certificate".into()))?;
+    let public_key = RsaPublicKey::from(private_key)
+        .to_public_key_der()
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    if certificate.public_key().raw != public_key.as_bytes() {
+        return Err(CommandError::Encryption(
+            "X.509 certificate public key does not match private key".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn encrypted_data_key_name(encrypted_data: Node<'_, '_>) -> Result<Option<String>, CommandError> {
