@@ -757,6 +757,7 @@ fn resolve_content_key_candidates(
     }
 
     let mut last_error = None;
+    let mut candidates = Vec::new();
     for encrypted_key in &encrypted.encrypted_keys {
         if !encrypted_key_applies_to_data(encrypted_key, encrypted) {
             continue;
@@ -772,12 +773,15 @@ fn resolve_content_key_candidates(
             Some(encrypted_key),
             &mut budget,
         ) {
-            Ok(keys) if !keys.is_empty() => return Ok(keys),
-            Ok(_) => {}
+            Ok(keys) => candidates.extend(keys),
             Err(error) => last_error = Some(error),
         }
     }
-    Err(last_error.unwrap_or(XmlEncError::KeyNotFound))
+    if candidates.is_empty() {
+        Err(last_error.unwrap_or(XmlEncError::KeyNotFound))
+    } else {
+        Ok(candidates)
+    }
 }
 
 fn resolve_candidates_with_budget(
@@ -1182,6 +1186,37 @@ mod tests {
     struct AssociationRecordingResolver {
         visited: RefCell<Vec<String>>,
         key: Vec<u8>,
+    }
+
+    struct OrderedRecipientResolver {
+        wrong: Vec<u8>,
+        correct: Vec<u8>,
+    }
+
+    impl DecryptionKeyResolver for OrderedRecipientResolver {
+        fn resolve_key(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            _encrypted_key: Option<&EncryptedKey>,
+        ) -> Result<Vec<u8>, XmlEncError> {
+            Err(XmlEncError::KeyNotFound)
+        }
+
+        fn resolve_key_candidates(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+            budget: &mut DecryptionCandidateBudget,
+        ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+            budget.consume(1, "decryption key candidates")?;
+            match encrypted_key.and_then(|key| key.id.as_deref()) {
+                Some("first") => Ok(vec![self.wrong.clone()]),
+                Some("second") => Ok(vec![self.correct.clone()]),
+                _ => Err(XmlEncError::KeyNotFound),
+            }
+        }
     }
 
     impl DecryptionKeyResolver for CandidateResolver {
@@ -1799,6 +1834,30 @@ mod tests {
             resolver.attempts.get(),
             crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING
         );
+    }
+
+    #[test]
+    fn authenticated_decryption_continues_after_wrong_unwrapped_recipient_key() {
+        // A same-width key can unwrap successfully yet fail GCM authentication;
+        // later applicable recipients must remain available to the data cipher.
+        let correct = vec![0x53_u8; 16];
+        let encrypted = encrypted_data_with_recipients(
+            &correct,
+            vec![
+                associated_encrypted_key("first", None, None),
+                associated_encrypted_key("second", None, None),
+            ],
+            None,
+        );
+        let resolver = OrderedRecipientResolver {
+            wrong: vec![0x11_u8; 16],
+            correct,
+        };
+
+        let plaintext = DecryptContext::new(&resolver)
+            .decrypt_data(&encrypted)
+            .expect("the second recipient key must authenticate");
+        assert_eq!(plaintext, DecryptedContent::Bytes(b"payload".to_vec()));
     }
 
     #[test]

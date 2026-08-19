@@ -931,13 +931,19 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
                 load_explicit_certificate_key_info(option, &mut certificate_budget)
                     .map(ExplicitVerificationCandidate::Certificate)
             } else {
-                key_material::load_verification_key(
-                    option.value.as_deref().unwrap_or_default(),
-                    public_key_encoding(option),
-                    algorithm,
-                )
-                .map_err(CommandError::from)
-                .map(ExplicitVerificationCandidate::Direct)
+                (|| {
+                    let path = Path::new(option.value.as_deref().unwrap_or_default());
+                    let bytes = key_material::read(path)?;
+                    certificate_budget.charge(bytes.len())?;
+                    key_material::decode_verification_key(
+                        path,
+                        &bytes,
+                        public_key_encoding(option),
+                        algorithm,
+                    )
+                    .map_err(CommandError::from)
+                    .map(ExplicitVerificationCandidate::Direct)
+                })()
             };
             match candidate {
                 Ok(candidate) => candidates.push(candidate),
@@ -1219,6 +1225,15 @@ impl KeyResolver for CandidateVerificationResolver {
         policy: &VerificationPolicy,
         provider: &dyn CryptoProvider,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
+        if self.candidates.len() > policy.key_trust.max_x509_candidate_paths {
+            return Err(DsigError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimit {
+                    resource: "verification key candidates",
+                    maximum: policy.key_trust.max_x509_candidate_paths,
+                    actual: self.candidates.len(),
+                },
+            ));
+        }
         let mut certificate_policy = policy.clone();
         if !self.has_trusted_certificates {
             // A caller-pinned certificate without a separate trust anchor is
@@ -1963,10 +1978,11 @@ fn apply_encryption_template(
     let generated_data = generated_document.root_element();
     let template_cipher = required_cipher_value(template_data, "template EncryptedData")?;
     let generated_cipher = required_cipher_value(generated_data, "generated EncryptedData")?;
-    let mut replacements = vec![(
-        template_cipher.range(),
-        standalone_cipher_value(generated_cipher),
-    )];
+    let mut replacements = vec![replace_element_text(
+        template,
+        template_cipher,
+        generated_cipher.text().unwrap_or_default(),
+    )?];
     if template_data.attribute("Type").is_none()
         && let Some(generated_type) = generated_data.attribute("Type")
     {
@@ -2055,14 +2071,15 @@ fn apply_encryption_template(
                             replacements.push(replacement);
                         }
                     }
-                    replacements.extend(template_values.into_iter().zip(generated_values).map(
-                        |(template_value, generated_value)| {
-                            (
-                                template_value.range(),
-                                standalone_cipher_value(generated_value),
-                            )
-                        },
-                    ));
+                    for (template_value, generated_value) in
+                        template_values.into_iter().zip(generated_values)
+                    {
+                        replacements.push(replace_element_text(
+                            template,
+                            template_value,
+                            generated_value.text().unwrap_or_default(),
+                        )?);
+                    }
                 }
             }
         }
@@ -2165,11 +2182,36 @@ fn opening_tag_end(fragment: &str) -> Option<usize> {
     None
 }
 
-fn standalone_cipher_value(node: roxmltree::Node<'_, '_>) -> String {
-    format!(
-        "<CipherValue xmlns=\"http://www.w3.org/2001/04/xmlenc#\">{}</CipherValue>",
-        node.text().unwrap_or_default()
-    )
+fn replace_element_text(
+    source: &str,
+    node: Node<'_, '_>,
+    text: &str,
+) -> Result<(std::ops::Range<usize>, String), CommandError> {
+    let range = node.range();
+    let fragment = &source[range.clone()];
+    let opening_end = opening_tag_end(fragment)
+        .ok_or_else(|| CommandError::Encryption("template CipherValue is malformed".into()))?;
+    if fragment[..opening_end].trim_end().ends_with('/') {
+        let slash = fragment[..opening_end]
+            .rfind('/')
+            .ok_or_else(|| CommandError::Encryption("template CipherValue is malformed".into()))?;
+        let name_end = fragment[1..]
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '/' | '>'))
+            .map(|offset| offset + 1)
+            .ok_or_else(|| CommandError::Encryption("template CipherValue is malformed".into()))?;
+        let qualified_name = &fragment[1..name_end];
+        return Ok((
+            range.start + slash..range.start + opening_end + 1,
+            format!(">{text}</{qualified_name}>"),
+        ));
+    }
+    let closing = fragment
+        .rfind("</")
+        .ok_or_else(|| CommandError::Encryption("template CipherValue is malformed".into()))?;
+    Ok((
+        range.start + opening_end + 1..range.start + closing,
+        text.into(),
+    ))
 }
 
 fn standalone_element(source: &str, node: roxmltree::Node<'_, '_>) -> Result<String, CommandError> {
@@ -2405,7 +2447,13 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             let loaded = (|| {
                 let (path, certificate_paths) =
                     split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
-                let private_key = key_material::load_rsa_private(path, private_key_format(option))?;
+                let bytes = key_material::read(path)?;
+                certificate_budget.charge(bytes.len())?;
+                let private_key = key_material::decode_rsa_private(
+                    Path::new(path),
+                    &bytes,
+                    private_key_format(option),
+                )?;
                 if !certificate_paths.is_empty() {
                     let encoding = if matches!(
                         private_key_format(option),
@@ -3102,6 +3150,46 @@ mod tests {
     }
 
     #[test]
+    fn verification_candidate_collection_obeys_trust_budget() {
+        // Lax lookup must not turn caller-provided key files into unbounded
+        // public-key verification attempts.
+        let candidate = VerificationKey {
+            algorithm: SignatureAlgorithm::RsaSha256,
+            public_key_bytes: Vec::new(),
+            certificate_der: None,
+            name: None,
+        };
+        let mut policy = VerificationPolicy::default();
+        policy.key_trust.max_x509_candidate_paths = 1;
+        let resolver = CandidateVerificationResolver::new(
+            vec![
+                ExplicitVerificationCandidate::Direct(candidate.clone()),
+                ExplicitVerificationCandidate::Direct(candidate),
+            ],
+            ConfiguredCertificates::default(),
+            true,
+        );
+
+        let error = match resolver.resolve_with_policy_and_provider(
+            None,
+            SignatureAlgorithm::RsaSha256,
+            &policy,
+            default_provider(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("candidate count above policy must fail closed"),
+        };
+        assert!(matches!(
+            error,
+            DsigError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "verification key candidates",
+                maximum: 1,
+                actual: 2,
+            })
+        ));
+    }
+
+    #[test]
     fn capability_checks_reject_unknown_names() {
         let mut output = Vec::new();
         assert!(
@@ -3333,6 +3421,40 @@ mod tests {
             .filter_map(|node| node.text())
             .collect::<Vec<_>>();
         assert_eq!(values, ["a2V5", "ZGF0YQ=="]);
+    }
+
+    #[test]
+    fn encryption_template_preserves_cipher_value_metadata() {
+        // CipherValue is caller-owned: replacing ciphertext must preserve its
+        // prefixes, namespace declarations, and extension attributes.
+        let template = format!(
+            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\" xmlns:x=\"urn:ext\"><s:KeyInfo><e:EncryptedKey><e:CipherData><e:CipherValue x:kind=\"wrapped\">old</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue x:kind=\"content\"/></e:CipherData></e:EncryptedData>"
+        );
+        let generated = format!(
+            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><e:EncryptedKey><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
+        );
+
+        let rendered = apply_encryption_template(
+            &template,
+            &generated,
+            None,
+            &[],
+            &EncryptionPolicy::default(),
+        )
+        .expect("CipherValue payload replacement must preserve template metadata");
+        let document = Document::parse(&rendered).unwrap();
+        let values = document
+            .descendants()
+            .filter(|node| node.has_tag_name((XMLENC_NS, "CipherValue")))
+            .map(|node| (node.attribute(("urn:ext", "kind")), node.text()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                (Some("wrapped"), Some("a2V5")),
+                (Some("content"), Some("ZGF0YQ=="))
+            ]
+        );
     }
 
     #[test]

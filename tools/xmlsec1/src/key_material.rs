@@ -290,6 +290,7 @@ fn normalize_rsa_signing_key(
         .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
 }
 
+#[cfg(test)]
 pub fn load_verification_key(
     path: impl AsRef<Path>,
     encoding: PublicKeyEncoding,
@@ -297,9 +298,20 @@ pub fn load_verification_key(
 ) -> Result<VerificationKey, KeyMaterialError> {
     let path = path.as_ref();
     let bytes = read(path)?;
+    decode_verification_key(path, &bytes, encoding, algorithm)
+}
+
+/// Decode caller-owned verification key bytes after the operation layer has
+/// charged their source length to its aggregate external-material budget.
+pub fn decode_verification_key(
+    path: &Path,
+    bytes: &[u8],
+    encoding: PublicKeyEncoding,
+    algorithm: SignatureAlgorithm,
+) -> Result<VerificationKey, KeyMaterialError> {
     let public_key_bytes = match encoding {
         PublicKeyEncoding::Pem => {
-            let text = std::str::from_utf8(&bytes)
+            let text = std::str::from_utf8(bytes)
                 .map_err(|_| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))?;
             parse_pem(text, "PUBLIC KEY", path).or_else(|_| {
                 RsaPublicKey::from_pkcs1_pem(text)
@@ -309,8 +321,8 @@ pub fn load_verification_key(
                     .ok_or_else(|| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))
             })?
         }
-        PublicKeyEncoding::Der if valid_spki(&bytes) => bytes,
-        PublicKeyEncoding::Der => RsaPublicKey::from_pkcs1_der(&bytes)
+        PublicKeyEncoding::Der if valid_spki(bytes) => bytes.to_vec(),
+        PublicKeyEncoding::Der => RsaPublicKey::from_pkcs1_der(bytes)
             .ok()
             .and_then(|key| key.to_public_key_der().ok())
             .map(|der| der.as_bytes().to_vec())
@@ -364,25 +376,36 @@ fn parse_pem(text: &str, expected_label: &str, path: &Path) -> Result<Vec<u8>, K
     Ok(pem.contents)
 }
 
+#[cfg(test)]
 pub fn load_rsa_private(
     path: impl AsRef<Path>,
     format: PrivateKeyFormat,
 ) -> Result<RsaPrivateKey, KeyMaterialError> {
     let path = path.as_ref();
     let bytes = read(path)?;
+    decode_rsa_private(path, &bytes, format)
+}
+
+/// Decode caller-owned RSA private-key bytes after the operation layer has
+/// charged their source length to its aggregate external-material budget.
+pub fn decode_rsa_private(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+) -> Result<RsaPrivateKey, KeyMaterialError> {
     match format {
-        PrivateKeyFormat::Pem => std::str::from_utf8(&bytes).ok().and_then(|text| {
+        PrivateKeyFormat::Pem => std::str::from_utf8(bytes).ok().and_then(|text| {
             RsaPrivateKey::from_pkcs8_pem(text)
                 .or_else(|_| RsaPrivateKey::from_pkcs1_pem(text))
                 .ok()
         }),
-        PrivateKeyFormat::Der => RsaPrivateKey::from_pkcs8_der(&bytes)
-            .or_else(|_| RsaPrivateKey::from_pkcs1_der(&bytes))
+        PrivateKeyFormat::Der => RsaPrivateKey::from_pkcs8_der(bytes)
+            .or_else(|_| RsaPrivateKey::from_pkcs1_der(bytes))
             .ok(),
-        PrivateKeyFormat::Pkcs8Pem => std::str::from_utf8(&bytes)
+        PrivateKeyFormat::Pkcs8Pem => std::str::from_utf8(bytes)
             .ok()
             .and_then(|text| RsaPrivateKey::from_pkcs8_pem(text).ok()),
-        PrivateKeyFormat::Pkcs8Der => RsaPrivateKey::from_pkcs8_der(&bytes).ok(),
+        PrivateKeyFormat::Pkcs8Der => RsaPrivateKey::from_pkcs8_der(bytes).ok(),
     }
     .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
 }
