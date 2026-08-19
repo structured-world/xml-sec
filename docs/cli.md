@@ -42,6 +42,9 @@ standalone XML or binary payload while diagnostics are enabled.
 fixed RustCrypto provider has no process-global OpenSSL error queue, so the flag
 does not add a second diagnostic stream beyond the operation error already
 reported by the CLI.
+`--verbose` is likewise accepted so unmodified donor runners can invoke the
+binary, but libxmlsec1's flag-controlled detailed error mode is not implemented
+yet and remains classified as planned compatibility work.
 PEM, DER, and PKCS#8 key and certificate options enforce the encoding and
 container named by the selected option; the CLI does not guess another format
 when decoding fails.

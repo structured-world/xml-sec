@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -30,8 +30,8 @@ use xml_sec::{
         DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
         EncryptedDataBuilder, EncryptedDataType, EncryptedKey, EncryptionMethod,
         EncryptionRecipient, KeyTransportAlgorithm, OaepDigestAlgorithm, PrivateKeyDecryptor,
-        RsaOaepParameters, SymmetricKeyDecryptor, XmlEncError,
-        parse_encrypted_data_template_node_with_policy, validate_rsa_recipient_key,
+        RsaOaepParameters, XmlEncError, parse_encrypted_data_template_node_with_policy,
+        validate_rsa_recipient_key,
     },
 };
 
@@ -1437,6 +1437,9 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         };
         let lax_key_search = invocation.flag("lax-key-search");
         let mut available_public_keys = public_keys.clone();
+        let mut loaded_public_keys = HashMap::new();
+        let mut certificate_budget =
+            CertificateBudget::new(policy.resources.max_external_resource_total_bytes);
         let mut selected_recipients = Vec::with_capacity(template_recipients.len());
         let recipient_metadata = recipient_key_metadata(
             &template,
@@ -1463,26 +1466,14 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             let mut selected = None;
             let mut last_error: Option<CommandError> = None;
             for (option, certificate) in candidates {
-                let path = option.value.as_deref().unwrap_or_default();
-                let loaded = if certificate {
-                    key_material::load_rsa_certificate_public(path, certificate_encoding(option))
-                        .map(
-                            |(public_key, certificate_der)| RecipientPublicKeyCandidate {
-                                public_key,
-                                certificate_der: Some(certificate_der),
-                            },
-                        )
-                } else {
-                    key_material::load_rsa_public(path, public_key_encoding(option)).map(
-                        |public_key| RecipientPublicKeyCandidate {
-                            public_key,
-                            certificate_der: None,
-                        },
-                    )
-                };
-                match loaded.map_err(CommandError::from).and_then(|key| {
-                    validate_rsa_recipient_key(&key.public_key, &policy)
-                        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+                match cached_rsa_recipient_candidate(
+                    &mut loaded_public_keys,
+                    option,
+                    certificate,
+                    &policy,
+                    &mut certificate_budget,
+                )
+                .and_then(|key| {
                     validate_recipient_key_metadata(metadata.as_ref(), &key)?;
                     Ok(key)
                 }) {
@@ -1658,9 +1649,75 @@ fn write_debug_transform(
     writeln!(stdout, "</{container}>").map_err(stdout_error)
 }
 
+#[derive(Clone, Debug)]
 struct RecipientPublicKeyCandidate {
     public_key: RsaPublicKey,
     certificate_der: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy)]
+enum RecipientPublicKeySource {
+    Public(key_material::PublicKeyEncoding),
+    Certificate(key_material::CertificateEncoding),
+}
+
+fn load_rsa_recipient_candidate(
+    path: &OsStr,
+    source: RecipientPublicKeySource,
+    policy: &EncryptionPolicy,
+    certificate_budget: &mut CertificateBudget,
+) -> Result<RecipientPublicKeyCandidate, CommandError> {
+    let candidate = match source {
+        RecipientPublicKeySource::Public(encoding) => RecipientPublicKeyCandidate {
+            public_key: key_material::load_rsa_public(path, encoding)?,
+            certificate_der: None,
+        },
+        RecipientPublicKeySource::Certificate(encoding) => {
+            let (public_key, certificate_der) =
+                key_material::load_rsa_certificate_public(path, encoding)?;
+            certificate_budget.charge(certificate_der.len())?;
+            RecipientPublicKeyCandidate {
+                public_key,
+                certificate_der: Some(certificate_der),
+            }
+        }
+    };
+    validate_rsa_recipient_key(&candidate.public_key, policy)
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    Ok(candidate)
+}
+
+fn cached_rsa_recipient_candidate(
+    cache: &mut HashMap<*const crate::OptionValue, Result<RecipientPublicKeyCandidate, String>>,
+    option: &crate::OptionValue,
+    certificate: bool,
+    policy: &EncryptionPolicy,
+    certificate_budget: &mut CertificateBudget,
+) -> Result<RecipientPublicKeyCandidate, CommandError> {
+    let identity = std::ptr::from_ref(option);
+    if let Some(cached) = cache.get(&identity) {
+        return cached.clone().map_err(CommandError::Encryption);
+    }
+    let source = if certificate {
+        RecipientPublicKeySource::Certificate(certificate_encoding(option))
+    } else {
+        RecipientPublicKeySource::Public(public_key_encoding(option))
+    };
+    match load_rsa_recipient_candidate(
+        option.value.as_deref().unwrap_or_default(),
+        source,
+        policy,
+        certificate_budget,
+    ) {
+        Ok(candidate) => {
+            cache.insert(identity, Ok(candidate.clone()));
+            Ok(candidate)
+        }
+        Err(error) => {
+            cache.insert(identity, Err(error.to_string()));
+            Err(error)
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2302,33 +2359,28 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             true,
             "AES key",
         )?;
-        let mut decrypted = None;
+        let lax_key_search = invocation.flag("lax-key-search");
+        let mut keys = Vec::with_capacity(candidates.len());
         let mut last_error = None;
         for (option, ()) in candidates {
-            let attempt =
-                key_material::load_symmetric(option.value.as_deref().unwrap_or_default(), None)
-                    .map_err(CommandError::from)
-                    .and_then(|key| {
-                        decrypt_input(
-                            &SymmetricKeyDecryptor::new(key),
-                            &xml,
-                            encrypted_data_id,
-                            standalone,
-                            policy.clone(),
-                            &id_attributes,
-                        )
-                    });
-            match attempt {
-                Ok(bytes) => {
-                    decrypted = Some(bytes);
-                    break;
-                }
-                Err(error) => last_error = Some(error),
+            match key_material::load_symmetric(option.value.as_deref().unwrap_or_default(), None) {
+                Ok(key) => keys.push(key),
+                Err(error) if lax_key_search => last_error = Some(CommandError::from(error)),
+                Err(error) => return Err(error.into()),
             }
         }
-        decrypted.ok_or_else(|| {
-            last_error.unwrap_or_else(|| CommandError::Usage("no compatible AES key input".into()))
-        })?
+        if keys.is_empty() {
+            return Err(last_error
+                .unwrap_or_else(|| CommandError::Usage("no compatible AES key input".into())));
+        }
+        decrypt_input(
+            &CandidateSymmetricKeyDecryptor { keys },
+            &xml,
+            encrypted_data_id,
+            standalone,
+            policy,
+            &id_attributes,
+        )?
     } else if !private_keys.is_empty() {
         let selected = select_recipient_private_keys(
             &private_keys,
@@ -2470,6 +2522,34 @@ fn write_decryption_diagnostics(
 struct RecipientPrivateKey {
     inner: PrivateKeyDecryptor,
     key_name: Option<String>,
+}
+
+struct CandidateSymmetricKeyDecryptor {
+    keys: Vec<Vec<u8>>,
+}
+
+impl DecryptionKeyResolver for CandidateSymmetricKeyDecryptor {
+    fn resolve_key(
+        &self,
+        _provider: &dyn CryptoProvider,
+        _algorithm: DataEncryptionAlgorithm,
+        _encrypted_key: Option<&EncryptedKey>,
+    ) -> Result<Vec<u8>, XmlEncError> {
+        self.keys.first().cloned().ok_or(XmlEncError::KeyNotFound)
+    }
+
+    fn resolve_key_candidates(
+        &self,
+        _provider: &dyn CryptoProvider,
+        _algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+    ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+        if encrypted_key.is_none() {
+            Ok(self.keys.clone())
+        } else {
+            Err(XmlEncError::KeyNotFound)
+        }
+    }
 }
 
 struct NamedRecipientDecryptor {
@@ -3336,6 +3416,73 @@ mod tests {
             Err(CommandError::CertificateMaterialTooLarge { maximum: 3 })
         ));
         assert_eq!(budget.total_bytes, 2);
+    }
+
+    #[test]
+    fn recipient_certificate_loader_charges_the_invocation_budget() {
+        // Recipient certificates are external inputs even when used only to
+        // extract an RSA wrapping key, so they share the operation-wide budget.
+        let certificate = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let mut budget = CertificateBudget::new(1);
+
+        let error = load_rsa_recipient_candidate(
+            certificate.as_os_str(),
+            RecipientPublicKeySource::Certificate(key_material::CertificateEncoding::Pem),
+            &EncryptionPolicy::default(),
+            &mut budget,
+        )
+        .expect_err("certificate DER must exceed the one-byte aggregate budget");
+
+        assert!(matches!(
+            error,
+            CommandError::CertificateMaterialTooLarge { maximum: 1 }
+        ));
+    }
+
+    #[test]
+    fn recipient_certificate_cache_reuses_one_budget_charge() {
+        // Repeated recipient selection may reuse one CLI option, but external
+        // certificate bytes belong to the invocation and are charged once.
+        let certificate = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+        let der = key_material::load_certificate(
+            certificate.as_os_str(),
+            key_material::CertificateEncoding::Pem,
+        )
+        .unwrap();
+        let invocation = Invocation::parse(
+            [
+                OsString::from("xmlsec1"),
+                OsString::from("encrypt"),
+                OsString::from("--pubkey-cert-pem"),
+                certificate.as_os_str().to_owned(),
+                OsString::from("--binary-data"),
+                OsString::from("payload.bin"),
+                OsString::from("template.xml"),
+            ],
+        )
+        .unwrap();
+        let option = invocation.values("pubkey-cert-pem").next().unwrap();
+        let mut cache = HashMap::new();
+        let mut budget = CertificateBudget::new(der.len());
+
+        cached_rsa_recipient_candidate(
+            &mut cache,
+            option,
+            true,
+            &EncryptionPolicy::default(),
+            &mut budget,
+        )
+        .unwrap();
+        cached_rsa_recipient_candidate(
+            &mut cache,
+            option,
+            true,
+            &EncryptionPolicy::default(),
+            &mut budget,
+        )
+        .expect("cached selection must not charge the certificate twice");
     }
 
     #[test]

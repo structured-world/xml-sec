@@ -30,6 +30,21 @@ pub trait DecryptionKeyResolver {
         algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
     ) -> Result<Vec<u8>, XmlEncError>;
+
+    /// Resolve ordered candidate keys for one prepared decryption operation.
+    ///
+    /// The default preserves single-key resolver behavior. Key rings override
+    /// this method so parsing, policy validation, and ciphertext decoding occur
+    /// once while only authenticated primitive decryption is retried.
+    fn resolve_key_candidates(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+    ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+        self.resolve_key(provider, algorithm, encrypted_key)
+            .map(|key| vec![key])
+    }
 }
 
 /// XML parser controls for caller-owned document decryption.
@@ -89,6 +104,16 @@ impl<'a> DecryptContext<'a> {
 
     /// Decrypt an already parsed `EncryptedData` value.
     pub fn decrypt_data(&self, encrypted: &EncryptedData) -> Result<DecryptedContent, XmlEncError> {
+        self.decrypt_data_candidates(encrypted)?
+            .into_iter()
+            .next()
+            .ok_or(XmlEncError::KeyNotFound)
+    }
+
+    fn decrypt_data_candidates(
+        &self,
+        encrypted: &EncryptedData,
+    ) -> Result<Vec<DecryptedContent>, XmlEncError> {
         self.policy.resources.validate()?;
         validate_encrypted_data_metadata(encrypted, &self.policy)?;
         encrypted.encryption_method.validate_structure()?;
@@ -129,29 +154,47 @@ impl<'a> DecryptContext<'a> {
             ciphertext.len(),
             self.policy.resources.max_encryption_plaintext_bytes,
         )?;
-        let key = resolve_content_key(
+        let keys = resolve_content_key_candidates(
             self.provider,
             algorithm,
             &encrypted.encrypted_keys,
             self.resolver,
             &self.policy,
         )?;
-        validate_key_len(algorithm, &key)?;
-        let plaintext = self
-            .provider
-            .decrypt_data(algorithm, &key, &ciphertext)
-            .map_err(|error| map_data_decryption_error(algorithm, ciphertext.len(), error))?;
-        validate_provider_plaintext_len(algorithm, ciphertext.len(), plaintext.len())?;
-        validate_plaintext_len(
-            plaintext.len(),
-            self.policy.resources.max_encryption_plaintext_bytes,
-        )?;
-        match encrypted.encrypted_type.as_ref() {
-            Some(EncryptedDataType::Element | EncryptedDataType::Content) => {
-                Ok(DecryptedContent::Xml(String::from_utf8(plaintext)?))
+        let mut decrypted = Vec::new();
+        let mut last_error = None;
+        for key in keys {
+            let attempt = (|| {
+                validate_key_len(algorithm, &key)?;
+                let plaintext = self
+                    .provider
+                    .decrypt_data(algorithm, &key, &ciphertext)
+                    .map_err(|error| {
+                        map_data_decryption_error(algorithm, ciphertext.len(), error)
+                    })?;
+                validate_provider_plaintext_len(algorithm, ciphertext.len(), plaintext.len())?;
+                validate_plaintext_len(
+                    plaintext.len(),
+                    self.policy.resources.max_encryption_plaintext_bytes,
+                )?;
+                match encrypted.encrypted_type.as_ref() {
+                    Some(EncryptedDataType::Element | EncryptedDataType::Content) => {
+                        Ok(DecryptedContent::Xml(String::from_utf8(plaintext)?))
+                    }
+                    Some(EncryptedDataType::Other(_)) | None => {
+                        Ok(DecryptedContent::Bytes(plaintext))
+                    }
+                }
+            })();
+            match attempt {
+                Ok(content) => decrypted.push(content),
+                Err(error) => last_error = Some(error),
             }
-            Some(EncryptedDataType::Other(_)) | None => Ok(DecryptedContent::Bytes(plaintext)),
         }
+        if decrypted.is_empty() {
+            return Err(last_error.unwrap_or(XmlEncError::KeyNotFound));
+        }
+        Ok(decrypted)
     }
 
     /// Decrypt and replace one selected `EncryptedData` in a caller-owned document.
@@ -493,26 +536,49 @@ fn decrypt_document_with_context(
 
     let range = selected.range();
     let encrypted = parse_encrypted_data_node_with_policy(selected, &context.policy)?;
-    let DecryptedContent::Xml(plaintext) = context.decrypt_data(&encrypted)? else {
+    let candidates = context.decrypt_data_candidates(&encrypted)?;
+    let mut last_error = None;
+    for candidate in candidates {
+        match replace_decrypted_content(
+            xml,
+            range.clone(),
+            candidate,
+            encrypted.encrypted_type.as_ref(),
+            &context.policy,
+        ) {
+            Ok(output) => return Ok(output),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or(XmlEncError::KeyNotFound))
+}
+
+fn replace_decrypted_content(
+    xml: &str,
+    range: std::ops::Range<usize>,
+    content: DecryptedContent,
+    encrypted_type: Option<&EncryptedDataType>,
+    policy: &crate::policy::DecryptionPolicy,
+) -> Result<String, XmlEncError> {
+    let DecryptedContent::Xml(plaintext) = content else {
         return Err(XmlEncError::ReplacementRequiresXml);
     };
-
     let output_len = xml.len() - range.len() + plaintext.len();
-    validate_encryption_document_len(output_len, &context.policy)?;
+    validate_encryption_document_len(output_len, policy)?;
     validate_plaintext_fragment(
         xml,
         range.start,
         range.end,
         &plaintext,
-        encrypted.encrypted_type.as_ref(),
-        &context.policy,
+        encrypted_type,
+        policy,
     )?;
 
     let mut output = String::with_capacity(output_len);
     output.push_str(&xml[..range.start]);
     output.push_str(&plaintext);
     output.push_str(&xml[range.end..]);
-    let _ = Document::parse_with_options(&output, parsing_options())?;
+    let _ = Document::parse_with_options(&output, decryption_parsing_options(policy))?;
     Ok(output)
 }
 
@@ -622,15 +688,16 @@ pub fn decrypt_data(
     DecryptContext::new(resolver).decrypt_data(encrypted)
 }
 
-fn resolve_content_key(
+fn resolve_content_key_candidates(
     provider: &dyn crate::provider::CryptoProvider,
     algorithm: DataEncryptionAlgorithm,
     encrypted_keys: &[EncryptedKey],
     resolver: &dyn DecryptionKeyResolver,
     policy: &crate::policy::DecryptionPolicy,
-) -> Result<Vec<u8>, XmlEncError> {
-    match resolver.resolve_key(provider, algorithm, None) {
-        Ok(key) => return Ok(key),
+) -> Result<Vec<Vec<u8>>, XmlEncError> {
+    match resolver.resolve_key_candidates(provider, algorithm, None) {
+        Ok(keys) if !keys.is_empty() => return Ok(keys),
+        Ok(_) => {}
         Err(XmlEncError::KeyNotFound) => {}
         Err(error) => return Err(error),
     }
@@ -641,8 +708,9 @@ fn resolve_content_key(
             last_error = Some(error);
             continue;
         }
-        match resolver.resolve_key(provider, algorithm, Some(encrypted_key)) {
-            Ok(key) => return Ok(key),
+        match resolver.resolve_key_candidates(provider, algorithm, Some(encrypted_key)) {
+            Ok(keys) if !keys.is_empty() => return Ok(keys),
+            Ok(_) => {}
             Err(error) => last_error = Some(error),
         }
     }
@@ -936,6 +1004,7 @@ mod tests {
     use sha2::{Sha256, Sha384};
 
     use super::*;
+    use crate::xmlenc::{CipherData, EncryptionMethod};
 
     struct RecipientKeyResolver {
         recipient: &'static str,
@@ -950,6 +1019,34 @@ mod tests {
     struct AllCallsResolver {
         calls: Cell<usize>,
         key: Vec<u8>,
+    }
+
+    struct CandidateResolver {
+        keys: Vec<Vec<u8>>,
+    }
+
+    impl DecryptionKeyResolver for CandidateResolver {
+        fn resolve_key(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            _encrypted_key: Option<&EncryptedKey>,
+        ) -> Result<Vec<u8>, XmlEncError> {
+            Err(XmlEncError::KeyNotFound)
+        }
+
+        fn resolve_key_candidates(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+        ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+            if encrypted_key.is_none() {
+                Ok(self.keys.clone())
+            } else {
+                Err(XmlEncError::KeyNotFound)
+            }
+        }
     }
 
     #[derive(Debug, Default)]
@@ -1166,6 +1263,49 @@ mod tests {
             decrypt(&tampered, &SymmetricKeyDecryptor::new(key)),
             Err(XmlEncError::AeadAuthenticationFailed)
         ));
+    }
+
+    #[test]
+    fn candidate_keys_retry_only_authenticated_decryption() {
+        // Candidate selection belongs inside one prepared decryption operation:
+        // structural validation and ciphertext decoding must not be repeated.
+        let key = [7_u8; 16];
+        let nonce = [9_u8; 12];
+        let mut ciphertext = b"candidate plaintext".to_vec();
+        Aes128Gcm::new_from_slice(&key)
+            .expect("fixed key length")
+            .encrypt_in_place(&nonce.into(), b"", &mut ciphertext)
+            .expect("test encryption must succeed");
+        let mut wire = nonce.to_vec();
+        wire.extend_from_slice(&ciphertext);
+        let encrypted = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            encryption_method: EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            key_name: None,
+            encrypted_keys: Vec::new(),
+            cipher_data: CipherData {
+                value: STANDARD.encode(wire),
+            },
+        };
+        let resolver = CandidateResolver {
+            keys: vec![vec![1_u8; 16], key.to_vec()],
+        };
+
+        let decrypted = DecryptContext::new(&resolver)
+            .decrypt_data(&encrypted)
+            .expect("a later authenticated candidate must decrypt");
+
+        assert_eq!(
+            decrypted,
+            DecryptedContent::Bytes(b"candidate plaintext".to_vec())
+        );
     }
 
     #[test]

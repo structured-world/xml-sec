@@ -165,7 +165,7 @@ fn complete_surface_categories_are_stable() {
         "https://github.com/lsh123/xmlsec"
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
-    assert_eq!(ledger.classifications.len(), 17);
+    assert_eq!(ledger.classifications.len(), 18);
     assert_eq!(ledger.availability.len(), 427);
 
     let counts = ledger
@@ -812,7 +812,6 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
         "output",
         "print-debug",
         "print-xml-debug",
-        "verbose",
         "verify-crls",
         "xml-data",
     ]);
@@ -836,6 +835,12 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
         "untrusted-der",
         "untrusted-pem",
     ]);
+    let verbose = ledger
+        .items
+        .iter()
+        .find(|item| item.kind == "cli-option" && item.name == "--verbose")
+        .expect("donor ledger must inventory --verbose");
+    assert_eq!(classification(&ledger, verbose).outcome, "planned");
     let runtime_options: BTreeSet<_> = cli_args::OPTION_SPECS
         .iter()
         .map(|spec| spec.canonical)

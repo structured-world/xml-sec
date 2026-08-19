@@ -122,9 +122,17 @@
       "evidence": "native-cli-tests"
     },
     {
+      "id": "planned-cli-verbose",
+      "kinds": ["cli-option"],
+      "name_regex": "^--verbose$",
+      "outcome": "planned",
+      "rationale": "The native CLI accepts this donor runner argument, but does not yet implement libxmlsec1's flag-controlled detailed error mode.",
+      "evidence": "planned-surface"
+    },
+    {
       "id": "native-cli-behavior-options",
       "kinds": ["cli-option"],
-      "name_regex": "^--(?:add-id-attr|binary-data|help|id-attr|ignore-manifests|insecure|lax-key-search|node-id|output|print-debug|print-xml-debug|verbose|verify-crls|xml-data)$",
+      "name_regex": "^--(?:add-id-attr|binary-data|help|id-attr|ignore-manifests|insecure|lax-key-search|node-id|output|print-debug|print-xml-debug|verify-crls|xml-data)$",
       "outcome": "behavior-compatible",
       "rationale": "The native CLI implements this provider-independent option with donor-compatible parsing and command behavior.",
       "evidence": "native-cli-tests"

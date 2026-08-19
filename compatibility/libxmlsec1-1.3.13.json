@@ -101,6 +101,11 @@
       "rationale": "This libxmlsec1 option or special status behavior is inventoried but is not yet reproduced by the native CLI.",
       "evidence": "planned-surface"
     },
+    "planned-cli-verbose": {
+      "outcome": "planned",
+      "rationale": "The native CLI accepts this donor runner argument, but does not yet implement libxmlsec1's flag-controlled detailed error mode.",
+      "evidence": "planned-surface"
+    },
     "planned-donor-families": {
       "outcome": "planned",
       "rationale": "The upstream family is tracked as a parity target; individual covered vectors are recorded by native interoperability tests rather than claiming the whole family.",
@@ -22357,7 +22362,7 @@
       "source": "apps/xmlsec.c",
       "line": 237,
       "detail": "static xmlSecAppCmdLineParam verboseParam = { xmlSecAppCmdLineTopicGeneral, \"--verbose\", NULL, \"--verbose\" \"\\n\\tprint detailed error messages\", xmlSecAppCmdLineParamTypeFlag, xmlSecAppCmdLineParamFlagNone, NULL };",
-      "classification": "native-cli-behavior-options"
+      "classification": "planned-cli-verbose"
     },
     {
       "kind": "cli-option",
