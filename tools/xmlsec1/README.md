@@ -23,7 +23,8 @@ diagnostics follow transformed data on stdout when `--output` is absent;
 selecting `--output` routes the data to a file and leaves diagnostics on stdout.
 Verification has no transformed document, so `verify --output` is reported as
 recognized but inapplicable rather than as malformed command syntax. XML inputs
-accept UTF-8 and BOM-marked UTF-16LE/BE.
+accept UTF-8 and BOM-marked UTF-16LE/BE; transcoded declarations are emitted as
+UTF-8 so the declaration remains consistent with output bytes.
 
 ## Keys and certificates
 

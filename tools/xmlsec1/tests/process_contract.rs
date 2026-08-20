@@ -1200,13 +1200,25 @@ fn signing_accepts_utf16_xml_and_rejects_malformed_code_units() {
     )
     .unwrap();
     let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
-    for (name, bom, encode) in [
-        ("le", [0xff, 0xfe], u16::to_le_bytes as fn(u16) -> [u8; 2]),
-        ("be", [0xfe, 0xff], u16::to_be_bytes as fn(u16) -> [u8; 2]),
+    for (name, bom, encode, declaration) in [
+        (
+            "le",
+            [0xff, 0xfe],
+            u16::to_le_bytes as fn(u16) -> [u8; 2],
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>",
+        ),
+        (
+            "be",
+            [0xfe, 0xff],
+            u16::to_be_bytes as fn(u16) -> [u8; 2],
+            "<?xml version='1.0' encoding='utf-16'?>",
+        ),
     ] {
         let path = temp.path().join(format!("template-{name}.xml"));
         let mut bytes = bom.to_vec();
-        bytes.extend(source.encode_utf16().flat_map(encode));
+        let declaration_end = source.find("?>").expect("fixture XML declaration") + 2;
+        let encoded_source = format!("{declaration}{}", &source[declaration_end..]);
+        bytes.extend(encoded_source.encode_utf16().flat_map(encode));
         fs::write(&path, bytes).unwrap();
         let output = Command::new(binary())
             .args(["sign", "--privkey-pem"])
@@ -1219,6 +1231,12 @@ fn signing_accepts_utf16_xml_and_rejects_malformed_code_units() {
             "{name}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let signed = String::from_utf8(output.stdout).unwrap();
+        let declaration_end = signed.find("?>").expect("signed XML declaration") + 2;
+        let declaration = &signed[..declaration_end];
+        assert!(declaration.contains("UTF-8"), "{name}: {declaration}");
+        assert!(!declaration.contains("UTF-16"), "{name}: {declaration}");
+        roxmltree::Document::parse(&signed).expect("transcoded output must remain byte-parseable");
     }
 
     let malformed = temp.path().join("malformed.xml");

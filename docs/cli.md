@@ -45,6 +45,8 @@ applicable" diagnostic instead of reporting generic malformed syntax.
 compatibility no-op because signing processes only `SignedInfo` references.
 XML file and `--xml-data` inputs accept XML 1.0 UTF-8 and BOM-marked UTF-16LE or
 UTF-16BE, with resource limits charged against source bytes before decoding.
+UTF-16 declarations are normalized to UTF-8 when the decoded document is
+emitted through the Rust string-based signing or encryption pipelines.
 `--print-crypto-library-errors` is accepted for donor argv compatibility. The
 fixed RustCrypto provider has no process-global OpenSSL error queue, so the flag
 does not add a second diagnostic stream beyond the operation error already
