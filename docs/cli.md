@@ -44,7 +44,10 @@ applicable" diagnostic instead of reporting generic malformed syntax.
 Signing processes direct `<Object>/<Manifest>` references before computing
 `SignedInfo`, matching libxmlsec1 and preventing a SignedInfo digest from
 becoming stale after Manifest mutation. Nested dependencies are filled from
-leaves to dependants, and cycles fail before output. `--ignore-manifests`
+leaves to dependants using the effective XPath/XPath Filter 2.0 node-set, and
+real cycles fail before output. Verification follows valid structure-preserving
+Manifest references recursively, so every authenticated nested Manifest reports
+its own reference results. `--ignore-manifests`
 disables that work for both DSig commands and leaves signing-template Manifest
 values untouched.
 XML file and `--xml-data` inputs accept XML 1.0 UTF-8 plus BOM-marked UTF-16 or
@@ -276,6 +279,9 @@ requires metadata to select exactly one distinct key identity and rejects
 unordered distinct candidates rather than treating valid padding as proof of
 the correct key. Repeated copies of identical key bytes remain one identity,
 while every source lookup or unwrap still consumes the operation work budget.
+The CLI rejects an AES candidate ring above that same operation ceiling before
+opening any candidate file, preventing oversized lax searches from turning the
+post-load cryptographic bound into unbounded filesystem work.
 A direct `--aes-key` cannot satisfy an `EncryptedKey` recipient embedded in the
 template, so that inconsistent combination is rejected rather than preserving
 a stale wrapped key.

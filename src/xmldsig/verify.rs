@@ -1591,102 +1591,98 @@ fn process_manifest_references(
     execution: &ReferenceExecutionContext<'_>,
     xpath_parse_budget: &mut XPathSignatureParseBudget,
 ) -> Result<Vec<ReferenceResult>, SignatureVerificationPipelineError> {
-    let parsed = parse_manifest_references(
-        signature_node,
-        signed_info_reference_nodes,
-        remaining_reference_capacity,
-        xpath_parse_budget,
-    )?;
-    let manifest_references = parsed.references;
-    let mut results = parsed.invalid_results;
-    if manifest_references.is_empty() && results.is_empty() {
-        return Ok(Vec::new());
-    }
-    results.reserve(manifest_references.len());
-    for (index, reference, reference_node_id) in &manifest_references {
-        if execution.transform_budget.remaining_c14n_output() == 0 {
-            results.push(manifest_reference_invalid_result(
-                reference,
-                *index,
-                FailureReason::ReferenceProcessingFailure { ref_index: *index },
-            ));
-            continue;
+    let mut authenticated_nodes = signed_info_reference_nodes.clone();
+    let mut processed_manifests = HashSet::new();
+    let mut remaining_reference_capacity = remaining_reference_capacity;
+    let mut next_reference_index = 0usize;
+    let mut results = Vec::new();
+    loop {
+        let parsed = parse_manifest_references(
+            signature_node,
+            &authenticated_nodes,
+            &mut processed_manifests,
+            &mut remaining_reference_capacity,
+            &mut next_reference_index,
+            xpath_parse_budget,
+        )?;
+        let manifest_references = parsed.references;
+        results.extend(parsed.invalid_results);
+        if manifest_references.is_empty() {
+            break;
         }
-        if reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference {
-            results.push(manifest_reference_invalid_result(
-                reference,
-                *index,
-                FailureReason::ReferencePolicyViolation { ref_index: *index },
-            ));
-            continue;
-        }
-        if ctx
-            .policy
-            .digest_algorithms
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
-        {
-            results.push(manifest_reference_invalid_result(
-                reference,
-                *index,
-                FailureReason::ReferencePolicyViolation { ref_index: *index },
-            ));
-            continue;
-        }
-        match enforce_reference_policies(
-            std::slice::from_ref(reference),
-            ctx.policy.reference_uri_types,
-            ctx.allowed_transform_uris(),
-        ) {
-            Ok(()) => {}
-            Err(
-                SignatureVerificationPipelineError::DisallowedUri { .. }
-                | SignatureVerificationPipelineError::DisallowedTransform { .. },
-            ) => {
-                results.push(manifest_reference_invalid_result(
+        results.reserve(manifest_references.len());
+        for (index, reference, reference_node_id) in &manifest_references {
+            let result = if execution.transform_budget.remaining_c14n_output() == 0 {
+                manifest_reference_invalid_result(
+                    reference,
+                    *index,
+                    FailureReason::ReferenceProcessingFailure { ref_index: *index },
+                )
+            } else if reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference
+                || ctx
+                    .policy
+                    .digest_algorithms
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
+            {
+                manifest_reference_invalid_result(
                     reference,
                     *index,
                     FailureReason::ReferencePolicyViolation { ref_index: *index },
-                ));
-                continue;
+                )
+            } else {
+                match enforce_reference_policies(
+                    std::slice::from_ref(reference),
+                    ctx.policy.reference_uri_types,
+                    ctx.allowed_transform_uris(),
+                ) {
+                    Ok(()) => process_reference_with_options(
+                        reference,
+                        resolver,
+                        signature_node,
+                        ReferenceSet::Manifest,
+                        *index,
+                        resolver.node_for_node_id(*reference_node_id),
+                        execution,
+                    )
+                    .unwrap_or_else(|_| {
+                        manifest_reference_invalid_result(
+                            reference,
+                            *index,
+                            FailureReason::ReferenceProcessingFailure { ref_index: *index },
+                        )
+                    }),
+                    Err(
+                        SignatureVerificationPipelineError::DisallowedUri { .. }
+                        | SignatureVerificationPipelineError::DisallowedTransform { .. },
+                    ) => manifest_reference_invalid_result(
+                        reference,
+                        *index,
+                        FailureReason::ReferencePolicyViolation { ref_index: *index },
+                    ),
+                    Err(_) => manifest_reference_invalid_result(
+                        reference,
+                        *index,
+                        FailureReason::ReferenceProcessingFailure { ref_index: *index },
+                    ),
+                }
+            };
+            if result.status == DsigStatus::Valid
+                && reference
+                    .transforms
+                    .iter()
+                    .all(transform_preserves_manifest_structure)
+                && let Some(target_id) = reference
+                    .uri
+                    .as_deref()
+                    .and_then(same_document_reference_id)
+                    .and_then(|id| resolver.node_id_for_id(id))
+            {
+                // A valid Manifest digest extends trust only to the exact
+                // same-document structure preserved by its transform chain.
+                authenticated_nodes.insert(target_id);
             }
-            Err(SignatureVerificationPipelineError::Reference(
-                ReferenceProcessingError::MissingUri,
-            )) => {
-                results.push(manifest_reference_invalid_result(
-                    reference,
-                    *index,
-                    FailureReason::ReferenceProcessingFailure { ref_index: *index },
-                ));
-                continue;
-            }
-            Err(_) => {
-                // Defensive fallback for future enforce_reference_policies variants:
-                // record as non-fatal per-reference processing failure instead of aborting.
-                results.push(manifest_reference_invalid_result(
-                    reference,
-                    *index,
-                    FailureReason::ReferenceProcessingFailure { ref_index: *index },
-                ));
-                continue;
-            }
-        }
-
-        match process_reference_with_options(
-            reference,
-            resolver,
-            signature_node,
-            ReferenceSet::Manifest,
-            *index,
-            resolver.node_for_node_id(*reference_node_id),
-            execution,
-        ) {
-            Ok(result) => results.push(result),
-            Err(_) => results.push(manifest_reference_invalid_result(
-                reference,
-                *index,
-                FailureReason::ReferenceProcessingFailure { ref_index: *index },
-            )),
+            results.push(result);
         }
     }
     results.sort_by_key(|result| result.reference_index);
@@ -1713,26 +1709,29 @@ fn manifest_reference_invalid_result(
 
 fn parse_manifest_references(
     signature_node: Node<'_, '_>,
-    signed_info_reference_nodes: &HashSet<NodeId>,
-    remaining_reference_capacity: usize,
+    authenticated_nodes: &HashSet<NodeId>,
+    processed_manifests: &mut HashSet<NodeId>,
+    remaining_reference_capacity: &mut usize,
+    next_reference_index: &mut usize,
     xpath_parse_budget: &mut XPathSignatureParseBudget,
 ) -> Result<ParsedManifestReferences, SignatureVerificationPipelineError> {
     let mut references = Vec::new();
     let mut invalid = Vec::new();
-    let mut reference_index = 0usize;
     for object_node in signature_node.children().filter(|node| {
         node.is_element()
             && node.tag_name().namespace() == Some(XMLDSIG_NS)
             && node.tag_name().name() == "Object"
     }) {
-        let object_is_signed = signed_info_reference_nodes.contains(&object_node.id());
+        let object_is_signed = authenticated_nodes.contains(&object_node.id());
         for manifest_node in object_node.children().filter(|node| {
             node.is_element()
                 && node.tag_name().namespace() == Some(XMLDSIG_NS)
                 && node.tag_name().name() == "Manifest"
         }) {
-            let manifest_is_signed = signed_info_reference_nodes.contains(&manifest_node.id());
-            if !object_is_signed && !manifest_is_signed {
+            let manifest_is_signed = authenticated_nodes.contains(&manifest_node.id());
+            if (!object_is_signed && !manifest_is_signed)
+                || !processed_manifests.insert(manifest_node.id())
+            {
                 continue;
             }
             let mut manifest_children = Vec::new();
@@ -1763,11 +1762,14 @@ fn parse_manifest_references(
                         reason: "Manifest must contain only ds:Reference element children",
                     });
                 }
-                if references.len() + invalid.len() >= remaining_reference_capacity {
+                if *remaining_reference_capacity == 0 {
                     return Err(SignatureVerificationPipelineError::InvalidStructure {
                         reason: "signed Manifests exceed the per-signature Reference limit",
                     });
                 }
+                *remaining_reference_capacity -= 1;
+                let reference_index = *next_reference_index;
+                *next_reference_index += 1;
                 match parse_reference_with_xpath_budget(child, xpath_parse_budget) {
                     Ok(reference) => references.push((reference_index, reference, child.id())),
                     Err(ParseError::Transform(super::TransformError::UnsupportedTransform(_))) => {
@@ -1793,7 +1795,6 @@ fn parse_manifest_references(
                         ));
                     }
                 }
-                reference_index += 1;
             }
         }
     }
@@ -3741,11 +3742,16 @@ mod tests {
         let signature = document.root_element();
         let object = signature.children().find(|node| node.is_element()).unwrap();
         let authenticated = HashSet::from([object.id()]);
+        let mut processed = HashSet::new();
+        let mut remaining = MAX_REFERENCES_PER_SIGNATURE;
+        let mut next_index = 0;
 
         let error = match parse_manifest_references(
             signature,
             &authenticated,
-            MAX_REFERENCES_PER_SIGNATURE,
+            &mut processed,
+            &mut remaining,
+            &mut next_index,
             &mut XPathSignatureParseBudget::default(),
         ) {
             Ok(_) => panic!("unsupported references must consume the same aggregate limit"),

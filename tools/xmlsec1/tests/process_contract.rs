@@ -23,7 +23,10 @@ use xml_sec::{
         DigestAlgorithm, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
         SignatureBuilder, Transform, XPathExpression, mutation::append_signature_to_root,
     },
-    xmlenc::{DataEncryptionAlgorithm, EncryptedDataBuilder, EncryptionRecipient},
+    xmlenc::{
+        DataEncryptionAlgorithm, DecryptionCandidateBudget, EncryptedDataBuilder,
+        EncryptionRecipient,
+    },
 };
 
 fn binary() -> &'static str {
@@ -2687,6 +2690,35 @@ fn named_aes_key_ring_selects_one_key_for_encryption_and_decryption() {
         String::from_utf8_lossy(&lax_decrypt.stderr)
     );
     assert_eq!(lax_decrypt.stdout, b"selected AES key");
+}
+
+#[test]
+fn lax_aes_key_ring_is_bounded_before_filesystem_reads() {
+    // Candidate work is an operation ceiling, so oversized rings must fail
+    // before even the first attacker-selected path is opened.
+    let temp = tempfile::tempdir().unwrap();
+    let encrypted = temp.path().join("encrypted.xml");
+    fs::write(
+        &encrypted,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue>AAAAAAAAAAAAAAAAAAAAAA==</CipherValue></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    let maximum = DecryptionCandidateBudget::for_operation().remaining();
+    let mut command = Command::new(binary());
+    command.args(["decrypt", "--lax-key-search"]);
+    for index in 0..=maximum {
+        command.arg("--aes-key");
+        command.arg(temp.path().join(format!("missing-{index}.key")));
+    }
+    let output = command.arg(&encrypted).output().unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("decryption candidate limit exceeded"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("missing-0.key"), "{stderr}");
 }
 
 #[test]

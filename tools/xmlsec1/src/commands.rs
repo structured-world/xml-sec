@@ -2538,6 +2538,9 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             true,
             "AES key",
         )?;
+        DecryptionCandidateBudget::for_operation()
+            .consume(candidates.len(), "decryption key candidates")
+            .map_err(|error| CommandError::Encryption(error.to_string()))?;
         let lax_key_search = invocation.flag("lax-key-search");
         let mut keys = Vec::with_capacity(candidates.len());
         let mut last_error = None;

@@ -34,6 +34,9 @@ SignedInfo reference to the Manifest authenticates the final values; Manifest
 and SignedInfo references share transform work and the aggregate reference
 ceiling. Nested Manifest dependencies are filled from leaves to dependants so
 every digest observes finalized content; cycles are rejected before mutation.
+Dependency analysis uses the effective XPath/XPath Filter 2.0 node-set, so a
+self-reference that excludes its mutable `DigestValue` is not misclassified as
+a cycle.
 The default core policy leaves application-defined Manifest values
 untouched, while the `xmlsec1` compatibility CLI enables processing unless
 `--ignore-manifests` is present.
@@ -151,6 +154,9 @@ that the input contained no Manifest. `VerifyContext::process_manifests(false)` 
 because Manifests were not processed; core validation failures and unsigned, unreferenced, or
 structurally excluded Manifest blocks can also produce an empty list. Callers must distinguish the
 disabled state from an enabled pass with no authenticated Manifest references.
+Successful Manifest references whose transforms preserve the referenced XML structure extend the
+authenticated set recursively. A sibling Manifest reached through such a reference is processed
+once; failed digests and node-set transforms that discard structure never extend that trust frontier.
 Manifest references obey the same per-reference transform-count ceiling and transform allowlist as
 `<SignedInfo>` references; a violation is recorded in that Manifest reference's independent status.
 They also share `ResourcePolicy::max_references` with `<SignedInfo>`: every parsed Manifest

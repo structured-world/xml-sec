@@ -9,7 +9,7 @@ use base64::Engine;
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey};
-use roxmltree::{Document, Node};
+use roxmltree::{Document, Node, NodeId};
 use rsa::RsaPrivateKey;
 use rsa::pkcs1v15::Signature as RsaPkcs1v15Signature;
 use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
@@ -38,10 +38,11 @@ use super::parse::{
 use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget, TransformOptions,
     XPathHereSemantics, XPathSignatureParseBudget, execute_transforms_with_options_and_budget,
-    parse_transforms_with_budget, transform_chain_produces_binary,
+    node_set_before_binary_transform, parse_transforms_with_budget,
+    transform_chain_produces_binary,
 };
 use super::types::TransformError;
-use super::uri::{UriReferenceResolver, same_document_reference_id};
+use super::uri::UriReferenceResolver;
 use super::verify::parse_signature_children;
 
 /// Result for one computed signing-template reference digest.
@@ -1009,6 +1010,7 @@ struct SigningReference {
     transforms: Vec<Transform>,
     digest_method: DigestAlgorithm,
     digest_value_range: Range<usize>,
+    digest_value_node_id: NodeId,
 }
 
 /// Compute base64 digest values for every `<Reference>` in the signing template.
@@ -1085,8 +1087,14 @@ fn fill_manifest_reference_digest_values_with_options(
     if manifest_references.is_empty() {
         return Ok(xml.to_owned());
     }
-    let dependency_levels =
-        manifest_reference_dependency_levels(&doc, signature, &manifest_references, id_attributes)?;
+    let dependency_levels = manifest_reference_dependency_levels(
+        &doc,
+        signature,
+        &manifest_references,
+        transform_options,
+        execution_budget,
+        id_attributes,
+    )?;
     let mut filled = xml.to_owned();
     for level in dependency_levels {
         let current_doc = parse_signing_document(&filled, Some(policy))?;
@@ -1128,42 +1136,35 @@ fn manifest_reference_dependency_levels(
     doc: &Document<'_>,
     signature: Node<'_, '_>,
     references: &[SigningReference],
+    transform_options: TransformOptions,
+    execution_budget: &TransformExecutionBudget,
     id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<Vec<Vec<usize>>, SigningDigestError> {
     let resolver = UriReferenceResolver::with_id_registrations(doc, id_attributes);
     let mut dependencies = references
         .iter()
         .map(|reference| {
-            if reference.transforms.iter().any(|transform| {
-                matches!(
-                    transform,
-                    Transform::Enveloped | Transform::XpathExcludeAllSignatures
-                )
-            }) {
-                return Ok(HashSet::new());
-            }
-            let target_range = if reference.uri.is_empty() || reference.uri == "#xpointer(/)" {
-                Some(None)
-            } else if let Some(id) = same_document_reference_id(&reference.uri) {
-                let node = resolver.node_for_id(id).ok_or_else(|| {
-                    SigningDigestError::Transform(TransformError::ElementNotFound(id.to_owned()))
-                })?;
-                Some(Some(node.range()))
-            } else {
-                None
-            };
-            let Some(target_range) = target_range else {
+            let initial_data = resolver.dereference_with_budget(
+                &reference.uri,
+                execution_budget.node_set_materialization(),
+            )?;
+            let Some(effective_nodes) = node_set_before_binary_transform(
+                signature,
+                initial_data,
+                &reference.transforms,
+                transform_options,
+                execution_budget,
+            )?
+            else {
                 return Ok(HashSet::new());
             };
             Ok(references
                 .iter()
                 .enumerate()
                 .filter_map(|(index, candidate)| {
-                    let included = target_range.as_ref().is_none_or(|range| {
-                        range.start <= candidate.digest_value_range.start
-                            && range.end >= candidate.digest_value_range.end
-                    });
-                    included.then_some(index)
+                    doc.get_node(candidate.digest_value_node_id)
+                        .is_some_and(|node| effective_nodes.contains(node))
+                        .then_some(index)
                 })
                 .collect::<HashSet<_>>())
         })
@@ -1633,6 +1634,7 @@ fn parse_signing_reference(
         transforms,
         digest_method,
         digest_value_range: digest_value_node.range(),
+        digest_value_node_id: digest_value_node.id(),
     })
 }
 

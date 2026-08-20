@@ -27,7 +27,7 @@ use roxmltree::{Document, Node};
 use sha2::{Digest as _, Sha256};
 
 use super::parse::XMLDSIG_NS;
-use super::types::{NodeSetMaterializationBudget, TransformData, TransformError};
+use super::types::{NodeSet, NodeSetMaterializationBudget, TransformData, TransformError};
 use super::whitespace::is_xml_whitespace_only;
 use super::xpath::{
     XPathDocumentRelation, XPathWorkBudget, apply_xpath_filter_with_semantics_and_budget,
@@ -864,6 +864,48 @@ pub(crate) fn execute_transforms_with_options_and_budget<'a>(
         None,
         &context,
     )
+}
+
+/// Return the effective XML node-set immediately before a transform chain
+/// first becomes binary.
+///
+/// Signing uses this view to determine whether mutating a template
+/// `<DigestValue>` can affect another Manifest digest. Once the chain becomes
+/// binary, the original document identities are no longer meaningful; callers
+/// inspect the last node-set instead of guessing from source ranges.
+pub(crate) fn node_set_before_binary_transform<'a>(
+    signature_node: Node<'a, 'a>,
+    mut data: TransformData<'a>,
+    transforms: &[Transform],
+    options: TransformOptions,
+    budget: &TransformExecutionBudget,
+) -> Result<Option<NodeSet<'a>>, TransformError> {
+    ensure_transform_count(transforms.len())?;
+    let state = TransformChainState::default();
+    for transform in transforms {
+        match data {
+            TransformData::Binary(_) => return Ok(None),
+            TransformData::NodeSet(nodes)
+                if matches!(transform, Transform::C14n(_) | Transform::Base64Decode) =>
+            {
+                return Ok(Some(nodes));
+            }
+            TransformData::NodeSet(nodes) => {
+                data = apply_transform_with_options_and_state(
+                    signature_node,
+                    transform,
+                    TransformData::NodeSet(nodes),
+                    options,
+                    budget,
+                    &state,
+                )?;
+            }
+        }
+    }
+    match data {
+        TransformData::NodeSet(nodes) => Ok(Some(nodes)),
+        TransformData::Binary(_) => Ok(None),
+    }
 }
 
 fn ensure_transform_count(count: usize) -> Result<(), TransformError> {

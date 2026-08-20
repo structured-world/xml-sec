@@ -996,13 +996,70 @@ fn sign_context_orders_nested_manifest_dependencies() {
         .expect("nested Manifest signature must verify");
 
     assert_eq!(verified.status, DsigStatus::Valid);
-    assert_eq!(verified.manifest_references.len(), 1);
+    assert_eq!(verified.manifest_references.len(), 2);
     assert!(
         verified
             .manifest_references
             .iter()
             .all(|reference| reference.status == DsigStatus::Valid)
     );
+
+    let tampered = signed.replace("nested payload", "tampered payload");
+    let tampered_result = VerifyContext::new()
+        .key(&verification_key)
+        .process_manifests(true)
+        .verify(&tampered)
+        .expect("nested Manifest payload mutation must produce verification results");
+    assert_eq!(tampered_result.status, DsigStatus::Valid);
+    assert!(matches!(
+        tampered_result.manifest_references[1].status,
+        DsigStatus::Invalid(_)
+    ));
+}
+
+#[test]
+fn manifest_signing_allows_xpath_excluded_self_digest() {
+    // A Manifest may reference itself when its XPath input excludes the mutable
+    // DigestValue subtree; no digest dependency exists in the effective node-set.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let policy = SigningPolicy {
+        manifest_processing: ManifestProcessing::Process,
+        ..SigningPolicy::default()
+    };
+    let spki_der = match private_key.public_key_info().expect("public key info") {
+        SigningPublicKeyInfo::Rsa { spki_der, .. } => spki_der,
+        _ => panic!("RSA key must expose RSA public-key info"),
+    };
+    let verification_key = VerificationKey {
+        algorithm: SignatureAlgorithm::RsaSha256,
+        public_key_bytes: spki_der,
+        certificate_der: None,
+        name: None,
+    };
+    let transforms = [
+        r#"<ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:DigestValue)</ds:XPath></ds:Transform>"#,
+        r#"<ds:Transform Algorithm="http://www.w3.org/2002/06/xmldsig-filter2"><xf:XPath xmlns:xf="http://www.w3.org/2002/06/xmldsig-filter2" Filter="subtract">//ds:DigestValue</xf:XPath></ds:Transform>"#,
+    ];
+    for transform in transforms {
+        let template = format!(
+            r##"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#manifest"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="manifest"><ds:Reference URI="#manifest"><ds:Transforms>{transform}</ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##
+        );
+        let signed = SignContext::new(&private_key)
+            .policy(policy.clone())
+            .sign_template(&template)
+            .expect("XPath-excluded self DigestValue must not form a dependency cycle");
+        let verified = VerifyContext::new()
+            .key(&verification_key)
+            .process_manifests(true)
+            .verify(&signed)
+            .expect("self-referencing Manifest must verify");
+
+        assert_eq!(verified.status, DsigStatus::Valid);
+        assert_eq!(verified.manifest_references.len(), 1);
+        assert_eq!(verified.manifest_references[0].status, DsigStatus::Valid);
+    }
 }
 
 #[test]
