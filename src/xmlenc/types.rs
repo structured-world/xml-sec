@@ -601,6 +601,19 @@ pub enum XmlEncError {
     #[error("XML Encryption policy violation: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),
 
+    /// One decryption operation exhausted its aggregate key-candidate work ceiling.
+    #[error(
+        "decryption candidate limit exceeded by {resource}: maximum {maximum}, attempted {actual}"
+    )]
+    DecryptionCandidateLimitExceeded {
+        /// Resolver-provided description of the candidate source being charged.
+        resource: &'static str,
+        /// Fixed operation-wide candidate ceiling.
+        maximum: usize,
+        /// Candidate work that would have been consumed.
+        actual: usize,
+    },
+
     /// The selected cryptographic provider rejected or failed an operation.
     #[error("cryptographic provider error: {0}")]
     Provider(#[from] crate::provider::ProviderError),

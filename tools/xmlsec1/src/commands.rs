@@ -3949,11 +3949,11 @@ mod tests {
 
         assert!(matches!(
             error,
-            XmlEncError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            XmlEncError::DecryptionCandidateLimitExceeded {
                 resource: "RSA private-key candidates",
                 maximum: observed_maximum,
                 actual,
-            }) if observed_maximum == maximum && actual == maximum + 1
+            } if observed_maximum == maximum && actual == maximum + 1
         ));
     }
 

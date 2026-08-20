@@ -49,15 +49,14 @@ impl DecryptionCandidateBudget {
     /// Charge attempted candidate work before performing it.
     pub fn consume(&mut self, count: usize, resource: &'static str) -> Result<(), XmlEncError> {
         if count > self.remaining {
-            return Err(crate::policy::PolicyViolation::ResourceLimit {
+            return Err(XmlEncError::DecryptionCandidateLimitExceeded {
                 resource,
                 maximum: self.maximum,
                 actual: self
                     .maximum
                     .saturating_sub(self.remaining)
                     .saturating_add(count),
-            }
-            .into());
+            });
         }
         self.remaining -= count;
         Ok(())
@@ -791,13 +790,7 @@ fn record_candidate_source_error(
     // Candidate-specific failures permit the next ordered key source. The
     // shared work ceiling is operation-wide and must never be recoverable by
     // advancing to another recipient.
-    if matches!(
-        &error,
-        XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "decryption key candidates",
-            ..
-        })
-    ) {
+    if matches!(&error, XmlEncError::DecryptionCandidateLimitExceeded { .. }) {
         return Err(error);
     }
     *last_error = Some(error);
@@ -1222,6 +1215,10 @@ mod tests {
         recipient: Vec<u8>,
     }
 
+    struct MislabelledExhaustionResolver {
+        direct: Vec<u8>,
+    }
+
     impl DecryptionKeyResolver for DirectAndRecipientResolver {
         fn resolve_key(
             &self,
@@ -1253,6 +1250,35 @@ mod tests {
                     actual: 8,
                 })
             }
+        }
+    }
+
+    impl DecryptionKeyResolver for MislabelledExhaustionResolver {
+        fn resolve_key(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            _encrypted_key: Option<&EncryptedKey>,
+        ) -> Result<Vec<u8>, XmlEncError> {
+            Err(XmlEncError::KeyNotFound)
+        }
+
+        fn resolve_key_candidates(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+            budget: &mut DecryptionCandidateBudget,
+        ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+            if encrypted_key.is_none() {
+                budget.consume(1, "decryption key candidates")?;
+                return Ok(vec![self.direct.clone()]);
+            }
+            budget.consume(
+                budget.remaining().saturating_add(1),
+                "RSA private-key candidates",
+            )?;
+            unreachable!("candidate budget exhaustion must return first")
         }
     }
 
@@ -1864,11 +1890,11 @@ mod tests {
 
         assert!(matches!(
             error,
-            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+            XmlEncError::DecryptionCandidateLimitExceeded {
                 resource: "decryption key candidates",
                 maximum: crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING,
                 actual: observed,
-            }) if observed == actual
+            } if observed == actual
         ));
     }
 
@@ -1897,6 +1923,34 @@ mod tests {
             resolver.attempts.get(),
             crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING
         );
+    }
+
+    #[test]
+    fn candidate_budget_exhaustion_is_fatal_after_a_key_was_found() {
+        // The resolver chooses resource labels only for diagnostics; changing
+        // that label must not turn operation-wide exhaustion into recovery.
+        let key = vec![0x49_u8; 16];
+        let resolver = MislabelledExhaustionResolver {
+            direct: key.clone(),
+        };
+        let encrypted = encrypted_data_with_recipients(
+            &key,
+            vec![associated_encrypted_key("recipient", None, None)],
+            None,
+        );
+
+        let error = DecryptContext::new(&resolver)
+            .decrypt_data(&encrypted)
+            .expect_err("candidate exhaustion must override an earlier usable key");
+
+        assert!(matches!(
+            error,
+            XmlEncError::DecryptionCandidateLimitExceeded {
+                resource: "RSA private-key candidates",
+                maximum: crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING,
+                actual,
+            } if actual == crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING + 1
+        ));
     }
 
     #[test]

@@ -152,9 +152,11 @@ XPath and XPath Filter 2.0 signing and verification use libxmlsec1's legacy
 round-trip with the donor. The Rust library API retains the XMLDSig specification
 binding by default and requires an explicit opt-in for legacy documents.
 Repeatable named raw public-key and explicit-certificate options form a key set.
-Every direct `KeyName` in the selected signature participates in lookup and must
-identify exactly one supplied key; duplicate matches for the same name fail as
-ambiguous, while distinct names are searched in document order.
+Direct `KeyName` entries in the selected signature are ordered alternative
+lookup sources. Each name that matches must identify exactly one supplied key;
+duplicate matches for that name fail as ambiguous, unmatched names are skipped,
+and strict lookup fails if none of the names select a key. Distinct matching
+names are searched in document order.
 `--lax-key-search` is the explicit opt-out. A signature without `KeyName` does
 not request a different identity, so its sole explicit key remains usable even
 when that key has a registry name. For a repeated explicit key set, lax lookup
