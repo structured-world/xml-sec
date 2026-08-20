@@ -14,8 +14,11 @@ pub enum XmlEncodingError {
     /// The detected XML byte encoding contradicted the document declaration.
     #[error("XML byte encoding conflicts with declared encoding {0}")]
     ConflictingDeclaration(String),
-    /// Unmarked input was not valid UTF-8.
-    #[error("XML input is neither BOM-marked UTF-16 nor valid UTF-8: {0}")]
+    /// BOM-less UTF-16 input omitted the required explicit byte-order declaration.
+    #[error("BOM-less UTF-16 XML input requires an explicit UTF-16LE or UTF-16BE declaration")]
+    MissingUtf16Declaration,
+    /// Input without an XML UTF-16 signature was not valid UTF-8.
+    #[error("XML input is neither declared UTF-16 nor valid UTF-8: {0}")]
     InvalidUtf8(#[from] std::str::Utf8Error),
 }
 
@@ -25,20 +28,25 @@ enum Utf16ByteOrder {
     BigEndian,
 }
 
-/// Decode XML 1.0 octets encoded as UTF-8 or BOM-marked UTF-16.
+/// Decode XML 1.0 octets encoded as UTF-8 or UTF-16.
 ///
-/// UTF-16 input becomes UTF-8-backed Rust text, so its XML declaration is
-/// normalized to `UTF-8`; a contradictory encoding or explicit byte order
-/// fails closed.
+/// UTF-16 is recognized from a BOM or the XML declaration byte signature.
+/// BOM-less input must declare the matching explicit `UTF-16LE` or `UTF-16BE`
+/// encoding. Transcoded declarations are normalized to `UTF-8` because the
+/// returned Rust text is subsequently serialized as UTF-8.
 pub fn decode_xml_octets(bytes: &[u8]) -> Result<Cow<'_, str>, XmlEncodingError> {
     let utf16 = if let Some(payload) = bytes.strip_prefix(&[0xff, 0xfe]) {
-        Some((payload, Utf16ByteOrder::LittleEndian))
+        Some((payload, Utf16ByteOrder::LittleEndian, false))
+    } else if let Some(payload) = bytes.strip_prefix(&[0xfe, 0xff]) {
+        Some((payload, Utf16ByteOrder::BigEndian, false))
+    } else if bytes.starts_with(&[0x3c, 0x00, 0x3f, 0x00]) {
+        Some((bytes, Utf16ByteOrder::LittleEndian, true))
+    } else if bytes.starts_with(&[0x00, 0x3c, 0x00, 0x3f]) {
+        Some((bytes, Utf16ByteOrder::BigEndian, true))
     } else {
-        bytes
-            .strip_prefix(&[0xfe, 0xff])
-            .map(|payload| (payload, Utf16ByteOrder::BigEndian))
+        None
     };
-    if let Some((payload, byte_order)) = utf16 {
+    if let Some((payload, byte_order, requires_explicit_byte_order)) = utf16 {
         if payload.len() % 2 != 0 {
             return Err(XmlEncodingError::OddUtf16Length);
         }
@@ -51,7 +59,8 @@ pub fn decode_xml_octets(bytes: &[u8]) -> Result<Cow<'_, str>, XmlEncodingError>
             }
         });
         let decoded = String::from_utf16(&code_units.collect::<Vec<_>>())?;
-        return normalize_transcoded_declaration(decoded, byte_order).map(Cow::Owned);
+        return normalize_transcoded_declaration(decoded, byte_order, requires_explicit_byte_order)
+            .map(Cow::Owned);
     }
 
     let payload = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
@@ -67,19 +76,22 @@ pub fn decode_xml_octets(bytes: &[u8]) -> Result<Cow<'_, str>, XmlEncodingError>
 fn normalize_transcoded_declaration(
     mut xml: String,
     byte_order: Utf16ByteOrder,
+    requires_explicit_byte_order: bool,
 ) -> Result<String, XmlEncodingError> {
     let Some(declared_range) = declared_encoding_range(&xml) else {
-        return Ok(xml);
+        return if requires_explicit_byte_order {
+            Err(XmlEncodingError::MissingUtf16Declaration)
+        } else {
+            Ok(xml)
+        };
     };
     let declared = &xml[declared_range.clone()];
-    let declaration_matches = encoding_label_matches(declared, "UTF-16")
-        || encoding_label_matches(
-            declared,
-            match byte_order {
-                Utf16ByteOrder::LittleEndian => "UTF-16LE",
-                Utf16ByteOrder::BigEndian => "UTF-16BE",
-            },
-        );
+    let explicit_encoding = match byte_order {
+        Utf16ByteOrder::LittleEndian => "UTF-16LE",
+        Utf16ByteOrder::BigEndian => "UTF-16BE",
+    };
+    let declaration_matches = encoding_label_matches(declared, explicit_encoding)
+        || (!requires_explicit_byte_order && encoding_label_matches(declared, "UTF-16"));
     if !declaration_matches {
         return Err(XmlEncodingError::ConflictingDeclaration(declared.into()));
     }
@@ -231,6 +243,47 @@ mod tests {
                 Err(XmlEncodingError::ConflictingDeclaration(_))
             ));
         }
+    }
+
+    #[test]
+    fn bomless_utf16_requires_an_explicit_matching_byte_order() {
+        // XML 1.0 Appendix F permits byte-signature autodetection, while
+        // section 4.3.3 still requires generic UTF-16 to carry a BOM.
+        for (encode, declared) in [
+            (u16::to_le_bytes as fn(u16) -> [u8; 2], "UTF-16LE"),
+            (u16::to_be_bytes as fn(u16) -> [u8; 2], "UTF-16BE"),
+        ] {
+            let bytes = format!("<?xml version=\"1.0\" encoding=\"{declared}\"?><root/>")
+                .encode_utf16()
+                .flat_map(encode)
+                .collect::<Vec<_>>();
+            let decoded = decode_xml_octets(&bytes).expect("explicit-endian UTF-16 must decode");
+            assert!(decoded.contains("encoding=\"UTF-8\""));
+        }
+
+        for (encode, declared) in [
+            (u16::to_le_bytes as fn(u16) -> [u8; 2], "UTF-16"),
+            (u16::to_le_bytes as fn(u16) -> [u8; 2], "UTF-16BE"),
+            (u16::to_be_bytes as fn(u16) -> [u8; 2], "UTF-16LE"),
+        ] {
+            let bytes = format!("<?xml version=\"1.0\" encoding=\"{declared}\"?><root/>")
+                .encode_utf16()
+                .flat_map(encode)
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                decode_xml_octets(&bytes),
+                Err(XmlEncodingError::ConflictingDeclaration(value)) if value == declared
+            ));
+        }
+
+        let missing = "<?xml version=\"1.0\"?><root/>"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            decode_xml_octets(&missing),
+            Err(XmlEncodingError::MissingUtf16Declaration)
+        ));
     }
 
     #[test]

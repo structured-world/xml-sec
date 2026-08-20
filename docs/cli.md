@@ -43,10 +43,13 @@ document. `verify --output` therefore fails with a command-specific "not
 applicable" diagnostic instead of reporting generic malformed syntax.
 Signing processes direct `<Object>/<Manifest>` references before computing
 `SignedInfo`, matching libxmlsec1 and preventing a SignedInfo digest from
-becoming stale after Manifest mutation. `--ignore-manifests` disables that work
-for both DSig commands and leaves signing-template Manifest values untouched.
-XML file and `--xml-data` inputs accept XML 1.0 UTF-8 and BOM-marked UTF-16LE or
-UTF-16BE, with resource limits charged against source bytes before decoding.
+becoming stale after Manifest mutation. Nested dependencies are filled from
+leaves to dependants, and cycles fail before output. `--ignore-manifests`
+disables that work for both DSig commands and leaves signing-template Manifest
+values untouched.
+XML file and `--xml-data` inputs accept XML 1.0 UTF-8 plus BOM-marked UTF-16 or
+BOM-less UTF-16LE/UTF-16BE with a matching explicit declaration, with resource
+limits charged against source bytes before decoding.
 UTF-16 declarations are normalized to UTF-8 when the decoded document is
 emitted through the Rust string-based signing or encryption pipelines.
 Generic `UTF-16` declarations follow the required BOM; explicit `UTF-16LE` or
@@ -186,7 +189,8 @@ bytes are consumed verbatim rather than guessed to be Base64 text. Reads are
 bounded to the largest supported AES key before allocation. `decrypt`
 accepts both standalone `EncryptedData` and encrypted elements embedded in a
 larger XML document; `--node-id` selects an ID-bearing operation start node and
-then requires exactly one `EncryptedData` in its subtree.
+then operates on the first `EncryptedData` descendant in document order, matching
+the donor command's selection behavior.
 Encryption preserves the template's `Id`, `Type`, `MimeType`, existing `KeyInfo`
 metadata, `EncryptionProperties`, and RSA-OAEP parameters. It may populate an
 empty `KeyInfo` placeholder with generated key or recipient metadata while

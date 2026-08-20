@@ -751,7 +751,9 @@ fn select_signing_key(
             prepare_signing_key_candidate(option, algorithm, policy, &mut material_budget);
         match attempt {
             Ok(candidate) => return Ok(candidate),
-            Err(error) if lax_key_search => last_error = Some(error),
+            Err(error) if lax_key_search && lax_candidate_error_is_recoverable(&error) => {
+                last_error = Some(error);
+            }
             Err(error) => return Err(error),
         }
     }
@@ -1057,7 +1059,9 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             };
             match candidate {
                 Ok(candidate) => candidates.push(candidate),
-                Err(error) if lax_key_search => last_load_error = Some(error),
+                Err(error) if lax_key_search && lax_candidate_error_is_recoverable(&error) => {
+                    last_load_error = Some(error);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -1163,6 +1167,12 @@ impl ExternalMaterialBudget {
             })?;
         Ok(())
     }
+}
+
+fn lax_candidate_error_is_recoverable(error: &CommandError) -> bool {
+    // Lax lookup may skip an unusable candidate, but an invocation-wide
+    // resource ceiling is terminal rather than a property of that candidate.
+    !matches!(error, CommandError::ExternalMaterialTooLarge { .. })
 }
 
 fn push_configured_certificate(certificates: &mut Vec<Vec<u8>>, certificate: Vec<u8>) {
@@ -3070,18 +3080,10 @@ fn select_encrypted_data<'a>(
     } else {
         document.root()
     };
-    let mut matches = start
+    start
         .descendants()
-        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedData")));
-    let selected = matches
-        .next()
-        .ok_or_else(|| CommandError::Encryption("document has no EncryptedData".into()))?;
-    if matches.next().is_some() {
-        return Err(CommandError::Encryption(
-            "multiple matching EncryptedData elements".into(),
-        ));
-    }
-    Ok(selected)
+        .find(|node| node.has_tag_name((XMLENC_NS, "EncryptedData")))
+        .ok_or_else(|| CommandError::Encryption("document has no EncryptedData".into()))
 }
 
 fn keys(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
@@ -3640,6 +3642,24 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_data_selection_uses_the_first_descendant() {
+        // libxmlsec1 starts a depth-first search at the operation root and
+        // does not impose global EncryptedData cardinality on that subtree.
+        let xml = format!(
+            "<root><group Id=\"selected\"><xenc:EncryptedData xmlns:xenc=\"{XMLENC_NS}\" Id=\"first\"/><xenc:EncryptedData xmlns:xenc=\"{XMLENC_NS}\" Id=\"second\"/></group></root>"
+        );
+        let document = Document::parse(&xml).unwrap();
+
+        let selected = select_encrypted_data(&document, None, &[])
+            .expect("the first document descendant must be selected");
+        assert_eq!(selected.attribute("Id"), Some("first"));
+
+        let selected = select_encrypted_data(&document, Some("selected"), &[])
+            .expect("the first operation-subtree descendant must be selected");
+        assert_eq!(selected.attribute("Id"), Some("first"));
+    }
+
+    #[test]
     fn merged_encryption_template_obeys_the_aggregate_node_ceiling() {
         // Template and generated output cross the trust boundary separately,
         // but the returned document must also fit the same operation policy.
@@ -3804,6 +3824,43 @@ mod tests {
                 &mut budget,
             ),
             Err(CommandError::ExternalMaterialTooLarge { maximum: 1 })
+        ));
+    }
+
+    #[test]
+    fn lax_signing_propagates_aggregate_material_exhaustion() {
+        // A malformed candidate is recoverable in lax mode, but a later source
+        // that exhausts the shared budget must stop search before a valid key.
+        let temp = tempfile::tempdir().unwrap();
+        let malformed = temp.path().join("malformed.pem");
+        let oversized = temp.path().join("oversized.pem");
+        let valid = testdata("rsa-2048-key.pem");
+        fs::write(&malformed, b"x").unwrap();
+        let valid_len = fs::metadata(&valid).unwrap().len();
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(valid_len + 1)
+            .unwrap();
+        let parsed = Invocation::parse([
+            OsString::from("xmlsec1"),
+            OsString::from("sign"),
+            OsString::from("--lax-key-search"),
+            OsString::from("--privkey-pem:malformed"),
+            malformed.into_os_string(),
+            OsString::from("--privkey-pem:oversized"),
+            oversized.into_os_string(),
+            OsString::from("--privkey-pem:valid"),
+            valid.into_os_string(),
+            OsString::from("template.xml"),
+        ])
+        .unwrap();
+        let mut policy = SigningPolicy::default();
+        policy.resources.max_external_resource_total_bytes = valid_len as usize + 1;
+
+        assert!(matches!(
+            select_signing_key(&parsed, &[], SignatureAlgorithm::RsaSha256, &policy),
+            Err(CommandError::ExternalMaterialTooLarge { maximum })
+                if maximum == valid_len as usize + 1
         ));
     }
 

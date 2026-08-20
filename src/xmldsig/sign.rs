@@ -17,7 +17,7 @@ use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use rsa::traits::PublicKeyParts;
 use sha2::{Sha256, Sha384, Sha512};
 use signature::hazmat::PrehashSigner;
-use std::collections::HashSet;
+use std::{collections::HashSet, ops::Range};
 use x509_parser::prelude::FromDer;
 
 use crate::c14n::{canonicalize_bounded_with_xml_base_budget, is_output_limit_error};
@@ -26,7 +26,8 @@ use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::DigestAlgorithm;
 use super::mutation::{
     XmlMutationError, append_signature_to_element_with_options,
-    append_signature_to_root_with_options, fill_manifest_digest_values_at_index_with_options,
+    append_signature_to_root_with_options,
+    fill_selected_manifest_digest_values_at_index_with_options,
     fill_signature_value_at_index_with_options, fill_signed_info_digest_values,
     fill_signed_info_digest_values_at_index_with_options,
     fill_signed_info_digest_values_with_options, merge_key_info_source_at_index_with_options,
@@ -40,7 +41,7 @@ use super::transforms::{
     parse_transforms_with_budget, transform_chain_produces_binary,
 };
 use super::types::TransformError;
-use super::uri::UriReferenceResolver;
+use super::uri::{UriReferenceResolver, same_document_reference_id};
 use super::verify::parse_signature_children;
 
 /// Result for one computed signing-template reference digest.
@@ -1002,11 +1003,12 @@ impl<'a> SignContext<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SigningReference {
     uri: String,
     transforms: Vec<Transform>,
     digest_method: DigestAlgorithm,
+    digest_value_range: Range<usize>,
 }
 
 /// Compute base64 digest values for every `<Reference>` in the signing template.
@@ -1083,23 +1085,121 @@ fn fill_manifest_reference_digest_values_with_options(
     if manifest_references.is_empty() {
         return Ok(xml.to_owned());
     }
-    let values = compute_signing_reference_digests(
-        &doc,
-        signature,
-        manifest_references,
-        transform_options,
-        provider,
-        execution_budget,
-        id_attributes,
-    )?
-    .into_iter()
-    .map(|digest| digest.digest_value);
-    Ok(fill_manifest_digest_values_at_index_with_options(
-        xml,
-        values,
-        target_signature,
-        Some(policy),
-    )?)
+    let dependency_levels =
+        manifest_reference_dependency_levels(&doc, signature, &manifest_references, id_attributes)?;
+    let mut filled = xml.to_owned();
+    for level in dependency_levels {
+        let current_doc = parse_signing_document(&filled, Some(policy))?;
+        let current_signature = find_signing_signature_node(
+            &current_doc,
+            SigningSignatureTarget::Index(target_signature),
+        )?;
+        let current_references = parse_signing_manifest_references(
+            current_signature,
+            &mut XPathSignatureParseBudget::default(),
+        )?;
+        let selected = level
+            .iter()
+            .map(|index| current_references[*index].clone())
+            .collect::<Vec<_>>();
+        let values = compute_signing_reference_digests(
+            &current_doc,
+            current_signature,
+            selected,
+            transform_options,
+            provider,
+            execution_budget,
+            id_attributes,
+        )?;
+        let replacements = level
+            .into_iter()
+            .zip(values.into_iter().map(|digest| digest.digest_value));
+        filled = fill_selected_manifest_digest_values_at_index_with_options(
+            &filled,
+            replacements,
+            target_signature,
+            Some(policy),
+        )?;
+    }
+    Ok(filled)
+}
+
+fn manifest_reference_dependency_levels(
+    doc: &Document<'_>,
+    signature: Node<'_, '_>,
+    references: &[SigningReference],
+    id_attributes: &[crate::IdAttributeRegistration],
+) -> Result<Vec<Vec<usize>>, SigningDigestError> {
+    let resolver = UriReferenceResolver::with_id_registrations(doc, id_attributes);
+    let mut dependencies = references
+        .iter()
+        .map(|reference| {
+            if reference.transforms.iter().any(|transform| {
+                matches!(
+                    transform,
+                    Transform::Enveloped | Transform::XpathExcludeAllSignatures
+                )
+            }) {
+                return Ok(HashSet::new());
+            }
+            let target_range = if reference.uri.is_empty() || reference.uri == "#xpointer(/)" {
+                Some(None)
+            } else if let Some(id) = same_document_reference_id(&reference.uri) {
+                let node = resolver.node_for_id(id).ok_or_else(|| {
+                    SigningDigestError::Transform(TransformError::ElementNotFound(id.to_owned()))
+                })?;
+                Some(Some(node.range()))
+            } else {
+                None
+            };
+            let Some(target_range) = target_range else {
+                return Ok(HashSet::new());
+            };
+            Ok(references
+                .iter()
+                .enumerate()
+                .filter_map(|(index, candidate)| {
+                    let included = target_range.as_ref().is_none_or(|range| {
+                        range.start <= candidate.digest_value_range.start
+                            && range.end >= candidate.digest_value_range.end
+                    });
+                    included.then_some(index)
+                })
+                .collect::<HashSet<_>>())
+        })
+        .collect::<Result<Vec<_>, SigningDigestError>>()?;
+    let mut completed = vec![false; references.len()];
+    let mut levels = Vec::new();
+    while completed.iter().any(|done| !done) {
+        let ready = dependencies
+            .iter()
+            .enumerate()
+            .filter_map(|(index, dependencies)| {
+                (!completed[index] && dependencies.is_empty()).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            return Err(SigningDigestError::InvalidStructure(
+                "Manifest Reference digest dependency cycle".into(),
+            ));
+        }
+        for index in &ready {
+            completed[*index] = true;
+        }
+        for dependency_set in &mut dependencies {
+            dependency_set.retain(|dependency| !completed[*dependency]);
+        }
+        levels.push(ready);
+    }
+
+    // Every mutable Manifest DigestValue belongs to the selected Signature;
+    // an enveloped transform excludes that complete subtree and therefore
+    // removes all such dependencies from its input node-set.
+    debug_assert!(references.iter().all(|reference| {
+        signature.range().start <= reference.digest_value_range.start
+            && signature.range().end >= reference.digest_value_range.end
+    }));
+    Ok(levels)
 }
 
 fn validate_signing_references(
@@ -1532,6 +1632,7 @@ fn parse_signing_reference(
         uri,
         transforms,
         digest_method,
+        digest_value_range: digest_value_node.range(),
     })
 }
 

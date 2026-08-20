@@ -840,6 +840,59 @@ fn lax_verification_searches_past_incompatible_key_types() {
 }
 
 #[test]
+fn lax_verification_does_not_recover_from_aggregate_material_exhaustion() {
+    // Lax search may skip malformed key candidates, but it must not turn the
+    // invocation-wide 32 MiB material ceiling into a per-candidate limit.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let signed = temp.path().join("signed.xml");
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let mut malformed = Vec::new();
+    for (index, size) in [8, 8, 8, 1, 8].into_iter().enumerate() {
+        let path = temp.path().join(format!("malformed-{index}.pem"));
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(size * 1024 * 1024)
+            .unwrap();
+        malformed.push(path);
+    }
+    let mut verify = Command::new(binary());
+    verify.args(["verify", "--lax-key-search"]);
+    for (index, path) in malformed.iter().enumerate() {
+        verify.arg(format!("--pubkey-pem:malformed-{index}"));
+        verify.arg(path);
+    }
+    let output = verify
+        .arg("--pubkey-pem:valid")
+        .arg(public_key)
+        .arg(signed)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("configured external key/certificate material exceeds policy limit")
+    );
+}
+
+#[test]
 fn strict_verification_searches_each_distinct_template_key_name() {
     // Separate KeyNames identify separate key-manager entries. A unique match
     // for each name is a search order, not an ambiguity across the whole set.
@@ -1211,6 +1264,47 @@ fn signing_processes_manifests_unless_explicitly_ignored() {
         String::from_utf8_lossy(&ignored.stderr)
     );
     assert!(String::from_utf8_lossy(&ignored.stdout).contains(">stale</ds:DigestValue>"));
+}
+
+#[test]
+fn signing_processes_nested_manifests_in_dependency_order() {
+    // The process API must expose the same dependency-aware Manifest pipeline
+    // as SignContext rather than emitting a signature with a stale outer digest.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("nested-manifest-template.xml");
+    let signed = temp.path().join("nested-manifest-signed.xml");
+    fs::write(
+        &template,
+        r##"<root><payload Id="payload">nested payload</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#outer"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="outer"><ds:Reference URI="#inner"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:Manifest><ds:Manifest Id="inner"><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##,
+    )
+    .unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(public_key)
+        .arg(signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
 }
 
 #[test]
@@ -1884,8 +1978,8 @@ fn encryption_preserves_template_metadata_and_supports_id_selection() {
 
 #[test]
 fn encryption_node_id_selects_one_template_subtree() {
-    // --node-id selects the operation start node, not EncryptedData/@Id. Both
-    // template inspection and replacement must stay within that subtree.
+    // --node-id selects the operation start node, not EncryptedData/@Id. The
+    // first descendant is filled and later templates remain untouched.
     let temp = tempfile::tempdir().unwrap();
     let template = temp.path().join("multiple-templates.xml");
     let plaintext = temp.path().join("plaintext.bin");
@@ -1898,8 +1992,9 @@ fn encryption_node_id_selects_one_template_subtree() {
     fs::write(
         &template,
         format!(
-            "<Document><Envelope Id=\"first\">{}</Envelope><Envelope Id=\"second\">{}</Envelope></Document>",
+            "<Document><Envelope Id=\"first\">{}{}</Envelope><Envelope Id=\"second\">{}</Envelope></Document>",
             encrypted_data("first-template"),
+            encrypted_data("later-first-subtree-template"),
             encrypted_data("second-template")
         ),
     )
@@ -1931,6 +2026,7 @@ fn encryption_node_id_selects_one_template_subtree() {
         .collect::<Vec<_>>();
     assert!(!values[0].trim().is_empty());
     assert!(values[1].trim().is_empty());
+    assert!(values[2].trim().is_empty());
 
     let missing = Command::new(binary())
         .args(["encrypt", "--aes-key"])

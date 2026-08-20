@@ -963,6 +963,74 @@ fn sign_context_processes_manifests_before_signed_info() {
 }
 
 #[test]
+fn sign_context_orders_nested_manifest_dependencies() {
+    // A Manifest may reference another Manifest. The outer digest must observe
+    // the inner Manifest after its DigestValue has been populated.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let spki_der = match private_key.public_key_info().expect("public key info") {
+        SigningPublicKeyInfo::Rsa { spki_der, .. } => spki_der,
+        _ => panic!("RSA key must expose RSA public-key info"),
+    };
+    let verification_key = VerificationKey {
+        algorithm: SignatureAlgorithm::RsaSha256,
+        public_key_bytes: spki_der,
+        certificate_der: None,
+        name: None,
+    };
+    let template = r##"<root><payload Id="payload">nested payload</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#outer"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="outer"><ds:Reference URI="#inner"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:Manifest><ds:Manifest Id="inner"><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##;
+    let policy = SigningPolicy {
+        manifest_processing: ManifestProcessing::Process,
+        ..SigningPolicy::default()
+    };
+
+    let signed = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_template(template)
+        .expect("nested Manifest dependencies must be signed in dependency order");
+    let verified = VerifyContext::new()
+        .key(&verification_key)
+        .process_manifests(true)
+        .verify(&signed)
+        .expect("nested Manifest signature must verify");
+
+    assert_eq!(verified.status, DsigStatus::Valid);
+    assert_eq!(verified.manifest_references.len(), 1);
+    assert!(
+        verified
+            .manifest_references
+            .iter()
+            .all(|reference| reference.status == DsigStatus::Valid)
+    );
+}
+
+#[test]
+fn manifest_signing_rejects_digest_dependency_cycles() {
+    // Circular Manifest references have no stable fill order and must fail
+    // before the signing template is partially mutated.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template = r##"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#outer"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="outer"><ds:Reference URI="#inner"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:Manifest><ds:Manifest Id="inner"><ds:Reference URI="#outer"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##;
+    let policy = SigningPolicy {
+        manifest_processing: ManifestProcessing::Process,
+        ..SigningPolicy::default()
+    };
+
+    let error = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_template(template)
+        .expect_err("cyclic Manifest digest dependencies must fail closed");
+
+    assert!(matches!(
+        error,
+        SigningError::Digest(SigningDigestError::InvalidStructure(message))
+            if message.contains("cycle")
+    ));
+}
+
+#[test]
 fn manifest_signing_rejects_malformed_structure_and_aggregate_overflow() {
     // Ignoring Manifests may leave application-defined content untouched, but
     // processing mode must validate grammar and share one Reference ceiling.
