@@ -1011,10 +1011,18 @@ fn sign_context_orders_nested_manifest_dependencies() {
         .verify(&tampered)
         .expect("nested Manifest payload mutation must produce verification results");
     assert_eq!(tampered_result.status, DsigStatus::Valid);
-    assert!(matches!(
-        tampered_result.manifest_references[1].status,
-        DsigStatus::Invalid(_)
-    ));
+    let payload_reference = tampered_result
+        .manifest_references
+        .iter()
+        .find(|reference| reference.uri == "#payload")
+        .expect("the inner Manifest reference to #payload must be reported");
+    assert!(matches!(payload_reference.status, DsigStatus::Invalid(_)));
+    let inner_reference = tampered_result
+        .manifest_references
+        .iter()
+        .find(|reference| reference.uri == "#inner")
+        .expect("the outer Manifest reference to #inner must be reported");
+    assert_eq!(inner_reference.status, DsigStatus::Valid);
 }
 
 #[test]
@@ -1041,6 +1049,14 @@ fn manifest_signing_allows_xpath_excluded_self_digest() {
     let transforms = [
         r#"<ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:DigestValue)</ds:XPath></ds:Transform>"#,
         r#"<ds:Transform Algorithm="http://www.w3.org/2002/06/xmldsig-filter2"><xf:XPath xmlns:xf="http://www.w3.org/2002/06/xmldsig-filter2" Filter="subtract">//ds:DigestValue</xf:XPath></ds:Transform>"#,
+        concat!(
+            r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            r#"<ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:DigestValue)</ds:XPath></ds:Transform>"#,
+        ),
+        concat!(
+            r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            r#"<ds:Transform Algorithm="http://www.w3.org/2002/06/xmldsig-filter2"><xf:XPath xmlns:xf="http://www.w3.org/2002/06/xmldsig-filter2" Filter="subtract">//ds:DigestValue</xf:XPath></ds:Transform>"#,
+        ),
     ];
     for transform in transforms {
         let template = format!(
@@ -1124,6 +1140,28 @@ fn manifest_signing_rejects_malformed_structure_and_aggregate_overflow() {
         .policy(bounded)
         .sign_template(manifest_signing_template())
         .expect_err("SignedInfo and Manifest must share one reference limit");
+    assert!(matches!(
+        error,
+        SigningError::Digest(SigningDigestError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "signature references",
+                maximum: 1,
+                actual: 2,
+            }
+        ))
+    ));
+
+    let malformed_overflow = manifest_signing_template()
+        .replace(r##"<ds:Reference URI="#payload">"##, r#"<ds:Reference>"#);
+    let mut bounded = SigningPolicy {
+        manifest_processing: ManifestProcessing::Process,
+        ..SigningPolicy::default()
+    };
+    bounded.resources.max_references = 1;
+    let error = SignContext::new(&private_key)
+        .policy(bounded)
+        .sign_template(&malformed_overflow)
+        .expect_err("exhausted reference capacity must stop before parsing overflow entries");
     assert!(matches!(
         error,
         SigningError::Digest(SigningDigestError::Policy(

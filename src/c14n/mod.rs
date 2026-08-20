@@ -38,6 +38,8 @@ use ns_exclusive::ExclusiveNsRenderer;
 use ns_inclusive::InclusiveNsRenderer;
 #[cfg(any(feature = "xmldsig", test))]
 use serialize::CanonicalOutputLimitExceeded;
+#[cfg(any(feature = "xmldsig", test))]
+use serialize::serialize_canonical_visible_with_positions_bounded;
 use serialize::{
     C14nConfig, CanonicalOutputOptions, serialize_canonical_visible_with_position_bounded,
     serialize_canonical_visible_with_position_with_xml_base_budget,
@@ -347,6 +349,41 @@ pub(crate) fn canonicalize_with_visibility_and_position_bounded_with_xml_base_bu
         tracked_element,
         Some(max_output_bytes),
         Some(xml_base_resolution),
+        output,
+    )
+}
+
+#[cfg(any(feature = "xmldsig", test))]
+pub(crate) fn canonicalize_with_visibility_and_positions_bounded_with_xml_base_budget(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    algo: &C14nAlgorithm,
+    tracked_elements: &[NodeId],
+    max_output_bytes: usize,
+    xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
+    output: &mut Vec<u8>,
+) -> Result<Vec<(NodeId, usize)>, C14nError> {
+    let config = C14nConfig {
+        inherit_xml_attrs: !matches!(algo.mode, C14nMode::Exclusive1_0),
+        fixup_xml_base: matches!(algo.mode, C14nMode::Inclusive1_1),
+    };
+    let inclusive = InclusiveNsRenderer;
+    let exclusive = ExclusiveNsRenderer::new(&algo.inclusive_prefixes);
+    let renderer: &dyn serialize::NsRenderer = match algo.mode {
+        C14nMode::Inclusive1_0 | C14nMode::Inclusive1_1 => &inclusive,
+        C14nMode::Exclusive1_0 => &exclusive,
+    };
+    serialize_canonical_visible_with_positions_bounded(
+        doc,
+        visibility,
+        algo.with_comments,
+        renderer,
+        config,
+        CanonicalOutputOptions::bounded_many(
+            tracked_elements,
+            max_output_bytes,
+            xml_base_resolution,
+        ),
         output,
     )
 }

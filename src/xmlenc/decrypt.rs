@@ -1163,7 +1163,7 @@ mod tests {
         aead::{AeadInOut, KeyInit},
     };
     use aes_kw::KwAes128;
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::engine::general_purpose::STANDARD;
     use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
     use rsa::{Oaep, RsaPublicKey, pkcs8::DecodePrivateKey};
     use sha1::Sha1;

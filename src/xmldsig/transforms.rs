@@ -20,14 +20,14 @@
 //! | XPath Filter 2.0 | NodeSet → NodeSet | P1 |
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use roxmltree::{Document, Node};
+use roxmltree::{Document, Node, NodeId};
 use sha2::{Digest as _, Sha256};
 
 use super::parse::XMLDSIG_NS;
-use super::types::{NodeSet, NodeSetMaterializationBudget, TransformData, TransformError};
+use super::types::{NodeSetMaterializationBudget, TransformData, TransformError};
 use super::whitespace::is_xml_whitespace_only;
 use super::xpath::{
     XPathDocumentRelation, XPathWorkBudget, apply_xpath_filter_with_semantics_and_budget,
@@ -862,50 +862,70 @@ pub(crate) fn execute_transforms_with_options_and_budget<'a>(
         initial_data,
         transforms,
         None,
+        None,
         &context,
     )
+    .map(|output| output.bytes)
 }
 
-/// Return the effective XML node-set immediately before a transform chain
-/// first becomes binary.
+/// Full transform output plus the mutable signing fields that can affect it.
+pub(crate) struct TransformDependencyOutput {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) dependencies: HashSet<usize>,
+}
+
+struct TransformChainOutput {
+    bytes: Vec<u8>,
+    dependencies: HashSet<usize>,
+}
+
+struct DependencyTracking {
+    // Node identities are remapped by canonical byte position whenever a later
+    // node-set transform reparses C14N output into a new document.
+    active_nodes: Vec<(usize, NodeId)>,
+    // Base64 decoding destroys XML identity. Dependencies that crossed that
+    // boundary remain conservative because later XPath cannot recover origin.
+    opaque_dependencies: HashSet<usize>,
+    canonical_positions: Option<Vec<(usize, usize)>>,
+}
+
+/// Execute the production transform state machine while carrying node origin.
 ///
-/// Signing uses this view to determine whether mutating a template
-/// `<DigestValue>` can affect another Manifest digest. Once the chain becomes
-/// binary, the original document identities are no longer meaningful; callers
-/// inspect the last node-set instead of guessing from source ranges.
-pub(crate) fn node_set_before_binary_transform<'a>(
+/// Dependency analysis deliberately shares this executor with digest
+/// computation so binary-to-node-set adaptation and later XPath filters cannot
+/// drift into a second, incomplete transform model.
+pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
     signature_node: Node<'a, 'a>,
-    mut data: TransformData<'a>,
+    initial_data: TransformData<'a>,
     transforms: &[Transform],
     options: TransformOptions,
     budget: &TransformExecutionBudget,
-) -> Result<Option<NodeSet<'a>>, TransformError> {
+    tracked_nodes: Vec<(usize, NodeId)>,
+) -> Result<TransformDependencyOutput, TransformError> {
     ensure_transform_count(transforms.len())?;
     let state = TransformChainState::default();
-    for transform in transforms {
-        match data {
-            TransformData::Binary(_) => return Ok(None),
-            TransformData::NodeSet(nodes)
-                if matches!(transform, Transform::C14n(_) | Transform::Base64Decode) =>
-            {
-                return Ok(Some(nodes));
-            }
-            TransformData::NodeSet(nodes) => {
-                data = apply_transform_with_options_and_state(
-                    signature_node,
-                    transform,
-                    TransformData::NodeSet(nodes),
-                    options,
-                    budget,
-                    &state,
-                )?;
-            }
-        }
-    }
-    match data {
-        TransformData::NodeSet(nodes) => Ok(Some(nodes)),
-        TransformData::Binary(_) => Ok(None),
-    }
+    let context = TransformExecutionContext {
+        options,
+        budget,
+        state: &state,
+    };
+    let output = execute_transform_chain(
+        signature_node,
+        Some(signature_node),
+        initial_data,
+        transforms,
+        None,
+        Some(DependencyTracking {
+            active_nodes: tracked_nodes,
+            opaque_dependencies: HashSet::new(),
+            canonical_positions: None,
+        }),
+        &context,
+    )?;
+    Ok(TransformDependencyOutput {
+        bytes: output.bytes,
+        dependencies: output.dependencies,
+    })
 }
 
 fn ensure_transform_count(count: usize) -> Result<(), TransformError> {
@@ -923,10 +943,23 @@ fn execute_transform_chain<'s, 'e, 'd>(
     data: TransformData<'d>,
     transforms: &[Transform],
     canonical_signature_position: Option<Option<usize>>,
+    mut dependency_tracking: Option<DependencyTracking>,
     context: &TransformExecutionContext<'_>,
-) -> Result<Vec<u8>, TransformError> {
+) -> Result<TransformChainOutput, TransformError> {
     let Some((transform, remaining)) = transforms.split_first() else {
-        return finalize_transform_data(data, context.budget);
+        if let (TransformData::NodeSet(nodes), Some(tracking)) = (&data, &mut dependency_tracking) {
+            tracking.active_nodes.retain(|(_, node_id)| {
+                nodes
+                    .document()
+                    .get_node(*node_id)
+                    .is_some_and(|node| nodes.contains(node))
+            });
+        }
+        let bytes = finalize_transform_data(data, context.budget)?;
+        return Ok(TransformChainOutput {
+            bytes,
+            dependencies: dependency_indexes(dependency_tracking),
+        });
     };
 
     if transform_requires_node_set(transform)
@@ -956,6 +989,19 @@ fn execute_transform_chain<'s, 'e, 'd>(
             &document,
             &context.budget.node_set_materialization,
         )?;
+        if let Some(tracking) = &mut dependency_tracking
+            && let Some(positions) = tracking.canonical_positions.take()
+        {
+            tracking.active_nodes = positions
+                .into_iter()
+                .filter_map(|(index, position)| {
+                    document
+                        .descendants()
+                        .find(|node| node.range().start == position)
+                        .map(|node| (index, node.id()))
+                })
+                .collect();
+        }
         return match canonical_signature_position {
             Some(Some(position)) => {
                 let remapped = document
@@ -972,6 +1018,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                     TransformData::NodeSet(nodes),
                     transforms,
                     None,
+                    dependency_tracking,
                     context,
                 )
             }
@@ -981,6 +1028,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 TransformData::NodeSet(nodes),
                 transforms,
                 None,
+                dependency_tracking,
                 context,
             ),
             None => execute_transform_chain(
@@ -992,6 +1040,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 TransformData::NodeSet(nodes),
                 transforms,
                 None,
+                dependency_tracking,
                 context,
             ),
         };
@@ -1005,7 +1054,55 @@ fn execute_transform_chain<'s, 'e, 'd>(
             .filter(|signature| nodes.contains(*signature))
             .map(|signature| signature.id());
         let mut output = Vec::new();
-        let position =
+        if let Some(tracking) = &mut dependency_tracking {
+            tracking.active_nodes.retain(|(_, node_id)| {
+                nodes
+                    .document()
+                    .get_node(*node_id)
+                    .is_some_and(|node| nodes.contains(node))
+            });
+        }
+        let position = if let Some(tracking) = &mut dependency_tracking {
+            let mut tracked_ids = tracking
+                .active_nodes
+                .iter()
+                .map(|(_, node_id)| *node_id)
+                .collect::<Vec<_>>();
+            if let Some(signature_id) = tracked_element
+                && !tracked_ids.contains(&signature_id)
+            {
+                tracked_ids.push(signature_id);
+            }
+            let positions =
+                c14n::canonicalize_with_visibility_and_positions_bounded_with_xml_base_budget(
+                    nodes.document(),
+                    Some(nodes),
+                    algo,
+                    &tracked_ids,
+                    context.budget.c14n.remaining(),
+                    context.budget.xml_base_resolution(),
+                    &mut output,
+                )
+                .map_err(|error| map_c14n_limit_error(error, &context.budget.c14n))?;
+            tracking.canonical_positions = Some(
+                tracking
+                    .active_nodes
+                    .iter()
+                    .filter_map(|(index, node_id)| {
+                        positions
+                            .iter()
+                            .find(|(tracked_id, _)| tracked_id == node_id)
+                            .map(|(_, position)| (*index, *position))
+                    })
+                    .collect(),
+            );
+            tracked_element.and_then(|signature_id| {
+                positions
+                    .iter()
+                    .find(|(tracked_id, _)| *tracked_id == signature_id)
+                    .map(|(_, position)| *position)
+            })
+        } else {
             c14n::canonicalize_with_visibility_and_position_bounded_with_xml_base_budget(
                 nodes.document(),
                 Some(nodes),
@@ -1015,7 +1112,8 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 context.budget.xml_base_resolution(),
                 &mut output,
             )
-            .map_err(|error| map_c14n_limit_error(error, &context.budget.c14n))?;
+            .map_err(|error| map_c14n_limit_error(error, &context.budget.c14n))?
+        };
         context.budget.c14n.charge(output.len())?;
         return execute_transform_chain(
             source_signature,
@@ -1023,13 +1121,22 @@ fn execute_transform_chain<'s, 'e, 'd>(
             TransformData::Binary(output),
             remaining,
             Some(position),
+            dependency_tracking,
             context,
         );
     }
 
     if matches!(transform, Transform::Enveloped) {
         let Some(signature) = enveloped_signature else {
-            return execute_transform_chain(source_signature, None, data, remaining, None, context);
+            return execute_transform_chain(
+                source_signature,
+                None,
+                data,
+                remaining,
+                None,
+                dependency_tracking,
+                context,
+            );
         };
         let data = apply_transform_with_options_and_state(
             signature,
@@ -1045,6 +1152,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
             data,
             remaining,
             None,
+            dependency_tracking,
             context,
         );
     }
@@ -1057,14 +1165,43 @@ fn execute_transform_chain<'s, 'e, 'd>(
         context.budget,
         context.state,
     )?;
+    if let Some(tracking) = &mut dependency_tracking {
+        match &data {
+            TransformData::NodeSet(nodes) => tracking.active_nodes.retain(|(_, node_id)| {
+                nodes
+                    .document()
+                    .get_node(*node_id)
+                    .is_some_and(|node| nodes.contains(node))
+            }),
+            TransformData::Binary(_) => {
+                tracking
+                    .opaque_dependencies
+                    .extend(tracking.active_nodes.drain(..).map(|(index, _)| index));
+                tracking.canonical_positions = None;
+            }
+        }
+    }
     execute_transform_chain(
         source_signature,
         enveloped_signature,
         data,
         remaining,
         None,
+        dependency_tracking,
         context,
     )
+}
+
+fn dependency_indexes(tracking: Option<DependencyTracking>) -> HashSet<usize> {
+    let Some(tracking) = tracking else {
+        return HashSet::new();
+    };
+    tracking
+        .active_nodes
+        .into_iter()
+        .map(|(index, _)| index)
+        .chain(tracking.opaque_dependencies)
+        .collect()
 }
 
 fn transform_requires_node_set(transform: &Transform) -> bool {

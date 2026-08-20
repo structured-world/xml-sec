@@ -47,12 +47,16 @@ fn output_limit_error(max_bytes: usize) -> C14nError {
 /// dedicated fixup in C14N 1.1; `xml:id` is never inherited in C14N 1.1.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
+type TrackedPositions = Vec<(NodeId, usize)>;
+
 struct CanonicalOutput<'a> {
     bytes: &'a mut Vec<u8>,
     max_len: Option<usize>,
     limit_exceeded: bool,
     tracked_element: Option<NodeId>,
     tracked_position: Option<usize>,
+    tracked_elements: Option<&'a [NodeId]>,
+    tracked_positions: Vec<(NodeId, usize)>,
     xml_base_resolution: &'a XmlBaseResolutionBudget,
 }
 
@@ -80,6 +84,12 @@ impl CanonicalOutput<'_> {
         if self.tracked_element == Some(node.id()) {
             self.tracked_position = Some(self.bytes.len());
         }
+        if self
+            .tracked_elements
+            .is_some_and(|tracked| tracked.contains(&node.id()))
+        {
+            self.tracked_positions.push((node.id(), self.bytes.len()));
+        }
     }
 }
 
@@ -104,6 +114,7 @@ pub(crate) struct C14nConfig {
 #[derive(Clone, Copy)]
 pub(crate) struct CanonicalOutputOptions<'a> {
     tracked_element: Option<NodeId>,
+    tracked_elements: Option<&'a [NodeId]>,
     max_output_bytes: Option<usize>,
     xml_base_resolution: &'a XmlBaseResolutionBudget,
 }
@@ -115,6 +126,7 @@ impl<'a> CanonicalOutputOptions<'a> {
     ) -> Self {
         Self {
             tracked_element,
+            tracked_elements: None,
             max_output_bytes: None,
             xml_base_resolution,
         }
@@ -127,6 +139,21 @@ impl<'a> CanonicalOutputOptions<'a> {
     ) -> Self {
         Self {
             tracked_element,
+            tracked_elements: None,
+            max_output_bytes: Some(max_output_bytes),
+            xml_base_resolution,
+        }
+    }
+
+    #[cfg(any(feature = "xmldsig", test))]
+    pub(crate) fn bounded_many(
+        tracked_elements: &'a [NodeId],
+        max_output_bytes: usize,
+        xml_base_resolution: &'a XmlBaseResolutionBudget,
+    ) -> Self {
+        Self {
+            tracked_element: None,
+            tracked_elements: Some(tracked_elements),
             max_output_bytes: Some(max_output_bytes),
             xml_base_resolution,
         }
@@ -243,6 +270,49 @@ pub(crate) fn serialize_canonical_visible_with_position_bounded(
     options: CanonicalOutputOptions<'_>,
     output: &mut Vec<u8>,
 ) -> Result<Option<usize>, C14nError> {
+    let (position, _) = serialize_canonical_visible_with_positions_bounded_impl(
+        doc,
+        visibility,
+        with_comments,
+        ns_renderer,
+        config,
+        options,
+        output,
+    )?;
+    Ok(position)
+}
+
+#[cfg(any(feature = "xmldsig", test))]
+pub(crate) fn serialize_canonical_visible_with_positions_bounded(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    with_comments: bool,
+    ns_renderer: &dyn NsRenderer,
+    config: C14nConfig,
+    options: CanonicalOutputOptions<'_>,
+    output: &mut Vec<u8>,
+) -> Result<TrackedPositions, C14nError> {
+    let (_, positions) = serialize_canonical_visible_with_positions_bounded_impl(
+        doc,
+        visibility,
+        with_comments,
+        ns_renderer,
+        config,
+        options,
+        output,
+    )?;
+    Ok(positions)
+}
+
+fn serialize_canonical_visible_with_positions_bounded_impl(
+    doc: &Document,
+    visibility: Option<&dyn NodeVisibility>,
+    with_comments: bool,
+    ns_renderer: &dyn NsRenderer,
+    config: C14nConfig,
+    options: CanonicalOutputOptions<'_>,
+    output: &mut Vec<u8>,
+) -> Result<(Option<usize>, TrackedPositions), C14nError> {
     let root = doc.root();
     let max_len = match options.max_output_bytes {
         Some(limit) => Some(
@@ -259,6 +329,8 @@ pub(crate) fn serialize_canonical_visible_with_position_bounded(
         limit_exceeded: false,
         tracked_element: options.tracked_element,
         tracked_position: None,
+        tracked_elements: options.tracked_elements,
+        tracked_positions: Vec::new(),
         xml_base_resolution: options.xml_base_resolution,
     };
     let result = serialize_children(
@@ -276,7 +348,7 @@ pub(crate) fn serialize_canonical_visible_with_position_bounded(
         ));
     }
     result?;
-    Ok(output.tracked_position)
+    Ok((output.tracked_position, output.tracked_positions))
 }
 
 /// Serialize children of a node in document order.
@@ -337,6 +409,7 @@ fn serialize_children(
                     // Document-level text nodes are ignored by C14N.
                     // Only text inside elements is serialized.
                     if !is_doc_root && let Some(text) = child.text() {
+                        output.track(child);
                         escape_text(text, output)?;
                     }
                 }

@@ -50,12 +50,13 @@ pub fn decode_xml_octets(bytes: &[u8]) -> Result<Cow<'_, str>, XmlEncodingError>
         if payload.len() % 2 != 0 {
             return Err(XmlEncodingError::OddUtf16Length);
         }
-        let code_units = payload.chunks_exact(2).map(|chunk| {
-            let bytes = [chunk[0], chunk[1]];
+        let (chunks, remainder) = payload.as_chunks::<2>();
+        debug_assert!(remainder.is_empty());
+        let code_units = chunks.iter().map(|bytes| {
             if matches!(byte_order, Utf16ByteOrder::LittleEndian) {
-                u16::from_le_bytes(bytes)
+                u16::from_le_bytes(*bytes)
             } else {
-                u16::from_be_bytes(bytes)
+                u16::from_be_bytes(*bytes)
             }
         });
         let decoded = String::from_utf16(&code_units.collect::<Vec<_>>())?;

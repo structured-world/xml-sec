@@ -37,8 +37,8 @@ use super::parse::{
 };
 use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget, TransformOptions,
-    XPathHereSemantics, XPathSignatureParseBudget, execute_transforms_with_options_and_budget,
-    node_set_before_binary_transform, parse_transforms_with_budget,
+    XPathHereSemantics, XPathSignatureParseBudget, execute_transforms_with_dependency_nodes,
+    execute_transforms_with_options_and_budget, parse_transforms_with_budget,
     transform_chain_produces_binary,
 };
 use super::types::TransformError;
@@ -1078,7 +1078,21 @@ fn fill_manifest_reference_digest_values_with_options(
     let mut xpath_budget = XPathSignatureParseBudget::default();
     let signed_info_references =
         parse_signing_references_with_budget(signed_info, &mut xpath_budget)?;
-    let manifest_references = parse_signing_manifest_references(signature, &mut xpath_budget)?;
+    validate_signing_references(
+        &signed_info_references,
+        signed_info_references.len(),
+        Some(policy),
+    )?;
+    let reference_limit = policy
+        .resources
+        .max_references
+        .min(MAX_REFERENCES_PER_SIGNATURE);
+    let manifest_references = parse_signing_manifest_references(
+        signature,
+        &mut xpath_budget,
+        reference_limit.saturating_sub(signed_info_references.len()),
+        reference_limit,
+    )?;
     let total_references = signed_info_references
         .len()
         .checked_add(manifest_references.len())
@@ -1087,16 +1101,17 @@ fn fill_manifest_reference_digest_values_with_options(
     if manifest_references.is_empty() {
         return Ok(xml.to_owned());
     }
-    let dependency_levels = manifest_reference_dependency_levels(
+    let mut dependency_plan = manifest_reference_dependency_levels(
         &doc,
         signature,
         &manifest_references,
         transform_options,
+        provider,
         execution_budget,
         id_attributes,
     )?;
     let mut filled = xml.to_owned();
-    for level in dependency_levels {
+    for level in dependency_plan.levels {
         let current_doc = parse_signing_document(&filled, Some(policy))?;
         let current_signature = find_signing_signature_node(
             &current_doc,
@@ -1105,23 +1120,34 @@ fn fill_manifest_reference_digest_values_with_options(
         let current_references = parse_signing_manifest_references(
             current_signature,
             &mut XPathSignatureParseBudget::default(),
+            reference_limit.saturating_sub(signed_info_references.len()),
+            reference_limit,
         )?;
-        let selected = level
-            .iter()
-            .map(|index| current_references[*index].clone())
-            .collect::<Vec<_>>();
-        let values = compute_signing_reference_digests(
-            &current_doc,
-            current_signature,
-            selected,
-            transform_options,
-            provider,
-            execution_budget,
-            id_attributes,
-        )?;
-        let replacements = level
-            .into_iter()
-            .zip(values.into_iter().map(|digest| digest.digest_value));
+        let mut replacements = Vec::with_capacity(level.len());
+        for index in level {
+            let digest_value = if let Some(value) = dependency_plan.precomputed.remove(&index) {
+                value
+            } else {
+                let mut computed = compute_signing_reference_digests(
+                    &current_doc,
+                    current_signature,
+                    vec![current_references[index].clone()],
+                    transform_options,
+                    provider,
+                    execution_budget,
+                    id_attributes,
+                )?;
+                computed
+                    .pop()
+                    .ok_or_else(|| {
+                        SigningDigestError::InvalidStructure(
+                            "signing Reference did not produce a digest".into(),
+                        )
+                    })?
+                    .digest_value
+            };
+            replacements.push((index, digest_value));
+        }
         filled = fill_selected_manifest_digest_values_at_index_with_options(
             &filled,
             replacements,
@@ -1132,43 +1158,66 @@ fn fill_manifest_reference_digest_values_with_options(
     Ok(filled)
 }
 
+struct ManifestDependencyPlan {
+    levels: Vec<Vec<usize>>,
+    precomputed: std::collections::HashMap<usize, String>,
+}
+
 fn manifest_reference_dependency_levels(
     doc: &Document<'_>,
     signature: Node<'_, '_>,
     references: &[SigningReference],
     transform_options: TransformOptions,
+    provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
     id_attributes: &[crate::IdAttributeRegistration],
-) -> Result<Vec<Vec<usize>>, SigningDigestError> {
+) -> Result<ManifestDependencyPlan, SigningDigestError> {
     let resolver = UriReferenceResolver::with_id_registrations(doc, id_attributes);
-    let mut dependencies = references
+    let analyses = references
         .iter()
         .map(|reference| {
             let initial_data = resolver.dereference_with_budget(
                 &reference.uri,
                 execution_budget.node_set_materialization(),
             )?;
-            let Some(effective_nodes) = node_set_before_binary_transform(
+            let output = execute_transforms_with_dependency_nodes(
                 signature,
                 initial_data,
                 &reference.transforms,
                 transform_options,
                 execution_budget,
-            )?
-            else {
-                return Ok(HashSet::new());
-            };
-            Ok(references
-                .iter()
-                .enumerate()
-                .filter_map(|(index, candidate)| {
-                    doc.get_node(candidate.digest_value_node_id)
-                        .is_some_and(|node| effective_nodes.contains(node))
-                        .then_some(index)
-                })
-                .collect::<HashSet<_>>())
+                references
+                    .iter()
+                    .enumerate()
+                    .map(|(index, candidate)| (index, candidate.digest_value_node_id))
+                    .collect(),
+            )?;
+            Ok((output.dependencies, output.bytes))
         })
         .collect::<Result<Vec<_>, SigningDigestError>>()?;
+    let mut dependencies = analyses
+        .iter()
+        .map(|(dependencies, _)| dependencies.clone())
+        .collect::<Vec<_>>();
+    let precomputed = analyses
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, (dependencies, pre_digest))| {
+            dependencies.is_empty().then(|| {
+                super::compute_digest_with_provider(
+                    provider,
+                    references[index].digest_method,
+                    &pre_digest,
+                )
+                .map(|digest| {
+                    (
+                        index,
+                        base64::engine::general_purpose::STANDARD.encode(digest),
+                    )
+                })
+            })
+        })
+        .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
     let mut completed = vec![false; references.len()];
     let mut levels = Vec::new();
     while completed.iter().any(|done| !done) {
@@ -1200,7 +1249,10 @@ fn manifest_reference_dependency_levels(
         signature.range().start <= reference.digest_value_range.start
             && signature.range().end >= reference.digest_value_range.end
     }));
-    Ok(levels)
+    Ok(ManifestDependencyPlan {
+        levels,
+        precomputed,
+    })
 }
 
 fn validate_signing_references(
@@ -1553,6 +1605,8 @@ fn parse_signing_references_with_budget(
 fn parse_signing_manifest_references(
     signature: Node<'_, '_>,
     xpath_budget: &mut XPathSignatureParseBudget,
+    mut remaining_capacity: usize,
+    maximum_references: usize,
 ) -> Result<Vec<SigningReference>, SigningDigestError> {
     let mut references = Vec::new();
     for manifest in signature
@@ -1567,6 +1621,15 @@ fn parse_signing_manifest_references(
         let mut manifest_references = 0usize;
         for child in element_children(manifest) {
             verify_ds_element(child, "Reference")?;
+            if remaining_capacity == 0 {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "signature references",
+                    maximum: maximum_references,
+                    actual: maximum_references.saturating_add(1),
+                }
+                .into());
+            }
+            remaining_capacity -= 1;
             references.push(parse_signing_reference(child, xpath_budget)?);
             manifest_references += 1;
         }

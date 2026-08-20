@@ -1729,9 +1729,12 @@ fn parse_manifest_references(
                 && node.tag_name().name() == "Manifest"
         }) {
             let manifest_is_signed = authenticated_nodes.contains(&manifest_node.id());
-            if (!object_is_signed && !manifest_is_signed)
-                || !processed_manifests.insert(manifest_node.id())
-            {
+            // Leave unauthenticated Manifests unmarked so a verified outer
+            // Manifest can make them eligible on the next discovery pass.
+            if !object_is_signed && !manifest_is_signed {
+                continue;
+            }
+            if !processed_manifests.insert(manifest_node.id()) {
                 continue;
             }
             let mut manifest_children = Vec::new();
@@ -3763,6 +3766,52 @@ mod tests {
                 reason: "signed Manifests exceed the per-signature Reference limit"
             }
         ));
+    }
+
+    #[test]
+    fn unsigned_manifest_remains_eligible_after_trust_expands() {
+        // The second Object is not authenticated during the first discovery
+        // pass. It must remain unprocessed so a valid reference from the first
+        // Manifest can make its sibling Manifest eligible on the next pass.
+        let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+        let xml = format!(
+            r##"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:Object Id="outer"><ds:Manifest><ds:Reference URI="#inner"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object><ds:Object Id="inner"><ds:Manifest><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature>"##
+        );
+        let document = Document::parse(&xml).expect("nested Manifest fixture must parse");
+        let signature = document.root_element();
+        let mut objects = signature.children().filter(|node| node.is_element());
+        let outer = objects.next().expect("outer Object");
+        let inner = objects.next().expect("inner Object");
+        let mut authenticated = HashSet::from([outer.id()]);
+        let mut processed = HashSet::new();
+        let mut remaining = 2;
+        let mut next_index = 0;
+        let mut xpath_budget = XPathSignatureParseBudget::default();
+
+        let first = parse_manifest_references(
+            signature,
+            &authenticated,
+            &mut processed,
+            &mut remaining,
+            &mut next_index,
+            &mut xpath_budget,
+        )
+        .expect("outer Manifest must be discovered");
+        assert_eq!(first.references.len(), 1);
+        assert_eq!(first.references[0].1.uri.as_deref(), Some("#inner"));
+
+        authenticated.insert(inner.id());
+        let second = parse_manifest_references(
+            signature,
+            &authenticated,
+            &mut processed,
+            &mut remaining,
+            &mut next_index,
+            &mut xpath_budget,
+        )
+        .expect("newly authenticated sibling Manifest must remain eligible");
+        assert_eq!(second.references.len(), 1);
+        assert_eq!(second.references[0].1.uri.as_deref(), Some("#payload"));
     }
 
     #[test]
