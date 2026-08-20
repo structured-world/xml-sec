@@ -19,32 +19,39 @@ pub enum XmlEncodingError {
     InvalidUtf8(#[from] std::str::Utf8Error),
 }
 
+#[derive(Clone, Copy)]
+enum Utf16ByteOrder {
+    LittleEndian,
+    BigEndian,
+}
+
 /// Decode XML 1.0 octets encoded as UTF-8 or BOM-marked UTF-16.
 ///
 /// UTF-16 input becomes UTF-8-backed Rust text, so its XML declaration is
-/// normalized to `UTF-8`; a contradictory declaration fails closed.
+/// normalized to `UTF-8`; a contradictory encoding or explicit byte order
+/// fails closed.
 pub fn decode_xml_octets(bytes: &[u8]) -> Result<Cow<'_, str>, XmlEncodingError> {
-    let (utf16, little_endian) = if let Some(payload) = bytes.strip_prefix(&[0xff, 0xfe]) {
-        (Some(payload), true)
-    } else if let Some(payload) = bytes.strip_prefix(&[0xfe, 0xff]) {
-        (Some(payload), false)
+    let utf16 = if let Some(payload) = bytes.strip_prefix(&[0xff, 0xfe]) {
+        Some((payload, Utf16ByteOrder::LittleEndian))
     } else {
-        (None, false)
+        bytes
+            .strip_prefix(&[0xfe, 0xff])
+            .map(|payload| (payload, Utf16ByteOrder::BigEndian))
     };
-    if let Some(payload) = utf16 {
+    if let Some((payload, byte_order)) = utf16 {
         if payload.len() % 2 != 0 {
             return Err(XmlEncodingError::OddUtf16Length);
         }
         let code_units = payload.chunks_exact(2).map(|chunk| {
             let bytes = [chunk[0], chunk[1]];
-            if little_endian {
+            if matches!(byte_order, Utf16ByteOrder::LittleEndian) {
                 u16::from_le_bytes(bytes)
             } else {
                 u16::from_be_bytes(bytes)
             }
         });
         let decoded = String::from_utf16(&code_units.collect::<Vec<_>>())?;
-        return normalize_transcoded_declaration(decoded).map(Cow::Owned);
+        return normalize_transcoded_declaration(decoded, byte_order).map(Cow::Owned);
     }
 
     let payload = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
@@ -53,7 +60,10 @@ pub fn decode_xml_octets(bytes: &[u8]) -> Result<Cow<'_, str>, XmlEncodingError>
         .map_err(XmlEncodingError::from)
 }
 
-fn normalize_transcoded_declaration(mut xml: String) -> Result<String, XmlEncodingError> {
+fn normalize_transcoded_declaration(
+    mut xml: String,
+    byte_order: Utf16ByteOrder,
+) -> Result<String, XmlEncodingError> {
     let Some(declaration_end) = xml.strip_prefix("<?xml").and_then(|rest| rest.find("?>")) else {
         return Ok(xml);
     };
@@ -88,17 +98,16 @@ fn normalize_transcoded_declaration(mut xml: String) -> Result<String, XmlEncodi
     };
     let value_end = value_start + relative_end;
     let declared = &xml[value_start..value_end];
-    if !matches_ignore_ascii_case(declared, &["UTF-16", "UTF-16LE", "UTF-16BE"]) {
+    let declaration_matches = declared.eq_ignore_ascii_case("UTF-16")
+        || declared.eq_ignore_ascii_case(match byte_order {
+            Utf16ByteOrder::LittleEndian => "UTF-16LE",
+            Utf16ByteOrder::BigEndian => "UTF-16BE",
+        });
+    if !declaration_matches {
         return Err(XmlEncodingError::ConflictingDeclaration(declared.into()));
     }
     xml.replace_range(value_start..value_end, "UTF-8");
     Ok(xml)
-}
-
-fn matches_ignore_ascii_case(value: &str, expected: &[&str]) -> bool {
-    expected
-        .iter()
-        .any(|candidate| value.eq_ignore_ascii_case(candidate))
 }
 
 #[cfg(test)]
@@ -109,15 +118,28 @@ mod tests {
     fn transcoding_normalizes_utf16_declarations() {
         // Once code units become a Rust string, subsequent serializers emit
         // UTF-8 bytes; the declaration must describe that representation.
-        for declaration in [
-            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>",
-            "<?xml version='1.0' encoding = 'utf-16le'?>",
+        for (bom, encode, declaration) in [
+            (
+                [0xff, 0xfe],
+                u16::to_le_bytes as fn(u16) -> [u8; 2],
+                "<?xml version=\"1.0\" encoding=\"UTF-16\"?>",
+            ),
+            (
+                [0xff, 0xfe],
+                u16::to_le_bytes as fn(u16) -> [u8; 2],
+                "<?xml version='1.0' encoding = 'utf-16le'?>",
+            ),
+            (
+                [0xfe, 0xff],
+                u16::to_be_bytes as fn(u16) -> [u8; 2],
+                "<?xml version=\"1.0\" encoding=\"UTF-16BE\"?>",
+            ),
         ] {
-            let mut bytes = vec![0xff, 0xfe];
+            let mut bytes = bom.to_vec();
             bytes.extend(
                 format!("{declaration}<root/>")
                     .encode_utf16()
-                    .flat_map(u16::to_le_bytes),
+                    .flat_map(encode),
             );
             let decoded = decode_xml_octets(&bytes).expect("valid UTF-16 XML declaration");
             assert!(
@@ -138,5 +160,29 @@ mod tests {
             decode_xml_octets(&bytes),
             Err(XmlEncodingError::ConflictingDeclaration(_))
         ));
+
+        for (bom, encode, declared) in [
+            (
+                [0xff, 0xfe],
+                u16::to_le_bytes as fn(u16) -> [u8; 2],
+                "UTF-16BE",
+            ),
+            (
+                [0xfe, 0xff],
+                u16::to_be_bytes as fn(u16) -> [u8; 2],
+                "UTF-16LE",
+            ),
+        ] {
+            let mut bytes = bom.to_vec();
+            bytes.extend(
+                format!("<?xml version=\"1.0\" encoding=\"{declared}\"?><root/>")
+                    .encode_utf16()
+                    .flat_map(encode),
+            );
+            assert!(matches!(
+                decode_xml_octets(&bytes),
+                Err(XmlEncodingError::ConflictingDeclaration(_))
+            ));
+        }
     }
 }
