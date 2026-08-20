@@ -886,12 +886,7 @@ fn load_certificate_companions(
 ) -> Result<Vec<Vec<u8>>, CommandError> {
     paths
         .iter()
-        .map(|path| {
-            let (certificate, source_len) =
-                key_material::load_certificate_with_source_len(path, encoding)?;
-            budget.charge(source_len)?;
-            Ok(certificate)
-        })
+        .map(|path| load_certificate_with_budget(path, encoding, budget))
         .collect()
 }
 
@@ -1111,25 +1106,22 @@ fn load_configured_certificates(
     };
     for name in lookup_names {
         for option in invocation.values(name) {
-            let (certificate, source_len) = key_material::load_certificate_with_source_len(
+            let certificate = load_certificate_with_budget(
                 option.value.as_deref().unwrap_or_default(),
                 certificate_encoding(option),
+                budget,
             )?;
-            push_configured_certificate(&mut certificates.lookup, certificate, source_len, budget)?;
+            push_configured_certificate(&mut certificates.lookup, certificate);
         }
     }
     for name in ["trusted-pem", "trusted-der"] {
         for option in invocation.values(name) {
-            let (certificate, source_len) = key_material::load_certificate_with_source_len(
+            let certificate = load_certificate_with_budget(
                 option.value.as_deref().unwrap_or_default(),
                 certificate_encoding(option),
-            )?;
-            push_configured_certificate(
-                &mut certificates.trusted,
-                certificate,
-                source_len,
                 budget,
             )?;
+            push_configured_certificate(&mut certificates.trusted, certificate);
         }
     }
     Ok(certificates)
@@ -1155,18 +1147,21 @@ impl ExternalMaterialBudget {
     }
 }
 
-fn push_configured_certificate(
-    certificates: &mut Vec<Vec<u8>>,
-    certificate: Vec<u8>,
-    source_bytes: usize,
-    budget: &mut ExternalMaterialBudget,
-) -> Result<(), CommandError> {
-    budget.charge(source_bytes)?;
+fn push_configured_certificate(certificates: &mut Vec<Vec<u8>>, certificate: Vec<u8>) {
     if certificates.iter().any(|existing| existing == &certificate) {
-        return Ok(());
+        return;
     }
     certificates.push(certificate);
-    Ok(())
+}
+
+fn load_certificate_with_budget(
+    path: &OsStr,
+    encoding: key_material::CertificateEncoding,
+    budget: &mut ExternalMaterialBudget,
+) -> Result<Vec<u8>, CommandError> {
+    let bytes = key_material::read(path)?;
+    budget.charge(bytes.len())?;
+    key_material::decode_certificate(Path::new(path), &bytes, encoding).map_err(CommandError::from)
 }
 
 fn write_verification_diagnostics(
@@ -1441,11 +1436,11 @@ fn load_explicit_certificate_key_info(
     certificate: &crate::OptionValue,
     budget: &mut ExternalMaterialBudget,
 ) -> Result<KeyInfo, CommandError> {
-    let (certificate_der, source_len) = key_material::load_certificate_with_source_len(
+    let certificate_der = load_certificate_with_budget(
         certificate.value.as_deref().unwrap_or_default(),
         certificate_encoding(certificate),
+        budget,
     )?;
-    budget.charge(source_len)?;
     // Model the caller-pinned leaf as the sole document key source. The core
     // resolver can then build its path through caller-supplied intermediates
     // and anchors without allowing the document's embedded KeyInfo to replace
@@ -1601,6 +1596,9 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                     Ok(key) => {
                         selected = Some((option, certificate, key.public_key));
                         break;
+                    }
+                    Err(error @ CommandError::ExternalMaterialTooLarge { .. }) => {
+                        return Err(error);
                     }
                     Err(error) => last_error = Some(error),
                 }
@@ -1798,9 +1796,10 @@ fn load_rsa_recipient_candidate(
             certificate_der: None,
         },
         RecipientPublicKeySource::Certificate(encoding) => {
-            let (public_key, certificate_der, source_len) =
-                key_material::load_rsa_certificate_public(path, encoding)?;
-            certificate_budget.charge(source_len)?;
+            let bytes = key_material::read(path)?;
+            certificate_budget.charge(bytes.len())?;
+            let (public_key, certificate_der) =
+                key_material::decode_rsa_certificate_public(Path::new(path), &bytes, encoding)?;
             RecipientPublicKeyCandidate {
                 public_key,
                 certificate_der: Some(certificate_der),
@@ -3310,6 +3309,29 @@ mod tests {
     }
 
     #[test]
+    fn certificate_recipient_key_is_charged_before_decode() {
+        // Aggregate source accounting must reject certificate bytes before PEM
+        // or X.509 parsing, just as it does for raw public-key candidates.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("malformed.pem");
+        fs::write(&path, b"xx").unwrap();
+        let mut budget = ExternalMaterialBudget::new(1);
+
+        let error = load_rsa_recipient_candidate(
+            path.as_os_str(),
+            RecipientPublicKeySource::Certificate(key_material::CertificateEncoding::Pem),
+            &EncryptionPolicy::default(),
+            &mut budget,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CommandError::ExternalMaterialTooLarge { maximum: 1 }
+        ));
+    }
+
+    #[test]
     fn capability_checks_reject_unknown_names() {
         let mut output = Vec::new();
         assert!(
@@ -3695,13 +3717,15 @@ mod tests {
         // trust material must be rejected before crossing the compiled total.
         let mut certificates = Vec::new();
         let mut budget = ExternalMaterialBudget::new(5);
-        push_configured_certificate(&mut certificates, vec![1, 2], 2, &mut budget).unwrap();
-        push_configured_certificate(&mut certificates, vec![1, 2], 2, &mut budget).unwrap();
+        budget.charge(2).unwrap();
+        push_configured_certificate(&mut certificates, vec![1, 2]);
+        budget.charge(2).unwrap();
+        push_configured_certificate(&mut certificates, vec![1, 2]);
         assert_eq!(certificates, [vec![1, 2]]);
         assert_eq!(budget.total_bytes, 4);
 
         assert!(matches!(
-            push_configured_certificate(&mut certificates, vec![3, 4], 2, &mut budget),
+            budget.charge(2),
             Err(CommandError::ExternalMaterialTooLarge { maximum: 5 })
         ));
         assert_eq!(certificates, [vec![1, 2]]);

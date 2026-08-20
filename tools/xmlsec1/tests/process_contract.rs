@@ -4959,7 +4959,10 @@ fn certificate_embedding_preserves_existing_key_info_sources() {
     let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
     let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
     let signed = temp.path().join("signed.xml");
-    let template_xml = fs::read_to_string(source).unwrap();
+    let template_xml = fs::read_to_string(source).unwrap().replace(
+        "<X509Data/>",
+        "<X509Data Id=\"caller\"><X509CRL>Y3Js</X509CRL></X509Data>",
+    );
     fs::write(&template, template_xml).unwrap();
     let compound = format!("{},{}", private_key.display(), certificate.display());
 
@@ -5001,6 +5004,18 @@ fn certificate_embedding_preserves_existing_key_info_sources() {
             })
             .count(),
         1
+    );
+    let x509_data = document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "X509Data")))
+        .unwrap();
+    assert_eq!(x509_data.attribute("Id"), Some("caller"));
+    assert_eq!(
+        x509_data
+            .children()
+            .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "X509CRL")))
+            .and_then(|node| node.text()),
+        Some("Y3Js")
     );
 
     let verify = Command::new(binary())

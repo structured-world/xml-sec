@@ -348,6 +348,7 @@ fn valid_spki(bytes: &[u8]) -> bool {
     x509_parser::x509::SubjectPublicKeyInfo::from_der(bytes).is_ok_and(|(rest, _)| rest.is_empty())
 }
 
+#[cfg(test)]
 pub(crate) fn load_certificate_with_source_len(
     path: impl AsRef<Path>,
     encoding: CertificateEncoding,
@@ -355,21 +356,31 @@ pub(crate) fn load_certificate_with_source_len(
     let path = path.as_ref();
     let bytes = read(path)?;
     let source_len = bytes.len();
+    let der = decode_certificate(path, &bytes, encoding)?;
+    Ok((der, source_len))
+}
+
+/// Decode certificate bytes after the operation layer has charged the source.
+pub(crate) fn decode_certificate(
+    path: &Path,
+    bytes: &[u8],
+    encoding: CertificateEncoding,
+) -> Result<Vec<u8>, KeyMaterialError> {
     let der = match encoding {
         CertificateEncoding::Pem => {
-            let text = std::str::from_utf8(&bytes)
+            let text = std::str::from_utf8(bytes)
                 .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
             parse_pem(text, "CERTIFICATE", path)
                 .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?
         }
-        CertificateEncoding::Der => bytes,
+        CertificateEncoding::Der => bytes.to_vec(),
     };
     let (rest, _) = x509_parser::certificate::X509Certificate::from_der(&der)
         .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
     if !rest.is_empty() {
         return Err(KeyMaterialError::InvalidCertificate(path.to_owned()));
     }
-    Ok((der, source_len))
+    Ok(der)
 }
 
 fn parse_pem(text: &str, expected_label: &str, path: &Path) -> Result<Vec<u8>, KeyMaterialError> {
@@ -435,17 +446,18 @@ pub fn decode_rsa_public(
     .ok_or_else(|| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))
 }
 
-pub fn load_rsa_certificate_public(
-    path: impl AsRef<Path>,
+/// Decode an RSA certificate after the operation layer has charged its source.
+pub(crate) fn decode_rsa_certificate_public(
+    path: &Path,
+    bytes: &[u8],
     encoding: CertificateEncoding,
-) -> Result<(RsaPublicKey, Vec<u8>, usize), KeyMaterialError> {
-    let path = path.as_ref();
-    let (der, source_len) = load_certificate_with_source_len(path, encoding)?;
+) -> Result<(RsaPublicKey, Vec<u8>), KeyMaterialError> {
+    let der = decode_certificate(path, bytes, encoding)?;
     let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(&der)
         .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
     let public_key = RsaPublicKey::from_public_key_der(certificate.public_key().raw)
         .map_err(|_| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))?;
-    Ok((public_key, der, source_len))
+    Ok((public_key, der))
 }
 
 pub fn load_symmetric(

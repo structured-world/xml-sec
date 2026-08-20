@@ -49,6 +49,9 @@ UTF-16 declarations are normalized to UTF-8 when the decoded document is
 emitted through the Rust string-based signing or encryption pipelines.
 Generic `UTF-16` declarations follow the required BOM; explicit `UTF-16LE` or
 `UTF-16BE` declarations that contradict the BOM are rejected.
+UTF-8 inputs likewise require an absent declaration or a case-insensitive
+`UTF-8` declaration; labels for a different byte encoding are rejected before
+the document reaches signing, verification, or encryption processing.
 `--print-crypto-library-errors` is accepted for donor argv compatibility. The
 fixed RustCrypto provider has no process-global OpenSSL error queue, so the flag
 does not add a second diagnostic stream beyond the operation error already
@@ -109,6 +112,9 @@ sign its populated `KeyInfo` by ID. Omitting `KeyInfo` leaves the signed output
 without `KeyInfo`. Preserved RSA/EC `KeyValue`, `DEREncodedKeyValue`, and X.509
 identity sources must identify the selected signing key; selector-only
 `X509Data` additionally requires a matching signing-certificate companion.
+When generated certificate identity replaces existing `X509Data` assertions,
+caller-owned `X509CRL`, extension children, and container attributes remain in
+the same source.
 Named signing keys
 require a matching template `KeyName` even when only one key is supplied. A
 named key with no template `KeyName` fails unless `--lax-key-search` explicitly

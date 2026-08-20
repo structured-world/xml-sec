@@ -26,6 +26,8 @@ recognized but inapplicable rather than as malformed command syntax. XML inputs
 accept UTF-8 and BOM-marked UTF-16LE/BE; transcoded declarations are emitted as
 UTF-8 so the declaration remains consistent with output bytes. Explicit
 UTF-16LE/BE declarations must agree with the BOM byte order.
+UTF-8 octets must either omit the encoding declaration or declare `UTF-8`;
+contradictory labels are rejected before XML processing.
 
 ## Keys and certificates
 
@@ -35,6 +37,8 @@ leaf-first and can populate an existing `KeyInfo`; document-selected
 certificates require caller trust unless `--insecure` is explicit. Named and
 lax key lookup remains fail-closed on ambiguous or contradictory identity data,
 including preserved signing `KeyValue`, `DEREncodedKeyValue`, and `X509Data`.
+Generated signing certificates replace stale X.509 identity assertions without
+discarding caller-owned CRLs, extension children, or `X509Data` attributes.
 
 ## Encryption
 

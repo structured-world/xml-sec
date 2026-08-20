@@ -416,6 +416,9 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     let generated_key_name = sources
         .iter()
         .any(|(namespace, name, _)| is_dsig_key_name(namespace.as_deref(), name));
+    let generated_x509_data = generated_key_material_sources
+        .iter()
+        .any(|(namespace, name)| is_dsig_x509_data(*namespace, name));
     let mut output = xml.to_owned();
     if !generated_key_material_sources.is_empty() || generated_key_name {
         // Writer-provided identity is authoritative within its own group.
@@ -424,7 +427,7 @@ pub(super) fn merge_key_info_source_at_index_with_options(
         let mut stale_ranges = key_info
             .children()
             .filter(|node| node.is_element())
-            .filter(|node| {
+            .flat_map(|node| {
                 let replaces_key_material = !generated_key_material_sources.is_empty()
                     && is_cryptographic_key_info_source(
                         node.tag_name().namespace(),
@@ -432,11 +435,23 @@ pub(super) fn merge_key_info_source_at_index_with_options(
                     );
                 let replaces_key_name = generated_key_name
                     && is_dsig_key_name(node.tag_name().namespace(), node.tag_name().name());
-                (replaces_key_material || replaces_key_name)
-                    && has_cryptographic_identity_content(*node)
-                    && !is_matching_empty_placeholder(*node, &generated_key_material_sources)
+                if !(replaces_key_material || replaces_key_name)
+                    || !has_cryptographic_identity_content(node)
+                    || is_matching_empty_placeholder(node, &generated_key_material_sources)
+                {
+                    return Vec::new();
+                }
+                if generated_x509_data
+                    && is_dsig_x509_data(node.tag_name().namespace(), node.tag_name().name())
+                {
+                    return node
+                        .children()
+                        .filter(|child| child.is_element() && is_x509_identity_child(*child))
+                        .map(|child| child.range())
+                        .collect();
+                }
+                vec![node.range()]
             })
-            .map(|node| node.range())
             .collect::<Vec<_>>();
         stale_ranges.sort_by_key(|range| std::cmp::Reverse(range.start));
         for range in stale_ranges {
@@ -485,8 +500,13 @@ fn merge_one_key_info_source_at_index_with_options(
     }
     let key_info = key_infos[0];
 
+    let source_is_x509_data =
+        is_dsig_x509_data(source.tag_name().namespace(), source.tag_name().name());
     if let Some(placeholder) = key_info.children().find(|node| {
-        node.is_element() && node.tag_name() == source.tag_name() && is_reusable_placeholder(*node)
+        node.is_element()
+            && node.tag_name() == source.tag_name()
+            && (is_reusable_placeholder(*node)
+                || (source_is_x509_data && has_x509_mergeable_metadata(*node)))
     }) {
         let placeholder_fragment = &xml[placeholder.range()];
         let placeholder_opening_end = element_opening_end(placeholder_fragment)
@@ -560,12 +580,23 @@ fn merge_one_key_info_source_at_index_with_options(
                     ));
                     Ok(attributes)
                 })?;
-        let output = replace_element_content(
-            xml,
-            placeholder.range(),
-            source_content,
-            &format!("{generated_namespace_attributes}{generated_attributes}"),
-        )?;
+        let generated_attributes =
+            format!("{generated_namespace_attributes}{generated_attributes}");
+        let output = if is_reusable_placeholder(placeholder) {
+            replace_element_content(
+                xml,
+                placeholder.range(),
+                source_content,
+                &generated_attributes,
+            )?
+        } else {
+            append_element_content(
+                xml,
+                placeholder.range(),
+                source_content,
+                &generated_attributes,
+            )?
+        };
         parse_synthesized_xml_with_options(&output, policy)?;
         return Ok(output);
     }
@@ -685,6 +716,11 @@ fn is_reusable_placeholder(node: roxmltree::Node<'_, '_>) -> bool {
 }
 
 fn has_cryptographic_identity_content(node: roxmltree::Node<'_, '_>) -> bool {
+    if is_dsig_x509_data(node.tag_name().namespace(), node.tag_name().name()) {
+        return node
+            .children()
+            .any(|child| child.is_element() && is_x509_identity_child(child));
+    }
     if node.children().any(|child| child.is_element()) {
         return true;
     }
@@ -700,6 +736,24 @@ fn has_cryptographic_identity_content(node: roxmltree::Node<'_, '_>) -> bool {
             .any(|text| !is_xml_whitespace_only(text)),
         _ => false,
     }
+}
+
+fn is_dsig_x509_data(namespace: Option<&str>, name: &str) -> bool {
+    namespace == Some(XMLDSIG_NS) && name == "X509Data"
+}
+
+fn is_x509_identity_child(node: roxmltree::Node<'_, '_>) -> bool {
+    matches!(
+        (node.tag_name().namespace(), node.tag_name().name()),
+        (
+            Some(XMLDSIG_NS),
+            "X509IssuerSerial" | "X509SKI" | "X509SubjectName" | "X509Certificate"
+        ) | (Some("http://www.w3.org/2009/xmldsig11#"), "X509Digest")
+    )
+}
+
+fn has_x509_mergeable_metadata(node: roxmltree::Node<'_, '_>) -> bool {
+    node.children().any(|child| child.is_element()) && !has_cryptographic_identity_content(node)
 }
 
 fn is_cryptographic_key_info_source(namespace: Option<&str>, name: &str) -> bool {
@@ -776,6 +830,31 @@ fn replace_element_content(
         );
         output.replace_range(range, &replacement);
     }
+    Ok(output)
+}
+
+fn append_element_content(
+    xml: &str,
+    range: Range<usize>,
+    content: &str,
+    namespace_attributes: &str,
+) -> Result<String, XmlMutationError> {
+    let element = &xml[range.clone()];
+    let content_start =
+        element_opening_end(element).ok_or(XmlMutationError::InvalidAppendTarget)?;
+    let content_end = element
+        .rfind("</")
+        .ok_or(XmlMutationError::InvalidAppendTarget)?;
+    let replacement = format!(
+        "{}{}>{}{}{}",
+        &element[..content_start - 1],
+        namespace_attributes,
+        &element[content_start..content_end],
+        content,
+        &element[content_end..]
+    );
+    let mut output = xml.to_owned();
+    output.replace_range(range, &replacement);
     Ok(output)
 }
 
@@ -1528,6 +1607,49 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(key_names, ["generated"]);
+    }
+
+    #[test]
+    fn key_info_source_merge_preserves_x509_revocation_metadata() {
+        // A generated certificate replaces stale identity assertions, but the
+        // caller's CRL and extension metadata still apply to that X509 source.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:ext="urn:example:x509"><ds:KeyInfo><ds:X509Data Id="caller"><ds:X509Certificate>c3RhbGU=</ds:X509Certificate><ds:X509SubjectName>CN=stale</ds:X509SubjectName><ds:X509CRL>Y3Js</ds:X509CRL><ext:Policy>keep</ext:Policy></ds:X509Data></ds:KeyInfo></ds:Signature>"#;
+        let generated = r#"<X509Data xmlns="http://www.w3.org/2000/09/xmldsig#"><X509Certificate>Z2VuZXJhdGVk</X509Certificate></X509Data>"#;
+
+        let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect("generated identity must preserve revocation metadata");
+        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let x509_sources = document
+            .descendants()
+            .filter(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
+            .collect::<Vec<_>>();
+
+        assert_eq!(x509_sources.len(), 1);
+        let x509_data = x509_sources[0];
+        assert_eq!(x509_data.attribute("Id"), Some("caller"));
+        assert_eq!(
+            x509_data
+                .children()
+                .find(|node| node.has_tag_name((XMLDSIG_NS, "X509Certificate")))
+                .and_then(|node| node.text()),
+            Some("Z2VuZXJhdGVk")
+        );
+        assert!(!merged.contains("c3RhbGU="));
+        assert!(!merged.contains("CN=stale"));
+        assert_eq!(
+            x509_data
+                .children()
+                .find(|node| node.has_tag_name((XMLDSIG_NS, "X509CRL")))
+                .and_then(|node| node.text()),
+            Some("Y3Js")
+        );
+        assert_eq!(
+            x509_data
+                .children()
+                .find(|node| node.has_tag_name(("urn:example:x509", "Policy")))
+                .and_then(|node| node.text()),
+            Some("keep")
+        );
     }
 
     #[test]

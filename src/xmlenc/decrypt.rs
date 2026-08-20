@@ -749,15 +749,13 @@ fn resolve_content_key_candidates(
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<Vec<Vec<u8>>, XmlEncError> {
     let mut budget = DecryptionCandidateBudget::for_operation();
-    match resolve_candidates_with_budget(resolver, provider, algorithm, None, &mut budget) {
-        Ok(keys) if !keys.is_empty() => return Ok(keys),
-        Ok(_) => {}
-        Err(XmlEncError::KeyNotFound) => {}
-        Err(error) => return Err(error),
-    }
-
     let mut last_error = None;
-    let mut candidates = Vec::new();
+    let mut candidates =
+        match resolve_candidates_with_budget(resolver, provider, algorithm, None, &mut budget) {
+            Ok(keys) => keys,
+            Err(XmlEncError::KeyNotFound) => Vec::new(),
+            Err(error) => return Err(error),
+        };
     for encrypted_key in &encrypted.encrypted_keys {
         if !encrypted_key_applies_to_data(encrypted_key, encrypted) {
             continue;
@@ -1191,6 +1189,26 @@ mod tests {
     struct OrderedRecipientResolver {
         wrong: Vec<u8>,
         correct: Vec<u8>,
+    }
+
+    struct DirectAndRecipientResolver {
+        direct: Vec<u8>,
+        recipient: Vec<u8>,
+    }
+
+    impl DecryptionKeyResolver for DirectAndRecipientResolver {
+        fn resolve_key(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+        ) -> Result<Vec<u8>, XmlEncError> {
+            Ok(if encrypted_key.is_some() {
+                self.recipient.clone()
+            } else {
+                self.direct.clone()
+            })
+        }
     }
 
     impl DecryptionKeyResolver for OrderedRecipientResolver {
@@ -1858,6 +1876,62 @@ mod tests {
             .decrypt_data(&encrypted)
             .expect("the second recipient key must authenticate");
         assert_eq!(plaintext, DecryptedContent::Bytes(b"payload".to_vec()));
+    }
+
+    #[test]
+    fn authenticated_decryption_continues_from_direct_key_to_recipient() {
+        // Direct candidates and embedded recipients are one ordered lookup
+        // space; a wrong direct GCM key must not hide a valid wrapped key.
+        let correct = vec![0x63_u8; 16];
+        let encrypted = encrypted_data_with_recipients(
+            &correct,
+            vec![associated_encrypted_key("recipient", None, None)],
+            None,
+        );
+        let resolver = DirectAndRecipientResolver {
+            direct: vec![0x19_u8; 16],
+            recipient: correct,
+        };
+
+        let plaintext = DecryptContext::new(&resolver)
+            .decrypt_data(&encrypted)
+            .expect("the embedded recipient must remain available after a direct candidate");
+
+        assert_eq!(plaintext, DecryptedContent::Bytes(b"payload".to_vec()));
+    }
+
+    #[test]
+    fn cbc_rejects_distinct_direct_and_recipient_candidates() {
+        // Combining lookup sources must not make unauthenticated CBC choose the
+        // direct key merely because it was resolved before the recipient key.
+        let recipient = vec![0x73_u8; 16];
+        let mut encrypted = encrypted_data_with_recipients(
+            &recipient,
+            vec![associated_encrypted_key("recipient", None, None)],
+            None,
+        );
+        encrypted.encryption_method.algorithm = DataEncryptionAlgorithm::Aes128Cbc.uri().into();
+        encrypted.cipher_data.value = STANDARD.encode(
+            crate::provider::default_provider()
+                .encrypt_data(DataEncryptionAlgorithm::Aes128Cbc, &recipient, b"payload")
+                .expect("test encryption must succeed"),
+        );
+        let resolver = DirectAndRecipientResolver {
+            direct: vec![0x29_u8; 16],
+            recipient,
+        };
+
+        let error = DecryptContext::new(&resolver)
+            .decrypt_data(&encrypted)
+            .expect_err("CBC must not guess between direct and recipient keys");
+
+        assert!(matches!(
+            error,
+            XmlEncError::AmbiguousKeyCandidates {
+                algorithm: DataEncryptionAlgorithm::Aes128Cbc,
+                actual: 2,
+            }
+        ));
     }
 
     #[test]

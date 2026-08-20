@@ -11,8 +11,8 @@ pub enum XmlEncodingError {
     /// UTF-16 code units did not form valid Unicode scalar values.
     #[error("invalid UTF-16 XML input: {0}")]
     InvalidUtf16(#[from] std::string::FromUtf16Error),
-    /// A UTF-16 BOM contradicted the encoding declared by the document.
-    #[error("UTF-16 XML BOM conflicts with declared encoding {0}")]
+    /// The detected XML byte encoding contradicted the document declaration.
+    #[error("XML byte encoding conflicts with declared encoding {0}")]
     ConflictingDeclaration(String),
     /// Unmarked input was not valid UTF-8.
     #[error("XML input is neither BOM-marked UTF-16 nor valid UTF-8: {0}")]
@@ -55,49 +55,23 @@ pub fn decode_xml_octets(bytes: &[u8]) -> Result<Cow<'_, str>, XmlEncodingError>
     }
 
     let payload = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
-    std::str::from_utf8(payload)
-        .map(Cow::Borrowed)
-        .map_err(XmlEncodingError::from)
+    let xml = std::str::from_utf8(payload)?;
+    if let Some(range) = declared_encoding_range(xml)
+        && !xml[range.clone()].eq_ignore_ascii_case("UTF-8")
+    {
+        return Err(XmlEncodingError::ConflictingDeclaration(xml[range].into()));
+    }
+    Ok(Cow::Borrowed(xml))
 }
 
 fn normalize_transcoded_declaration(
     mut xml: String,
     byte_order: Utf16ByteOrder,
 ) -> Result<String, XmlEncodingError> {
-    let Some(declaration_end) = xml.strip_prefix("<?xml").and_then(|rest| rest.find("?>")) else {
+    let Some(declared_range) = declared_encoding_range(&xml) else {
         return Ok(xml);
     };
-    let declaration_end = "<?xml".len() + declaration_end;
-    let declaration = &xml.as_bytes()[..declaration_end];
-    let Some(name_start) = declaration
-        .windows("encoding".len())
-        .position(|candidate| candidate == b"encoding")
-    else {
-        return Ok(xml);
-    };
-    let mut cursor = name_start + "encoding".len();
-    while declaration.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-        cursor += 1;
-    }
-    if declaration.get(cursor) != Some(&b'=') {
-        return Ok(xml);
-    }
-    cursor += 1;
-    while declaration.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-        cursor += 1;
-    }
-    let Some(&quote @ (b'\'' | b'"')) = declaration.get(cursor) else {
-        return Ok(xml);
-    };
-    let value_start = cursor + 1;
-    let Some(relative_end) = declaration[value_start..]
-        .iter()
-        .position(|byte| *byte == quote)
-    else {
-        return Ok(xml);
-    };
-    let value_end = value_start + relative_end;
-    let declared = &xml[value_start..value_end];
+    let declared = &xml[declared_range.clone()];
     let declaration_matches = declared.eq_ignore_ascii_case("UTF-16")
         || declared.eq_ignore_ascii_case(match byte_order {
             Utf16ByteOrder::LittleEndian => "UTF-16LE",
@@ -106,8 +80,39 @@ fn normalize_transcoded_declaration(
     if !declaration_matches {
         return Err(XmlEncodingError::ConflictingDeclaration(declared.into()));
     }
-    xml.replace_range(value_start..value_end, "UTF-8");
+    xml.replace_range(declared_range, "UTF-8");
     Ok(xml)
+}
+
+fn declared_encoding_range(xml: &str) -> Option<std::ops::Range<usize>> {
+    let declaration_end = xml
+        .strip_prefix("<?xml")?
+        .find("?>")?
+        .checked_add("<?xml".len())?;
+    let declaration = &xml.as_bytes()[..declaration_end];
+    let name_start = declaration
+        .windows("encoding".len())
+        .position(|candidate| candidate == b"encoding")?;
+    let mut cursor = name_start + "encoding".len();
+    while declaration.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    if declaration.get(cursor) != Some(&b'=') {
+        return None;
+    }
+    cursor += 1;
+    while declaration.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    let &quote @ (b'\'' | b'"') = declaration.get(cursor)? else {
+        return None;
+    };
+    let value_start = cursor + 1;
+    let relative_end = declaration[value_start..]
+        .iter()
+        .position(|byte| *byte == quote)?;
+    let value_end = value_start + relative_end;
+    Some(value_start..value_end)
 }
 
 #[cfg(test)]
@@ -182,6 +187,27 @@ mod tests {
             assert!(matches!(
                 decode_xml_octets(&bytes),
                 Err(XmlEncodingError::ConflictingDeclaration(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn utf8_input_requires_a_matching_encoding_declaration() {
+        // Successful UTF-8 decoding is not sufficient when the XML declaration
+        // tells downstream processors to interpret the same octets differently.
+        for valid in [
+            br#"<?xml version="1.0" encoding="UTF-8"?><root/>"#.as_slice(),
+            br#"<?xml version='1.0' encoding = 'utf-8'?><root/>"#.as_slice(),
+            b"<root/>".as_slice(),
+        ] {
+            decode_xml_octets(valid).expect("UTF-8 declaration must match UTF-8 octets");
+        }
+
+        for declared in ["UTF-16", "ISO-8859-1"] {
+            let xml = format!("<?xml version=\"1.0\" encoding=\"{declared}\"?><root>\u{e9}</root>");
+            assert!(matches!(
+                decode_xml_octets(xml.as_bytes()),
+                Err(XmlEncodingError::ConflictingDeclaration(value)) if value == declared
             ));
         }
     }
