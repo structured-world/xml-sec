@@ -57,7 +57,7 @@ pub fn decode_xml_octets(bytes: &[u8]) -> Result<Cow<'_, str>, XmlEncodingError>
     let payload = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
     let xml = std::str::from_utf8(payload)?;
     if let Some(range) = declared_encoding_range(xml)
-        && !xml[range.clone()].eq_ignore_ascii_case("UTF-8")
+        && !encoding_label_matches(&xml[range.clone()], "UTF-8")
     {
         return Err(XmlEncodingError::ConflictingDeclaration(xml[range].into()));
     }
@@ -72,11 +72,14 @@ fn normalize_transcoded_declaration(
         return Ok(xml);
     };
     let declared = &xml[declared_range.clone()];
-    let declaration_matches = declared.eq_ignore_ascii_case("UTF-16")
-        || declared.eq_ignore_ascii_case(match byte_order {
-            Utf16ByteOrder::LittleEndian => "UTF-16LE",
-            Utf16ByteOrder::BigEndian => "UTF-16BE",
-        });
+    let declaration_matches = encoding_label_matches(declared, "UTF-16")
+        || encoding_label_matches(
+            declared,
+            match byte_order {
+                Utf16ByteOrder::LittleEndian => "UTF-16LE",
+                Utf16ByteOrder::BigEndian => "UTF-16BE",
+            },
+        );
     if !declaration_matches {
         return Err(XmlEncodingError::ConflictingDeclaration(declared.into()));
     }
@@ -85,34 +88,73 @@ fn normalize_transcoded_declaration(
 }
 
 fn declared_encoding_range(xml: &str) -> Option<std::ops::Range<usize>> {
-    let declaration_end = xml
-        .strip_prefix("<?xml")?
-        .find("?>")?
-        .checked_add("<?xml".len())?;
-    let declaration = &xml.as_bytes()[..declaration_end];
-    let name_start = declaration
-        .windows("encoding".len())
-        .position(|candidate| candidate == b"encoding")?;
-    let mut cursor = name_start + "encoding".len();
-    while declaration.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-        cursor += 1;
-    }
-    if declaration.get(cursor) != Some(&b'=') {
+    const PREFIX: &str = "<?xml";
+    let rest = xml.strip_prefix(PREFIX)?;
+    if !rest.as_bytes().first().is_some_and(u8::is_ascii_whitespace) {
         return None;
     }
-    cursor += 1;
-    while declaration.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+    let declaration = rest.as_bytes().get(..rest.find("?>")?)?;
+    let mut cursor = 0;
+    while cursor < declaration.len() {
+        while declaration.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let name_start = cursor;
+        while declaration.get(cursor).is_some_and(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-' | b'.')
+        }) {
+            cursor += 1;
+        }
+        if cursor == name_start {
+            return None;
+        }
+        let name = &declaration[name_start..cursor];
+        while declaration.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if declaration.get(cursor) != Some(&b'=') {
+            return None;
+        }
         cursor += 1;
+        while declaration.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let &quote @ (b'\'' | b'"') = declaration.get(cursor)? else {
+            return None;
+        };
+        let value_start = cursor + 1;
+        let value_end = value_start
+            + declaration[value_start..]
+                .iter()
+                .position(|byte| *byte == quote)?;
+        if name == b"encoding" {
+            return Some((PREFIX.len() + value_start)..(PREFIX.len() + value_end));
+        }
+        cursor = value_end + 1;
+        if declaration
+            .get(cursor)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            return None;
+        }
     }
-    let &quote @ (b'\'' | b'"') = declaration.get(cursor)? else {
-        return None;
-    };
-    let value_start = cursor + 1;
-    let relative_end = declaration[value_start..]
-        .iter()
-        .position(|byte| *byte == quote)?;
-    let value_end = value_start + relative_end;
-    Some(value_start..value_end)
+    None
+}
+
+fn encoding_label_matches(actual: &str, canonical: &str) -> bool {
+    actual.eq_ignore_ascii_case(canonical)
+        || matches!(canonical,
+            "UTF-8" if actual.eq_ignore_ascii_case("UTF8")
+        )
+        || matches!(canonical,
+            "UTF-16" if actual.eq_ignore_ascii_case("UTF16")
+        )
+        || matches!(canonical,
+            "UTF-16LE" if actual.eq_ignore_ascii_case("UTF16LE")
+        )
+        || matches!(canonical,
+            "UTF-16BE" if actual.eq_ignore_ascii_case("UTF16BE")
+        )
 }
 
 #[cfg(test)]
@@ -198,6 +240,7 @@ mod tests {
         for valid in [
             br#"<?xml version="1.0" encoding="UTF-8"?><root/>"#.as_slice(),
             br#"<?xml version='1.0' encoding = 'utf-8'?><root/>"#.as_slice(),
+            br#"<?xml version='1.0' encoding='UTF8'?><root/>"#.as_slice(),
             b"<root/>".as_slice(),
         ] {
             decode_xml_octets(valid).expect("UTF-8 declaration must match UTF-8 octets");
@@ -209,6 +252,18 @@ mod tests {
                 decode_xml_octets(xml.as_bytes()),
                 Err(XmlEncodingError::ConflictingDeclaration(value)) if value == declared
             ));
+        }
+    }
+
+    #[test]
+    fn declaration_detection_ignores_processing_instructions_and_similar_names() {
+        // Only the XML declaration's exact encoding pseudo-attribute controls
+        // byte decoding; processing instructions and longer names are content.
+        for xml in [
+            r#"<?xml-stylesheet encoding="ISO-8859-1"?><root/>"#,
+            r#"<?xml version="1.0" data-encoding="ISO-8859-1"?><root/>"#,
+        ] {
+            decode_xml_octets(xml.as_bytes()).expect("non-declaration text must be ignored");
         }
     }
 }

@@ -16,7 +16,9 @@ use rsa::{
 use x509_parser::prelude::FromDer as _;
 use xml_sec::{
     IdAttributeRegistration,
-    policy::{DecryptionPolicy, EncryptionPolicy, SigningPolicy, VerificationPolicy},
+    policy::{
+        DecryptionPolicy, EncryptionPolicy, ManifestProcessing, SigningPolicy, VerificationPolicy,
+    },
     provider::{CryptoProvider, default_provider},
     xmldsig::{
         DefaultKeyResolver, DsigError, DsigStatus, FailureReason, KeyInfo, KeyInfoSource,
@@ -650,6 +652,11 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     // This binary is an explicit libxmlsec1 compatibility boundary. Its sign
     // and verify commands must bind XPath here() identically for round trips.
     let policy = SigningPolicy {
+        manifest_processing: if invocation.flag("ignore-manifests") {
+            ManifestProcessing::Ignore
+        } else {
+            ManifestProcessing::Process
+        },
         xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
         ..SigningPolicy::default()
     };
@@ -942,7 +949,11 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
     // boundary: both CLI signing and verification use the donor interpretation,
     // while the core library retains the XMLDSig binding by default.
     let mut policy = VerificationPolicy {
-        process_manifests: !invocation.flag("ignore-manifests"),
+        manifest_processing: if invocation.flag("ignore-manifests") {
+            ManifestProcessing::Ignore
+        } else {
+            ManifestProcessing::Process
+        },
         reference_uri_types: UriTypeSet::ALL,
         retrieval_uri_types: UriTypeSet::ALL,
         xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
@@ -961,6 +972,13 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
     let insecure = invocation.flag("insecure");
     policy.key_trust.verify_x509_chains = !insecure;
     policy.key_trust.check_crls = invocation.flag("verify-crls") && !insecure;
+    // libxmlsec1's OpenSSL backend does not consume
+    // XMLSEC_KEYINFO_FLAGS_X509DATA_SKIP_STRICT_CHECKS; only its GnuTLS/NSS
+    // adapters relax backend-specific certificate checks. RustCrypto likewise
+    // has no provider security-level switch: every implemented certificate
+    // signature algorithm is already available to path validation. Reading the
+    // flag here documents that the compatibility no-op is deliberate.
+    let _skip_backend_strict_checks = invocation.flag("X509-skip-strict-checks");
     policy
 }
 
@@ -3411,6 +3429,28 @@ mod tests {
             policy.xpath_here_semantics,
             xml_sec::xmldsig::XPathHereSemantics::XmlSecLegacy
         );
+    }
+
+    #[test]
+    fn openssl_compatibility_strict_check_flag_does_not_weaken_trust_policy() {
+        // The pinned donor uses OpenSSL, where this backend-specific flag is a
+        // no-op; accepting it must not disable Rust certificate/path checks.
+        let baseline = xmlsec_compatibility_verification_policy(&invocation(&[
+            "xmlsec1",
+            "verify",
+            "input.xml",
+        ]));
+        let skipped = xmlsec_compatibility_verification_policy(&invocation(&[
+            "xmlsec1",
+            "verify",
+            "--X509-skip-strict-checks",
+            "input.xml",
+        ]));
+
+        assert_eq!(skipped.key_trust, baseline.key_trust);
+        assert_eq!(skipped.signature_algorithms, baseline.signature_algorithms);
+        assert_eq!(skipped.digest_algorithms, baseline.digest_algorithms);
+        assert_eq!(skipped.transforms, baseline.transforms);
     }
 
     #[test]

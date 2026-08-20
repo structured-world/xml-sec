@@ -1171,23 +1171,46 @@ fn verification_reports_output_as_inapplicable() {
 }
 
 #[test]
-fn signing_accepts_ignore_manifests_as_a_compatibility_noop() {
-    // Signing computes SignedInfo references only; the donor's DSig-common flag
-    // is accepted without introducing a second Manifest signing pipeline.
-    let template = project_root()
-        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+fn signing_processes_manifests_unless_explicitly_ignored() {
+    // libxmlsec1 fills direct Object/Manifest references before SignedInfo;
+    // --ignore-manifests is the explicit opt-out, not an accepted no-op.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("manifest-template.xml");
+    fs::write(
+        &template,
+        r##"<root><payload Id="payload">manifest payload</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#manifest"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="manifest"><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>stale</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##,
+    )
+    .unwrap();
     let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
-    let output = Command::new(binary())
-        .args(["sign", "--ignore-manifests", "--privkey-pem"])
-        .arg(private_key)
-        .arg(template)
-        .output()
-        .unwrap();
+    let sign = |ignore: bool| {
+        let mut command = Command::new(binary());
+        command.arg("sign");
+        if ignore {
+            command.arg("--ignore-manifests");
+        }
+        command
+            .arg("--privkey-pem")
+            .arg(&private_key)
+            .arg(&template)
+            .output()
+            .unwrap()
+    };
+
+    let processed = sign(false);
     assert!(
-        output.status.success(),
+        processed.status.success(),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&processed.stderr)
     );
+    assert!(!String::from_utf8_lossy(&processed.stdout).contains(">stale</ds:DigestValue>"));
+
+    let ignored = sign(true);
+    assert!(
+        ignored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ignored.stderr)
+    );
+    assert!(String::from_utf8_lossy(&ignored.stdout).contains(">stale</ds:DigestValue>"));
 }
 
 #[test]

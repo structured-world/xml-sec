@@ -26,8 +26,9 @@ use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::DigestAlgorithm;
 use super::mutation::{
     XmlMutationError, append_signature_to_element_with_options,
-    append_signature_to_root_with_options, fill_signature_value_at_index_with_options,
-    fill_signed_info_digest_values, fill_signed_info_digest_values_at_index_with_options,
+    append_signature_to_root_with_options, fill_manifest_digest_values_at_index_with_options,
+    fill_signature_value_at_index_with_options, fill_signed_info_digest_values,
+    fill_signed_info_digest_values_at_index_with_options,
     fill_signed_info_digest_values_with_options, merge_key_info_source_at_index_with_options,
 };
 use super::parse::{
@@ -886,6 +887,21 @@ impl<'a> SignContext<'a> {
             None
         };
         let prepared_xml = with_key_info.as_deref().unwrap_or(xml);
+        let with_manifests =
+            if self.policy.manifest_processing == crate::policy::ManifestProcessing::Process {
+                Some(fill_manifest_reference_digest_values_with_options(
+                    prepared_xml,
+                    transform_options,
+                    &self.policy,
+                    self.provider,
+                    &execution_budget,
+                    target_signature,
+                    self.id_attributes,
+                )?)
+            } else {
+                None
+            };
+        let prepared_xml = with_manifests.as_deref().unwrap_or(prepared_xml);
         let with_digests = fill_reference_digest_values_with_options(
             prepared_xml,
             transform_options,
@@ -1030,65 +1046,138 @@ fn compute_reference_digest_values_with_options(
     )?;
     let signed_info = find_required_child(signature, "SignedInfo")?;
     let references = parse_signing_references(signed_info)?;
-    if let Some(policy) = policy {
-        if references.len() > policy.resources.max_references {
+    validate_signing_references(&references, references.len(), policy)?;
+    compute_signing_reference_digests(
+        &doc,
+        signature,
+        references,
+        transform_options,
+        provider,
+        execution_budget,
+        id_attributes,
+    )
+}
+
+fn fill_manifest_reference_digest_values_with_options(
+    xml: &str,
+    transform_options: TransformOptions,
+    policy: &crate::policy::SigningPolicy,
+    provider: &dyn crate::provider::CryptoProvider,
+    execution_budget: &TransformExecutionBudget,
+    target_signature: usize,
+    id_attributes: &[crate::IdAttributeRegistration],
+) -> Result<String, SigningDigestError> {
+    let doc = parse_signing_document(xml, Some(policy))?;
+    let signature =
+        find_signing_signature_node(&doc, SigningSignatureTarget::Index(target_signature))?;
+    let signed_info = find_required_child(signature, "SignedInfo")?;
+    let mut xpath_budget = XPathSignatureParseBudget::default();
+    let signed_info_references =
+        parse_signing_references_with_budget(signed_info, &mut xpath_budget)?;
+    let manifest_references = parse_signing_manifest_references(signature, &mut xpath_budget)?;
+    let total_references = signed_info_references
+        .len()
+        .checked_add(manifest_references.len())
+        .ok_or_else(|| SigningDigestError::InvalidStructure("reference count overflow".into()))?;
+    validate_signing_references(&manifest_references, total_references, Some(policy))?;
+    if manifest_references.is_empty() {
+        return Ok(xml.to_owned());
+    }
+    let values = compute_signing_reference_digests(
+        &doc,
+        signature,
+        manifest_references,
+        transform_options,
+        provider,
+        execution_budget,
+        id_attributes,
+    )?
+    .into_iter()
+    .map(|digest| digest.digest_value);
+    Ok(fill_manifest_digest_values_at_index_with_options(
+        xml,
+        values,
+        target_signature,
+        Some(policy),
+    )?)
+}
+
+fn validate_signing_references(
+    references: &[SigningReference],
+    total_references: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<(), SigningDigestError> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    if total_references > policy.resources.max_references {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "signature references",
+            maximum: policy.resources.max_references,
+            actual: total_references,
+        }
+        .into());
+    }
+    for reference in references {
+        if reference.transforms.len() > policy.resources.max_transforms_per_reference {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "signature references",
-                maximum: policy.resources.max_references,
-                actual: references.len(),
+                resource: "reference transforms",
+                maximum: policy.resources.max_transforms_per_reference,
+                actual: reference.transforms.len(),
             }
             .into());
         }
-        for reference in &references {
-            if reference.transforms.len() > policy.resources.max_transforms_per_reference {
-                return Err(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "reference transforms",
-                    maximum: policy.resources.max_transforms_per_reference,
-                    actual: reference.transforms.len(),
-                }
-                .into());
+        if policy
+            .digest_algorithms
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
+        {
+            return Err(crate::policy::PolicyViolation::Algorithm {
+                operation: "signing",
+                algorithm: reference.digest_method.uri().to_string(),
             }
-            if let Some(allowed) = policy.transforms.as_ref() {
-                for transform in &reference.transforms {
-                    let uri = transform.algorithm_uri();
-                    if !allowed.contains(uri) {
-                        return Err(crate::policy::PolicyViolation::Algorithm {
-                            operation: "signing transform",
-                            algorithm: uri.to_owned(),
-                        }
-                        .into());
-                    }
-                }
-                let initial_binary = !reference.uri.is_empty() && !reference.uri.starts_with('#');
-                if !transform_chain_produces_binary(initial_binary, &reference.transforms)
-                    && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI)
-                {
+            .into());
+        }
+        if let Some(allowed) = policy.transforms.as_ref() {
+            for transform in &reference.transforms {
+                let uri = transform.algorithm_uri();
+                if !allowed.contains(uri) {
                     return Err(crate::policy::PolicyViolation::Algorithm {
                         operation: "signing transform",
-                        algorithm: DEFAULT_IMPLICIT_C14N_URI.to_owned(),
+                        algorithm: uri.to_owned(),
                     }
                     .into());
                 }
             }
+            let initial_binary = !reference.uri.is_empty() && !reference.uri.starts_with('#');
+            if !transform_chain_produces_binary(initial_binary, &reference.transforms)
+                && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI)
+            {
+                return Err(crate::policy::PolicyViolation::Algorithm {
+                    operation: "signing transform",
+                    algorithm: DEFAULT_IMPLICIT_C14N_URI.to_owned(),
+                }
+                .into());
+            }
         }
     }
-    let resolver = UriReferenceResolver::with_id_registrations(&doc, id_attributes);
+    Ok(())
+}
+
+fn compute_signing_reference_digests(
+    doc: &Document<'_>,
+    signature: Node<'_, '_>,
+    references: Vec<SigningReference>,
+    transform_options: TransformOptions,
+    provider: &dyn crate::provider::CryptoProvider,
+    execution_budget: &TransformExecutionBudget,
+    id_attributes: &[crate::IdAttributeRegistration],
+) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
+    let resolver = UriReferenceResolver::with_id_registrations(doc, id_attributes);
     references
         .into_iter()
         .enumerate()
         .map(|(index, reference)| {
-            if policy.is_some_and(|policy| {
-                policy
-                    .digest_algorithms
-                    .as_ref()
-                    .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
-            }) {
-                return Err(crate::policy::PolicyViolation::Algorithm {
-                    operation: "signing",
-                    algorithm: reference.digest_method.uri().to_string(),
-                }
-                .into());
-            }
             let initial_data = resolver.dereference_with_budget(
                 &reference.uri,
                 execution_budget.node_set_materialization(),
@@ -1320,6 +1409,13 @@ fn signature_index(
 fn parse_signing_references(
     signed_info: Node<'_, '_>,
 ) -> Result<Vec<SigningReference>, SigningDigestError> {
+    parse_signing_references_with_budget(signed_info, &mut XPathSignatureParseBudget::default())
+}
+
+fn parse_signing_references_with_budget(
+    signed_info: Node<'_, '_>,
+    xpath_budget: &mut XPathSignatureParseBudget,
+) -> Result<Vec<SigningReference>, SigningDigestError> {
     verify_ds_element(signed_info, "SignedInfo")?;
     let mut children = element_children(signed_info);
 
@@ -1336,7 +1432,6 @@ fn parse_signing_references(
     required_algorithm_attr(signature_method_node, "SignatureMethod")?;
 
     let mut references = Vec::new();
-    let mut xpath_budget = XPathSignatureParseBudget::default();
     for child in children {
         verify_ds_element(child, "Reference")?;
         if references.len() == MAX_REFERENCES_PER_SIGNATURE {
@@ -1344,12 +1439,41 @@ fn parse_signing_references(
                 "SignedInfo contains more than {MAX_REFERENCES_PER_SIGNATURE} Reference elements"
             )));
         }
-        references.push(parse_signing_reference(child, &mut xpath_budget)?);
+        references.push(parse_signing_reference(child, xpath_budget)?);
     }
     if references.is_empty() {
         return Err(SigningDigestError::MissingElement {
             element: "Reference",
         });
+    }
+    Ok(references)
+}
+
+fn parse_signing_manifest_references(
+    signature: Node<'_, '_>,
+    xpath_budget: &mut XPathSignatureParseBudget,
+) -> Result<Vec<SigningReference>, SigningDigestError> {
+    let mut references = Vec::new();
+    for manifest in signature
+        .children()
+        .filter(|node| node.has_tag_name((XMLDSIG_NS, "Object")))
+        .flat_map(|object| {
+            object
+                .children()
+                .filter(|node| node.has_tag_name((XMLDSIG_NS, "Manifest")))
+        })
+    {
+        let mut manifest_references = 0usize;
+        for child in element_children(manifest) {
+            verify_ds_element(child, "Reference")?;
+            references.push(parse_signing_reference(child, xpath_budget)?);
+            manifest_references += 1;
+        }
+        if manifest_references == 0 {
+            return Err(SigningDigestError::MissingElement {
+                element: "Reference",
+            });
+        }
     }
     Ok(references)
 }

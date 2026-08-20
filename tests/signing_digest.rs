@@ -5,7 +5,7 @@ use std::sync::{
 };
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
-use xml_sec::policy::SigningPolicy;
+use xml_sec::policy::{ManifestProcessing, SigningPolicy};
 use xml_sec::xmldsig::mutation::append_signature_to_root;
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::uri::UriReferenceResolver;
@@ -14,9 +14,9 @@ use xml_sec::xmldsig::{
     DEFAULT_IMPLICIT_C14N_URI, DefaultKeyResolver, DigestAlgorithm, DsigStatus,
     EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriter, ReferenceBuilder, RsaSigningKey,
     SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError,
-    SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, X509CertificateKeyInfoWriter,
-    compute_reference_digest_values, fill_reference_digest_values, parse_key_info,
-    validate_signing_key, verify_signature_with_pem_key,
+    SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, VerificationKey, VerifyContext,
+    X509CertificateKeyInfoWriter, compute_reference_digest_values, fill_reference_digest_values,
+    parse_key_info, validate_signing_key, verify_signature_with_pem_key,
 };
 
 fn exclusive_c14n() -> C14nAlgorithm {
@@ -915,6 +915,100 @@ fn fills_only_signed_info_reference_digest_values() {
 
     assert!(filled.contains("<DigestValue>keep-manifest-digest</DigestValue>"));
     assert_reference_digests_verify(&filled);
+}
+
+fn manifest_signing_template() -> &'static str {
+    r##"<root><payload Id="payload">manifest payload</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#manifest"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="manifest"><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>stale</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##
+}
+
+#[test]
+fn sign_context_processes_manifests_before_signed_info() {
+    // SignedInfo references the Manifest itself, so filling Manifest values
+    // after SignedInfo would leave an internally stale but well-formed signature.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let spki_der = match private_key.public_key_info().expect("public key info") {
+        SigningPublicKeyInfo::Rsa { spki_der, .. } => spki_der,
+        _ => panic!("RSA key must expose RSA public-key info"),
+    };
+    let verification_key = VerificationKey {
+        algorithm: SignatureAlgorithm::RsaSha256,
+        public_key_bytes: spki_der,
+        certificate_der: None,
+        name: None,
+    };
+    let policy = SigningPolicy {
+        manifest_processing: ManifestProcessing::Process,
+        ..SigningPolicy::default()
+    };
+
+    let signed = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_template(manifest_signing_template())
+        .expect("Manifest-aware signing must succeed");
+    let verified = VerifyContext::new()
+        .key(&verification_key)
+        .process_manifests(true)
+        .verify(&signed)
+        .expect("signed Manifest must verify");
+
+    assert_eq!(verified.status, DsigStatus::Valid);
+    assert_eq!(verified.manifest_references.len(), 1);
+    assert!(matches!(
+        verified.manifest_references[0].status,
+        DsigStatus::Valid
+    ));
+    assert!(!signed.contains(">stale</ds:DigestValue>"));
+}
+
+#[test]
+fn manifest_signing_rejects_malformed_structure_and_aggregate_overflow() {
+    // Ignoring Manifests may leave application-defined content untouched, but
+    // processing mode must validate grammar and share one Reference ceiling.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let malformed = manifest_signing_template().replace(
+        "<ds:Reference URI=\"#payload\"",
+        "<ds:NotReference URI=\"#payload\"",
+    );
+    let malformed = malformed.replace(
+        "</ds:Reference></ds:Manifest>",
+        "</ds:NotReference></ds:Manifest>",
+    );
+    let process = SigningPolicy {
+        manifest_processing: ManifestProcessing::Process,
+        ..SigningPolicy::default()
+    };
+    let error = SignContext::new(&private_key)
+        .policy(process)
+        .sign_template(&malformed)
+        .expect_err("processed Manifest grammar must be enforced");
+    assert!(matches!(
+        error,
+        SigningError::Digest(SigningDigestError::InvalidStructure(_))
+    ));
+
+    let mut bounded = SigningPolicy {
+        manifest_processing: ManifestProcessing::Process,
+        ..SigningPolicy::default()
+    };
+    bounded.resources.max_references = 1;
+    let error = SignContext::new(&private_key)
+        .policy(bounded)
+        .sign_template(manifest_signing_template())
+        .expect_err("SignedInfo and Manifest must share one reference limit");
+    assert!(matches!(
+        error,
+        SigningError::Digest(SigningDigestError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "signature references",
+                maximum: 1,
+                actual: 2,
+            }
+        ))
+    ));
 }
 
 #[test]

@@ -327,7 +327,11 @@ impl<'a> VerifyContext<'a> {
     /// Structural/parse errors in Manifest content abort `verify()` and are
     /// returned as `Err(...)`.
     pub fn process_manifests(mut self, enabled: bool) -> Self {
-        self.policy.process_manifests = enabled;
+        self.policy.manifest_processing = if enabled {
+            crate::policy::ManifestProcessing::Process
+        } else {
+            crate::policy::ManifestProcessing::Ignore
+        };
         self
     }
 
@@ -1315,7 +1319,9 @@ fn verify_signature_with_context(
         });
     }
 
-    let manifest_references = if ctx.policy.process_manifests {
+    let manifest_references = if ctx.policy.manifest_processing
+        == crate::policy::ManifestProcessing::Process
+    {
         let signed_info_reference_nodes =
             collect_authenticated_signed_info_reference_nodes(&signed_info.references, &resolver);
         let remaining_reference_capacity = ctx
@@ -3518,7 +3524,7 @@ mod tests {
         // Manifest results are authenticated extension data and must obey the
         // same digest allowlist as SignedInfo references.
         let policy = crate::policy::VerificationPolicy {
-            process_manifests: true,
+            manifest_processing: crate::policy::ManifestProcessing::Process,
             digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
             ..crate::policy::VerificationPolicy::default()
         };
@@ -3560,7 +3566,7 @@ mod tests {
         // Authenticated Manifest references share the caller's per-reference
         // transform ceiling and fail before transform execution when exceeded.
         let policy = crate::policy::VerificationPolicy {
-            process_manifests: true,
+            manifest_processing: crate::policy::ManifestProcessing::Process,
             resources: crate::policy::ResourcePolicy {
                 max_transforms_per_reference: 1,
                 ..crate::policy::ResourcePolicy::default()
@@ -3791,7 +3797,7 @@ mod tests {
         // Lowering the operation policy must lower the aggregate SignedInfo and
         // Manifest capacity rather than falling back to the crate hard limit.
         let policy = crate::policy::VerificationPolicy {
-            process_manifests: true,
+            manifest_processing: crate::policy::ManifestProcessing::Process,
             resources: crate::policy::ResourcePolicy {
                 max_references: 1,
                 ..crate::policy::ResourcePolicy::default()

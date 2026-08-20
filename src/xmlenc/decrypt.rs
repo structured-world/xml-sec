@@ -753,8 +753,10 @@ fn resolve_content_key_candidates(
     let mut candidates =
         match resolve_candidates_with_budget(resolver, provider, algorithm, None, &mut budget) {
             Ok(keys) => keys,
-            Err(XmlEncError::KeyNotFound) => Vec::new(),
-            Err(error) => return Err(error),
+            Err(error) => {
+                record_candidate_source_error(error, &mut last_error)?;
+                Vec::new()
+            }
         };
     for encrypted_key in &encrypted.encrypted_keys {
         if !encrypted_key_applies_to_data(encrypted_key, encrypted) {
@@ -772,7 +774,7 @@ fn resolve_content_key_candidates(
             &mut budget,
         ) {
             Ok(keys) => candidates.extend(keys),
-            Err(error) => last_error = Some(error),
+            Err(error) => record_candidate_source_error(error, &mut last_error)?,
         }
     }
     if candidates.is_empty() {
@@ -780,6 +782,26 @@ fn resolve_content_key_candidates(
     } else {
         Ok(candidates)
     }
+}
+
+fn record_candidate_source_error(
+    error: XmlEncError,
+    last_error: &mut Option<XmlEncError>,
+) -> Result<(), XmlEncError> {
+    // Candidate-specific failures permit the next ordered key source. The
+    // shared work ceiling is operation-wide and must never be recoverable by
+    // advancing to another recipient.
+    if matches!(
+        &error,
+        XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "decryption key candidates",
+            ..
+        })
+    ) {
+        return Err(error);
+    }
+    *last_error = Some(error);
+    Ok(())
 }
 
 fn resolve_candidates_with_budget(
@@ -1196,6 +1218,10 @@ mod tests {
         recipient: Vec<u8>,
     }
 
+    struct FailingDirectResolver {
+        recipient: Vec<u8>,
+    }
+
     impl DecryptionKeyResolver for DirectAndRecipientResolver {
         fn resolve_key(
             &self,
@@ -1208,6 +1234,25 @@ mod tests {
             } else {
                 self.direct.clone()
             })
+        }
+    }
+
+    impl DecryptionKeyResolver for FailingDirectResolver {
+        fn resolve_key(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+        ) -> Result<Vec<u8>, XmlEncError> {
+            if encrypted_key.is_some() {
+                Ok(self.recipient.clone())
+            } else {
+                Err(XmlEncError::InvalidKeySize {
+                    algorithm,
+                    expected: 16,
+                    actual: 8,
+                })
+            }
         }
     }
 
@@ -1896,6 +1941,25 @@ mod tests {
         let plaintext = DecryptContext::new(&resolver)
             .decrypt_data(&encrypted)
             .expect("the embedded recipient must remain available after a direct candidate");
+
+        assert_eq!(plaintext, DecryptedContent::Bytes(b"payload".to_vec()));
+    }
+
+    #[test]
+    fn authenticated_decryption_continues_after_direct_lookup_error() {
+        // A candidate-local direct lookup failure must not suppress a valid
+        // embedded recipient from the same ordered key-resolution operation.
+        let correct = vec![0x64_u8; 16];
+        let encrypted = encrypted_data_with_recipients(
+            &correct,
+            vec![associated_encrypted_key("recipient", None, None)],
+            None,
+        );
+        let resolver = FailingDirectResolver { recipient: correct };
+
+        let plaintext = DecryptContext::new(&resolver)
+            .decrypt_data(&encrypted)
+            .expect("recipient lookup must follow a candidate-local direct error");
 
         assert_eq!(plaintext, DecryptedContent::Bytes(b"payload".to_vec()));
     }

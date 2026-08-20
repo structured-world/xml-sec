@@ -41,8 +41,10 @@ standalone XML or binary payload while diagnostics are enabled.
 Verification produces status and diagnostics rather than a transformed
 document. `verify --output` therefore fails with a command-specific "not
 applicable" diagnostic instead of reporting generic malformed syntax.
-`--ignore-manifests` is accepted by both DSig commands; for signing it is a
-compatibility no-op because signing processes only `SignedInfo` references.
+Signing processes direct `<Object>/<Manifest>` references before computing
+`SignedInfo`, matching libxmlsec1 and preventing a SignedInfo digest from
+becoming stale after Manifest mutation. `--ignore-manifests` disables that work
+for both DSig commands and leaves signing-template Manifest values untouched.
 XML file and `--xml-data` inputs accept XML 1.0 UTF-8 and BOM-marked UTF-16LE or
 UTF-16BE, with resource limits charged against source bytes before decoding.
 UTF-16 declarations are normalized to UTF-8 when the decoded document is
@@ -50,7 +52,7 @@ emitted through the Rust string-based signing or encryption pipelines.
 Generic `UTF-16` declarations follow the required BOM; explicit `UTF-16LE` or
 `UTF-16BE` declarations that contradict the BOM are rejected.
 UTF-8 inputs likewise require an absent declaration or a case-insensitive
-`UTF-8` declaration; labels for a different byte encoding are rejected before
+`UTF-8`/`UTF8` declaration; labels for a different byte encoding are rejected before
 the document reaches signing, verification, or encryption processing.
 `--print-crypto-library-errors` is accepted for donor argv compatibility. The
 fixed RustCrypto provider has no process-global OpenSSL error queue, so the flag
@@ -307,10 +309,11 @@ and unsupported CLI policy knobs fail rather than weakening policy or falling
 back.
 
 The compatibility CLI accepts `--X509-skip-strict-checks` at the explicit donor
-boundary. libxmlsec1 uses that switch to lower provider security levels for
-legacy certificate signatures; RustCrypto has no corresponding strict mode and
-already verifies every certificate signature algorithm implemented by the
-selected provider, so no additional relaxation is applied.
+boundary. In libxmlsec1 1.3.13 the OpenSSL backend selected by the compatibility
+target does not consume this flag; only GnuTLS/NSS adapters apply
+backend-specific relaxations. RustCrypto has no corresponding security-level
+switch and already verifies every certificate signature algorithm implemented
+by the provider, so the flag deliberately does not weaken path validation.
 
 Filesystem arguments remain native `OsString` values, so Unix paths are not
 required to be UTF-8. Values immediately following valued options are consumed

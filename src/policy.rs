@@ -524,6 +524,17 @@ impl KeyTrustPolicy {
     }
 }
 
+/// Whether an XMLDSig operation evaluates direct `<Object>/<Manifest>` references.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ManifestProcessing {
+    /// Leave Manifest reference values untouched and perform no Manifest work.
+    #[default]
+    Ignore,
+    /// Evaluate Manifest references under the operation's shared resource policy.
+    Process,
+}
+
 /// Immutable policy snapshot for XMLDSig verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default)]
@@ -542,7 +553,7 @@ pub struct VerificationPolicy {
     /// Allowed transform and canonicalization URIs; `None` accepts every implemented algorithm.
     pub transforms: Option<HashSet<String>>,
     /// Whether authenticated Manifest references are processed.
-    pub process_manifests: bool,
+    pub manifest_processing: ManifestProcessing,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
     /// Node selected for the XPath `here()` extension function.
@@ -605,6 +616,8 @@ pub struct SigningPolicy {
     pub rsa_keys: RsaKeyPolicy,
     /// Allowed transform URIs; `None` accepts every implemented transform.
     pub transforms: Option<HashSet<String>>,
+    /// Whether direct `<Object>/<Manifest>` reference digests are populated.
+    pub manifest_processing: ManifestProcessing,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
     /// Node selected for the XPath `here()` extension function.

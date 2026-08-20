@@ -28,6 +28,13 @@ cargo run --example verify --all-features -- signed.xml
 ```
 
 The signing and verification contexts share the same reference-transform implementation.
+`SigningPolicy::manifest_processing` controls direct `<Object>/<Manifest>`
+reference generation. Processing fills Manifest digests before SignedInfo so a
+SignedInfo reference to the Manifest authenticates the final values; Manifest
+and SignedInfo references share transform work and the aggregate reference
+ceiling. The default core policy leaves application-defined Manifest values
+untouched, while the `xmlsec1` compatibility CLI enables processing unless
+`--ignore-manifests` is present.
 [`XPathHereSemantics::Specification`] follows the XMLDSig `<XPath>` contract; callers
 interoperating with legacy libxmlsec1 `here()` behavior can explicitly select
 [`XPathHereSemantics::XmlSecLegacy`] on both contexts.
