@@ -55,6 +55,7 @@ const GENERIC_OPTIONS: &[&str] = &[
 ];
 const SIGN_OPTIONS: &[&str] = &[
     "output",
+    "ignore-manifests",
     "privkey-pem",
     "privkey-der",
     "pkcs8-pem",
@@ -146,6 +147,8 @@ pub enum CommandError {
     Usage(String),
     #[error("unsupported option for this command: --{0}")]
     UnsupportedOption(String),
+    #[error("option --{option} is recognized but is not applicable to the {command} command")]
+    InapplicableOption { option: String, command: Command },
     #[error("unsupported crypto provider: {0}")]
     UnsupportedProvider(String),
     #[error("I/O error for {}: {source}", path.display())]
@@ -155,8 +158,8 @@ pub enum CommandError {
     },
     #[error("input XML exceeds policy limit of {maximum} bytes")]
     InputTooLarge { maximum: usize },
-    #[error("input XML is not valid UTF-8")]
-    InvalidUtf8Input,
+    #[error("invalid XML byte encoding: {0}")]
+    InvalidXmlEncoding(String),
     #[error("encryption plaintext exceeds policy limit of {maximum} bytes")]
     PlaintextTooLarge { maximum: usize },
     #[error("configured external key/certificate material exceeds policy limit of {maximum} bytes")]
@@ -349,9 +352,16 @@ fn validate_crypto_config(invocation: &Invocation) -> Result<(), CommandError> {
 }
 
 fn validate_options(invocation: &Invocation, command_options: &[&str]) -> Result<(), CommandError> {
+    // Parsing establishes that every option name is known. Command validation
+    // must therefore report a recognized-but-inapplicable option semantically,
+    // naming both the option and command; never collapse this case into a
+    // generic syntax, usage, or unknown-option error.
     for name in invocation.options.keys() {
         if !GENERIC_OPTIONS.contains(&name.as_str()) && !command_options.contains(&name.as_str()) {
-            return Err(CommandError::UnsupportedOption(name.clone()));
+            return Err(CommandError::InapplicableOption {
+                option: name.clone(),
+                command: invocation.command,
+            });
         }
     }
     Ok(())
@@ -395,7 +405,9 @@ fn read_input(invocation: &Invocation, maximum: usize) -> Result<String, Command
     if bytes.len() > maximum {
         return Err(CommandError::InputTooLarge { maximum });
     }
-    String::from_utf8(bytes).map_err(|_| CommandError::InvalidUtf8Input)
+    xml_sec::encoding::decode_xml_octets(&bytes)
+        .map(Cow::into_owned)
+        .map_err(|error| CommandError::InvalidXmlEncoding(error.to_string()))
 }
 
 fn write_output(
@@ -460,10 +472,12 @@ fn read_plaintext(path: &OsStr, maximum: usize) -> Result<Vec<u8>, CommandError>
 }
 
 fn read_xml_data(path: &OsStr, maximum: usize) -> Result<String, CommandError> {
-    String::from_utf8(read_bounded_file(path, maximum, |maximum| {
-        CommandError::InputTooLarge { maximum }
-    })?)
-    .map_err(|_| CommandError::InvalidUtf8Input)
+    let bytes = read_bounded_file(path, maximum, |maximum| CommandError::InputTooLarge {
+        maximum,
+    })?;
+    xml_sec::encoding::decode_xml_octets(&bytes)
+        .map(Cow::into_owned)
+        .map_err(|error| CommandError::InvalidXmlEncoding(error.to_string()))
 }
 
 fn read_bounded_file(
@@ -3992,6 +4006,26 @@ mod tests {
             xml_data_plaintext(xml, &EncryptedDataType::Content, &policy),
             Err(CommandError::PlaintextTooLarge { maximum: 32 })
         ));
+    }
+
+    #[test]
+    fn xml_data_reader_decodes_utf16_before_template_use() {
+        // --xml-data has its own file reader and must share the same XML 1.0
+        // encoding contract as the primary command input.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("payload.xml");
+        let mut bytes = vec![0xfe, 0xff];
+        bytes.extend(
+            "<payload>value</payload>"
+                .encode_utf16()
+                .flat_map(u16::to_be_bytes),
+        );
+        fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            read_xml_data(path.as_os_str(), bytes.len()).unwrap(),
+            "<payload>value</payload>"
+        );
     }
 
     #[test]

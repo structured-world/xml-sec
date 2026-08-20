@@ -1,3 +1,10 @@
+//! Donor-compatible command-line grammar.
+//!
+//! This layer recognizes option names, aliases, arity, and repetition only.
+//! Applicability belongs to command validation: a known option used with the
+//! wrong command must be reported as recognized but inapplicable, with both
+//! names in the diagnostic, rather than as malformed syntax.
+
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},

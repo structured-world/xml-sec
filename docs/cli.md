@@ -38,6 +38,13 @@ Without `--output`, signing, encryption, and decryption preserve libxmlsec1's
 stdout ordering: the transformed payload is followed by requested diagnostics
 on the same stream. Select `--output` whenever a downstream process requires a
 standalone XML or binary payload while diagnostics are enabled.
+Verification produces status and diagnostics rather than a transformed
+document. `verify --output` therefore fails with a command-specific "not
+applicable" diagnostic instead of reporting generic malformed syntax.
+`--ignore-manifests` is accepted by both DSig commands; for signing it is a
+compatibility no-op because signing processes only `SignedInfo` references.
+XML file and `--xml-data` inputs accept XML 1.0 UTF-8 and BOM-marked UTF-16LE or
+UTF-16BE, with resource limits charged against source bytes before decoding.
 `--print-crypto-library-errors` is accepted for donor argv compatibility. The
 fixed RustCrypto provider has no process-global OpenSSL error queue, so the flag
 does not add a second diagnostic stream beyond the operation error already

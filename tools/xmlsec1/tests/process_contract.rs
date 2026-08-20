@@ -1156,6 +1156,84 @@ fn verification_reads_the_conventional_stdin_marker() {
 }
 
 #[test]
+fn verification_reports_output_as_inapplicable() {
+    // Verification produces status and diagnostics, not a transformed document;
+    // reject the shared donor option with a command-specific diagnostic.
+    let output = Command::new(binary())
+        .args(["verify", "--output", "unused.xml", "input.xml"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "Error: option --output is recognized but is not applicable to the verify command\n"
+    );
+}
+
+#[test]
+fn signing_accepts_ignore_manifests_as_a_compatibility_noop() {
+    // Signing computes SignedInfo references only; the donor's DSig-common flag
+    // is accepted without introducing a second Manifest signing pipeline.
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let output = Command::new(binary())
+        .args(["sign", "--ignore-manifests", "--privkey-pem"])
+        .arg(private_key)
+        .arg(template)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn signing_accepts_utf16_xml_and_rejects_malformed_code_units() {
+    // XML 1.0 requires UTF-16 support at the byte-oriented process boundary.
+    let temp = tempfile::tempdir().unwrap();
+    let source = fs::read_to_string(
+        project_root()
+            .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl"),
+    )
+    .unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    for (name, bom, encode) in [
+        ("le", [0xff, 0xfe], u16::to_le_bytes as fn(u16) -> [u8; 2]),
+        ("be", [0xfe, 0xff], u16::to_be_bytes as fn(u16) -> [u8; 2]),
+    ] {
+        let path = temp.path().join(format!("template-{name}.xml"));
+        let mut bytes = bom.to_vec();
+        bytes.extend(source.encode_utf16().flat_map(encode));
+        fs::write(&path, bytes).unwrap();
+        let output = Command::new(binary())
+            .args(["sign", "--privkey-pem"])
+            .arg(&private_key)
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let malformed = temp.path().join("malformed.xml");
+    fs::write(&malformed, [0xff, 0xfe, 0x00]).unwrap();
+    let output = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(private_key)
+        .arg(malformed)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("odd byte length"));
+}
+
+#[test]
 fn verification_node_id_selects_one_signature_subtree() {
     // libxmlsec1 resolves --node-id to a start node and finds the Signature
     // below it; unrelated signatures elsewhere in the document are ignored.

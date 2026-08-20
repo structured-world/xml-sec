@@ -19,7 +19,6 @@
 //! | XPath 1.0 | NodeSet → NodeSet | P1 |
 //! | XPath Filter 2.0 | NodeSet → NodeSet | P1 |
 
-use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 
@@ -896,7 +895,8 @@ fn execute_transform_chain<'s, 'e, 'd>(
         // returns only owned digest bytes. Every C14N output is charged before
         // recursion, so these retained buffers remain a bounded subset of the
         // signature-wide canonicalization work budget.
-        let xml = decode_xml_octets(&bytes)?;
+        let xml = crate::encoding::decode_xml_octets(&bytes)
+            .map_err(|error| TransformError::XmlParse(error.to_string()))?;
         let document = roxmltree::Document::parse_with_options(
             &xml,
             roxmltree::ParsingOptions {
@@ -1023,44 +1023,6 @@ fn execute_transform_chain<'s, 'e, 'd>(
         None,
         context,
     )
-}
-
-fn decode_xml_octets(bytes: &[u8]) -> Result<Cow<'_, str>, TransformError> {
-    // XML 1.0 requires processors to accept UTF-8 and UTF-16. UTF-16 external
-    // entities carry a BOM, which also makes byte order detection deterministic.
-    let (utf16, little_endian) = if let Some(payload) = bytes.strip_prefix(&[0xff, 0xfe]) {
-        (Some(payload), true)
-    } else if let Some(payload) = bytes.strip_prefix(&[0xfe, 0xff]) {
-        (Some(payload), false)
-    } else {
-        (None, false)
-    };
-    if let Some(payload) = utf16 {
-        if payload.len() % 2 != 0 {
-            return Err(TransformError::XmlParse(
-                "UTF-16 XML input has an odd byte length".into(),
-            ));
-        }
-        let code_units = payload
-            .chunks_exact(2)
-            .map(|chunk| {
-                let bytes = [chunk[0], chunk[1]];
-                if little_endian {
-                    u16::from_le_bytes(bytes)
-                } else {
-                    u16::from_be_bytes(bytes)
-                }
-            })
-            .collect::<Vec<_>>();
-        return String::from_utf16(&code_units)
-            .map(Cow::Owned)
-            .map_err(|error| TransformError::XmlParse(error.to_string()));
-    }
-
-    let payload = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
-    std::str::from_utf8(payload)
-        .map(Cow::Borrowed)
-        .map_err(|error| TransformError::XmlParse(error.to_string()))
 }
 
 fn transform_requires_node_set(transform: &Transform) -> bool {

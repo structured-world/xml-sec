@@ -21,6 +21,9 @@ options are enforced by the parser registry. `--print-debug` emits text and
 `--print-xml-debug` emits parseable operation contexts. As in libxmlsec1,
 diagnostics follow transformed data on stdout when `--output` is absent;
 selecting `--output` routes the data to a file and leaves diagnostics on stdout.
+Verification has no transformed document, so `verify --output` is reported as
+recognized but inapplicable rather than as malformed command syntax. XML inputs
+accept UTF-8 and BOM-marked UTF-16LE/BE.
 
 ## Keys and certificates
 
