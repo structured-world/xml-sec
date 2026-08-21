@@ -2609,7 +2609,9 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             })();
             match loaded {
                 Ok(key) => keys.push(key),
-                Err(error) if lax_key_search => last_load_error = Some(error),
+                Err(error) if lax_key_search && lax_candidate_error_is_recoverable(&error) => {
+                    last_load_error = Some(error);
+                }
                 Err(error) => return Err(error),
             }
         }

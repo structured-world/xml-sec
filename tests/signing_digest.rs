@@ -1079,6 +1079,42 @@ fn manifest_signing_allows_xpath_excluded_self_digest() {
 }
 
 #[test]
+fn manifest_signing_rejects_self_dependency_kept_as_text() {
+    // Excluding only the DigestValue element does not exclude its text node.
+    // Replacing stale simple content therefore changes the effective node-set,
+    // so treating this self-reference as independent would emit a stale digest.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let policy = SigningPolicy {
+        manifest_processing: ManifestProcessing::Process,
+        ..SigningPolicy::default()
+    };
+    for transforms in [
+        r#"<ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(self::ds:DigestValue)</ds:XPath></ds:Transform>"#,
+        concat!(
+            r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            r#"<ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(self::ds:DigestValue)</ds:XPath></ds:Transform>"#,
+        ),
+    ] {
+        let template = format!(
+            r##"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#manifest"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="manifest"><ds:Reference URI="#manifest"><ds:Transforms>{transforms}</ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>stale</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##
+        );
+
+        let error = SignContext::new(&private_key)
+            .policy(policy.clone())
+            .sign_template(&template)
+            .expect_err("retained DigestValue text must form a dependency cycle");
+
+        assert!(matches!(
+            error,
+            SigningError::Digest(SigningDigestError::InvalidStructure(message))
+                if message.contains("cycle")
+        ));
+    }
+}
+
+#[test]
 fn manifest_signing_rejects_digest_dependency_cycles() {
     // Circular Manifest references have no stable fill order and must fail
     // before the signing template is partially mutated.

@@ -3651,6 +3651,70 @@ fn lax_rsa_decryption_skips_malformed_private_key_candidates() {
 }
 
 #[test]
+fn lax_rsa_decryption_stops_after_aggregate_material_exhaustion() {
+    // Candidate-local decode failures remain skippable, but once cumulative
+    // source bytes cross the invocation ceiling a later small valid key must
+    // not revive the search using the unchanged pre-failure budget total.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("budget-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let malformed_8m = temp.path().join("malformed-8m.pem");
+    let malformed_1m = temp.path().join("malformed-1m.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"aggregate budget must be terminal").unwrap();
+    fs::File::create(&malformed_8m)
+        .unwrap()
+        .set_len(8 * 1024 * 1024)
+        .unwrap();
+    fs::File::create(&malformed_1m)
+        .unwrap()
+        .set_len(1024 * 1024)
+        .unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(encrypt.status.success());
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--lax-key-search", "--privkey-pem:first"])
+        .arg(&malformed_8m)
+        .args(["--privkey-pem:second"])
+        .arg(&malformed_8m)
+        .args(["--privkey-pem:third"])
+        .arg(&malformed_8m)
+        .args(["--privkey-pem:fourth"])
+        .arg(&malformed_1m)
+        .args(["--privkey-pem:fifth"])
+        .arg(&malformed_8m)
+        .args(["--privkey-pem:valid"])
+        .arg(&private_key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+
+    assert!(!decrypt.status.success());
+    assert!(
+        String::from_utf8_lossy(&decrypt.stderr)
+            .contains("configured external key/certificate material exceeds policy limit")
+    );
+}
+
+#[test]
 fn lax_rsa_search_skips_candidates_that_conflict_with_recipient_metadata() {
     // Lax name matching does not make preserved KeyValue metadata advisory: a
     // syntactically valid but mismatching key must be skipped in favor of the

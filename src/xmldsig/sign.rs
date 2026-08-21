@@ -1119,7 +1119,7 @@ fn fill_manifest_reference_digest_values_with_options(
         )?;
         let current_references = parse_signing_manifest_references(
             current_signature,
-            &mut XPathSignatureParseBudget::default(),
+            &mut xpath_budget,
             reference_limit.saturating_sub(signed_info_references.len()),
             reference_limit,
         )?;
@@ -1173,6 +1173,19 @@ fn manifest_reference_dependency_levels(
     id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<ManifestDependencyPlan, SigningDigestError> {
     let resolver = UriReferenceResolver::with_id_registrations(doc, id_attributes);
+    let tracked_digest_nodes = references
+        .iter()
+        .enumerate()
+        .flat_map(|(index, reference)| {
+            std::iter::once((index, reference.digest_value_node_id)).chain(
+                doc.get_node(reference.digest_value_node_id)
+                    .into_iter()
+                    .flat_map(|node| node.children())
+                    .filter(|node| node.is_text())
+                    .map(move |node| (index, node.id())),
+            )
+        })
+        .collect::<Vec<_>>();
     let analyses = references
         .iter()
         .map(|reference| {
@@ -1186,11 +1199,7 @@ fn manifest_reference_dependency_levels(
                 &reference.transforms,
                 transform_options,
                 execution_budget,
-                references
-                    .iter()
-                    .enumerate()
-                    .map(|(index, candidate)| (index, candidate.digest_value_node_id))
-                    .collect(),
+                tracked_digest_nodes.clone(),
             )?;
             Ok((output.dependencies, output.bytes))
         })
@@ -1777,5 +1786,63 @@ mod error_conversion_tests {
             }),
         ));
         assert!(matches!(mutation, SigningError::Policy(_)));
+    }
+
+    #[test]
+    fn manifest_reparse_consumes_the_signature_wide_xpath_budget() {
+        // Signing reparses Manifest references after each dependency level.
+        // Repeated parser/compiler work must consume the original signature
+        // budget rather than receiving a fresh allowance for every level.
+        let filter = r#"<xf:XPath xmlns:xf="http://www.w3.org/2002/06/xmldsig-filter2" Filter="intersect">true()</xf:XPath>"#;
+        let signed_info_transforms = format!(
+            r#"<ds:Transform Algorithm="http://www.w3.org/2002/06/xmldsig-filter2">{}</ds:Transform><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform>"#,
+            filter.repeat(64)
+        );
+        let signed_info_references = (0..62)
+            .map(|index| {
+                let extra = if index == 0 {
+                    r#"<ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform>"#
+                } else {
+                    ""
+                };
+                format!(
+                    r##"<ds:Reference URI="#payload"><ds:Transforms>{signed_info_transforms}{extra}</ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference>"##
+                )
+            })
+            .collect::<String>();
+        let manifest_reference = |id: &str| {
+            format!(
+                r##"<ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference>"##
+            )
+        };
+        let xml = format!(
+            r##"<root><payload Id="payload"/><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>{signed_info_references}</ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest>{}{}</ds:Manifest></ds:Object></ds:Signature></root>"##,
+            manifest_reference("payload"),
+            manifest_reference("payload")
+        );
+        let policy = crate::policy::SigningPolicy {
+            manifest_processing: crate::policy::ManifestProcessing::Process,
+            ..crate::policy::SigningPolicy::default()
+        };
+
+        let error = fill_manifest_reference_digest_values_with_options(
+            &xml,
+            TransformOptions::default(),
+            &policy,
+            crate::provider::default_provider(),
+            &TransformExecutionBudget::default(),
+            0,
+            &[],
+        )
+        .expect_err("Manifest reparse must not reset the XPath parse budget");
+
+        assert!(
+            matches!(
+                &error,
+                SigningDigestError::Transform(TransformError::XPath(message))
+                    if message.contains("signature-wide XPath expression budget")
+            ),
+            "expected the shared XPath budget error, got: {error:?}"
+        );
     }
 }

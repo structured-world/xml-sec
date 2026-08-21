@@ -23,7 +23,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use roxmltree::{Document, Node, NodeId};
+use roxmltree::{Document, Node, NodeId, NodeType};
 use sha2::{Digest as _, Sha256};
 
 use super::parse::XMLDSIG_NS;
@@ -882,11 +882,23 @@ struct TransformChainOutput {
 struct DependencyTracking {
     // Node identities are remapped by canonical byte position whenever a later
     // node-set transform reparses C14N output into a new document.
-    active_nodes: Vec<(usize, NodeId)>,
+    active_nodes: Vec<TrackedDependencyNode>,
     // Base64 decoding destroys XML identity. Dependencies that crossed that
     // boundary remain conservative because later XPath cannot recover origin.
     opaque_dependencies: HashSet<usize>,
-    canonical_positions: Option<Vec<(usize, usize)>>,
+    canonical_positions: Option<Vec<CanonicalDependencyPosition>>,
+}
+
+struct TrackedDependencyNode {
+    index: usize,
+    node_id: NodeId,
+    node_type: NodeType,
+}
+
+struct CanonicalDependencyPosition {
+    index: usize,
+    position: usize,
+    node_type: NodeType,
 }
 
 /// Execute the production transform state machine while carrying node origin.
@@ -903,6 +915,19 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
     tracked_nodes: Vec<(usize, NodeId)>,
 ) -> Result<TransformDependencyOutput, TransformError> {
     ensure_transform_count(transforms.len())?;
+    let mut active_nodes = Vec::with_capacity(tracked_nodes.len());
+    let mut opaque_dependencies = HashSet::new();
+    for (index, node_id) in tracked_nodes {
+        if let Some(node) = signature_node.document().get_node(node_id) {
+            active_nodes.push(TrackedDependencyNode {
+                index,
+                node_id,
+                node_type: node.node_type(),
+            });
+        } else {
+            opaque_dependencies.insert(index);
+        }
+    }
     let state = TransformChainState::default();
     let context = TransformExecutionContext {
         options,
@@ -916,8 +941,8 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
         transforms,
         None,
         Some(DependencyTracking {
-            active_nodes: tracked_nodes,
-            opaque_dependencies: HashSet::new(),
+            active_nodes,
+            opaque_dependencies,
             canonical_positions: None,
         }),
         &context,
@@ -948,10 +973,10 @@ fn execute_transform_chain<'s, 'e, 'd>(
 ) -> Result<TransformChainOutput, TransformError> {
     let Some((transform, remaining)) = transforms.split_first() else {
         if let (TransformData::NodeSet(nodes), Some(tracking)) = (&data, &mut dependency_tracking) {
-            tracking.active_nodes.retain(|(_, node_id)| {
+            tracking.active_nodes.retain(|tracked| {
                 nodes
                     .document()
-                    .get_node(*node_id)
+                    .get_node(tracked.node_id)
                     .is_some_and(|node| nodes.contains(node))
             });
         }
@@ -992,15 +1017,23 @@ fn execute_transform_chain<'s, 'e, 'd>(
         if let Some(tracking) = &mut dependency_tracking
             && let Some(positions) = tracking.canonical_positions.take()
         {
-            tracking.active_nodes = positions
-                .into_iter()
-                .filter_map(|(index, position)| {
-                    document
-                        .descendants()
-                        .find(|node| node.range().start == position)
-                        .map(|node| (index, node.id()))
-                })
-                .collect();
+            let mut remapped = Vec::with_capacity(positions.len());
+            for tracked in positions {
+                if let Some(node) = document.descendants().find(|node| {
+                    node.node_type() == tracked.node_type && node.range().start == tracked.position
+                }) {
+                    remapped.push(TrackedDependencyNode {
+                        index: tracked.index,
+                        node_id: node.id(),
+                        node_type: tracked.node_type,
+                    });
+                } else {
+                    // Losing provenance must never become proof that later
+                    // mutable DigestValue content cannot affect the digest.
+                    tracking.opaque_dependencies.insert(tracked.index);
+                }
+            }
+            tracking.active_nodes = remapped;
         }
         return match canonical_signature_position {
             Some(Some(position)) => {
@@ -1055,10 +1088,10 @@ fn execute_transform_chain<'s, 'e, 'd>(
             .map(|signature| signature.id());
         let mut output = Vec::new();
         if let Some(tracking) = &mut dependency_tracking {
-            tracking.active_nodes.retain(|(_, node_id)| {
+            tracking.active_nodes.retain(|tracked| {
                 nodes
                     .document()
-                    .get_node(*node_id)
+                    .get_node(tracked.node_id)
                     .is_some_and(|node| nodes.contains(node))
             });
         }
@@ -1066,7 +1099,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
             let mut tracked_ids = tracking
                 .active_nodes
                 .iter()
-                .map(|(_, node_id)| *node_id)
+                .map(|tracked| tracked.node_id)
                 .collect::<Vec<_>>();
             if let Some(signature_id) = tracked_element
                 && !tracked_ids.contains(&signature_id)
@@ -1084,18 +1117,22 @@ fn execute_transform_chain<'s, 'e, 'd>(
                     &mut output,
                 )
                 .map_err(|error| map_c14n_limit_error(error, &context.budget.c14n))?;
-            tracking.canonical_positions = Some(
-                tracking
-                    .active_nodes
+            let mut canonical_positions = Vec::with_capacity(tracking.active_nodes.len());
+            for tracked in &tracking.active_nodes {
+                if let Some((_, position)) = positions
                     .iter()
-                    .filter_map(|(index, node_id)| {
-                        positions
-                            .iter()
-                            .find(|(tracked_id, _)| tracked_id == node_id)
-                            .map(|(_, position)| (*index, *position))
-                    })
-                    .collect(),
-            );
+                    .find(|(tracked_id, _)| *tracked_id == tracked.node_id)
+                {
+                    canonical_positions.push(CanonicalDependencyPosition {
+                        index: tracked.index,
+                        position: *position,
+                        node_type: tracked.node_type,
+                    });
+                } else {
+                    tracking.opaque_dependencies.insert(tracked.index);
+                }
+            }
+            tracking.canonical_positions = Some(canonical_positions);
             tracked_element.and_then(|signature_id| {
                 positions
                     .iter()
@@ -1167,16 +1204,16 @@ fn execute_transform_chain<'s, 'e, 'd>(
     )?;
     if let Some(tracking) = &mut dependency_tracking {
         match &data {
-            TransformData::NodeSet(nodes) => tracking.active_nodes.retain(|(_, node_id)| {
+            TransformData::NodeSet(nodes) => tracking.active_nodes.retain(|tracked| {
                 nodes
                     .document()
-                    .get_node(*node_id)
+                    .get_node(tracked.node_id)
                     .is_some_and(|node| nodes.contains(node))
             }),
             TransformData::Binary(_) => {
                 tracking
                     .opaque_dependencies
-                    .extend(tracking.active_nodes.drain(..).map(|(index, _)| index));
+                    .extend(tracking.active_nodes.drain(..).map(|tracked| tracked.index));
                 tracking.canonical_positions = None;
             }
         }
@@ -1199,7 +1236,7 @@ fn dependency_indexes(tracking: Option<DependencyTracking>) -> HashSet<usize> {
     tracking
         .active_nodes
         .into_iter()
-        .map(|(index, _)| index)
+        .map(|tracked| tracked.index)
         .chain(tracking.opaque_dependencies)
         .collect()
 }
@@ -1564,7 +1601,8 @@ impl<'a> XPathParseState<'a> {
 }
 
 #[derive(Default)]
-/// Parser state shared by every Reference in one Signature, including Manifests.
+/// Parse/compile work shared by every Reference in one Signature, including
+/// repeated Manifest parses required by dependency-ordered signing.
 pub(crate) struct XPathSignatureParseBudget {
     expressions: usize,
 }
