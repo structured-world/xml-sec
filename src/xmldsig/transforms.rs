@@ -32,7 +32,7 @@ use super::whitespace::is_xml_whitespace_only;
 use super::xpath::{
     XPathDocumentRelation, XPathWorkBudget, apply_xpath_filter_with_semantics_and_budget,
     apply_xpath_filter2_with_semantics_and_budget, compile_xpath, is_xpath_whitespace,
-    xpath_may_read_node_values,
+    xpath_may_read_mutable_character_data,
 };
 use crate::c14n::xml_base::XmlBaseResolutionBudget;
 use crate::c14n::{self, C14nAlgorithm};
@@ -1206,11 +1206,11 @@ fn execute_transform_chain<'s, 'e, 'd>(
             TransformData::NodeSet(nodes) => {
                 let preserve_excluded_as_opaque = match transform {
                     Transform::XPath(expression) => {
-                        xpath_may_read_node_values(expression.expression())
+                        xpath_may_read_mutable_character_data(expression.expression())
                     }
-                    Transform::XPathFilter2(filters) => filters
-                        .iter()
-                        .any(|filter| xpath_may_read_node_values(filter.xpath().expression())),
+                    Transform::XPathFilter2(filters) => filters.iter().any(|filter| {
+                        xpath_may_read_mutable_character_data(filter.xpath().expression())
+                    }),
                     _ => false,
                 };
                 let mut active_nodes = Vec::with_capacity(tracking.active_nodes.len());

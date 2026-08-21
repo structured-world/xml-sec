@@ -1115,6 +1115,15 @@ fn fill_reference_digest_values_in_dependency_order(
         target_signature,
         Some(policy),
     )?;
+    // SignatureValue is the final mutable value in the signing pipeline. Give
+    // it concrete character data during analysis so references that retain the
+    // existing or future text cannot be mistaken for stable inputs.
+    let analysis_xml = fill_signature_value_at_index_with_options(
+        &analysis_xml,
+        placeholder,
+        target_signature,
+        Some(policy),
+    )?;
     let analysis_doc = parse_signing_document(&analysis_xml, Some(policy))?;
     let analysis_signature = find_signing_signature_node(
         &analysis_doc,
@@ -1219,7 +1228,9 @@ fn reference_dependency_levels(
     id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<Vec<Vec<usize>>, SigningDigestError> {
     let resolver = UriReferenceResolver::with_id_registrations(doc, id_attributes);
-    let tracked_digest_nodes = references
+    let terminal_signature_value_index = references.len();
+    let signature_value = find_required_child(signature, "SignatureValue")?;
+    let mut tracked_mutable_nodes = references
         .iter()
         .enumerate()
         .flat_map(|(index, reference)| {
@@ -1232,6 +1243,13 @@ fn reference_dependency_levels(
             )
         })
         .collect::<Vec<_>>();
+    tracked_mutable_nodes.push((terminal_signature_value_index, signature_value.id()));
+    tracked_mutable_nodes.extend(
+        signature_value
+            .children()
+            .filter(|node| node.is_text())
+            .map(|node| (terminal_signature_value_index, node.id())),
+    );
     let analyses = references
         .iter()
         .map(|reference| {
@@ -1245,11 +1263,19 @@ fn reference_dependency_levels(
                 &reference.transforms,
                 transform_options,
                 execution_budget,
-                tracked_digest_nodes.clone(),
+                tracked_mutable_nodes.clone(),
             )?;
             Ok(output.dependencies)
         })
         .collect::<Result<Vec<_>, SigningDigestError>>()?;
+    if analyses
+        .iter()
+        .any(|dependencies| dependencies.contains(&terminal_signature_value_index))
+    {
+        return Err(SigningDigestError::InvalidStructure(
+            "Reference dependency cycle includes the mutable SignatureValue".into(),
+        ));
+    }
     let mut dependencies = analyses;
     let mut completed = vec![false; references.len()];
     let mut levels = Vec::new();
@@ -1892,6 +1918,54 @@ mod error_conversion_tests {
                     if message.contains("dependency cycle")
             ),
             "expected a dependency-cycle rejection, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn signing_allows_payload_local_xpath_value_predicates() {
+        // Attribute comparisons read payload metadata, not mutable values in a
+        // disjoint Signature subtree. They must not manufacture a self-cycle.
+        let xml = r##"<root><payload Id="payload" kind="include">content</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>@kind = 'include'</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
+
+        let filled = fill_reference_digest_values_in_dependency_order(
+            xml,
+            TransformOptions::default(),
+            &crate::policy::SigningPolicy::default(),
+            crate::provider::default_provider(),
+            &TransformExecutionBudget::default(),
+            0,
+            &[],
+        )
+        .expect("payload-local XPath predicates must not depend on Signature values");
+
+        assert_ne!(filled, xml);
+    }
+
+    #[test]
+    fn signing_rejects_references_that_retain_signature_value() {
+        // SignatureValue is filled after every Reference digest. A Reference
+        // retaining that node is therefore an unavoidable signing cycle even
+        // when all DigestValue nodes are excluded from the resulting node-set.
+        let xml = r##"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:DigestValue)</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
+
+        let error = fill_reference_digest_values_in_dependency_order(
+            xml,
+            TransformOptions::default(),
+            &crate::policy::SigningPolicy::default(),
+            crate::provider::default_provider(),
+            &TransformExecutionBudget::default(),
+            0,
+            &[],
+        )
+        .expect_err("a mutable SignatureValue dependency must fail before signing");
+
+        assert!(
+            matches!(
+                &error,
+                SigningDigestError::InvalidStructure(message)
+                    if message.contains("SignatureValue") && message.contains("cycle")
+            ),
+            "expected a SignatureValue dependency-cycle rejection, got: {error:?}"
         );
     }
 }

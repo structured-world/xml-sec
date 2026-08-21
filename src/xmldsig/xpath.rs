@@ -329,6 +329,93 @@ pub(super) fn xpath_may_read_node_values(source: &str) -> bool {
     scans != 1 || !is_count_number_comparison(source)
 }
 
+/// Whether XPath value coercion can observe mutable element character data.
+///
+/// Attribute-to-literal comparisons are value reads, but XMLDSig fills neither
+/// attributes nor their owners while constructing a signature. Keep those
+/// predicates out of the mutable-node dependency graph; every other coercion
+/// remains conservative because it can consume an element or text string-value.
+pub(super) fn xpath_may_read_mutable_character_data(source: &str) -> bool {
+    xpath_may_read_node_values(source) && !comparisons_are_attribute_to_scalar(source)
+}
+
+fn comparisons_are_attribute_to_scalar(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut quote = None;
+    let mut index = 0_usize;
+    let mut comparisons = 0_usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if matches!(byte, b'\'' | b'"') {
+            if quote == Some(byte) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(byte);
+            }
+            index += 1;
+            continue;
+        }
+        if quote.is_some() {
+            index += 1;
+            continue;
+        }
+        let operator_len = match byte {
+            b'=' => 1,
+            b'!' if bytes.get(index + 1) == Some(&b'=') => 2,
+            b'<' | b'>' => 1 + usize::from(bytes.get(index + 1) == Some(&b'=')),
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        comparisons = comparisons.saturating_add(1);
+        let left = source[..index].trim_end_matches(is_xpath_whitespace);
+        let right = source[index + operator_len..].trim_start_matches(is_xpath_whitespace);
+        if !(operand_ends_in_attribute(left) && operand_starts_with_scalar(right)
+            || operand_ends_in_scalar(left) && operand_starts_with_attribute(right))
+        {
+            return false;
+        }
+        index += operator_len;
+    }
+    comparisons > 0 && xpath_string_scan_count(source) == comparisons
+}
+
+fn operand_ends_in_attribute(source: &str) -> bool {
+    let operand = source.trim_end_matches(is_xpath_whitespace);
+    let name_start = operand
+        .as_bytes()
+        .iter()
+        .rposition(|byte| !is_xpath_identifier_byte(*byte))
+        .map_or(0, |index| index + 1);
+    name_start > 0 && operand.as_bytes().get(name_start - 1) == Some(&b'@')
+}
+
+fn operand_starts_with_attribute(source: &str) -> bool {
+    source
+        .trim_start_matches(is_xpath_whitespace)
+        .starts_with('@')
+}
+
+fn operand_ends_in_scalar(source: &str) -> bool {
+    let operand = source.trim_end_matches(is_xpath_whitespace);
+    operand.ends_with('\'')
+        || operand.ends_with('"')
+        || operand
+            .split(|byte: char| is_xpath_whitespace(byte) || matches!(byte, '(' | ','))
+            .next_back()
+            .is_some_and(|value| value.parse::<f64>().is_ok())
+}
+
+fn operand_starts_with_scalar(source: &str) -> bool {
+    let operand = source.trim_start_matches(is_xpath_whitespace);
+    operand.starts_with(['\'', '"'])
+        || operand
+            .split(|byte: char| is_xpath_whitespace(byte) || matches!(byte, ')' | ','))
+            .next()
+            .is_some_and(|value| value.parse::<f64>().is_ok())
+}
+
 fn is_count_number_comparison(source: &str) -> bool {
     let bytes = source.as_bytes();
     let mut depth = 0_usize;
@@ -2148,6 +2235,23 @@ mod tests {
         assert!(!xpath_may_read_node_values("1 != count(//item)"));
         assert!(xpath_may_read_node_values("//ds:DigestValue = ''"));
         assert!(xpath_may_read_node_values("string(//ds:DigestValue) = ''"));
+    }
+
+    #[test]
+    fn xpath_dependency_profile_excludes_attribute_scalar_comparisons() {
+        // Signing never mutates attributes, so comparing one to a literal does
+        // not make disjoint DigestValue or SignatureValue text a dependency.
+        assert!(!xpath_may_read_mutable_character_data("@kind = 'include'"));
+        assert!(!xpath_may_read_mutable_character_data("'include' = @kind"));
+        assert!(xpath_may_read_mutable_character_data(
+            "//ds:DigestValue = ''"
+        ));
+        assert!(xpath_may_read_mutable_character_data(
+            "@kind = //ds:DigestValue"
+        ));
+        assert!(xpath_may_read_mutable_character_data(
+            "@kind = 'include' and string(//ds:DigestValue)"
+        ));
     }
 
     #[test]
