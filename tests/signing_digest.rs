@@ -1115,6 +1115,57 @@ fn manifest_signing_rejects_self_dependency_kept_as_text() {
 }
 
 #[test]
+fn manifest_signing_rejects_empty_self_dependency_kept_as_future_text() {
+    // Filling an empty DigestValue creates character data. XPath that excludes
+    // only the element still retains that future text and therefore forms a
+    // self-dependency even though no text node exists in the template yet.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let policy = SigningPolicy {
+        manifest_processing: ManifestProcessing::Process,
+        ..SigningPolicy::default()
+    };
+    let template = r##"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#manifest"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="manifest"><ds:Reference URI="#manifest"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(self::ds:DigestValue)</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##;
+
+    let error = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_template(template)
+        .expect_err("future DigestValue text must form a dependency cycle");
+
+    assert!(matches!(
+        error,
+        SigningError::Digest(SigningDigestError::InvalidStructure(message))
+            if message.contains("cycle")
+    ));
+}
+
+#[test]
+fn manifest_signing_rejects_cross_set_digest_dependency_cycle() {
+    // SignedInfo and Manifest digest slots are one mutation graph. Each side
+    // authenticating the other has no stable fill order and must fail closed.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let policy = SigningPolicy {
+        manifest_processing: ManifestProcessing::Process,
+        ..SigningPolicy::default()
+    };
+    let template = r##"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo Id="signed-info"><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#manifest"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="manifest"><ds:Reference URI="#signed-info"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##;
+
+    let error = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_template(template)
+        .expect_err("cross-set digest dependencies must form a cycle");
+
+    assert!(matches!(
+        error,
+        SigningError::Digest(SigningDigestError::InvalidStructure(message))
+            if message.contains("cycle")
+    ));
+}
+
+#[test]
 fn manifest_signing_rejects_digest_dependency_cycles() {
     // Circular Manifest references have no stable fill order and must fail
     // before the signing template is partially mutated.

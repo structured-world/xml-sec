@@ -20,8 +20,8 @@ mod parse;
 mod types;
 
 pub use decrypt::{
-    DecryptContext, DecryptionCandidateBudget, DecryptionKeyResolver, DocumentDecryptionOptions,
-    KekDecryptor, PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt, decrypt_data,
+    DecryptContext, DecryptionKeyResolver, DocumentDecryptionOptions, KekDecryptor,
+    KeyCandidateBudget, PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt, decrypt_data,
     decrypt_document, decrypt_document_with_options,
 };
 pub use encrypt::{EncryptedDataBuilder, validate_rsa_recipient_key};

@@ -21,20 +21,20 @@ use crate::xml::XmlIdIndex;
 #[cfg(test)]
 use super::parse_encrypted_data;
 
-/// Aggregate key-candidate work allowance for one decryption operation.
+/// Aggregate key-candidate work allowance for one cryptographic operation.
 ///
 /// Resolver implementations must consume one unit before each key lookup or
 /// unwrap attempt. A single budget is shared across direct and recipient keys.
 #[derive(Debug)]
-pub struct DecryptionCandidateBudget {
+pub struct KeyCandidateBudget {
     maximum: usize,
     remaining: usize,
 }
 
-impl DecryptionCandidateBudget {
+impl KeyCandidateBudget {
     /// Create the fixed implementation-wide budget for one operation.
     pub fn for_operation() -> Self {
-        let maximum = crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING;
+        let maximum = crate::hard_limits::KEY_CANDIDATE_CEILING;
         Self {
             maximum,
             remaining: maximum,
@@ -49,7 +49,7 @@ impl DecryptionCandidateBudget {
     /// Charge attempted candidate work before performing it.
     pub fn consume(&mut self, count: usize, resource: &'static str) -> Result<(), XmlEncError> {
         if count > self.remaining {
-            return Err(XmlEncError::DecryptionCandidateLimitExceeded {
+            return Err(XmlEncError::KeyCandidateLimitExceeded {
                 resource,
                 maximum: self.maximum,
                 actual: self
@@ -98,7 +98,7 @@ pub trait DecryptionKeyResolver {
         provider: &dyn crate::provider::CryptoProvider,
         algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
-        budget: &mut DecryptionCandidateBudget,
+        budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
         budget.consume(1, "decryption key candidates")?;
         self.resolve_key(provider, algorithm, encrypted_key)
@@ -747,7 +747,7 @@ fn resolve_content_key_candidates(
     resolver: &dyn DecryptionKeyResolver,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<Vec<Vec<u8>>, XmlEncError> {
-    let mut budget = DecryptionCandidateBudget::for_operation();
+    let mut budget = KeyCandidateBudget::for_operation();
     let mut last_error = None;
     let mut candidates =
         match resolve_candidates_with_budget(resolver, provider, algorithm, None, &mut budget) {
@@ -790,7 +790,7 @@ fn record_candidate_source_error(
     // Candidate-specific failures permit the next ordered key source. The
     // shared work ceiling is operation-wide and must never be recoverable by
     // advancing to another recipient.
-    if matches!(&error, XmlEncError::DecryptionCandidateLimitExceeded { .. }) {
+    if matches!(&error, XmlEncError::KeyCandidateLimitExceeded { .. }) {
         return Err(error);
     }
     *last_error = Some(error);
@@ -802,7 +802,7 @@ fn resolve_candidates_with_budget(
     provider: &dyn crate::provider::CryptoProvider,
     algorithm: DataEncryptionAlgorithm,
     encrypted_key: Option<&EncryptedKey>,
-    budget: &mut DecryptionCandidateBudget,
+    budget: &mut KeyCandidateBudget,
 ) -> Result<Vec<Vec<u8>>, XmlEncError> {
     let remaining_before = budget.remaining();
     let keys = resolver.resolve_key_candidates(provider, algorithm, encrypted_key, budget)?;
@@ -863,7 +863,7 @@ fn validate_decryption_key_candidates(
     algorithm: DataEncryptionAlgorithm,
     actual: usize,
 ) -> Result<(), XmlEncError> {
-    let maximum = crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING;
+    let maximum = crate::hard_limits::KEY_CANDIDATE_CEILING;
     if actual > maximum {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
             resource: "decryption key candidates",
@@ -1268,7 +1268,7 @@ mod tests {
             _provider: &dyn crate::provider::CryptoProvider,
             _algorithm: DataEncryptionAlgorithm,
             encrypted_key: Option<&EncryptedKey>,
-            budget: &mut DecryptionCandidateBudget,
+            budget: &mut KeyCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
             if encrypted_key.is_none() {
                 budget.consume(1, "decryption key candidates")?;
@@ -1297,7 +1297,7 @@ mod tests {
             _provider: &dyn crate::provider::CryptoProvider,
             _algorithm: DataEncryptionAlgorithm,
             encrypted_key: Option<&EncryptedKey>,
-            budget: &mut DecryptionCandidateBudget,
+            budget: &mut KeyCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
             budget.consume(1, "decryption key candidates")?;
             match encrypted_key.and_then(|key| key.id.as_deref()) {
@@ -1323,7 +1323,7 @@ mod tests {
             _provider: &dyn crate::provider::CryptoProvider,
             _algorithm: DataEncryptionAlgorithm,
             encrypted_key: Option<&EncryptedKey>,
-            budget: &mut DecryptionCandidateBudget,
+            budget: &mut KeyCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
             if encrypted_key.is_none() {
                 budget.consume(self.keys.len(), "decryption key candidates")?;
@@ -1349,7 +1349,7 @@ mod tests {
             _provider: &dyn crate::provider::CryptoProvider,
             _algorithm: DataEncryptionAlgorithm,
             encrypted_key: Option<&EncryptedKey>,
-            budget: &mut DecryptionCandidateBudget,
+            budget: &mut KeyCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
             let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
             let attempts = budget.remaining();
@@ -1381,7 +1381,7 @@ mod tests {
             _provider: &dyn crate::provider::CryptoProvider,
             _algorithm: DataEncryptionAlgorithm,
             encrypted_key: Option<&EncryptedKey>,
-            budget: &mut DecryptionCandidateBudget,
+            budget: &mut KeyCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
             let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
             budget.consume(1, "decryption key candidates")?;
@@ -1879,7 +1879,7 @@ mod tests {
                 value: STANDARD.encode(vec![0_u8; 28]),
             },
         };
-        let actual = crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING + 1;
+        let actual = crate::hard_limits::KEY_CANDIDATE_CEILING + 1;
         let resolver = CandidateResolver {
             keys: vec![vec![0_u8; 16]; actual],
         };
@@ -1890,9 +1890,9 @@ mod tests {
 
         assert!(matches!(
             error,
-            XmlEncError::DecryptionCandidateLimitExceeded {
+            XmlEncError::KeyCandidateLimitExceeded {
                 resource: "decryption key candidates",
-                maximum: crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING,
+                maximum: crate::hard_limits::KEY_CANDIDATE_CEILING,
                 actual: observed,
             } if observed == actual
         ));
@@ -1921,7 +1921,7 @@ mod tests {
             .expect_err("a second recipient must not receive a fresh candidate allowance");
         assert_eq!(
             resolver.attempts.get(),
-            crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING
+            crate::hard_limits::KEY_CANDIDATE_CEILING
         );
     }
 
@@ -1945,11 +1945,11 @@ mod tests {
 
         assert!(matches!(
             error,
-            XmlEncError::DecryptionCandidateLimitExceeded {
+            XmlEncError::KeyCandidateLimitExceeded {
                 resource: "RSA private-key candidates",
-                maximum: crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING,
+                maximum: crate::hard_limits::KEY_CANDIDATE_CEILING,
                 actual,
-            } if actual == crate::hard_limits::DECRYPTION_KEY_CANDIDATE_CEILING + 1
+            } if actual == crate::hard_limits::KEY_CANDIDATE_CEILING + 1
         ));
     }
 

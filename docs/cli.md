@@ -30,7 +30,9 @@ without template-generation semantics.
 `--print-xml-debug` emits a well-formed operation context. Signing and
 verification use `SignatureContext` and `VerificationContext`; encryption and
 decryption use `DataEncryptionContext` and `DataDecryptionContext`. With
-`--output`, the transformed payload is written to the requested file and
+other commands both options are recognized but rejected as inapplicable rather
+than being silently ignored. When `--output` applies, the transformed payload
+is written to the requested file and
 diagnostics remain on stdout. Verification diagnostics retain donor
 `OK`/`FAILED` status and failure-reason vocabulary and are emitted for invalid
 signatures before the command returns its required non-zero status.

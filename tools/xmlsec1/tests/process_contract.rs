@@ -24,8 +24,7 @@ use xml_sec::{
         SignatureBuilder, Transform, XPathExpression, mutation::append_signature_to_root,
     },
     xmlenc::{
-        DataEncryptionAlgorithm, DecryptionCandidateBudget, EncryptedDataBuilder,
-        EncryptionRecipient,
+        DataEncryptionAlgorithm, EncryptedDataBuilder, EncryptionRecipient, KeyCandidateBudget,
     },
 };
 
@@ -429,6 +428,25 @@ fn signing_writes_requested_diagnostics_separately_from_output() {
             );
         }
     }
+}
+
+#[test]
+fn debug_options_are_rejected_for_non_crypto_commands() {
+    // Diagnostic contexts exist only for DSig and XMLEnc operations. Accepting
+    // the flags on keys would silently discard a recognized caller request.
+    let output = Command::new(binary())
+        .args(["keys", "--print-debug", "--gen-key:test", "aes-128"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "option --print-debug is recognized but is not applicable to the keys command"
+        ),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -2703,7 +2721,7 @@ fn lax_aes_key_ring_is_bounded_before_filesystem_reads() {
         r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue>AAAAAAAAAAAAAAAAAAAAAA==</CipherValue></CipherData></EncryptedData>"#,
     )
     .unwrap();
-    let maximum = DecryptionCandidateBudget::for_operation().remaining();
+    let maximum = KeyCandidateBudget::for_operation().remaining();
     let mut command = Command::new(binary());
     command.args(["decrypt", "--lax-key-search"]);
     for index in 0..=maximum {
@@ -2714,10 +2732,40 @@ fn lax_aes_key_ring_is_bounded_before_filesystem_reads() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("decryption candidate limit exceeded"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("key candidate limit exceeded"), "{stderr}");
+    assert!(!stderr.contains("missing-0.key"), "{stderr}");
+}
+
+#[test]
+fn lax_aes_encryption_key_ring_is_bounded_before_filesystem_reads() {
+    // Encryption shares the operation-wide key candidate ceiling and must reject
+    // an oversized ring before opening any attacker-selected path.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"bounded encryption candidates").unwrap();
+    let maximum = KeyCandidateBudget::for_operation().remaining();
+    let mut command = Command::new(binary());
+    command.args(["encrypt", "--lax-key-search"]);
+    for index in 0..=maximum {
+        command.arg("--aes-key");
+        command.arg(temp.path().join(format!("missing-{index}.key")));
+    }
+    let output = command
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("key candidate limit exceeded"), "{stderr}");
     assert!(!stderr.contains("missing-0.key"), "{stderr}");
 }
 

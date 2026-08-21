@@ -32,7 +32,7 @@ pub(crate) const XML_DOCUMENT_BYTE_CEILING: usize = ENCRYPTION_CIPHER_VALUE_BASE
 pub(crate) const ENCRYPTION_RECIPIENT_CEILING: usize = 64;
 /// Maximum symmetric keys attempted by one prepared decryption operation.
 #[cfg(feature = "xmlenc")]
-pub(crate) const DECRYPTION_KEY_CANDIDATE_CEILING: usize = 64;
+pub(crate) const KEY_CANDIDATE_CEILING: usize = 64;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const ENCRYPTION_METADATA_BYTE_CEILING: usize = 4 * 1024;
 

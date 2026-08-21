@@ -275,6 +275,61 @@ where
     })
 }
 
+pub(super) fn fill_selected_signed_info_digest_values_at_index_with_options<I, S>(
+    xml: &str,
+    replacements: I,
+    target_signature: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError>
+where
+    I: IntoIterator<Item = (usize, S)>,
+    S: AsRef<str>,
+{
+    let replacements = replacements
+        .into_iter()
+        .map(|(index, value)| (index, value.as_ref().to_owned()))
+        .collect::<Vec<_>>();
+    let expected = count_signed_info_digest_values(xml, target_signature, policy)?;
+    if replacements
+        .iter()
+        .enumerate()
+        .any(|(position, (index, _))| {
+            *index >= expected
+                || position
+                    .checked_sub(1)
+                    .is_some_and(|previous| replacements[previous].0 >= *index)
+        })
+    {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "DigestValue",
+            expected,
+            actual: replacements.len(),
+        });
+    }
+
+    let replacement_indices = replacements
+        .iter()
+        .map(|(index, _)| *index)
+        .collect::<Vec<_>>();
+    let values = replacements
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>();
+    let mut signed_info_index = 0usize;
+    let mut replacement_index = 0usize;
+    fill_dsig_values_matching(xml, "DigestValue", values, policy, |stack, namespace| {
+        if !is_signed_info_reference_context(stack, namespace, target_signature) {
+            return false;
+        }
+        let selected = replacement_indices.get(replacement_index) == Some(&signed_info_index);
+        signed_info_index += 1;
+        if selected {
+            replacement_index += 1;
+        }
+        selected
+    })
+}
+
 pub(super) fn fill_selected_manifest_digest_values_at_index_with_options<I, S>(
     xml: &str,
     replacements: I,

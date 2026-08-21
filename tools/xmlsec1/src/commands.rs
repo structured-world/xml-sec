@@ -29,9 +29,9 @@ use xml_sec::{
         uri::UriReferenceResolver, validate_signing_key, x509_certificate_matches_selectors,
     },
     xmlenc::{
-        DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionCandidateBudget,
-        DecryptionKeyResolver, EncryptedDataBuilder, EncryptedDataType, EncryptedKey,
-        EncryptionMethod, EncryptionRecipient, KeyTransportAlgorithm, OaepDigestAlgorithm,
+        DataEncryptionAlgorithm, DecryptContext, DecryptedContent, DecryptionKeyResolver,
+        EncryptedDataBuilder, EncryptedDataType, EncryptedKey, EncryptionMethod,
+        EncryptionRecipient, KeyCandidateBudget, KeyTransportAlgorithm, OaepDigestAlgorithm,
         PrivateKeyDecryptor, RsaOaepParameters, XmlEncError,
         parse_encrypted_data_template_node_with_policy, validate_rsa_recipient_key,
     },
@@ -51,11 +51,11 @@ const GENERIC_OPTIONS: &[&str] = &[
     "crypto-config",
     "verbose",
     "print-crypto-library-errors",
-    "print-debug",
-    "print-xml-debug",
     "help",
 ];
 const SIGN_OPTIONS: &[&str] = &[
+    "print-debug",
+    "print-xml-debug",
     "output",
     "ignore-manifests",
     "privkey-pem",
@@ -71,6 +71,8 @@ const SIGN_OPTIONS: &[&str] = &[
     "add-id-attr",
 ];
 const VERIFY_OPTIONS: &[&str] = &[
+    "print-debug",
+    "print-xml-debug",
     "pubkey-pem",
     "pubkey-der",
     "pubkey-cert-pem",
@@ -97,6 +99,8 @@ const VERIFY_OPTIONS: &[&str] = &[
     "url-map",
 ];
 const ENCRYPT_OPTIONS: &[&str] = &[
+    "print-debug",
+    "print-xml-debug",
     "output",
     "binary-data",
     "xml-data",
@@ -113,6 +117,8 @@ const ENCRYPT_OPTIONS: &[&str] = &[
     "add-id-attr",
 ];
 const DECRYPT_OPTIONS: &[&str] = &[
+    "print-debug",
+    "print-xml-debug",
     "output",
     "aes-key",
     "privkey-pem",
@@ -1547,12 +1553,18 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             true,
             "AES key",
         )?;
+        KeyCandidateBudget::for_operation()
+            .consume(candidates.len(), "encryption key candidates")
+            .map_err(|error| CommandError::Encryption(error.to_string()))?;
+        let mut material_budget =
+            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
         let mut selected = None;
         let mut last_error = None;
         for (option, ()) in candidates {
-            match key_material::load_symmetric(
+            match load_symmetric_with_budget(
                 option.value.as_deref().unwrap_or_default(),
                 Some(algorithm.key_len()),
+                &mut material_budget,
             ) {
                 Ok(key) => {
                     selected = Some((option, key));
@@ -1562,9 +1574,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             }
         }
         let (option, key) = selected.ok_or_else(|| {
-            last_error
-                .map(CommandError::from)
-                .unwrap_or_else(|| CommandError::Usage("no compatible AES key input".into()))
+            last_error.unwrap_or_else(|| CommandError::Usage("no compatible AES key input".into()))
         })?;
         builder = builder.direct_key(key);
         if let Some(name) = option.parameter.as_deref() {
@@ -1705,6 +1715,16 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     write_result_then_stdout_diagnostics(invocation, rendered.as_bytes(), stdout, |stdout| {
         write_encryption_diagnostics(invocation, algorithm, stdout)
     })
+}
+
+fn load_symmetric_with_budget(
+    path: &OsStr,
+    expected: Option<usize>,
+    budget: &mut ExternalMaterialBudget,
+) -> Result<Vec<u8>, CommandError> {
+    let bytes = key_material::read_symmetric(path, expected)?;
+    budget.charge(bytes.len())?;
+    key_material::decode_symmetric(bytes, expected).map_err(CommandError::from)
 }
 
 fn xml_data_plaintext<'a>(
@@ -2538,7 +2558,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             true,
             "AES key",
         )?;
-        DecryptionCandidateBudget::for_operation()
+        KeyCandidateBudget::for_operation()
             .consume(candidates.len(), "decryption key candidates")
             .map_err(|error| CommandError::Encryption(error.to_string()))?;
         let lax_key_search = invocation.flag("lax-key-search");
@@ -2733,7 +2753,7 @@ impl DecryptionKeyResolver for CandidateSymmetricKeyDecryptor {
         _provider: &dyn CryptoProvider,
         _algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
-        budget: &mut DecryptionCandidateBudget,
+        budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
         if encrypted_key.is_none() {
             budget.consume(self.keys.len(), "decryption key candidates")?;
@@ -2778,7 +2798,7 @@ impl DecryptionKeyResolver for NamedRecipientDecryptor {
         provider: &dyn CryptoProvider,
         algorithm: DataEncryptionAlgorithm,
         encrypted_key: Option<&EncryptedKey>,
-        budget: &mut DecryptionCandidateBudget,
+        budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
         let Some(encrypted_key) = encrypted_key else {
             return Err(XmlEncError::KeyNotFound);
@@ -3994,7 +4014,7 @@ mod tests {
             carried_key_name: None,
         };
 
-        let mut candidate_budget = DecryptionCandidateBudget::for_operation();
+        let mut candidate_budget = KeyCandidateBudget::for_operation();
         let maximum = candidate_budget.remaining();
         let reserved = maximum - 1;
         candidate_budget
@@ -4011,7 +4031,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            XmlEncError::DecryptionCandidateLimitExceeded {
+            XmlEncError::KeyCandidateLimitExceeded {
                 resource: "RSA private-key candidates",
                 maximum: observed_maximum,
                 actual,

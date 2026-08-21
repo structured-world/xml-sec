@@ -28,6 +28,7 @@ use super::mutation::{
     XmlMutationError, append_signature_to_element_with_options,
     append_signature_to_root_with_options,
     fill_selected_manifest_digest_values_at_index_with_options,
+    fill_selected_signed_info_digest_values_at_index_with_options,
     fill_signature_value_at_index_with_options, fill_signed_info_digest_values,
     fill_signed_info_digest_values_at_index_with_options,
     fill_signed_info_digest_values_with_options, merge_key_info_source_at_index_with_options,
@@ -889,9 +890,9 @@ impl<'a> SignContext<'a> {
             None
         };
         let prepared_xml = with_key_info.as_deref().unwrap_or(xml);
-        let with_manifests =
+        let with_digests =
             if self.policy.manifest_processing == crate::policy::ManifestProcessing::Process {
-                Some(fill_manifest_reference_digest_values_with_options(
+                Some(fill_reference_digest_values_in_dependency_order(
                     prepared_xml,
                     transform_options,
                     &self.policy,
@@ -903,16 +904,19 @@ impl<'a> SignContext<'a> {
             } else {
                 None
             };
-        let prepared_xml = with_manifests.as_deref().unwrap_or(prepared_xml);
-        let with_digests = fill_reference_digest_values_with_options(
-            prepared_xml,
-            transform_options,
-            Some(&self.policy),
-            self.provider,
-            &execution_budget,
-            Some(target_signature),
-            self.id_attributes,
-        )?;
+        let with_digests = if let Some(with_digests) = with_digests {
+            with_digests
+        } else {
+            fill_reference_digest_values_with_options(
+                prepared_xml,
+                transform_options,
+                Some(&self.policy),
+                self.provider,
+                &execution_budget,
+                Some(target_signature),
+                self.id_attributes,
+            )?
+        };
         self.policy
             .resources
             .validate_xml_document_len(with_digests.len())?;
@@ -1062,7 +1066,7 @@ fn compute_reference_digest_values_with_options(
     )
 }
 
-fn fill_manifest_reference_digest_values_with_options(
+fn fill_reference_digest_values_in_dependency_order(
     xml: &str,
     transform_options: TransformOptions,
     policy: &crate::policy::SigningPolicy,
@@ -1098,80 +1102,122 @@ fn fill_manifest_reference_digest_values_with_options(
         .checked_add(manifest_references.len())
         .ok_or_else(|| SigningDigestError::InvalidStructure("reference count overflow".into()))?;
     validate_signing_references(&manifest_references, total_references, Some(policy))?;
-    if manifest_references.is_empty() {
-        return Ok(xml.to_owned());
-    }
-    let mut dependency_plan = manifest_reference_dependency_levels(
-        &doc,
-        signature,
-        &manifest_references,
+    let placeholder = "AA==";
+    let analysis_xml = fill_signed_info_digest_values_at_index_with_options(
+        xml,
+        std::iter::repeat_n(placeholder, signed_info_references.len()),
+        target_signature,
+        Some(policy),
+    )?;
+    let analysis_xml = fill_selected_manifest_digest_values_at_index_with_options(
+        &analysis_xml,
+        (0..manifest_references.len()).map(|index| (index, placeholder)),
+        target_signature,
+        Some(policy),
+    )?;
+    let analysis_doc = parse_signing_document(&analysis_xml, Some(policy))?;
+    let analysis_signature = find_signing_signature_node(
+        &analysis_doc,
+        SigningSignatureTarget::Index(target_signature),
+    )?;
+    let analysis_signed_info = find_required_child(analysis_signature, "SignedInfo")?;
+    let mut analysis_references =
+        parse_signing_references_with_budget(analysis_signed_info, &mut xpath_budget)?;
+    analysis_references.extend(parse_signing_manifest_references(
+        analysis_signature,
+        &mut xpath_budget,
+        reference_limit.saturating_sub(signed_info_references.len()),
+        reference_limit,
+    )?);
+    let dependency_plan = reference_dependency_levels(
+        &analysis_doc,
+        analysis_signature,
+        &analysis_references,
         transform_options,
-        provider,
         execution_budget,
         id_attributes,
     )?;
     let mut filled = xml.to_owned();
-    for level in dependency_plan.levels {
+    for level in dependency_plan {
         let current_doc = parse_signing_document(&filled, Some(policy))?;
         let current_signature = find_signing_signature_node(
             &current_doc,
             SigningSignatureTarget::Index(target_signature),
         )?;
-        let current_references = parse_signing_manifest_references(
+        let current_signed_info = find_required_child(current_signature, "SignedInfo")?;
+        let current_signed_info_references =
+            parse_signing_references_with_budget(current_signed_info, &mut xpath_budget)?;
+        let current_manifest_references = parse_signing_manifest_references(
             current_signature,
             &mut xpath_budget,
             reference_limit.saturating_sub(signed_info_references.len()),
             reference_limit,
         )?;
-        let mut replacements = Vec::with_capacity(level.len());
+        let mut signed_info_replacements = Vec::new();
+        let mut manifest_replacements = Vec::new();
         for index in level {
-            let digest_value = if let Some(value) = dependency_plan.precomputed.remove(&index) {
-                value
+            let (reference, local_index, signed_info) =
+                if index < current_signed_info_references.len() {
+                    (&current_signed_info_references[index], index, true)
+                } else {
+                    let local_index = index - current_signed_info_references.len();
+                    (
+                        &current_manifest_references[local_index],
+                        local_index,
+                        false,
+                    )
+                };
+            let mut computed = compute_signing_reference_digests(
+                &current_doc,
+                current_signature,
+                vec![reference.clone()],
+                transform_options,
+                provider,
+                execution_budget,
+                id_attributes,
+            )?;
+            let digest_value = computed
+                .pop()
+                .ok_or_else(|| {
+                    SigningDigestError::InvalidStructure(
+                        "signing Reference did not produce a digest".into(),
+                    )
+                })?
+                .digest_value;
+            if signed_info {
+                signed_info_replacements.push((local_index, digest_value));
             } else {
-                let mut computed = compute_signing_reference_digests(
-                    &current_doc,
-                    current_signature,
-                    vec![current_references[index].clone()],
-                    transform_options,
-                    provider,
-                    execution_budget,
-                    id_attributes,
-                )?;
-                computed
-                    .pop()
-                    .ok_or_else(|| {
-                        SigningDigestError::InvalidStructure(
-                            "signing Reference did not produce a digest".into(),
-                        )
-                    })?
-                    .digest_value
-            };
-            replacements.push((index, digest_value));
+                manifest_replacements.push((local_index, digest_value));
+            }
         }
-        filled = fill_selected_manifest_digest_values_at_index_with_options(
-            &filled,
-            replacements,
-            target_signature,
-            Some(policy),
-        )?;
+        if !signed_info_replacements.is_empty() {
+            filled = fill_selected_signed_info_digest_values_at_index_with_options(
+                &filled,
+                signed_info_replacements,
+                target_signature,
+                Some(policy),
+            )?;
+        }
+        if !manifest_replacements.is_empty() {
+            filled = fill_selected_manifest_digest_values_at_index_with_options(
+                &filled,
+                manifest_replacements,
+                target_signature,
+                Some(policy),
+            )?;
+        }
     }
     Ok(filled)
 }
 
-struct ManifestDependencyPlan {
-    levels: Vec<Vec<usize>>,
-    precomputed: std::collections::HashMap<usize, String>,
-}
-
-fn manifest_reference_dependency_levels(
+fn reference_dependency_levels(
     doc: &Document<'_>,
     signature: Node<'_, '_>,
     references: &[SigningReference],
     transform_options: TransformOptions,
-    provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
     id_attributes: &[crate::IdAttributeRegistration],
-) -> Result<ManifestDependencyPlan, SigningDigestError> {
+) -> Result<Vec<Vec<usize>>, SigningDigestError> {
     let resolver = UriReferenceResolver::with_id_registrations(doc, id_attributes);
     let tracked_digest_nodes = references
         .iter()
@@ -1201,32 +1247,10 @@ fn manifest_reference_dependency_levels(
                 execution_budget,
                 tracked_digest_nodes.clone(),
             )?;
-            Ok((output.dependencies, output.bytes))
+            Ok(output.dependencies)
         })
         .collect::<Result<Vec<_>, SigningDigestError>>()?;
-    let mut dependencies = analyses
-        .iter()
-        .map(|(dependencies, _)| dependencies.clone())
-        .collect::<Vec<_>>();
-    let precomputed = analyses
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, (dependencies, pre_digest))| {
-            dependencies.is_empty().then(|| {
-                super::compute_digest_with_provider(
-                    provider,
-                    references[index].digest_method,
-                    &pre_digest,
-                )
-                .map(|digest| {
-                    (
-                        index,
-                        base64::engine::general_purpose::STANDARD.encode(digest),
-                    )
-                })
-            })
-        })
-        .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
+    let mut dependencies = analyses;
     let mut completed = vec![false; references.len()];
     let mut levels = Vec::new();
     while completed.iter().any(|done| !done) {
@@ -1251,17 +1275,14 @@ fn manifest_reference_dependency_levels(
         levels.push(ready);
     }
 
-    // Every mutable Manifest DigestValue belongs to the selected Signature;
+    // Every mutable DigestValue belongs to the selected Signature;
     // an enveloped transform excludes that complete subtree and therefore
     // removes all such dependencies from its input node-set.
     debug_assert!(references.iter().all(|reference| {
         signature.range().start <= reference.digest_value_range.start
             && signature.range().end >= reference.digest_value_range.end
     }));
-    Ok(ManifestDependencyPlan {
-        levels,
-        precomputed,
-    })
+    Ok(levels)
 }
 
 fn validate_signing_references(
@@ -1825,7 +1846,7 @@ mod error_conversion_tests {
             ..crate::policy::SigningPolicy::default()
         };
 
-        let error = fill_manifest_reference_digest_values_with_options(
+        let error = fill_reference_digest_values_in_dependency_order(
             &xml,
             TransformOptions::default(),
             &policy,

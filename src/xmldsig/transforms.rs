@@ -868,9 +868,8 @@ pub(crate) fn execute_transforms_with_options_and_budget<'a>(
     .map(|output| output.bytes)
 }
 
-/// Full transform output plus the mutable signing fields that can affect it.
+/// Mutable signing fields that can affect a transform output.
 pub(crate) struct TransformDependencyOutput {
-    pub(crate) bytes: Vec<u8>,
     pub(crate) dependencies: HashSet<usize>,
 }
 
@@ -948,7 +947,6 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
         &context,
     )?;
     Ok(TransformDependencyOutput {
-        bytes: output.bytes,
         dependencies: output.dependencies,
     })
 }

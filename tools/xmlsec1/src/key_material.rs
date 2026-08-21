@@ -466,6 +466,16 @@ pub fn load_symmetric(
 ) -> Result<Vec<u8>, KeyMaterialError> {
     // libxmlsec1's binary-key options consume the file verbatim. In particular,
     // ASCII bytes must not be guessed to be a textual Base64 representation.
+    let path = path.as_ref();
+    let key = read_symmetric(path, expected)?;
+    decode_symmetric(key, expected)
+}
+
+/// Read a bounded symmetric-key source before operation-level accounting.
+pub(crate) fn read_symmetric(
+    path: impl AsRef<Path>,
+    expected: Option<usize>,
+) -> Result<Vec<u8>, KeyMaterialError> {
     const MAX_AES_KEY_BYTES: usize = 32;
 
     let path = path.as_ref();
@@ -482,6 +492,17 @@ pub fn load_symmetric(
             path: path.to_owned(),
             source,
         })?;
+    Ok(key)
+}
+
+/// Validate symmetric-key bytes after their source has been charged.
+pub(crate) fn decode_symmetric(
+    key: Vec<u8>,
+    expected: Option<usize>,
+) -> Result<Vec<u8>, KeyMaterialError> {
+    const MAX_AES_KEY_BYTES: usize = 32;
+
+    let maximum = expected.unwrap_or(MAX_AES_KEY_BYTES);
     if key.len() > maximum {
         return match expected {
             Some(expected) => Err(KeyMaterialError::SymmetricLength {
