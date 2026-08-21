@@ -1034,6 +1034,8 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             "verification key",
         )?
     };
+    validate_verification_candidate_count(selected_keys.len(), &policy)
+        .map_err(|error| CommandError::Signature(error.to_string()))?;
     let mut certificate_budget =
         ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
     let configured_certificates = load_configured_certificates(
@@ -1337,6 +1339,22 @@ impl CandidateVerificationResolver {
     }
 }
 
+fn validate_verification_candidate_count(
+    actual: usize,
+    policy: &VerificationPolicy,
+) -> Result<(), DsigError> {
+    if actual > policy.key_trust.max_x509_candidate_paths {
+        return Err(DsigError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "verification key candidates",
+                maximum: policy.key_trust.max_x509_candidate_paths,
+                actual,
+            },
+        ));
+    }
+    Ok(())
+}
+
 impl KeyResolver for CandidateVerificationResolver {
     fn resolve<'a>(
         &'a self,
@@ -1358,15 +1376,7 @@ impl KeyResolver for CandidateVerificationResolver {
         policy: &VerificationPolicy,
         provider: &dyn CryptoProvider,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
-        if self.candidates.len() > policy.key_trust.max_x509_candidate_paths {
-            return Err(DsigError::Policy(
-                xml_sec::policy::PolicyViolation::ResourceLimit {
-                    resource: "verification key candidates",
-                    maximum: policy.key_trust.max_x509_candidate_paths,
-                    actual: self.candidates.len(),
-                },
-            ));
-        }
+        validate_verification_candidate_count(self.candidates.len(), policy)?;
         let document_crls = key_info
             .into_iter()
             .flat_map(|info| &info.sources)
@@ -2628,6 +2638,9 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             &recipient_key_names,
             invocation.flag("lax-key-search"),
         )?;
+        KeyCandidateBudget::for_operation()
+            .consume(selected.len(), "decryption key candidates")
+            .map_err(|error| CommandError::Encryption(error.to_string()))?;
         let mut keys = Vec::with_capacity(selected.len());
         let lax_key_search = invocation.flag("lax-key-search");
         let mut last_load_error = None;

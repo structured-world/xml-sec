@@ -282,9 +282,10 @@ requires metadata to select exactly one distinct key identity and rejects
 unordered distinct candidates rather than treating valid padding as proof of
 the correct key. Repeated copies of identical key bytes remain one identity,
 while every source lookup or unwrap still consumes the operation work budget.
-The CLI rejects an AES candidate ring above that same operation ceiling before
-opening any candidate file, preventing oversized lax searches from turning the
-post-load cryptographic bound into unbounded filesystem work.
+The CLI rejects explicit verification, AES decryption, and RSA decryption key
+rings above their compiled candidate ceilings before opening any candidate
+file. Oversized lax searches therefore cannot turn post-load cryptographic or
+certificate-path bounds into unbounded filesystem and key-decoding work.
 A direct `--aes-key` cannot satisfy an `EncryptedKey` recipient embedded in the
 template, so that inconsistent combination is rejected rather than preserving
 a stale wrapped key.

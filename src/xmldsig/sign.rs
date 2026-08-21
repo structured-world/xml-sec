@@ -1160,37 +1160,55 @@ fn fill_reference_digest_values_in_dependency_order(
         } else {
             Vec::new()
         };
+        if current_signed_info_references.len() != signed_info_references.len()
+            || current_manifest_references.len() != manifest_references.len()
+        {
+            return Err(SigningDigestError::InvalidStructure(
+                "signing Reference set changed while filling digests".into(),
+            ));
+        }
         let mut signed_info_replacements = Vec::new();
         let mut manifest_replacements = Vec::new();
+        let mut destinations = Vec::with_capacity(level.len());
+        let mut level_references = Vec::with_capacity(level.len());
         for index in level {
-            let (reference, local_index, signed_info) =
-                if index < current_signed_info_references.len() {
-                    (&current_signed_info_references[index], index, true)
-                } else {
-                    let local_index = index - current_signed_info_references.len();
-                    (
-                        &current_manifest_references[local_index],
-                        local_index,
-                        false,
-                    )
-                };
-            let mut computed = compute_signing_reference_digests(
-                &current_doc,
-                current_signature,
-                vec![reference.clone()],
-                transform_options,
-                provider,
-                execution_budget,
-                id_attributes,
-            )?;
-            let digest_value = computed
-                .pop()
-                .ok_or_else(|| {
+            let (reference, local_index, signed_info) = if index < signed_info_references.len() {
+                let reference = current_signed_info_references.get(index).ok_or_else(|| {
                     SigningDigestError::InvalidStructure(
-                        "signing Reference did not produce a digest".into(),
+                        "signing Reference set changed while filling digests".into(),
                     )
-                })?
-                .digest_value;
+                })?;
+                (reference, index, true)
+            } else {
+                let local_index = index - signed_info_references.len();
+                let reference = current_manifest_references
+                    .get(local_index)
+                    .ok_or_else(|| {
+                        SigningDigestError::InvalidStructure(
+                            "signing Reference set changed while filling digests".into(),
+                        )
+                    })?;
+                (reference, local_index, false)
+            };
+            destinations.push((local_index, signed_info));
+            level_references.push(reference.clone());
+        }
+        let computed = compute_signing_reference_digests(
+            &current_doc,
+            current_signature,
+            level_references,
+            transform_options,
+            provider,
+            execution_budget,
+            id_attributes,
+        )?;
+        if computed.len() != destinations.len() {
+            return Err(SigningDigestError::InvalidStructure(
+                "signing Reference set changed while computing digests".into(),
+            ));
+        }
+        for ((local_index, signed_info), digest) in destinations.into_iter().zip(computed) {
+            let digest_value = digest.digest_value;
             if signed_info {
                 signed_info_replacements.push((local_index, digest_value));
             } else {

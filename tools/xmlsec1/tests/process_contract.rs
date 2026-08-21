@@ -17,7 +17,7 @@ use rsa::{
 use x509_parser::{extensions::ParsedExtension, prelude::FromDer as _};
 use xml_sec::{
     c14n::{C14nAlgorithm, C14nMode},
-    policy::EncryptionPolicy,
+    policy::{EncryptionPolicy, VerificationPolicy},
     provider::default_provider,
     xmldsig::{
         DigestAlgorithm, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
@@ -2767,6 +2767,79 @@ fn lax_aes_key_ring_is_bounded_before_filesystem_reads() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("key candidate limit exceeded"), "{stderr}");
     assert!(!stderr.contains("missing-0.key"), "{stderr}");
+}
+
+#[test]
+fn lax_verification_key_ring_is_bounded_before_filesystem_reads() {
+    // The compiled verification candidate ceiling must reject oversized rings
+    // before opening even the first attacker-selected public-key path.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let signed = temp.path().join("signed.xml");
+    fs::write(&template, signature_template_without_key_info()).unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let maximum = VerificationPolicy::default()
+        .key_trust
+        .max_x509_candidate_paths;
+    let mut command = Command::new(binary());
+    command.args(["verify", "--lax-key-search"]);
+    for index in 0..=maximum {
+        command.arg("--pubkey-pem");
+        command.arg(temp.path().join(format!("missing-{index}.pem")));
+    }
+    let output = command.arg(&signed).output().unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("verification key candidates"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "exceeds policy maximum {maximum}: got {}",
+            maximum + 1
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("missing-0.pem"), "{stderr}");
+}
+
+#[test]
+fn lax_rsa_key_ring_is_bounded_before_filesystem_reads() {
+    // RSA decryption must apply the shared candidate-work ceiling before
+    // decoding any private-key source, matching the direct AES path.
+    let temp = tempfile::tempdir().unwrap();
+    let encrypted = temp.path().join("encrypted.xml");
+    fs::write(
+        &encrypted,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue>AAAAAAAAAAAAAAAAAAAAAA==</CipherValue></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    let maximum = KeyCandidateBudget::for_operation().remaining();
+    let mut command = Command::new(binary());
+    command.args(["decrypt", "--lax-key-search"]);
+    for index in 0..=maximum {
+        command.arg("--privkey-pem");
+        command.arg(temp.path().join(format!("missing-{index}.pem")));
+    }
+    let output = command.arg(&encrypted).output().unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("key candidate limit exceeded"), "{stderr}");
+    assert!(!stderr.contains("missing-0.pem"), "{stderr}");
 }
 
 #[test]

@@ -1108,6 +1108,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                     .get_node(tracked.node_id)
                     .is_some_and(|node| nodes.contains(node))
             });
+            tracking.dormant_indexes.clear();
         }
         let position = if let Some(tracking) = &mut dependency_tracking {
             let mut tracked_ids = tracking
@@ -1231,7 +1232,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 if preserve_excluded_as_opaque {
                     tracking
                         .opaque_dependencies
-                        .extend(tracking.dormant_indexes.iter().copied());
+                        .extend(tracking.dormant_indexes.drain());
                 }
                 let mut active_nodes = Vec::with_capacity(tracking.active_nodes.len());
                 for tracked in tracking.active_nodes.drain(..) {
@@ -1248,6 +1249,8 @@ fn execute_transform_chain<'s, 'e, 'd>(
                         // scan may control another node's inclusion, so absence
                         // is not proof of independence in that case.
                         tracking.opaque_dependencies.insert(tracked.index);
+                    } else {
+                        tracking.dormant_indexes.insert(tracked.index);
                     }
                 }
                 tracking.active_nodes = active_nodes;
@@ -1256,6 +1259,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
                 tracking
                     .opaque_dependencies
                     .extend(tracking.active_nodes.drain(..).map(|tracked| tracked.index));
+                tracking.dormant_indexes.clear();
                 tracking.canonical_positions = None;
             }
         }
@@ -2482,6 +2486,84 @@ mod tests {
         assert!(output.contains("Id=\"other\""));
         assert!(!output.contains("Id=\"owner\""));
         assert!(!output.contains("discard"));
+    }
+
+    #[test]
+    fn dependency_tracking_retains_structurally_excluded_nodes_for_later_xpath() {
+        // A structural XPath may hide a mutable node from the current set, but
+        // a later XPath still evaluates against the full source document.
+        let document = Document::parse(
+            r#"<root><Signature><Object><Manifest><DigestValue>pending</DigestValue></Manifest></Object></Signature></root>"#,
+        )
+        .unwrap();
+        let signature = document
+            .descendants()
+            .find(|node| node.tag_name().name() == "Signature")
+            .unwrap();
+        let manifest = document
+            .descendants()
+            .find(|node| node.tag_name().name() == "Manifest")
+            .unwrap();
+        let digest_text = document
+            .descendants()
+            .find(|node| node.is_text() && node.text() == Some("pending"))
+            .unwrap();
+        let transforms = [
+            Transform::XPath(XPathExpression::new("not(ancestor-or-self::DigestValue)")),
+            Transform::XPath(XPathExpression::new(
+                "string-length(string(//DigestValue)) >= 0",
+            )),
+        ];
+
+        let output = execute_transforms_with_dependency_nodes(
+            signature,
+            TransformData::NodeSet(NodeSet::subtree(manifest).unwrap()),
+            &transforms,
+            TransformOptions::default(),
+            &TransformExecutionBudget::default(),
+            vec![(7, digest_text.id())],
+        )
+        .unwrap();
+
+        assert_eq!(output.dependencies, HashSet::from([7]));
+    }
+
+    #[test]
+    fn dependency_tracking_discards_dormant_nodes_at_binary_boundary() {
+        // C14N serializes only the current node set. A later XPath reparses
+        // those bytes and cannot recover a tracked source node outside it.
+        let document = Document::parse(
+            r#"<root><DigestValue>external</DigestValue><Signature><payload>value</payload></Signature></root>"#,
+        )
+        .unwrap();
+        let signature = document
+            .descendants()
+            .find(|node| node.tag_name().name() == "Signature")
+            .unwrap();
+        let digest_text = document
+            .descendants()
+            .find(|node| node.is_text() && node.text() == Some("external"))
+            .unwrap();
+        let transforms = [
+            Transform::C14n(
+                C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315").unwrap(),
+            ),
+            Transform::XPath(XPathExpression::new(
+                "string-length(string(//DigestValue)) >= 0",
+            )),
+        ];
+
+        let output = execute_transforms_with_dependency_nodes(
+            signature,
+            TransformData::NodeSet(NodeSet::subtree(signature).unwrap()),
+            &transforms,
+            TransformOptions::default(),
+            &TransformExecutionBudget::default(),
+            vec![(11, digest_text.id())],
+        )
+        .unwrap();
+
+        assert!(output.dependencies.is_empty());
     }
 
     #[test]

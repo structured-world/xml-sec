@@ -1268,11 +1268,28 @@ fn ignored_manifests_do_not_disable_signed_info_dependency_checks() {
     let private_key =
         RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
             .expect("RSA private key fixture must parse");
-    let template = r##"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:DigestValue)</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
+    let template = r##"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:DigestValue)</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest><ds:Reference><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>untouched</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##;
+
+    let process_error = SignContext::new(&private_key)
+        .policy(SigningPolicy {
+            manifest_processing: ManifestProcessing::Process,
+            ..SigningPolicy::default()
+        })
+        .sign_template(template)
+        .expect_err("processing must parse the malformed Manifest reference");
+    assert!(matches!(
+        process_error,
+        SigningError::Digest(SigningDigestError::InvalidStructure(message))
+            if message.contains("URI")
+    ));
 
     let error = SignContext::new(&private_key)
+        .policy(SigningPolicy {
+            manifest_processing: ManifestProcessing::Ignore,
+            ..SigningPolicy::default()
+        })
         .sign_template(template)
-        .expect_err("default signing policy must reject a SignatureValue dependency");
+        .expect_err("ignored Manifest content must not disable SignedInfo dependency checks");
 
     assert!(matches!(
         error,

@@ -290,43 +290,8 @@ where
         .map(|(index, value)| (index, value.as_ref().to_owned()))
         .collect::<Vec<_>>();
     let expected = count_signed_info_digest_values(xml, target_signature, policy)?;
-    if replacements
-        .iter()
-        .enumerate()
-        .any(|(position, (index, _))| {
-            *index >= expected
-                || position
-                    .checked_sub(1)
-                    .is_some_and(|previous| replacements[previous].0 >= *index)
-        })
-    {
-        return Err(XmlMutationError::ValueCountMismatch {
-            element: "DigestValue",
-            expected,
-            actual: replacements.len(),
-        });
-    }
-
-    let replacement_indices = replacements
-        .iter()
-        .map(|(index, _)| *index)
-        .collect::<Vec<_>>();
-    let values = replacements
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect::<Vec<_>>();
-    let mut signed_info_index = 0usize;
-    let mut replacement_index = 0usize;
-    fill_dsig_values_matching(xml, "DigestValue", values, policy, |stack, namespace| {
-        if !is_signed_info_reference_context(stack, namespace, target_signature) {
-            return false;
-        }
-        let selected = replacement_indices.get(replacement_index) == Some(&signed_info_index);
-        signed_info_index += 1;
-        if selected {
-            replacement_index += 1;
-        }
-        selected
+    fill_selected_digest_values(xml, replacements, expected, policy, |stack, namespace| {
+        is_signed_info_reference_context(stack, namespace, target_signature)
     })
 }
 
@@ -345,6 +310,18 @@ where
         .map(|(index, value)| (index, value.as_ref().to_owned()))
         .collect::<Vec<_>>();
     let expected = count_manifest_digest_values(xml, target_signature, policy)?;
+    fill_selected_digest_values(xml, replacements, expected, policy, |stack, namespace| {
+        is_manifest_reference_context(stack, namespace, target_signature)
+    })
+}
+
+fn fill_selected_digest_values(
+    xml: &str,
+    replacements: Vec<(usize, String)>,
+    expected: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+    mut in_context: impl FnMut(&[(bool, Vec<u8>, Option<usize>)], &ResolveResult<'_>) -> bool,
+) -> Result<String, XmlMutationError> {
     if replacements
         .iter()
         .enumerate()
@@ -370,14 +347,14 @@ where
         .into_iter()
         .map(|(_, value)| value)
         .collect::<Vec<_>>();
-    let mut manifest_index = 0usize;
+    let mut context_index = 0usize;
     let mut replacement_index = 0usize;
     fill_dsig_values_matching(xml, "DigestValue", values, policy, |stack, namespace| {
-        if !is_manifest_reference_context(stack, namespace, target_signature) {
+        if !in_context(stack, namespace) {
             return false;
         }
-        let selected = replacement_indices.get(replacement_index) == Some(&manifest_index);
-        manifest_index += 1;
+        let selected = replacement_indices.get(replacement_index) == Some(&context_index);
+        context_index += 1;
         if selected {
             replacement_index += 1;
         }
