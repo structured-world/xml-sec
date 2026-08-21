@@ -51,6 +51,19 @@ fn signature_template_without_key_info() -> &'static str {
 </Signature>"##
 }
 
+fn signature_template_with_key_info(key_info: &str) -> String {
+    signature_template_without_key_info()
+        .replacen(
+            "<Signature ",
+            "<Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" ",
+            1,
+        )
+        .replace(
+            "<SignatureValue/>",
+            &format!("<SignatureValue/><KeyInfo>{key_info}</KeyInfo>"),
+        )
+}
+
 fn rsa_key_value_with_leading_zeroes(
     public_key: &RsaPublicKey,
     modulus_zeroes: usize,
@@ -2835,6 +2848,61 @@ fn lax_rsa_key_ring_is_bounded_before_filesystem_reads() {
         command.arg(temp.path().join(format!("missing-{index}.pem")));
     }
     let output = command.arg(&encrypted).output().unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("key candidate limit exceeded"), "{stderr}");
+    assert!(!stderr.contains("missing-0.pem"), "{stderr}");
+}
+
+#[test]
+fn lax_signing_key_ring_is_bounded_before_filesystem_reads() {
+    // Candidate work is bounded independently from successful byte accounting:
+    // unreadable or oversized sources must not permit unbounded read attempts.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    fs::write(&template, signature_template_without_key_info()).unwrap();
+    let maximum = KeyCandidateBudget::for_operation().remaining();
+    let mut command = Command::new(binary());
+    command.args(["sign", "--lax-key-search"]);
+    for index in 0..=maximum {
+        command.arg("--privkey-pem");
+        command.arg(temp.path().join(format!("missing-{index}.pem")));
+    }
+    let output = command.arg(&template).output().unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("key candidate limit exceeded"), "{stderr}");
+    assert!(!stderr.contains("missing-0.pem"), "{stderr}");
+}
+
+#[test]
+fn lax_rsa_encryption_key_ring_is_bounded_before_filesystem_reads() {
+    // RSA recipient lookup has the same operation ceiling as direct AES and
+    // RSA decryption, so oversized rings must fail before candidate decoding.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"bounded RSA encryption candidates").unwrap();
+    let maximum = KeyCandidateBudget::for_operation().remaining();
+    let mut command = Command::new(binary());
+    command.args(["encrypt", "--lax-key-search"]);
+    for index in 0..=maximum {
+        command.arg("--pubkey-pem");
+        command.arg(temp.path().join(format!("missing-{index}.pem")));
+    }
+    let output = command
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg(&template)
+        .output()
+        .unwrap();
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5751,6 +5819,80 @@ fn lax_signing_skips_a_key_with_a_mismatched_certificate_companion() {
         .args(["sign", "--lax-key-search", "--privkey-pem:first"])
         .arg(mismatched)
         .args(["--privkey-pem:second"])
+        .arg(matching)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+}
+
+#[test]
+fn lax_signing_skips_a_key_that_conflicts_with_preserved_rsa_key_value() {
+    // Preserved public identity is part of candidate suitability. Lax search
+    // must continue after a valid private key whose public components differ.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("key-value-template.xml");
+    let wrong = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let matching = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let matching_key =
+        RsaPrivateKey::from_pkcs8_pem(&fs::read_to_string(&matching).unwrap()).unwrap();
+    fs::write(
+        &template,
+        signature_template_with_key_info(&rsa_key_value_with_leading_zeroes(
+            &matching_key.to_public_key(),
+            0,
+            0,
+        )),
+    )
+    .unwrap();
+
+    let signed = Command::new(binary())
+        .args(["sign", "--lax-key-search", "--privkey-pem:wrong"])
+        .arg(&wrong)
+        .args(["--privkey-pem:matching"])
+        .arg(&matching)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+}
+
+#[test]
+fn lax_signing_skips_a_key_that_conflicts_with_preserved_x509_identity() {
+    // Each key/certificate option can be internally consistent yet contradict
+    // the template's X509Data; lax search must validate that identity per try.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("x509-template.xml");
+    let wrong_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let wrong_certificate = project_root().join("tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+    let matching_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let matching_certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    fs::write(
+        &template,
+        signature_template_with_key_info(&x509_certificate_value(&matching_certificate)),
+    )
+    .unwrap();
+    let wrong = format!("{},{}", wrong_key.display(), wrong_certificate.display());
+    let matching = format!(
+        "{},{}",
+        matching_key.display(),
+        matching_certificate.display()
+    );
+
+    let signed = Command::new(binary())
+        .args(["sign", "--lax-key-search", "--privkey-pem:wrong"])
+        .arg(wrong)
+        .args(["--privkey-pem:matching"])
         .arg(matching)
         .arg(&template)
         .output()

@@ -675,9 +675,9 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         invocation,
         &signature.key_names,
         signature.algorithm,
+        signature.key_info.as_ref(),
         &policy,
     )?;
-    validate_signing_key_info(signature.key_info.as_ref(), &selected)?;
     let mut context = SignContext::new(selected.key.as_ref())
         .policy(policy)
         .signature_template_selection(SignatureTemplateSelection::FirstDescendant);
@@ -730,6 +730,7 @@ fn select_signing_key(
     invocation: &Invocation,
     requested_names: &[String],
     algorithm: SignatureAlgorithm,
+    key_info: Option<&KeyInfo>,
     policy: &SigningPolicy,
 ) -> Result<SigningKeyCandidate, CommandError> {
     let keys = invocation
@@ -748,13 +749,20 @@ fn select_signing_key(
         false,
         "private key",
     )?;
+    KeyCandidateBudget::for_operation()
+        .consume(candidates.len(), "signing key candidates")
+        .map_err(|error| CommandError::Signature(error.to_string()))?;
     let lax_key_search = invocation.flag("lax-key-search");
     let mut last_error: Option<CommandError> = None;
     let mut material_budget =
         ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
     for (option, ()) in candidates {
         let attempt =
-            prepare_signing_key_candidate(option, algorithm, policy, &mut material_budget);
+            prepare_signing_key_candidate(option, algorithm, policy, &mut material_budget)
+                .and_then(|candidate| {
+                    validate_signing_key_info(key_info, &candidate)?;
+                    Ok(candidate)
+                });
         match attempt {
             Ok(candidate) => return Ok(candidate),
             Err(error) if lax_key_search && lax_candidate_error_is_recoverable(&error) => {
@@ -1640,6 +1648,11 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         };
         let lax_key_search = invocation.flag("lax-key-search");
         let mut available_public_keys = public_keys.clone();
+        if lax_key_search {
+            KeyCandidateBudget::for_operation()
+                .consume(available_public_keys.len(), "encryption key candidates")
+                .map_err(|error| CommandError::Encryption(error.to_string()))?;
+        }
         let mut loaded_public_keys = HashMap::new();
         let mut certificate_budget =
             ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
@@ -3936,7 +3949,13 @@ mod tests {
         policy.resources.max_external_resource_total_bytes = valid_len as usize + 1;
 
         assert!(matches!(
-            select_signing_key(&parsed, &[], SignatureAlgorithm::RsaSha256, &policy),
+            select_signing_key(
+                &parsed,
+                &[],
+                SignatureAlgorithm::RsaSha256,
+                None,
+                &policy,
+            ),
             Err(CommandError::ExternalMaterialTooLarge { maximum })
                 if maximum == valid_len as usize + 1
         ));

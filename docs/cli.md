@@ -134,9 +134,11 @@ template unconstrained when one explicit key is supplied. Lax signing treats
 each comma-separated key and certificate chain as one candidate and continues
 past malformed, mismatched, algorithm-incompatible, or policy-rejected
 candidates until it finds a usable one; it never weakens the compiled signing
-policy. Every private-key source and certificate companion is charged to one
-invocation-wide external-material byte budget before private-key decoding, so
-lax search cannot multiply bounded per-file parsing work without bound.
+policy. Preserved `KeyValue`, `DEREncodedKeyValue`, and `X509Data` identities
+are checked during each attempt rather than only after selecting a key. The CLI
+rejects an oversized candidate ring before opening any private-key source, and
+every successfully read private-key source and certificate companion is also
+charged to one invocation-wide external-material byte budget before decoding.
 
 Verification accepts `-` as the conventional stdin marker. Verification starts
 at the document root and uses the first descendant `Signature` in document order.
@@ -282,10 +284,11 @@ requires metadata to select exactly one distinct key identity and rejects
 unordered distinct candidates rather than treating valid padding as proof of
 the correct key. Repeated copies of identical key bytes remain one identity,
 while every source lookup or unwrap still consumes the operation work budget.
-The CLI rejects explicit verification, AES decryption, and RSA decryption key
-rings above their compiled candidate ceilings before opening any candidate
-file. Oversized lax searches therefore cannot turn post-load cryptographic or
-certificate-path bounds into unbounded filesystem and key-decoding work.
+The CLI rejects signing, explicit verification, AES encryption/decryption, and
+RSA encryption/decryption key rings above their compiled candidate ceilings
+before opening any candidate file. Oversized lax searches therefore cannot turn
+post-load cryptographic or certificate-path bounds into unbounded filesystem and
+key-decoding work.
 A direct `--aes-key` cannot satisfy an `EncryptedKey` recipient embedded in the
 template, so that inconsistent combination is rejected rather than preserving
 a stale wrapped key.
