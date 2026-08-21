@@ -32,6 +32,7 @@ use super::whitespace::is_xml_whitespace_only;
 use super::xpath::{
     XPathDocumentRelation, XPathWorkBudget, apply_xpath_filter_with_semantics_and_budget,
     apply_xpath_filter2_with_semantics_and_budget, compile_xpath, is_xpath_whitespace,
+    xpath_may_read_node_values,
 };
 use crate::c14n::xml_base::XmlBaseResolutionBudget;
 use crate::c14n::{self, C14nAlgorithm};
@@ -1202,12 +1203,35 @@ fn execute_transform_chain<'s, 'e, 'd>(
     )?;
     if let Some(tracking) = &mut dependency_tracking {
         match &data {
-            TransformData::NodeSet(nodes) => tracking.active_nodes.retain(|tracked| {
-                nodes
-                    .document()
-                    .get_node(tracked.node_id)
-                    .is_some_and(|node| nodes.contains(node))
-            }),
+            TransformData::NodeSet(nodes) => {
+                let preserve_excluded_as_opaque = match transform {
+                    Transform::XPath(expression) => {
+                        xpath_may_read_node_values(expression.expression())
+                    }
+                    Transform::XPathFilter2(filters) => filters
+                        .iter()
+                        .any(|filter| xpath_may_read_node_values(filter.xpath().expression())),
+                    _ => false,
+                };
+                let mut active_nodes = Vec::with_capacity(tracking.active_nodes.len());
+                for tracked in tracking.active_nodes.drain(..) {
+                    let remains_visible = nodes
+                        .document()
+                        .get_node(tracked.node_id)
+                        .is_some_and(|node| nodes.contains(node));
+                    if remains_visible {
+                        active_nodes.push(tracked);
+                    } else if preserve_excluded_as_opaque {
+                        // SXD exposes output membership but not which source
+                        // values a predicate coerced. Structural selection does
+                        // not depend on mutable DigestValue text, but a value
+                        // scan may control another node's inclusion, so absence
+                        // is not proof of independence in that case.
+                        tracking.opaque_dependencies.insert(tracked.index);
+                    }
+                }
+                tracking.active_nodes = active_nodes;
+            }
             TransformData::Binary(_) => {
                 tracking
                     .opaque_dependencies

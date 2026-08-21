@@ -1074,8 +1074,12 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         if candidates.is_empty() {
             return Err(last_load_error.unwrap_or(CommandError::InvalidSignature));
         }
-        let resolver =
-            CandidateVerificationResolver::new(candidates, configured_certificates, lax_key_search);
+        let resolver = CandidateVerificationResolver::new(
+            candidates,
+            configured_certificates,
+            lax_key_search,
+            policy.key_trust.check_crls,
+        );
         verification_context(policy, start_node_id, &id_attributes)
             .key_resolver(&resolver)
             .verify(&xml)
@@ -1312,6 +1316,7 @@ struct CandidateVerificationResolver {
     certificate_resolver: DefaultKeyResolver,
     has_trusted_certificates: bool,
     lax_key_search: bool,
+    consume_document_crls: bool,
 }
 
 impl CandidateVerificationResolver {
@@ -1319,6 +1324,7 @@ impl CandidateVerificationResolver {
         candidates: Vec<ExplicitVerificationCandidate>,
         configured: ConfiguredCertificates,
         lax_key_search: bool,
+        consume_document_crls: bool,
     ) -> Self {
         let has_trusted_certificates = !configured.trusted.is_empty();
         Self {
@@ -1326,6 +1332,7 @@ impl CandidateVerificationResolver {
             certificate_resolver: DefaultKeyResolver::new(configured.into_resolver_config()),
             has_trusted_certificates,
             lax_key_search,
+            consume_document_crls,
         }
     }
 }
@@ -1346,7 +1353,7 @@ impl KeyResolver for CandidateVerificationResolver {
 
     fn resolve_with_policy_and_provider<'a>(
         &'a self,
-        _key_info: Option<&KeyInfo>,
+        key_info: Option<&KeyInfo>,
         algorithm: SignatureAlgorithm,
         policy: &VerificationPolicy,
         provider: &dyn CryptoProvider,
@@ -1360,6 +1367,16 @@ impl KeyResolver for CandidateVerificationResolver {
                 },
             ));
         }
+        let document_crls = key_info
+            .into_iter()
+            .flat_map(|info| &info.sources)
+            .filter_map(|source| match source {
+                KeyInfoSource::X509Data(info) => Some(info.crls.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut certificate_policy = policy.clone();
         if !self.has_trusted_certificates {
             // A caller-pinned certificate without a separate trust anchor is
@@ -1376,8 +1393,20 @@ impl KeyResolver for CandidateVerificationResolver {
                     Some(Box::new(key.clone()) as Box<dyn VerifyingKey>)
                 }
                 ExplicitVerificationCandidate::Certificate(info) => {
+                    let mut candidate = info.clone();
+                    if !document_crls.is_empty()
+                        && let Some(KeyInfoSource::X509Data(x509)) = candidate
+                            .sources
+                            .iter_mut()
+                            .find(|source| matches!(source, KeyInfoSource::X509Data(_)))
+                    {
+                        // The explicit certificate remains the sole identity
+                        // source. Only revocation evidence crosses from the
+                        // untrusted document KeyInfo into its candidate path.
+                        x509.crls.extend(document_crls.iter().cloned());
+                    }
                     match self.certificate_resolver.resolve_with_policy_and_provider(
-                        Some(info),
+                        Some(&candidate),
                         algorithm,
                         &certificate_policy,
                         provider,
@@ -1408,6 +1437,16 @@ impl KeyResolver for CandidateVerificationResolver {
         Ok(Some(Box::new(CandidateVerifyingKey {
             candidates: resolved,
         })))
+    }
+
+    fn consumes_document_key_info(&self) -> bool {
+        // Explicit certificate candidates ignore document-controlled identity
+        // hints, but they still consume embedded CRLs as revocation evidence.
+        self.consume_document_crls
+            && self
+                .candidates
+                .iter()
+                .any(|candidate| matches!(candidate, ExplicitVerificationCandidate::Certificate(_)))
     }
 }
 
@@ -3313,6 +3352,7 @@ mod tests {
             ],
             ConfiguredCertificates::default(),
             true,
+            false,
         );
 
         let error = match resolver.resolve_with_policy_and_provider(

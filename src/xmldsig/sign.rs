@@ -1866,4 +1866,32 @@ mod error_conversion_tests {
             "expected the shared XPath budget error, got: {error:?}"
         );
     }
+
+    #[test]
+    fn signing_rejects_xpath_control_dependencies_on_digest_values() {
+        // The second Reference excludes DigestValue nodes from its output but
+        // reads the first DigestValue to decide whether payload remains. Filling
+        // both references in one level would therefore invalidate the result.
+        let xml = r##"<root><payload Id="payload">content</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:DigestValue) and (not(self::payload) or string(//ds:Reference[1]/ds:DigestValue) = '')</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
+
+        let error = fill_reference_digest_values_in_dependency_order(
+            xml,
+            TransformOptions::default(),
+            &crate::policy::SigningPolicy::default(),
+            crate::provider::default_provider(),
+            &TransformExecutionBudget::default(),
+            0,
+            &[],
+        )
+        .expect_err("mutable XPath control dependencies must fail closed");
+
+        assert!(
+            matches!(
+                &error,
+                SigningDigestError::InvalidStructure(message)
+                    if message.contains("dependency cycle")
+            ),
+            "expected a dependency-cycle rejection, got: {error:?}"
+        );
+    }
 }

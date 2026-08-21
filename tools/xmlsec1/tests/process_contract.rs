@@ -86,6 +86,11 @@ fn x509_certificate_value(path: &Path) -> String {
     )
 }
 
+fn pem_der_base64(path: &Path) -> String {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&fs::read(path).unwrap()).unwrap();
+    base64::engine::general_purpose::STANDARD.encode(pem.contents)
+}
+
 #[test]
 fn signs_verifies_and_rejects_tampering_through_process_api() {
     // Exercise the process boundary and prove a post-signature content change
@@ -5417,6 +5422,76 @@ fn explicit_certificate_obeys_trust_anchor_policy() {
             .status()
             .unwrap()
             .success()
+    );
+}
+
+#[test]
+fn explicit_certificate_verification_honors_embedded_crls() {
+    // The explicit certificate pins identity, while document X509CRL entries
+    // still provide revocation evidence when the caller enables CRL checking.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+    let intermediate = project_root().join("tests/fixtures/keys/ca2cert.pem");
+    let anchor = project_root().join("tests/fixtures/keys/cacert.pem");
+    let crl = project_root().join("tests/fixtures/keys/rsa/rsa-2048-cert-revoked-crl.pem");
+    let signed = temp.path().join("signed.xml");
+    let with_crl = temp.path().join("signed-with-crl.xml");
+    let compound = format!("{},{}", private_key.display(), certificate.display());
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(compound)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+    let signed_xml = fs::read_to_string(&signed).unwrap();
+    let signed_xml = signed_xml.replacen(
+        "</X509Data>",
+        &format!("<X509CRL>{}</X509CRL></X509Data>", pem_der_base64(&crl)),
+        1,
+    );
+    fs::write(&with_crl, signed_xml).unwrap();
+
+    let unchecked = Command::new(binary())
+        .args(["verify", "--pubkey-cert-pem"])
+        .arg(&certificate)
+        .arg("--trusted-pem")
+        .arg(&anchor)
+        .arg("--untrusted-pem")
+        .arg(&intermediate)
+        .arg(&with_crl)
+        .output()
+        .unwrap();
+    assert!(
+        unchecked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unchecked.stderr)
+    );
+
+    let checked = Command::new(binary())
+        .args(["verify", "--verify-crls", "--pubkey-cert-pem"])
+        .arg(&certificate)
+        .arg("--trusted-pem")
+        .arg(&anchor)
+        .arg("--untrusted-pem")
+        .arg(&intermediate)
+        .arg(&with_crl)
+        .output()
+        .unwrap();
+    assert!(!checked.status.success());
+    assert!(
+        String::from_utf8_lossy(&checked.stderr).contains("CRL"),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
     );
 }
 

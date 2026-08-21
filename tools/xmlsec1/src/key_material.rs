@@ -23,6 +23,7 @@ use xml_sec::xmldsig::{
 // This is an absolute process-safety ceiling, not deployment policy. Parsed
 // key sizes remain governed by the operation policy after bounded ingestion.
 const KEY_MATERIAL_BYTE_CEILING: usize = 8 * 1024 * 1024;
+const MAX_AES_KEY_BYTES: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KeyMaterialError {
@@ -476,8 +477,6 @@ pub(crate) fn read_symmetric(
     path: impl AsRef<Path>,
     expected: Option<usize>,
 ) -> Result<Vec<u8>, KeyMaterialError> {
-    const MAX_AES_KEY_BYTES: usize = 32;
-
     let path = path.as_ref();
     let maximum = expected.unwrap_or(MAX_AES_KEY_BYTES);
     let mut key = Vec::with_capacity(maximum.saturating_add(1));
@@ -500,8 +499,6 @@ pub(crate) fn decode_symmetric(
     key: Vec<u8>,
     expected: Option<usize>,
 ) -> Result<Vec<u8>, KeyMaterialError> {
-    const MAX_AES_KEY_BYTES: usize = 32;
-
     let maximum = expected.unwrap_or(MAX_AES_KEY_BYTES);
     if key.len() > maximum {
         return match expected {

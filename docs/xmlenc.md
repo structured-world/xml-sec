@@ -118,7 +118,9 @@ symmetric key remains authoritative and does not consult unrelated embedded key 
 The operation shares one `KeyCandidateBudget` across the direct lookup and every recipient;
 custom `DecryptionKeyResolver` implementations must charge it before each lookup or unwrap attempt.
 The context additionally accounts for returned candidates, so a resolver cannot multiply work by
-resetting a per-recipient allowance. Explicit `ReferenceList/DataReference` and `CarriedKeyName`
+resetting a per-recipient allowance. Candidate-local lookup or unwrap failures may be recorded while
+later recipients are tried, but `KeyCandidateLimitExceeded` is terminal and stops the operation as
+soon as the shared budget is exhausted. Explicit `ReferenceList/DataReference` and `CarriedKeyName`
 metadata restricts an embedded key to the referenced `EncryptedData` or matching `ds:KeyName`.
 Association metadata may be omitted, but an explicit contradiction is skipped rather than tried.
 Wrong-width symmetric candidates are discarded before AES-CBC ambiguity checks because they cannot
