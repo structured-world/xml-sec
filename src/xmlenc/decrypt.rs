@@ -277,7 +277,21 @@ impl<'a> DecryptContext<'a> {
     ) -> Result<String, XmlEncError> {
         decrypt_document_with_context(
             xml,
-            DocumentEncryptedDataSelector::StartNodeId(start_node_id),
+            DocumentEncryptedDataSelector::UniqueBelowStartNode(start_node_id),
+            self,
+        )
+    }
+
+    /// Decrypt and replace the first `EncryptedData` below an operation start
+    /// node selected by ID, leaving later encrypted descendants untouched.
+    pub fn decrypt_first_document_from_start_node(
+        &self,
+        xml: &str,
+        start_node_id: Option<&str>,
+    ) -> Result<String, XmlEncError> {
+        decrypt_document_with_context(
+            xml,
+            DocumentEncryptedDataSelector::FirstBelowStartNode(start_node_id),
             self,
         )
     }
@@ -558,7 +572,8 @@ pub fn decrypt_document_with_options(
 #[derive(Clone, Copy)]
 enum DocumentEncryptedDataSelector<'a> {
     EncryptedDataId(Option<&'a str>),
-    StartNodeId(Option<&'a str>),
+    UniqueBelowStartNode(Option<&'a str>),
+    FirstBelowStartNode(Option<&'a str>),
 }
 
 fn decrypt_document_with_context(
@@ -571,24 +586,32 @@ fn decrypt_document_with_context(
     let parsing_options = || decryption_parsing_options(&context.policy);
     let document = Document::parse_with_options(xml, parsing_options())?;
     let start = match selector {
-        DocumentEncryptedDataSelector::StartNodeId(Some(id)) => {
+        DocumentEncryptedDataSelector::UniqueBelowStartNode(Some(id))
+        | DocumentEncryptedDataSelector::FirstBelowStartNode(Some(id)) => {
             XmlIdIndex::with_registrations(&document, context.id_attributes)
                 .node(id)
                 .ok_or_else(|| XmlEncError::SelectedNodeUnavailable { id: id.to_owned() })?
         }
-        DocumentEncryptedDataSelector::StartNodeId(None)
+        DocumentEncryptedDataSelector::UniqueBelowStartNode(None)
+        | DocumentEncryptedDataSelector::FirstBelowStartNode(None)
         | DocumentEncryptedDataSelector::EncryptedDataId(_) => document.root(),
     };
     let encrypted_data_id = match selector {
         DocumentEncryptedDataSelector::EncryptedDataId(id) => id,
-        DocumentEncryptedDataSelector::StartNodeId(_) => None,
+        DocumentEncryptedDataSelector::UniqueBelowStartNode(_)
+        | DocumentEncryptedDataSelector::FirstBelowStartNode(_) => None,
     };
     let mut matches = start.descendants().filter(|node| {
         node.has_tag_name((XMLENC_NS, "EncryptedData"))
             && encrypted_data_id.is_none_or(|id| node.attribute("Id") == Some(id))
     });
     let selected = matches.next().ok_or(XmlEncError::EncryptedDataNotFound)?;
-    if matches.next().is_some() {
+    if matches!(
+        selector,
+        DocumentEncryptedDataSelector::EncryptedDataId(_)
+            | DocumentEncryptedDataSelector::UniqueBelowStartNode(_)
+    ) && matches.next().is_some()
+    {
         return Err(XmlEncError::AmbiguousEncryptedData);
     }
 
@@ -3430,6 +3453,20 @@ mod tests {
             context.decrypt_document_from_start_node(&ambiguous, Some("selected")),
             Err(XmlEncError::AmbiguousEncryptedData)
         ));
+
+        let first_replaced = context
+            .decrypt_first_document_from_start_node(&ambiguous, Some("selected"))
+            .expect("first-match selection must leave later encrypted descendants untouched");
+        assert!(first_replaced.contains("<scope Id=\"selected\">first<xenc:EncryptedData"));
+        let replaced_document =
+            Document::parse(&first_replaced).expect("first-match output must remain valid XML");
+        assert_eq!(
+            replaced_document
+                .descendants()
+                .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedData")))
+                .count(),
+            1
+        );
     }
 
     #[test]

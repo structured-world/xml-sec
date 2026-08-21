@@ -5093,6 +5093,76 @@ fn decrypts_encrypted_data_embedded_in_a_document() {
 }
 
 #[test]
+fn embedded_decryption_replaces_only_the_first_encrypted_data() {
+    // libxmlsec1 starts at the selected operation node and decrypts its first
+    // EncryptedData descendant rather than rejecting later encrypted siblings.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.xml");
+    let key = temp.path().join("key.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let document = temp.path().join("document.xml");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, "<secret>first payload</secret>").unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--aes-key"])
+        .arg(&key)
+        .arg("--xml-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    let encrypted_xml = fs::read_to_string(&encrypted).unwrap();
+    fs::write(
+        &document,
+        format!("<root><first>{encrypted_xml}</first><second>{encrypted_xml}</second></root>"),
+    )
+    .unwrap();
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--aes-key"])
+        .arg(&key)
+        .arg(&document)
+        .output()
+        .unwrap();
+
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    let output = String::from_utf8(decrypt.stdout).unwrap();
+    let parsed = roxmltree::Document::parse(&output).unwrap();
+    let first = parsed
+        .descendants()
+        .find(|node| node.has_tag_name("first"))
+        .unwrap();
+    let second = parsed
+        .descendants()
+        .find(|node| node.has_tag_name("second"))
+        .unwrap();
+    assert!(first.descendants().any(|node| node.has_tag_name("secret")));
+    assert!(
+        second.descendants().any(|node| {
+            node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "EncryptedData"))
+        })
+    );
+}
+
+#[test]
 fn generated_key_store_uses_the_libxmlsec1_xml_shape() {
     // Validate namespaces and element layout, not just well-formedness, because
     // libxmlsec1's key manager depends on this exact interoperable structure.

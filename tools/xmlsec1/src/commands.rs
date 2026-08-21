@@ -2921,7 +2921,7 @@ fn decrypt_input(
             .map_err(|error| CommandError::Encryption(error.to_string()));
     }
     context
-        .decrypt_document_from_start_node(xml, encrypted_data_id)
+        .decrypt_first_document_from_start_node(xml, encrypted_data_id)
         .map(String::into_bytes)
         .map_err(|error| CommandError::Encryption(error.to_string()))
 }
