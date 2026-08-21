@@ -1293,6 +1293,34 @@ fn signing_processes_manifests_unless_explicitly_ignored() {
 }
 
 #[test]
+fn ignore_manifests_preserves_signed_info_dependency_checks() {
+    // The CLI flag opts out of Manifest traversal, not the dependency safety
+    // required to keep SignedInfo references valid after SignatureValue fill.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("signature-value-cycle.xml");
+    fs::write(
+        &template,
+        r##"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:DigestValue)</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##,
+    )
+    .unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+
+    let output = Command::new(binary())
+        .args(["sign", "--ignore-manifests", "--privkey-pem"])
+        .arg(private_key)
+        .arg(template)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SignatureValue") && stderr.contains("cycle"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn signing_processes_nested_manifests_in_dependency_order() {
     // The process API must expose the same dependency-aware Manifest pipeline
     // as SignContext rather than emitting a signature with a stale outer digest.

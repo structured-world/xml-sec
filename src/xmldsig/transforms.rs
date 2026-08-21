@@ -883,6 +883,11 @@ struct DependencyTracking {
     // Node identities are remapped by canonical byte position whenever a later
     // node-set transform reparses C14N output into a new document.
     active_nodes: Vec<TrackedDependencyNode>,
+    // Mutable nodes outside the dereferenced input cannot affect ordinary
+    // serialization transforms. XPath can still read them through absolute or
+    // document-scanning expressions, so retain their indexes until that choice
+    // is known rather than treating them as active input provenance.
+    dormant_indexes: HashSet<usize>,
     // Base64 decoding destroys XML identity. Dependencies that crossed that
     // boundary remain conservative because later XPath cannot recover origin.
     opaque_dependencies: HashSet<usize>,
@@ -917,13 +922,22 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
     ensure_transform_count(transforms.len())?;
     let mut active_nodes = Vec::with_capacity(tracked_nodes.len());
     let mut opaque_dependencies = HashSet::new();
+    let mut dormant_indexes = HashSet::new();
     for (index, node_id) in tracked_nodes {
         if let Some(node) = signature_node.document().get_node(node_id) {
-            active_nodes.push(TrackedDependencyNode {
-                index,
-                node_id,
-                node_type: node.node_type(),
-            });
+            let belongs_to_input = match &initial_data {
+                TransformData::NodeSet(nodes) => nodes.contains(node),
+                TransformData::Binary(_) => false,
+            };
+            if belongs_to_input {
+                active_nodes.push(TrackedDependencyNode {
+                    index,
+                    node_id,
+                    node_type: node.node_type(),
+                });
+            } else {
+                dormant_indexes.insert(index);
+            }
         } else {
             opaque_dependencies.insert(index);
         }
@@ -942,6 +956,7 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
         None,
         Some(DependencyTracking {
             active_nodes,
+            dormant_indexes,
             opaque_dependencies,
             canonical_positions: None,
         }),
@@ -1213,6 +1228,11 @@ fn execute_transform_chain<'s, 'e, 'd>(
                     }),
                     _ => false,
                 };
+                if preserve_excluded_as_opaque {
+                    tracking
+                        .opaque_dependencies
+                        .extend(tracking.dormant_indexes.iter().copied());
+                }
                 let mut active_nodes = Vec::with_capacity(tracking.active_nodes.len());
                 for tracked in tracking.active_nodes.drain(..) {
                     let remains_visible = nodes

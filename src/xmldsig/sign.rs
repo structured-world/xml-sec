@@ -890,33 +890,15 @@ impl<'a> SignContext<'a> {
             None
         };
         let prepared_xml = with_key_info.as_deref().unwrap_or(xml);
-        let with_digests =
-            if self.policy.manifest_processing == crate::policy::ManifestProcessing::Process {
-                Some(fill_reference_digest_values_in_dependency_order(
-                    prepared_xml,
-                    transform_options,
-                    &self.policy,
-                    self.provider,
-                    &execution_budget,
-                    target_signature,
-                    self.id_attributes,
-                )?)
-            } else {
-                None
-            };
-        let with_digests = if let Some(with_digests) = with_digests {
-            with_digests
-        } else {
-            fill_reference_digest_values_with_options(
-                prepared_xml,
-                transform_options,
-                Some(&self.policy),
-                self.provider,
-                &execution_budget,
-                Some(target_signature),
-                self.id_attributes,
-            )?
-        };
+        let with_digests = fill_reference_digest_values_in_dependency_order(
+            prepared_xml,
+            transform_options,
+            &self.policy,
+            self.provider,
+            &execution_budget,
+            target_signature,
+            self.id_attributes,
+        )?;
         self.policy
             .resources
             .validate_xml_document_len(with_digests.len())?;
@@ -1091,12 +1073,18 @@ fn fill_reference_digest_values_in_dependency_order(
         .resources
         .max_references
         .min(MAX_REFERENCES_PER_SIGNATURE);
-    let manifest_references = parse_signing_manifest_references(
-        signature,
-        &mut xpath_budget,
-        reference_limit.saturating_sub(signed_info_references.len()),
-        reference_limit,
-    )?;
+    let process_manifests =
+        policy.manifest_processing == crate::policy::ManifestProcessing::Process;
+    let manifest_references = if process_manifests {
+        parse_signing_manifest_references(
+            signature,
+            &mut xpath_budget,
+            reference_limit.saturating_sub(signed_info_references.len()),
+            reference_limit,
+        )?
+    } else {
+        Vec::new()
+    };
     let total_references = signed_info_references
         .len()
         .checked_add(manifest_references.len())
@@ -1109,12 +1097,16 @@ fn fill_reference_digest_values_in_dependency_order(
         target_signature,
         Some(policy),
     )?;
-    let analysis_xml = fill_selected_manifest_digest_values_at_index_with_options(
-        &analysis_xml,
-        (0..manifest_references.len()).map(|index| (index, placeholder)),
-        target_signature,
-        Some(policy),
-    )?;
+    let analysis_xml = if manifest_references.is_empty() {
+        analysis_xml
+    } else {
+        fill_selected_manifest_digest_values_at_index_with_options(
+            &analysis_xml,
+            (0..manifest_references.len()).map(|index| (index, placeholder)),
+            target_signature,
+            Some(policy),
+        )?
+    };
     // SignatureValue is the final mutable value in the signing pipeline. Give
     // it concrete character data during analysis so references that retain the
     // existing or future text cannot be mistaken for stable inputs.
@@ -1132,12 +1124,14 @@ fn fill_reference_digest_values_in_dependency_order(
     let analysis_signed_info = find_required_child(analysis_signature, "SignedInfo")?;
     let mut analysis_references =
         parse_signing_references_with_budget(analysis_signed_info, &mut xpath_budget)?;
-    analysis_references.extend(parse_signing_manifest_references(
-        analysis_signature,
-        &mut xpath_budget,
-        reference_limit.saturating_sub(signed_info_references.len()),
-        reference_limit,
-    )?);
+    if process_manifests {
+        analysis_references.extend(parse_signing_manifest_references(
+            analysis_signature,
+            &mut xpath_budget,
+            reference_limit.saturating_sub(signed_info_references.len()),
+            reference_limit,
+        )?);
+    }
     let dependency_plan = reference_dependency_levels(
         &analysis_doc,
         analysis_signature,
@@ -1156,12 +1150,16 @@ fn fill_reference_digest_values_in_dependency_order(
         let current_signed_info = find_required_child(current_signature, "SignedInfo")?;
         let current_signed_info_references =
             parse_signing_references_with_budget(current_signed_info, &mut xpath_budget)?;
-        let current_manifest_references = parse_signing_manifest_references(
-            current_signature,
-            &mut xpath_budget,
-            reference_limit.saturating_sub(signed_info_references.len()),
-            reference_limit,
-        )?;
+        let current_manifest_references = if process_manifests {
+            parse_signing_manifest_references(
+                current_signature,
+                &mut xpath_budget,
+                reference_limit.saturating_sub(signed_info_references.len()),
+                reference_limit,
+            )?
+        } else {
+            Vec::new()
+        };
         let mut signed_info_replacements = Vec::new();
         let mut manifest_replacements = Vec::new();
         for index in level {

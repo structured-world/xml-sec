@@ -51,7 +51,8 @@ real cycles fail before output. Verification follows valid structure-preserving
 Manifest references recursively, so every authenticated nested Manifest reports
 its own reference results. `--ignore-manifests`
 disables that work for both DSig commands and leaves signing-template Manifest
-values untouched.
+values untouched. It does not disable dependency validation among `SignedInfo`
+references or against the `SignatureValue` that signing will populate last.
 XML file and `--xml-data` inputs accept XML 1.0 UTF-8 plus BOM-marked UTF-16 or
 BOM-less UTF-16LE/UTF-16BE with a matching explicit declaration, with resource
 limits charged against source bytes before decoding.

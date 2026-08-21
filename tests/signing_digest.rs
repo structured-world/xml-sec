@@ -1262,6 +1262,26 @@ fn manifest_signing_rejects_malformed_structure_and_aggregate_overflow() {
 }
 
 #[test]
+fn ignored_manifests_do_not_disable_signed_info_dependency_checks() {
+    // ManifestProcessing::Ignore excludes Manifest references only. SignedInfo
+    // still cannot retain SignatureValue because signing mutates it last.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template = r##"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:DigestValue)</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
+
+    let error = SignContext::new(&private_key)
+        .sign_template(template)
+        .expect_err("default signing policy must reject a SignatureValue dependency");
+
+    assert!(matches!(
+        error,
+        SigningError::Digest(SigningDigestError::InvalidStructure(message))
+            if message.contains("SignatureValue") && message.contains("cycle")
+    ));
+}
+
+#[test]
 fn rejects_reference_without_uri() {
     // External/object reference support is not implicit: signing must know what
     // bytes are being digested, so an omitted URI fails before mutation.
