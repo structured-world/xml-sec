@@ -60,7 +60,8 @@ pub const DEFAULT_IMPLICIT_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c
 pub const MAX_TRANSFORMS_PER_REFERENCE: usize = crate::hard_limits::REFERENCE_TRANSFORM_CEILING;
 /// xmlsec1 donor vectors use this XPath expression as a compatibility form of
 /// enveloped-signature exclusion.
-const ENVELOPED_SIGNATURE_XPATH_EXPR: &str = "not(ancestor-or-self::dsig:Signature)";
+pub(super) const ENVELOPED_SIGNATURE_XPATH_PREFIX: &str = "dsig";
+pub(super) const ENVELOPED_SIGNATURE_XPATH_EXPR: &str = "not(ancestor-or-self::dsig:Signature)";
 pub(super) const MAX_XPATH_EXPRESSION_BYTES: usize =
     crate::hard_limits::XPATH_EXPRESSION_BYTE_CEILING;
 pub(super) const MAX_XPATH_FILTERS: usize = crate::hard_limits::XPATH_FILTER_COUNT_CEILING;
@@ -690,12 +691,19 @@ fn apply_transform_with_options_and_state<'s, 'd>(
             let mut nodes = input.into_node_set()?;
             let doc = nodes.document();
 
+            // This variant is an optimized execution of a concrete wire-level
+            // XPath expression. Optimization may avoid SXD, but it must retain
+            // the expression's policy accounting for every input context and
+            // the node-set filtering pass.
+            budget.xpath.validate_context_evaluations(nodes.len())?;
+            budget.xpath.charge(nodes.len())?;
+            budget.node_filter.charge(nodes.len())?;
+
             for node in doc.descendants().filter(|node| {
                 node.is_element()
                     && node.tag_name().name() == "Signature"
                     && node.tag_name().namespace() == Some(XMLDSIG_NS)
             }) {
-                budget.node_filter.charge(nodes.len())?;
                 nodes.exclude_subtree(node);
             }
 
@@ -703,6 +711,7 @@ fn apply_transform_with_options_and_state<'s, 'd>(
         }
         Transform::XPath(xpath) => {
             let nodes = input.into_node_set()?;
+            budget.node_filter.charge(nodes.len())?;
             let document_relation = xpath_document_relation(
                 signature_node.document(),
                 nodes.document(),
@@ -722,6 +731,9 @@ fn apply_transform_with_options_and_state<'s, 'd>(
         }
         Transform::XPathFilter2(filters) => {
             let nodes = input.into_node_set()?;
+            budget
+                .node_filter
+                .charge(nodes.len().saturating_mul(filters.len()))?;
             let document_relation = xpath_document_relation(
                 signature_node.document(),
                 nodes.document(),
@@ -1981,6 +1993,11 @@ fn validate_xpath_namespace_budget_with_limits(
     };
     for transform in transforms {
         match transform {
+            Transform::XpathExcludeAllSignatures => {
+                let xpath = XPathExpression::new(ENVELOPED_SIGNATURE_XPATH_EXPR)
+                    .with_namespace(ENVELOPED_SIGNATURE_XPATH_PREFIX, XMLDSIG_NS);
+                validate_expression(&xpath)?;
+            }
             Transform::XPath(xpath) => validate_expression(xpath)?,
             Transform::XPathFilter2(filters) => {
                 for filter in filters {
@@ -2670,6 +2687,97 @@ mod tests {
             ),
             "the second reference exclusion must exhaust the shared budget"
         );
+    }
+
+    #[test]
+    fn xpath_node_set_operations_consume_filter_work_budget() {
+        // XPath evaluation and node-set filtering are separate costs. A policy
+        // that denies filtering must stop both XPath forms before they project,
+        // intersect, subtract, or union their results.
+        let document = Document::parse("<root><keep/><drop/></root>").unwrap();
+        let transforms = [
+            Transform::XPath(XPathExpression::new("true()")),
+            Transform::XPathFilter2(vec![XPathFilter::new(
+                XPathFilterOperation::Intersect,
+                XPathExpression::new("//*"),
+            )]),
+        ];
+
+        for transform in transforms {
+            let resources = crate::policy::ResourcePolicy {
+                max_node_set_filter_work: 0,
+                ..crate::policy::ResourcePolicy::default()
+            };
+            let budget = TransformExecutionBudget::from_resources(&resources);
+            let input = NodeSet::entire_document_without_comments(&document)
+                .map(TransformData::NodeSet)
+                .unwrap();
+            let error = execute_transforms_with_options_and_budget(
+                document.root_element(),
+                input,
+                &[transform],
+                TransformOptions::default(),
+                &budget,
+            )
+            .expect_err("zero filter-work policy must deny XPath node-set operations");
+
+            assert!(matches!(
+                error,
+                TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::NODE_SET_FILTER_WORK,
+                    maximum: 0,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn optimized_exclusion_consumes_xpath_execution_budgets() {
+        // Recognizing the standard expression is an optimization, not a policy
+        // bypass: its per-node predicate still consumes XPath contexts and work.
+        let document = Document::parse(
+            r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><value/><ds:Signature/></root>"#,
+        )
+        .unwrap();
+
+        for resource in [
+            crate::policy::resource_name::XPATH_CONTEXT_EVALUATIONS,
+            crate::policy::resource_name::XPATH_EVALUATION_WORK,
+        ] {
+            let resources = if resource == crate::policy::resource_name::XPATH_CONTEXT_EVALUATIONS {
+                crate::policy::ResourcePolicy {
+                    max_xpath_context_evaluations: 0,
+                    ..crate::policy::ResourcePolicy::default()
+                }
+            } else {
+                crate::policy::ResourcePolicy {
+                    max_xpath_evaluation_work: 0,
+                    ..crate::policy::ResourcePolicy::default()
+                }
+            };
+            let budget = TransformExecutionBudget::from_resources(&resources);
+            let input = NodeSet::entire_document_without_comments(&document)
+                .map(TransformData::NodeSet)
+                .unwrap();
+            let error = execute_transforms_with_options_and_budget(
+                document.root_element(),
+                input,
+                &[Transform::XpathExcludeAllSignatures],
+                TransformOptions::default(),
+                &budget,
+            )
+            .expect_err("optimized XPath must obey execution budgets");
+
+            assert!(matches!(
+                error,
+                TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: actual,
+                    maximum: 0,
+                    ..
+                }) if actual == resource
+            ));
+        }
     }
 
     #[test]

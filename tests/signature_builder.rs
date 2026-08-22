@@ -99,6 +99,24 @@ fn preserves_reference_order_and_default_namespace() {
 }
 
 #[test]
+fn default_reference_serializes_explicit_same_document_uri() {
+    // The signing parser requires a URI attribute. The builder's ergonomic
+    // default therefore denotes the empty same-document URI rather than an
+    // omitted attribute that would fail only after template serialization.
+    let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256))
+        .build_template()
+        .expect("the default reference must remain signable");
+    let document = roxmltree::Document::parse(&xml).expect("valid XML");
+    let reference = document
+        .descendants()
+        .find(|node| node.has_tag_name((DSIG_NS, "Reference")))
+        .expect("Reference");
+
+    assert_eq!(reference.attribute("URI"), Some(""));
+}
+
+#[test]
 fn rejects_incomplete_or_unsafe_signing_templates() {
     // Builders fail before serialization rather than producing unusable templates.
     let missing = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
@@ -283,6 +301,66 @@ fn rejects_xpath_namespace_budget_before_serialization() {
             ..
         })
     ));
+}
+
+#[test]
+fn policy_aware_builder_validates_optimized_xpath_wire_form() {
+    // The optimized variant still serializes one XPath expression with one
+    // namespace binding. Builder validation must account for that wire form so
+    // signing cannot reject a template accepted under the same policy.
+    let builder = || {
+        SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256).add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .transform(Transform::XpathExcludeAllSignatures),
+        )
+    };
+    let mut policies = Vec::new();
+
+    let expression_count = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xpath_expressions: 0,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    policies.push(("XPath expressions", expression_count));
+
+    let expression_bytes = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xpath_expression_bytes: 1,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    policies.push(("XPath expression bytes", expression_bytes));
+
+    let expression_complexity = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xpath_expression_complexity: 0,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    policies.push(("XPath expression complexity", expression_complexity));
+
+    let namespace_bindings = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xpath_namespace_bindings: 0,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    policies.push(("XPath namespace bindings", namespace_bindings));
+
+    for (resource, policy) in policies {
+        let error = builder()
+            .build_template_with_policy(&policy)
+            .expect_err("optimized XPath wire content must obey builder policy");
+        assert!(
+            error.to_string().contains(resource),
+            "expected {resource} rejection, got {error}"
+        );
+    }
 }
 
 #[test]

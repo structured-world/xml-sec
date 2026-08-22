@@ -10,8 +10,8 @@ use crate::policy::{PolicyViolation, SigningPolicy};
 use crate::xml::{is_xml_1_0_character, is_xml_ncname};
 
 use super::transforms::{
-    XPathSignatureParseBudget, validate_signing_transform_policy,
-    validate_xpath_namespace_budget_with_resources,
+    ENVELOPED_SIGNATURE_XPATH_EXPR, ENVELOPED_SIGNATURE_XPATH_PREFIX, XPathSignatureParseBudget,
+    validate_signing_transform_policy, validate_xpath_namespace_budget_with_resources,
 };
 use super::{
     BASE64_TRANSFORM_URI, DigestAlgorithm, ENVELOPED_SIGNATURE_URI, SignatureAlgorithm, Transform,
@@ -22,7 +22,6 @@ const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 const EXCLUSIVE_C14N_NS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
-const XPATH_EXCLUDE_ALL_SIGNATURES: &str = "not(ancestor-or-self::dsig:Signature)";
 
 /// Errors produced while validating or serializing an XMLDSig template.
 #[derive(Debug, thiserror::Error)]
@@ -70,7 +69,7 @@ pub enum SignatureBuilderError {
 /// Builder for a single XMLDSig `<Reference>` template.
 #[derive(Debug, Clone)]
 pub struct ReferenceBuilder {
-    uri: Option<String>,
+    uri: String,
     id: Option<String>,
     ref_type: Option<String>,
     transforms: Vec<Transform>,
@@ -82,7 +81,7 @@ impl ReferenceBuilder {
     #[must_use]
     pub fn new(digest_method: DigestAlgorithm) -> Self {
         Self {
-            uri: None,
+            uri: String::new(),
             id: None,
             ref_type: None,
             transforms: Vec::new(),
@@ -90,10 +89,13 @@ impl ReferenceBuilder {
         }
     }
 
-    /// Set the optional reference URI.
+    /// Set the reference URI.
+    ///
+    /// References default to the empty same-document URI because the signing
+    /// pipeline requires an explicit `URI` attribute.
     #[must_use]
     pub fn uri(mut self, uri: impl Into<String>) -> Self {
-        self.uri = Some(uri.into());
+        self.uri = uri.into();
         self
     }
 
@@ -269,11 +271,7 @@ impl SignatureBuilder {
         let mut xpath_signature_budget =
             XPathSignatureParseBudget::from_resources(&policy.resources);
         for reference in &self.references {
-            if !policy
-                .uris
-                .references
-                .allows(reference.uri.as_deref().unwrap_or(""))
-            {
+            if !policy.uris.references.allows(&reference.uri) {
                 return Err(PolicyViolation::Uri {
                     operation: "signing",
                     reason: "signing reference URI class is not permitted",
@@ -288,10 +286,7 @@ impl SignatureBuilder {
                 }
                 .into());
             }
-            let initial_binary = reference
-                .uri
-                .as_deref()
-                .is_some_and(|uri| !uri.is_empty() && !uri.starts_with('#'));
+            let initial_binary = !reference.uri.is_empty() && !reference.uri.starts_with('#');
             validate_signing_transform_policy(
                 initial_binary,
                 &reference.transforms,
@@ -299,6 +294,12 @@ impl SignatureBuilder {
             )?;
             for transform in &reference.transforms {
                 match transform {
+                    Transform::XpathExcludeAllSignatures => {
+                        validate_xpath_source(
+                            ENVELOPED_SIGNATURE_XPATH_EXPR,
+                            &mut xpath_signature_budget,
+                        )?;
+                    }
                     Transform::XPath(xpath) => {
                         validate_xpath_source(xpath.expression(), &mut xpath_signature_budget)?;
                     }
@@ -477,9 +478,7 @@ fn write_reference<W: Write>(
     if let Some(ref_type) = &reference.ref_type {
         element.push_attribute(("Type", ref_type.as_str()));
     }
-    if let Some(uri) = &reference.uri {
-        element.push_attribute(("URI", uri.as_str()));
-    }
+    element.push_attribute(("URI", reference.uri.as_str()));
     writer.write_event(Event::Start(element))?;
 
     if !reference.transforms.is_empty() {
@@ -516,9 +515,10 @@ fn write_transform<W: Write>(
             writer.write_event(Event::Start(element))?;
             let xpath_name = qualified_name(prefix, "XPath");
             let mut xpath = BytesStart::new(&xpath_name);
-            xpath.push_attribute(("xmlns:dsig", XMLDSIG_NS));
+            let namespace = format!("xmlns:{ENVELOPED_SIGNATURE_XPATH_PREFIX}");
+            xpath.push_attribute((namespace.as_str(), XMLDSIG_NS));
             writer.write_event(Event::Start(xpath))?;
-            writer.write_event(Event::Text(BytesText::new(XPATH_EXCLUDE_ALL_SIGNATURES)))?;
+            writer.write_event(Event::Text(BytesText::new(ENVELOPED_SIGNATURE_XPATH_EXPR)))?;
             writer.write_event(Event::End(BytesEnd::new(xpath_name)))?;
             writer.write_event(Event::End(BytesEnd::new(name)))?;
             Ok(())

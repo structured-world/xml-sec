@@ -1321,8 +1321,10 @@ fn ignored_manifests_do_not_disable_signed_info_dependency_checks() {
 #[test]
 fn rejects_reference_without_uri() {
     // External/object reference support is not implicit: signing must know what
-    // bytes are being digested, so an omitted URI fails before mutation.
-    let template = template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256));
+    // bytes are being digested, so malformed input with an omitted URI fails
+    // before mutation. The builder itself always emits the explicit empty URI.
+    let template = template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256))
+        .replacen("<Reference URI=\"\">", "<Reference>", 1);
     let xml = append_signature_to_root("<root><payload>hello</payload></root>", &template)
         .expect("append signature");
 
