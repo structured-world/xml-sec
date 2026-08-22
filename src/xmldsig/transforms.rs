@@ -237,7 +237,7 @@ mod c14n_budget_regression_tests {
         assert!(matches!(
             error,
             TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "canonicalized bytes",
+                resource: crate::policy::resource_name::CANONICALIZED_BYTES,
                 maximum: 8,
                 ..
             })
@@ -1384,7 +1384,7 @@ fn map_c14n_limit_error(error: c14n::C14nError, budget: &C14nOutputBudget) -> Tr
         // consumed so another Reference cannot spend the same budget.
         budget.exhaust();
     }
-    if let Some(violation) = c14n_policy_violation(
+    if let Some(violation) = map_c14n_resource_policy_violation(
         &error,
         crate::policy::resource_name::CANONICALIZED_BYTES,
         budget.max_bytes,
@@ -1404,7 +1404,11 @@ pub(crate) fn transform_chain_produces_binary(
     })
 }
 
-pub(crate) fn c14n_policy_violation(
+/// Map every C14N resource failure governed by the operation policy.
+///
+/// The output parameters apply only to the bounded-writer case; XML Base
+/// component and byte failures carry their own policy maxima in the error.
+pub(crate) fn map_c14n_resource_policy_violation(
     error: &c14n::C14nError,
     output_resource: &'static str,
     output_maximum: usize,
@@ -1748,11 +1752,13 @@ fn parse_xpath_expression(
             document: xpath_state.document_identity(xpath_node.document()),
         }),
     };
+    let mut namespace_budget = XPathNamespaceBudget::with_limits(
+        xpath_state.signature_budget.max_namespace_bindings,
+        xpath_state.signature_budget.max_namespace_bytes,
+    );
     for namespace in xpath_node.namespaces() {
         if let Some(prefix) = namespace.name() {
-            xpath_state
-                .namespace_budget
-                .charge(prefix, namespace.uri())?;
+            namespace_budget.charge(prefix, namespace.uri())?;
             xpath
                 .namespaces
                 .insert(prefix.to_owned(), namespace.uri().to_owned());
@@ -1762,7 +1768,6 @@ fn parse_xpath_expression(
 }
 
 struct XPathParseState<'a> {
-    namespace_budget: XPathNamespaceBudget,
     document_identity: Option<XPathDocumentIdentity>,
     signature_budget: &'a mut XPathSignatureParseBudget,
 }
@@ -1770,10 +1775,6 @@ struct XPathParseState<'a> {
 impl<'a> XPathParseState<'a> {
     fn new(signature_budget: &'a mut XPathSignatureParseBudget) -> Self {
         Self {
-            namespace_budget: XPathNamespaceBudget::with_limits(
-                signature_budget.max_namespace_bindings,
-                signature_budget.max_namespace_bytes,
-            ),
             document_identity: None,
             signature_budget,
         }
@@ -1945,29 +1946,24 @@ fn validate_xpath_namespace_budget_with_limits(
     max_bindings: usize,
     max_bytes: usize,
 ) -> Result<(), TransformError> {
-    let mut budget = XPathNamespaceBudget::with_limits(max_bindings, max_bytes);
+    let validate_expression = |xpath: &XPathExpression| {
+        let mut budget = XPathNamespaceBudget::with_limits(max_bindings, max_bytes);
+        for (prefix, uri) in xpath.namespaces() {
+            budget.charge(prefix, uri)?;
+        }
+        if let Some((prefix, uri)) = inherited_namespace
+            && !xpath.namespaces().contains_key(prefix)
+        {
+            budget.charge(prefix, uri)?;
+        }
+        Ok::<(), TransformError>(())
+    };
     for transform in transforms {
         match transform {
-            Transform::XPath(xpath) => {
-                for (prefix, uri) in xpath.namespaces() {
-                    budget.charge(prefix, uri)?;
-                }
-                if let Some((prefix, uri)) = inherited_namespace
-                    && !xpath.namespaces().contains_key(prefix)
-                {
-                    budget.charge(prefix, uri)?;
-                }
-            }
+            Transform::XPath(xpath) => validate_expression(xpath)?,
             Transform::XPathFilter2(filters) => {
                 for filter in filters {
-                    for (prefix, uri) in filter.xpath().namespaces() {
-                        budget.charge(prefix, uri)?;
-                    }
-                    if let Some((prefix, uri)) = inherited_namespace
-                        && !filter.xpath().namespaces().contains_key(prefix)
-                    {
-                        budget.charge(prefix, uri)?;
-                    }
+                    validate_expression(filter.xpath())?;
                 }
             }
             _ => {}
@@ -3256,9 +3252,36 @@ mod tests {
     }
 
     #[test]
-    fn parse_transforms_bounds_cumulative_xpath_namespace_storage() {
-        // In-scope bindings are copied into every Filter 2.0 expression, so a
-        // chain-level budget must reject their multiplicative amplification.
+    fn xpath_namespace_limits_apply_to_each_expression() {
+        // Namespace ceilings describe one compiled expression, while expression
+        // count remains shared across the complete signature operation.
+        let xml = format!(
+            r#"<Transforms xmlns="{XMLDSIG_NS}">
+                <Transform Algorithm="{XPATH_TRANSFORM_URI}">
+                    <XPath xmlns:a="urn:a">a:item</XPath>
+                </Transform>
+                <Transform Algorithm="{XPATH_TRANSFORM_URI}">
+                    <XPath xmlns:b="urn:b">b:item</XPath>
+                </Transform>
+            </Transforms>"#
+        );
+        let doc = Document::parse(&xml).unwrap();
+        let resources = crate::policy::ResourcePolicy {
+            max_xpath_namespace_bindings: 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let mut budget = XPathSignatureParseBudget::from_resources(&resources);
+
+        let transforms = parse_transforms_with_budget(doc.root_element(), &mut budget)
+            .expect("each XPath independently satisfies the one-binding ceiling");
+
+        assert_eq!(transforms.len(), 2);
+    }
+
+    #[test]
+    fn parse_transforms_applies_namespace_storage_limit_per_expression() {
+        // Repeated expressions may each consume the configured per-expression
+        // allowance without being charged for bindings copied into their peers.
         let declarations = (0..32)
             .map(|index| {
                 format!(
@@ -3280,19 +3303,13 @@ mod tests {
         );
         let doc = Document::parse(&xml).unwrap();
 
-        let error = parse_transforms(doc.root_element())
-            .expect_err("cumulative XPath namespace storage must be bounded");
+        let transforms = parse_transforms(doc.root_element())
+            .expect("each expression remains below its namespace storage ceiling");
 
-        assert!(
-            matches!(
-                error,
-                TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XPATH_NAMESPACE_BYTES,
-                    ..
-                })
-            ),
-            "unexpected error: {error:?}"
-        );
+        assert!(matches!(
+            transforms.as_slice(),
+            [Transform::XPathFilter2(filters)] if filters.len() == MAX_XPATH_FILTERS
+        ));
     }
 
     #[test]

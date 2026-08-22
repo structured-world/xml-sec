@@ -38,9 +38,9 @@ use super::parse::{
 };
 use super::transforms::{
     Transform, TransformExecutionBudget, TransformOptions, XPathHereSemantics,
-    XPathSignatureParseBudget, c14n_policy_violation, execute_transforms_with_dependency_nodes,
-    execute_transforms_with_options_and_budget, parse_transforms_with_budget,
-    validate_signing_transform_policy,
+    XPathSignatureParseBudget, execute_transforms_with_dependency_nodes,
+    execute_transforms_with_options_and_budget, map_c14n_resource_policy_violation,
+    parse_transforms_with_budget, validate_signing_transform_policy,
 };
 use super::types::TransformError;
 use super::uri::UriReferenceResolver;
@@ -1537,7 +1537,7 @@ fn canonicalize_signed_info(
         &mut canonical_signed_info,
     )
     .map_err(|error| {
-        if let Some(violation) = c14n_policy_violation(
+        if let Some(violation) = map_c14n_resource_policy_violation(
             &error,
             crate::policy::resource_name::CANONICALIZED_BYTES,
             execution_budget.c14n_output_limit(),

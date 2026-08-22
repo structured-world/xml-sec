@@ -42,8 +42,9 @@ use super::signature::{
 use super::transforms::BASE64_TRANSFORM_URI;
 use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget, TransformOptions,
-    XPATH_TRANSFORM_URI, XPathHereSemantics, XPathSignatureParseBudget, c14n_policy_violation,
-    execute_transforms_with_options_and_budget, transform_chain_produces_binary,
+    XPATH_TRANSFORM_URI, XPathHereSemantics, XPathSignatureParseBudget,
+    execute_transforms_with_options_and_budget, map_c14n_resource_policy_violation,
+    transform_chain_produces_binary,
 };
 use super::uri::{UriReferenceResolver, same_document_reference_id};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
@@ -1281,7 +1282,7 @@ fn verify_signature_with_context(
         &mut canonical_signed_info,
     )
     .map_err(|error| {
-        if let Some(violation) = c14n_policy_violation(
+        if let Some(violation) = map_c14n_resource_policy_violation(
             &error,
             crate::policy::resource_name::CANONICALIZED_BYTES,
             canonicalized_data_budget.max_bytes,

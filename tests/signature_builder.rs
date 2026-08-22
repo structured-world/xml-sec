@@ -262,8 +262,8 @@ fn rejects_xpath_sources_that_parsing_cannot_accept() {
 
 #[test]
 fn rejects_xpath_namespace_budget_before_serialization() {
-    // Parsing enforces one aggregate namespace budget per Reference. The builder
-    // must reject the same input rather than emit a template that signing reparses.
+    // Parsing enforces the namespace budget for each XPath expression. The
+    // builder must reject the same oversized expression before serialization.
     let mut expression = XPathExpression::new("true()");
     for index in 0..=1_024 {
         expression = expression.with_namespace(format!("p{index}"), "urn:test");
@@ -274,7 +274,7 @@ fn rejects_xpath_namespace_budget_before_serialization() {
             ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::XPath(expression)),
         )
         .build_template()
-        .expect_err("builder must enforce the parser's aggregate namespace budget");
+        .expect_err("builder must enforce the parser's per-expression namespace budget");
 
     assert!(matches!(
         error,
@@ -327,9 +327,9 @@ fn rejects_signature_wide_xpath_expression_budget() {
 }
 
 #[test]
-fn rejects_inherited_signature_prefix_over_namespace_budget() {
-    // Every serialized Filter2 XPath inherits the signature prefix binding. The
-    // builder must charge those bindings before signing reparses its template.
+fn accepts_repeated_inherited_prefix_within_each_xpath_budget() {
+    // Every serialized Filter2 XPath inherits the signature prefix independently;
+    // one expression must not consume another expression's namespace allowance.
     let filters = (0..64)
         .map(|_| {
             XPathFilter::new(
@@ -343,19 +343,29 @@ fn rejects_inherited_signature_prefix_over_namespace_budget() {
         |reference, _| reference.transform(Transform::XPathFilter2(filters.clone())),
     );
 
-    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xpath_namespace_bindings: 1,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    let xml = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
         .ns_prefix("ds")
         .add_reference(reference)
-        .build_template()
-        .expect_err("builder must count inherited namespace bindings on every XPath element");
+        .build_template_with_policy(&policy)
+        .expect("each XPath contains exactly one inherited namespace binding");
 
-    assert!(matches!(
-        error,
-        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
-            resource: "XPath namespace bindings",
-            ..
-        })
-    ));
+    let document = roxmltree::Document::parse(&xml).expect("builder output must remain valid XML");
+    assert_eq!(
+        document
+            .descendants()
+            .filter(
+                |node| node.has_tag_name((xml_sec::xmldsig::XPATH_FILTER2_TRANSFORM_URI, "XPath"))
+            )
+            .count(),
+        17 * 64
+    );
 }
 
 #[test]

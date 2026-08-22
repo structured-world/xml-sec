@@ -731,6 +731,7 @@ impl DefaultKeyResolver {
         algorithm: SignatureAlgorithm,
         sources: crate::policy::KeySourcePolicy,
         trust: &crate::policy::KeyTrustPolicy,
+        resources: &crate::policy::ResourcePolicy,
         provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
         trust.validate()?;
@@ -738,7 +739,16 @@ impl DefaultKeyResolver {
             return Ok(None);
         };
         let mut deferred_key_value_error = None;
-        for source in &key_info.sources {
+        for (index, source) in key_info.sources.iter().enumerate() {
+            let attempted = index.saturating_add(1);
+            if attempted > resources.max_key_candidates {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_CANDIDATES,
+                    maximum: resources.max_key_candidates,
+                    actual: attempted,
+                }
+                .into());
+            }
             let resolved = match source {
                 KeyInfoSource::X509Data(info) => {
                     if !sources.x509_data {
@@ -828,6 +838,7 @@ impl KeyResolver for DefaultKeyResolver {
             algorithm,
             policy.key_sources,
             &policy.key_trust,
+            &policy.resources,
             crate::provider::default_provider(),
         )
     }
@@ -858,6 +869,7 @@ impl KeyResolver for DefaultKeyResolver {
             algorithm,
             policy.key_sources,
             &policy.key_trust,
+            &policy.resources,
             provider,
         )
     }
@@ -2825,6 +2837,62 @@ mod tests {
                 reason: "KeyValue key sources are disabled"
             })
         ));
+    }
+
+    #[test]
+    fn operation_policy_bounds_ordered_key_info_candidates() {
+        // The candidate ceiling belongs to the complete verification snapshot:
+        // neither a first source nor fallback to a later source may bypass it.
+        let mut config = KeyResolverConfig::default();
+        config.named_keys.insert(
+            "idp-signing".into(),
+            VerificationKey {
+                algorithm: SignatureAlgorithm::EcdsaSha256,
+                public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
+                certificate_der: None,
+                name: Some("idp-signing".into()),
+            },
+        );
+        let resolver = DefaultKeyResolver::new(config);
+        let key_info = KeyInfo {
+            sources: vec![
+                KeyInfoSource::KeyValue(KeyValueInfo::Ec {
+                    curve_oid: "1.3.132.0.35".into(),
+                    public_key: vec![4],
+                }),
+                KeyInfoSource::KeyName("idp-signing".into()),
+            ],
+        };
+
+        for maximum in [0, 1] {
+            let mut policy = crate::policy::VerificationPolicy::default();
+            policy.resources.max_key_candidates = maximum;
+            let error = match resolver.resolve_with_policy(
+                Some(&key_info),
+                SignatureAlgorithm::EcdsaSha256,
+                &policy,
+            ) {
+                Ok(_) => panic!("candidate ceiling {maximum} must stop resolution"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_CANDIDATES,
+                    maximum: observed,
+                    actual,
+                }) if observed == maximum && actual == maximum + 1
+            ));
+        }
+
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_key_candidates = 2;
+        assert!(
+            resolver
+                .resolve_with_policy(Some(&key_info), SignatureAlgorithm::EcdsaSha256, &policy,)
+                .expect("two allowed attempts must reach the named key")
+                .is_some()
+        );
     }
 
     #[test]

@@ -539,7 +539,7 @@ impl ResourcePolicy {
     pub(crate) fn validate_xml_document_len(&self, actual: usize) -> Result<(), PolicyViolation> {
         if actual > self.max_xml_document_bytes {
             return Err(PolicyViolation::ResourceLimit {
-                resource: "XML document",
+                resource: resource_name::XML_DOCUMENT,
                 maximum: self.max_xml_document_bytes,
                 actual,
             });
@@ -951,7 +951,7 @@ mod tests {
         assert!(matches!(
             policy.validate(),
             Err(PolicyViolation::ResourceLimit {
-                resource: "XML nodes",
+                resource: resource_name::XML_NODES,
                 maximum: 100_000,
                 actual: 100_001,
             })
@@ -966,62 +966,62 @@ mod tests {
         type Case = (&'static str, usize, fn(&mut ResourcePolicy) -> &mut usize);
         let cases: &[Case] = &[
             (
-                "XML nodes",
+                resource_name::XML_NODES,
                 crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
                 |p| &mut p.max_xml_nodes,
             ),
             (
-                "signature references",
+                resource_name::SIGNATURE_REFERENCES,
                 crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
                 |p| &mut p.max_references,
             ),
             (
-                "reference transforms",
+                resource_name::REFERENCE_TRANSFORMS,
                 crate::hard_limits::REFERENCE_TRANSFORM_CEILING,
                 |p| &mut p.max_transforms_per_reference,
             ),
             (
-                "XML Base components",
+                resource_name::XML_BASE_COMPONENTS,
                 crate::hard_limits::XML_BASE_COMPONENT_CEILING,
                 |p| &mut p.max_xml_base_components,
             ),
             (
-                "XML Base resolution bytes",
+                resource_name::XML_BASE_RESOLUTION_BYTES,
                 crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING,
                 |p| &mut p.max_xml_base_resolution_bytes,
             ),
             (
-                "canonicalized bytes",
+                resource_name::CANONICALIZED_BYTES,
                 crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING,
                 |p| &mut p.max_canonicalized_bytes,
             ),
             (
-                "external resource bytes",
+                resource_name::EXTERNAL_RESOURCE_BYTES,
                 crate::hard_limits::EXTERNAL_RESOURCE_BYTE_CEILING,
                 |p| &mut p.max_external_resource_bytes,
             ),
             (
-                "aggregate external resource bytes",
+                resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
                 crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING,
                 |p| &mut p.max_external_resource_total_bytes,
             ),
             (
-                "encryption plaintext bytes",
+                resource_name::ENCRYPTION_PLAINTEXT_BYTES,
                 crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING,
                 |p| &mut p.max_encryption_plaintext_bytes,
             ),
             (
-                "XML document",
+                resource_name::XML_DOCUMENT,
                 crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
                 |p| &mut p.max_xml_document_bytes,
             ),
             (
-                "encryption recipients",
+                resource_name::ENCRYPTION_RECIPIENTS,
                 crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
                 |p| &mut p.max_encryption_recipients,
             ),
             (
-                "encryption metadata bytes",
+                resource_name::ENCRYPTION_METADATA_BYTES,
                 crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
                 |p| &mut p.max_encryption_metadata_bytes,
             ),
@@ -1041,32 +1041,32 @@ mod tests {
                 |p| &mut p.max_base64_transform_output_bytes,
             ),
             (
-                "XPath expressions",
+                resource_name::XPATH_EXPRESSIONS,
                 crate::hard_limits::XPATH_EXPRESSION_COUNT_CEILING,
                 |p| &mut p.max_xpath_expressions,
             ),
             (
-                "XPath expression bytes",
+                resource_name::XPATH_EXPRESSION_BYTES,
                 crate::hard_limits::XPATH_EXPRESSION_BYTE_CEILING,
                 |p| &mut p.max_xpath_expression_bytes,
             ),
             (
-                "XPath expression complexity",
+                resource_name::XPATH_EXPRESSION_COMPLEXITY,
                 crate::hard_limits::XPATH_EXPRESSION_COMPLEXITY_CEILING,
                 |p| &mut p.max_xpath_expression_complexity,
             ),
             (
-                "XPath context evaluations",
+                resource_name::XPATH_CONTEXT_EVALUATIONS,
                 crate::hard_limits::XPATH_CONTEXT_EVALUATION_CEILING,
                 |p| &mut p.max_xpath_context_evaluations,
             ),
             (
-                "XPath evaluation work",
+                resource_name::XPATH_EVALUATION_WORK,
                 crate::hard_limits::XPATH_EVALUATION_WORK_CEILING,
                 |p| &mut p.max_xpath_evaluation_work,
             ),
             (
-                "XPath mirror string bytes",
+                resource_name::XPATH_MIRROR_STRING_BYTES,
                 crate::hard_limits::XPATH_MIRROR_STRING_BYTE_CEILING,
                 |p| &mut p.max_xpath_mirror_string_bytes,
             ),
@@ -1076,12 +1076,12 @@ mod tests {
                 |p| &mut p.max_xpath_string_work_bytes,
             ),
             (
-                "XPath namespace bindings",
+                resource_name::XPATH_NAMESPACE_BINDINGS,
                 crate::hard_limits::XPATH_NAMESPACE_BINDING_CEILING,
                 |p| &mut p.max_xpath_namespace_bindings,
             ),
             (
-                "XPath namespace bytes",
+                resource_name::XPATH_NAMESPACE_BYTES,
                 crate::hard_limits::XPATH_NAMESPACE_BYTE_CEILING,
                 |p| &mut p.max_xpath_namespace_bytes,
             ),
@@ -1091,22 +1091,22 @@ mod tests {
                 |p| &mut p.max_xpath_filters,
             ),
             (
-                "node-set filter work",
+                resource_name::NODE_SET_FILTER_WORK,
                 crate::hard_limits::NODE_SET_FILTER_WORK_CEILING,
                 |p| &mut p.max_node_set_filter_work,
             ),
             (
-                "node-set entries",
+                resource_name::NODE_SET_ENTRIES,
                 crate::hard_limits::NODE_SET_ENTRY_CEILING,
                 |p| &mut p.max_node_set_entries,
             ),
             (
-                "node-set owned string bytes",
+                resource_name::NODE_SET_OWNED_STRING_BYTES,
                 crate::hard_limits::NODE_SET_OWNED_STRING_BYTE_CEILING,
                 |p| &mut p.max_node_set_owned_string_bytes,
             ),
             (
-                "cumulative node-set owned string bytes",
+                resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
                 crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING,
                 |p| &mut p.max_node_set_cumulative_owned_string_bytes,
             ),
