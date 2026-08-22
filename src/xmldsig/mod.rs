@@ -76,13 +76,13 @@ pub use keys::{
 pub use parse::{
     KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, RetrievalMethodTransforms,
     SignatureAlgorithm, SignedInfo, X509DataInfo, find_signature_node, parse_key_info,
-    parse_reference, parse_signed_info,
+    parse_reference, parse_signed_info, x509_certificate_matches_selectors,
 };
 pub use sign::{
     ComputedReferenceDigest, EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriteError,
-    KeyInfoWriter, RsaSigningKey, SignContext, SigningDigestError, SigningError, SigningKey,
-    SigningKeyError, SigningPublicKeyInfo, X509CertificateKeyInfoWriter,
-    compute_reference_digest_values, fill_reference_digest_values,
+    KeyInfoWriter, RsaSigningKey, SignContext, SignatureTemplateSelection, SigningDigestError,
+    SigningError, SigningKey, SigningKeyError, SigningPublicKeyInfo, X509CertificateKeyInfoWriter,
+    compute_reference_digest_values, fill_reference_digest_values, validate_signing_key,
 };
 pub use signature::{
     SignatureVerificationError, verify_dsa_signature_spki, verify_ecdsa_signature_pem,
@@ -97,7 +97,7 @@ pub use transforms::{
 pub use types::{NodeSet, TransformData, TransformError};
 pub use verify::{
     DsigError, DsigStatus, FailureReason, KeyResolver, ReferenceProcessingError, ReferenceResult,
-    ReferenceSet, ReferencesResult, UriTypeSet, VerifyContext, VerifyResult, VerifyingKey,
-    process_all_references, process_reference, verify_signature_with_pem_key,
+    ReferenceSet, ReferencesResult, SignatureSelection, UriTypeSet, VerifyContext, VerifyResult,
+    VerifyingKey, process_all_references, process_reference, verify_signature_with_pem_key,
 };
 pub use x509::{X509ChainError, X509ChainOptions, verify_x509_certificate_chain};

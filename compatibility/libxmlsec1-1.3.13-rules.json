@@ -25,6 +25,10 @@
       "test": "capability_ledger::backend_surface_distinguishes_provider_capabilities_from_unimplemented_apis",
       "description": "Only backend transform classes backed by native provider operations are provider-limited; every other backend-specific C entry point remains planned."
     },
+    "native-cli-tests": {
+      "test": "capability_ledger::native_cli_claims_match_process_and_upstream_runner_tests",
+      "description": "Process tests cover native command parsing, exit statuses, sign/verify and encrypt/decrypt paths; the unmodified upstream DSig, Enc, and Keys runners exercise the same binary and capability registry."
+    },
     "planned-surface": {
       "test": "capability_ledger::planned_surface_is_never_reported_as_supported",
       "description": "Unimplemented backend APIs, CLI, registry, format, URI, and donor-suite entries remain machine-readable planned work."
@@ -111,10 +115,49 @@
       "evidence": "planned-surface"
     },
     {
-      "id": "planned-cli-surface",
-      "kinds": ["cli-command", "cli-option", "cli-exit-status"],
+      "id": "native-cli-commands",
+      "kinds": ["cli-command"],
+      "outcome": "behavior-compatible",
+      "rationale": "The native binary implements the libxmlsec1 command spelling and dispatch contract while capability checks delimit the available algorithm and key-data subsets.",
+      "evidence": "native-cli-tests"
+    },
+    {
+      "id": "planned-cli-verbose",
+      "kinds": ["cli-option"],
+      "name_regex": "^--verbose$",
       "outcome": "planned",
-      "rationale": "A command-compatible xmlsec1 CLI is not yet shipped; commands, typed options, and exit semantics remain explicit roadmap surface.",
+      "rationale": "The native CLI accepts this donor runner argument, but does not yet implement libxmlsec1's flag-controlled detailed error mode.",
+      "evidence": "planned-surface"
+    },
+    {
+      "id": "native-cli-behavior-options",
+      "kinds": ["cli-option"],
+      "name_regex": "^--(?:add-id-attr|binary-data|help|id-attr|ignore-manifests|insecure|lax-key-search|node-id|output|print-debug|print-xml-debug|verify-crls|xml-data)$",
+      "outcome": "behavior-compatible",
+      "rationale": "The native CLI implements this provider-independent option with donor-compatible parsing and command behavior.",
+      "evidence": "native-cli-tests"
+    },
+    {
+      "id": "native-cli-provider-options",
+      "kinds": ["cli-option"],
+      "name_regex": "^--(?:X509-skip-strict-checks|aes-key|crypto|crypto-config|gen-key|pkcs8-der|pkcs8-pem|print-crypto-library-errors|privkey-der|privkey-pem|pubkey-cert-der|pubkey-cert-pem|pubkey-der|pubkey-pem|trusted-der|trusted-pem|untrusted-der|untrusted-pem)$",
+      "outcome": "provider-limited",
+      "rationale": "The native CLI implements this option only for the formats, algorithms, or fixed RustCrypto provider behavior advertised by its capability registry.",
+      "evidence": "native-cli-tests"
+    },
+    {
+      "id": "native-cli-exit-status",
+      "kinds": ["cli-exit-status"],
+      "name_regex": "^(?:success|failure)$",
+      "outcome": "behavior-compatible",
+      "rationale": "Successful operations exit zero and parse, policy, capability, verification, cryptographic, and I/O failures exit non-zero.",
+      "evidence": "native-cli-tests"
+    },
+    {
+      "id": "planned-cli-surface",
+      "kinds": ["cli-option", "cli-exit-status"],
+      "outcome": "planned",
+      "rationale": "This libxmlsec1 option or special status behavior is inventoried but is not yet reproduced by the native CLI.",
       "evidence": "planned-surface"
     },
     {

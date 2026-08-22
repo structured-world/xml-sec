@@ -13,6 +13,12 @@ struct ParsedKeyInfo {
     encrypted_keys: Vec<EncryptedKey>,
 }
 
+#[derive(Clone, Copy)]
+enum EncryptedTypeElement {
+    Data,
+    Key,
+}
+
 /// Parse one `xenc:EncryptedData` document fragment.
 pub fn parse_encrypted_data(xml: &str) -> Result<EncryptedData, XmlEncError> {
     parse_encrypted_data_with_policy(xml, &crate::policy::DecryptionPolicy::default())
@@ -22,7 +28,7 @@ pub(super) fn parse_encrypted_data_with_policy(
     xml: &str,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
-    policy.resources.validate()?;
+    policy.validate()?;
     policy.resources.validate_xml_document_len(xml.len())?;
     let document = Document::parse_with_options(
         xml,
@@ -32,31 +38,113 @@ pub(super) fn parse_encrypted_data_with_policy(
             entity_resolver: None,
         },
     )?;
-    parse_encrypted_data_node_with_policy(document.root_element(), policy)
+    parse_encrypted_data_node(document.root_element(), policy, false)
 }
 
-pub(super) fn parse_encrypted_data_node_with_policy(
+/// Parse a selected `xenc:EncryptedData` node under an immutable policy snapshot.
+///
+/// This is the node-oriented counterpart to [`parse_encrypted_data`]. It lets
+/// callers that already parsed a containing document validate the complete
+/// encrypted-data structure without serializing the selected subtree and losing
+/// namespace declarations inherited from its ancestors. The containing source
+/// document is reparsed because [`Node`] does not expose its parser provenance.
+pub fn parse_encrypted_data_node_with_policy(
     node: Node<'_, '_>,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
+    policy.validate()?;
+    validate_node_document_policy(node, policy)?;
+    parse_encrypted_data_node(node, policy, false)
+}
+
+/// Parse an `xenc:EncryptedData` template under an immutable policy snapshot.
+///
+/// This applies the complete encrypted-data grammar and metadata limits while
+/// permitting empty `CipherValue` placeholders that encryption will replace.
+/// Non-empty placeholders must still be well-formed base64. The containing
+/// source document is reparsed under this policy before template inspection.
+pub fn parse_encrypted_data_template_node_with_policy(
+    node: Node<'_, '_>,
+    policy: &crate::policy::EncryptionPolicy,
+) -> Result<EncryptedData, XmlEncError> {
+    policy.validate()?;
+    validate_node_document_policy(node, policy)?;
+    parse_encrypted_data_node(node, policy, true)
+}
+
+fn validate_node_document_policy(
+    node: Node<'_, '_>,
+    policy: &crate::policy::EncryptionPolicy,
+) -> Result<(), XmlEncError> {
+    let resources = &policy.resources;
+    resources
+        .validate_xml_document_len(node.document().input_text().len())
+        .map_err(XmlEncError::from)?;
+    let actual = node.document().root().descendants().count();
+    if actual > resources.max_xml_nodes {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "XML document nodes",
+            maximum: resources.max_xml_nodes,
+            actual,
+        }
+        .into());
+    }
+    Document::parse_with_options(
+        node.document().input_text(),
+        ParsingOptions {
+            allow_dtd: policy.xml.allow_internal_dtd,
+            nodes_limit: resources.effective_xml_nodes(),
+            entity_resolver: None,
+        },
+    )?;
+    Ok(())
+}
+
+fn parse_encrypted_data_node(
+    node: Node<'_, '_>,
+    policy: &crate::policy::DecryptionPolicy,
+    allow_empty_cipher_values: bool,
+) -> Result<EncryptedData, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedData")?;
+    validate_encrypted_type_attributes(node, EncryptedTypeElement::Data, policy)?;
     let mut children = element_children(node);
     let encryption_method = parse_encryption_method_with_limit(
         next_required(&mut children, "EncryptionMethod")?,
         policy.resources.max_encryption_metadata_bytes,
     )?;
+    if children
+        .peek()
+        .is_some_and(|child| child.has_tag_name((XMLENC_NS, "EncryptionMethod")))
+    {
+        return Err(XmlEncError::InvalidStructure(
+            "EncryptedData contains more than one direct EncryptionMethod".into(),
+        ));
+    }
 
     let key_info = match children.peek() {
-        Some(child) if child.has_tag_name((XMLDSIG_NS, "KeyInfo")) => {
-            parse_key_info(next_required(&mut children, "KeyInfo")?, policy)?
-        }
+        Some(child) if child.has_tag_name((XMLDSIG_NS, "KeyInfo")) => parse_key_info(
+            next_required(&mut children, "KeyInfo")?,
+            policy,
+            allow_empty_cipher_values,
+        )?,
         _ => ParsedKeyInfo {
             key_name: None,
             encrypted_keys: Vec::new(),
         },
     };
+    if children
+        .peek()
+        .is_some_and(|child| child.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+    {
+        return Err(XmlEncError::InvalidStructure(
+            "EncryptedData contains more than one direct KeyInfo".into(),
+        ));
+    }
 
-    let cipher_data = parse_cipher_data(next_required(&mut children, "CipherData")?)?;
+    let cipher_data = parse_cipher_data(
+        next_required(&mut children, "CipherData")?,
+        allow_empty_cipher_values,
+    )?;
     consume_encryption_properties(&mut children);
     if children.next().is_some() {
         return Err(XmlEncError::InvalidStructure(
@@ -66,7 +154,7 @@ pub(super) fn parse_encrypted_data_node_with_policy(
 
     let encrypted = EncryptedData {
         id: bounded_attribute(node, "Id", "EncryptedData Id", policy)?,
-        encrypted_type: parse_type_bounded(node.attribute("Type"), policy)?,
+        encrypted_type: parse_encrypted_data_type(node.attribute("Type")),
         key_name: key_info.key_name,
         encryption_method,
         encrypted_keys: key_info.encrypted_keys,
@@ -79,6 +167,7 @@ pub(super) fn parse_encrypted_data_node_with_policy(
 fn parse_key_info(
     node: Node<'_, '_>,
     policy: &crate::policy::DecryptionPolicy,
+    allow_empty_cipher_values: bool,
 ) -> Result<ParsedKeyInfo, XmlEncError> {
     require_element(node, XMLDSIG_NS, "KeyInfo")?;
     let mut key_name = None;
@@ -101,7 +190,11 @@ fn parse_key_info(
                 }
                 .into());
             }
-            encrypted_keys.push(parse_encrypted_key(child, policy)?);
+            encrypted_keys.push(parse_encrypted_key(
+                child,
+                policy,
+                allow_empty_cipher_values,
+            )?);
         } else if child.has_tag_name((XMLENC_NS, "AgreementMethod")) {
             // Agreement methods require a separate key-derivation trust boundary.
             // Keep the URI as a fallback error while allowing another advertised
@@ -134,13 +227,23 @@ fn parse_key_info(
 fn parse_encrypted_key(
     node: Node<'_, '_>,
     policy: &crate::policy::DecryptionPolicy,
+    allow_empty_cipher_values: bool,
 ) -> Result<EncryptedKey, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedKey")?;
+    validate_encrypted_type_attributes(node, EncryptedTypeElement::Key, policy)?;
     let mut children = element_children(node);
     let encryption_method = parse_encryption_method_with_limit(
         next_required(&mut children, "EncryptionMethod")?,
         policy.resources.max_encryption_metadata_bytes,
     )?;
+    if children
+        .peek()
+        .is_some_and(|child| child.has_tag_name((XMLENC_NS, "EncryptionMethod")))
+    {
+        return Err(XmlEncError::InvalidStructure(
+            "EncryptedKey contains more than one direct EncryptionMethod".into(),
+        ));
+    }
     let key_name = if children
         .peek()
         .is_some_and(|child| child.has_tag_name((XMLDSIG_NS, "KeyInfo")))
@@ -149,7 +252,18 @@ fn parse_encrypted_key(
     } else {
         None
     };
-    let cipher_data = parse_cipher_data(next_required(&mut children, "CipherData")?)?;
+    if children
+        .peek()
+        .is_some_and(|child| child.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+    {
+        return Err(XmlEncError::InvalidStructure(
+            "EncryptedKey contains more than one direct KeyInfo".into(),
+        ));
+    }
+    let cipher_data = parse_cipher_data(
+        next_required(&mut children, "CipherData")?,
+        allow_empty_cipher_values,
+    )?;
     consume_encryption_properties(&mut children);
     let reference_list = if children
         .peek()
@@ -374,7 +488,7 @@ fn parse_key_size(node: Node<'_, '_>, metadata_limit: usize) -> Result<usize, Xm
     Ok(bits)
 }
 
-fn parse_cipher_data(node: Node<'_, '_>) -> Result<CipherData, XmlEncError> {
+fn parse_cipher_data(node: Node<'_, '_>, allow_empty: bool) -> Result<CipherData, XmlEncError> {
     require_element(node, XMLENC_NS, "CipherData")?;
     let mut children = element_children(node);
     let value = next_required(&mut children, "CipherValue")?;
@@ -385,7 +499,7 @@ fn parse_cipher_data(node: Node<'_, '_>) -> Result<CipherData, XmlEncError> {
         ));
     }
     Ok(CipherData {
-        value: normalize_base64(&simple_text(value, "CipherValue")?)?,
+        value: normalize_base64_with_empty(&simple_text(value, "CipherValue")?, allow_empty)?,
     })
 }
 
@@ -525,23 +639,39 @@ fn validate_encryption_method_metadata(
     Ok(())
 }
 
-fn parse_type_bounded(
-    value: Option<&str>,
+fn validate_encrypted_type_attributes(
+    node: Node<'_, '_>,
+    element: EncryptedTypeElement,
     policy: &crate::policy::DecryptionPolicy,
-) -> Result<Option<EncryptedDataType>, XmlEncError> {
-    let Some(value) = value else {
-        return Ok(None);
+) -> Result<(), XmlEncError> {
+    // Both EncryptedData and EncryptedKey derive these attributes from the XML
+    // Encryption EncryptedType schema. Template mutation preserves attributes
+    // that are not represented in the cryptographic model, so bound them here.
+    let (type_field, mime_type_field, encoding_field) = match element {
+        EncryptedTypeElement::Data => (
+            "EncryptedData Type",
+            "EncryptedData MimeType",
+            "EncryptedData Encoding",
+        ),
+        EncryptedTypeElement::Key => (
+            "EncryptedKey Type",
+            "EncryptedKey MimeType",
+            "EncryptedKey Encoding",
+        ),
     };
-    validate_metadata_len(
-        "EncryptedData Type",
-        value.len(),
-        policy.resources.max_encryption_metadata_bytes,
-    )?;
-    Ok(Some(match value {
+
+    bounded_attribute(node, "Type", type_field, policy)?;
+    bounded_attribute(node, "MimeType", mime_type_field, policy)?;
+    bounded_attribute(node, "Encoding", encoding_field, policy)?;
+    Ok(())
+}
+
+fn parse_encrypted_data_type(value: Option<&str>) -> Option<EncryptedDataType> {
+    value.map(|value| match value {
         "http://www.w3.org/2001/04/xmlenc#Element" => EncryptedDataType::Element,
         "http://www.w3.org/2001/04/xmlenc#Content" => EncryptedDataType::Content,
         other => EncryptedDataType::Other(other.to_owned()),
-    }))
+    })
 }
 
 fn decode_bounded_base64_text(node: Node<'_, '_>, maximum: usize) -> Result<Vec<u8>, XmlEncError> {
@@ -581,11 +711,6 @@ fn decode_bounded_base64_text(node: Node<'_, '_>, maximum: usize) -> Result<Vec<
     Ok(decoded)
 }
 
-/// Normalize XML base64 whitespace while applying a pre-allocation bound.
-pub(super) fn normalize_base64(value: &str) -> Result<String, XmlEncError> {
-    normalize_base64_with_empty(value, false)
-}
-
 fn normalize_base64_with_empty(value: &str, allow_empty: bool) -> Result<String, XmlEncError> {
     let mut normalized = String::with_capacity(value.len().min(MAX_CIPHER_VALUE_BASE64_LEN));
     for character in value.chars() {
@@ -606,7 +731,17 @@ fn normalize_base64_with_empty(value: &str, allow_empty: bool) -> Result<String,
     if normalized.is_empty() && !allow_empty {
         return Err(XmlEncError::Base64("CipherValue is empty".into()));
     }
+    if !normalized.is_empty() {
+        STANDARD
+            .decode(&normalized)
+            .map_err(|error| XmlEncError::Base64(error.to_string()))?;
+    }
     Ok(normalized)
+}
+
+#[cfg(test)]
+fn normalize_base64(value: &str) -> Result<String, XmlEncError> {
+    normalize_base64_with_empty(value, false)
 }
 
 fn require_element(node: Node<'_, '_>, namespace: &str, name: &str) -> Result<(), XmlEncError> {
@@ -649,6 +784,166 @@ mod tests {
         let parsed = parse_encrypted_data(DATA).expect("valid XMLEnc data must parse");
         assert_eq!(parsed.cipher_data.value, "YWJjZA==");
         assert_eq!(parsed.encrypted_type, Some(EncryptedDataType::Element));
+    }
+
+    #[test]
+    fn node_parsers_enforce_the_containing_document_byte_limit() {
+        // A caller-selected node retains its complete source document. Passing a
+        // small subtree must not bypass the operation's document-byte ceiling.
+        let containing = format!("<root>{}<payload/></root>", DATA);
+        let document = Document::parse(&containing).expect("containing document must parse");
+        let encrypted_data = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLENC_NS, "EncryptedData")))
+            .expect("selected EncryptedData");
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_document_bytes: DATA.len(),
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let decryption = crate::policy::DecryptionPolicy {
+            resources: resources.clone(),
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        let encryption = crate::policy::EncryptionPolicy {
+            resources,
+            ..crate::policy::EncryptionPolicy::default()
+        };
+
+        for result in [
+            parse_encrypted_data_node_with_policy(encrypted_data, &decryption),
+            parse_encrypted_data_template_node_with_policy(encrypted_data, &encryption),
+        ] {
+            assert!(matches!(
+                result,
+                Err(XmlEncError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "XML document",
+                        ..
+                    }
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn node_parsers_enforce_the_containing_document_node_limit() {
+        // A selected EncryptedData subtree must not hide sibling nodes from the
+        // immutable resource policy supplied for the containing document.
+        let containing = format!("<root>{}<payload/></root>", DATA);
+        let document = Document::parse(&containing).expect("containing document must parse");
+        let encrypted_data = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLENC_NS, "EncryptedData")))
+            .expect("selected EncryptedData");
+        let actual_nodes = document.root().descendants().count();
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_nodes: actual_nodes - 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let decryption = crate::policy::DecryptionPolicy {
+            resources: resources.clone(),
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        let encryption = crate::policy::EncryptionPolicy {
+            resources,
+            ..crate::policy::EncryptionPolicy::default()
+        };
+
+        for result in [
+            parse_encrypted_data_node_with_policy(encrypted_data, &decryption),
+            parse_encrypted_data_template_node_with_policy(encrypted_data, &encryption),
+        ] {
+            assert!(matches!(
+                result,
+                Err(XmlEncError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "XML document nodes",
+                        maximum,
+                        actual,
+                    }
+                )) if maximum == actual_nodes - 1 && actual == actual_nodes
+            ));
+        }
+
+        let exact_resources = crate::policy::ResourcePolicy {
+            max_xml_nodes: actual_nodes,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let exact_policy = crate::policy::DecryptionPolicy {
+            resources: exact_resources,
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        parse_encrypted_data_node_with_policy(encrypted_data, &exact_policy)
+            .expect("a document exactly at the node ceiling must parse");
+    }
+
+    #[test]
+    fn node_parsers_revalidate_the_containing_documents_dtd_policy() {
+        // Node parse provenance is not available through roxmltree. Both public
+        // entry points must therefore validate the source document themselves.
+        let containing = format!(
+            r#"<!DOCTYPE root [<!ENTITY marker "allowed">]><root>{DATA}<payload>&marker;</payload></root>"#
+        );
+        let document = Document::parse_with_options(
+            &containing,
+            ParsingOptions {
+                allow_dtd: true,
+                ..ParsingOptions::default()
+            },
+        )
+        .expect("the caller can parse a document under a more permissive policy");
+        let encrypted_data = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLENC_NS, "EncryptedData")))
+            .expect("selected EncryptedData");
+
+        for result in [
+            parse_encrypted_data_node_with_policy(
+                encrypted_data,
+                &crate::policy::DecryptionPolicy::default(),
+            ),
+            parse_encrypted_data_template_node_with_policy(
+                encrypted_data,
+                &crate::policy::EncryptionPolicy::default(),
+            ),
+        ] {
+            assert!(matches!(result, Err(XmlEncError::XmlParse(_))));
+        }
+
+        let mut allowed = crate::policy::EncryptionPolicy::default();
+        allowed.xml.allow_internal_dtd = true;
+        parse_encrypted_data_node_with_policy(encrypted_data, &allowed)
+            .expect("explicitly permitted internal DTD must remain accepted");
+        parse_encrypted_data_template_node_with_policy(encrypted_data, &allowed)
+            .expect("template parsing must share the same explicit DTD policy");
+    }
+
+    #[test]
+    fn template_parser_rejects_nonempty_invalid_cipher_values() {
+        // Empty placeholders are intentional template slots, but every nonempty
+        // direct or recipient value must already satisfy the base64Binary syntax.
+        let invalid_direct = DATA.replace(" YWJj\nZA== ", "!!!!");
+        let invalid_recipient = format!(
+            "<xenc:EncryptedData xmlns:xenc=\"{XMLENC_NS}\" xmlns:ds=\"{XMLDSIG_NS}\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo><xenc:EncryptedKey><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p\"/><xenc:CipherData><xenc:CipherValue>!!!!</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue/></xenc:CipherData></xenc:EncryptedData>"
+        );
+        for xml in [&invalid_direct, &invalid_recipient] {
+            let document = Document::parse(xml).expect("template must be well-formed XML");
+            assert!(matches!(
+                parse_encrypted_data_template_node_with_policy(
+                    document.root_element(),
+                    &crate::policy::EncryptionPolicy::default(),
+                ),
+                Err(XmlEncError::Base64(_))
+            ));
+        }
+
+        let empty = DATA.replace(" YWJj\nZA== ", "");
+        let document = Document::parse(&empty).expect("empty template must be XML");
+        parse_encrypted_data_template_node_with_policy(
+            document.root_element(),
+            &crate::policy::EncryptionPolicy::default(),
+        )
+        .expect("an explicit empty template placeholder remains valid");
     }
 
     #[test]
@@ -1013,6 +1308,14 @@ mod tests {
         for xml in [
             DATA.replace("<xenc:EncryptedData ", &format!("<xenc:EncryptedData Id=\"{oversized}\" ")),
             DATA.replace(
+                "<xenc:EncryptedData ",
+                &format!("<xenc:EncryptedData MimeType=\"{oversized}\" "),
+            ),
+            DATA.replace(
+                "<xenc:EncryptedData ",
+                &format!("<xenc:EncryptedData Encoding=\"{oversized}\" "),
+            ),
+            DATA.replace(
                 "<xenc:CipherData>",
                 &format!("<ds:KeyInfo xmlns:ds=\"{XMLDSIG_NS}\"><ds:KeyName>{oversized}</ds:KeyName></ds:KeyInfo><xenc:CipherData>"),
             ),
@@ -1024,6 +1327,57 @@ mod tests {
                     actual: 65,
                     ..
                 })
+            ));
+        }
+    }
+
+    #[test]
+    fn policy_bounds_common_encrypted_type_metadata_on_nested_keys() {
+        // EncryptedKey inherits Type, MimeType, and Encoding from EncryptedType.
+        // Even though the key model does not retain them, both parse entry points
+        // must reject oversized values before a template can preserve them.
+        let resources = crate::policy::ResourcePolicy {
+            max_encryption_metadata_bytes: 64,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let decryption = crate::policy::DecryptionPolicy {
+            resources: resources.clone(),
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        let encryption = crate::policy::EncryptionPolicy {
+            resources,
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let oversized = "x".repeat(65);
+
+        for (attribute, field) in [
+            ("Type", "EncryptedKey Type"),
+            ("MimeType", "EncryptedKey MimeType"),
+            ("Encoding", "EncryptedKey Encoding"),
+        ] {
+            let xml = format!(
+                r#"<xenc:EncryptedData xmlns:xenc="{XMLENC_NS}" xmlns:ds="{XMLDSIG_NS}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><xenc:EncryptedKey {attribute}="{oversized}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes128"/><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData>"#
+            );
+            assert!(matches!(
+                parse_encrypted_data_with_policy(&xml, &decryption),
+                Err(XmlEncError::EncryptionMetadataTooLarge {
+                    field: actual_field,
+                    maximum: 64,
+                    actual: 65,
+                }) if actual_field == field
+            ));
+
+            let document = Document::parse(&xml).expect("test template must be XML");
+            assert!(matches!(
+                parse_encrypted_data_template_node_with_policy(
+                    document.root_element(),
+                    &encryption,
+                ),
+                Err(XmlEncError::EncryptionMetadataTooLarge {
+                    field: actual_field,
+                    maximum: 64,
+                    actual: 65,
+                }) if actual_field == field
             ));
         }
     }

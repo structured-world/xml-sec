@@ -28,6 +28,18 @@ cargo run --example verify --all-features -- signed.xml
 ```
 
 The signing and verification contexts share the same reference-transform implementation.
+`SigningPolicy::manifest_processing` controls direct `<Object>/<Manifest>`
+reference generation. Processing fills Manifest digests before SignedInfo so a
+SignedInfo reference to the Manifest authenticates the final values; Manifest
+and SignedInfo references share transform work and the aggregate reference
+ceiling. Nested Manifest dependencies are filled from leaves to dependants so
+every digest observes finalized content; cycles are rejected before mutation.
+Dependency analysis uses the effective XPath/XPath Filter 2.0 node-set, so a
+self-reference that excludes its mutable `DigestValue` is not misclassified as
+a cycle.
+The default core policy leaves application-defined Manifest values
+untouched, while the `xmlsec1` compatibility CLI enables processing unless
+`--ignore-manifests` is present.
 [`XPathHereSemantics::Specification`] follows the XMLDSig `<XPath>` contract; callers
 interoperating with legacy libxmlsec1 `here()` behavior can explicitly select
 [`XPathHereSemantics::XmlSecLegacy`] on both contexts.
@@ -40,7 +52,22 @@ occurs during rendering rather than after an oversized buffer has already been a
 The same immutable policy controls every signing parse and mutation reparse, including source
 validation in `sign_with_builder`, digest filling, `SignedInfo` parsing, signature filling, and
 optional `KeyInfo` filling. An internal-DTD opt-in and XML node ceiling therefore cannot be lost
-between stages.
+between stages. Custom `KeyInfoWriter` output is treated as a separate untrusted XML input: its
+byte ceiling is enforced before namespace wrapping or parsing, and the populated document is
+checked again after mutation.
+`IdAttributeRegistration` supplies immutable request context for non-standard ID attributes.
+`SignContext::id_attributes` and `VerifyContext::id_attributes` apply the same global or
+element-scoped registrations to operation start-node selection and every same-document Reference.
+`scoped_any_namespace` matches one element local name across namespaces, while `scoped` matches
+one exact expanded name and uses `None` for no namespace. The registration is not stored in policy
+and never comes from document content.
+`SignContext::sign_template` selects the last descendant `Signature` template by default, preserving
+append-then-sign workflows when a document already contains signatures. Process compatibility
+boundaries that use donor document-order lookup can explicitly select
+`SignatureTemplateSelection::FirstDescendant`; `start_node_id` scopes that selection to one subtree.
+`VerifyContext` instead requires one unique document-level `Signature` by default and rejects
+documents containing multiple candidates. Callers that intentionally consume multi-signature
+documents must choose `first_document_signature()` or scope lookup with `start_node_id()`.
 `SigningPolicy::rsa_keys` validates normalized modulus width and public exponent before provider
 dispatch. The default accepts 2048-8192-bit RSA keys for new signatures; compatibility callers can
 raise or lower the minimum explicitly, while the 8192-bit implementation ceiling cannot be relaxed.
@@ -127,6 +154,9 @@ that the input contained no Manifest. `VerifyContext::process_manifests(false)` 
 because Manifests were not processed; core validation failures and unsigned, unreferenced, or
 structurally excluded Manifest blocks can also produce an empty list. Callers must distinguish the
 disabled state from an enabled pass with no authenticated Manifest references.
+Successful Manifest references whose transforms preserve the referenced XML structure extend the
+authenticated set recursively. A sibling Manifest reached through such a reference is processed
+once; failed digests and node-set transforms that discard structure never extend that trust frontier.
 Manifest references obey the same per-reference transform-count ceiling and transform allowlist as
 `<SignedInfo>` references; a violation is recorded in that Manifest reference's independent status.
 They also share `ResourcePolicy::max_references` with `<SignedInfo>`: every parsed Manifest

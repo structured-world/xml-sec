@@ -1,6 +1,9 @@
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "../tools/xmlsec1/src/args.rs"]
+mod cli_args;
+
 const LEDGER_JSON: &str = include_str!("../compatibility/libxmlsec1-1.3.13.json");
 const DONOR_COMMIT: &str = include_str!("../compatibility/libxmlsec1-1.3.13-donor-commit.txt");
 
@@ -38,6 +41,7 @@ struct Item {
     source: String,
     line: usize,
     detail: String,
+    exit_code: Option<i32>,
     classification: String,
 }
 
@@ -161,7 +165,7 @@ fn complete_surface_categories_are_stable() {
         "https://github.com/lsh123/xmlsec"
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
-    assert_eq!(ledger.classifications.len(), 13);
+    assert_eq!(ledger.classifications.len(), 18);
     assert_eq!(ledger.availability.len(), 427);
 
     let counts = ledger
@@ -338,10 +342,11 @@ fn native_algorithm_claims_match_the_rust_api() {
         .items
         .iter()
         .filter(|item| {
-            matches!(
-                classification(&ledger, item).outcome.as_str(),
-                "behavior-compatible" | "compatibility-profile-only"
-            )
+            item.kind == "algorithm-uri"
+                && matches!(
+                    classification(&ledger, item).outcome.as_str(),
+                    "behavior-compatible" | "compatibility-profile-only"
+                )
         })
         .collect();
     assert_eq!(claims.len(), 41);
@@ -760,11 +765,149 @@ fn planned_surface_is_never_reported_as_supported() {
         .filter(|item| classification(&ledger, item).outcome == "planned")
         .collect();
     assert!(!planned.is_empty());
-    assert!(planned.iter().any(|item| item.kind == "cli-command"));
     assert!(planned.iter().any(|item| item.kind == "cli-option"));
     assert!(planned.iter().any(|item| item.kind == "algorithm-uri"));
     assert!(planned.iter().any(|item| item.kind == "test-family"));
     assert!(planned.iter().any(|item| item.kind == "registry"));
+}
+
+#[test]
+fn native_cli_claims_match_process_and_upstream_runner_tests() {
+    // Commands are complete dispatch entries; individual options remain explicit
+    // when their format or policy mapping has not been implemented yet.
+    let ledger = ledger();
+    let runtime_commands: BTreeSet<_> = cli_args::Command::ALL
+        .iter()
+        .map(|command| command.canonical_name())
+        .collect();
+    let ledger_commands: BTreeSet<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "cli-command" && !item.name.starts_with("--"))
+        .map(|item| item.name.as_str())
+        .collect();
+    assert_eq!(runtime_commands, ledger_commands);
+
+    for item in ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "cli-command" && !item.name.starts_with("--"))
+    {
+        assert!(
+            runtime_commands.contains(item.name.as_str()),
+            "missing runtime command {}",
+            item.name
+        );
+        assert_eq!(classification(&ledger, item).outcome, "behavior-compatible");
+    }
+    let behavior_compatible = BTreeSet::from([
+        "add-id-attr",
+        "binary-data",
+        "help",
+        "id-attr",
+        "ignore-manifests",
+        "insecure",
+        "lax-key-search",
+        "node-id",
+        "output",
+        "print-debug",
+        "print-xml-debug",
+        "verify-crls",
+        "xml-data",
+    ]);
+    let provider_limited = BTreeSet::from([
+        "X509-skip-strict-checks",
+        "aes-key",
+        "crypto",
+        "crypto-config",
+        "gen-key",
+        "pkcs8-der",
+        "pkcs8-pem",
+        "print-crypto-library-errors",
+        "privkey-der",
+        "privkey-pem",
+        "pubkey-cert-der",
+        "pubkey-cert-pem",
+        "pubkey-der",
+        "pubkey-pem",
+        "trusted-der",
+        "trusted-pem",
+        "untrusted-der",
+        "untrusted-pem",
+    ]);
+    let verbose = ledger
+        .items
+        .iter()
+        .find(|item| item.kind == "cli-option" && item.name == "--verbose")
+        .expect("donor ledger must inventory --verbose");
+    assert_eq!(classification(&ledger, verbose).outcome, "planned");
+    let runtime_options: BTreeSet<_> = cli_args::OPTION_SPECS
+        .iter()
+        .map(|spec| spec.canonical)
+        .collect();
+    let runtime_supported_options: BTreeSet<_> = runtime_options
+        .iter()
+        .copied()
+        .filter(|option| behavior_compatible.contains(option) || provider_limited.contains(option))
+        .collect();
+    let ledger_supported_options: BTreeSet<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "cli-option")
+        .filter(|item| {
+            matches!(
+                classification(&ledger, item).outcome.as_str(),
+                "behavior-compatible" | "provider-limited"
+            )
+        })
+        .map(|item| item.name.trim_start_matches("--"))
+        .collect();
+    assert_eq!(runtime_supported_options, ledger_supported_options);
+
+    for spec in cli_args::OPTION_SPECS {
+        let option = format!("--{}", spec.canonical);
+        let item = ledger
+            .items
+            .iter()
+            .find(|item| item.kind == "cli-option" && item.name == option)
+            .unwrap_or_else(|| panic!("missing CLI option {option}"));
+        let expected = if behavior_compatible.contains(spec.canonical) {
+            "behavior-compatible"
+        } else if provider_limited.contains(spec.canonical) {
+            "provider-limited"
+        } else {
+            "planned"
+        };
+        assert_eq!(
+            classification(&ledger, item).outcome,
+            expected,
+            "CLI option {option} has the wrong compatibility classification"
+        );
+    }
+    let ledger_statuses: BTreeSet<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "cli-exit-status")
+        .map(|item| item.name.as_str())
+        .collect();
+    assert_eq!(
+        ledger_statuses,
+        BTreeSet::from(["failure", "success", "unknown-command"])
+    );
+
+    for (status, outcome, code) in [
+        ("success", "behavior-compatible", 0),
+        ("failure", "behavior-compatible", 1),
+        ("unknown-command", "planned", 0),
+    ] {
+        let item = ledger
+            .items
+            .iter()
+            .find(|item| item.kind == "cli-exit-status" && item.name == status)
+            .unwrap_or_else(|| panic!("missing CLI status {status}"));
+        assert_eq!(classification(&ledger, item).outcome, outcome);
+        assert_eq!(item.exit_code, Some(code), "wrong exit code for {status}");
+    }
 }
 
 #[test]

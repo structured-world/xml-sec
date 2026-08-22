@@ -83,16 +83,39 @@ source_dir="$work_dir/xmlsec"
 build_dir="$work_dir/build"
 stage_dir="$work_dir/stage"
 
-git init "$source_dir"
-git -C "$source_dir" remote add origin "$XMLSEC1_REPOSITORY"
-git -C "$source_dir" fetch --depth=1 origin "$XMLSEC1_COMMIT"
-fetched_commit="$(git -C "$source_dir" rev-parse FETCH_HEAD)"
-if [[ "$fetched_commit" != "$XMLSEC1_COMMIT" ]]; then
-  printf 'xmlsec1 source revision mismatch: expected %s, got %s\n' \
-    "$XMLSEC1_COMMIT" "$fetched_commit" >&2
-  exit 1
+if [[ -n "${XMLSEC1_SOURCE_DIR:-}" ]]; then
+  local_source_dir="$XMLSEC1_SOURCE_DIR"
+  if [[ "$local_source_dir" != /* || ! -d "$local_source_dir" ]]; then
+    printf 'XMLSEC1_SOURCE_DIR must be an absolute git checkout: %s\n' "$local_source_dir" >&2
+    exit 1
+  fi
+  if [[ "$(git -C "$local_source_dir" rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]]; then
+    printf 'XMLSEC1_SOURCE_DIR must be an absolute git checkout: %s\n' "$local_source_dir" >&2
+    exit 1
+  fi
+  source_commit="$(git -C "$local_source_dir" rev-parse HEAD)"
+  if [[ "$source_commit" != "$XMLSEC1_COMMIT" ]]; then
+    printf 'xmlsec1 source revision mismatch: expected %s, got %s\n' \
+      "$XMLSEC1_COMMIT" "$source_commit" >&2
+    exit 1
+  fi
+  mkdir -p "$source_dir"
+  # Configure/autoreconf writes generated files into the source tree. Export
+  # the verified commit so a CI checkout remains immutable and reusable by
+  # ledger and fixture checks.
+  git -C "$local_source_dir" archive "$XMLSEC1_COMMIT" | tar -x -C "$source_dir"
+else
+  git init "$source_dir"
+  git -C "$source_dir" remote add origin "$XMLSEC1_REPOSITORY"
+  git -C "$source_dir" fetch --depth=1 origin "$XMLSEC1_COMMIT"
+  fetched_commit="$(git -C "$source_dir" rev-parse FETCH_HEAD)"
+  if [[ "$fetched_commit" != "$XMLSEC1_COMMIT" ]]; then
+    printf 'xmlsec1 source revision mismatch: expected %s, got %s\n' \
+      "$XMLSEC1_COMMIT" "$fetched_commit" >&2
+    exit 1
+  fi
+  git -C "$source_dir" checkout --detach "$XMLSEC1_COMMIT"
 fi
-git -C "$source_dir" checkout --detach "$XMLSEC1_COMMIT"
 
 mkdir -p "$build_dir" "$stage_dir"
 OBJ_DIR="$build_dir" "$source_dir/autogen.sh" \

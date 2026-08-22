@@ -220,6 +220,18 @@ impl Default for UriTypeSet {
     }
 }
 
+/// Request-scoped selection of the XMLDSig operation node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SignatureSelection<'a> {
+    /// Require exactly one `Signature` in the complete document.
+    #[default]
+    UniqueDocumentSignature,
+    /// Select the first descendant `Signature` from the document root.
+    FirstDocumentSignature,
+    /// Select the first descendant `Signature` below the element with this ID.
+    FirstSignatureUnderId(&'a str),
+}
+
 /// Verification builder/configuration.
 #[must_use = "configure the context and call verify(), or store it for reuse"]
 pub struct VerifyContext<'a> {
@@ -229,6 +241,8 @@ pub struct VerifyContext<'a> {
     provider: &'a dyn crate::provider::CryptoProvider,
     store_pre_digest: bool,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
+    signature_selection: SignatureSelection<'a>,
+    id_attributes: &'a [crate::IdAttributeRegistration],
 }
 
 impl<'a> VerifyContext<'a> {
@@ -248,6 +262,8 @@ impl<'a> VerifyContext<'a> {
             provider: crate::provider::default_provider(),
             store_pre_digest: false,
             external_resources: None,
+            signature_selection: SignatureSelection::UniqueDocumentSignature,
+            id_attributes: &[],
         }
     }
 
@@ -311,7 +327,11 @@ impl<'a> VerifyContext<'a> {
     /// Structural/parse errors in Manifest content abort `verify()` and are
     /// returned as `Err(...)`.
     pub fn process_manifests(mut self, enabled: bool) -> Self {
-        self.policy.process_manifests = enabled;
+        self.policy.manifest_processing = if enabled {
+            crate::policy::ManifestProcessing::Process
+        } else {
+            crate::policy::ManifestProcessing::Ignore
+        };
         self
     }
 
@@ -341,6 +361,31 @@ impl<'a> VerifyContext<'a> {
     /// query or fragment suffixes.
     pub fn external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
         self.external_resources = Some(resources);
+        self
+    }
+
+    /// Select the operation start node by its XML ID value.
+    ///
+    /// Verification selects the first descendant `<Signature>` in document
+    /// order. This is request context, not a policy decision, and mirrors
+    /// libxmlsec1's depth-first `xmlSecFindNode` start-node contract.
+    pub fn start_node_id(mut self, id: &'a str) -> Self {
+        self.signature_selection = SignatureSelection::FirstSignatureUnderId(id);
+        self
+    }
+
+    /// Select the first descendant `<Signature>` from the document root.
+    ///
+    /// This is the libxmlsec1 command-line operation-root contract. The library
+    /// default remains fail-closed and requires a unique document signature.
+    pub fn first_document_signature(mut self) -> Self {
+        self.signature_selection = SignatureSelection::FirstDocumentSignature;
+        self
+    }
+
+    /// Add caller-declared ID attributes for start-node and Reference lookup.
+    pub fn id_attributes(mut self, registrations: &'a [crate::IdAttributeRegistration]) -> Self {
+        self.id_attributes = registrations;
         self
     }
 
@@ -878,6 +923,13 @@ pub enum DsigError {
         reason: &'static str,
     },
 
+    /// The requested operation start node is absent or has a duplicate ID.
+    #[error("selected node ID is missing or ambiguous: {id}")]
+    SelectedNodeUnavailable {
+        /// Caller-provided XML ID value.
+        id: String,
+    },
+
     /// `<SignedInfo>` parsing failed.
     #[error("failed to parse SignedInfo: {0}")]
     ParseSignedInfo(#[from] super::parse::ParseError),
@@ -995,20 +1047,50 @@ fn verify_signature_with_context(
             entity_resolver: None,
         },
     )?;
+    let resolver = UriReferenceResolver::with_id_registrations(&doc, ctx.id_attributes)
+        .with_external_resource_limits(
+            ctx.policy.resources.max_external_resource_bytes,
+            ctx.policy.resources.max_external_resource_total_bytes,
+        );
+    let resolver = match ctx.external_resources {
+        Some(resources) => resolver.with_external_resources(resources),
+        None => resolver,
+    };
     let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
-    let mut signatures = doc.descendants().filter(|node| {
+    let start_node = match ctx.signature_selection {
+        SignatureSelection::FirstSignatureUnderId(id) => {
+            resolver.node_for_id(id).ok_or_else(|| {
+                SignatureVerificationPipelineError::SelectedNodeUnavailable { id: id.to_owned() }
+            })?
+        }
+        SignatureSelection::UniqueDocumentSignature
+        | SignatureSelection::FirstDocumentSignature => doc.root(),
+    };
+    let mut signatures = start_node.descendants().filter(|node| {
         node.is_element()
             && node.tag_name().name() == "Signature"
             && node.tag_name().namespace() == Some(XMLDSIG_NS)
     });
-    let signature_node = match (signatures.next(), signatures.next()) {
+    let signature_node = match (signatures.next(), ctx.signature_selection) {
         (None, _) => {
             return Err(SignatureVerificationPipelineError::MissingElement {
                 element: "Signature",
             });
         }
-        (Some(node), None) => node,
-        (Some(_), Some(_)) => {
+        // libxmlsec1 treats --node-id as an operation start node and performs
+        // a depth-first xmlSecFindNode lookup from there. Without a selector,
+        // the library API retains its fail-closed document-wide cardinality.
+        (
+            Some(node),
+            SignatureSelection::FirstDocumentSignature
+            | SignatureSelection::FirstSignatureUnderId(_),
+        ) => node,
+        (Some(node), SignatureSelection::UniqueDocumentSignature)
+            if signatures.next().is_none() =>
+        {
+            node
+        }
+        (Some(_), SignatureSelection::UniqueDocumentSignature) => {
             return Err(SignatureVerificationPipelineError::InvalidStructure {
                 reason: "Signature must appear exactly once in document",
             });
@@ -1108,14 +1190,6 @@ fn verify_signature_with_context(
             .into());
         }
     }
-    let resolver = UriReferenceResolver::new(&doc).with_external_resource_limits(
-        ctx.policy.resources.max_external_resource_bytes,
-        ctx.policy.resources.max_external_resource_total_bytes,
-    );
-    let resolver = match ctx.external_resources {
-        Some(resources) => resolver.with_external_resources(resources),
-        None => resolver,
-    };
     let retrieval_materialization = if let Some(info) = key_info.as_mut() {
         materialize_retrieval_methods(
             info,
@@ -1245,7 +1319,9 @@ fn verify_signature_with_context(
         });
     }
 
-    let manifest_references = if ctx.policy.process_manifests {
+    let manifest_references = if ctx.policy.manifest_processing
+        == crate::policy::ManifestProcessing::Process
+    {
         let signed_info_reference_nodes =
             collect_authenticated_signed_info_reference_nodes(&signed_info.references, &resolver);
         let remaining_reference_capacity = ctx
@@ -1515,102 +1591,98 @@ fn process_manifest_references(
     execution: &ReferenceExecutionContext<'_>,
     xpath_parse_budget: &mut XPathSignatureParseBudget,
 ) -> Result<Vec<ReferenceResult>, SignatureVerificationPipelineError> {
-    let parsed = parse_manifest_references(
-        signature_node,
-        signed_info_reference_nodes,
-        remaining_reference_capacity,
-        xpath_parse_budget,
-    )?;
-    let manifest_references = parsed.references;
-    let mut results = parsed.invalid_results;
-    if manifest_references.is_empty() && results.is_empty() {
-        return Ok(Vec::new());
-    }
-    results.reserve(manifest_references.len());
-    for (index, reference, reference_node_id) in &manifest_references {
-        if execution.transform_budget.remaining_c14n_output() == 0 {
-            results.push(manifest_reference_invalid_result(
-                reference,
-                *index,
-                FailureReason::ReferenceProcessingFailure { ref_index: *index },
-            ));
-            continue;
+    let mut authenticated_nodes = signed_info_reference_nodes.clone();
+    let mut processed_manifests = HashSet::new();
+    let mut remaining_reference_capacity = remaining_reference_capacity;
+    let mut next_reference_index = 0usize;
+    let mut results = Vec::new();
+    loop {
+        let parsed = parse_manifest_references(
+            signature_node,
+            &authenticated_nodes,
+            &mut processed_manifests,
+            &mut remaining_reference_capacity,
+            &mut next_reference_index,
+            xpath_parse_budget,
+        )?;
+        let manifest_references = parsed.references;
+        results.extend(parsed.invalid_results);
+        if manifest_references.is_empty() {
+            break;
         }
-        if reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference {
-            results.push(manifest_reference_invalid_result(
-                reference,
-                *index,
-                FailureReason::ReferencePolicyViolation { ref_index: *index },
-            ));
-            continue;
-        }
-        if ctx
-            .policy
-            .digest_algorithms
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
-        {
-            results.push(manifest_reference_invalid_result(
-                reference,
-                *index,
-                FailureReason::ReferencePolicyViolation { ref_index: *index },
-            ));
-            continue;
-        }
-        match enforce_reference_policies(
-            std::slice::from_ref(reference),
-            ctx.policy.reference_uri_types,
-            ctx.allowed_transform_uris(),
-        ) {
-            Ok(()) => {}
-            Err(
-                SignatureVerificationPipelineError::DisallowedUri { .. }
-                | SignatureVerificationPipelineError::DisallowedTransform { .. },
-            ) => {
-                results.push(manifest_reference_invalid_result(
+        results.reserve(manifest_references.len());
+        for (index, reference, reference_node_id) in &manifest_references {
+            let result = if execution.transform_budget.remaining_c14n_output() == 0 {
+                manifest_reference_invalid_result(
+                    reference,
+                    *index,
+                    FailureReason::ReferenceProcessingFailure { ref_index: *index },
+                )
+            } else if reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference
+                || ctx
+                    .policy
+                    .digest_algorithms
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
+            {
+                manifest_reference_invalid_result(
                     reference,
                     *index,
                     FailureReason::ReferencePolicyViolation { ref_index: *index },
-                ));
-                continue;
+                )
+            } else {
+                match enforce_reference_policies(
+                    std::slice::from_ref(reference),
+                    ctx.policy.reference_uri_types,
+                    ctx.allowed_transform_uris(),
+                ) {
+                    Ok(()) => process_reference_with_options(
+                        reference,
+                        resolver,
+                        signature_node,
+                        ReferenceSet::Manifest,
+                        *index,
+                        resolver.node_for_node_id(*reference_node_id),
+                        execution,
+                    )
+                    .unwrap_or_else(|_| {
+                        manifest_reference_invalid_result(
+                            reference,
+                            *index,
+                            FailureReason::ReferenceProcessingFailure { ref_index: *index },
+                        )
+                    }),
+                    Err(
+                        SignatureVerificationPipelineError::DisallowedUri { .. }
+                        | SignatureVerificationPipelineError::DisallowedTransform { .. },
+                    ) => manifest_reference_invalid_result(
+                        reference,
+                        *index,
+                        FailureReason::ReferencePolicyViolation { ref_index: *index },
+                    ),
+                    Err(_) => manifest_reference_invalid_result(
+                        reference,
+                        *index,
+                        FailureReason::ReferenceProcessingFailure { ref_index: *index },
+                    ),
+                }
+            };
+            if result.status == DsigStatus::Valid
+                && reference
+                    .transforms
+                    .iter()
+                    .all(transform_preserves_manifest_structure)
+                && let Some(target_id) = reference
+                    .uri
+                    .as_deref()
+                    .and_then(same_document_reference_id)
+                    .and_then(|id| resolver.node_id_for_id(id))
+            {
+                // A valid Manifest digest extends trust only to the exact
+                // same-document structure preserved by its transform chain.
+                authenticated_nodes.insert(target_id);
             }
-            Err(SignatureVerificationPipelineError::Reference(
-                ReferenceProcessingError::MissingUri,
-            )) => {
-                results.push(manifest_reference_invalid_result(
-                    reference,
-                    *index,
-                    FailureReason::ReferenceProcessingFailure { ref_index: *index },
-                ));
-                continue;
-            }
-            Err(_) => {
-                // Defensive fallback for future enforce_reference_policies variants:
-                // record as non-fatal per-reference processing failure instead of aborting.
-                results.push(manifest_reference_invalid_result(
-                    reference,
-                    *index,
-                    FailureReason::ReferenceProcessingFailure { ref_index: *index },
-                ));
-                continue;
-            }
-        }
-
-        match process_reference_with_options(
-            reference,
-            resolver,
-            signature_node,
-            ReferenceSet::Manifest,
-            *index,
-            resolver.node_for_node_id(*reference_node_id),
-            execution,
-        ) {
-            Ok(result) => results.push(result),
-            Err(_) => results.push(manifest_reference_invalid_result(
-                reference,
-                *index,
-                FailureReason::ReferenceProcessingFailure { ref_index: *index },
-            )),
+            results.push(result);
         }
     }
     results.sort_by_key(|result| result.reference_index);
@@ -1637,26 +1709,32 @@ fn manifest_reference_invalid_result(
 
 fn parse_manifest_references(
     signature_node: Node<'_, '_>,
-    signed_info_reference_nodes: &HashSet<NodeId>,
-    remaining_reference_capacity: usize,
+    authenticated_nodes: &HashSet<NodeId>,
+    processed_manifests: &mut HashSet<NodeId>,
+    remaining_reference_capacity: &mut usize,
+    next_reference_index: &mut usize,
     xpath_parse_budget: &mut XPathSignatureParseBudget,
 ) -> Result<ParsedManifestReferences, SignatureVerificationPipelineError> {
     let mut references = Vec::new();
     let mut invalid = Vec::new();
-    let mut reference_index = 0usize;
     for object_node in signature_node.children().filter(|node| {
         node.is_element()
             && node.tag_name().namespace() == Some(XMLDSIG_NS)
             && node.tag_name().name() == "Object"
     }) {
-        let object_is_signed = signed_info_reference_nodes.contains(&object_node.id());
+        let object_is_signed = authenticated_nodes.contains(&object_node.id());
         for manifest_node in object_node.children().filter(|node| {
             node.is_element()
                 && node.tag_name().namespace() == Some(XMLDSIG_NS)
                 && node.tag_name().name() == "Manifest"
         }) {
-            let manifest_is_signed = signed_info_reference_nodes.contains(&manifest_node.id());
+            let manifest_is_signed = authenticated_nodes.contains(&manifest_node.id());
+            // Leave unauthenticated Manifests unmarked so a verified outer
+            // Manifest can make them eligible on the next discovery pass.
             if !object_is_signed && !manifest_is_signed {
+                continue;
+            }
+            if !processed_manifests.insert(manifest_node.id()) {
                 continue;
             }
             let mut manifest_children = Vec::new();
@@ -1687,11 +1765,14 @@ fn parse_manifest_references(
                         reason: "Manifest must contain only ds:Reference element children",
                     });
                 }
-                if references.len() + invalid.len() >= remaining_reference_capacity {
+                if *remaining_reference_capacity == 0 {
                     return Err(SignatureVerificationPipelineError::InvalidStructure {
                         reason: "signed Manifests exceed the per-signature Reference limit",
                     });
                 }
+                *remaining_reference_capacity -= 1;
+                let reference_index = *next_reference_index;
+                *next_reference_index += 1;
                 match parse_reference_with_xpath_budget(child, xpath_parse_budget) {
                     Ok(reference) => references.push((reference_index, reference, child.id())),
                     Err(ParseError::Transform(super::TransformError::UnsupportedTransform(_))) => {
@@ -1717,7 +1798,6 @@ fn parse_manifest_references(
                         ));
                     }
                 }
-                reference_index += 1;
             }
         }
     }
@@ -1855,13 +1935,13 @@ fn enforce_transform_allowed(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SignatureChildNodes<'a, 'input> {
+pub(super) struct SignatureChildNodes<'a, 'input> {
     signed_info_node: Node<'a, 'input>,
     signature_value_node: Node<'a, 'input>,
     key_info_node: Option<Node<'a, 'input>>,
 }
 
-fn parse_signature_children<'a, 'input>(
+pub(super) fn parse_signature_children<'a, 'input>(
     signature_node: Node<'a, 'input>,
 ) -> Result<SignatureChildNodes<'a, 'input>, SignatureVerificationPipelineError> {
     let mut signed_info_node: Option<Node<'_, '_>> = None;
@@ -3448,7 +3528,7 @@ mod tests {
         // Manifest results are authenticated extension data and must obey the
         // same digest allowlist as SignedInfo references.
         let policy = crate::policy::VerificationPolicy {
-            process_manifests: true,
+            manifest_processing: crate::policy::ManifestProcessing::Process,
             digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
             ..crate::policy::VerificationPolicy::default()
         };
@@ -3490,7 +3570,7 @@ mod tests {
         // Authenticated Manifest references share the caller's per-reference
         // transform ceiling and fail before transform execution when exceeded.
         let policy = crate::policy::VerificationPolicy {
-            process_manifests: true,
+            manifest_processing: crate::policy::ManifestProcessing::Process,
             resources: crate::policy::ResourcePolicy {
                 max_transforms_per_reference: 1,
                 ..crate::policy::ResourcePolicy::default()
@@ -3665,11 +3745,16 @@ mod tests {
         let signature = document.root_element();
         let object = signature.children().find(|node| node.is_element()).unwrap();
         let authenticated = HashSet::from([object.id()]);
+        let mut processed = HashSet::new();
+        let mut remaining = MAX_REFERENCES_PER_SIGNATURE;
+        let mut next_index = 0;
 
         let error = match parse_manifest_references(
             signature,
             &authenticated,
-            MAX_REFERENCES_PER_SIGNATURE,
+            &mut processed,
+            &mut remaining,
+            &mut next_index,
             &mut XPathSignatureParseBudget::default(),
         ) {
             Ok(_) => panic!("unsupported references must consume the same aggregate limit"),
@@ -3681,6 +3766,52 @@ mod tests {
                 reason: "signed Manifests exceed the per-signature Reference limit"
             }
         ));
+    }
+
+    #[test]
+    fn unsigned_manifest_remains_eligible_after_trust_expands() {
+        // The second Object is not authenticated during the first discovery
+        // pass. It must remain unprocessed so a valid reference from the first
+        // Manifest can make its sibling Manifest eligible on the next pass.
+        let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+        let xml = format!(
+            r##"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:Object Id="outer"><ds:Manifest><ds:Reference URI="#inner"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object><ds:Object Id="inner"><ds:Manifest><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature>"##
+        );
+        let document = Document::parse(&xml).expect("nested Manifest fixture must parse");
+        let signature = document.root_element();
+        let mut objects = signature.children().filter(|node| node.is_element());
+        let outer = objects.next().expect("outer Object");
+        let inner = objects.next().expect("inner Object");
+        let mut authenticated = HashSet::from([outer.id()]);
+        let mut processed = HashSet::new();
+        let mut remaining = 2;
+        let mut next_index = 0;
+        let mut xpath_budget = XPathSignatureParseBudget::default();
+
+        let first = parse_manifest_references(
+            signature,
+            &authenticated,
+            &mut processed,
+            &mut remaining,
+            &mut next_index,
+            &mut xpath_budget,
+        )
+        .expect("outer Manifest must be discovered");
+        assert_eq!(first.references.len(), 1);
+        assert_eq!(first.references[0].1.uri.as_deref(), Some("#inner"));
+
+        authenticated.insert(inner.id());
+        let second = parse_manifest_references(
+            signature,
+            &authenticated,
+            &mut processed,
+            &mut remaining,
+            &mut next_index,
+            &mut xpath_budget,
+        )
+        .expect("newly authenticated sibling Manifest must remain eligible");
+        assert_eq!(second.references.len(), 1);
+        assert_eq!(second.references[0].1.uri.as_deref(), Some("#payload"));
     }
 
     #[test]
@@ -3721,7 +3852,7 @@ mod tests {
         // Lowering the operation policy must lower the aggregate SignedInfo and
         // Manifest capacity rather than falling back to the crate hard limit.
         let policy = crate::policy::VerificationPolicy {
-            process_manifests: true,
+            manifest_processing: crate::policy::ManifestProcessing::Process,
             resources: crate::policy::ResourcePolicy {
                 max_references: 1,
                 ..crate::policy::ResourcePolicy::default()
@@ -5244,6 +5375,28 @@ mod tests {
             err,
             SignatureVerificationPipelineError::InvalidStructure {
                 reason: "Signature must appear exactly once in document",
+            }
+        ));
+    }
+
+    #[test]
+    fn pipeline_start_node_limits_signature_cardinality_to_its_subtree() {
+        // A start-node selector changes the operation root, not global ID or
+        // reference resolution; another Signature outside the subtree is irrelevant.
+        let xml = r#"
+<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <scope Id="selected"><ds:Signature/></scope>
+  <scope Id="other"><ds:Signature/></scope>
+</root>
+"#;
+        let err = VerifyContext::new()
+            .start_node_id("selected")
+            .verify(xml)
+            .expect_err("the selected Signature remains structurally incomplete");
+        assert!(matches!(
+            err,
+            SignatureVerificationPipelineError::MissingElement {
+                element: "SignedInfo"
             }
         ));
     }

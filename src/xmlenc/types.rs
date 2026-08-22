@@ -192,6 +192,29 @@ pub enum OaepDigestAlgorithm {
 }
 
 impl OaepDigestAlgorithm {
+    /// Parse a digest URI accepted by XML Encryption and libxmlsec1.
+    pub fn from_uri(uri: &str) -> Option<Self> {
+        match uri {
+            "http://www.w3.org/2000/09/xmldsig#sha1" => Some(Self::Sha1),
+            "http://www.w3.org/2001/04/xmlenc#sha256" => Some(Self::Sha256),
+            "http://www.w3.org/2001/04/xmlenc#sha384"
+            | "http://www.w3.org/2001/04/xmldsig-more#sha384" => Some(Self::Sha384),
+            "http://www.w3.org/2001/04/xmlenc#sha512" => Some(Self::Sha512),
+            _ => None,
+        }
+    }
+
+    /// Parse an XML Encryption 1.1 MGF1 URI.
+    pub fn from_mgf_uri(uri: &str) -> Option<Self> {
+        match uri {
+            "http://www.w3.org/2009/xmlenc11#mgf1sha1" => Some(Self::Sha1),
+            "http://www.w3.org/2009/xmlenc11#mgf1sha256" => Some(Self::Sha256),
+            "http://www.w3.org/2009/xmlenc11#mgf1sha384" => Some(Self::Sha384),
+            "http://www.w3.org/2009/xmlenc11#mgf1sha512" => Some(Self::Sha512),
+            _ => None,
+        }
+    }
+
     /// Return the standard digest URI.
     pub const fn uri(self) -> &'static str {
         match self {
@@ -210,6 +233,45 @@ impl OaepDigestAlgorithm {
             Self::Sha384 => "http://www.w3.org/2009/xmlenc11#mgf1sha384",
             Self::Sha512 => "http://www.w3.org/2009/xmlenc11#mgf1sha512",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OaepDigestAlgorithm;
+
+    #[test]
+    fn oaep_sha384_accepts_both_interoperable_digest_uris() {
+        // The canonical XML Encryption spelling and libxmlsec1's XMLDSig-more
+        // spelling identify the same OAEP digest algorithm.
+        for uri in [
+            "http://www.w3.org/2001/04/xmlenc#sha384",
+            "http://www.w3.org/2001/04/xmldsig-more#sha384",
+        ] {
+            assert_eq!(
+                OaepDigestAlgorithm::from_uri(uri),
+                Some(OaepDigestAlgorithm::Sha384)
+            );
+        }
+    }
+
+    #[test]
+    fn oaep_mgf_uris_round_trip() {
+        for algorithm in [
+            OaepDigestAlgorithm::Sha1,
+            OaepDigestAlgorithm::Sha256,
+            OaepDigestAlgorithm::Sha384,
+            OaepDigestAlgorithm::Sha512,
+        ] {
+            assert_eq!(
+                OaepDigestAlgorithm::from_mgf_uri(algorithm.mgf_uri()),
+                Some(algorithm)
+            );
+        }
+        assert_eq!(
+            OaepDigestAlgorithm::from_mgf_uri("urn:unsupported-mgf"),
+            None
+        );
     }
 }
 
@@ -539,6 +601,17 @@ pub enum XmlEncError {
     #[error("XML Encryption policy violation: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),
 
+    /// One cryptographic operation exhausted its aggregate key-candidate work ceiling.
+    #[error("key candidate limit exceeded by {resource}: maximum {maximum}, attempted {actual}")]
+    KeyCandidateLimitExceeded {
+        /// Resolver-provided description of the candidate source being charged.
+        resource: &'static str,
+        /// Fixed operation-wide candidate ceiling.
+        maximum: usize,
+        /// Candidate work that would have been consumed.
+        actual: usize,
+    },
+
     /// The selected cryptographic provider rejected or failed an operation.
     #[error("cryptographic provider error: {0}")]
     Provider(#[from] crate::provider::ProviderError),
@@ -552,6 +625,12 @@ pub enum XmlEncError {
     /// The XML element order or namespace is invalid for the XMLEnc profile.
     #[error("invalid encrypted structure: {0}")]
     InvalidStructure(String),
+    /// The selected operation-start node ID is absent or resolves ambiguously.
+    #[error("selected node ID is missing or ambiguous: {id}")]
+    SelectedNodeUnavailable {
+        /// Caller-supplied node identifier.
+        id: String,
+    },
     /// An algorithm URI is not supported by this build.
     #[error("unsupported encryption algorithm: {0}")]
     UnsupportedAlgorithm(String),
@@ -588,6 +667,16 @@ pub enum XmlEncError {
         /// Expected key size.
         expected: usize,
         /// Actual key size.
+        actual: usize,
+    },
+    /// An unauthenticated content algorithm cannot safely select among keys.
+    #[error(
+        "{algorithm:?} cannot safely select among {actual} unordered decryption key candidates"
+    )]
+    AmbiguousKeyCandidates {
+        /// Unauthenticated algorithm for which key success is ambiguous.
+        algorithm: DataEncryptionAlgorithm,
+        /// Number of unresolved candidate keys.
         actual: usize,
     },
     /// A supplied AES key-encryption key is not the size declared by EncryptedKey.

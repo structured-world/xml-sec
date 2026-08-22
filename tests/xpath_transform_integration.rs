@@ -250,7 +250,8 @@ fn signing_shares_xpath_work_across_references() {
     // Each Reference is below the per-transform limit, but resetting the meter
     // between References would allow aggregate work to grow with signature size.
     let document = format!("<root>{}</root>", "<item/>".repeat(1_000));
-    let mut builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256);
+    let mut builder =
+        SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256).key_info(true);
     for _ in 0..6 {
         builder = builder.add_reference(
             ReferenceBuilder::new(DigestAlgorithm::Sha256)

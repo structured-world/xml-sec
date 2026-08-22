@@ -21,11 +21,14 @@ mod types;
 
 pub use decrypt::{
     DecryptContext, DecryptionKeyResolver, DocumentDecryptionOptions, KekDecryptor,
-    PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt, decrypt_data, decrypt_document,
-    decrypt_document_with_options,
+    KeyCandidateBudget, PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt, decrypt_data,
+    decrypt_document, decrypt_document_with_options,
 };
-pub use encrypt::EncryptedDataBuilder;
-pub use parse::parse_encrypted_data;
+pub use encrypt::{EncryptedDataBuilder, validate_rsa_recipient_key};
+pub use parse::{
+    parse_encrypted_data, parse_encrypted_data_node_with_policy,
+    parse_encrypted_data_template_node_with_policy,
+};
 pub use types::{
     CipherData, DataEncryptionAlgorithm, DecryptedContent, DocumentEncryptionOptions,
     EncryptedData, EncryptedDataType, EncryptedKey, EncryptionMethod, EncryptionRecipient,

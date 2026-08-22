@@ -21,6 +21,22 @@ use super::{
 
 const XML_WHITESPACE: &[char] = &[' ', '\t', '\n', '\r'];
 
+/// Validate an RSA recipient key against the compiled encryption policy.
+///
+/// Key registries can use this preflight before selecting a candidate, ensuring
+/// ordered searches skip keys that the encryption operation would reject.
+pub fn validate_rsa_recipient_key(
+    key: &RsaPublicKey,
+    policy: &crate::policy::EncryptionPolicy,
+) -> Result<(), XmlEncError> {
+    policy.rsa_keys.validate_components(
+        "encryption",
+        &key.n().to_be_bytes_trimmed_vartime(),
+        &key.e().to_be_bytes_trimmed_vartime(),
+    )?;
+    Ok(())
+}
+
 /// Builder for complete `EncryptedData` fragments and document replacement.
 #[derive(Clone)]
 pub struct EncryptedDataBuilder {
@@ -134,10 +150,17 @@ impl EncryptedDataBuilder {
             .map(|generated| generated.result)
     }
 
-    /// Encrypt opaque bytes without an XML `Type` attribute.
+    /// Encrypt opaque bytes, preserving a configured non-XML `Type` hint.
+    ///
+    /// Element and Content are XML replacement semantics and are omitted from
+    /// binary output. Any other URI remains application metadata.
     pub fn encrypt_binary(&self, data: &[u8]) -> Result<EncryptionResult, XmlEncError> {
         self.policy.validate()?;
-        self.encrypt_payload(data, None)
+        let encrypted_type = match &self.encrypted_type {
+            EncryptedDataType::Other(uri) => Some(EncryptedDataType::Other(uri.clone())),
+            EncryptedDataType::Element | EncryptedDataType::Content => None,
+        };
+        self.encrypt_payload(data, encrypted_type)
             .map(|generated| generated.result)
     }
 
@@ -276,6 +299,9 @@ impl EncryptedDataBuilder {
 
     fn validate_configuration(&self) -> Result<(), XmlEncError> {
         self.policy.validate()?;
+        if let EncryptedDataType::Other(uri) = &self.encrypted_type {
+            self.validate_metadata("EncryptedData Type", Some(uri))?;
+        }
         if self
             .policy
             .data_algorithms
@@ -287,11 +313,6 @@ impl EncryptedDataBuilder {
                 algorithm: self.algorithm.to_string(),
             }
             .into());
-        }
-        if matches!(self.encrypted_type, EncryptedDataType::Other(_)) {
-            return Err(XmlEncError::InvalidEncryptionConfig(
-                "Other Type hints are not valid for XML encryption".into(),
-            ));
         }
         if self.recipients.len() > self.policy.resources.max_encryption_recipients {
             return Err(XmlEncError::TooManyRecipients {
@@ -314,11 +335,7 @@ impl EncryptedDataBuilder {
                     recipient,
                     key_name,
                 } => {
-                    self.policy.rsa_keys.validate_components(
-                        "encryption",
-                        &public_key.n().to_be_bytes_trimmed_vartime(),
-                        &public_key.e().to_be_bytes_trimmed_vartime(),
-                    )?;
+                    validate_rsa_recipient_key(public_key, &self.policy)?;
                     if parameters.algorithm == super::KeyTransportAlgorithm::RsaOaepMgf1p
                         && parameters.mgf_digest != super::OaepDigestAlgorithm::Sha1
                     {
@@ -1400,6 +1417,55 @@ mod tests {
                 Err(XmlEncError::DocumentTooLarge { .. })
             ));
         }
+    }
+
+    #[test]
+    fn binary_encryption_preserves_an_opaque_type_hint() {
+        // A non-XML Type URI describes opaque application bytes. It must survive
+        // binary encryption so decryption can continue returning byte content.
+        let result = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .encryption_type(EncryptedDataType::Other("urn:example:binary".into()))
+            .direct_key([0x42_u8; 16])
+            .encrypt_binary(b"opaque payload")
+            .expect("opaque binary Type must be accepted");
+
+        assert!(
+            result
+                .encrypted_data_xml
+                .contains("Type=\"urn:example:binary\"")
+        );
+    }
+
+    #[test]
+    fn binary_encryption_bounds_an_opaque_type_hint() {
+        // Generated metadata must obey the same policy as reciprocal parsing so
+        // the builder cannot emit an EncryptedData document it would reject.
+        let maximum = 64;
+        let policy = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_encryption_metadata_bytes: maximum,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let encrypt = |uri: String| {
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .encryption_type(EncryptedDataType::Other(uri))
+                .direct_key([0x42_u8; 16])
+                .policy(policy.clone())
+                .encrypt_binary(b"opaque payload")
+        };
+
+        encrypt(format!("urn:{}", "x".repeat(maximum - 4)))
+            .expect("metadata at the configured boundary must remain accepted");
+        assert!(matches!(
+            encrypt(format!("urn:{}", "x".repeat(maximum - 3))),
+            Err(XmlEncError::EncryptionMetadataTooLarge {
+                field: "EncryptedData Type",
+                maximum: 64,
+                actual: 65,
+            })
+        ));
     }
 
     #[test]

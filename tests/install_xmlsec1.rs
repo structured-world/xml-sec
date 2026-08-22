@@ -75,7 +75,7 @@ impl InstallHarness {
 
         root.tool(
             "git",
-            "#!/bin/sh\nif [ \"$1\" = \"init\" ]; then mkdir -p \"$2\"; exit 0; fi\n[ \"$1\" = \"-C\" ] || exit 2\nsource=$2\nshift 2\ncommand=$1\nshift\ncase \"$command\" in\n  remote) exit 0 ;;\n  fetch)\n    for argument in \"$@\"; do requested=$argument; done\n    printf '%s\\n' \"${GIT_REPORTED_COMMIT:-$requested}\" > \"$GIT_FETCHED_COMMIT_FILE\"\n    printf '#!/bin/sh\\nexit 0\\n' > \"$source/autogen.sh\"\n    chmod +x \"$source/autogen.sh\"\n    ;;\n  rev-parse) cat \"$GIT_FETCHED_COMMIT_FILE\" ;;\n  checkout) exit 0 ;;\n  *) exit 2 ;;\nesac\n",
+            "#!/bin/sh\nif [ \"$1\" = \"init\" ]; then mkdir -p \"$2\"; exit 0; fi\n[ \"$1\" = \"-C\" ] || exit 2\nsource=$2\nshift 2\ncommand=$1\nshift\ncase \"$command\" in\n  remote) exit 0 ;;\n  fetch)\n    for argument in \"$@\"; do requested=$argument; done\n    printf '%s\\n' \"${GIT_REPORTED_COMMIT:-$requested}\" > \"$GIT_FETCHED_COMMIT_FILE\"\n    printf '#!/bin/sh\\nexit 0\\n' > \"$source/autogen.sh\"\n    chmod +x \"$source/autogen.sh\"\n    ;;\n  rev-parse)\n    if [ \"${1:-}\" = \"--is-inside-work-tree\" ]; then\n      [ -e \"$source/.git\" ] || exit 128\n      printf 'true\\n'\n    elif [ -n \"${XMLSEC1_SOURCE_DIR:-}\" ] && [ \"$source\" = \"$XMLSEC1_SOURCE_DIR\" ]; then\n      printf '%s\\n' \"$GIT_REPORTED_COMMIT\"\n    else\n      cat \"$GIT_FETCHED_COMMIT_FILE\"\n    fi\n    ;;\n  archive) /usr/bin/tar -C \"$source\" -cf - autogen.sh ;;\n  checkout) exit 0 ;;\n  *) exit 2 ;;\nesac\n",
         );
         root.tool("nproc", "#!/bin/sh\nprintf '1\\n'\n");
         root.tool(
@@ -130,6 +130,27 @@ impl InstallHarness {
         }
         command.status().expect("installation script must run")
     }
+
+    fn run_from_source(&self, source: &Path) -> std::process::ExitStatus {
+        let inherited_path = std::env::var_os("PATH").expect("test process must have PATH");
+        let path = std::env::join_paths(
+            std::iter::once(self.tools.clone()).chain(std::env::split_paths(&inherited_path)),
+        )
+        .expect("test PATH must be joinable");
+        Command::new("bash")
+            .arg("scripts/install-xmlsec1.sh")
+            .env("XMLSEC1_PREFIX", &self.prefix)
+            .env("XMLSEC1_SOURCE_DIR", source)
+            .env("GIT_REPORTED_COMMIT", DONOR_COMMIT.trim())
+            .env(
+                "GIT_FETCHED_COMMIT_FILE",
+                self.root.path().join("fetched-commit"),
+            )
+            .env("MV_COUNT_FILE", self.root.path().join("mv-count"))
+            .env("PATH", path)
+            .status()
+            .expect("installation script must run")
+    }
 }
 
 #[test]
@@ -172,6 +193,27 @@ fn installer_rejects_source_revision_mismatch() {
             .expect("failed source verification must preserve the previous installation"),
         "previous installation"
     );
+}
+
+#[test]
+fn installer_accepts_a_linked_worktree_source_checkout() {
+    // Linked worktrees represent .git as a file. Repository identity must come
+    // from Git rather than a filesystem-shape assumption.
+    let harness = InstallHarness::new();
+    let source = harness.root.path().join("linked-worktree");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join(".git"), "gitdir: /tmp/fake-worktree\n").unwrap();
+    let autogen = source.join("autogen.sh");
+    std::fs::write(&autogen, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&autogen, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let status = harness.run_from_source(&source);
+
+    assert!(
+        status.success(),
+        "linked worktree checkout must be accepted"
+    );
+    assert!(!harness.prefix.join("sentinel").exists());
 }
 
 #[test]
