@@ -599,6 +599,18 @@ impl<'a> NodeSet<'a> {
         Ok(Self::subtree_materialization(root)?.entries)
     }
 
+    pub(crate) fn ensure_subtree_materialization_fits_with_budget(
+        root: Node<'_, '_>,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<usize, TransformError> {
+        Ok(Self::subtree_materialization_with_limits(
+            root,
+            budget.max_entries,
+            budget.max_owned_string_bytes,
+        )?
+        .entries)
+    }
+
     fn charge_subtree_materialization(
         root: Node<'_, '_>,
         budget: &NodeSetMaterializationBudget,

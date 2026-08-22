@@ -1026,7 +1026,7 @@ fn validate_typed_cipher_values(
     let mut aggregate_encoded = encrypted.cipher_data.value.len();
     if aggregate_encoded > maximum_cipher_values {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "aggregate encryption CipherValue bytes",
+            resource: crate::policy::resource_name::AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES,
             maximum: maximum_cipher_values,
             actual: aggregate_encoded,
         }
@@ -1039,7 +1039,7 @@ fn validate_typed_cipher_values(
         aggregate_encoded = aggregate_encoded.saturating_add(encrypted_key.cipher_data.value.len());
         if aggregate_encoded > maximum_cipher_values {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "aggregate encryption CipherValue bytes",
+                resource: crate::policy::resource_name::AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES,
                 maximum: maximum_cipher_values,
                 actual: aggregate_encoded,
             }
@@ -3221,7 +3221,8 @@ mod tests {
                 .decrypt_data(&encrypted),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "aggregate encryption CipherValue bytes",
+                    resource:
+                        crate::policy::resource_name::AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES,
                     maximum,
                     actual,
                 }

@@ -1484,7 +1484,10 @@ fn evaluate_expression<'a>(
     materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
     let document = input.document();
-    let document_size = NodeSet::ensure_subtree_materialization_fits(document.root())?;
+    let document_size = NodeSet::ensure_subtree_materialization_fits_with_budget(
+        document.root(),
+        materialization_budget,
+    )?;
     // The node-set preflight bounds map cardinality and inherited namespace
     // amplification. This separate preflight accounts for every string copied
     // by Mirror::build before allocating the secondary DOM.
@@ -1932,6 +1935,60 @@ mod tests {
                     resource: crate::policy::resource_name::XPATH_MIRROR_STRING_BYTES,
                     ..
                 })
+            ));
+        }
+    }
+
+    #[test]
+    fn xpath_preflights_policy_node_set_limits_before_mirror_allocation() {
+        // A low compiled node-set limit must win before the mirror string
+        // budget, proving that policy-aware preflight runs before SXD allocates.
+        let fixtures = [
+            (
+                "<root><child/></root>",
+                1,
+                usize::MAX,
+                crate::policy::resource_name::NODE_SET_ENTRIES,
+            ),
+            (
+                "<root attribute=\"value\"/>",
+                usize::MAX,
+                0,
+                crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+            ),
+        ];
+
+        for (xml, max_entries, max_owned_bytes, expected_resource) in fixtures {
+            let document = Document::parse(xml).expect("fixed XPath fixture must parse");
+            let input = NodeSet::entire_document_without_comments(&document)
+                .expect("fixture fits the default node-set ceiling");
+            let resources = crate::policy::ResourcePolicy {
+                max_xpath_mirror_string_bytes: 0,
+                ..crate::policy::ResourcePolicy::default()
+            };
+            let work_budget = XPathWorkBudget::with_limits(&resources);
+            let materialization_budget =
+                NodeSetMaterializationBudget::with_limits(max_entries, max_owned_bytes, usize::MAX);
+
+            let error = match evaluate_expression(
+                &input,
+                &XPathExpression::new("true()"),
+                XPathEvaluationMode::Filter2NodeSetSelection,
+                XPathHereSemantics::default(),
+                XPathDocumentRelation::SameDocument,
+                &work_budget,
+                &materialization_budget,
+            ) {
+                Ok(_) => panic!("node-set policy must reject the source before mirror allocation"),
+                Err(error) => error,
+            };
+
+            assert!(matches!(
+                error,
+                TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource,
+                    ..
+                }) if resource == expected_resource
             ));
         }
     }

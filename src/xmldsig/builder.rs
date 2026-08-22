@@ -62,6 +62,9 @@ pub enum SignatureBuilderError {
     /// The writer unexpectedly emitted bytes that are not UTF-8.
     #[error("XML writer emitted invalid UTF-8: {0}")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
+    /// The generated template could not be parsed under the selected policy.
+    #[error("generated XML template is invalid: {0}")]
+    GeneratedXml(#[from] roxmltree::Error),
 }
 
 /// Builder for a single XMLDSig `<Reference>` template.
@@ -217,7 +220,23 @@ impl SignatureBuilder {
         }
         writer.write_event(Event::End(BytesEnd::new(signature_name)))?;
 
-        Ok(String::from_utf8(writer.into_inner())?)
+        let template = String::from_utf8(writer.into_inner())?;
+        // Field-level checks bound each input class; these checks cover the
+        // completed artifact exactly as the signing operation will consume it.
+        policy.resources.validate_xml_document_len(template.len())?;
+        super::mutation::parse_with_options(&template, Some(policy)).map_err(
+            |error| match error {
+                roxmltree::Error::NodesLimitReached => {
+                    SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+                        resource: crate::policy::resource_name::XML_NODES,
+                        maximum: policy.resources.max_xml_nodes,
+                        actual: policy.resources.max_xml_nodes.saturating_add(1),
+                    })
+                }
+                other => SignatureBuilderError::GeneratedXml(other),
+            },
+        )?;
+        Ok(template)
     }
 
     fn validate(&self, policy: &SigningPolicy) -> Result<(), SignatureBuilderError> {

@@ -1075,7 +1075,7 @@ fn execute_transform_chain<'s, 'e, 'd>(
         )
         .map_err(|error| match error {
             roxmltree::Error::NodesLimitReached => transform_resource_limit(
-                "XML nodes",
+                crate::policy::resource_name::XML_NODES,
                 context.budget.xml_node_limit as usize,
                 context.budget.xml_node_limit as usize + 1,
             ),

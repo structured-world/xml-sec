@@ -129,8 +129,10 @@ The operation shares one `KeyCandidateBudget` across the direct lookup and every
 custom `DecryptionKeyResolver` implementations must charge it before each lookup or unwrap attempt.
 The context additionally accounts for returned candidates, so a resolver cannot multiply work by
 resetting a per-recipient allowance. Candidate-local lookup or unwrap failures may be recorded while
-later recipients are tried, but a `PolicyViolation::ResourceLimit` for `key candidates`
-is terminal and stops the operation as soon as the shared budget is exhausted. Explicit
+later recipients are tried, but any policy violation returned by
+`DecryptionKeyResolver::resolve_key_candidates` is terminal for the complete operation. Resolution
+does not continue after a resolver rejects resource bounds, key trust, or any other compiled-policy
+requirement. Explicit
 `ReferenceList/DataReference` and `CarriedKeyName`
 metadata restricts an embedded key to the referenced `EncryptedData` or matching `ds:KeyName`.
 Association metadata may be omitted, but an explicit contradiction is skipped rather than tried.

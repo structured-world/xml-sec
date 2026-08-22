@@ -393,6 +393,43 @@ fn policy_aware_builder_uses_the_callers_resource_snapshot() {
 }
 
 #[test]
+fn policy_aware_builder_bounds_the_serialized_template() {
+    // Builder validation must cover the completed XML artifact, not only the
+    // individual fields that contributed to it. Otherwise the same policy
+    // accepts a template here and rejects it immediately when signing starts.
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256));
+
+    let mut byte_policy = SigningPolicy::default();
+    byte_policy.resources.max_xml_document_bytes = 1;
+    let byte_error = builder
+        .build_template_with_policy(&byte_policy)
+        .expect_err("serialized template must obey the XML byte limit");
+    assert!(matches!(
+        byte_error,
+        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+            resource: "XML document",
+            maximum: 1,
+            actual,
+        }) if actual > 1
+    ));
+
+    let mut node_policy = SigningPolicy::default();
+    node_policy.resources.max_xml_nodes = 1;
+    let node_error = builder
+        .build_template_with_policy(&node_policy)
+        .expect_err("serialized template must obey the XML node limit");
+    assert!(matches!(
+        node_error,
+        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+            resource: "XML nodes",
+            maximum: 1,
+            actual: 2,
+        })
+    ));
+}
+
+#[test]
 fn serializes_xpath_and_exclusive_prefix_list() {
     // Complex transforms retain the child content required by their specifications.
     let c14n = exclusive_c14n().with_prefix_list("saml #default ds");

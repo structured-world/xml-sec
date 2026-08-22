@@ -735,6 +735,7 @@ impl DefaultKeyResolver {
         provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
         trust.validate()?;
+        resources.validate()?;
         let Some(key_info) = key_info else {
             return Ok(None);
         };
@@ -2893,6 +2894,32 @@ mod tests {
                 .expect("two allowed attempts must reach the named key")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn policy_aware_resolver_rejects_resources_above_hard_ceiling() {
+        // The resolver is a public policy enforcement boundary in its own
+        // right; callers must not need VerifyContext to validate the snapshot.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_key_candidates = usize::MAX;
+
+        let error = match DefaultKeyResolver::default().resolve_with_policy(
+            None,
+            SignatureAlgorithm::RsaSha256,
+            &policy,
+        ) {
+            Ok(_) => panic!("invalid resource policy must fail before key resolution"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                actual: usize::MAX,
+                ..
+            })
+        ));
     }
 
     #[test]

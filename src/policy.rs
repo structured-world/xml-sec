@@ -30,6 +30,8 @@ pub(crate) mod resource_name {
     pub const EXTERNAL_RESOURCE_BYTES: &str = "external resource bytes";
     pub const AGGREGATE_EXTERNAL_RESOURCE_BYTES: &str = "aggregate external resource bytes";
     pub const ENCRYPTION_PLAINTEXT_BYTES: &str = "encryption plaintext bytes";
+    pub const AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES: &str =
+        "aggregate encryption CipherValue bytes";
     pub const XML_DOCUMENT: &str = "XML document";
     pub const ENCRYPTION_RECIPIENTS: &str = "encryption recipients";
     pub const ENCRYPTION_METADATA_BYTES: &str = "encryption metadata bytes";
