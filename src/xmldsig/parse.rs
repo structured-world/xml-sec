@@ -21,6 +21,7 @@ use der::{
     asn1::{Ia5StringRef, ObjectIdentifier},
 };
 use roxmltree::{Document, Node};
+use std::collections::BTreeMap;
 use x509_cert::ext::pkix::name::DirectoryString;
 use x509_cert::name::Name;
 use x509_parser::extensions::ParsedExtension;
@@ -199,13 +200,18 @@ pub enum KeyInfoSource {
 }
 
 /// Transform forms accepted on `<RetrievalMethod>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RetrievalMethodTransforms {
     /// No transform chain is present.
     None,
     /// Filter a same-document node-set to one `ds:X509Data`-rooted subtree.
-    X509DataNodeSetFilter,
+    X509DataNodeSetFilter {
+        /// Original expression retained for operation policy accounting.
+        expression: String,
+        /// Namespace axis visible from the XPath parameter element.
+        namespaces: BTreeMap<String, String>,
+    },
     /// A transform chain attached to a RetrievalMethod type this implementation
     /// does not materialize. Resolvers may ignore this advisory key source and
     /// continue with later `<KeyInfo>` children.
@@ -325,6 +331,10 @@ pub enum X509PublicKeyInfo {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParseError {
+    /// The default low-level parsing policy rejected bounded input.
+    #[error("XMLDSig policy violation: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
+
     /// The selected cryptographic provider could not evaluate parsed key metadata.
     #[error("cryptographic provider error: {0}")]
     Provider(#[from] crate::provider::ProviderError),
@@ -339,13 +349,6 @@ pub enum ParseError {
     /// Invalid structure (wrong child order, unexpected element, etc.).
     #[error("invalid structure: {0}")]
     InvalidStructure(String),
-
-    /// `<SignedInfo>` declared more references than one signature may process.
-    #[error("SignedInfo contains more than {max} Reference elements")]
-    TooManyReferences {
-        /// Maximum references accepted for one signature.
-        max: usize,
-    },
 
     /// Unsupported algorithm URI.
     #[error("unsupported algorithm: {uri}")]
@@ -442,9 +445,12 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
     for child in children {
         verify_ds_element(child, "Reference")?;
         if references.len() == crate::hard_limits::SIGNATURE_REFERENCE_CEILING {
-            return Err(ParseError::TooManyReferences {
-                max: crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
-            });
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
+                maximum: crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
+                actual: references.len().saturating_add(1),
+            }
+            .into());
         }
         references.push(parse_reference_with_xpath_budget(child, xpath_budget)?);
     }
@@ -770,7 +776,18 @@ fn parse_retrieval_method_transforms(
             "unsupported RetrievalMethod XPath selection".into(),
         ));
     }
-    Ok(RetrievalMethodTransforms::X509DataNodeSetFilter)
+    let namespaces = xpath
+        .namespaces()
+        .filter_map(|namespace| {
+            namespace
+                .name()
+                .map(|prefix| (prefix.to_owned(), namespace.uri().to_owned()))
+        })
+        .collect();
+    Ok(RetrievalMethodTransforms::X509DataNodeSetFilter {
+        expression: expression.to_owned(),
+        namespaces,
+    })
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -2329,6 +2346,7 @@ fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Resu
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
     use super::*;
+    use crate::xmldsig::TransformError;
     use base64::Engine;
 
     fn fixture_rsa_cert_base64() -> String {
@@ -3868,7 +3886,7 @@ BA== </Modulus>
             [KeyInfoSource::RetrievalMethod {
                 uri,
                 resource_type: Some(resource_type),
-                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter,
+                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter { .. },
             }] if uri == "#keys"
                 && resource_type == "http://www.w3.org/2000/09/xmldsig#X509Data"
         ));
@@ -3972,7 +3990,7 @@ BA== </Modulus>
                 .sources
                 .as_slice(),
             [KeyInfoSource::RetrievalMethod {
-                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter,
+                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter { .. },
                 ..
             }]
         ));
@@ -4339,9 +4357,11 @@ BA== </Modulus>
 
         assert!(matches!(
             error,
-            ParseError::TooManyReferences {
-                max: MAX_REFERENCES_PER_SIGNATURE
-            }
+            ParseError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
+                maximum: MAX_REFERENCES_PER_SIGNATURE,
+                actual: 65,
+            })
         ));
     }
 
@@ -4387,11 +4407,15 @@ BA== </Modulus>
         let error = parse_signed_info(document.root_element())
             .expect_err("signature-wide XPath expression count must be bounded");
 
-        assert!(
-            error
-                .to_string()
-                .contains("signature-wide XPath expression budget")
-        );
+        assert!(matches!(
+            error,
+            ParseError::Transform(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "XPath expressions",
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]

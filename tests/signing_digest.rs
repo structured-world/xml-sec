@@ -14,9 +14,10 @@ use xml_sec::xmldsig::{
     DEFAULT_IMPLICIT_C14N_URI, DefaultKeyResolver, DigestAlgorithm, DsigStatus,
     EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriter, ReferenceBuilder, RsaSigningKey,
     SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError,
-    SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, VerificationKey, VerifyContext,
-    X509CertificateKeyInfoWriter, compute_reference_digest_values, fill_reference_digest_values,
-    parse_key_info, validate_signing_key, verify_signature_with_pem_key,
+    SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, TransformError, VerificationKey,
+    VerifyContext, X509CertificateKeyInfoWriter, compute_reference_digest_values,
+    fill_reference_digest_values, parse_key_info, validate_signing_key,
+    verify_signature_with_pem_key,
 };
 
 fn exclusive_c14n() -> C14nAlgorithm {
@@ -540,7 +541,10 @@ fn signing_policy_rejects_disallowed_reference_transform() {
     let xml =
         append_signature_to_root("<root><payload/></root>", &template).expect("append signature");
     let policy = SigningPolicy {
-        transforms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+        transforms: xml_sec::policy::TransformPolicy {
+            allowed_algorithms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+            ..xml_sec::policy::TransformPolicy::default()
+        },
         ..SigningPolicy::default()
     };
 
@@ -548,7 +552,9 @@ fn signing_policy_rejects_disallowed_reference_transform() {
         SignContext::new(&private_key)
             .policy(policy)
             .sign_template(&xml),
-        Err(SigningError::Digest(SigningDigestError::Policy(_)))
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::Algorithm { .. }
+        ))
     ));
 }
 
@@ -755,7 +761,13 @@ fn signing_policy_shares_canonicalization_budget_with_signed_info() {
         SignContext::new(&private_key)
             .policy(constrained)
             .sign_template(&xml),
-        Err(SigningError::Digest(SigningDigestError::Transform(_)))
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "canonicalized bytes",
+                maximum: 64,
+                ..
+            }
+        ))
     ));
 
     let sufficient = SigningPolicy {
@@ -810,8 +822,12 @@ fn signing_policy_applies_xml_base_budget_to_signed_info_c14n() {
     assert!(
         matches!(
             result,
-            Err(SigningError::Canonicalization(
-                xml_sec::c14n::C14nError::XmlBaseComponentsTooLarge { max: 1, actual: 2 }
+            Err(SigningError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimit {
+                    resource: "XML Base components",
+                    maximum: 1,
+                    actual: 2,
+                }
             ))
         ),
         "unexpected signing result: {result:?}"
@@ -834,18 +850,26 @@ fn signing_policy_covers_implicit_and_signed_info_canonicalization() {
     .expect("append signature");
 
     let implicit_disallowed = SigningPolicy {
-        transforms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+        transforms: xml_sec::policy::TransformPolicy {
+            allowed_algorithms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+            ..xml_sec::policy::TransformPolicy::default()
+        },
         ..SigningPolicy::default()
     };
     assert!(matches!(
         SignContext::new(&private_key)
             .policy(implicit_disallowed)
             .sign_template(&xml),
-        Err(SigningError::Digest(SigningDigestError::Policy(_)))
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::Algorithm { .. }
+        ))
     ));
 
     let signed_info_disallowed = SigningPolicy {
-        transforms: Some(HashSet::from([DEFAULT_IMPLICIT_C14N_URI.to_owned()])),
+        transforms: xml_sec::policy::TransformPolicy {
+            allowed_algorithms: Some(HashSet::from([DEFAULT_IMPLICIT_C14N_URI.to_owned()])),
+            ..xml_sec::policy::TransformPolicy::default()
+        },
         ..SigningPolicy::default()
     };
     assert!(matches!(
@@ -1229,13 +1253,11 @@ fn manifest_signing_rejects_malformed_structure_and_aggregate_overflow() {
         .expect_err("SignedInfo and Manifest must share one reference limit");
     assert!(matches!(
         error,
-        SigningError::Digest(SigningDigestError::Policy(
-            xml_sec::policy::PolicyViolation::ResourceLimit {
-                resource: "signature references",
-                maximum: 1,
-                actual: 2,
-            }
-        ))
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "signature references",
+            maximum: 1,
+            actual: 2,
+        })
     ));
 
     let malformed_overflow = manifest_signing_template()
@@ -1251,13 +1273,11 @@ fn manifest_signing_rejects_malformed_structure_and_aggregate_overflow() {
         .expect_err("exhausted reference capacity must stop before parsing overflow entries");
     assert!(matches!(
         error,
-        SigningError::Digest(SigningDigestError::Policy(
-            xml_sec::policy::PolicyViolation::ResourceLimit {
-                resource: "signature references",
-                maximum: 1,
-                actual: 2,
-            }
-        ))
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "signature references",
+            maximum: 1,
+            actual: 2,
+        })
     ));
 }
 
@@ -1301,8 +1321,10 @@ fn ignored_manifests_do_not_disable_signed_info_dependency_checks() {
 #[test]
 fn rejects_reference_without_uri() {
     // External/object reference support is not implicit: signing must know what
-    // bytes are being digested, so an omitted URI fails before mutation.
-    let template = template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256));
+    // bytes are being digested, so malformed input with an omitted URI fails
+    // before mutation. The builder itself always emits the explicit empty URI.
+    let template = template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256))
+        .replacen("<Reference URI=\"\">", "<Reference>", 1);
     let xml = append_signature_to_root("<root><payload>hello</payload></root>", &template)
         .expect("append signature");
 
@@ -1355,11 +1377,15 @@ fn signing_template_bounds_xpath_expressions_across_references() {
     let error = compute_reference_digest_values(&xml)
         .expect_err("signing parser must enforce the signature-wide XPath budget");
 
-    assert!(
-        error
-            .to_string()
-            .contains("signature-wide XPath expression budget")
-    );
+    assert!(matches!(
+        error,
+        SigningDigestError::Transform(TransformError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "XPath expressions",
+                ..
+            }
+        ))
+    ));
 }
 
 #[test]

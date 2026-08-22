@@ -11,9 +11,11 @@ use std::ops::RangeInclusive;
 
 use roxmltree::{Document, Node, NodeId};
 
-const MAX_NODE_SET_ENTRIES: usize = 65_536;
-const MAX_NODE_SET_OWNED_STRING_BYTES: usize = 8 * 1024 * 1024;
-const MAX_NODE_SET_CUMULATIVE_OWNED_STRING_BYTES: usize = 64 * 1024 * 1024;
+const MAX_NODE_SET_ENTRIES: usize = crate::hard_limits::NODE_SET_ENTRY_CEILING;
+const MAX_NODE_SET_OWNED_STRING_BYTES: usize =
+    crate::hard_limits::NODE_SET_OWNED_STRING_BYTE_CEILING;
+const MAX_NODE_SET_CUMULATIVE_OWNED_STRING_BYTES: usize =
+    crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING;
 
 use crate::c14n::NodeVisibility;
 
@@ -77,6 +79,7 @@ pub struct NodeSet<'a> {
     /// Reference to the parsed document.
     doc: &'a Document<'a>,
     nodes: HashSet<XmlNodeKey>,
+    owned_string_bytes: usize,
     /// Whether comment nodes are included. For empty URI dereference (whole
     /// document), comments are excluded per XMLDSig spec.
     with_comments: bool,
@@ -99,27 +102,39 @@ enum XmlNodeKey {
 
 pub(crate) struct NodeSetMaterializationBudget {
     remaining_owned_string_bytes: Cell<usize>,
+    max_entries: usize,
+    max_owned_string_bytes: usize,
+    max_cumulative_owned_string_bytes: usize,
 }
 
 impl Default for NodeSetMaterializationBudget {
     fn default() -> Self {
         Self {
             remaining_owned_string_bytes: Cell::new(MAX_NODE_SET_CUMULATIVE_OWNED_STRING_BYTES),
+            max_entries: MAX_NODE_SET_ENTRIES,
+            max_owned_string_bytes: MAX_NODE_SET_OWNED_STRING_BYTES,
+            max_cumulative_owned_string_bytes: MAX_NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
         }
     }
 }
 
 impl NodeSetMaterializationBudget {
     fn charge(&self, owned_string_bytes: usize) -> Result<(), TransformError> {
+        let remaining_before = self.remaining_owned_string_bytes.get();
         let Some(remaining) = self
             .remaining_owned_string_bytes
             .get()
             .checked_sub(owned_string_bytes)
         else {
             self.remaining_owned_string_bytes.set(0);
-            return Err(TransformError::NodeSetCumulativeStringsTooLarge {
-                max_bytes: MAX_NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
-            });
+            let consumed = self
+                .max_cumulative_owned_string_bytes
+                .saturating_sub(remaining_before);
+            return Err(transform_resource_limit(
+                crate::policy::resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
+                self.max_cumulative_owned_string_bytes,
+                consumed.saturating_add(owned_string_bytes),
+            ));
         };
         self.remaining_owned_string_bytes.set(remaining);
         Ok(())
@@ -129,6 +144,21 @@ impl NodeSetMaterializationBudget {
     pub(crate) fn with_limit(limit: usize) -> Self {
         Self {
             remaining_owned_string_bytes: Cell::new(limit),
+            max_cumulative_owned_string_bytes: limit,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_limits(
+        max_entries: usize,
+        max_owned_string_bytes: usize,
+        max_cumulative_owned_string_bytes: usize,
+    ) -> Self {
+        Self {
+            remaining_owned_string_bytes: Cell::new(max_cumulative_owned_string_bytes),
+            max_entries,
+            max_owned_string_bytes,
+            max_cumulative_owned_string_bytes,
         }
     }
 }
@@ -138,6 +168,36 @@ impl XmlNodeKey {
         match self {
             Self::Tree(id) => *id,
             Self::Attribute { owner, .. } | Self::Namespace { owner, .. } => *owner,
+        }
+    }
+
+    fn owned_string_bytes(&self) -> usize {
+        match self {
+            Self::Tree(_) => 0,
+            Self::Attribute {
+                namespace,
+                local_name,
+                ..
+            } => namespace
+                .as_ref()
+                .map_or(0, String::len)
+                .saturating_add(local_name.len()),
+            Self::Namespace { prefix, uri, .. } => prefix.len().saturating_add(uri.len()),
+        }
+    }
+
+    fn checked_owned_string_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Tree(_) => Some(0),
+            Self::Attribute {
+                namespace,
+                local_name,
+                ..
+            } => namespace
+                .as_ref()
+                .map_or(0, String::len)
+                .checked_add(local_name.len()),
+            Self::Namespace { prefix, uri, .. } => prefix.len().checked_add(uri.len()),
         }
     }
 }
@@ -150,9 +210,8 @@ impl<'a> NodeSet<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`TransformError::NodeSetTooLarge`] or
-    /// [`TransformError::NodeSetStringsTooLarge`] when projecting the document's
-    /// tree, attribute, namespace, or owned string data would exceed its budget.
+    /// Returns [`TransformError::Policy`] when projecting the document's tree,
+    /// attribute, namespace, or owned string data would exceed its budget.
     pub fn entire_document_without_comments(doc: &'a Document<'a>) -> Result<Self, TransformError> {
         Self::ensure_subtree_materialization_fits(doc.root())?;
         Ok(Self::collect_document(doc, false))
@@ -172,9 +231,8 @@ impl<'a> NodeSet<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`TransformError::NodeSetTooLarge`] or
-    /// [`TransformError::NodeSetStringsTooLarge`] when projecting the document's
-    /// tree, attribute, namespace, or owned string data would exceed its budget.
+    /// Returns [`TransformError::Policy`] when projecting the document's tree,
+    /// attribute, namespace, or owned string data would exceed its budget.
     pub fn entire_document_with_comments(doc: &'a Document<'a>) -> Result<Self, TransformError> {
         Self::ensure_subtree_materialization_fits(doc.root())?;
         Ok(Self::collect_document(doc, true))
@@ -194,9 +252,8 @@ impl<'a> NodeSet<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`TransformError::NodeSetTooLarge`] or
-    /// [`TransformError::NodeSetStringsTooLarge`] when projecting the subtree's
-    /// tree, attribute, namespace, or owned string data would exceed its budget.
+    /// Returns [`TransformError::Policy`] when projecting the subtree's tree,
+    /// attribute, namespace, or owned string data would exceed its budget.
     pub fn subtree(element: Node<'a, 'a>) -> Result<Self, TransformError> {
         Self::ensure_subtree_materialization_fits(element)?;
         Ok(Self::collect_subtree(element))
@@ -217,6 +274,7 @@ impl<'a> NodeSet<'a> {
         let mut set = Self {
             doc: element.document(),
             nodes: HashSet::new(),
+            owned_string_bytes: 0,
             with_comments: false,
         };
         for node in element.descendants().filter(|node| !node.is_comment()) {
@@ -245,6 +303,7 @@ impl<'a> NodeSet<'a> {
         let mut set = Self {
             doc: element.document(),
             nodes: HashSet::new(),
+            owned_string_bytes: 0,
             with_comments: true,
         };
         set.insert_subtree(element);
@@ -286,6 +345,7 @@ impl<'a> NodeSet<'a> {
         // either walking ancestors per key or materializing the excluded subtree.
         self.nodes
             .retain(|key| !excluded_ids.contains(&key.owner_id().get()));
+        self.refresh_owned_string_bytes();
     }
 
     /// Whether comments are included in this node set.
@@ -297,6 +357,7 @@ impl<'a> NodeSet<'a> {
         Self {
             doc,
             nodes: HashSet::new(),
+            owned_string_bytes: 0,
             with_comments: false,
         }
     }
@@ -331,11 +392,17 @@ impl<'a> NodeSet<'a> {
         local_name: &str,
     ) {
         if self.owns(owner) {
-            self.nodes.insert(XmlNodeKey::Attribute {
+            let key = XmlNodeKey::Attribute {
                 owner: owner.id(),
                 namespace: namespace.map(str::to_owned),
                 local_name: local_name.to_owned(),
-            });
+            };
+            if self.nodes.insert(key) {
+                self.owned_string_bytes = self
+                    .owned_string_bytes
+                    .saturating_add(namespace.map_or(0, str::len))
+                    .saturating_add(local_name.len());
+            }
         }
     }
 
@@ -347,25 +414,31 @@ impl<'a> NodeSet<'a> {
         budget: &NodeSetMaterializationBudget,
     ) -> Result<(), TransformError> {
         if self.owns(owner) {
-            let owned_string_bytes = namespace
-                .map_or(0, str::len)
-                .checked_add(local_name.len())
-                .ok_or(TransformError::NodeSetStringsTooLarge {
-                    max_bytes: MAX_NODE_SET_OWNED_STRING_BYTES,
-                })?;
-            budget.charge(owned_string_bytes)?;
-            self.insert_attribute(owner, namespace, local_name);
+            self.insert_projected_key_with_budget(
+                XmlNodeKey::Attribute {
+                    owner: owner.id(),
+                    namespace: namespace.map(str::to_owned),
+                    local_name: local_name.to_owned(),
+                },
+                budget,
+            )?;
         }
         Ok(())
     }
 
     pub(crate) fn insert_namespace(&mut self, owner: Node<'_, '_>, prefix: &str, uri: &str) {
         if self.owns(owner) {
-            self.nodes.insert(XmlNodeKey::Namespace {
+            let key = XmlNodeKey::Namespace {
                 owner: owner.id(),
                 prefix: prefix.to_owned(),
                 uri: uri.to_owned(),
-            });
+            };
+            if self.nodes.insert(key) {
+                self.owned_string_bytes = self
+                    .owned_string_bytes
+                    .saturating_add(prefix.len())
+                    .saturating_add(uri.len());
+            }
         }
     }
 
@@ -377,13 +450,53 @@ impl<'a> NodeSet<'a> {
         budget: &NodeSetMaterializationBudget,
     ) -> Result<(), TransformError> {
         if self.owns(owner) {
-            let owned_string_bytes = prefix.len().checked_add(uri.len()).ok_or(
-                TransformError::NodeSetStringsTooLarge {
-                    max_bytes: MAX_NODE_SET_OWNED_STRING_BYTES,
+            self.insert_projected_key_with_budget(
+                XmlNodeKey::Namespace {
+                    owner: owner.id(),
+                    prefix: prefix.to_owned(),
+                    uri: uri.to_owned(),
                 },
+                budget,
             )?;
-            budget.charge(owned_string_bytes)?;
-            self.insert_namespace(owner, prefix, uri);
+        }
+        Ok(())
+    }
+
+    fn insert_projected_key_with_budget(
+        &mut self,
+        key: XmlNodeKey,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<(), TransformError> {
+        if self.nodes.contains(&key) {
+            return Ok(());
+        }
+        let additional_bytes = key.checked_owned_string_bytes().ok_or_else(|| {
+            transform_resource_limit(
+                crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+                budget.max_owned_string_bytes,
+                usize::MAX,
+            )
+        })?;
+        let total_bytes = self.owned_string_bytes.saturating_add(additional_bytes);
+        if total_bytes > budget.max_owned_string_bytes {
+            return Err(transform_resource_limit(
+                crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+                budget.max_owned_string_bytes,
+                total_bytes,
+            ));
+        }
+        if self.nodes.len() >= budget.max_entries {
+            return Err(transform_resource_limit(
+                crate::policy::resource_name::NODE_SET_ENTRIES,
+                budget.max_entries,
+                self.nodes.len().saturating_add(1),
+            ));
+        }
+        budget.charge(additional_bytes)?;
+        let inserted = self.nodes.insert(key);
+        debug_assert!(inserted, "the duplicate key was checked before insertion");
+        if inserted {
+            self.owned_string_bytes = total_bytes;
         }
         Ok(())
     }
@@ -410,16 +523,19 @@ impl<'a> NodeSet<'a> {
     pub(crate) fn intersect_with(&mut self, other: &Self) {
         if !std::ptr::eq(self.doc as *const _, other.doc as *const _) {
             self.nodes.clear();
+            self.owned_string_bytes = 0;
             self.with_comments = false;
             return;
         }
         self.nodes.retain(|key| other.nodes.contains(key));
+        self.refresh_owned_string_bytes();
         self.with_comments &= other.with_comments;
     }
 
     pub(crate) fn subtract(&mut self, other: &Self) {
         if std::ptr::eq(self.doc as *const _, other.doc as *const _) {
             self.nodes.retain(|key| !other.nodes.contains(key));
+            self.refresh_owned_string_bytes();
         }
     }
 
@@ -433,17 +549,25 @@ impl<'a> NodeSet<'a> {
                 if self.nodes.contains(key) {
                     continue;
                 }
-                let owned_string_bytes = match key {
-                    XmlNodeKey::Tree(_) => 0,
-                    XmlNodeKey::Attribute {
-                        namespace,
-                        local_name,
-                        ..
-                    } => namespace.as_ref().map_or(0, String::len) + local_name.len(),
-                    XmlNodeKey::Namespace { prefix, uri, .. } => prefix.len() + uri.len(),
-                };
+                let owned_string_bytes = key.owned_string_bytes();
+                let total_bytes = self.owned_string_bytes.saturating_add(owned_string_bytes);
+                if total_bytes > budget.max_owned_string_bytes {
+                    return Err(transform_resource_limit(
+                        crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+                        budget.max_owned_string_bytes,
+                        total_bytes,
+                    ));
+                }
+                if self.nodes.len() >= budget.max_entries {
+                    return Err(transform_resource_limit(
+                        crate::policy::resource_name::NODE_SET_ENTRIES,
+                        budget.max_entries,
+                        self.nodes.len().saturating_add(1),
+                    ));
+                }
                 budget.charge(owned_string_bytes)?;
                 self.nodes.insert(key.clone());
+                self.owned_string_bytes = total_bytes;
             }
             self.with_comments |= other.with_comments;
         }
@@ -463,22 +587,56 @@ impl<'a> NodeSet<'a> {
         set
     }
 
+    fn refresh_owned_string_bytes(&mut self) {
+        self.owned_string_bytes = self.nodes.iter().fold(0_usize, |total, key| {
+            total.saturating_add(key.owned_string_bytes())
+        });
+    }
+
     pub(crate) fn ensure_subtree_materialization_fits(
         root: Node<'_, '_>,
     ) -> Result<usize, TransformError> {
         Ok(Self::subtree_materialization(root)?.entries)
     }
 
+    pub(crate) fn ensure_subtree_materialization_fits_with_budget(
+        root: Node<'_, '_>,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<usize, TransformError> {
+        Ok(Self::subtree_materialization_with_limits(
+            root,
+            budget.max_entries,
+            budget.max_owned_string_bytes,
+        )?
+        .entries)
+    }
+
     fn charge_subtree_materialization(
         root: Node<'_, '_>,
         budget: &NodeSetMaterializationBudget,
     ) -> Result<(), TransformError> {
-        let materialization = Self::subtree_materialization(root)?;
+        let materialization = Self::subtree_materialization_with_limits(
+            root,
+            budget.max_entries,
+            budget.max_owned_string_bytes,
+        )?;
         budget.charge(materialization.owned_string_bytes)
     }
 
     fn subtree_materialization(
         root: Node<'_, '_>,
+    ) -> Result<NodeSetMaterialization, TransformError> {
+        Self::subtree_materialization_with_limits(
+            root,
+            MAX_NODE_SET_ENTRIES,
+            MAX_NODE_SET_OWNED_STRING_BYTES,
+        )
+    }
+
+    fn subtree_materialization_with_limits(
+        root: Node<'_, '_>,
+        max_entries: usize,
+        max_owned_string_bytes: usize,
     ) -> Result<NodeSetMaterialization, TransformError> {
         let mut entries = 0_usize;
         let mut owned_string_bytes = 0_usize;
@@ -489,17 +647,25 @@ impl<'a> NodeSet<'a> {
                     owned_string_bytes = charge_node_set_string_bytes(
                         owned_string_bytes,
                         attribute.namespace().map_or(0, str::len),
+                        max_owned_string_bytes,
                     )?;
-                    owned_string_bytes =
-                        charge_node_set_string_bytes(owned_string_bytes, attribute.name().len())?;
+                    owned_string_bytes = charge_node_set_string_bytes(
+                        owned_string_bytes,
+                        attribute.name().len(),
+                        max_owned_string_bytes,
+                    )?;
                 }
                 for namespace in node.namespaces() {
                     owned_string_bytes = charge_node_set_string_bytes(
                         owned_string_bytes,
                         namespace.name().map_or(0, str::len),
+                        max_owned_string_bytes,
                     )?;
-                    owned_string_bytes =
-                        charge_node_set_string_bytes(owned_string_bytes, namespace.uri().len())?;
+                    owned_string_bytes = charge_node_set_string_bytes(
+                        owned_string_bytes,
+                        namespace.uri().len(),
+                        max_owned_string_bytes,
+                    )?;
                 }
                 1_usize
                     .checked_add(node.attributes().len())
@@ -507,18 +673,26 @@ impl<'a> NodeSet<'a> {
             } else {
                 Some(1)
             }
-            .ok_or(TransformError::NodeSetTooLarge {
-                max: MAX_NODE_SET_ENTRIES,
+            .ok_or_else(|| {
+                transform_resource_limit(
+                    crate::policy::resource_name::NODE_SET_ENTRIES,
+                    max_entries,
+                    usize::MAX,
+                )
             })?;
-            entries = entries
-                .checked_add(projected)
-                .ok_or(TransformError::NodeSetTooLarge {
-                    max: MAX_NODE_SET_ENTRIES,
-                })?;
-            if entries > MAX_NODE_SET_ENTRIES {
-                return Err(TransformError::NodeSetTooLarge {
-                    max: MAX_NODE_SET_ENTRIES,
-                });
+            entries = entries.checked_add(projected).ok_or_else(|| {
+                transform_resource_limit(
+                    crate::policy::resource_name::NODE_SET_ENTRIES,
+                    max_entries,
+                    usize::MAX,
+                )
+            })?;
+            if entries > max_entries {
+                return Err(transform_resource_limit(
+                    crate::policy::resource_name::NODE_SET_ENTRIES,
+                    max_entries,
+                    entries,
+                ));
             }
             stack.extend(node.children());
         }
@@ -541,16 +715,21 @@ struct NodeSetMaterialization {
 fn charge_node_set_string_bytes(
     current: usize,
     additional: usize,
+    max_bytes: usize,
 ) -> Result<usize, TransformError> {
-    let total = current
-        .checked_add(additional)
-        .ok_or(TransformError::NodeSetStringsTooLarge {
-            max_bytes: MAX_NODE_SET_OWNED_STRING_BYTES,
-        })?;
-    if total > MAX_NODE_SET_OWNED_STRING_BYTES {
-        return Err(TransformError::NodeSetStringsTooLarge {
-            max_bytes: MAX_NODE_SET_OWNED_STRING_BYTES,
-        });
+    let total = current.checked_add(additional).ok_or_else(|| {
+        transform_resource_limit(
+            crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+            max_bytes,
+            usize::MAX,
+        )
+    })?;
+    if total > max_bytes {
+        return Err(transform_resource_limit(
+            crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+            max_bytes,
+            total,
+        ));
     }
     Ok(total)
 }
@@ -596,6 +775,10 @@ impl NodeVisibility for NodeSet<'_> {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransformError {
+    /// The active operation policy rejected transform processing.
+    #[error("transform policy violation: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
+
     /// Data type mismatch between transforms.
     #[error("type mismatch: expected {expected}, got {got}")]
     TypeMismatch {
@@ -617,89 +800,13 @@ pub enum TransformError {
     #[error("unsupported transform: {0}")]
     UnsupportedTransform(String),
 
-    /// A reference declared more transforms than the implementation permits.
-    #[error("transform chain exceeds maximum length of {max}")]
-    TooManyTransforms {
-        /// Maximum accepted transforms in one reference.
-        max: usize,
-    },
-
-    /// Exact XPath node projection would exceed the materialization budget.
-    #[error("node-set materialization exceeds maximum of {max} entries")]
-    NodeSetTooLarge {
-        /// Maximum tree, attribute, and namespace entries accepted.
-        max: usize,
-    },
-
-    /// Owned names and namespace bindings would exceed the byte budget.
-    #[error("node-set materialization exceeds maximum of {max_bytes} owned string bytes")]
-    NodeSetStringsTooLarge {
-        /// Maximum string bytes cloned into one exact XPath node projection.
-        max_bytes: usize,
-    },
-
-    /// Repeated node-set projections would cumulatively clone too many strings.
-    #[error(
-        "node-set materialization exceeds signature-wide maximum of {max_bytes} cumulative owned string bytes"
-    )]
-    NodeSetCumulativeStringsTooLarge {
-        /// Maximum owned string bytes cloned across one signature execution.
-        max_bytes: usize,
-    },
-
-    /// Node-set filtering would exceed the cumulative transform work budget.
-    #[error("node-set filtering exceeds signature-wide maximum of {max_entries} entry visits")]
-    NodeSetFilterWorkTooLarge {
-        /// Maximum node-set entries visited across one signature execution.
-        max_entries: usize,
-    },
-
-    /// Temporary XPath documents would cumulatively copy too many strings.
-    #[error(
-        "XPath mirrors exceed signature-wide maximum of {max_bytes} cumulative copied string bytes"
-    )]
-    XPathMirrorTooLarge {
-        /// Maximum string bytes copied across one signature execution.
-        max_bytes: usize,
-    },
-
-    /// Non-interruptible XPath evaluations would scan too much source text.
-    #[error(
-        "XPath transform exceeds signature-wide maximum of {max_bytes} string-processing work bytes"
-    )]
-    XPathStringWorkTooLarge {
-        /// Maximum conservatively charged source-string bytes per signature.
-        max_bytes: usize,
-    },
-
     /// Canonicalization error during transform.
     #[error("C14N error: {0}")]
     C14n(#[from] crate::c14n::C14nError),
 
-    /// Explicit canonicalization produced too much output in one execution.
-    #[error("cumulative canonical output exceeds signature-wide maximum of {max_bytes} bytes")]
-    C14nOutputTooLarge {
-        /// Maximum canonical bytes produced across one signature execution.
-        max_bytes: usize,
-    },
-
     /// Base64 decoding failed during the standard XMLDSig Base64 transform.
     #[error("base64 transform decode error: {0}")]
     Base64(String),
-
-    /// Raw Base64 transform input exceeded its cumulative execution budget.
-    #[error("cumulative base64 transform input exceeds maximum of {max_bytes} bytes")]
-    Base64InputTooLarge {
-        /// Maximum raw input bytes accepted across one signature execution.
-        max_bytes: usize,
-    },
-
-    /// Decoded Base64 transform output exceeded its allocation budget.
-    #[error("base64 transform output exceeds maximum of {max_bytes} bytes")]
-    Base64OutputTooLarge {
-        /// Maximum decoded output bytes produced by one Base64 transform.
-        max_bytes: usize,
-    },
 
     /// XPath parsing or evaluation failed.
     #[error("XPath transform error: {0}")]
@@ -710,56 +817,87 @@ pub enum TransformError {
     #[error("XML transform input parse error: {0}")]
     XmlParse(String),
 
-    /// XML octets exceeded the operation policy's document node ceiling.
-    #[error("XML transform input exceeds the configured node limit")]
-    XmlNodeLimit,
-
-    /// Effective XML Base resolution crossed too many inherited attributes.
-    #[error("XML Base resolution exceeds maximum of {max} inherited components: got {actual}")]
-    XmlBaseComponentsTooLarge {
-        /// Maximum inherited components permitted by the operation policy.
-        max: usize,
-        /// Number of inherited components encountered.
-        actual: usize,
-    },
-
-    /// Effective XML Base resolution exhausted its cumulative byte budget.
-    #[error("XML Base resolution exceeds cumulative maximum of {max_bytes} bytes: got {actual}")]
-    XmlBaseResolutionTooLarge {
-        /// Maximum cumulative bytes permitted by the operation policy.
-        max_bytes: usize,
-        /// Conservatively charged cumulative byte count.
-        actual: usize,
-    },
-
-    /// One external resource exceeds the operation's per-resource byte limit.
-    #[error("external resource bytes exceed maximum of {max_bytes}: got {actual}")]
-    ExternalResourceTooLarge {
-        /// Maximum bytes permitted for one external resource.
-        max_bytes: usize,
-        /// Bytes in the selected external resource.
-        actual: usize,
-    },
-
-    /// Repeated external dereferences exhausted the operation-wide byte budget.
-    #[error("aggregate external resource bytes exceed maximum of {max_bytes}: got {actual}")]
-    ExternalResourceTotalTooLarge {
-        /// Maximum cumulative bytes permitted across dereferences.
-        max_bytes: usize,
-        /// Cumulative dereferenced bytes that exceeded the maximum.
-        actual: usize,
-    },
-
     /// The Signature node passed to the enveloped transform belongs to a
     /// different `Document` than the input `NodeSet`.
     #[error("enveloped-signature transform: invalid Signature node for this document")]
     CrossDocumentSignatureNode,
 }
 
+pub(crate) fn transform_resource_limit(
+    resource: &'static str,
+    maximum: usize,
+    actual: usize,
+) -> TransformError {
+    crate::policy::PolicyViolation::ResourceLimit {
+        resource,
+        maximum,
+        actual,
+    }
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::c14n::{C14nAlgorithm, C14nMode, canonicalize_with_visibility};
+
+    #[test]
+    fn incremental_projection_enforces_aggregate_owned_string_policy() {
+        // XPath builds arbitrary projected sets incrementally. Individually small
+        // attribute keys must not bypass the per-set aggregate string ceiling.
+        let document = Document::parse("<root/>").expect("fixed XML must parse");
+        let root = document.root_element();
+        let mut nodes = NodeSet::empty(&document);
+        let budget = NodeSetMaterializationBudget::with_limits(16, 3, 16);
+
+        nodes
+            .insert_attribute_with_budget(root, None, "a", &budget)
+            .expect("the first one-byte attribute name must fit");
+        let error = nodes
+            .insert_attribute_with_budget(root, None, "bbb", &budget)
+            .expect_err("aggregate projected names must exceed three bytes");
+
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "node-set owned string bytes",
+                maximum: 3,
+                actual: 4,
+            })
+        ));
+    }
+
+    #[test]
+    fn projected_attribute_and_namespace_share_one_budget_path() {
+        // Duplicate projected keys are free, while distinct attributes and
+        // namespaces consume the same operation-wide owned-string allowance.
+        let document = Document::parse("<root/>").expect("fixed XML must parse");
+        let root = document.root_element();
+        let mut nodes = NodeSet::empty(&document);
+        let budget = NodeSetMaterializationBudget::with_limits(16, 16, 3);
+
+        nodes
+            .insert_namespace_with_budget(root, "p", "u", &budget)
+            .expect("two namespace bytes must fit");
+        nodes
+            .insert_namespace_with_budget(root, "p", "u", &budget)
+            .expect("a duplicate namespace must not consume budget twice");
+        nodes
+            .insert_attribute_with_budget(root, None, "a", &budget)
+            .expect("one remaining byte must admit an attribute");
+        let error = nodes
+            .insert_attribute_with_budget(root, None, "b", &budget)
+            .expect_err("distinct projected keys must share cumulative accounting");
+
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "cumulative node-set owned string bytes",
+                maximum: 3,
+                actual: 4,
+            })
+        ));
+    }
 
     #[test]
     fn document_without_comments_preserves_comment_policy() {
@@ -831,7 +969,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            TransformError::NodeSetStringsTooLarge { .. }
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "node-set owned string bytes",
+                ..
+            })
         ));
     }
 

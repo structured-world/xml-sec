@@ -2004,7 +2004,7 @@ mod tests {
         assert!(matches!(
             error,
             XmlMutationError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "XML document",
+                resource: crate::policy::resource_name::XML_DOCUMENT,
                 maximum: observed_maximum,
                 actual,
             }) if observed_maximum == maximum && actual == wrapped.len()

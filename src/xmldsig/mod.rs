@@ -90,9 +90,8 @@ pub use signature::{
 };
 pub use transforms::{
     BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, ENVELOPED_SIGNATURE_URI, Transform,
-    TransformOptions, XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI, XPathExpression,
-    XPathFilter, XPathFilterOperation, XPathHereSemantics, execute_transforms,
-    execute_transforms_with_options, parse_transforms,
+    XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI, XPathExpression, XPathFilter,
+    XPathFilterOperation, XPathHereSemantics, execute_transforms, parse_transforms,
 };
 pub use types::{NodeSet, TransformData, TransformError};
 pub use verify::{

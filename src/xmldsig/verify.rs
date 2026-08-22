@@ -15,7 +15,7 @@ use roxmltree::{Document, Node, NodeId};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
-use crate::c14n::{canonicalize_bounded_with_xml_base_budget, is_output_limit_error};
+use crate::c14n::canonicalize_bounded_with_xml_base_budget;
 use crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING;
 
 #[cfg(test)]
@@ -43,7 +43,8 @@ use super::transforms::BASE64_TRANSFORM_URI;
 use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget, TransformOptions,
     XPATH_TRANSFORM_URI, XPathHereSemantics, XPathSignatureParseBudget,
-    execute_transforms_with_options_and_budget, transform_chain_produces_binary,
+    execute_transforms_with_options_and_budget, map_c14n_resource_policy_violation,
+    transform_chain_produces_binary,
 };
 use super::uri::{UriReferenceResolver, same_document_reference_id};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
@@ -205,7 +206,7 @@ impl UriTypeSet {
         allow_external: true,
     };
 
-    fn allows(self, uri: &str) -> bool {
+    pub(crate) fn allows(self, uri: &str) -> bool {
         match classify_uri(uri) {
             UriClass::Empty => self.allow_empty,
             UriClass::SameDocument => self.allow_same_document,
@@ -337,7 +338,7 @@ impl<'a> VerifyContext<'a> {
 
     /// Restrict allowed reference URI classes.
     pub fn allowed_uri_types(mut self, types: UriTypeSet) -> Self {
-        self.policy.reference_uri_types = types;
+        self.policy.uris.references = types;
         self
     }
 
@@ -348,7 +349,7 @@ impl<'a> VerifyContext<'a> {
     /// Same-document retrieval is enabled by default; external retrieval requires
     /// an explicit opt-in and still uses only caller-supplied resources.
     pub fn allowed_retrieval_method_uri_types(mut self, types: UriTypeSet) -> Self {
-        self.policy.retrieval_uri_types = types;
+        self.policy.uris.retrieval_methods = types;
         self
     }
 
@@ -411,7 +412,8 @@ impl<'a> VerifyContext<'a> {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.policy.transforms = Some(transforms.into_iter().map(Into::into).collect());
+        self.policy.transforms.allowed_algorithms =
+            Some(transforms.into_iter().map(Into::into).collect());
         self
     }
 
@@ -420,8 +422,8 @@ impl<'a> VerifyContext<'a> {
     /// Retained reference buffers and canonicalized `<SignedInfo>` share a
     /// non-configurable 32 MiB safety ceiling. Canonicalized `<SignedInfo>` is
     /// charged even when diagnostic retention is disabled because signature
-    /// verification always materializes it. Verification returns
-    /// [`ReferenceProcessingError::CanonicalizedDataTooLarge`] on overflow.
+    /// verification always materializes it. Overflow remains a typed policy
+    /// violation at both low-level and end-to-end entry points.
     pub fn store_pre_digest(mut self, enabled: bool) -> Self {
         self.store_pre_digest = enabled;
         self
@@ -433,18 +435,18 @@ impl<'a> VerifyContext<'a> {
     /// Use [`XPathHereSemantics::XmlSecLegacy`] only for documents known to
     /// have been generated with libxmlsec1's `<Transform>` interpretation.
     pub fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
-        self.policy.xpath_here_semantics = semantics;
+        self.policy.transforms.xpath_here_semantics = semantics;
         self
     }
 
     fn allowed_transform_uris(&self) -> Option<&HashSet<String>> {
-        self.policy.transforms.as_ref()
+        self.policy.transforms.allowed_algorithms.as_ref()
     }
 
     fn transform_options(&self) -> TransformOptions {
         TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
-            .xpath_here_semantics(self.policy.xpath_here_semantics)
+            .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
     }
 
     /// Verify one XMLDSig signature using this context.
@@ -673,11 +675,17 @@ impl CanonicalizedDataBudget {
     }
 
     fn charge(&self, bytes: usize) -> Result<(), ReferenceProcessingError> {
-        let Some(remaining) = self.remaining.get().checked_sub(bytes) else {
+        let available = self.remaining.get();
+        let Some(remaining) = available.checked_sub(bytes) else {
             self.remaining.set(0);
-            return Err(ReferenceProcessingError::CanonicalizedDataTooLarge {
-                max_bytes: self.max_bytes,
-            });
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::CANONICALIZED_BYTES,
+                maximum: self.max_bytes,
+                actual: self
+                    .max_bytes
+                    .saturating_add(bytes.saturating_sub(available)),
+            }
+            .into());
         };
         self.remaining.set(remaining);
         Ok(())
@@ -840,6 +848,10 @@ fn process_all_references_with_options(
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReferenceProcessingError {
+    /// The immutable verification policy rejected reference processing.
+    #[error("verification policy violation: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
+
     /// The selected provider could not compute the declared digest.
     #[error("cryptographic provider error: {0}")]
     Provider(#[from] crate::provider::ProviderError),
@@ -855,13 +867,6 @@ pub enum ReferenceProcessingError {
     /// Transform execution failed.
     #[error("transform failed: {0}")]
     Transform(#[source] super::types::TransformError),
-
-    /// Canonicalized signature data would exceed its signature-wide cap.
-    #[error("canonicalized signature data exceeds signature-wide maximum of {max_bytes} bytes")]
-    CanonicalizedDataTooLarge {
-        /// Maximum bytes consumed by canonicalized SignedInfo and retained diagnostics.
-        max_bytes: usize,
-    },
 }
 
 /// End-to-end XMLDSig verification result for one `<Signature>`.
@@ -932,7 +937,7 @@ pub enum DsigError {
 
     /// `<SignedInfo>` parsing failed.
     #[error("failed to parse SignedInfo: {0}")]
-    ParseSignedInfo(#[from] super::parse::ParseError),
+    ParseSignedInfo(super::parse::ParseError),
 
     /// `<KeyInfo>` parsing failed.
     #[error("failed to parse KeyInfo: {0}")]
@@ -948,7 +953,7 @@ pub enum DsigError {
 
     /// Reference processing failed.
     #[error("reference processing failed: {0}")]
-    Reference(#[from] ReferenceProcessingError),
+    Reference(ReferenceProcessingError),
 
     /// SignedInfo canonicalization failed.
     #[error("SignedInfo canonicalization failed: {0}")]
@@ -961,20 +966,51 @@ pub enum DsigError {
     /// Cryptographic verification failed before validity decision.
     #[error("signature verification failed: {0}")]
     Crypto(#[from] SignatureVerificationError),
+}
 
-    /// A `<Reference>` URI class is rejected by policy.
-    #[error("reference URI is not allowed by policy: {uri}")]
-    DisallowedUri {
-        /// Offending URI value from `<Reference URI="...">`.
-        uri: String,
-    },
+impl From<super::parse::ParseError> for DsigError {
+    fn from(error: super::parse::ParseError) -> Self {
+        match error {
+            super::parse::ParseError::Policy(error) => Self::Policy(error),
+            super::parse::ParseError::Transform(super::TransformError::Policy(error)) => {
+                Self::Policy(error)
+            }
+            error => Self::ParseSignedInfo(error),
+        }
+    }
+}
 
-    /// A `<Transform>` algorithm is rejected by policy.
-    #[error("transform is not allowed by policy: {algorithm}")]
-    DisallowedTransform {
-        /// Rejected transform algorithm URI.
-        algorithm: String,
-    },
+fn map_key_info_parse_error(error: super::parse::ParseError) -> DsigError {
+    match error {
+        super::parse::ParseError::Policy(error)
+        | super::parse::ParseError::Transform(super::TransformError::Policy(error)) => {
+            DsigError::Policy(error)
+        }
+        error => DsigError::ParseKeyInfo(error),
+    }
+}
+
+fn map_manifest_parse_error(error: super::parse::ParseError) -> DsigError {
+    match error {
+        super::parse::ParseError::Policy(error)
+        | super::parse::ParseError::Transform(super::TransformError::Policy(error)) => {
+            DsigError::Policy(error)
+        }
+        error => DsigError::ParseManifestReference(error),
+    }
+}
+
+impl From<ReferenceProcessingError> for DsigError {
+    fn from(error: ReferenceProcessingError) -> Self {
+        match error {
+            ReferenceProcessingError::Policy(error) => Self::Policy(error),
+            ReferenceProcessingError::UriDereference(super::TransformError::Policy(error))
+            | ReferenceProcessingError::Transform(super::TransformError::Policy(error)) => {
+                Self::Policy(error)
+            }
+            error => Self::Reference(error),
+        }
+    }
 }
 
 type SignatureVerificationPipelineError = DsigError;
@@ -1115,17 +1151,17 @@ fn verify_signature_with_context(
                 )
             })
             .transpose()
-            .map_err(SignatureVerificationPipelineError::ParseKeyInfo)?
+            .map_err(map_key_info_parse_error)?
     } else {
         None
     };
 
-    let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+    let mut xpath_parse_budget = XPathSignatureParseBudget::from_resources(&ctx.policy.resources);
     let signed_info =
         parse_signed_info_with_xpath_budget(signed_info_node, &mut xpath_parse_budget)?;
     if signed_info.references.len() > ctx.policy.resources.max_references {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "signature references",
+            resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
             maximum: ctx.policy.resources.max_references,
             actual: signed_info.references.len(),
         }
@@ -1134,7 +1170,7 @@ fn verify_signature_with_context(
     for reference in &signed_info.references {
         if reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "reference transforms",
+                resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
                 maximum: ctx.policy.resources.max_transforms_per_reference,
                 actual: reference.transforms.len(),
             }
@@ -1159,7 +1195,7 @@ fn verify_signature_with_context(
     }
     enforce_reference_policies(
         &signed_info.references,
-        ctx.policy.reference_uri_types,
+        ctx.policy.uris.references,
         ctx.allowed_transform_uris(),
     )?;
     enforce_transform_allowed(ctx.allowed_transform_uris(), signed_info.c14n_method.uri())?;
@@ -1169,7 +1205,7 @@ fn verify_signature_with_context(
         for bytes in resources.values() {
             if bytes.len() > ctx.policy.resources.max_external_resource_bytes {
                 return Err(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "external resource bytes",
+                    resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
                     maximum: ctx.policy.resources.max_external_resource_bytes,
                     actual: bytes.len(),
                 }
@@ -1183,7 +1219,7 @@ fn verify_signature_with_context(
         }
         if total > ctx.policy.resources.max_external_resource_total_bytes {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "aggregate external resource bytes",
+                resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
                 maximum: ctx.policy.resources.max_external_resource_total_bytes,
                 actual: total,
             }
@@ -1191,12 +1227,14 @@ fn verify_signature_with_context(
         }
     }
     let retrieval_materialization = if let Some(info) = key_info.as_mut() {
-        materialize_retrieval_methods(
+        materialize_retrieval_methods_with_budgets(
             info,
             &resolver,
-            ctx.policy.retrieval_uri_types,
+            ctx.policy.uris.retrieval_methods,
             ctx.allowed_transform_uris(),
             ctx.provider,
+            &mut xpath_parse_budget,
+            &execution_budget,
         )?
     } else {
         RetrievalMaterialization::default()
@@ -1244,12 +1282,12 @@ fn verify_signature_with_context(
         &mut canonical_signed_info,
     )
     .map_err(|error| {
-        if is_output_limit_error(&error) {
-            SignatureVerificationPipelineError::Reference(
-                ReferenceProcessingError::CanonicalizedDataTooLarge {
-                    max_bytes: canonicalized_data_budget.max_bytes,
-                },
-            )
+        if let Some(violation) = map_c14n_resource_policy_violation(
+            &error,
+            crate::policy::resource_name::CANONICALIZED_BYTES,
+            canonicalized_data_budget.max_bytes,
+        ) {
+            SignatureVerificationPipelineError::Policy(violation)
         } else {
             SignatureVerificationPipelineError::Canonicalization(error)
         }
@@ -1366,12 +1404,14 @@ struct RetrievalMaterialization {
     deferred_error: Option<SignatureVerificationPipelineError>,
 }
 
-fn materialize_retrieval_methods(
+fn materialize_retrieval_methods_with_budgets(
     key_info: &mut KeyInfo,
     resolver: &UriReferenceResolver<'_>,
     allowed_uri_types: UriTypeSet,
     allowed_transforms: Option<&HashSet<String>>,
     provider: &dyn crate::provider::CryptoProvider,
+    xpath_parse_budget: &mut XPathSignatureParseBudget,
+    execution_budget: &TransformExecutionBudget,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
     let retrieval_count = key_info
         .sources
@@ -1399,7 +1439,11 @@ fn materialize_retrieval_methods(
             continue;
         };
 
-        let identity = (resolved_uri.clone(), resource_type.clone(), transforms);
+        let identity = (
+            resolved_uri.clone(),
+            resource_type.clone(),
+            transforms.clone(),
+        );
         if !seen.insert(identity) {
             continue;
         }
@@ -1414,14 +1458,14 @@ fn materialize_retrieval_methods(
                 });
             }
             if !allowed_uri_types.allows(&resolved_uri) {
-                return Err(SignatureVerificationPipelineError::DisallowedUri {
-                    uri: resolved_uri,
-                });
+                return Err(crate::policy::PolicyViolation::Uri {
+                    operation: "verification",
+                    reason: "retrieval method URI class is not permitted",
+                }
+                .into());
             }
             let certificate = resolver.external_resource(&resolved_uri).map_err(|error| {
-                SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
-                    error,
-                ))
+                SignatureVerificationPipelineError::from(ReferenceProcessingError::Transform(error))
             })?;
             let Some(certificate) = certificate else {
                 outcome.deferred_error.get_or_insert_with(|| {
@@ -1447,9 +1491,11 @@ fn materialize_retrieval_methods(
             let parsed = match parse_x509_certificate(certificate) {
                 Ok(parsed) => parsed,
                 Err(error) => {
-                    outcome
-                        .deferred_error
-                        .get_or_insert(SignatureVerificationPipelineError::ParseKeyInfo(error));
+                    let error = map_key_info_parse_error(error);
+                    if matches!(error, SignatureVerificationPipelineError::Policy(_)) {
+                        return Err(error);
+                    }
+                    outcome.deferred_error.get_or_insert(error);
                     materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
                         uri: resolved_uri,
                         resource_type,
@@ -1468,9 +1514,11 @@ fn materialize_retrieval_methods(
             ));
         } else if resource_type.as_deref() == Some("http://www.w3.org/2000/09/xmldsig#X509Data") {
             if !allowed_uri_types.allows(&resolved_uri) {
-                return Err(SignatureVerificationPipelineError::DisallowedUri {
-                    uri: resolved_uri,
-                });
+                return Err(crate::policy::PolicyViolation::Uri {
+                    operation: "verification",
+                    reason: "retrieval method URI class is not permitted",
+                }
+                .into());
             }
             let id = same_document_reference_id(&resolved_uri).ok_or(
                 SignatureVerificationPipelineError::InvalidStructure {
@@ -1493,9 +1541,18 @@ fn materialize_retrieval_methods(
                         reason: "untransformed X509Data RetrievalMethod must target X509Data directly",
                     });
                 }
-                RetrievalMethodTransforms::X509DataNodeSetFilter => {
+                RetrievalMethodTransforms::X509DataNodeSetFilter {
+                    expression,
+                    namespaces,
+                } => {
                     enforce_transform_allowed(allowed_transforms, XPATH_TRANSFORM_URI)?;
-                    select_retrieved_x509_data_root(target)?
+                    xpath_parse_budget
+                        .validate_expression(&expression)
+                        .map_err(ReferenceProcessingError::Transform)?;
+                    xpath_parse_budget
+                        .validate_namespaces(&namespaces)
+                        .map_err(ReferenceProcessingError::Transform)?;
+                    select_retrieved_x509_data_root(target, execution_budget)?
                 }
                 RetrievalMethodTransforms::Unsupported => {
                     return Err(SignatureVerificationPipelineError::InvalidStructure {
@@ -1524,27 +1581,57 @@ fn materialize_retrieval_methods(
 
 fn select_retrieved_x509_data_root<'a, 'input>(
     target: Node<'a, 'input>,
+    execution_budget: &TransformExecutionBudget,
 ) -> Result<Node<'a, 'input>, SignatureVerificationPipelineError> {
     // XMLDSig XPath filtering evaluates the predicate for every node in the
     // dereferenced node-set. `ancestor-or-self::ds:X509Data` therefore retains
     // one X509Data descendant and its subtree; it cannot import an ancestor
     // that was outside the URI target's node-set.
-    let mut roots = target.descendants().filter(|candidate| {
-        candidate.is_element()
-            && candidate.tag_name().namespace() == Some(XMLDSIG_NS)
-            && candidate.tag_name().name() == "X509Data"
-    });
-    let root = roots
-        .next()
-        .ok_or(SignatureVerificationPipelineError::InvalidStructure {
-            reason: "X509Data RetrievalMethod selected no X509Data element",
-        })?;
-    if roots.next().is_some() {
-        return Err(SignatureVerificationPipelineError::InvalidStructure {
-            reason: "X509Data RetrievalMethod selected multiple X509Data elements",
-        });
+    execution_budget
+        .validate_xpath_context_evaluations(target.descendants().count())
+        .map_err(ReferenceProcessingError::Transform)?;
+    let mut root = None;
+    for candidate in target.descendants() {
+        execution_budget
+            .charge_xpath_work(1)
+            .map_err(ReferenceProcessingError::Transform)?;
+        execution_budget
+            .charge_node_filter_work(1)
+            .map_err(ReferenceProcessingError::Transform)?;
+        if !candidate.is_element()
+            || candidate.tag_name().namespace() != Some(XMLDSIG_NS)
+            || candidate.tag_name().name() != "X509Data"
+        {
+            continue;
+        }
+        if root.replace(candidate).is_some() {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "X509Data RetrievalMethod selected multiple X509Data elements",
+            });
+        }
     }
-    Ok(root)
+    root.ok_or(SignatureVerificationPipelineError::InvalidStructure {
+        reason: "X509Data RetrievalMethod selected no X509Data element",
+    })
+}
+
+#[cfg(test)]
+fn materialize_retrieval_methods(
+    key_info: &mut KeyInfo,
+    resolver: &UriReferenceResolver<'_>,
+    allowed_uri_types: UriTypeSet,
+    allowed_transforms: Option<&HashSet<String>>,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
+    materialize_retrieval_methods_with_budgets(
+        key_info,
+        resolver,
+        allowed_uri_types,
+        allowed_transforms,
+        provider,
+        &mut XPathSignatureParseBudget::default(),
+        &TransformExecutionBudget::default(),
+    )
 }
 
 fn existing_x509_binary_len(
@@ -1637,7 +1724,7 @@ fn process_manifest_references(
             } else {
                 match enforce_reference_policies(
                     std::slice::from_ref(reference),
-                    ctx.policy.reference_uri_types,
+                    ctx.policy.uris.references,
                     ctx.allowed_transform_uris(),
                 ) {
                     Ok(()) => process_reference_with_options(
@@ -1656,14 +1743,13 @@ fn process_manifest_references(
                             FailureReason::ReferenceProcessingFailure { ref_index: *index },
                         )
                     }),
-                    Err(
-                        SignatureVerificationPipelineError::DisallowedUri { .. }
-                        | SignatureVerificationPipelineError::DisallowedTransform { .. },
-                    ) => manifest_reference_invalid_result(
-                        reference,
-                        *index,
-                        FailureReason::ReferencePolicyViolation { ref_index: *index },
-                    ),
+                    Err(SignatureVerificationPipelineError::Policy(_)) => {
+                        manifest_reference_invalid_result(
+                            reference,
+                            *index,
+                            FailureReason::ReferencePolicyViolation { ref_index: *index },
+                        )
+                    }
                     Err(_) => manifest_reference_invalid_result(
                         reference,
                         *index,
@@ -1780,9 +1866,8 @@ fn parse_manifest_references(
                 match parse_reference_with_xpath_budget(child, xpath_parse_budget) {
                     Ok(reference) => references.push((reference_index, reference, child.id())),
                     Err(ParseError::Transform(super::TransformError::UnsupportedTransform(_))) => {
-                        let digest_algorithm = reference_digest_method(child).map_err(|error| {
-                            SignatureVerificationPipelineError::ParseManifestReference(error)
-                        })?;
+                        let digest_algorithm =
+                            reference_digest_method(child).map_err(map_manifest_parse_error)?;
                         invalid.push(ReferenceResult {
                             reference_set: ReferenceSet::Manifest,
                             reference_index,
@@ -1796,11 +1881,7 @@ fn parse_manifest_references(
                             pre_digest_data: None,
                         });
                     }
-                    Err(error) => {
-                        return Err(SignatureVerificationPipelineError::ParseManifestReference(
-                            error,
-                        ));
-                    }
+                    Err(error) => return Err(map_manifest_parse_error(error)),
                 }
             }
         }
@@ -1872,6 +1953,12 @@ fn resolve_verifying_key<'k>(
     algorithm: SignatureAlgorithm,
 ) -> Result<Option<ResolvedVerifyingKey<'k>>, SignatureVerificationPipelineError> {
     if let Some(key) = ctx.key {
+        if !ctx.policy.key_sources.preset_key {
+            return Err(crate::policy::PolicyViolation::KeyTrust {
+                reason: "pre-resolved verification keys are disabled",
+            }
+            .into());
+        }
         return Ok(Some(ResolvedVerifyingKey::Borrowed(key)));
     }
     if let Some(resolver) = ctx.key_resolver {
@@ -1899,9 +1986,11 @@ fn enforce_reference_policies(
                 ReferenceProcessingError::MissingUri,
             ))?;
         if !allowed_uri_types.allows(uri) {
-            return Err(SignatureVerificationPipelineError::DisallowedUri {
-                uri: uri.to_owned(),
-            });
+            return Err(crate::policy::PolicyViolation::Uri {
+                operation: "verification",
+                reason: "reference URI class is not permitted",
+            }
+            .into());
         }
 
         if let Some(allowed) = allowed_transforms {
@@ -1931,9 +2020,11 @@ fn enforce_transform_allowed(
     algorithm: &str,
 ) -> Result<(), SignatureVerificationPipelineError> {
     if allowed_transforms.is_some_and(|allowed| !allowed.contains(algorithm)) {
-        return Err(SignatureVerificationPipelineError::DisallowedTransform {
+        return Err(crate::policy::PolicyViolation::Algorithm {
+            operation: "verification transform",
             algorithm: algorithm.to_owned(),
-        });
+        }
+        .into());
     }
     Ok(())
 }
@@ -2352,9 +2443,13 @@ mod tests {
         assert!(
             matches!(
                 error,
-                SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
-                    TransformError::C14nOutputTooLarge { max_bytes: 64 }
-                ))
+                SignatureVerificationPipelineError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: crate::policy::resource_name::CANONICALIZED_BYTES,
+                        maximum: 64,
+                        ..
+                    }
+                )
             ),
             "unexpected error: {error:?}"
         );
@@ -2377,11 +2472,79 @@ mod tests {
             VerifyContext::new().policy(policy).verify(&xml),
             Err(SignatureVerificationPipelineError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "XML document",
+                    resource: crate::policy::resource_name::XML_DOCUMENT,
                     maximum,
                     actual,
                 }
             )) if maximum == xml.len() - 1 && actual == xml.len()
+        ));
+    }
+
+    #[test]
+    fn verification_policy_bounds_base64_transform_input() {
+        // The operation snapshot must reach the transform executor rather than
+        // silently falling back to its implementation-wide default budget.
+        let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+        let xml = format!(
+            r##"<root xmlns:ds="{XMLDSIG_NS}"><payload ID="payload">QUJDRA==</payload><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"##
+        );
+        let policy = crate::policy::VerificationPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_base64_transform_input_bytes: 4,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .verify(&xml)
+            .expect_err("Base64 input must use the operation policy ceiling");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::BASE64_TRANSFORM_INPUT_BYTES,
+                    maximum: 4,
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn verification_policy_bounds_xpath_source_before_compilation() {
+        // XPath parser limits are part of the same operation snapshot as the
+        // evaluator limits; parsing cannot use a separate hard-coded budget.
+        let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
+        let xml = format!(
+            r#"<root xmlns:ds="{XMLDSIG_NS}"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"#
+        );
+        let policy = crate::policy::VerificationPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xpath_expression_bytes: 4,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .verify(&xml)
+            .expect_err("XPath source must use the operation policy ceiling");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_EXPRESSION_BYTES,
+                    maximum: 4,
+                    ..
+                }
+            )
         ));
     }
 
@@ -2413,12 +2576,19 @@ mod tests {
             .verify(&xml)
             .expect_err("SignedInfo must consume the remaining operation C14N budget");
 
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Reference(
-                ReferenceProcessingError::CanonicalizedDataTooLarge { max_bytes: 1_024 }
-            )
-        ));
+        assert!(
+            matches!(
+                &error,
+                SignatureVerificationPipelineError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "canonicalized bytes",
+                        maximum: 1_024,
+                        ..
+                    }
+                )
+            ),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]
@@ -2486,7 +2656,10 @@ mod tests {
         );
         let resources = HashMap::from([("urn:detached-nodes".to_owned(), detached.into_bytes())]);
         let policy = crate::policy::VerificationPolicy {
-            reference_uri_types: UriTypeSet::ALL,
+            uris: crate::policy::UriPolicy {
+                references: UriTypeSet::ALL,
+                ..crate::policy::UriPolicy::default()
+            },
             resources: crate::policy::ResourcePolicy {
                 max_xml_nodes: 24,
                 ..crate::policy::ResourcePolicy::default()
@@ -2504,9 +2677,13 @@ mod tests {
         assert!(
             matches!(
                 error,
-                SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
-                    TransformError::XmlNodeLimit
-                ))
+                SignatureVerificationPipelineError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: crate::policy::resource_name::XML_NODES,
+                        maximum: 24,
+                        ..
+                    }
+                )
             ),
             "unexpected error: {error:?}"
         );
@@ -2850,7 +3027,10 @@ mod tests {
             .expect_err("external URI should be rejected by default policy");
         assert!(matches!(
             err,
-            SignatureVerificationPipelineError::DisallowedUri { .. }
+            SignatureVerificationPipelineError::Policy(crate::policy::PolicyViolation::Uri {
+                operation: "verification",
+                ..
+            })
         ));
     }
 
@@ -2870,10 +3050,16 @@ mod tests {
             .verify(&xml)
             .expect_err("XML Base component work must be bounded before lookup");
 
-        assert!(
-            error.to_string().contains("XML Base resolution"),
-            "unexpected error: {error:?}"
-        );
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_BASE_COMPONENTS,
+                    maximum: 64,
+                    actual: 65,
+                }
+            )
+        ));
     }
 
     #[test]
@@ -2897,10 +3083,12 @@ mod tests {
 
         assert!(matches!(
             error,
-            SignatureVerificationPipelineError::Reference(
-                ReferenceProcessingError::UriDereference(
-                    TransformError::XmlBaseResolutionTooLarge { max_bytes: 32, .. }
-                )
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_BASE_RESOLUTION_BYTES,
+                    maximum: 32,
+                    ..
+                }
             )
         ));
     }
@@ -2937,9 +3125,54 @@ mod tests {
 
         assert!(matches!(
             error,
-            SignatureVerificationPipelineError::Canonicalization(
-                crate::c14n::C14nError::XmlBaseComponentsTooLarge { max: 1, actual: 2 }
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_BASE_COMPONENTS,
+                    maximum: 1,
+                    actual: 2,
+                }
             )
+        ));
+    }
+
+    #[test]
+    fn verify_context_classifies_signed_info_xml_base_byte_limit_as_policy() {
+        // SignedInfo C14N 1.1 XML Base work is policy enforcement, not a
+        // malformed canonicalization request, and must retain typed diagnostics.
+        let xml = signature_with_target_reference("AQ==")
+            .replacen(
+                "http://www.w3.org/2001/10/xml-exc-c14n#",
+                "http://www.w3.org/2006/12/xml-c14n11",
+                1,
+            )
+            .replace(
+                "  <ds:Signature>",
+                "  <outer xml:base=\"segment/\"><ds:Signature>",
+            )
+            .replace("  </ds:Signature>", "  </ds:Signature></outer>");
+        let policy = crate::policy::VerificationPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_base_resolution_bytes: 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .verify(&xml)
+            .expect_err("SignedInfo XML Base byte exhaustion must be a policy error");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_BASE_RESOLUTION_BYTES,
+                    maximum: 1,
+                    actual,
+                }
+            ) if actual > 1
         ));
     }
 
@@ -2959,7 +3192,10 @@ mod tests {
         );
         let resources = HashMap::from([("urn:payload".to_owned(), payload.to_vec())]);
         let policy = crate::policy::VerificationPolicy {
-            reference_uri_types: UriTypeSet::ALL,
+            uris: crate::policy::UriPolicy {
+                references: UriTypeSet::ALL,
+                ..crate::policy::UriPolicy::default()
+            },
             resources: crate::policy::ResourcePolicy {
                 max_external_resource_bytes: payload.len(),
                 max_external_resource_total_bytes: payload.len(),
@@ -2992,7 +3228,10 @@ mod tests {
             .expect_err("empty URI must be rejected when empty references are disabled");
         assert!(matches!(
             err,
-            SignatureVerificationPipelineError::DisallowedUri { ref uri } if uri.is_empty()
+            SignatureVerificationPipelineError::Policy(crate::policy::PolicyViolation::Uri {
+                operation: "verification",
+                ..
+            })
         ));
     }
 
@@ -3009,7 +3248,10 @@ mod tests {
             .expect_err("enveloped transform should be rejected by allowlist");
         assert!(matches!(
             err,
-            SignatureVerificationPipelineError::DisallowedTransform { .. }
+            SignatureVerificationPipelineError::Policy(crate::policy::PolicyViolation::Algorithm {
+                operation: "verification transform",
+                ..
+            })
         ));
     }
 
@@ -3030,7 +3272,12 @@ mod tests {
 
         assert!(matches!(
             error,
-            SignatureVerificationPipelineError::DisallowedTransform { ref algorithm }
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::Algorithm {
+                    operation: "verification transform",
+                    ref algorithm,
+                }
+            )
                 if algorithm == "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"
         ));
     }
@@ -3058,7 +3305,12 @@ mod tests {
 
         assert!(matches!(
             error,
-            SignatureVerificationPipelineError::DisallowedTransform { ref algorithm }
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::Algorithm {
+                    operation: "verification transform",
+                    ref algorithm,
+                }
+            )
                 if algorithm == XPATH_TRANSFORM_URI
         ));
     }
@@ -3313,8 +3565,12 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                SignatureVerificationPipelineError::ParseManifestReference(source)
-                    if source.to_string().contains("signature-wide XPath expression budget")
+                SignatureVerificationPipelineError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "XPath expressions",
+                        ..
+                    }
+                )
             ),
             "unexpected error: {error:?}"
         );
@@ -3916,6 +4172,214 @@ mod tests {
         }
     }
 
+    fn retrieval_method_xpath_signature() -> String {
+        format!(
+            r##"<root xmlns:ds="{XMLDSIG_NS}">
+              <payload Id="payload">ok</payload>
+              <ds:Signature>
+                <ds:SignedInfo>
+                  <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+                  <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+                  <ds:Reference URI="#payload">
+                    <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                    <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
+                  </ds:Reference>
+                </ds:SignedInfo>
+                <ds:SignatureValue>AQ==</ds:SignatureValue>
+                <ds:KeyInfo>
+                  <ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data">
+                    <ds:Transforms><ds:Transform Algorithm="{XPATH_TRANSFORM_URI}">
+                      <ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath>
+                    </ds:Transform></ds:Transforms>
+                  </ds:RetrievalMethod>
+                </ds:KeyInfo>
+              </ds:Signature>
+              <holder Id="target"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder>
+            </root>"##
+        )
+    }
+
+    #[test]
+    fn retrieval_method_xpath_uses_signature_expression_budget() {
+        // RetrievalMethod XPath belongs to the same untrusted Signature as
+        // Reference XPath and must not receive a separate parse allowance.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xpath_expressions = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath must consume the signature parse budget");
+
+        assert!(
+            matches!(
+                &error,
+                SignatureVerificationPipelineError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "XPath expressions",
+                        maximum: 0,
+                        actual: 1,
+                    }
+                )
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn retrieval_method_xpath_obeys_expression_byte_limit() {
+        // The parser recognizes this restricted XPath shape, but the original
+        // untrusted expression still belongs to the operation policy budget.
+        let expression = "ancestor-or-self::ds:X509Data";
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xpath_expression_bytes = expression.len() - 1;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath must obey the expression byte limit");
+
+        assert!(
+            matches!(
+                &error,
+                SignatureVerificationPipelineError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "XPath expression bytes",
+                        maximum,
+                        actual,
+                    }
+                ) if *maximum == expression.len() - 1 && *actual == expression.len()
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn retrieval_method_xpath_obeys_expression_complexity_limit() {
+        // Recognizing a fixed safe predicate must not bypass the common XPath
+        // complexity policy applied to every expression in the signature.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xpath_expression_complexity = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath must obey the complexity limit");
+
+        assert!(
+            matches!(
+                &error,
+                SignatureVerificationPipelineError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "XPath expression complexity",
+                        maximum: 0,
+                        actual,
+                    }
+                ) if *actual > 0
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn retrieval_method_xpath_uses_node_filter_work_budget() {
+        // The fixed ancestor-or-self predicate scans the dereferenced node-set
+        // and therefore consumes the operation-wide node-filter allowance.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_node_set_filter_work = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath must consume node-filter work");
+
+        assert!(
+            matches!(
+                &error,
+                SignatureVerificationPipelineError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: crate::policy::resource_name::NODE_SET_FILTER_WORK,
+                        maximum: 0,
+                        actual,
+                    }
+                ) if *actual > 0
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn retrieval_method_xpath_obeys_namespace_binding_limit() {
+        // The specialized RetrievalMethod path must retain the XPath element's
+        // in-scope namespaces and enforce the same limit as ordinary XPath.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xpath_namespace_bindings = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath namespaces must obey the binding limit");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_NAMESPACE_BINDINGS,
+                    maximum: 0,
+                    actual,
+                }
+            ) if actual > 0
+        ));
+    }
+
+    #[test]
+    fn retrieval_method_xpath_obeys_namespace_byte_limit() {
+        // Prefix and URI bytes retained from the XPath namespace axis consume
+        // the same per-expression byte budget as an ordinary XPath transform.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xpath_namespace_bytes = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath namespaces must obey the byte limit");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_NAMESPACE_BYTES,
+                    maximum: 0,
+                    actual,
+                }
+            ) if actual > 0
+        ));
+    }
+
+    #[test]
+    fn retrieval_method_xpath_obeys_context_evaluation_limit() {
+        // Even a recognized fixed expression is evaluated once per node in the
+        // dereferenced set and must obey the ordinary XPath context ceiling.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xpath_context_evaluations = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath contexts must obey the evaluation limit");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_CONTEXT_EVALUATIONS,
+                    maximum: 0,
+                    actual,
+                }
+            ) if actual > 0
+        ));
+    }
+
     #[test]
     fn retrieval_method_materializes_direct_untransformed_x509_data() {
         // A typed RetrievalMethod may point directly at the XML structure it
@@ -4353,7 +4817,10 @@ mod tests {
             .expect_err("implicit default C14N must be checked against allowlist");
         assert!(matches!(
             err,
-            SignatureVerificationPipelineError::DisallowedTransform { .. }
+            SignatureVerificationPipelineError::Policy(crate::policy::PolicyViolation::Algorithm {
+                operation: "verification transform",
+                ..
+            })
         ));
     }
 
@@ -4658,7 +5125,12 @@ mod tests {
         .expect_err("a node-set result must require allowlisted implicit C14N");
         assert!(matches!(
             error,
-            SignatureVerificationPipelineError::DisallowedTransform { ref algorithm }
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::Algorithm {
+                    operation: "verification transform",
+                    ref algorithm,
+                }
+            )
                 if algorithm == DEFAULT_IMPLICIT_C14N_URI
         ));
 
@@ -4686,7 +5158,12 @@ mod tests {
         .expect_err("external XML converted to a node-set must require implicit C14N");
         assert!(matches!(
             error,
-            SignatureVerificationPipelineError::DisallowedTransform { ref algorithm }
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::Algorithm {
+                    operation: "verification transform",
+                    ref algorithm,
+                }
+            )
                 if algorithm == DEFAULT_IMPLICIT_C14N_URI
         ));
     }
@@ -4733,7 +5210,11 @@ mod tests {
         );
         assert!(matches!(
             error,
-            ReferenceProcessingError::CanonicalizedDataTooLarge { max_bytes: 32 }
+            ReferenceProcessingError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "canonicalized bytes",
+                maximum: 32,
+                ..
+            })
         ));
     }
 
@@ -4762,8 +5243,11 @@ mod tests {
 
         assert!(matches!(
             error,
-            SignatureVerificationPipelineError::Reference(
-                ReferenceProcessingError::CanonicalizedDataTooLarge { .. }
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "canonicalized bytes",
+                    ..
+                }
             )
         ));
     }
@@ -5104,7 +5588,15 @@ mod tests {
         )
         .expect_err("the second Reference must consume the first Reference's XPath work");
 
-        assert!(error.to_string().contains("signature-wide"));
+        assert!(matches!(
+            error,
+            ReferenceProcessingError::Transform(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_EVALUATION_WORK,
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]
@@ -5143,7 +5635,15 @@ mod tests {
         )
         .expect_err("the second Reference must consume the first Reference's materialization work");
 
-        assert!(error.to_string().contains("cumulative owned string bytes"));
+        assert!(matches!(
+            error,
+            ReferenceProcessingError::UriDereference(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]

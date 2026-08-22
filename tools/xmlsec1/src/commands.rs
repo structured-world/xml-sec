@@ -17,7 +17,8 @@ use x509_parser::prelude::FromDer as _;
 use xml_sec::{
     IdAttributeRegistration,
     policy::{
-        DecryptionPolicy, EncryptionPolicy, ManifestProcessing, SigningPolicy, VerificationPolicy,
+        DecryptionPolicy, EncryptionPolicy, ManifestProcessing, ResourcePolicy, SigningPolicy,
+        TransformPolicy, UriPolicy, VerificationPolicy, XmlInputPolicy,
     },
     provider::{CryptoProvider, default_provider},
     xmldsig::{
@@ -663,7 +664,10 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         } else {
             ManifestProcessing::Process
         },
-        xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
+        transforms: TransformPolicy {
+            xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
+            ..TransformPolicy::default()
+        },
         ..SigningPolicy::default()
     };
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
@@ -749,8 +753,8 @@ fn select_signing_key(
         false,
         "private key",
     )?;
-    KeyCandidateBudget::for_operation()
-        .consume(candidates.len(), "signing key candidates")
+    KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
+        .consume(candidates.len())
         .map_err(|error| CommandError::Signature(error.to_string()))?;
     let lax_key_search = invocation.flag("lax-key-search");
     let mut last_error: Option<CommandError> = None;
@@ -970,9 +974,14 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         } else {
             ManifestProcessing::Process
         },
-        reference_uri_types: UriTypeSet::ALL,
-        retrieval_uri_types: UriTypeSet::ALL,
-        xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
+        uris: UriPolicy {
+            references: UriTypeSet::ALL,
+            retrieval_methods: UriTypeSet::ALL,
+        },
+        transforms: TransformPolicy {
+            xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
+            ..TransformPolicy::default()
+        },
         ..VerificationPolicy::default()
     };
     policy.key_trust.allowed_legacy_signature_algorithms = HashSet::from([
@@ -1610,8 +1619,8 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             true,
             "AES key",
         )?;
-        KeyCandidateBudget::for_operation()
-            .consume(candidates.len(), "encryption key candidates")
+        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
+            .consume(candidates.len())
             .map_err(|error| CommandError::Encryption(error.to_string()))?;
         let mut material_budget =
             ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
@@ -1649,8 +1658,8 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let lax_key_search = invocation.flag("lax-key-search");
         let mut available_public_keys = public_keys.clone();
         if lax_key_search {
-            KeyCandidateBudget::for_operation()
-                .consume(available_public_keys.len(), "encryption key candidates")
+            KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
+                .consume(available_public_keys.len())
                 .map_err(|error| CommandError::Encryption(error.to_string()))?;
         }
         let mut loaded_public_keys = HashMap::new();
@@ -1798,7 +1807,7 @@ fn xml_data_plaintext<'a>(
     // xmlSecEncCtxXmlEncrypt. Element serializes that node; Content serializes
     // only its children. The document declaration and boundary nodes therefore
     // never become encrypted replacement plaintext.
-    let document = parse_encryption_document(xml, policy)?;
+    let document = parse_encryption_document(xml, &policy.xml, &policy.resources)?;
     let root = document.root_element();
     let element = &xml[root.range()];
     match encrypted_type {
@@ -1964,7 +1973,7 @@ fn recipient_key_metadata(
     policy: &EncryptionPolicy,
     expected_recipients: usize,
 ) -> Result<Vec<Option<ParsedRecipientKeyMetadata>>, CommandError> {
-    let document = parse_encryption_document(template, policy)?;
+    let document = parse_encryption_document(template, &policy.xml, &policy.resources)?;
     let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
     let encrypted_keys = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
         .into_iter()
@@ -2182,8 +2191,8 @@ fn apply_encryption_template(
     id_attributes: &[IdAttributeRegistration],
     policy: &EncryptionPolicy,
 ) -> Result<String, CommandError> {
-    let template_document = parse_encryption_document(template, policy)?;
-    let generated_document = parse_encryption_document(generated, policy)?;
+    let template_document = parse_encryption_document(template, &policy.xml, &policy.resources)?;
+    let generated_document = parse_encryption_document(generated, &policy.xml, &policy.resources)?;
     let template_data = select_encrypted_data(&template_document, start_node_id, id_attributes)?;
     let generated_data = generated_document.root_element();
     let template_cipher = required_cipher_value(template_data, "template EncryptedData")?;
@@ -2314,7 +2323,7 @@ fn apply_encryption_template(
             "encrypted template output exceeds XML document policy".into(),
         ));
     }
-    parse_encryption_document(&output, policy)?;
+    parse_encryption_document(&output, &policy.xml, &policy.resources)?;
     Ok(output)
 }
 
@@ -2592,7 +2601,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let encrypted_data_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
-    let document = parse_encryption_document(&xml, &policy)?;
+    let document = parse_encryption_document(&xml, &policy.xml, &policy.resources)?;
     let encrypted_data = select_encrypted_data(&document, encrypted_data_id, &id_attributes)?;
     let standalone = encrypted_data == document.root_element();
     let content_key_name = encrypted_data_key_name(encrypted_data)?;
@@ -2620,8 +2629,8 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             true,
             "AES key",
         )?;
-        KeyCandidateBudget::for_operation()
-            .consume(candidates.len(), "decryption key candidates")
+        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
+            .consume(candidates.len())
             .map_err(|error| CommandError::Encryption(error.to_string()))?;
         let lax_key_search = invocation.flag("lax-key-search");
         let mut keys = Vec::with_capacity(candidates.len());
@@ -2651,8 +2660,8 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             &recipient_key_names,
             invocation.flag("lax-key-search"),
         )?;
-        KeyCandidateBudget::for_operation()
-            .consume(selected.len(), "decryption key candidates")
+        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
+            .consume(selected.len())
             .map_err(|error| CommandError::Encryption(error.to_string()))?;
         let mut keys = Vec::with_capacity(selected.len());
         let lax_key_search = invocation.flag("lax-key-search");
@@ -2821,7 +2830,7 @@ impl DecryptionKeyResolver for CandidateSymmetricKeyDecryptor {
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
         if encrypted_key.is_none() {
-            budget.consume(self.keys.len(), "decryption key candidates")?;
+            budget.consume(self.keys.len())?;
             Ok(self.keys.clone())
         } else {
             Err(XmlEncError::KeyNotFound)
@@ -2871,7 +2880,7 @@ impl DecryptionKeyResolver for NamedRecipientDecryptor {
         let mut resolved = Vec::new();
         let mut last_error = None;
         for key in self.applicable_keys(encrypted_key) {
-            budget.consume(1, "RSA private-key candidates")?;
+            budget.consume(1)?;
             match key
                 .inner
                 .resolve_key(provider, algorithm, Some(encrypted_key))
@@ -2953,7 +2962,7 @@ fn encryption_template(
     id_attributes: &[IdAttributeRegistration],
     policy: &EncryptionPolicy,
 ) -> Result<EncryptionTemplateMetadata, CommandError> {
-    let document = parse_encryption_document(xml, policy)?;
+    let document = parse_encryption_document(xml, &policy.xml, &policy.resources)?;
     let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
     // Templates preserve every non-cipher field. Parse the selected node through
     // the reciprocal core path first so encryption cannot emit a document that
@@ -3137,18 +3146,19 @@ fn select_recipient_private_keys<'a>(
 
 fn parse_encryption_document<'a>(
     xml: &'a str,
-    policy: &EncryptionPolicy,
+    xml_policy: &XmlInputPolicy,
+    resources: &ResourcePolicy,
 ) -> Result<Document<'a>, CommandError> {
-    policy
+    resources
         .validate()
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
-    let nodes_limit = u32::try_from(policy.resources.max_xml_nodes).map_err(|_| {
+    let nodes_limit = u32::try_from(resources.max_xml_nodes).map_err(|_| {
         CommandError::Encryption("XML node ceiling does not fit the parser limit".into())
     })?;
     Document::parse_with_options(
         xml,
         ParsingOptions {
-            allow_dtd: policy.xml.allow_internal_dtd,
+            allow_dtd: xml_policy.allow_internal_dtd,
             nodes_limit,
             entity_resolver: None,
         },
@@ -3519,7 +3529,7 @@ mod tests {
             "input.xml",
         ]));
         assert_eq!(
-            policy.xpath_here_semantics,
+            policy.transforms.xpath_here_semantics,
             xml_sec::xmldsig::XPathHereSemantics::XmlSecLegacy
         );
     }
@@ -4089,9 +4099,7 @@ mod tests {
         let mut candidate_budget = KeyCandidateBudget::for_operation();
         let maximum = candidate_budget.remaining();
         let reserved = maximum - 1;
-        candidate_budget
-            .consume(reserved, "prior recipient candidates")
-            .unwrap();
+        candidate_budget.consume(reserved).unwrap();
         let error = resolver
             .resolve_key_candidates(
                 default_provider(),
@@ -4103,11 +4111,11 @@ mod tests {
 
         assert!(matches!(
             error,
-            XmlEncError::KeyCandidateLimitExceeded {
-                resource: "RSA private-key candidates",
+            XmlEncError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "key candidates",
                 maximum: observed_maximum,
                 actual,
-            } if observed_maximum == maximum && actual == maximum + 1
+            }) if observed_maximum == maximum && actual == maximum + 1
         ));
     }
 
