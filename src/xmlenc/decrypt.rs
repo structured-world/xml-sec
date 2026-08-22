@@ -1,10 +1,10 @@
 //! XMLEnc decryption entry point and key resolvers.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use roxmltree::{Document, ParsingOptions};
-use rsa::{RsaPrivateKey, traits::PublicKeyParts as _};
+use rsa::RsaPrivateKey;
 
 use super::parse::{
     parse_encrypted_data_node_with_policy, parse_encrypted_data_with_policy,
@@ -191,6 +191,8 @@ impl<'a> DecryptContext<'a> {
             }
             .into());
         }
+        self.provider
+            .require_capability(crate::provider::ProviderCapability::Decrypt(algorithm))?;
         validate_typed_cipher_values(
             encrypted,
             algorithm,
@@ -334,7 +336,7 @@ impl DecryptionKeyResolver for SymmetricKeyDecryptor {
 /// Resolver backed by an RSA private key for OAEP-wrapped session keys.
 #[derive(Clone)]
 pub struct PrivateKeyDecryptor {
-    key: RsaPrivateKey,
+    key: Arc<dyn crate::provider::KeyRecoveryKey>,
 }
 
 /// Resolver backed by a pre-shared AES key-encryption key (KEK).
@@ -388,6 +390,9 @@ impl DecryptionKeyResolver for KekDecryptor {
                 actual: wrapped.len(),
             });
         }
+        provider.require_capability(crate::provider::ProviderCapability::KeyUnwrap(
+            wrap_algorithm,
+        ))?;
         let key = provider
             .unwrap_key(wrap_algorithm, &self.kek, &wrapped)
             .map_err(|error| match error {
@@ -412,6 +417,11 @@ impl DecryptionKeyResolver for KekDecryptor {
 impl PrivateKeyDecryptor {
     /// Create a resolver from an already-parsed RSA private key.
     pub fn new(key: RsaPrivateKey) -> Self {
+        Self::provider_key(Arc::new(crate::provider::RustCryptoRsaPrivateKey::new(key)))
+    }
+
+    /// Create a resolver from an opaque provider-owned recovery key.
+    pub fn provider_key(key: Arc<dyn crate::provider::KeyRecoveryKey>) -> Self {
         Self { key }
     }
 }
@@ -469,7 +479,7 @@ impl PrivateKeyDecryptor {
             mgf_digest: OaepDigestAlgorithm::Sha1,
             label,
         };
-        recover_rsa_oaep(provider, &self.key, &parameters, wrapped)
+        recover_rsa_oaep(provider, self.key.as_ref(), &parameters, wrapped)
     }
 
     fn decrypt_oaep11(
@@ -486,7 +496,7 @@ impl PrivateKeyDecryptor {
             mgf_digest: parse_oaep_mgf_digest(mgf)?,
             label,
         };
-        recover_rsa_oaep(provider, &self.key, &parameters, wrapped)
+        recover_rsa_oaep(provider, self.key.as_ref(), &parameters, wrapped)
     }
 }
 
@@ -504,17 +514,18 @@ fn parse_oaep_mgf_digest(uri: Option<&str>) -> Result<OaepDigestAlgorithm, XmlEn
 
 fn recover_rsa_oaep(
     provider: &dyn crate::provider::CryptoProvider,
-    key: &RsaPrivateKey,
+    key: &dyn crate::provider::KeyRecoveryKey,
     parameters: &RsaOaepParameters,
     wrapped: &[u8],
 ) -> Result<Vec<u8>, XmlEncError> {
-    let expected = key.size();
+    let expected = key.ciphertext_len();
     if wrapped.len() != expected {
         return Err(XmlEncError::InvalidWrappedKeyLength {
             expected,
             actual: wrapped.len(),
         });
     }
+    provider.require_capability(crate::provider::ProviderCapability::KeyRecovery(parameters))?;
     provider
         .recover_key(key, parameters, wrapped)
         .map_err(|error| match error {
@@ -1478,13 +1489,33 @@ mod tests {
         candidate_plaintexts: Vec<Vec<u8>>,
     }
 
+    struct OpaqueRecoveryKey;
+
+    impl crate::provider::KeyRecoveryKey for OpaqueRecoveryKey {
+        fn ciphertext_len(&self) -> usize {
+            256
+        }
+
+        fn recover_with_provider(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _parameters: &RsaOaepParameters,
+            _ciphertext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            panic!("custom provider must own recovery for its opaque key")
+        }
+    }
+
     impl crate::provider::CryptoProvider for PermissiveUnwrapProvider {
         fn name(&self) -> &'static str {
             "permissive-unwrap-test"
         }
 
-        fn supports(&self, query: crate::provider::CapabilityQuery<'_>) -> bool {
-            crate::provider::CryptoProvider::supports(&crate::provider::RustCryptoProvider, query)
+        fn supports(&self, capability: crate::provider::ProviderCapability<'_>) -> bool {
+            crate::provider::CryptoProvider::supports(
+                &crate::provider::RustCryptoProvider,
+                capability,
+            )
         }
 
         fn fill_random(&self, output: &mut [u8]) -> Result<(), crate::provider::ProviderError> {
@@ -1492,6 +1523,14 @@ mod tests {
                 &crate::provider::RustCryptoProvider,
                 output,
             )
+        }
+
+        fn derive_key(
+            &self,
+            parameters: &crate::provider::KdfParameters<'_>,
+            secret: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::RustCryptoProvider.derive_key(parameters, secret)
         }
 
         #[cfg(feature = "xmldsig")]
@@ -1593,7 +1632,7 @@ mod tests {
 
         fn transport_key(
             &self,
-            key: &RsaPublicKey,
+            key: &dyn crate::provider::KeyTransportKey,
             parameters: &RsaOaepParameters,
             plaintext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
@@ -1607,7 +1646,7 @@ mod tests {
 
         fn recover_key(
             &self,
-            _key: &rsa::RsaPrivateKey,
+            _key: &dyn crate::provider::KeyRecoveryKey,
             _parameters: &RsaOaepParameters,
             _ciphertext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
@@ -2546,6 +2585,42 @@ mod tests {
             ));
         }
         assert_eq!(provider.recover_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn custom_provider_recovers_with_an_opaque_private_key() {
+        // The resolver knows only the public ciphertext width; private key
+        // material remains entirely behind the provider/key-handle boundary.
+        let encrypted_key = EncryptedKey {
+            id: None,
+            recipient: None,
+            key_name: None,
+            encryption_method: super::super::EncryptionMethod {
+                algorithm: KeyTransportAlgorithm::RsaOaep11.uri().into(),
+                key_size_bits: None,
+                oaep_digest: Some(OaepDigestAlgorithm::Sha256.uri().into()),
+                mgf_algorithm: Some(OaepDigestAlgorithm::Sha256.mgf_uri().into()),
+                oaep_params: None,
+            },
+            cipher_data: super::super::CipherData {
+                value: STANDARD.encode(vec![0x5a; 256]),
+            },
+            reference_list: None,
+            carried_key_name: None,
+        };
+        let provider = PermissiveUnwrapProvider::default();
+        let decryptor = PrivateKeyDecryptor::provider_key(Arc::new(OpaqueRecoveryKey));
+
+        let key = decryptor
+            .resolve_key(
+                &provider,
+                DataEncryptionAlgorithm::Aes128Gcm,
+                Some(&encrypted_key),
+            )
+            .expect("custom provider must recover through its opaque private key");
+
+        assert_eq!(key, vec![0_u8; 16]);
+        assert_eq!(provider.recover_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -926,6 +926,9 @@ impl<'a> SignContext<'a> {
         }
         let expected_signature_len =
             expected_signature_output_len(self.signing_key, algorithm, &self.policy)?;
+        self.provider
+            .require_capability(crate::provider::ProviderCapability::Sign(algorithm))
+            .map_err(SigningKeyError::from)?;
         let signature_value =
             self.provider
                 .sign(self.signing_key, algorithm, &canonical_signed_info)?;

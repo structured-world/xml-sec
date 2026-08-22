@@ -8,7 +8,7 @@ use quick_xml::{
     events::{BytesEnd, BytesStart, BytesText, Event},
 };
 use roxmltree::{Document, Node, ParsingOptions};
-use rsa::{RsaPublicKey, traits::PublicKeyParts as _};
+use rsa::RsaPublicKey;
 
 use crate::xml::{is_xml_1_0_character, is_xml_ncname};
 
@@ -29,11 +29,23 @@ pub fn validate_rsa_recipient_key(
     key: &RsaPublicKey,
     policy: &crate::policy::EncryptionPolicy,
 ) -> Result<(), XmlEncError> {
-    policy.rsa_keys.validate_components(
-        "encryption",
-        &key.n().to_be_bytes_trimmed_vartime(),
-        &key.e().to_be_bytes_trimmed_vartime(),
-    )?;
+    validate_key_transport_recipient(key, policy)
+}
+
+/// Validate an opaque RSA transport key against the compiled encryption policy.
+///
+/// The handle's public metadata must identify the exact key used by the
+/// selected provider. This preflight lets provider-owned key registries apply
+/// the same policy as [`EncryptedDataBuilder`] before selecting a candidate.
+pub fn validate_key_transport_recipient(
+    key: &dyn crate::provider::KeyTransportKey,
+    policy: &crate::policy::EncryptionPolicy,
+) -> Result<(), XmlEncError> {
+    let modulus = key.rsa_modulus();
+    let exponent = key.rsa_exponent();
+    policy
+        .rsa_keys
+        .validate_components("encryption", &modulus, &exponent)?;
     Ok(())
 }
 
@@ -134,6 +146,14 @@ impl EncryptedDataBuilder {
     /// Add an RSA-OAEP recipient using secure XMLEnc 1.1 defaults.
     pub fn recipient_rsa_oaep(self, public_key: RsaPublicKey) -> Self {
         self.add_recipient(EncryptionRecipient::rsa_oaep(public_key))
+    }
+
+    /// Add an RSA-OAEP recipient backed by an opaque provider key handle.
+    pub fn recipient_key_transport(
+        self,
+        public_key: Arc<dyn crate::provider::KeyTransportKey>,
+    ) -> Self {
+        self.add_recipient(EncryptionRecipient::provider_key_transport(public_key))
     }
 
     /// Add an AES Key Wrap recipient.
@@ -335,7 +355,7 @@ impl EncryptedDataBuilder {
                     recipient,
                     key_name,
                 } => {
-                    validate_rsa_recipient_key(public_key, &self.policy)?;
+                    validate_key_transport_recipient(public_key.as_ref(), &self.policy)?;
                     if parameters.algorithm == super::KeyTransportAlgorithm::RsaOaepMgf1p
                         && parameters.mgf_digest != super::OaepDigestAlgorithm::Sha1
                     {
@@ -606,6 +626,7 @@ fn random_bytes(
     provider: &dyn crate::provider::CryptoProvider,
     len: usize,
 ) -> Result<Vec<u8>, XmlEncError> {
+    provider.require_capability(crate::provider::ProviderCapability::Random)?;
     let mut bytes = vec![0_u8; len];
     provider.fill_random(&mut bytes)?;
     Ok(bytes)
@@ -617,6 +638,7 @@ fn encrypt_content(
     key: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, XmlEncError> {
+    provider.require_capability(crate::provider::ProviderCapability::Encrypt(algorithm))?;
     let ciphertext = provider.encrypt_data(algorithm, key, plaintext)?;
     super::types::validate_ciphertext_framing(algorithm, ciphertext.len())?;
     let expected = algorithm
@@ -652,7 +674,7 @@ fn wrap_content_key(
             oaep: Some(parameters.clone()),
             recipient: recipient.clone(),
             key_name: key_name.clone(),
-            ciphertext: wrap_rsa_oaep(provider, public_key, parameters, content_key)?,
+            ciphertext: wrap_rsa_oaep(provider, public_key.as_ref(), parameters, content_key)?,
         }),
         EncryptionRecipient::AesKeyWrap {
             kek,
@@ -660,6 +682,8 @@ fn wrap_content_key(
             recipient,
             key_name,
         } => {
+            provider
+                .require_capability(crate::provider::ProviderCapability::KeyWrap(*algorithm))?;
             let wrapped = provider.wrap_key(*algorithm, kek, content_key)?;
             let expected = content_key.len() + 8;
             if wrapped.len() != expected {
@@ -681,10 +705,13 @@ fn wrap_content_key(
 
 fn wrap_rsa_oaep(
     provider: &dyn crate::provider::CryptoProvider,
-    public_key: &RsaPublicKey,
+    public_key: &dyn crate::provider::KeyTransportKey,
     parameters: &RsaOaepParameters,
     content_key: &[u8],
 ) -> Result<Vec<u8>, XmlEncError> {
+    provider.require_capability(crate::provider::ProviderCapability::KeyTransport(
+        parameters,
+    ))?;
     let ciphertext = provider
         .transport_key(public_key, parameters, content_key)
         .map_err(|error| match error {
@@ -694,7 +721,7 @@ fn wrap_rsa_oaep(
             }
             error => XmlEncError::RsaEncrypt(error.to_string()),
         })?;
-    let expected = public_key.size();
+    let expected = public_key.rsa_modulus().len();
     if ciphertext.len() != expected {
         return Err(XmlEncError::InvalidWrappedKeyLength {
             expected,
@@ -992,13 +1019,40 @@ mod tests {
         transport_calls: AtomicUsize,
     }
 
+    struct OpaqueTransportKey {
+        modulus: Vec<u8>,
+        exponent: Vec<u8>,
+    }
+
+    impl crate::provider::KeyTransportKey for OpaqueTransportKey {
+        fn rsa_modulus(&self) -> std::borrow::Cow<'_, [u8]> {
+            std::borrow::Cow::Borrowed(&self.modulus)
+        }
+
+        fn rsa_exponent(&self) -> std::borrow::Cow<'_, [u8]> {
+            std::borrow::Cow::Borrowed(&self.exponent)
+        }
+
+        fn transport_with_provider(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _parameters: &RsaOaepParameters,
+            _plaintext: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            panic!("custom provider must own transport for its opaque key")
+        }
+    }
+
     impl crate::provider::CryptoProvider for OverridingOutputProvider {
         fn name(&self) -> &'static str {
             "overriding-output-test"
         }
 
-        fn supports(&self, query: crate::provider::CapabilityQuery<'_>) -> bool {
-            crate::provider::CryptoProvider::supports(&crate::provider::RustCryptoProvider, query)
+        fn supports(&self, capability: crate::provider::ProviderCapability<'_>) -> bool {
+            crate::provider::CryptoProvider::supports(
+                &crate::provider::RustCryptoProvider,
+                capability,
+            )
         }
 
         fn fill_random(&self, output: &mut [u8]) -> Result<(), crate::provider::ProviderError> {
@@ -1006,6 +1060,14 @@ mod tests {
                 &crate::provider::RustCryptoProvider,
                 output,
             )
+        }
+
+        fn derive_key(
+            &self,
+            parameters: &crate::provider::KdfParameters<'_>,
+            secret: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::RustCryptoProvider.derive_key(parameters, secret)
         }
 
         #[cfg(feature = "xmldsig")]
@@ -1117,7 +1179,7 @@ mod tests {
 
         fn transport_key(
             &self,
-            key: &RsaPublicKey,
+            key: &dyn crate::provider::KeyTransportKey,
             parameters: &RsaOaepParameters,
             plaintext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
@@ -1135,7 +1197,7 @@ mod tests {
 
         fn recover_key(
             &self,
-            key: &RsaPrivateKey,
+            key: &dyn crate::provider::KeyRecoveryKey,
             parameters: &RsaOaepParameters,
             ciphertext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
@@ -2006,6 +2068,47 @@ mod tests {
             .recipient_rsa_oaep(public_key)
             .encrypt_binary(b"data")
             .expect("modulus-sized RSA transport output must remain accepted");
+    }
+
+    #[test]
+    fn custom_provider_encrypts_with_an_opaque_transport_key() {
+        // The key exposes only public policy metadata. Successful encryption
+        // proves orchestration never needs a concrete RustCrypto RSA object.
+        let provider = Arc::new(OverridingOutputProvider {
+            ciphertext: None,
+            wrapped_key: None,
+            transported_key: Some(vec![0x5a; 256]),
+            transport_calls: AtomicUsize::new(0),
+        });
+        let key = Arc::new(OpaqueTransportKey {
+            modulus: vec![0x80; 256],
+            exponent: vec![0x01, 0x00, 0x01],
+        });
+
+        let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .provider(provider.clone())
+            .recipient_key_transport(key)
+            .encrypt_binary(b"opaque provider key")
+            .expect("custom provider must accept its opaque transport key");
+
+        assert_eq!(provider.transport_calls.load(Ordering::Relaxed), 1);
+        assert!(encrypted.encrypted_data_xml.contains("rsa-oaep"));
+    }
+
+    #[test]
+    fn opaque_transport_preflight_rejects_weak_rsa_metadata() {
+        // Provider-owned keys cannot bypass the same outbound RSA policy used
+        // by the RustCrypto convenience constructor.
+        let key = OpaqueTransportKey {
+            modulus: vec![0x80; 128],
+            exponent: vec![0x01, 0x00, 0x01],
+        };
+        assert!(matches!(
+            validate_key_transport_recipient(&key, &crate::policy::EncryptionPolicy::default()),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::KeySize { .. }
+            ))
+        ));
     }
 
     #[test]

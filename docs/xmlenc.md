@@ -48,6 +48,16 @@ the XML Encryption 1.1 RSA-OAEP URI `xml-sec` emits explicit `ds:DigestMethod` a
 values rather than relying on those implicit legacy defaults. SHA-1 OAEP remains available only
 through explicit parameters. The legacy `rsa-oaep-mgf1p` URI fixes MGF1 to SHA-1 and has no
 `xenc11:MGF` wire field.
+`recipient_key_transport` accepts an opaque `KeyTransportKey` for provider-owned public keys;
+the RSA convenience constructor wraps a RustCrypto key into the same contract. The handle exposes
+only normalized public modulus/exponent metadata required by encryption policy and framing checks.
+On decryption, `PrivateKeyDecryptor::provider_key` accepts an opaque `KeyRecoveryKey`; private key
+material never enters XML orchestration. Capability checks receive complete OAEP digest, MGF, and
+label parameters. Key transport and key recovery are independent capabilities, so a private-key
+provider can advertise recovery without public-key wrapping support. An unsupported provider fails
+without invoking the key or falling back.
+`validate_key_transport_recipient` gives provider-owned key registries the same policy preflight;
+the existing `validate_rsa_recipient_key` remains the RustCrypto convenience form.
 `EncryptionPolicy::rsa_keys` validates every recipient modulus and exponent before provider
 dispatch. New output defaults to 2048-8192-bit RSA keys; callers can explicitly tighten or relax
 the minimum for a deployment profile, but cannot exceed the implementation ceiling.
