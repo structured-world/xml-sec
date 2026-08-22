@@ -14,8 +14,8 @@ use sxd_document_no_unsafe::{Package, QName, dom};
 use sxd_xpath_no_unsafe::{Context, Factory, Value, function, nodeset};
 
 use super::transforms::{
-    MAX_XPATH_EXPRESSION_BYTES, MAX_XPATH_FILTERS, XPathExpression, XPathFilter,
-    XPathFilterOperation, XPathHereSemantics,
+    MAX_XPATH_EXPRESSION_BYTES, MAX_XPATH_FILTERS, NodeFilterWorkBudget, XPathExpression,
+    XPathFilter, XPathFilterOperation, XPathHereSemantics,
 };
 use super::types::{
     NodeSet, NodeSetMaterializationBudget, TransformError, transform_resource_limit,
@@ -1660,6 +1660,7 @@ pub(super) fn apply_xpath_filter_with_semantics<'a>(
         here_semantics,
         document_relation,
         work_budget,
+        &NodeFilterWorkBudget::default(),
         &NodeSetMaterializationBudget::default(),
     )
 }
@@ -1670,6 +1671,7 @@ pub(super) fn apply_xpath_filter_with_semantics_and_budget<'a>(
     here_semantics: XPathHereSemantics,
     document_relation: XPathDocumentRelation,
     work_budget: &XPathWorkBudget,
+    node_filter_budget: &NodeFilterWorkBudget,
     materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
     let selected = evaluate_expression(
@@ -1681,6 +1683,7 @@ pub(super) fn apply_xpath_filter_with_semantics_and_budget<'a>(
         work_budget,
         materialization_budget,
     )?;
+    node_filter_budget.charge(input.len())?;
     input.intersect_with(&selected);
     Ok(input)
 }
@@ -1713,6 +1716,7 @@ pub(super) fn apply_xpath_filter2_with_semantics<'a>(
         here_semantics,
         document_relation,
         work_budget,
+        &NodeFilterWorkBudget::default(),
         &NodeSetMaterializationBudget::default(),
     )
 }
@@ -1723,6 +1727,7 @@ pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a>(
     here_semantics: XPathHereSemantics,
     document_relation: XPathDocumentRelation,
     work_budget: &XPathWorkBudget,
+    node_filter_budget: &NodeFilterWorkBudget,
     materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
     if filters.is_empty() || filters.len() > work_budget.limits.filters {
@@ -1750,13 +1755,21 @@ pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a>(
             materialization_budget,
         )?;
         match filter.operation() {
-            XPathFilterOperation::Intersect => result.intersect_with(&selected),
-            XPathFilterOperation::Subtract => result.subtract(&selected),
+            XPathFilterOperation::Intersect => {
+                node_filter_budget.charge(result.len())?;
+                result.intersect_with(&selected);
+            }
+            XPathFilterOperation::Subtract => {
+                node_filter_budget.charge(result.len())?;
+                result.subtract(&selected);
+            }
             XPathFilterOperation::Union => {
+                node_filter_budget.charge(selected.len())?;
                 result.union_with_budget(&selected, materialization_budget)?;
             }
         }
     }
+    node_filter_budget.charge(result.len())?;
     result.intersect_with(&input);
     Ok(result)
 }

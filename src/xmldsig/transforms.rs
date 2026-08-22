@@ -121,7 +121,7 @@ impl Default for TransformExecutionBudget {
     }
 }
 
-struct NodeFilterWorkBudget {
+pub(super) struct NodeFilterWorkBudget {
     remaining: Cell<usize>,
     maximum: usize,
 }
@@ -136,7 +136,7 @@ impl Default for NodeFilterWorkBudget {
 }
 
 impl NodeFilterWorkBudget {
-    fn charge(&self, entries: usize) -> Result<(), TransformError> {
+    pub(super) fn charge(&self, entries: usize) -> Result<(), TransformError> {
         let consumed = self.maximum.saturating_sub(self.remaining.get());
         if !charge_byte_budget(&self.remaining, entries) {
             return Err(transform_resource_limit(
@@ -696,14 +696,14 @@ fn apply_transform_with_options_and_state<'s, 'd>(
             // the expression's policy accounting for every input context and
             // the node-set filtering pass.
             budget.xpath.validate_context_evaluations(nodes.len())?;
-            budget.xpath.charge(nodes.len())?;
-            budget.node_filter.charge(nodes.len())?;
+            budget.xpath.charge(doc.descendants().count())?;
 
             for node in doc.descendants().filter(|node| {
                 node.is_element()
                     && node.tag_name().name() == "Signature"
                     && node.tag_name().namespace() == Some(XMLDSIG_NS)
             }) {
+                budget.node_filter.charge(nodes.len())?;
                 nodes.exclude_subtree(node);
             }
 
@@ -711,7 +711,6 @@ fn apply_transform_with_options_and_state<'s, 'd>(
         }
         Transform::XPath(xpath) => {
             let nodes = input.into_node_set()?;
-            budget.node_filter.charge(nodes.len())?;
             let document_relation = xpath_document_relation(
                 signature_node.document(),
                 nodes.document(),
@@ -725,15 +724,13 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                     options.here_semantics(),
                     document_relation,
                     &budget.xpath,
+                    &budget.node_filter,
                     &budget.node_set_materialization,
                 )?,
             ))
         }
         Transform::XPathFilter2(filters) => {
             let nodes = input.into_node_set()?;
-            budget
-                .node_filter
-                .charge(nodes.len().saturating_mul(filters.len()))?;
             let document_relation = xpath_document_relation(
                 signature_node.document(),
                 nodes.document(),
@@ -747,6 +744,7 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                     options.here_semantics(),
                     document_relation,
                     &budget.xpath,
+                    &budget.node_filter,
                     &budget.node_set_materialization,
                 )?,
             ))
@@ -2052,6 +2050,20 @@ mod tests {
     use crate::xmldsig::NodeSet;
     use roxmltree::Document;
 
+    fn assert_resource_limit(error: &TransformError, expected_resource: &'static str) {
+        assert!(
+            matches!(
+                error,
+                TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource,
+                    maximum,
+                    actual,
+                }) if *resource == expected_resource && actual > maximum
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
     // ── Enveloped transform ──────────────────────────────────────────
 
     #[test]
@@ -2778,6 +2790,87 @@ mod tests {
                 }) if actual == resource
             ));
         }
+    }
+
+    #[test]
+    fn optimized_exclusion_charges_document_scan_and_each_filter_pass() {
+        // A fragment input can be much smaller than its owning document. The
+        // optimized XPath still scans that document and filters the fragment
+        // once for every matching Signature, so neither cost may use only the
+        // fragment cardinality.
+        let document = Document::parse(
+            r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><payload><value/></payload><padding/><ds:Signature/><ds:Signature/></root>"#,
+        )
+        .unwrap();
+        let payload = document
+            .descendants()
+            .find(|node| node.has_tag_name("payload"))
+            .unwrap();
+        let input = || NodeSet::subtree(payload).unwrap();
+        let fragment_entries = input().len();
+
+        for resource in [
+            crate::policy::resource_name::XPATH_EVALUATION_WORK,
+            crate::policy::resource_name::NODE_SET_FILTER_WORK,
+        ] {
+            let resources = if resource == crate::policy::resource_name::XPATH_EVALUATION_WORK {
+                crate::policy::ResourcePolicy {
+                    max_xpath_evaluation_work: fragment_entries,
+                    ..crate::policy::ResourcePolicy::default()
+                }
+            } else {
+                crate::policy::ResourcePolicy {
+                    max_node_set_filter_work: fragment_entries,
+                    ..crate::policy::ResourcePolicy::default()
+                }
+            };
+            let budget = TransformExecutionBudget::from_resources(&resources);
+            let error = execute_transforms_with_options_and_budget(
+                document.root_element(),
+                TransformData::NodeSet(input()),
+                &[Transform::XpathExcludeAllSignatures],
+                TransformOptions::default(),
+                &budget,
+            )
+            .expect_err("document-sized optimized XPath work must exceed the fragment budget");
+
+            assert_resource_limit(&error, resource);
+        }
+    }
+
+    #[test]
+    fn filter2_charges_document_sized_set_operations() {
+        // Filter 2 starts from a whole-document result even when dereferencing
+        // selected a tiny fragment. Charge the set actually traversed by each
+        // operation rather than the incoming fragment alone.
+        let document =
+            Document::parse("<root><payload><value/></payload><outside/><outside/></root>")
+                .unwrap();
+        let payload = document
+            .descendants()
+            .find(|node| node.has_tag_name("payload"))
+            .unwrap();
+        let input = NodeSet::subtree(payload).unwrap();
+        let resources = crate::policy::ResourcePolicy {
+            max_node_set_filter_work: input.len(),
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = TransformExecutionBudget::from_resources(&resources);
+        let transform = Transform::XPathFilter2(vec![XPathFilter::new(
+            XPathFilterOperation::Intersect,
+            XPathExpression::new("//*"),
+        )]);
+
+        let error = execute_transforms_with_options_and_budget(
+            document.root_element(),
+            TransformData::NodeSet(input),
+            &[transform],
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect_err("Filter 2 must charge document-sized set operations");
+
+        assert_resource_limit(&error, crate::policy::resource_name::NODE_SET_FILTER_WORK);
     }
 
     #[test]

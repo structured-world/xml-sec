@@ -34,7 +34,8 @@ use super::mutation::{
     fill_signed_info_digest_values_with_options, merge_key_info_source_at_index_with_options,
 };
 use super::parse::{
-    MAX_REFERENCES_PER_SIGNATURE, SignatureAlgorithm, XMLDSIG_NS, parse_signed_info,
+    MAX_REFERENCES_PER_SIGNATURE, SignatureAlgorithm, XMLDSIG_NS,
+    parse_signed_info_with_xpath_budget,
 };
 use super::transforms::{
     Transform, TransformExecutionBudget, TransformOptions, XPathHereSemantics,
@@ -886,7 +887,7 @@ impl<'a> SignContext<'a> {
         )?;
         parse_signature_children(signature)
             .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
-        let execution_budget = TransformExecutionBudget::from_resources(&self.policy.resources);
+        let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
         let transform_options = TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics);
@@ -916,20 +917,17 @@ impl<'a> SignContext<'a> {
             transform_options,
             &self.policy,
             self.provider,
-            &execution_budget,
+            &mut budgets,
             target_signature,
             self.id_attributes,
         )?;
         self.policy
             .resources
             .validate_xml_document_len(with_digests.len())?;
-        let (algorithm, canonical_signed_info) = canonicalize_signed_info(
-            &with_digests,
-            &self.policy,
-            &execution_budget,
-            target_signature,
-        )?;
-        execution_budget
+        let (algorithm, canonical_signed_info) =
+            canonicalize_signed_info(&with_digests, &self.policy, &mut budgets, target_signature)?;
+        budgets
+            .transforms
             .charge_c14n_output(canonical_signed_info.len())
             .map_err(SigningDigestError::Transform)?;
         if !algorithm.signing_allowed()
@@ -1023,6 +1021,21 @@ struct SigningReference {
     digest_value_node_id: NodeId,
 }
 
+#[derive(Default)]
+struct SigningOperationBudgets {
+    transforms: TransformExecutionBudget,
+    xpath_parse: XPathSignatureParseBudget,
+}
+
+impl SigningOperationBudgets {
+    fn from_resources(resources: &crate::policy::ResourcePolicy) -> Self {
+        Self {
+            transforms: TransformExecutionBudget::from_resources(resources),
+            xpath_parse: XPathSignatureParseBudget::from_resources(resources),
+        }
+    }
+}
+
 /// Compute base64 digest values for every `<Reference>` in the signing template.
 ///
 /// References are processed in `<SignedInfo>` document order under the last
@@ -1077,7 +1090,7 @@ fn fill_reference_digest_values_in_dependency_order(
     transform_options: TransformOptions,
     policy: &crate::policy::SigningPolicy,
     provider: &dyn crate::provider::CryptoProvider,
-    execution_budget: &TransformExecutionBudget,
+    budgets: &mut SigningOperationBudgets,
     target_signature: usize,
     id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<String, SigningDigestError> {
@@ -1085,9 +1098,8 @@ fn fill_reference_digest_values_in_dependency_order(
     let signature =
         find_signing_signature_node(&doc, SigningSignatureTarget::Index(target_signature))?;
     let signed_info = find_required_child(signature, "SignedInfo")?;
-    let mut xpath_budget = XPathSignatureParseBudget::from_resources(&policy.resources);
     let signed_info_references =
-        parse_signing_references_with_budget(signed_info, &mut xpath_budget)?;
+        parse_signing_references_with_budget(signed_info, &mut budgets.xpath_parse)?;
     validate_signing_references(
         &signed_info_references,
         signed_info_references.len(),
@@ -1102,7 +1114,7 @@ fn fill_reference_digest_values_in_dependency_order(
     let manifest_references = if process_manifests {
         parse_signing_manifest_references(
             signature,
-            &mut xpath_budget,
+            &mut budgets.xpath_parse,
             reference_limit.saturating_sub(signed_info_references.len()),
             reference_limit,
         )?
@@ -1147,11 +1159,11 @@ fn fill_reference_digest_values_in_dependency_order(
     )?;
     let analysis_signed_info = find_required_child(analysis_signature, "SignedInfo")?;
     let mut analysis_references =
-        parse_signing_references_with_budget(analysis_signed_info, &mut xpath_budget)?;
+        parse_signing_references_with_budget(analysis_signed_info, &mut budgets.xpath_parse)?;
     if process_manifests {
         analysis_references.extend(parse_signing_manifest_references(
             analysis_signature,
-            &mut xpath_budget,
+            &mut budgets.xpath_parse,
             reference_limit.saturating_sub(signed_info_references.len()),
             reference_limit,
         )?);
@@ -1161,7 +1173,7 @@ fn fill_reference_digest_values_in_dependency_order(
         analysis_signature,
         &analysis_references,
         transform_options,
-        execution_budget,
+        &budgets.transforms,
         id_attributes,
     )?;
     let mut filled = xml.to_owned();
@@ -1173,11 +1185,11 @@ fn fill_reference_digest_values_in_dependency_order(
         )?;
         let current_signed_info = find_required_child(current_signature, "SignedInfo")?;
         let current_signed_info_references =
-            parse_signing_references_with_budget(current_signed_info, &mut xpath_budget)?;
+            parse_signing_references_with_budget(current_signed_info, &mut budgets.xpath_parse)?;
         let current_manifest_references = if process_manifests {
             parse_signing_manifest_references(
                 current_signature,
-                &mut xpath_budget,
+                &mut budgets.xpath_parse,
                 reference_limit.saturating_sub(signed_info_references.len()),
                 reference_limit,
             )?
@@ -1223,7 +1235,7 @@ fn fill_reference_digest_values_in_dependency_order(
             level_references,
             transform_options,
             provider,
-            execution_budget,
+            &budgets.transforms,
             id_attributes,
         )?;
         if computed.len() != destinations.len() {
@@ -1501,7 +1513,7 @@ fn fill_reference_digest_values_with_options(
 fn canonicalize_signed_info(
     xml: &str,
     policy: &crate::policy::SigningPolicy,
-    execution_budget: &TransformExecutionBudget,
+    budgets: &mut SigningOperationBudgets,
     target_signature: usize,
 ) -> Result<(SignatureAlgorithm, Vec<u8>), SigningError> {
     let doc = parse_signing_document(xml, Some(policy)).map_err(SigningDigestError::XmlParse)?;
@@ -1510,7 +1522,8 @@ fn canonicalize_signed_info(
             .map_err(SigningError::Digest)?;
     let signed_info_node =
         find_required_child(signature, "SignedInfo").map_err(SigningError::Digest)?;
-    let signed_info = parse_signed_info(signed_info_node)?;
+    let signed_info =
+        parse_signed_info_with_xpath_budget(signed_info_node, &mut budgets.xpath_parse)?;
     if policy
         .transforms
         .allowed_algorithms
@@ -1532,15 +1545,15 @@ fn canonicalize_signed_info(
         &doc,
         Some(&|node| signed_info_subtree.contains(&node.id())),
         &signed_info.c14n_method,
-        execution_budget.remaining_c14n_output(),
-        execution_budget.xml_base_resolution(),
+        budgets.transforms.remaining_c14n_output(),
+        budgets.transforms.xml_base_resolution(),
         &mut canonical_signed_info,
     )
     .map_err(|error| {
         if let Some(violation) = map_c14n_resource_policy_violation(
             &error,
             crate::policy::resource_name::CANONICALIZED_BYTES,
-            execution_budget.c14n_output_limit(),
+            budgets.transforms.c14n_output_limit(),
         ) {
             SigningError::Policy(violation)
         } else {
@@ -1844,6 +1857,22 @@ mod error_conversion_tests {
     use super::*;
     use crate::policy::PolicyViolation;
 
+    struct RejectingSigningKey;
+
+    impl SigningKey for RejectingSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            Err(SigningKeyError::SigningFailed)
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Err(SigningKeyError::PublicKeyEncodingFailed)
+        }
+    }
+
     #[test]
     fn signing_error_promotes_every_policy_failure() {
         // All policy refusals use one public pipeline variant regardless of
@@ -1906,7 +1935,7 @@ mod error_conversion_tests {
             TransformOptions::default(),
             &policy,
             crate::provider::default_provider(),
-            &TransformExecutionBudget::default(),
+            &mut SigningOperationBudgets::default(),
             0,
             &[],
         )
@@ -1927,6 +1956,33 @@ mod error_conversion_tests {
     }
 
     #[test]
+    fn final_signed_info_parse_consumes_the_signing_xpath_budget() {
+        // One XPath Reference is parsed while discovering references, while
+        // analyzing dependencies, and while filling its dependency level. The
+        // final SignedInfo parse must consume the same operation-wide budget.
+        let xml = r##"<root><payload Id="payload">content</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
+        let mut policy = crate::policy::SigningPolicy::default();
+        policy.resources.max_xpath_expressions = 3;
+
+        let error = SignContext::new(&RejectingSigningKey)
+            .policy(policy)
+            .sign_template(xml)
+            .expect_err("the final SignedInfo parse must not reset the XPath budget");
+
+        assert!(
+            matches!(
+                error,
+                SigningError::Policy(PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_EXPRESSIONS,
+                    maximum: 3,
+                    ..
+                })
+            ),
+            "expected the shared XPath parse budget error, got: {error:?}"
+        );
+    }
+
+    #[test]
     fn signing_rejects_xpath_control_dependencies_on_digest_values() {
         // The second Reference excludes DigestValue nodes from its output but
         // reads the first DigestValue to decide whether payload remains. Filling
@@ -1938,7 +1994,7 @@ mod error_conversion_tests {
             TransformOptions::default(),
             &crate::policy::SigningPolicy::default(),
             crate::provider::default_provider(),
-            &TransformExecutionBudget::default(),
+            &mut SigningOperationBudgets::default(),
             0,
             &[],
         )
@@ -1965,7 +2021,7 @@ mod error_conversion_tests {
             TransformOptions::default(),
             &crate::policy::SigningPolicy::default(),
             crate::provider::default_provider(),
-            &TransformExecutionBudget::default(),
+            &mut SigningOperationBudgets::default(),
             0,
             &[],
         )
@@ -1986,7 +2042,7 @@ mod error_conversion_tests {
             TransformOptions::default(),
             &crate::policy::SigningPolicy::default(),
             crate::provider::default_provider(),
-            &TransformExecutionBudget::default(),
+            &mut SigningOperationBudgets::default(),
             0,
             &[],
         )
