@@ -15,7 +15,7 @@ use roxmltree::{Document, Node, NodeId};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
-use crate::c14n::{canonicalize_bounded_with_xml_base_budget, is_output_limit_error};
+use crate::c14n::canonicalize_bounded_with_xml_base_budget;
 use crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING;
 
 #[cfg(test)]
@@ -42,7 +42,7 @@ use super::signature::{
 use super::transforms::BASE64_TRANSFORM_URI;
 use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget, TransformOptions,
-    XPATH_TRANSFORM_URI, XPathHereSemantics, XPathSignatureParseBudget,
+    XPATH_TRANSFORM_URI, XPathHereSemantics, XPathSignatureParseBudget, c14n_policy_violation,
     execute_transforms_with_options_and_budget, transform_chain_produces_binary,
 };
 use super::uri::{UriReferenceResolver, same_document_reference_id};
@@ -1226,12 +1226,14 @@ fn verify_signature_with_context(
         }
     }
     let retrieval_materialization = if let Some(info) = key_info.as_mut() {
-        materialize_retrieval_methods(
+        materialize_retrieval_methods_with_budgets(
             info,
             &resolver,
             ctx.policy.uris.retrieval_methods,
             ctx.allowed_transform_uris(),
             ctx.provider,
+            &mut xpath_parse_budget,
+            &execution_budget,
         )?
     } else {
         RetrievalMaterialization::default()
@@ -1279,14 +1281,12 @@ fn verify_signature_with_context(
         &mut canonical_signed_info,
     )
     .map_err(|error| {
-        if is_output_limit_error(&error) {
-            SignatureVerificationPipelineError::from(ReferenceProcessingError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "canonicalized signature data bytes",
-                    maximum: canonicalized_data_budget.max_bytes,
-                    actual: canonicalized_data_budget.max_bytes.saturating_add(1),
-                },
-            ))
+        if let Some(violation) = c14n_policy_violation(
+            &error,
+            "canonicalized signature data bytes",
+            canonicalized_data_budget.max_bytes,
+        ) {
+            SignatureVerificationPipelineError::Policy(violation)
         } else {
             SignatureVerificationPipelineError::Canonicalization(error)
         }
@@ -1403,12 +1403,14 @@ struct RetrievalMaterialization {
     deferred_error: Option<SignatureVerificationPipelineError>,
 }
 
-fn materialize_retrieval_methods(
+fn materialize_retrieval_methods_with_budgets(
     key_info: &mut KeyInfo,
     resolver: &UriReferenceResolver<'_>,
     allowed_uri_types: UriTypeSet,
     allowed_transforms: Option<&HashSet<String>>,
     provider: &dyn crate::provider::CryptoProvider,
+    xpath_parse_budget: &mut XPathSignatureParseBudget,
+    execution_budget: &TransformExecutionBudget,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
     let retrieval_count = key_info
         .sources
@@ -1536,7 +1538,10 @@ fn materialize_retrieval_methods(
                 }
                 RetrievalMethodTransforms::X509DataNodeSetFilter => {
                     enforce_transform_allowed(allowed_transforms, XPATH_TRANSFORM_URI)?;
-                    select_retrieved_x509_data_root(target)?
+                    xpath_parse_budget
+                        .charge()
+                        .map_err(ReferenceProcessingError::Transform)?;
+                    select_retrieved_x509_data_root(target, execution_budget)?
                 }
                 RetrievalMethodTransforms::Unsupported => {
                     return Err(SignatureVerificationPipelineError::InvalidStructure {
@@ -1565,27 +1570,54 @@ fn materialize_retrieval_methods(
 
 fn select_retrieved_x509_data_root<'a, 'input>(
     target: Node<'a, 'input>,
+    execution_budget: &TransformExecutionBudget,
 ) -> Result<Node<'a, 'input>, SignatureVerificationPipelineError> {
     // XMLDSig XPath filtering evaluates the predicate for every node in the
     // dereferenced node-set. `ancestor-or-self::ds:X509Data` therefore retains
     // one X509Data descendant and its subtree; it cannot import an ancestor
     // that was outside the URI target's node-set.
-    let mut roots = target.descendants().filter(|candidate| {
-        candidate.is_element()
-            && candidate.tag_name().namespace() == Some(XMLDSIG_NS)
-            && candidate.tag_name().name() == "X509Data"
-    });
-    let root = roots
-        .next()
-        .ok_or(SignatureVerificationPipelineError::InvalidStructure {
-            reason: "X509Data RetrievalMethod selected no X509Data element",
-        })?;
-    if roots.next().is_some() {
-        return Err(SignatureVerificationPipelineError::InvalidStructure {
-            reason: "X509Data RetrievalMethod selected multiple X509Data elements",
-        });
+    let mut root = None;
+    for candidate in target.descendants() {
+        execution_budget
+            .charge_xpath_work(1)
+            .map_err(ReferenceProcessingError::Transform)?;
+        execution_budget
+            .charge_node_filter_work(1)
+            .map_err(ReferenceProcessingError::Transform)?;
+        if !candidate.is_element()
+            || candidate.tag_name().namespace() != Some(XMLDSIG_NS)
+            || candidate.tag_name().name() != "X509Data"
+        {
+            continue;
+        }
+        if root.replace(candidate).is_some() {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "X509Data RetrievalMethod selected multiple X509Data elements",
+            });
+        }
     }
-    Ok(root)
+    root.ok_or(SignatureVerificationPipelineError::InvalidStructure {
+        reason: "X509Data RetrievalMethod selected no X509Data element",
+    })
+}
+
+#[cfg(test)]
+fn materialize_retrieval_methods(
+    key_info: &mut KeyInfo,
+    resolver: &UriReferenceResolver<'_>,
+    allowed_uri_types: UriTypeSet,
+    allowed_transforms: Option<&HashSet<String>>,
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
+    materialize_retrieval_methods_with_budgets(
+        key_info,
+        resolver,
+        allowed_uri_types,
+        allowed_transforms,
+        provider,
+        &mut XPathSignatureParseBudget::default(),
+        &TransformExecutionBudget::default(),
+    )
 }
 
 fn existing_x509_binary_len(
@@ -3079,9 +3111,54 @@ mod tests {
 
         assert!(matches!(
             error,
-            SignatureVerificationPipelineError::Canonicalization(
-                crate::c14n::C14nError::XmlBaseComponentsTooLarge { max: 1, actual: 2 }
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "XML Base components",
+                    maximum: 1,
+                    actual: 2,
+                }
             )
+        ));
+    }
+
+    #[test]
+    fn verify_context_classifies_signed_info_xml_base_byte_limit_as_policy() {
+        // SignedInfo C14N 1.1 XML Base work is policy enforcement, not a
+        // malformed canonicalization request, and must retain typed diagnostics.
+        let xml = signature_with_target_reference("AQ==")
+            .replacen(
+                "http://www.w3.org/2001/10/xml-exc-c14n#",
+                "http://www.w3.org/2006/12/xml-c14n11",
+                1,
+            )
+            .replace(
+                "  <ds:Signature>",
+                "  <outer xml:base=\"segment/\"><ds:Signature>",
+            )
+            .replace("  </ds:Signature>", "  </ds:Signature></outer>");
+        let policy = crate::policy::VerificationPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_base_resolution_bytes: 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .verify(&xml)
+            .expect_err("SignedInfo XML Base byte exhaustion must be a policy error");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "XML Base resolution bytes",
+                    maximum: 1,
+                    actual,
+                }
+            ) if actual > 1
         ));
     }
 
@@ -4079,6 +4156,87 @@ mod tests {
                 ));
             }
         }
+    }
+
+    fn retrieval_method_xpath_signature() -> String {
+        format!(
+            r##"<root xmlns:ds="{XMLDSIG_NS}">
+              <payload Id="payload">ok</payload>
+              <ds:Signature>
+                <ds:SignedInfo>
+                  <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+                  <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+                  <ds:Reference URI="#payload">
+                    <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                    <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
+                  </ds:Reference>
+                </ds:SignedInfo>
+                <ds:SignatureValue>AQ==</ds:SignatureValue>
+                <ds:KeyInfo>
+                  <ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data">
+                    <ds:Transforms><ds:Transform Algorithm="{XPATH_TRANSFORM_URI}">
+                      <ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath>
+                    </ds:Transform></ds:Transforms>
+                  </ds:RetrievalMethod>
+                </ds:KeyInfo>
+              </ds:Signature>
+              <holder Id="target"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder>
+            </root>"##
+        )
+    }
+
+    #[test]
+    fn retrieval_method_xpath_uses_signature_expression_budget() {
+        // RetrievalMethod XPath belongs to the same untrusted Signature as
+        // Reference XPath and must not receive a separate parse allowance.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xpath_expressions = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath must consume the signature parse budget");
+
+        assert!(
+            matches!(
+                &error,
+                SignatureVerificationPipelineError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "XPath expressions",
+                        maximum: 0,
+                        actual: 1,
+                    }
+                )
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn retrieval_method_xpath_uses_node_filter_work_budget() {
+        // The fixed ancestor-or-self predicate scans the dereferenced node-set
+        // and therefore consumes the operation-wide node-filter allowance.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_node_set_filter_work = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath must consume node-filter work");
+
+        assert!(
+            matches!(
+                &error,
+                SignatureVerificationPipelineError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "node-set filter work",
+                        maximum: 0,
+                        actual,
+                    }
+                ) if *actual > 0
+            ),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

@@ -10,7 +10,8 @@ use crate::policy::{PolicyViolation, SigningPolicy};
 use crate::xml::{is_xml_1_0_character, is_xml_ncname};
 
 use super::transforms::{
-    XPathSignatureParseBudget, validate_xpath_namespace_budget_with_resources,
+    XPathSignatureParseBudget, validate_signing_transform_policy,
+    validate_xpath_namespace_budget_with_resources,
 };
 use super::{
     BASE64_TRANSFORM_URI, DigestAlgorithm, ENVELOPED_SIGNATURE_URI, SignatureAlgorithm, Transform,
@@ -268,19 +269,16 @@ impl SignatureBuilder {
                 }
                 .into());
             }
+            let initial_binary = reference
+                .uri
+                .as_deref()
+                .is_some_and(|uri| !uri.is_empty() && !uri.starts_with('#'));
+            validate_signing_transform_policy(
+                initial_binary,
+                &reference.transforms,
+                policy.transforms.allowed_algorithms.as_ref(),
+            )?;
             for transform in &reference.transforms {
-                if policy
-                    .transforms
-                    .allowed_algorithms
-                    .as_ref()
-                    .is_some_and(|allowed| !allowed.contains(transform.algorithm_uri()))
-                {
-                    return Err(PolicyViolation::Algorithm {
-                        operation: "signing transform",
-                        algorithm: transform.algorithm_uri().to_owned(),
-                    }
-                    .into());
-                }
                 match transform {
                     Transform::XPath(xpath) => {
                         validate_xpath_source(xpath.expression(), &mut xpath_signature_budget)?;

@@ -369,6 +369,14 @@ impl TransformExecutionBudget {
     pub(crate) fn xml_base_resolution(&self) -> &XmlBaseResolutionBudget {
         &self.xml_base_resolution
     }
+
+    pub(crate) fn charge_xpath_work(&self, work: usize) -> Result<(), TransformError> {
+        self.xpath.charge(work)
+    }
+
+    pub(crate) fn charge_node_filter_work(&self, nodes: usize) -> Result<(), TransformError> {
+        self.node_filter.charge(nodes)
+    }
 }
 
 impl TransformOptions {
@@ -1371,24 +1379,16 @@ fn finalize_transform_data(
 }
 
 fn map_c14n_limit_error(error: c14n::C14nError, budget: &C14nOutputBudget) -> TransformError {
-    match error {
-        error if c14n::is_output_limit_error(&error) => {
-            // Rendering already spent work up to the remaining allowance. Mark
-            // it consumed so another Reference cannot spend the same budget.
-            budget.exhaust();
-            transform_resource_limit(
-                "canonicalized bytes",
-                budget.max_bytes,
-                budget.max_bytes.saturating_add(1),
-            )
-        }
-        c14n::C14nError::XmlBaseComponentsTooLarge { max, actual } => {
-            transform_resource_limit("XML Base components", max, actual)
-        }
-        c14n::C14nError::XmlBaseResolutionTooLarge { max_bytes, actual } => {
-            transform_resource_limit("XML Base resolution bytes", max_bytes, actual)
-        }
-        error => TransformError::C14n(error),
+    if c14n::is_output_limit_error(&error) {
+        // Rendering already spent work up to the remaining allowance. Mark it
+        // consumed so another Reference cannot spend the same budget.
+        budget.exhaust();
+    }
+    if let Some(violation) = c14n_policy_violation(&error, "canonicalized bytes", budget.max_bytes)
+    {
+        TransformError::Policy(violation)
+    } else {
+        TransformError::C14n(error)
     }
 }
 
@@ -1399,6 +1399,65 @@ pub(crate) fn transform_chain_produces_binary(
     transforms.last().map_or(initial_binary, |transform| {
         matches!(transform, Transform::C14n(_) | Transform::Base64Decode)
     })
+}
+
+pub(crate) fn c14n_policy_violation(
+    error: &c14n::C14nError,
+    output_resource: &'static str,
+    output_maximum: usize,
+) -> Option<crate::policy::PolicyViolation> {
+    match error {
+        error if c14n::is_output_limit_error(error) => {
+            Some(crate::policy::PolicyViolation::ResourceLimit {
+                resource: output_resource,
+                maximum: output_maximum,
+                actual: output_maximum.saturating_add(1),
+            })
+        }
+        c14n::C14nError::XmlBaseComponentsTooLarge { max, actual } => {
+            Some(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "XML Base components",
+                maximum: *max,
+                actual: *actual,
+            })
+        }
+        c14n::C14nError::XmlBaseResolutionTooLarge { max_bytes, actual } => {
+            Some(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "XML Base resolution bytes",
+                maximum: *max_bytes,
+                actual: *actual,
+            })
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn validate_signing_transform_policy(
+    initial_binary: bool,
+    transforms: &[Transform],
+    allowed: Option<&HashSet<String>>,
+) -> Result<(), crate::policy::PolicyViolation> {
+    let Some(allowed) = allowed else {
+        return Ok(());
+    };
+    for transform in transforms {
+        let algorithm = transform.algorithm_uri();
+        if !allowed.contains(algorithm) {
+            return Err(crate::policy::PolicyViolation::Algorithm {
+                operation: "signing transform",
+                algorithm: algorithm.to_owned(),
+            });
+        }
+    }
+    if !transform_chain_produces_binary(initial_binary, transforms)
+        && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI)
+    {
+        return Err(crate::policy::PolicyViolation::Algorithm {
+            operation: "signing transform",
+            algorithm: DEFAULT_IMPLICIT_C14N_URI.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Parse a `<Transforms>` element into a `Vec<Transform>`.

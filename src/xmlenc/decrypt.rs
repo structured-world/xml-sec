@@ -97,7 +97,10 @@ pub trait DecryptionKeyResolver {
     /// once while only authenticated primitive decryption is retried. Overrides
     /// must consume the shared budget before every lookup or unwrap attempt.
     /// The context also accounts for any returned candidates an implementation
-    /// did not explicitly charge.
+    /// did not explicitly charge. Returning [`XmlEncError::Policy`] rejects the
+    /// complete operation and never advances to another key source; use a
+    /// candidate-local error such as [`XmlEncError::KeyNotFound`] when later
+    /// ordered sources are still eligible.
     fn resolve_key_candidates(
         &self,
         provider: &dyn crate::provider::CryptoProvider,
@@ -783,7 +786,7 @@ fn resolve_content_key_candidates(
         match resolve_candidates_with_budget(resolver, provider, algorithm, None, &mut budget) {
             Ok(keys) => keys,
             Err(error) => {
-                record_candidate_source_error(error, &mut last_error)?;
+                record_candidate_source_error_or_fail_operation(error, &mut last_error)?;
                 Vec::new()
             }
         };
@@ -803,7 +806,7 @@ fn resolve_content_key_candidates(
             &mut budget,
         ) {
             Ok(keys) => candidates.extend(keys),
-            Err(error) => record_candidate_source_error(error, &mut last_error)?,
+            Err(error) => record_candidate_source_error_or_fail_operation(error, &mut last_error)?,
         }
     }
     if candidates.is_empty() {
@@ -813,7 +816,7 @@ fn resolve_content_key_candidates(
     }
 }
 
-fn record_candidate_source_error(
+fn record_candidate_source_error_or_fail_operation(
     error: XmlEncError,
     last_error: &mut Option<XmlEncError>,
 ) -> Result<(), XmlEncError> {
@@ -1252,6 +1255,10 @@ mod tests {
         recipient: Vec<u8>,
     }
 
+    struct PolicyRejectingDirectResolver {
+        recipient: Vec<u8>,
+    }
+
     struct MislabelledExhaustionResolver {
         direct: Vec<u8>,
     }
@@ -1286,6 +1293,24 @@ mod tests {
                     expected: 16,
                     actual: 8,
                 })
+            }
+        }
+    }
+
+    impl DecryptionKeyResolver for PolicyRejectingDirectResolver {
+        fn resolve_key(
+            &self,
+            _provider: &dyn crate::provider::CryptoProvider,
+            _algorithm: DataEncryptionAlgorithm,
+            encrypted_key: Option<&EncryptedKey>,
+        ) -> Result<Vec<u8>, XmlEncError> {
+            if encrypted_key.is_some() {
+                Ok(self.recipient.clone())
+            } else {
+                Err(crate::policy::PolicyViolation::KeyTrust {
+                    reason: "test resolver rejected the operation",
+                }
+                .into())
             }
         }
     }
@@ -2122,6 +2147,30 @@ mod tests {
             .expect("recipient lookup must follow a candidate-local direct error");
 
         assert_eq!(plaintext, DecryptedContent::Bytes(b"payload".to_vec()));
+    }
+
+    #[test]
+    fn resolver_policy_rejection_stops_before_later_recipient() {
+        // A custom resolver's typed policy rejection is operation-wide; trying
+        // a later recipient after it would allow key-source policy bypass.
+        let correct = vec![0x65_u8; 16];
+        let encrypted = encrypted_data_with_recipients(
+            &correct,
+            vec![associated_encrypted_key("recipient", None, None)],
+            None,
+        );
+        let resolver = PolicyRejectingDirectResolver { recipient: correct };
+
+        let error = DecryptContext::new(&resolver)
+            .decrypt_data(&encrypted)
+            .expect_err("operation policy rejection must be fatal");
+
+        assert!(matches!(
+            error,
+            XmlEncError::Policy(crate::policy::PolicyViolation::KeyTrust {
+                reason: "test resolver rejected the operation",
+            })
+        ));
     }
 
     #[test]

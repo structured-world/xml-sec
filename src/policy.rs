@@ -924,38 +924,170 @@ mod tests {
     #[test]
     fn every_resource_policy_field_obeys_its_hard_ceiling() {
         // Each public tuning knob is only a stricter operational limit; none
-        // may raise the implementation's allocation ceiling.
-        let mut policies = Vec::new();
-        let mut external = ResourcePolicy::default();
-        external.max_external_resource_bytes += 1;
-        policies.push(external);
-        let mut aggregate = ResourcePolicy::default();
-        aggregate.max_external_resource_total_bytes += 1;
-        policies.push(aggregate);
-        let mut xml_base_components = ResourcePolicy::default();
-        xml_base_components.max_xml_base_components += 1;
-        policies.push(xml_base_components);
-        let mut xml_base_bytes = ResourcePolicy::default();
-        xml_base_bytes.max_xml_base_resolution_bytes += 1;
-        policies.push(xml_base_bytes);
-        let mut plaintext = ResourcePolicy::default();
-        plaintext.max_encryption_plaintext_bytes += 1;
-        policies.push(plaintext);
-        let mut document = ResourcePolicy::default();
-        document.max_xml_document_bytes += 1;
-        policies.push(document);
-        let mut recipients = ResourcePolicy::default();
-        recipients.max_encryption_recipients += 1;
-        policies.push(recipients);
-        let mut metadata = ResourcePolicy::default();
-        metadata.max_encryption_metadata_bytes += 1;
-        policies.push(metadata);
+        // may raise the implementation's allocation ceiling. Exact diagnostics
+        // also catch a field accidentally paired with another field's ceiling.
+        type Case = (&'static str, usize, fn(&mut ResourcePolicy) -> &mut usize);
+        let cases: &[Case] = &[
+            (
+                "XML nodes",
+                crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
+                |p| &mut p.max_xml_nodes,
+            ),
+            (
+                "signature references",
+                crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
+                |p| &mut p.max_references,
+            ),
+            (
+                "reference transforms",
+                crate::hard_limits::REFERENCE_TRANSFORM_CEILING,
+                |p| &mut p.max_transforms_per_reference,
+            ),
+            (
+                "XML Base components",
+                crate::hard_limits::XML_BASE_COMPONENT_CEILING,
+                |p| &mut p.max_xml_base_components,
+            ),
+            (
+                "XML Base resolution bytes",
+                crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING,
+                |p| &mut p.max_xml_base_resolution_bytes,
+            ),
+            (
+                "canonicalized bytes",
+                crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING,
+                |p| &mut p.max_canonicalized_bytes,
+            ),
+            (
+                "external resource bytes",
+                crate::hard_limits::EXTERNAL_RESOURCE_BYTE_CEILING,
+                |p| &mut p.max_external_resource_bytes,
+            ),
+            (
+                "aggregate external resource bytes",
+                crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING,
+                |p| &mut p.max_external_resource_total_bytes,
+            ),
+            (
+                "encryption plaintext bytes",
+                crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING,
+                |p| &mut p.max_encryption_plaintext_bytes,
+            ),
+            (
+                "XML document",
+                crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
+                |p| &mut p.max_xml_document_bytes,
+            ),
+            (
+                "encryption recipients",
+                crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
+                |p| &mut p.max_encryption_recipients,
+            ),
+            (
+                "encryption metadata bytes",
+                crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
+                |p| &mut p.max_encryption_metadata_bytes,
+            ),
+            (
+                "decryption key candidates",
+                crate::hard_limits::KEY_CANDIDATE_CEILING,
+                |p| &mut p.max_key_candidates,
+            ),
+            (
+                "Base64 transform input",
+                crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
+                |p| &mut p.max_base64_transform_input_bytes,
+            ),
+            (
+                "Base64 transform output",
+                crate::hard_limits::BASE64_TRANSFORM_OUTPUT_BYTE_CEILING,
+                |p| &mut p.max_base64_transform_output_bytes,
+            ),
+            (
+                "XPath expressions",
+                crate::hard_limits::XPATH_EXPRESSION_COUNT_CEILING,
+                |p| &mut p.max_xpath_expressions,
+            ),
+            (
+                "XPath expression bytes",
+                crate::hard_limits::XPATH_EXPRESSION_BYTE_CEILING,
+                |p| &mut p.max_xpath_expression_bytes,
+            ),
+            (
+                "XPath expression complexity",
+                crate::hard_limits::XPATH_EXPRESSION_COMPLEXITY_CEILING,
+                |p| &mut p.max_xpath_expression_complexity,
+            ),
+            (
+                "XPath context evaluations",
+                crate::hard_limits::XPATH_CONTEXT_EVALUATION_CEILING,
+                |p| &mut p.max_xpath_context_evaluations,
+            ),
+            (
+                "XPath evaluation work",
+                crate::hard_limits::XPATH_EVALUATION_WORK_CEILING,
+                |p| &mut p.max_xpath_evaluation_work,
+            ),
+            (
+                "XPath mirror string bytes",
+                crate::hard_limits::XPATH_MIRROR_STRING_BYTE_CEILING,
+                |p| &mut p.max_xpath_mirror_string_bytes,
+            ),
+            (
+                "XPath string work bytes",
+                crate::hard_limits::XPATH_STRING_WORK_BYTE_CEILING,
+                |p| &mut p.max_xpath_string_work_bytes,
+            ),
+            (
+                "XPath namespace bindings",
+                crate::hard_limits::XPATH_NAMESPACE_BINDING_CEILING,
+                |p| &mut p.max_xpath_namespace_bindings,
+            ),
+            (
+                "XPath namespace bytes",
+                crate::hard_limits::XPATH_NAMESPACE_BYTE_CEILING,
+                |p| &mut p.max_xpath_namespace_bytes,
+            ),
+            (
+                "XPath filters",
+                crate::hard_limits::XPATH_FILTER_COUNT_CEILING,
+                |p| &mut p.max_xpath_filters,
+            ),
+            (
+                "node-set filter work",
+                crate::hard_limits::NODE_SET_FILTER_WORK_CEILING,
+                |p| &mut p.max_node_set_filter_work,
+            ),
+            (
+                "node-set entries",
+                crate::hard_limits::NODE_SET_ENTRY_CEILING,
+                |p| &mut p.max_node_set_entries,
+            ),
+            (
+                "node-set owned string bytes",
+                crate::hard_limits::NODE_SET_OWNED_STRING_BYTE_CEILING,
+                |p| &mut p.max_node_set_owned_string_bytes,
+            ),
+            (
+                "cumulative node-set owned string bytes",
+                crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING,
+                |p| &mut p.max_node_set_cumulative_owned_string_bytes,
+            ),
+        ];
 
-        for policy in policies {
-            assert!(matches!(
+        for &(resource, ceiling, field) in cases {
+            let mut policy = ResourcePolicy::default();
+            let actual = ceiling.saturating_add(1);
+            *field(&mut policy) = actual;
+            assert_eq!(
                 policy.validate(),
-                Err(PolicyViolation::ResourceLimit { .. })
-            ));
+                Err(PolicyViolation::ResourceLimit {
+                    resource,
+                    maximum: ceiling,
+                    actual,
+                }),
+                "wrong hard-ceiling validation for {resource}",
+            );
         }
     }
 

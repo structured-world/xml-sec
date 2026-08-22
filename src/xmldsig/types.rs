@@ -185,6 +185,21 @@ impl XmlNodeKey {
             Self::Namespace { prefix, uri, .. } => prefix.len().saturating_add(uri.len()),
         }
     }
+
+    fn checked_owned_string_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Tree(_) => Some(0),
+            Self::Attribute {
+                namespace,
+                local_name,
+                ..
+            } => namespace
+                .as_ref()
+                .map_or(0, String::len)
+                .checked_add(local_name.len()),
+            Self::Namespace { prefix, uri, .. } => prefix.len().checked_add(uri.len()),
+        }
+    }
 }
 
 impl<'a> NodeSet<'a> {
@@ -399,23 +414,21 @@ impl<'a> NodeSet<'a> {
         budget: &NodeSetMaterializationBudget,
     ) -> Result<(), TransformError> {
         if self.owns(owner) {
-            if self.nodes.contains(&XmlNodeKey::Attribute {
+            let key = XmlNodeKey::Attribute {
                 owner: owner.id(),
                 namespace: namespace.map(str::to_owned),
                 local_name: local_name.to_owned(),
-            }) {
+            };
+            if self.nodes.contains(&key) {
                 return Ok(());
             }
-            let additional_bytes = namespace
-                .map_or(0, str::len)
-                .checked_add(local_name.len())
-                .ok_or_else(|| {
-                    transform_resource_limit(
-                        "node-set owned string bytes",
-                        budget.max_owned_string_bytes,
-                        usize::MAX,
-                    )
-                })?;
+            let additional_bytes = key.checked_owned_string_bytes().ok_or_else(|| {
+                transform_resource_limit(
+                    "node-set owned string bytes",
+                    budget.max_owned_string_bytes,
+                    usize::MAX,
+                )
+            })?;
             let total_bytes = self.owned_string_bytes.saturating_add(additional_bytes);
             if total_bytes > budget.max_owned_string_bytes {
                 return Err(transform_resource_limit(
@@ -432,7 +445,11 @@ impl<'a> NodeSet<'a> {
                 ));
             }
             budget.charge(additional_bytes)?;
-            self.insert_attribute(owner, namespace, local_name);
+            let inserted = self.nodes.insert(key);
+            debug_assert!(inserted, "the duplicate key was checked before insertion");
+            if inserted {
+                self.owned_string_bytes = total_bytes;
+            }
         }
         Ok(())
     }
@@ -461,14 +478,15 @@ impl<'a> NodeSet<'a> {
         budget: &NodeSetMaterializationBudget,
     ) -> Result<(), TransformError> {
         if self.owns(owner) {
-            if self.nodes.contains(&XmlNodeKey::Namespace {
+            let key = XmlNodeKey::Namespace {
                 owner: owner.id(),
                 prefix: prefix.to_owned(),
                 uri: uri.to_owned(),
-            }) {
+            };
+            if self.nodes.contains(&key) {
                 return Ok(());
             }
-            let additional_bytes = prefix.len().checked_add(uri.len()).ok_or_else(|| {
+            let additional_bytes = key.checked_owned_string_bytes().ok_or_else(|| {
                 transform_resource_limit(
                     "node-set owned string bytes",
                     budget.max_owned_string_bytes,
@@ -491,7 +509,11 @@ impl<'a> NodeSet<'a> {
                 ));
             }
             budget.charge(additional_bytes)?;
-            self.insert_namespace(owner, prefix, uri);
+            let inserted = self.nodes.insert(key);
+            debug_assert!(inserted, "the duplicate key was checked before insertion");
+            if inserted {
+                self.owned_string_bytes = total_bytes;
+            }
         }
         Ok(())
     }

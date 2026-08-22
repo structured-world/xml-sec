@@ -202,6 +202,36 @@ fn rejects_transform_chains_that_execution_cannot_accept() {
 }
 
 #[test]
+fn rejects_node_set_reference_when_implicit_c14n_is_disallowed() {
+    // A node-set reference receives inclusive C14N 1.0 implicitly during
+    // digest computation, so template validation must enforce that hidden
+    // transform before emitting a template that signing cannot consume.
+    let mut policy = SigningPolicy::default();
+    policy.transforms.allowed_algorithms = Some(
+        [
+            exclusive_c14n().uri().to_owned(),
+            xml_sec::xmldsig::ENVELOPED_SIGNATURE_URI.to_owned(),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::Enveloped),
+        )
+        .build_template_with_policy(&policy)
+        .expect_err("builder must enforce the implicit canonicalization transform");
+
+    assert!(matches!(
+        error,
+        SignatureBuilderError::Policy(PolicyViolation::Algorithm {
+            operation: "signing transform",
+            algorithm,
+        }) if algorithm == xml_sec::xmldsig::DEFAULT_IMPLICIT_C14N_URI
+    ));
+}
+
+#[test]
 fn rejects_xpath_sources_that_parsing_cannot_accept() {
     // Programmatic XPath and Filter 2.0 parameters must pass the same source
     // contract as serialized parameters parsed back during signing.

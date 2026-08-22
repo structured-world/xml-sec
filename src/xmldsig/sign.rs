@@ -20,7 +20,7 @@ use signature::hazmat::PrehashSigner;
 use std::{collections::HashSet, ops::Range};
 use x509_parser::prelude::FromDer;
 
-use crate::c14n::{canonicalize_bounded_with_xml_base_budget, is_output_limit_error};
+use crate::c14n::canonicalize_bounded_with_xml_base_budget;
 
 use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::DigestAlgorithm;
@@ -37,10 +37,10 @@ use super::parse::{
     MAX_REFERENCES_PER_SIGNATURE, SignatureAlgorithm, XMLDSIG_NS, parse_signed_info,
 };
 use super::transforms::{
-    DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget, TransformOptions,
-    XPathHereSemantics, XPathSignatureParseBudget, execute_transforms_with_dependency_nodes,
+    Transform, TransformExecutionBudget, TransformOptions, XPathHereSemantics,
+    XPathSignatureParseBudget, c14n_policy_violation, execute_transforms_with_dependency_nodes,
     execute_transforms_with_options_and_budget, parse_transforms_with_budget,
-    transform_chain_produces_binary,
+    validate_signing_transform_policy,
 };
 use super::types::TransformError;
 use super::uri::UriReferenceResolver;
@@ -1395,28 +1395,12 @@ fn validate_signing_references(
             }
             .into());
         }
-        if let Some(allowed) = policy.transforms.allowed_algorithms.as_ref() {
-            for transform in &reference.transforms {
-                let uri = transform.algorithm_uri();
-                if !allowed.contains(uri) {
-                    return Err(crate::policy::PolicyViolation::Algorithm {
-                        operation: "signing transform",
-                        algorithm: uri.to_owned(),
-                    }
-                    .into());
-                }
-            }
-            let initial_binary = !reference.uri.is_empty() && !reference.uri.starts_with('#');
-            if !transform_chain_produces_binary(initial_binary, &reference.transforms)
-                && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI)
-            {
-                return Err(crate::policy::PolicyViolation::Algorithm {
-                    operation: "signing transform",
-                    algorithm: DEFAULT_IMPLICIT_C14N_URI.to_owned(),
-                }
-                .into());
-            }
-        }
+        let initial_binary = !reference.uri.is_empty() && !reference.uri.starts_with('#');
+        validate_signing_transform_policy(
+            initial_binary,
+            &reference.transforms,
+            policy.transforms.allowed_algorithms.as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -1554,15 +1538,12 @@ fn canonicalize_signed_info(
         &mut canonical_signed_info,
     )
     .map_err(|error| {
-        if is_output_limit_error(&error) {
-            SigningError::Digest(SigningDigestError::Transform(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "canonicalized bytes",
-                    maximum: execution_budget.c14n_output_limit(),
-                    actual: execution_budget.c14n_output_limit().saturating_add(1),
-                }
-                .into(),
-            ))
+        if let Some(violation) = c14n_policy_violation(
+            &error,
+            "canonicalized bytes",
+            execution_budget.c14n_output_limit(),
+        ) {
+            SigningError::Digest(SigningDigestError::Transform(violation.into()))
         } else {
             SigningError::Canonicalization(error)
         }

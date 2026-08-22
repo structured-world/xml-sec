@@ -123,7 +123,7 @@ impl XPathWorkBudget {
         }
     }
 
-    fn charge(&self, work: usize) -> Result<(), TransformError> {
+    pub(super) fn charge(&self, work: usize) -> Result<(), TransformError> {
         let remaining = self.remaining.get();
         let Some(next) = remaining.checked_sub(work) else {
             self.remaining.set(0);
