@@ -140,6 +140,14 @@ mod tests {
             crate::provider::default_provider().fill_random(output)
         }
 
+        fn derive_key(
+            &self,
+            parameters: &crate::provider::KdfParameters<'_>,
+            secret: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::default_provider().derive_key(parameters, secret)
+        }
+
         fn digest(
             &self,
             _algorithm: DigestAlgorithm,

@@ -6,11 +6,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use xml_sec::{
     provider::{
         CryptoProvider, KeyRecoveryKey, KeyTransportKey, ProviderCapability, ProviderError,
-        RustCryptoProvider,
+        ProviderOperation, RustCryptoProvider,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, EncryptedDataBuilder, KeyWrapAlgorithm,
-        PrivateKeyDecryptor, RsaOaepParameters,
+        PrivateKeyDecryptor, RsaOaepParameters, XmlEncError,
     },
 };
 
@@ -52,7 +52,25 @@ impl KeyRecoveryKey for ExternalPrivateKey {
     }
 }
 
-struct ExternalProvider;
+struct ExternalProvider {
+    reject_decrypt: bool,
+    reject_transport: bool,
+}
+
+impl ExternalProvider {
+    const FULL: Self = Self {
+        reject_decrypt: false,
+        reject_transport: false,
+    };
+    const RECOVERY_ONLY: Self = Self {
+        reject_decrypt: false,
+        reject_transport: true,
+    };
+    const REFUSES_DECRYPT: Self = Self {
+        reject_decrypt: true,
+        reject_transport: true,
+    };
+}
 
 impl CryptoProvider for ExternalProvider {
     fn name(&self) -> &'static str {
@@ -60,11 +78,25 @@ impl CryptoProvider for ExternalProvider {
     }
 
     fn supports(&self, capability: ProviderCapability<'_>) -> bool {
+        if self.reject_decrypt && matches!(capability, ProviderCapability::Decrypt(_)) {
+            return false;
+        }
+        if self.reject_transport && matches!(capability, ProviderCapability::KeyTransport(_)) {
+            return false;
+        }
         RustCryptoProvider.supports(capability)
     }
 
     fn fill_random(&self, output: &mut [u8]) -> Result<(), ProviderError> {
         RustCryptoProvider.fill_random(output)
+    }
+
+    fn derive_key(
+        &self,
+        parameters: &xml_sec::provider::KdfParameters<'_>,
+        secret: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        RustCryptoProvider.derive_key(parameters, secret)
     }
 
     fn digest(
@@ -109,6 +141,7 @@ impl CryptoProvider for ExternalProvider {
         _key: &[u8],
         _ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
+        assert!(!self.reject_decrypt, "refused decryption was dispatched");
         Ok(b"external plaintext".to_vec())
     }
 
@@ -146,7 +179,7 @@ impl CryptoProvider for ExternalProvider {
         parameters: &RsaOaepParameters,
         _ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
-        assert!(self.supports(ProviderCapability::KeyTransport(parameters)));
+        assert!(self.supports(ProviderCapability::KeyRecovery(parameters)));
         Ok(vec![0x42; 16])
     }
 }
@@ -156,7 +189,7 @@ fn opaque_provider_keys_cross_the_public_encrypt_and_decrypt_pipelines() {
     // A provider-specific public handle reaches transport without exposing a
     // concrete backend key type to the encryption builder.
     let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
-        .provider(Arc::new(ExternalProvider))
+        .provider(Arc::new(ExternalProvider::FULL))
         .recipient_key_transport(Arc::new(ExternalPublicKey))
         .encrypt_binary(b"provider contract")
         .expect("external transport provider must produce EncryptedData");
@@ -165,9 +198,41 @@ fn opaque_provider_keys_cross_the_public_encrypt_and_decrypt_pipelines() {
     // The reciprocal public resolver exposes only RSA ciphertext width. The
     // custom provider recovers the content key and decrypts without accessing
     // private key material through RustCrypto.
+    let xml = external_encrypted_xml();
+    let resolver = PrivateKeyDecryptor::provider_key(Arc::new(ExternalPrivateKey));
+    let decrypted = DecryptContext::new(&resolver)
+        .provider(&ExternalProvider::RECOVERY_ONLY)
+        .decrypt(&xml)
+        .expect("external recovery and content decryption must complete");
+    assert_eq!(
+        decrypted,
+        xml_sec::xmlenc::DecryptedContent::Bytes(b"external plaintext".to_vec())
+    );
+}
+
+#[test]
+fn refused_public_capability_fails_before_provider_dispatch() {
+    // A provider's capability declaration is authoritative. The facade must
+    // return the typed refusal without invoking the corresponding operation.
+    let resolver = PrivateKeyDecryptor::provider_key(Arc::new(ExternalPrivateKey));
+    let error = DecryptContext::new(&resolver)
+        .provider(&ExternalProvider::REFUSES_DECRYPT)
+        .decrypt(&external_encrypted_xml())
+        .expect_err("refused decryption capability must fail closed");
+
+    assert!(matches!(
+        error,
+        XmlEncError::Provider(ProviderError::Unsupported {
+            operation: ProviderOperation::Decrypt,
+            ..
+        })
+    ));
+}
+
+fn external_encrypted_xml() -> String {
     let wrapped = STANDARD.encode(vec![0xa5; 256]);
     let ciphertext = STANDARD.encode(vec![0x5a; 46]);
-    let xml = format!(
+    format!(
         r#"<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#"
              xmlns:xenc11="http://www.w3.org/2009/xmlenc11#"
              xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
@@ -181,14 +246,5 @@ fn opaque_provider_keys_cross_the_public_encrypt_and_decrypt_pipelines() {
           </xenc:EncryptedKey></ds:KeyInfo>
           <xenc:CipherData><xenc:CipherValue>{ciphertext}</xenc:CipherValue></xenc:CipherData>
         </xenc:EncryptedData>"#
-    );
-    let resolver = PrivateKeyDecryptor::provider_key(Arc::new(ExternalPrivateKey));
-    let decrypted = DecryptContext::new(&resolver)
-        .provider(&ExternalProvider)
-        .decrypt(&xml)
-        .expect("external recovery and content decryption must complete");
-    assert_eq!(
-        decrypted,
-        xml_sec::xmlenc::DecryptedContent::Bytes(b"external plaintext".to_vec())
-    );
+    )
 }

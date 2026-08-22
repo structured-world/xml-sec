@@ -1062,6 +1062,14 @@ mod tests {
             )
         }
 
+        fn derive_key(
+            &self,
+            parameters: &crate::provider::KdfParameters<'_>,
+            secret: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::RustCryptoProvider.derive_key(parameters, secret)
+        }
+
         #[cfg(feature = "xmldsig")]
         fn digest(
             &self,

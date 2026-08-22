@@ -525,9 +525,7 @@ fn recover_rsa_oaep(
             actual: wrapped.len(),
         });
     }
-    provider.require_capability(crate::provider::ProviderCapability::KeyTransport(
-        parameters,
-    ))?;
+    provider.require_capability(crate::provider::ProviderCapability::KeyRecovery(parameters))?;
     provider
         .recover_key(key, parameters, wrapped)
         .map_err(|error| match error {
@@ -1525,6 +1523,14 @@ mod tests {
                 &crate::provider::RustCryptoProvider,
                 output,
             )
+        }
+
+        fn derive_key(
+            &self,
+            parameters: &crate::provider::KdfParameters<'_>,
+            secret: &[u8],
+        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            crate::provider::RustCryptoProvider.derive_key(parameters, secret)
         }
 
         #[cfg(feature = "xmldsig")]

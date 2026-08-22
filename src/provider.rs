@@ -39,6 +39,8 @@ pub enum ProviderOperation {
     KeyUnwrap,
     /// Public-key key transport.
     KeyTransport,
+    /// Private-key recovery of transported key bytes.
+    KeyRecovery,
     /// Key agreement.
     KeyAgreement,
     /// Key derivation.
@@ -81,6 +83,9 @@ pub enum ProviderCapability<'a> {
     /// RSA-OAEP key transport with complete digest, MGF, and label parameters.
     #[cfg(feature = "xmlenc")]
     KeyTransport(&'a RsaOaepParameters),
+    /// RSA-OAEP key recovery with complete digest, MGF, and label parameters.
+    #[cfg(feature = "xmlenc")]
+    KeyRecovery(&'a RsaOaepParameters),
     /// Provider-defined key agreement identified by its standard URI.
     KeyAgreement(&'a KeyAgreementParameters<'a>),
     /// Provider-defined key derivation identified by its standard URI.
@@ -112,6 +117,8 @@ impl ProviderCapability<'_> {
             Self::KeyUnwrap(_) => ProviderOperation::KeyUnwrap,
             #[cfg(feature = "xmlenc")]
             Self::KeyTransport(_) => ProviderOperation::KeyTransport,
+            #[cfg(feature = "xmlenc")]
+            Self::KeyRecovery(_) => ProviderOperation::KeyRecovery,
             Self::KeyAgreement(_) => ProviderOperation::KeyAgreement,
             Self::Kdf(_) => ProviderOperation::Kdf,
             Self::Random => ProviderOperation::Random,
@@ -133,7 +140,9 @@ impl ProviderCapability<'_> {
             #[cfg(feature = "xmlenc")]
             Self::KeyWrap(algorithm) | Self::KeyUnwrap(algorithm) => Some(algorithm.uri()),
             #[cfg(feature = "xmlenc")]
-            Self::KeyTransport(parameters) => Some(parameters.algorithm.uri()),
+            Self::KeyTransport(parameters) | Self::KeyRecovery(parameters) => {
+                Some(parameters.algorithm.uri())
+            }
             Self::KeyAgreement(parameters) => Some(parameters.algorithm),
             Self::Kdf(parameters) => Some(parameters.algorithm),
             Self::Random => None,
@@ -475,18 +484,15 @@ pub trait CryptoProvider: Send + Sync {
     }
 
     /// Derive key bytes from caller-owned secret material.
+    ///
+    /// Implementations that advertise [`ProviderCapability::Kdf`] must perform
+    /// the advertised derivation here. This method is required so capability
+    /// discovery cannot silently inherit a contradictory unsupported default.
     fn derive_key(
         &self,
         parameters: &KdfParameters<'_>,
         secret: &[u8],
-    ) -> Result<Vec<u8>, ProviderError> {
-        let _ = secret;
-        self.require_capability(ProviderCapability::Kdf(parameters))?;
-        Err(ProviderError::Unsupported {
-            operation: ProviderOperation::Kdf,
-            algorithm: Some(parameters.algorithm.to_owned()),
-        })
-    }
+    ) -> Result<Vec<u8>, ProviderError>;
 
     /// Reject an unavailable exact capability without falling back.
     fn require_capability(&self, capability: ProviderCapability<'_>) -> Result<(), ProviderError> {
@@ -700,10 +706,8 @@ impl CryptoProvider for RustCryptoProvider {
             #[cfg(feature = "xmlenc")]
             ProviderCapability::KeyWrap(_) | ProviderCapability::KeyUnwrap(_) => true,
             #[cfg(feature = "xmlenc")]
-            ProviderCapability::KeyTransport(parameters) => {
-                parameters.algorithm != crate::xmlenc::KeyTransportAlgorithm::RsaOaepMgf1p
-                    || parameters.mgf_digest == crate::xmlenc::OaepDigestAlgorithm::Sha1
-            }
+            ProviderCapability::KeyTransport(parameters)
+            | ProviderCapability::KeyRecovery(parameters) => legacy_oaep_mgf_is_valid(parameters),
             ProviderCapability::Random => true,
             ProviderCapability::KeyAgreement(_) | ProviderCapability::Kdf(_) => false,
         }
@@ -713,6 +717,18 @@ impl CryptoProvider for RustCryptoProvider {
         SysRng
             .try_fill_bytes(output)
             .map_err(|error| ProviderError::Random(error.to_string()))
+    }
+
+    fn derive_key(
+        &self,
+        parameters: &KdfParameters<'_>,
+        _secret: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.require_capability(ProviderCapability::Kdf(parameters))?;
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::Kdf,
+            algorithm: Some(parameters.algorithm.to_owned()),
+        })
     }
 
     #[cfg(feature = "xmldsig")]
@@ -821,21 +837,25 @@ impl CryptoProvider for RustCryptoProvider {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
         validate_oaep_parameters(parameters)?;
-        self.require_capability(ProviderCapability::KeyTransport(parameters))?;
+        self.require_capability(ProviderCapability::KeyRecovery(parameters))?;
         key.recover_with_provider(self, parameters, ciphertext)
     }
 }
 
 #[cfg(feature = "xmlenc")]
+fn legacy_oaep_mgf_is_valid(parameters: &RsaOaepParameters) -> bool {
+    parameters.algorithm != crate::xmlenc::KeyTransportAlgorithm::RsaOaepMgf1p
+        || parameters.mgf_digest == crate::xmlenc::OaepDigestAlgorithm::Sha1
+}
+
+#[cfg(feature = "xmlenc")]
 fn validate_oaep_parameters(parameters: &RsaOaepParameters) -> Result<(), ProviderError> {
-    if parameters.algorithm == crate::xmlenc::KeyTransportAlgorithm::RsaOaepMgf1p
-        && parameters.mgf_digest != crate::xmlenc::OaepDigestAlgorithm::Sha1
-    {
+    if legacy_oaep_mgf_is_valid(parameters) {
+        Ok(())
+    } else {
         Err(ProviderError::InvalidInput(
             ProviderInputError::LegacyRsaOaepMgf,
         ))
-    } else {
-        Ok(())
     }
 }
 
@@ -894,6 +914,7 @@ mod rustcrypto_x509 {
         RsaPublicKey,
         pkcs1::DecodeRsaPublicKey as _,
         pss::{Signature as RsaPssSignature, VerifyingKey as RsaPssVerifyingKey},
+        traits::PublicKeyParts as _,
     };
     use sha1::Digest as _;
     use sha2::{Sha256, Sha384, Sha512};
@@ -994,6 +1015,9 @@ mod rustcrypto_x509 {
         signature: &[u8],
         key: RsaPublicKey,
     ) -> Result<bool, ProviderError> {
+        if !rsa_pss_salt_fits_key(&key, digest, salt_len) {
+            return Ok(false);
+        }
         let Ok(signature) = RsaPssSignature::try_from(signature) else {
             return Ok(false);
         };
@@ -1019,6 +1043,24 @@ mod rustcrypto_x509 {
             }
         };
         Ok(verified.is_ok())
+    }
+
+    pub(super) fn rsa_pss_salt_fits_key(
+        key: &RsaPublicKey,
+        digest: DigestAlgorithm,
+        salt_len: usize,
+    ) -> bool {
+        let Some(em_bits) = key.n().bits().checked_sub(1) else {
+            return false;
+        };
+        let Ok(em_len) = usize::try_from(em_bits.div_ceil(8)) else {
+            return false;
+        };
+        digest
+            .output_len()
+            .checked_add(salt_len)
+            .and_then(|length| length.checked_add(2))
+            .is_some_and(|required| required <= em_len)
     }
 
     fn compatible_rsa_pss_public_key_from_spki(
@@ -1127,8 +1169,7 @@ mod rustcrypto {
 
     use super::{CryptoProvider, ProviderError, ProviderInputError};
     use crate::xmlenc::{
-        DataEncryptionAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm,
-        RsaOaepParameters,
+        DataEncryptionAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm, RsaOaepParameters,
     };
 
     pub(super) fn encrypt_data(
@@ -1353,13 +1394,7 @@ mod rustcrypto {
         parameters: &RsaOaepParameters,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
-        if parameters.algorithm == KeyTransportAlgorithm::RsaOaepMgf1p
-            && parameters.mgf_digest != OaepDigestAlgorithm::Sha1
-        {
-            return Err(ProviderError::InvalidInput(
-                ProviderInputError::LegacyRsaOaepMgf,
-            ));
-        }
+        super::validate_oaep_parameters(parameters)?;
         let mut rng = super::ProviderRng(provider);
         macro_rules! encrypt_with {
             ($digest:ty, $mgf:ty) => {
@@ -1426,13 +1461,7 @@ mod rustcrypto {
         parameters: &RsaOaepParameters,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
-        if parameters.algorithm == KeyTransportAlgorithm::RsaOaepMgf1p
-            && parameters.mgf_digest != OaepDigestAlgorithm::Sha1
-        {
-            return Err(ProviderError::InvalidInput(
-                ProviderInputError::LegacyRsaOaepMgf,
-            ));
-        }
+        super::validate_oaep_parameters(parameters)?;
         let mut rng = super::ProviderRng(provider);
         macro_rules! decrypt_with {
             ($digest:ty, $mgf:ty) => {
@@ -1530,6 +1559,14 @@ mod tests {
         fn fill_random(&self, output: &mut [u8]) -> Result<(), ProviderError> {
             self.random_calls.fetch_add(1, Ordering::Relaxed);
             RUST_CRYPTO_PROVIDER.fill_random(output)
+        }
+
+        fn derive_key(
+            &self,
+            parameters: &KdfParameters<'_>,
+            secret: &[u8],
+        ) -> Result<Vec<u8>, ProviderError> {
+            RUST_CRYPTO_PROVIDER.derive_key(parameters, secret)
         }
 
         fn digest(
@@ -2116,6 +2153,54 @@ mod tests {
                 .expect(
                     "provider must evaluate structurally valid RSA-PSS independently of policy"
                 )
+        );
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn oversized_rsa_pss_salt_is_a_verification_miss() {
+        use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
+        use rsa::{RsaPrivateKey, pkcs8::EncodePublicKey as _, traits::PublicKeyParts as _};
+
+        // ASN.1 saltLength is attacker-controlled. It must not reach the
+        // dependency's unchecked hLen + saltLen + 2 arithmetic.
+        let mut rng = ChaCha20Rng::from_seed([0x55; 32]);
+        let public_key = RsaPrivateKey::new(&mut rng, 1024)
+            .expect("deterministic RSA key generation")
+            .to_public_key();
+        let spki = public_key
+            .to_public_key_der()
+            .expect("RSA public key must encode as SPKI");
+
+        assert!(rustcrypto_x509::rsa_pss_salt_fits_key(
+            &public_key,
+            DigestAlgorithm::Sha256,
+            0,
+        ));
+        assert!(rustcrypto_x509::rsa_pss_salt_fits_key(
+            &public_key,
+            DigestAlgorithm::Sha256,
+            94,
+        ));
+        assert!(!rustcrypto_x509::rsa_pss_salt_fits_key(
+            &public_key,
+            DigestAlgorithm::Sha256,
+            95,
+        ));
+
+        assert!(
+            !RUST_CRYPTO_PROVIDER
+                .verify_x509_signature(
+                    X509SignatureAlgorithm::RsaPss {
+                        digest: DigestAlgorithm::Sha256,
+                        mgf_digest: DigestAlgorithm::Sha256,
+                        salt_len: usize::MAX,
+                    },
+                    b"certificate tbs bytes",
+                    &vec![0_u8; public_key.size()],
+                    spki.as_bytes(),
+                )
+                .expect("oversized PSS salt must fail without panicking")
         );
     }
 

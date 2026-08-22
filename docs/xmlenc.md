@@ -53,7 +53,9 @@ the RSA convenience constructor wraps a RustCrypto key into the same contract. T
 only normalized public modulus/exponent metadata required by encryption policy and framing checks.
 On decryption, `PrivateKeyDecryptor::provider_key` accepts an opaque `KeyRecoveryKey`; private key
 material never enters XML orchestration. Capability checks receive complete OAEP digest, MGF, and
-label parameters, and an unsupported provider fails without invoking the key or falling back.
+label parameters. Key transport and key recovery are independent capabilities, so a private-key
+provider can advertise recovery without public-key wrapping support. An unsupported provider fails
+without invoking the key or falling back.
 `validate_key_transport_recipient` gives provider-owned key registries the same policy preflight;
 the existing `validate_rsa_recipient_key` remains the RustCrypto convenience form.
 `EncryptionPolicy::rsa_keys` validates every recipient modulus and exponent before provider
