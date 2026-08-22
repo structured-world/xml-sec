@@ -333,7 +333,7 @@ impl EncryptedDataBuilder {
         }
         if self.recipients.len() > self.policy.resources.max_encryption_recipients {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "encryption recipients",
+                resource: crate::policy::resource_name::ENCRYPTION_RECIPIENTS,
                 maximum: self.policy.resources.max_encryption_recipients,
                 actual: self.recipients.len(),
             }
@@ -380,7 +380,7 @@ impl EncryptedDataBuilder {
                     }
                     self.validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
                     self.validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
-                    self.validate_metadata_len("OAEPparams", parameters.label.len())?;
+                    self.validate_metadata_len(parameters.label.len())?;
                 }
                 EncryptionRecipient::AesKeyWrap {
                     kek,
@@ -453,12 +453,8 @@ impl EncryptedDataBuilder {
         )
     }
 
-    fn validate_metadata_len(&self, field: &'static str, actual: usize) -> Result<(), XmlEncError> {
-        validate_metadata_len(
-            field,
-            actual,
-            self.policy.resources.max_encryption_metadata_bytes,
-        )
+    fn validate_metadata_len(&self, actual: usize) -> Result<(), XmlEncError> {
+        validate_metadata_len(actual, self.policy.resources.max_encryption_metadata_bytes)
     }
 
     fn validate_plaintext_len(&self, actual: usize) -> Result<(), XmlEncError> {
@@ -480,7 +476,7 @@ fn validate_metadata(
             "{field} contains a character forbidden by XML 1.0"
         )));
     }
-    validate_metadata_len(field, value.map_or(0, str::len), maximum)
+    validate_metadata_len(value.map_or(0, str::len), maximum)
 }
 
 fn validate_key_name(
@@ -496,16 +492,12 @@ fn validate_key_name(
     validate_metadata(field, value, maximum)
 }
 
-fn validate_metadata_len(
-    field: &'static str,
-    actual: usize,
-    maximum: usize,
-) -> Result<(), XmlEncError> {
+fn validate_metadata_len(actual: usize, maximum: usize) -> Result<(), XmlEncError> {
     if actual <= maximum {
         Ok(())
     } else {
         Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: field,
+            resource: crate::policy::resource_name::ENCRYPTION_METADATA_BYTES,
             maximum,
             actual,
         }
@@ -535,7 +527,7 @@ fn validate_plaintext_len(actual: usize, maximum: usize) -> Result<(), XmlEncErr
         Ok(())
     } else {
         Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "encryption plaintext bytes",
+            resource: crate::policy::resource_name::ENCRYPTION_PLAINTEXT_BYTES,
             maximum,
             actual,
         }
@@ -546,7 +538,7 @@ fn validate_plaintext_len(actual: usize, maximum: usize) -> Result<(), XmlEncErr
 fn validate_document_len(actual: usize, maximum: usize) -> Result<(), XmlEncError> {
     if actual > maximum {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "XML document",
+            resource: crate::policy::resource_name::XML_DOCUMENT,
             maximum,
             actual,
         }
@@ -587,7 +579,7 @@ fn validate_replacement_document_nodes(
         .saturating_add(inserted_nodes);
     if actual > maximum {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "encrypted document XML nodes",
+            resource: crate::policy::resource_name::XML_NODES,
             maximum,
             actual,
         }
@@ -611,7 +603,7 @@ fn validate_generated_encrypted_data_nodes(
     let actual = generated.root_element().descendants().count();
     if actual > maximum {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "generated EncryptedData XML nodes",
+            resource: crate::policy::resource_name::XML_NODES,
             maximum,
             actual,
         }
@@ -654,7 +646,7 @@ fn encrypt_content(
     let expected = algorithm
         .ciphertext_len_for_plaintext(plaintext.len())
         .ok_or(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "encryption plaintext bytes",
+            resource: crate::policy::resource_name::ENCRYPTION_PLAINTEXT_BYTES,
             maximum: crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING,
             actual: plaintext.len(),
         })?;
@@ -1394,7 +1386,7 @@ mod tests {
             ),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "encryption plaintext bytes",
+                    resource: crate::policy::resource_name::ENCRYPTION_PLAINTEXT_BYTES,
                     ..
                 }
             ))
@@ -1415,7 +1407,7 @@ mod tests {
             too_many_recipients.encrypt_binary(b"data"),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "encryption recipients",
+                    resource: crate::policy::resource_name::ENCRYPTION_RECIPIENTS,
                     ..
                 }
             ))
@@ -1429,7 +1421,7 @@ mod tests {
                 .encrypt_binary(b"data"),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "EncryptedData Id",
+                    resource: crate::policy::resource_name::ENCRYPTION_METADATA_BYTES,
                     ..
                 }
             ))
@@ -1452,7 +1444,7 @@ mod tests {
                 .encrypt_xml(&oversized_malformed),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "encryption plaintext bytes",
+                    resource: crate::policy::resource_name::ENCRYPTION_PLAINTEXT_BYTES,
                     ..
                 }
             ))
@@ -1474,7 +1466,7 @@ mod tests {
                 .encrypt_document(&oversized_malformed, DocumentEncryptionOptions::default()),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "XML document",
+                    resource: crate::policy::resource_name::XML_DOCUMENT,
                     ..
                 }
             ))
@@ -1508,7 +1500,7 @@ mod tests {
                     ),
                 Err(XmlEncError::Policy(
                     crate::policy::PolicyViolation::ResourceLimit {
-                        resource: "XML document",
+                        resource: crate::policy::resource_name::XML_DOCUMENT,
                         ..
                     }
                 ))
@@ -1559,7 +1551,7 @@ mod tests {
             encrypt(format!("urn:{}", "x".repeat(maximum - 3))),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "EncryptedData Type",
+                    resource: crate::policy::resource_name::ENCRYPTION_METADATA_BYTES,
                     maximum: 64,
                     actual: 65,
                 }
@@ -1646,7 +1638,7 @@ mod tests {
             .encrypt_document("<root/>", DocumentEncryptionOptions::default())
         {
             Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "encrypted document XML nodes",
+                resource: "XML nodes",
                 maximum,
                 actual,
             })) if maximum == generated_nodes && actual > maximum => actual,
@@ -1668,7 +1660,7 @@ mod tests {
             .encrypt_document("<root/>", DocumentEncryptionOptions::default())
         {
             Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "encrypted document XML nodes",
+                resource: "XML nodes",
                 maximum,
                 actual,
             })) if maximum == generated_nodes && actual > maximum => actual,
@@ -1702,7 +1694,7 @@ mod tests {
                 .policy(policy(1))
                 .encrypt_binary(b"payload"),
             Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "generated EncryptedData XML nodes",
+                resource: "XML nodes",
                 maximum: 1,
                 actual,
             })) if actual > 1
@@ -1795,7 +1787,7 @@ mod tests {
                 .policy(policy(binary_len - 1))
                 .encrypt_binary(b"bounded binary"),
             Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "XML document",
+                resource: crate::policy::resource_name::XML_DOCUMENT,
                 maximum,
                 actual,
             }))
@@ -1819,7 +1811,7 @@ mod tests {
                 .policy(policy(xml_len - 1))
                 .encrypt_xml("<secret>bounded XML</secret>"),
             Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "XML document",
+                resource: crate::policy::resource_name::XML_DOCUMENT,
                 maximum,
                 actual,
             }))
@@ -1858,7 +1850,7 @@ mod tests {
                 .encrypt_binary(b"x"),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "encryption plaintext bytes",
+                    resource: crate::policy::resource_name::ENCRYPTION_PLAINTEXT_BYTES,
                     maximum: 0,
                     actual: 1
                 }
@@ -1871,7 +1863,7 @@ mod tests {
                 .encrypt_binary(&[]),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "encryption recipients",
+                    resource: crate::policy::resource_name::ENCRYPTION_RECIPIENTS,
                     maximum: 0,
                     actual: 1,
                 }

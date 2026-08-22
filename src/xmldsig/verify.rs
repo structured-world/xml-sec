@@ -678,7 +678,7 @@ impl CanonicalizedDataBudget {
         let Some(remaining) = available.checked_sub(bytes) else {
             self.remaining.set(0);
             return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "canonicalized signature data bytes",
+                resource: crate::policy::resource_name::CANONICALIZED_BYTES,
                 maximum: self.max_bytes,
                 actual: self
                     .max_bytes
@@ -1160,7 +1160,7 @@ fn verify_signature_with_context(
         parse_signed_info_with_xpath_budget(signed_info_node, &mut xpath_parse_budget)?;
     if signed_info.references.len() > ctx.policy.resources.max_references {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "signature references",
+            resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
             maximum: ctx.policy.resources.max_references,
             actual: signed_info.references.len(),
         }
@@ -1169,7 +1169,7 @@ fn verify_signature_with_context(
     for reference in &signed_info.references {
         if reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "reference transforms",
+                resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
                 maximum: ctx.policy.resources.max_transforms_per_reference,
                 actual: reference.transforms.len(),
             }
@@ -1204,7 +1204,7 @@ fn verify_signature_with_context(
         for bytes in resources.values() {
             if bytes.len() > ctx.policy.resources.max_external_resource_bytes {
                 return Err(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "external resource bytes",
+                    resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
                     maximum: ctx.policy.resources.max_external_resource_bytes,
                     actual: bytes.len(),
                 }
@@ -1218,7 +1218,7 @@ fn verify_signature_with_context(
         }
         if total > ctx.policy.resources.max_external_resource_total_bytes {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "aggregate external resource bytes",
+                resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
                 maximum: ctx.policy.resources.max_external_resource_total_bytes,
                 actual: total,
             }
@@ -1283,7 +1283,7 @@ fn verify_signature_with_context(
     .map_err(|error| {
         if let Some(violation) = c14n_policy_violation(
             &error,
-            "canonicalized signature data bytes",
+            crate::policy::resource_name::CANONICALIZED_BYTES,
             canonicalized_data_budget.max_bytes,
         ) {
             SignatureVerificationPipelineError::Policy(violation)
@@ -1438,7 +1438,11 @@ fn materialize_retrieval_methods_with_budgets(
             continue;
         };
 
-        let identity = (resolved_uri.clone(), resource_type.clone(), transforms);
+        let identity = (
+            resolved_uri.clone(),
+            resource_type.clone(),
+            transforms.clone(),
+        );
         if !seen.insert(identity) {
             continue;
         }
@@ -1536,10 +1540,10 @@ fn materialize_retrieval_methods_with_budgets(
                         reason: "untransformed X509Data RetrievalMethod must target X509Data directly",
                     });
                 }
-                RetrievalMethodTransforms::X509DataNodeSetFilter => {
+                RetrievalMethodTransforms::X509DataNodeSetFilter { expression } => {
                     enforce_transform_allowed(allowed_transforms, XPATH_TRANSFORM_URI)?;
                     xpath_parse_budget
-                        .charge()
+                        .validate_expression(&expression)
                         .map_err(ReferenceProcessingError::Transform)?;
                     select_retrieved_x509_data_root(target, execution_budget)?
                 }
@@ -2431,7 +2435,7 @@ mod tests {
                 error,
                 SignatureVerificationPipelineError::Policy(
                     crate::policy::PolicyViolation::ResourceLimit {
-                        resource: "canonicalized bytes",
+                        resource: crate::policy::resource_name::CANONICALIZED_BYTES,
                         maximum: 64,
                         ..
                     }
@@ -2458,7 +2462,7 @@ mod tests {
             VerifyContext::new().policy(policy).verify(&xml),
             Err(SignatureVerificationPipelineError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "XML document",
+                    resource: crate::policy::resource_name::XML_DOCUMENT,
                     maximum,
                     actual,
                 }
@@ -2492,7 +2496,7 @@ mod tests {
             error,
             SignatureVerificationPipelineError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "Base64 transform input bytes",
+                    resource: crate::policy::resource_name::BASE64_TRANSFORM_INPUT_BYTES,
                     maximum: 4,
                     ..
                 }
@@ -2526,7 +2530,7 @@ mod tests {
             error,
             SignatureVerificationPipelineError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "XPath expression bytes",
+                    resource: crate::policy::resource_name::XPATH_EXPRESSION_BYTES,
                     maximum: 4,
                     ..
                 }
@@ -2567,7 +2571,7 @@ mod tests {
                 &error,
                 SignatureVerificationPipelineError::Policy(
                     crate::policy::PolicyViolation::ResourceLimit {
-                        resource: "canonicalized signature data bytes",
+                        resource: "canonicalized bytes",
                         maximum: 1_024,
                         ..
                     }
@@ -2665,7 +2669,7 @@ mod tests {
                 error,
                 SignatureVerificationPipelineError::Policy(
                     crate::policy::PolicyViolation::ResourceLimit {
-                        resource: "XML nodes",
+                        resource: crate::policy::resource_name::XML_NODES,
                         maximum: 24,
                         ..
                     }
@@ -3040,7 +3044,7 @@ mod tests {
             error,
             SignatureVerificationPipelineError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "XML Base components",
+                    resource: crate::policy::resource_name::XML_BASE_COMPONENTS,
                     maximum: 64,
                     actual: 65,
                 }
@@ -3071,7 +3075,7 @@ mod tests {
             error,
             SignatureVerificationPipelineError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "XML Base resolution bytes",
+                    resource: crate::policy::resource_name::XML_BASE_RESOLUTION_BYTES,
                     maximum: 32,
                     ..
                 }
@@ -3113,7 +3117,7 @@ mod tests {
             error,
             SignatureVerificationPipelineError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "XML Base components",
+                    resource: crate::policy::resource_name::XML_BASE_COMPONENTS,
                     maximum: 1,
                     actual: 2,
                 }
@@ -3154,7 +3158,7 @@ mod tests {
             error,
             SignatureVerificationPipelineError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "XML Base resolution bytes",
+                    resource: crate::policy::resource_name::XML_BASE_RESOLUTION_BYTES,
                     maximum: 1,
                     actual,
                 }
@@ -4213,6 +4217,61 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_method_xpath_obeys_expression_byte_limit() {
+        // The parser recognizes this restricted XPath shape, but the original
+        // untrusted expression still belongs to the operation policy budget.
+        let expression = "ancestor-or-self::ds:X509Data";
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xpath_expression_bytes = expression.len() - 1;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath must obey the expression byte limit");
+
+        assert!(
+            matches!(
+                &error,
+                SignatureVerificationPipelineError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "XPath expression bytes",
+                        maximum,
+                        actual,
+                    }
+                ) if *maximum == expression.len() - 1 && *actual == expression.len()
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn retrieval_method_xpath_obeys_expression_complexity_limit() {
+        // Recognizing a fixed safe predicate must not bypass the common XPath
+        // complexity policy applied to every expression in the signature.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xpath_expression_complexity = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath must obey the complexity limit");
+
+        assert!(
+            matches!(
+                &error,
+                SignatureVerificationPipelineError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "XPath expression complexity",
+                        maximum: 0,
+                        actual,
+                    }
+                ) if *actual > 0
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
     fn retrieval_method_xpath_uses_node_filter_work_budget() {
         // The fixed ancestor-or-self predicate scans the dereferenced node-set
         // and therefore consumes the operation-wide node-filter allowance.
@@ -4229,7 +4288,7 @@ mod tests {
                 &error,
                 SignatureVerificationPipelineError::Policy(
                     crate::policy::PolicyViolation::ResourceLimit {
-                        resource: "node-set filter work",
+                        resource: crate::policy::resource_name::NODE_SET_FILTER_WORK,
                         maximum: 0,
                         actual,
                     }
@@ -5070,7 +5129,7 @@ mod tests {
         assert!(matches!(
             error,
             ReferenceProcessingError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "canonicalized signature data bytes",
+                resource: "canonicalized bytes",
                 maximum: 32,
                 ..
             })
@@ -5104,7 +5163,7 @@ mod tests {
             error,
             SignatureVerificationPipelineError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "canonicalized signature data bytes",
+                    resource: "canonicalized bytes",
                     ..
                 }
             )
@@ -5451,7 +5510,7 @@ mod tests {
             error,
             ReferenceProcessingError::Transform(TransformError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "XPath evaluation work",
+                    resource: crate::policy::resource_name::XPATH_EVALUATION_WORK,
                     ..
                 }
             ))
@@ -5498,7 +5557,7 @@ mod tests {
             error,
             ReferenceProcessingError::UriDereference(TransformError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "cumulative node-set owned string bytes",
+                    resource: crate::policy::resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
                     ..
                 }
             ))

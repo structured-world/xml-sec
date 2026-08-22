@@ -822,13 +822,13 @@ fn signing_policy_applies_xml_base_budget_to_signed_info_c14n() {
     assert!(
         matches!(
             result,
-            Err(SigningError::Digest(SigningDigestError::Transform(
-                TransformError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            Err(SigningError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimit {
                     resource: "XML Base components",
                     maximum: 1,
                     actual: 2,
-                })
-            )))
+                }
+            ))
         ),
         "unexpected signing result: {result:?}"
     );

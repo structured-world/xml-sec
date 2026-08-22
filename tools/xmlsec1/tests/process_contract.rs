@@ -2779,7 +2779,7 @@ fn lax_aes_key_ring_is_bounded_before_filesystem_reads() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("decryption key candidates exceeds policy maximum"),
+        stderr.contains("key candidates exceeds policy maximum"),
         "{stderr}"
     );
     assert!(stderr.contains(&format!("got {}", maximum + 1)), "{stderr}");
@@ -2856,7 +2856,7 @@ fn lax_rsa_key_ring_is_bounded_before_filesystem_reads() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("decryption key candidates exceeds policy maximum"),
+        stderr.contains("key candidates exceeds policy maximum"),
         "{stderr}"
     );
     assert!(stderr.contains(&format!("got {}", maximum + 1)), "{stderr}");
@@ -2882,7 +2882,7 @@ fn lax_signing_key_ring_is_bounded_before_filesystem_reads() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("signing key candidates exceeds policy maximum"),
+        stderr.contains("key candidates exceeds policy maximum"),
         "{stderr}"
     );
     assert!(stderr.contains(&format!("got {}", maximum + 1)), "{stderr}");
@@ -2919,7 +2919,7 @@ fn lax_rsa_encryption_key_ring_is_bounded_before_filesystem_reads() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("encryption key candidates exceeds policy maximum"),
+        stderr.contains("key candidates exceeds policy maximum"),
         "{stderr}"
     );
     assert!(stderr.contains(&format!("got {}", maximum + 1)), "{stderr}");
@@ -2956,7 +2956,7 @@ fn lax_aes_encryption_key_ring_is_bounded_before_filesystem_reads() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("encryption key candidates exceeds policy maximum"),
+        stderr.contains("key candidates exceeds policy maximum"),
         "{stderr}"
     );
     assert!(stderr.contains(&format!("got {}", maximum + 1)), "{stderr}");

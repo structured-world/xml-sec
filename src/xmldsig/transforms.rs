@@ -139,7 +139,7 @@ impl NodeFilterWorkBudget {
         let consumed = self.maximum.saturating_sub(self.remaining.get());
         if !charge_byte_budget(&self.remaining, entries) {
             return Err(transform_resource_limit(
-                "node-set filter work",
+                crate::policy::resource_name::NODE_SET_FILTER_WORK,
                 self.maximum,
                 consumed.saturating_add(entries),
             ));
@@ -193,7 +193,7 @@ impl C14nOutputBudget {
         let consumed = self.max_bytes.saturating_sub(self.remaining.get());
         if !charge_byte_budget(&self.remaining, bytes) {
             return Err(transform_resource_limit(
-                "canonicalized bytes",
+                crate::policy::resource_name::CANONICALIZED_BYTES,
                 self.max_bytes,
                 consumed.saturating_add(bytes),
             ));
@@ -265,7 +265,7 @@ impl Base64WorkBudget {
         let consumed = self.max_input_bytes.saturating_sub(self.remaining.get());
         if !charge_byte_budget(&self.remaining, bytes) {
             return Err(transform_resource_limit(
-                "Base64 transform input bytes",
+                crate::policy::resource_name::BASE64_TRANSFORM_INPUT_BYTES,
                 self.max_input_bytes,
                 consumed.saturating_add(bytes),
             ));
@@ -843,7 +843,7 @@ fn decode_base64_transform(
     let decoded_len = base64::decoded_len_estimate(normalized.len()).saturating_sub(padding);
     if decoded_len > budget.max_output_bytes {
         return Err(transform_resource_limit(
-            "Base64 transform output bytes",
+            crate::policy::resource_name::BASE64_TRANSFORM_OUTPUT_BYTES,
             budget.max_output_bytes,
             decoded_len,
         ));
@@ -1022,7 +1022,7 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
 fn ensure_transform_count(count: usize) -> Result<(), TransformError> {
     if count > MAX_TRANSFORMS_PER_REFERENCE {
         return Err(transform_resource_limit(
-            "reference transforms",
+            crate::policy::resource_name::REFERENCE_TRANSFORMS,
             MAX_TRANSFORMS_PER_REFERENCE,
             count,
         ));
@@ -1384,8 +1384,11 @@ fn map_c14n_limit_error(error: c14n::C14nError, budget: &C14nOutputBudget) -> Tr
         // consumed so another Reference cannot spend the same budget.
         budget.exhaust();
     }
-    if let Some(violation) = c14n_policy_violation(&error, "canonicalized bytes", budget.max_bytes)
-    {
+    if let Some(violation) = c14n_policy_violation(
+        &error,
+        crate::policy::resource_name::CANONICALIZED_BYTES,
+        budget.max_bytes,
+    ) {
         TransformError::Policy(violation)
     } else {
         TransformError::C14n(error)
@@ -1411,19 +1414,21 @@ pub(crate) fn c14n_policy_violation(
             Some(crate::policy::PolicyViolation::ResourceLimit {
                 resource: output_resource,
                 maximum: output_maximum,
+                // The bounded writer stops at the limit, so only the smallest
+                // rejected size is known; this sentinel is a lower bound.
                 actual: output_maximum.saturating_add(1),
             })
         }
         c14n::C14nError::XmlBaseComponentsTooLarge { max, actual } => {
             Some(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "XML Base components",
+                resource: crate::policy::resource_name::XML_BASE_COMPONENTS,
                 maximum: *max,
                 actual: *actual,
             })
         }
         c14n::C14nError::XmlBaseResolutionTooLarge { max_bytes, actual } => {
             Some(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "XML Base resolution bytes",
+                resource: crate::policy::resource_name::XML_BASE_RESOLUTION_BYTES,
                 maximum: *max_bytes,
                 actual: *actual,
             })
@@ -1642,7 +1647,7 @@ fn parse_xpath_filter2_transform(
         }
         if filters.len() == xpath_state.signature_budget.max_filters {
             return Err(transform_resource_limit(
-                "XPath Filter 2.0 expressions",
+                crate::policy::resource_name::XPATH_FILTERS,
                 xpath_state.signature_budget.max_filters,
                 filters.len().saturating_add(1),
             ));
@@ -1688,7 +1693,7 @@ fn parse_xpath_expression(
             let attempted = source.len().saturating_add(text.len());
             if attempted > xpath_state.signature_budget.max_expression_bytes {
                 return Err(transform_resource_limit(
-                    "XPath expression bytes",
+                    crate::policy::resource_name::XPATH_EXPRESSION_BYTES,
                     xpath_state.signature_budget.max_expression_bytes,
                     attempted,
                 ));
@@ -1709,7 +1714,7 @@ fn parse_xpath_expression(
     xpath_state.signature_budget.charge()?;
     if source.len() > xpath_state.signature_budget.max_expression_bytes {
         return Err(transform_resource_limit(
-            "XPath expression bytes",
+            crate::policy::resource_name::XPATH_EXPRESSION_BYTES,
             xpath_state.signature_budget.max_expression_bytes,
             source.len(),
         ));
@@ -1717,7 +1722,7 @@ fn parse_xpath_expression(
     let complexity = crate::xmldsig::xpath::xpath_expression_complexity(source);
     if complexity > xpath_state.signature_budget.max_expression_complexity {
         return Err(transform_resource_limit(
-            "XPath expression complexity",
+            crate::policy::resource_name::XPATH_EXPRESSION_COMPLEXITY,
             xpath_state.signature_budget.max_expression_complexity,
             complexity,
         ));
@@ -1840,7 +1845,7 @@ impl XPathSignatureParseBudget {
         self.charge()?;
         if source.len() > self.max_expression_bytes {
             return Err(transform_resource_limit(
-                "XPath expression bytes",
+                crate::policy::resource_name::XPATH_EXPRESSION_BYTES,
                 self.max_expression_bytes,
                 source.len(),
             ));
@@ -1848,7 +1853,7 @@ impl XPathSignatureParseBudget {
         let complexity = crate::xmldsig::xpath::xpath_expression_complexity(source);
         if complexity > self.max_expression_complexity {
             return Err(transform_resource_limit(
-                "XPath expression complexity",
+                crate::policy::resource_name::XPATH_EXPRESSION_COMPLEXITY,
                 self.max_expression_complexity,
                 complexity,
             ));
@@ -1864,7 +1869,7 @@ impl XPathSignatureParseBudget {
 
     fn error(&self) -> TransformError {
         transform_resource_limit(
-            "XPath expressions",
+            crate::policy::resource_name::XPATH_EXPRESSIONS,
             self.max_expressions,
             self.expressions.max(self.max_expressions.saturating_add(1)),
         )
@@ -1903,14 +1908,14 @@ impl XPathNamespaceBudget {
             .unwrap_or(usize::MAX);
         if bindings > self.max_bindings {
             return Err(transform_resource_limit(
-                "XPath namespace bindings",
+                crate::policy::resource_name::XPATH_NAMESPACE_BINDINGS,
                 self.max_bindings,
                 bindings,
             ));
         }
         if bytes > self.max_bytes {
             return Err(transform_resource_limit(
-                "XPath namespace bytes",
+                crate::policy::resource_name::XPATH_NAMESPACE_BYTES,
                 self.max_bytes,
                 bytes,
             ));
@@ -2172,7 +2177,7 @@ mod tests {
         assert!(matches!(
             error,
             TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "XML Base components",
+                resource: crate::policy::resource_name::XML_BASE_COMPONENTS,
                 maximum: 1,
                 actual: 2
             })
@@ -2280,7 +2285,7 @@ mod tests {
             result,
             Err(TransformError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "Base64 transform input bytes",
+                    resource: crate::policy::resource_name::BASE64_TRANSFORM_INPUT_BYTES,
                     maximum: MAX_BASE64_TRANSFORM_INPUT_BYTES,
                     ..
                 }
@@ -2303,7 +2308,7 @@ mod tests {
             result,
             Err(TransformError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "Base64 transform output bytes",
+                    resource: crate::policy::resource_name::BASE64_TRANSFORM_OUTPUT_BYTES,
                     maximum: MAX_BASE64_TRANSFORM_OUTPUT_BYTES,
                     ..
                 }
@@ -2351,7 +2356,7 @@ mod tests {
             result,
             Err(TransformError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "Base64 transform input bytes",
+                    resource: crate::policy::resource_name::BASE64_TRANSFORM_INPUT_BYTES,
                     maximum: MAX_BASE64_TRANSFORM_INPUT_BYTES,
                     ..
                 }
@@ -2376,7 +2381,7 @@ mod tests {
             result,
             Err(TransformError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "reference transforms",
+                    resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
                     maximum: MAX_TRANSFORMS_PER_REFERENCE,
                     ..
                 }
@@ -2431,7 +2436,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "canonicalized bytes",
+                resource: crate::policy::resource_name::CANONICALIZED_BYTES,
                 maximum,
                 ..
             })) if maximum == limit
@@ -2459,7 +2464,7 @@ mod tests {
         assert!(matches!(
             error,
             TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "cumulative node-set owned string bytes",
+                resource: crate::policy::resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
                 ..
             })
         ));
@@ -2493,7 +2498,7 @@ mod tests {
         assert!(matches!(
             error,
             TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "XML nodes",
+                resource: crate::policy::resource_name::XML_NODES,
                 ..
             })
         ));
@@ -2520,7 +2525,7 @@ mod tests {
         assert!(matches!(
             error,
             TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "cumulative node-set owned string bytes",
+                resource: crate::policy::resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
                 ..
             })
         ));
@@ -2551,7 +2556,7 @@ mod tests {
             assert!(matches!(
                 error,
                 TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "canonicalized bytes",
+                    resource: crate::policy::resource_name::CANONICALIZED_BYTES,
                     maximum: 64,
                     ..
                 })
@@ -2597,7 +2602,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "canonicalized bytes",
+                resource: crate::policy::resource_name::CANONICALIZED_BYTES,
                 maximum,
                 ..
             })) if maximum == limit
@@ -2641,7 +2646,7 @@ mod tests {
                 result,
                 Err(TransformError::Policy(
                     crate::policy::PolicyViolation::ResourceLimit {
-                        resource: "node-set filter work",
+                        resource: crate::policy::resource_name::NODE_SET_FILTER_WORK,
                         ..
                     }
                 ))
@@ -2687,7 +2692,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "canonicalized bytes",
+                resource: crate::policy::resource_name::CANONICALIZED_BYTES,
                 maximum,
                 ..
             })) if maximum == limit
@@ -3004,7 +3009,7 @@ mod tests {
             parse_transforms(doc.root_element()),
             Err(TransformError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "reference transforms",
+                    resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
                     maximum: MAX_TRANSFORMS_PER_REFERENCE,
                     ..
                 }
@@ -3243,7 +3248,7 @@ mod tests {
         assert!(matches!(
             error,
             TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "XPath expression bytes",
+                resource: crate::policy::resource_name::XPATH_EXPRESSION_BYTES,
                 maximum: MAX_XPATH_EXPRESSION_BYTES,
                 ..
             })
@@ -3282,7 +3287,7 @@ mod tests {
             matches!(
                 error,
                 TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "XPath namespace bytes",
+                    resource: crate::policy::resource_name::XPATH_NAMESPACE_BYTES,
                     ..
                 })
             ),

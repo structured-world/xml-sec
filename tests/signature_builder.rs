@@ -569,7 +569,7 @@ fn rejects_invalid_filter2_expression_counts() {
     assert!(matches!(
         build(oversized).expect_err("oversized Filter2 must fail at the builder boundary"),
         SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
-            resource: "XPath Filter 2.0 expressions",
+            resource: "XPath filters",
             maximum: 64,
             actual: 65,
         })

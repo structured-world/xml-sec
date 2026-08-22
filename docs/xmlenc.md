@@ -129,8 +129,9 @@ The operation shares one `KeyCandidateBudget` across the direct lookup and every
 custom `DecryptionKeyResolver` implementations must charge it before each lookup or unwrap attempt.
 The context additionally accounts for returned candidates, so a resolver cannot multiply work by
 resetting a per-recipient allowance. Candidate-local lookup or unwrap failures may be recorded while
-later recipients are tried, but `KeyCandidateLimitExceeded` is terminal and stops the operation as
-soon as the shared budget is exhausted. Explicit `ReferenceList/DataReference` and `CarriedKeyName`
+later recipients are tried, but a `PolicyViolation::ResourceLimit` for `key candidates`
+is terminal and stops the operation as soon as the shared budget is exhausted. Explicit
+`ReferenceList/DataReference` and `CarriedKeyName`
 metadata restricts an embedded key to the referenced `EncryptedData` or matching `ds:KeyName`.
 Association metadata may be omitted, but an explicit contradiction is skipped rather than tried.
 Wrong-width symmetric candidates are discarded before AES-CBC ambiguity checks because they cannot
@@ -153,10 +154,8 @@ the shared `ResourcePolicy::max_xml_document_bytes` ceiling before DOM allocatio
 XML node ceiling to
 the initial document, replacement-boundary validation, and final output reparse. The projected
 output byte length is checked before constructing the replacement. DTD parsing remains disabled by
-default; legacy documents that need an internal DTD can opt in only when both
-`DecryptionPolicy::xml.allow_internal_dtd` and `DocumentDecryptionOptions::allow_dtd` are enabled.
-The per-call option cannot weaken the operation policy, and the API never installs an external
-entity resolver.
+default; legacy documents that need an internal DTD can opt in only through
+`DecryptionPolicy::xml.allow_internal_dtd`. The API never installs an external entity resolver.
 
 `encrypt_document` also checks the exact projected document byte length and XML node count after
 cipher framing, base64, and `EncryptedData` serialization but before allocating the replacement

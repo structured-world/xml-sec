@@ -69,9 +69,8 @@ pub enum SigningDigestError {
 
     /// The compiled signing policy rejected input while processing References.
     ///
-    /// The full signing pipeline preserves this digest-stage context as
-    /// [`SigningError::Digest`]. Policy failures raised by later XML mutation
-    /// stages use [`SigningError::Policy`] instead.
+    /// The lower-level digest APIs return this variant directly. The full
+    /// signing pipeline promotes every policy failure to [`SigningError::Policy`].
     #[error("signing policy violation: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),
 
@@ -1362,7 +1361,7 @@ fn validate_signing_references(
     };
     if total_references > policy.resources.max_references {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "signature references",
+            resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
             maximum: policy.resources.max_references,
             actual: total_references,
         }
@@ -1378,7 +1377,7 @@ fn validate_signing_references(
         }
         if reference.transforms.len() > policy.resources.max_transforms_per_reference {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "reference transforms",
+                resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
                 maximum: policy.resources.max_transforms_per_reference,
                 actual: reference.transforms.len(),
             }
@@ -1540,10 +1539,10 @@ fn canonicalize_signed_info(
     .map_err(|error| {
         if let Some(violation) = c14n_policy_violation(
             &error,
-            "canonicalized bytes",
+            crate::policy::resource_name::CANONICALIZED_BYTES,
             execution_budget.c14n_output_limit(),
         ) {
-            SigningError::Digest(SigningDigestError::Transform(violation.into()))
+            SigningError::Policy(violation)
         } else {
             SigningError::Canonicalization(error)
         }
@@ -1712,7 +1711,7 @@ fn parse_signing_manifest_references(
             verify_ds_element(child, "Reference")?;
             if remaining_capacity == 0 {
                 return Err(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "signature references",
+                    resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
                     maximum: maximum_references,
                     actual: maximum_references.saturating_add(1),
                 }
@@ -1857,7 +1856,7 @@ mod error_conversion_tests {
 
         let mutation = SigningError::from(SigningDigestError::XmlMutation(
             XmlMutationError::Policy(PolicyViolation::ResourceLimit {
-                resource: "signed XML bytes",
+                resource: crate::policy::resource_name::XML_DOCUMENT,
                 maximum: 1,
                 actual: 2,
             }),

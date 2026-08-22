@@ -130,7 +130,7 @@ impl XPathWorkBudget {
             self.evaluation_limit_exceeded.set(true);
             let consumed = self.limits.evaluation_work.saturating_sub(remaining);
             return Err(transform_resource_limit(
-                "XPath evaluation work",
+                crate::policy::resource_name::XPATH_EVALUATION_WORK,
                 self.limits.evaluation_work,
                 consumed.saturating_add(work),
             ));
@@ -148,7 +148,7 @@ impl XPathWorkBudget {
     fn map_evaluation_error(&self, error: impl ToString) -> TransformError {
         if self.evaluation_limit_exceeded.get() {
             transform_resource_limit(
-                "XPath evaluation work",
+                crate::policy::resource_name::XPATH_EVALUATION_WORK,
                 self.limits.evaluation_work,
                 self.limits.evaluation_work.saturating_add(1),
             )
@@ -163,7 +163,7 @@ impl XPathWorkBudget {
             self.mirror_bytes_remaining.set(0);
             let consumed = self.limits.mirror_string_bytes.saturating_sub(remaining);
             return Err(transform_resource_limit(
-                "XPath mirror string bytes",
+                crate::policy::resource_name::XPATH_MIRROR_STRING_BYTES,
                 self.limits.mirror_string_bytes,
                 consumed.saturating_add(bytes),
             ));
@@ -186,7 +186,7 @@ impl XPathWorkBudget {
             self.string_work_bytes_remaining.set(0);
             let consumed = self.limits.string_work_bytes.saturating_sub(remaining);
             return Err(transform_resource_limit(
-                "XPath string-processing work bytes",
+                crate::policy::resource_name::XPATH_STRING_WORK_BYTES,
                 self.limits.string_work_bytes,
                 work.map_or(usize::MAX, |work| consumed.saturating_add(work)),
             ));
@@ -1254,14 +1254,14 @@ impl<'d> Mirror<'d> {
 fn charge_xpath_mirror_bytes(current: usize, additional: usize) -> Result<usize, TransformError> {
     let total = current.checked_add(additional).ok_or_else(|| {
         transform_resource_limit(
-            "XPath mirror string bytes",
+            crate::policy::resource_name::XPATH_MIRROR_STRING_BYTES,
             MAX_XPATH_MIRROR_STRING_BYTES,
             usize::MAX,
         )
     })?;
     if total > MAX_XPATH_MIRROR_STRING_BYTES {
         return Err(transform_resource_limit(
-            "XPath mirror string bytes",
+            crate::policy::resource_name::XPATH_MIRROR_STRING_BYTES,
             MAX_XPATH_MIRROR_STRING_BYTES,
             total,
         ));
@@ -1531,7 +1531,7 @@ fn evaluate_expression<'a>(
     let expression_bytes = expression.expression().len();
     if expression_bytes > work_budget.limits.expression_bytes {
         return Err(transform_resource_limit(
-            "XPath expression bytes",
+            crate::policy::resource_name::XPATH_EXPRESSION_BYTES,
             work_budget.limits.expression_bytes,
             expression_bytes,
         ));
@@ -1539,7 +1539,7 @@ fn evaluate_expression<'a>(
     let expression_complexity = xpath_expression_complexity(expression.expression());
     if expression_complexity > work_budget.limits.expression_complexity {
         return Err(transform_resource_limit(
-            "XPath expression complexity",
+            crate::policy::resource_name::XPATH_EXPRESSION_COMPLEXITY,
             work_budget.limits.expression_complexity,
             expression_complexity,
         ));
@@ -1575,7 +1575,7 @@ fn evaluate_expression<'a>(
             .collect::<Vec<_>>();
         if ordered_nodes.len() > work_budget.limits.context_evaluations {
             return Err(transform_resource_limit(
-                "XPath context evaluations",
+                crate::policy::resource_name::XPATH_CONTEXT_EVALUATIONS,
                 work_budget.limits.context_evaluations,
                 ordered_nodes.len(),
             ));
@@ -1724,7 +1724,7 @@ pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a>(
             ));
         }
         return Err(transform_resource_limit(
-            "XPath Filter 2.0 expressions",
+            crate::policy::resource_name::XPATH_FILTERS,
             work_budget.limits.filters,
             filters.len(),
         ));
@@ -1895,7 +1895,7 @@ mod tests {
         assert!(matches!(
             error,
             TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "node-set entries",
+                resource: crate::policy::resource_name::NODE_SET_ENTRIES,
                 ..
             })
         ));
@@ -1929,7 +1929,7 @@ mod tests {
             assert!(matches!(
                 error,
                 TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "XPath mirror string bytes",
+                    resource: crate::policy::resource_name::XPATH_MIRROR_STRING_BYTES,
                     ..
                 })
             ));
@@ -2216,7 +2216,7 @@ mod tests {
         assert!(matches!(
             error,
             TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "XPath mirror string bytes",
+                resource: crate::policy::resource_name::XPATH_MIRROR_STRING_BYTES,
                 ..
             })
         ));

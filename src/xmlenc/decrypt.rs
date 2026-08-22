@@ -51,10 +51,10 @@ impl KeyCandidateBudget {
     }
 
     /// Charge attempted candidate work before performing it.
-    pub fn consume(&mut self, count: usize, resource: &'static str) -> Result<(), XmlEncError> {
+    pub fn consume(&mut self, count: usize) -> Result<(), XmlEncError> {
         if count > self.remaining {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource,
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
                 maximum: self.maximum,
                 actual: self
                     .maximum
@@ -73,10 +73,7 @@ impl KeyCandidateBudget {
         returned: usize,
     ) -> Result<(), XmlEncError> {
         let resolver_charged = remaining_before.saturating_sub(self.remaining);
-        self.consume(
-            returned.saturating_sub(resolver_charged),
-            "decryption key candidates",
-        )
+        self.consume(returned.saturating_sub(resolver_charged))
     }
 }
 
@@ -108,7 +105,7 @@ pub trait DecryptionKeyResolver {
         encrypted_key: Option<&EncryptedKey>,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
-        budget.consume(1, "decryption key candidates")?;
+        budget.consume(1)?;
         self.resolve_key(provider, algorithm, encrypted_key)
             .map(|key| vec![key])
     }
@@ -756,7 +753,7 @@ fn validate_encryption_document_len(
 fn validate_recipient_count(actual: usize, maximum: usize) -> Result<(), XmlEncError> {
     if actual > maximum {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "encryption recipients",
+            resource: crate::policy::resource_name::ENCRYPTION_RECIPIENTS,
             maximum,
             actual,
         }
@@ -899,7 +896,7 @@ fn validate_decryption_key_candidates(
     let maximum = crate::hard_limits::KEY_CANDIDATE_CEILING;
     if actual > maximum {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "decryption key candidates",
+            resource: crate::policy::resource_name::KEY_CANDIDATES,
             maximum,
             actual,
         }
@@ -1019,7 +1016,7 @@ fn validate_typed_cipher_values(
     let projected = validate_cipher_value_len(&encrypted.cipher_data.value, maximum_ciphertext)?;
     if projected > maximum_ciphertext {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "encryption plaintext bytes",
+            resource: crate::policy::resource_name::ENCRYPTION_PLAINTEXT_BYTES,
             maximum: maximum_plaintext,
             actual: projected.saturating_sub(algorithm.minimum_ciphertext_len()),
         }
@@ -1145,7 +1142,7 @@ fn validate_plaintext_len(actual: usize, maximum: usize) -> Result<(), XmlEncErr
         Ok(())
     } else {
         Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: "encryption plaintext bytes",
+            resource: crate::policy::resource_name::ENCRYPTION_PLAINTEXT_BYTES,
             maximum,
             actual,
         }
@@ -1333,13 +1330,10 @@ mod tests {
             budget: &mut KeyCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
             if encrypted_key.is_none() {
-                budget.consume(1, "decryption key candidates")?;
+                budget.consume(1)?;
                 return Ok(vec![self.direct.clone()]);
             }
-            budget.consume(
-                budget.remaining().saturating_add(1),
-                "RSA private-key candidates",
-            )?;
+            budget.consume(budget.remaining().saturating_add(1))?;
             unreachable!("candidate budget exhaustion must return first")
         }
     }
@@ -1361,7 +1355,7 @@ mod tests {
             encrypted_key: Option<&EncryptedKey>,
             budget: &mut KeyCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
-            budget.consume(1, "decryption key candidates")?;
+            budget.consume(1)?;
             match encrypted_key.and_then(|key| key.id.as_deref()) {
                 Some("first") => Ok(vec![self.wrong.clone()]),
                 Some("second") => Ok(vec![self.correct.clone()]),
@@ -1388,7 +1382,7 @@ mod tests {
             budget: &mut KeyCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
             if encrypted_key.is_none() {
-                budget.consume(self.keys.len(), "decryption key candidates")?;
+                budget.consume(self.keys.len())?;
                 Ok(self.keys.clone())
             } else {
                 Err(XmlEncError::KeyNotFound)
@@ -1416,9 +1410,9 @@ mod tests {
             let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
             let attempts = budget.remaining();
             if attempts == 0 {
-                budget.consume(1, "decryption key candidates")?;
+                budget.consume(1)?;
             }
-            budget.consume(attempts, "decryption key candidates")?;
+            budget.consume(attempts)?;
             self.attempts.set(self.attempts.get() + attempts);
             if encrypted_key.id.as_deref() == Some("first") {
                 Err(XmlEncError::KeyNotFound)
@@ -1446,7 +1440,7 @@ mod tests {
             budget: &mut KeyCandidateBudget,
         ) -> Result<Vec<Vec<u8>>, XmlEncError> {
             let encrypted_key = encrypted_key.ok_or(XmlEncError::KeyNotFound)?;
-            budget.consume(1, "decryption key candidates")?;
+            budget.consume(1)?;
             self.visited
                 .borrow_mut()
                 .push(encrypted_key.id.clone().unwrap_or_default());
@@ -1981,7 +1975,7 @@ mod tests {
         assert!(matches!(
             error,
             XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "decryption key candidates",
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
                 maximum: crate::hard_limits::KEY_CANDIDATE_CEILING,
                 actual: observed,
             }) if observed == actual
@@ -2022,7 +2016,7 @@ mod tests {
         assert!(matches!(
             error,
             XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "decryption key candidates",
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
                 maximum: 2,
                 actual: 3,
             })
@@ -2058,8 +2052,8 @@ mod tests {
 
     #[test]
     fn candidate_budget_exhaustion_is_fatal_after_a_key_was_found() {
-        // The resolver chooses resource labels only for diagnostics; changing
-        // that label must not turn operation-wide exhaustion into recovery.
+        // Candidate exhaustion must remain terminal even when it occurs in a
+        // resolver path dedicated to one particular key family.
         let key = vec![0x49_u8; 16];
         let resolver = MislabelledExhaustionResolver {
             direct: key.clone(),
@@ -2077,7 +2071,7 @@ mod tests {
         assert!(matches!(
             error,
             XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "RSA private-key candidates",
+                resource: "key candidates",
                 maximum: crate::hard_limits::KEY_CANDIDATE_CEILING,
                 actual,
             }) if actual == crate::hard_limits::KEY_CANDIDATE_CEILING + 1
@@ -2431,7 +2425,7 @@ mod tests {
             assert!(matches!(
                 error,
                 XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "encryption recipients",
+                    resource: crate::policy::resource_name::ENCRYPTION_RECIPIENTS,
                     maximum: 1,
                     actual: 2,
                 })
@@ -3049,7 +3043,7 @@ mod tests {
                 .decrypt_data(&bounded),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "encryption plaintext bytes",
+                    resource: crate::policy::resource_name::ENCRYPTION_PLAINTEXT_BYTES,
                     maximum: 3,
                     actual: 4
                 }
@@ -3126,7 +3120,7 @@ mod tests {
                 .decrypt_data(&encrypted),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "EncryptedData Id",
+                    resource: crate::policy::resource_name::ENCRYPTION_METADATA_BYTES,
                     maximum: 8,
                     actual: 9,
                 }
@@ -3172,7 +3166,7 @@ mod tests {
                 .decrypt_data(&encrypted),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "encryption plaintext bytes",
+                    resource: crate::policy::resource_name::ENCRYPTION_PLAINTEXT_BYTES,
                     ..
                 }
             ))
@@ -3756,7 +3750,7 @@ mod tests {
                 .policy(byte_policy)
                 .decrypt_document(&document, None),
             Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "XML document",
+                resource: crate::policy::resource_name::XML_DOCUMENT,
                 maximum,
                 actual,
             })) if maximum == document.len() - 1 && actual == document.len()

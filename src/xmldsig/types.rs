@@ -131,7 +131,7 @@ impl NodeSetMaterializationBudget {
                 .max_cumulative_owned_string_bytes
                 .saturating_sub(remaining_before);
             return Err(transform_resource_limit(
-                "cumulative node-set owned string bytes",
+                crate::policy::resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
                 self.max_cumulative_owned_string_bytes,
                 consumed.saturating_add(owned_string_bytes),
             ));
@@ -414,42 +414,14 @@ impl<'a> NodeSet<'a> {
         budget: &NodeSetMaterializationBudget,
     ) -> Result<(), TransformError> {
         if self.owns(owner) {
-            let key = XmlNodeKey::Attribute {
-                owner: owner.id(),
-                namespace: namespace.map(str::to_owned),
-                local_name: local_name.to_owned(),
-            };
-            if self.nodes.contains(&key) {
-                return Ok(());
-            }
-            let additional_bytes = key.checked_owned_string_bytes().ok_or_else(|| {
-                transform_resource_limit(
-                    "node-set owned string bytes",
-                    budget.max_owned_string_bytes,
-                    usize::MAX,
-                )
-            })?;
-            let total_bytes = self.owned_string_bytes.saturating_add(additional_bytes);
-            if total_bytes > budget.max_owned_string_bytes {
-                return Err(transform_resource_limit(
-                    "node-set owned string bytes",
-                    budget.max_owned_string_bytes,
-                    total_bytes,
-                ));
-            }
-            if self.nodes.len() >= budget.max_entries {
-                return Err(transform_resource_limit(
-                    "node-set entries",
-                    budget.max_entries,
-                    self.nodes.len().saturating_add(1),
-                ));
-            }
-            budget.charge(additional_bytes)?;
-            let inserted = self.nodes.insert(key);
-            debug_assert!(inserted, "the duplicate key was checked before insertion");
-            if inserted {
-                self.owned_string_bytes = total_bytes;
-            }
+            self.insert_projected_key_with_budget(
+                XmlNodeKey::Attribute {
+                    owner: owner.id(),
+                    namespace: namespace.map(str::to_owned),
+                    local_name: local_name.to_owned(),
+                },
+                budget,
+            )?;
         }
         Ok(())
     }
@@ -478,42 +450,53 @@ impl<'a> NodeSet<'a> {
         budget: &NodeSetMaterializationBudget,
     ) -> Result<(), TransformError> {
         if self.owns(owner) {
-            let key = XmlNodeKey::Namespace {
-                owner: owner.id(),
-                prefix: prefix.to_owned(),
-                uri: uri.to_owned(),
-            };
-            if self.nodes.contains(&key) {
-                return Ok(());
-            }
-            let additional_bytes = key.checked_owned_string_bytes().ok_or_else(|| {
-                transform_resource_limit(
-                    "node-set owned string bytes",
-                    budget.max_owned_string_bytes,
-                    usize::MAX,
-                )
-            })?;
-            let total_bytes = self.owned_string_bytes.saturating_add(additional_bytes);
-            if total_bytes > budget.max_owned_string_bytes {
-                return Err(transform_resource_limit(
-                    "node-set owned string bytes",
-                    budget.max_owned_string_bytes,
-                    total_bytes,
-                ));
-            }
-            if self.nodes.len() >= budget.max_entries {
-                return Err(transform_resource_limit(
-                    "node-set entries",
-                    budget.max_entries,
-                    self.nodes.len().saturating_add(1),
-                ));
-            }
-            budget.charge(additional_bytes)?;
-            let inserted = self.nodes.insert(key);
-            debug_assert!(inserted, "the duplicate key was checked before insertion");
-            if inserted {
-                self.owned_string_bytes = total_bytes;
-            }
+            self.insert_projected_key_with_budget(
+                XmlNodeKey::Namespace {
+                    owner: owner.id(),
+                    prefix: prefix.to_owned(),
+                    uri: uri.to_owned(),
+                },
+                budget,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_projected_key_with_budget(
+        &mut self,
+        key: XmlNodeKey,
+        budget: &NodeSetMaterializationBudget,
+    ) -> Result<(), TransformError> {
+        if self.nodes.contains(&key) {
+            return Ok(());
+        }
+        let additional_bytes = key.checked_owned_string_bytes().ok_or_else(|| {
+            transform_resource_limit(
+                crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+                budget.max_owned_string_bytes,
+                usize::MAX,
+            )
+        })?;
+        let total_bytes = self.owned_string_bytes.saturating_add(additional_bytes);
+        if total_bytes > budget.max_owned_string_bytes {
+            return Err(transform_resource_limit(
+                crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+                budget.max_owned_string_bytes,
+                total_bytes,
+            ));
+        }
+        if self.nodes.len() >= budget.max_entries {
+            return Err(transform_resource_limit(
+                crate::policy::resource_name::NODE_SET_ENTRIES,
+                budget.max_entries,
+                self.nodes.len().saturating_add(1),
+            ));
+        }
+        budget.charge(additional_bytes)?;
+        let inserted = self.nodes.insert(key);
+        debug_assert!(inserted, "the duplicate key was checked before insertion");
+        if inserted {
+            self.owned_string_bytes = total_bytes;
         }
         Ok(())
     }
@@ -570,14 +553,14 @@ impl<'a> NodeSet<'a> {
                 let total_bytes = self.owned_string_bytes.saturating_add(owned_string_bytes);
                 if total_bytes > budget.max_owned_string_bytes {
                     return Err(transform_resource_limit(
-                        "node-set owned string bytes",
+                        crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
                         budget.max_owned_string_bytes,
                         total_bytes,
                     ));
                 }
                 if self.nodes.len() >= budget.max_entries {
                     return Err(transform_resource_limit(
-                        "node-set entries",
+                        crate::policy::resource_name::NODE_SET_ENTRIES,
                         budget.max_entries,
                         self.nodes.len().saturating_add(1),
                     ));
@@ -678,13 +661,23 @@ impl<'a> NodeSet<'a> {
             } else {
                 Some(1)
             }
-            .ok_or_else(|| transform_resource_limit("node-set entries", max_entries, usize::MAX))?;
+            .ok_or_else(|| {
+                transform_resource_limit(
+                    crate::policy::resource_name::NODE_SET_ENTRIES,
+                    max_entries,
+                    usize::MAX,
+                )
+            })?;
             entries = entries.checked_add(projected).ok_or_else(|| {
-                transform_resource_limit("node-set entries", max_entries, usize::MAX)
+                transform_resource_limit(
+                    crate::policy::resource_name::NODE_SET_ENTRIES,
+                    max_entries,
+                    usize::MAX,
+                )
             })?;
             if entries > max_entries {
                 return Err(transform_resource_limit(
-                    "node-set entries",
+                    crate::policy::resource_name::NODE_SET_ENTRIES,
                     max_entries,
                     entries,
                 ));
@@ -713,11 +706,15 @@ fn charge_node_set_string_bytes(
     max_bytes: usize,
 ) -> Result<usize, TransformError> {
     let total = current.checked_add(additional).ok_or_else(|| {
-        transform_resource_limit("node-set owned string bytes", max_bytes, usize::MAX)
+        transform_resource_limit(
+            crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+            max_bytes,
+            usize::MAX,
+        )
     })?;
     if total > max_bytes {
         return Err(transform_resource_limit(
-            "node-set owned string bytes",
+            crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
             max_bytes,
             total,
         ));
@@ -852,6 +849,38 @@ mod tests {
             error,
             TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                 resource: "node-set owned string bytes",
+                maximum: 3,
+                actual: 4,
+            })
+        ));
+    }
+
+    #[test]
+    fn projected_attribute_and_namespace_share_one_budget_path() {
+        // Duplicate projected keys are free, while distinct attributes and
+        // namespaces consume the same operation-wide owned-string allowance.
+        let document = Document::parse("<root/>").expect("fixed XML must parse");
+        let root = document.root_element();
+        let mut nodes = NodeSet::empty(&document);
+        let budget = NodeSetMaterializationBudget::with_limits(16, 16, 3);
+
+        nodes
+            .insert_namespace_with_budget(root, "p", "u", &budget)
+            .expect("two namespace bytes must fit");
+        nodes
+            .insert_namespace_with_budget(root, "p", "u", &budget)
+            .expect("a duplicate namespace must not consume budget twice");
+        nodes
+            .insert_attribute_with_budget(root, None, "a", &budget)
+            .expect("one remaining byte must admit an attribute");
+        let error = nodes
+            .insert_attribute_with_budget(root, None, "b", &budget)
+            .expect_err("distinct projected keys must share cumulative accounting");
+
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "cumulative node-set owned string bytes",
                 maximum: 3,
                 actual: 4,
             })

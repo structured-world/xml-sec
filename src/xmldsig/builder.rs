@@ -241,7 +241,7 @@ impl SignatureBuilder {
         }
         if self.references.len() > policy.resources.max_references {
             return Err(PolicyViolation::ResourceLimit {
-                resource: "signature references",
+                resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
                 maximum: policy.resources.max_references,
                 actual: self.references.len(),
             }
@@ -263,7 +263,7 @@ impl SignatureBuilder {
             }
             if reference.transforms.len() > policy.resources.max_transforms_per_reference {
                 return Err(PolicyViolation::ResourceLimit {
-                    resource: "reference transforms",
+                    resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
                     maximum: policy.resources.max_transforms_per_reference,
                     actual: reference.transforms.len(),
                 }
@@ -291,7 +291,7 @@ impl SignatureBuilder {
                         }
                         if filters.len() > policy.resources.max_xpath_filters {
                             return Err(PolicyViolation::ResourceLimit {
-                                resource: "XPath Filter 2.0 expressions",
+                                resource: crate::policy::resource_name::XPATH_FILTERS,
                                 maximum: policy.resources.max_xpath_filters,
                                 actual: filters.len(),
                             }

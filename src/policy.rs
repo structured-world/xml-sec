@@ -16,6 +16,43 @@ use crate::xmlenc::{
     DataEncryptionAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
 
+/// Canonical diagnostics for limits represented by [`ResourcePolicy`].
+///
+/// Validation and every enforcement point use the same names so callers can
+/// match typed policy violations without operation-specific string drift.
+pub(crate) mod resource_name {
+    pub const XML_NODES: &str = "XML nodes";
+    pub const SIGNATURE_REFERENCES: &str = "signature references";
+    pub const REFERENCE_TRANSFORMS: &str = "reference transforms";
+    pub const XML_BASE_COMPONENTS: &str = "XML Base components";
+    pub const XML_BASE_RESOLUTION_BYTES: &str = "XML Base resolution bytes";
+    pub const CANONICALIZED_BYTES: &str = "canonicalized bytes";
+    pub const EXTERNAL_RESOURCE_BYTES: &str = "external resource bytes";
+    pub const AGGREGATE_EXTERNAL_RESOURCE_BYTES: &str = "aggregate external resource bytes";
+    pub const ENCRYPTION_PLAINTEXT_BYTES: &str = "encryption plaintext bytes";
+    pub const XML_DOCUMENT: &str = "XML document";
+    pub const ENCRYPTION_RECIPIENTS: &str = "encryption recipients";
+    pub const ENCRYPTION_METADATA_BYTES: &str = "encryption metadata bytes";
+    pub const KEY_CANDIDATES: &str = "key candidates";
+    pub const BASE64_TRANSFORM_INPUT_BYTES: &str = "Base64 transform input bytes";
+    pub const BASE64_TRANSFORM_OUTPUT_BYTES: &str = "Base64 transform output bytes";
+    pub const XPATH_EXPRESSIONS: &str = "XPath expressions";
+    pub const XPATH_EXPRESSION_BYTES: &str = "XPath expression bytes";
+    pub const XPATH_EXPRESSION_COMPLEXITY: &str = "XPath expression complexity";
+    pub const XPATH_CONTEXT_EVALUATIONS: &str = "XPath context evaluations";
+    pub const XPATH_EVALUATION_WORK: &str = "XPath evaluation work";
+    pub const XPATH_MIRROR_STRING_BYTES: &str = "XPath mirror string bytes";
+    pub const XPATH_STRING_WORK_BYTES: &str = "XPath string-processing work bytes";
+    pub const XPATH_NAMESPACE_BINDINGS: &str = "XPath namespace bindings";
+    pub const XPATH_NAMESPACE_BYTES: &str = "XPath namespace bytes";
+    pub const XPATH_FILTERS: &str = "XPath filters";
+    pub const NODE_SET_FILTER_WORK: &str = "node-set filter work";
+    pub const NODE_SET_ENTRIES: &str = "node-set entries";
+    pub const NODE_SET_OWNED_STRING_BYTES: &str = "node-set owned string bytes";
+    pub const NODE_SET_CUMULATIVE_OWNED_STRING_BYTES: &str =
+        "cumulative node-set owned string bytes";
+}
+
 /// A typed rejection produced by an operation policy.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -267,7 +304,7 @@ pub struct ResourcePolicy {
     pub max_encryption_recipients: usize,
     /// Maximum caller-controlled XMLEnc metadata bytes per field.
     pub max_encryption_metadata_bytes: usize,
-    /// Maximum decryption key candidates attempted by one operation.
+    /// Maximum key candidates attempted by one operation.
     pub max_key_candidates: usize,
     /// Maximum bytes accepted by Base64 transforms before decoding.
     pub max_base64_transform_input_bytes: usize,
@@ -348,148 +385,148 @@ impl ResourcePolicy {
     /// Validate policy values against non-configurable implementation ceilings.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         Self::within(
-            "XML nodes",
+            resource_name::XML_NODES,
             self.max_xml_nodes,
             crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
         )?;
         Self::within(
-            "canonicalized bytes",
+            resource_name::CANONICALIZED_BYTES,
             self.max_canonicalized_bytes,
             crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING,
         )?;
         Self::within(
-            "signature references",
+            resource_name::SIGNATURE_REFERENCES,
             self.max_references,
             crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
         )?;
         Self::within(
-            "reference transforms",
+            resource_name::REFERENCE_TRANSFORMS,
             self.max_transforms_per_reference,
             crate::hard_limits::REFERENCE_TRANSFORM_CEILING,
         )?;
         Self::within(
-            "XML Base components",
+            resource_name::XML_BASE_COMPONENTS,
             self.max_xml_base_components,
             crate::hard_limits::XML_BASE_COMPONENT_CEILING,
         )?;
         Self::within(
-            "XML Base resolution bytes",
+            resource_name::XML_BASE_RESOLUTION_BYTES,
             self.max_xml_base_resolution_bytes,
             crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING,
         )?;
         Self::within(
-            "XML document",
+            resource_name::XML_DOCUMENT,
             self.max_xml_document_bytes,
             crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
         )?;
         Self::within(
-            "external resource bytes",
+            resource_name::EXTERNAL_RESOURCE_BYTES,
             self.max_external_resource_bytes,
             crate::hard_limits::EXTERNAL_RESOURCE_BYTE_CEILING,
         )?;
         Self::within(
-            "aggregate external resource bytes",
+            resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
             self.max_external_resource_total_bytes,
             crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING,
         )?;
         Self::within(
-            "encryption plaintext bytes",
+            resource_name::ENCRYPTION_PLAINTEXT_BYTES,
             self.max_encryption_plaintext_bytes,
             crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING,
         )?;
         Self::within(
-            "encryption recipients",
+            resource_name::ENCRYPTION_RECIPIENTS,
             self.max_encryption_recipients,
             crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
         )?;
         Self::within(
-            "encryption metadata bytes",
+            resource_name::ENCRYPTION_METADATA_BYTES,
             self.max_encryption_metadata_bytes,
             crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
         )?;
         for (resource, selected, ceiling) in [
             (
-                "decryption key candidates",
+                resource_name::KEY_CANDIDATES,
                 self.max_key_candidates,
                 crate::hard_limits::KEY_CANDIDATE_CEILING,
             ),
             (
-                "Base64 transform input",
+                resource_name::BASE64_TRANSFORM_INPUT_BYTES,
                 self.max_base64_transform_input_bytes,
                 crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
             ),
             (
-                "Base64 transform output",
+                resource_name::BASE64_TRANSFORM_OUTPUT_BYTES,
                 self.max_base64_transform_output_bytes,
                 crate::hard_limits::BASE64_TRANSFORM_OUTPUT_BYTE_CEILING,
             ),
             (
-                "XPath expressions",
+                resource_name::XPATH_EXPRESSIONS,
                 self.max_xpath_expressions,
                 crate::hard_limits::XPATH_EXPRESSION_COUNT_CEILING,
             ),
             (
-                "XPath expression bytes",
+                resource_name::XPATH_EXPRESSION_BYTES,
                 self.max_xpath_expression_bytes,
                 crate::hard_limits::XPATH_EXPRESSION_BYTE_CEILING,
             ),
             (
-                "XPath expression complexity",
+                resource_name::XPATH_EXPRESSION_COMPLEXITY,
                 self.max_xpath_expression_complexity,
                 crate::hard_limits::XPATH_EXPRESSION_COMPLEXITY_CEILING,
             ),
             (
-                "XPath context evaluations",
+                resource_name::XPATH_CONTEXT_EVALUATIONS,
                 self.max_xpath_context_evaluations,
                 crate::hard_limits::XPATH_CONTEXT_EVALUATION_CEILING,
             ),
             (
-                "XPath evaluation work",
+                resource_name::XPATH_EVALUATION_WORK,
                 self.max_xpath_evaluation_work,
                 crate::hard_limits::XPATH_EVALUATION_WORK_CEILING,
             ),
             (
-                "XPath mirror string bytes",
+                resource_name::XPATH_MIRROR_STRING_BYTES,
                 self.max_xpath_mirror_string_bytes,
                 crate::hard_limits::XPATH_MIRROR_STRING_BYTE_CEILING,
             ),
             (
-                "XPath string work bytes",
+                resource_name::XPATH_STRING_WORK_BYTES,
                 self.max_xpath_string_work_bytes,
                 crate::hard_limits::XPATH_STRING_WORK_BYTE_CEILING,
             ),
             (
-                "XPath namespace bindings",
+                resource_name::XPATH_NAMESPACE_BINDINGS,
                 self.max_xpath_namespace_bindings,
                 crate::hard_limits::XPATH_NAMESPACE_BINDING_CEILING,
             ),
             (
-                "XPath namespace bytes",
+                resource_name::XPATH_NAMESPACE_BYTES,
                 self.max_xpath_namespace_bytes,
                 crate::hard_limits::XPATH_NAMESPACE_BYTE_CEILING,
             ),
             (
-                "XPath filters",
+                resource_name::XPATH_FILTERS,
                 self.max_xpath_filters,
                 crate::hard_limits::XPATH_FILTER_COUNT_CEILING,
             ),
             (
-                "node-set filter work",
+                resource_name::NODE_SET_FILTER_WORK,
                 self.max_node_set_filter_work,
                 crate::hard_limits::NODE_SET_FILTER_WORK_CEILING,
             ),
             (
-                "node-set entries",
+                resource_name::NODE_SET_ENTRIES,
                 self.max_node_set_entries,
                 crate::hard_limits::NODE_SET_ENTRY_CEILING,
             ),
             (
-                "node-set owned string bytes",
+                resource_name::NODE_SET_OWNED_STRING_BYTES,
                 self.max_node_set_owned_string_bytes,
                 crate::hard_limits::NODE_SET_OWNED_STRING_BYTE_CEILING,
             ),
             (
-                "cumulative node-set owned string bytes",
+                resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
                 self.max_node_set_cumulative_owned_string_bytes,
                 crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING,
             ),
@@ -989,17 +1026,17 @@ mod tests {
                 |p| &mut p.max_encryption_metadata_bytes,
             ),
             (
-                "decryption key candidates",
+                resource_name::KEY_CANDIDATES,
                 crate::hard_limits::KEY_CANDIDATE_CEILING,
                 |p| &mut p.max_key_candidates,
             ),
             (
-                "Base64 transform input",
+                resource_name::BASE64_TRANSFORM_INPUT_BYTES,
                 crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
                 |p| &mut p.max_base64_transform_input_bytes,
             ),
             (
-                "Base64 transform output",
+                resource_name::BASE64_TRANSFORM_OUTPUT_BYTES,
                 crate::hard_limits::BASE64_TRANSFORM_OUTPUT_BYTE_CEILING,
                 |p| &mut p.max_base64_transform_output_bytes,
             ),
@@ -1034,7 +1071,7 @@ mod tests {
                 |p| &mut p.max_xpath_mirror_string_bytes,
             ),
             (
-                "XPath string work bytes",
+                resource_name::XPATH_STRING_WORK_BYTES,
                 crate::hard_limits::XPATH_STRING_WORK_BYTE_CEILING,
                 |p| &mut p.max_xpath_string_work_bytes,
             ),
@@ -1049,7 +1086,7 @@ mod tests {
                 |p| &mut p.max_xpath_namespace_bytes,
             ),
             (
-                "XPath filters",
+                resource_name::XPATH_FILTERS,
                 crate::hard_limits::XPATH_FILTER_COUNT_CEILING,
                 |p| &mut p.max_xpath_filters,
             ),

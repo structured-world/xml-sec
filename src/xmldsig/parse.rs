@@ -199,13 +199,16 @@ pub enum KeyInfoSource {
 }
 
 /// Transform forms accepted on `<RetrievalMethod>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RetrievalMethodTransforms {
     /// No transform chain is present.
     None,
     /// Filter a same-document node-set to one `ds:X509Data`-rooted subtree.
-    X509DataNodeSetFilter,
+    X509DataNodeSetFilter {
+        /// Original expression retained for operation policy accounting.
+        expression: String,
+    },
     /// A transform chain attached to a RetrievalMethod type this implementation
     /// does not materialize. Resolvers may ignore this advisory key source and
     /// continue with later `<KeyInfo>` children.
@@ -440,7 +443,7 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
         verify_ds_element(child, "Reference")?;
         if references.len() == crate::hard_limits::SIGNATURE_REFERENCE_CEILING {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "signature references",
+                resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
                 maximum: crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
                 actual: references.len().saturating_add(1),
             }
@@ -770,7 +773,9 @@ fn parse_retrieval_method_transforms(
             "unsupported RetrievalMethod XPath selection".into(),
         ));
     }
-    Ok(RetrievalMethodTransforms::X509DataNodeSetFilter)
+    Ok(RetrievalMethodTransforms::X509DataNodeSetFilter {
+        expression: expression.to_owned(),
+    })
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -3869,7 +3874,7 @@ BA== </Modulus>
             [KeyInfoSource::RetrievalMethod {
                 uri,
                 resource_type: Some(resource_type),
-                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter,
+                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter { .. },
             }] if uri == "#keys"
                 && resource_type == "http://www.w3.org/2000/09/xmldsig#X509Data"
         ));
@@ -3973,7 +3978,7 @@ BA== </Modulus>
                 .sources
                 .as_slice(),
             [KeyInfoSource::RetrievalMethod {
-                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter,
+                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter { .. },
                 ..
             }]
         ));
@@ -4341,7 +4346,7 @@ BA== </Modulus>
         assert!(matches!(
             error,
             ParseError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "signature references",
+                resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
                 maximum: MAX_REFERENCES_PER_SIGNATURE,
                 actual: 65,
             })

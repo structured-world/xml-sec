@@ -754,7 +754,7 @@ fn select_signing_key(
         "private key",
     )?;
     KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-        .consume(candidates.len(), "signing key candidates")
+        .consume(candidates.len())
         .map_err(|error| CommandError::Signature(error.to_string()))?;
     let lax_key_search = invocation.flag("lax-key-search");
     let mut last_error: Option<CommandError> = None;
@@ -1620,7 +1620,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             "AES key",
         )?;
         KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-            .consume(candidates.len(), "encryption key candidates")
+            .consume(candidates.len())
             .map_err(|error| CommandError::Encryption(error.to_string()))?;
         let mut material_budget =
             ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
@@ -1659,7 +1659,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         let mut available_public_keys = public_keys.clone();
         if lax_key_search {
             KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-                .consume(available_public_keys.len(), "encryption key candidates")
+                .consume(available_public_keys.len())
                 .map_err(|error| CommandError::Encryption(error.to_string()))?;
         }
         let mut loaded_public_keys = HashMap::new();
@@ -2630,7 +2630,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             "AES key",
         )?;
         KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-            .consume(candidates.len(), "decryption key candidates")
+            .consume(candidates.len())
             .map_err(|error| CommandError::Encryption(error.to_string()))?;
         let lax_key_search = invocation.flag("lax-key-search");
         let mut keys = Vec::with_capacity(candidates.len());
@@ -2661,7 +2661,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             invocation.flag("lax-key-search"),
         )?;
         KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-            .consume(selected.len(), "decryption key candidates")
+            .consume(selected.len())
             .map_err(|error| CommandError::Encryption(error.to_string()))?;
         let mut keys = Vec::with_capacity(selected.len());
         let lax_key_search = invocation.flag("lax-key-search");
@@ -2830,7 +2830,7 @@ impl DecryptionKeyResolver for CandidateSymmetricKeyDecryptor {
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
         if encrypted_key.is_none() {
-            budget.consume(self.keys.len(), "decryption key candidates")?;
+            budget.consume(self.keys.len())?;
             Ok(self.keys.clone())
         } else {
             Err(XmlEncError::KeyNotFound)
@@ -2880,7 +2880,7 @@ impl DecryptionKeyResolver for NamedRecipientDecryptor {
         let mut resolved = Vec::new();
         let mut last_error = None;
         for key in self.applicable_keys(encrypted_key) {
-            budget.consume(1, "RSA private-key candidates")?;
+            budget.consume(1)?;
             match key
                 .inner
                 .resolve_key(provider, algorithm, Some(encrypted_key))
@@ -4099,9 +4099,7 @@ mod tests {
         let mut candidate_budget = KeyCandidateBudget::for_operation();
         let maximum = candidate_budget.remaining();
         let reserved = maximum - 1;
-        candidate_budget
-            .consume(reserved, "prior recipient candidates")
-            .unwrap();
+        candidate_budget.consume(reserved).unwrap();
         let error = resolver
             .resolve_key_candidates(
                 default_provider(),
@@ -4114,7 +4112,7 @@ mod tests {
         assert!(matches!(
             error,
             XmlEncError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
-                resource: "RSA private-key candidates",
+                resource: "key candidates",
                 maximum: observed_maximum,
                 actual,
             }) if observed_maximum == maximum && actual == maximum + 1

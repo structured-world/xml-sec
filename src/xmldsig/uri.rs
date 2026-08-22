@@ -53,7 +53,7 @@ impl ExternalResourceBudget {
     fn charge(&self, bytes: usize) -> Result<(), TransformError> {
         if bytes > self.max_resource_bytes {
             return Err(transform_resource_limit(
-                "external resource bytes",
+                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
                 self.max_resource_bytes,
                 bytes,
             ));
@@ -62,7 +62,7 @@ impl ExternalResourceBudget {
         let Some(next) = remaining.checked_sub(bytes) else {
             self.remaining_total_bytes.set(0);
             return Err(transform_resource_limit(
-                "aggregate external resource bytes",
+                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
                 self.max_total_bytes,
                 self.max_total_bytes
                     .saturating_add(bytes.saturating_sub(remaining)),
@@ -339,12 +339,16 @@ impl<'a> UriReferenceResolver<'a> {
 
 fn map_xml_base_resolution_error(error: XmlBaseResolutionError) -> TransformError {
     match error {
-        XmlBaseResolutionError::Components { maximum, actual } => {
-            transform_resource_limit("XML Base components", maximum, actual)
-        }
-        XmlBaseResolutionError::Bytes { maximum, actual } => {
-            transform_resource_limit("XML Base resolution bytes", maximum, actual)
-        }
+        XmlBaseResolutionError::Components { maximum, actual } => transform_resource_limit(
+            crate::policy::resource_name::XML_BASE_COMPONENTS,
+            maximum,
+            actual,
+        ),
+        XmlBaseResolutionError::Bytes { maximum, actual } => transform_resource_limit(
+            crate::policy::resource_name::XML_BASE_RESOLUTION_BYTES,
+            maximum,
+            actual,
+        ),
     }
 }
 
