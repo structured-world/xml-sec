@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/structured-world/xml-sec/compare/v0.1.11...v0.1.12) - 2026-08-22
+
+### Added
+
+- *(cli)* add native xmlsec1 command
+
+### Fixed
+
+- *(cli)* decrypt first embedded payload
+- *(cli)* bound lax key selection
+- *(cli)* bound key candidate work
+- *(xmldsig)* preserve digest dependencies
+- *(xmldsig)* track mutable signing values
+- *(cli)* preserve verification dependencies
+- *(cli)* close dependency review gaps
+- *(cli)* close resource tracking gaps
+- *(xmldsig)* complete manifest processing
+- *(cli)* harden bounded manifest handling
+- *(cli)* harden compatibility edge cases
+- *(xmlenc)* type candidate budget exhaustion
+- *(cli)* resolve compatibility review
+- *(cli)* harden input and key handling
+- *(xml)* enforce UTF-16 byte order
+- *(xml)* normalize transcoded declarations
+- *(cli)* clarify option applicability
+- *(cli)* validate signing key identity
+- *(cli)* bound key candidate processing
+- *(cli)* bound lax key selection
+- *(xmlenc)* bound recipient key search
+- *(cli)* bound certificate sources
+- *(cli)* fail strict verification key errors
+- *(xmlenc)* process decrypt candidates lazily
+- *(cli)* bound certificate and RSA inputs
+- *(cli)* validate configured trust inputs
+- *(xmlenc)* bound authenticated key retries
+- *(cli)* bound key candidate processing
+- *(cli)* validate compound key inputs
+- *(cli)* harden verification key search
+- *(xmldsig)* bound synthesized XML parses
+- *(cli)* enforce mutation boundaries
+- *(cli)* preserve positional sentinels
+- *(ledger)* harden compatibility invariants
+- *(cli)* tighten capability ledger checks
+- *(cli)* enforce donor input contracts
+- *(cli)* harden compatibility contracts
+- *(ledger)* normalize capability metadata
+- *(ledger)* preserve conditional availability
+- *(ledger)* inventory omitted donor surface
+- *(ledger)* preserve complete donor surface
+- *(ledger)* complete C surface extraction
+- *(ledger)* fail closed on donor drift
+
+### Refactored
+
+- *(cli)* clarify diagnostic routing
+
 ## [0.1.11](https://github.com/structured-world/xml-sec/compare/v0.1.10...v0.1.11) - 2026-08-13
 
 ### Added
