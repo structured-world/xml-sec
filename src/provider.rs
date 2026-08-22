@@ -1,9 +1,12 @@
 //! Provider-neutral cryptographic operations.
 //!
 //! XML parsing and protocol orchestration depend on this contract rather than
-//! concrete cryptographic crates. Secret-bearing signing/decryption keys remain
-//! opaque behind the operation-specific key traits exposed by `xmldsig` and
-//! `xmlenc`; this provider owns stateless primitives and randomness.
+//! concrete cryptographic crates. Secret-bearing keys remain opaque behind
+//! operation-specific handles; this provider owns primitive dispatch and
+//! randomness.
+
+#[cfg(feature = "xmlenc")]
+use std::borrow::Cow;
 
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 use getrandom::rand_core::TryCryptoRng;
@@ -12,9 +15,7 @@ use getrandom::{SysRng, rand_core::TryRng};
 #[cfg(feature = "xmldsig")]
 use crate::xmldsig::DigestAlgorithm;
 #[cfg(feature = "xmlenc")]
-use crate::xmlenc::RsaOaepParameters;
-#[cfg(feature = "xmlenc")]
-use crate::xmlenc::{DataEncryptionAlgorithm, KeyWrapAlgorithm};
+use crate::xmlenc::{DataEncryptionAlgorithm, KeyWrapAlgorithm, RsaOaepParameters};
 
 /// A cryptographic operation advertised by a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -46,13 +47,124 @@ pub enum ProviderOperation {
     Random,
 }
 
-/// Provider capability query, including optional algorithm granularity.
+/// One exact provider capability, including operation-specific parameters.
+///
+/// Capability discovery describes mechanisms, not policy permission. Callers
+/// must still apply the immutable operation policy before provider dispatch.
 #[derive(Debug, Clone, Copy)]
-pub struct CapabilityQuery<'a> {
-    /// Operation the caller intends to execute.
-    pub operation: ProviderOperation,
-    /// Standard algorithm URI when one exists.
-    pub algorithm: Option<&'a str>,
+#[non_exhaustive]
+pub enum ProviderCapability<'a> {
+    /// Message digest computation for an XMLDSig digest method.
+    #[cfg(feature = "xmldsig")]
+    Digest(DigestAlgorithm),
+    /// Signature generation for an XMLDSig signature method.
+    #[cfg(feature = "xmldsig")]
+    Sign(crate::xmldsig::SignatureAlgorithm),
+    /// Signature verification for an XMLDSig signature method.
+    #[cfg(feature = "xmldsig")]
+    Verify(crate::xmldsig::SignatureAlgorithm),
+    /// X.509 signature verification with complete algorithm parameters.
+    #[cfg(feature = "xmldsig")]
+    VerifyCertificate(X509SignatureAlgorithm),
+    /// XMLEnc content encryption.
+    #[cfg(feature = "xmlenc")]
+    Encrypt(DataEncryptionAlgorithm),
+    /// XMLEnc content decryption.
+    #[cfg(feature = "xmlenc")]
+    Decrypt(DataEncryptionAlgorithm),
+    /// RFC 3394 key wrapping.
+    #[cfg(feature = "xmlenc")]
+    KeyWrap(KeyWrapAlgorithm),
+    /// RFC 3394 key unwrapping.
+    #[cfg(feature = "xmlenc")]
+    KeyUnwrap(KeyWrapAlgorithm),
+    /// RSA-OAEP key transport with complete digest, MGF, and label parameters.
+    #[cfg(feature = "xmlenc")]
+    KeyTransport(&'a RsaOaepParameters),
+    /// Provider-defined key agreement identified by its standard URI.
+    KeyAgreement(&'a KeyAgreementParameters<'a>),
+    /// Provider-defined key derivation identified by its standard URI.
+    Kdf(&'a KdfParameters<'a>),
+    /// Cryptographically secure random byte generation.
+    Random,
+}
+
+impl ProviderCapability<'_> {
+    /// Operation category used in diagnostics.
+    #[must_use]
+    pub const fn operation(&self) -> ProviderOperation {
+        match self {
+            #[cfg(feature = "xmldsig")]
+            Self::Digest(_) => ProviderOperation::Digest,
+            #[cfg(feature = "xmldsig")]
+            Self::Sign(_) => ProviderOperation::Sign,
+            #[cfg(feature = "xmldsig")]
+            Self::Verify(_) => ProviderOperation::Verify,
+            #[cfg(feature = "xmldsig")]
+            Self::VerifyCertificate(_) => ProviderOperation::VerifyCertificate,
+            #[cfg(feature = "xmlenc")]
+            Self::Encrypt(_) => ProviderOperation::Encrypt,
+            #[cfg(feature = "xmlenc")]
+            Self::Decrypt(_) => ProviderOperation::Decrypt,
+            #[cfg(feature = "xmlenc")]
+            Self::KeyWrap(_) => ProviderOperation::KeyWrap,
+            #[cfg(feature = "xmlenc")]
+            Self::KeyUnwrap(_) => ProviderOperation::KeyUnwrap,
+            #[cfg(feature = "xmlenc")]
+            Self::KeyTransport(_) => ProviderOperation::KeyTransport,
+            Self::KeyAgreement(_) => ProviderOperation::KeyAgreement,
+            Self::Kdf(_) => ProviderOperation::Kdf,
+            Self::Random => ProviderOperation::Random,
+        }
+    }
+
+    /// Standard algorithm identifier used in unsupported-operation errors.
+    #[must_use]
+    pub fn algorithm(&self) -> Option<&str> {
+        match self {
+            #[cfg(feature = "xmldsig")]
+            Self::Digest(algorithm) => Some(algorithm.uri()),
+            #[cfg(feature = "xmldsig")]
+            Self::Sign(algorithm) | Self::Verify(algorithm) => Some(algorithm.uri()),
+            #[cfg(feature = "xmldsig")]
+            Self::VerifyCertificate(algorithm) => Some(algorithm.oid()),
+            #[cfg(feature = "xmlenc")]
+            Self::Encrypt(algorithm) | Self::Decrypt(algorithm) => Some(algorithm.uri()),
+            #[cfg(feature = "xmlenc")]
+            Self::KeyWrap(algorithm) | Self::KeyUnwrap(algorithm) => Some(algorithm.uri()),
+            #[cfg(feature = "xmlenc")]
+            Self::KeyTransport(parameters) => Some(parameters.algorithm.uri()),
+            Self::KeyAgreement(parameters) => Some(parameters.algorithm),
+            Self::Kdf(parameters) => Some(parameters.algorithm),
+            Self::Random => None,
+        }
+    }
+}
+
+/// Provider-neutral parameters for an asymmetric key-agreement operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyAgreementParameters<'a> {
+    /// Standard key-agreement algorithm URI.
+    pub algorithm: &'a str,
+    /// Encoded peer public key in the algorithm's standard wire format.
+    pub peer_public_key: &'a [u8],
+}
+
+/// Provider-neutral parameters for a key-derivation operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdfParameters<'a> {
+    /// Standard KDF algorithm URI.
+    pub algorithm: &'a str,
+    /// Optional digest or PRF URI selected by the KDF parameters.
+    pub digest: Option<&'a str>,
+    /// Caller-provided salt, when the KDF defines one.
+    pub salt: &'a [u8],
+    /// Algorithm-specific context bytes such as ConcatKDF OtherInfo or HKDF info.
+    pub info: &'a [u8],
+    /// Policy-validated iteration count for iterative KDFs; zero when not applicable.
+    pub iterations: u64,
+    /// Policy-validated requested output length in bytes.
+    pub output_len: usize,
 }
 
 /// Provider-neutral X.509 certificate and CRL signature parameters.
@@ -186,13 +298,64 @@ pub enum ProviderError {
     Random(String),
 }
 
+/// Opaque public-key handle used for asymmetric key transport.
+///
+/// Implementations own their key material and operation. The orchestration
+/// layer can inspect only public RSA components needed for policy validation
+/// and output framing; it cannot recover a backend-specific key object.
+#[cfg(feature = "xmlenc")]
+pub trait KeyTransportKey: Send + Sync {
+    /// RSA modulus bytes without redundant leading zero octets.
+    ///
+    /// These components must identify the exact key used by
+    /// [`Self::transport_with_provider`]; returning metadata for another key
+    /// would violate the policy boundary.
+    fn rsa_modulus(&self) -> Cow<'_, [u8]>;
+
+    /// RSA public exponent bytes without redundant leading zero octets.
+    fn rsa_exponent(&self) -> Cow<'_, [u8]>;
+
+    /// Execute OAEP key transport using the selected provider's randomness.
+    fn transport_with_provider(
+        &self,
+        provider: &dyn CryptoProvider,
+        parameters: &RsaOaepParameters,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError>;
+}
+
+/// Opaque private-key handle used to recover transported key bytes.
+///
+/// Private key material never crosses this boundary. The ciphertext size is
+/// public metadata required to reject malformed RSA inputs before dispatch.
+#[cfg(feature = "xmlenc")]
+pub trait KeyRecoveryKey: Send + Sync {
+    /// Exact RSA ciphertext width in bytes for the key used by
+    /// [`Self::recover_with_provider`].
+    fn ciphertext_len(&self) -> usize;
+
+    /// Execute OAEP recovery using the selected provider's randomness.
+    fn recover_with_provider(
+        &self,
+        provider: &dyn CryptoProvider,
+        parameters: &RsaOaepParameters,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError>;
+}
+
+/// Opaque private-key handle used for provider-defined key agreement.
+pub trait KeyAgreementKey: Send + Sync {
+    /// Derive the raw shared secret for the supplied peer and parameters.
+    fn agree(&self, parameters: &KeyAgreementParameters<'_>) -> Result<Vec<u8>, ProviderError>;
+}
+
 /// Stateless provider operations used by the XML Security pipelines.
 pub trait CryptoProvider: Send + Sync {
     /// Stable provider name for diagnostics and capability reporting.
     fn name(&self) -> &'static str;
 
     /// Return whether this build supports the requested operation and parameters.
-    fn supports(&self, query: CapabilityQuery<'_>) -> bool;
+    fn supports(&self, capability: ProviderCapability<'_>) -> bool;
 
     /// Fill caller-owned output with cryptographically secure random bytes.
     fn fill_random(&self, output: &mut [u8]) -> Result<(), ProviderError>;
@@ -287,7 +450,7 @@ pub trait CryptoProvider: Send + Sync {
     #[cfg(feature = "xmlenc")]
     fn transport_key(
         &self,
-        key: &rsa::RsaPublicKey,
+        key: &dyn KeyTransportKey,
         parameters: &RsaOaepParameters,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ProviderError>;
@@ -296,15 +459,187 @@ pub trait CryptoProvider: Send + Sync {
     #[cfg(feature = "xmlenc")]
     fn recover_key(
         &self,
-        key: &rsa::RsaPrivateKey,
+        key: &dyn KeyRecoveryKey,
         parameters: &RsaOaepParameters,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError>;
+
+    /// Perform key agreement with an opaque provider-owned private key.
+    fn agree_key(
+        &self,
+        key: &dyn KeyAgreementKey,
+        parameters: &KeyAgreementParameters<'_>,
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.require_capability(ProviderCapability::KeyAgreement(parameters))?;
+        key.agree(parameters)
+    }
+
+    /// Derive key bytes from caller-owned secret material.
+    fn derive_key(
+        &self,
+        parameters: &KdfParameters<'_>,
+        secret: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        let _ = secret;
+        self.require_capability(ProviderCapability::Kdf(parameters))?;
+        Err(ProviderError::Unsupported {
+            operation: ProviderOperation::Kdf,
+            algorithm: Some(parameters.algorithm.to_owned()),
+        })
+    }
+
+    /// Reject an unavailable exact capability without falling back.
+    fn require_capability(&self, capability: ProviderCapability<'_>) -> Result<(), ProviderError> {
+        if self.supports(capability) {
+            Ok(())
+        } else {
+            Err(ProviderError::Unsupported {
+                operation: capability.operation(),
+                algorithm: capability.algorithm().map(str::to_owned),
+            })
+        }
+    }
 }
 
 /// Pure-Rust provider backed by RustCrypto crates.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RustCryptoProvider;
+
+/// Opaque RSA public-key handle for the built-in RustCrypto provider.
+#[cfg(feature = "xmlenc")]
+#[derive(Clone)]
+pub struct RustCryptoRsaPublicKey {
+    key: rsa::RsaPublicKey,
+    modulus: Vec<u8>,
+    exponent: Vec<u8>,
+}
+
+#[cfg(feature = "xmlenc")]
+impl RustCryptoRsaPublicKey {
+    /// Wrap an already parsed RustCrypto RSA public key.
+    #[must_use]
+    pub fn new(key: rsa::RsaPublicKey) -> Self {
+        use rsa::traits::PublicKeyParts as _;
+        let modulus = key.n().to_be_bytes_trimmed_vartime().into_vec();
+        let exponent = key.e().to_be_bytes_trimmed_vartime().into_vec();
+        Self {
+            key,
+            modulus,
+            exponent,
+        }
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+impl From<rsa::RsaPublicKey> for RustCryptoRsaPublicKey {
+    fn from(key: rsa::RsaPublicKey) -> Self {
+        Self::new(key)
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+impl KeyTransportKey for RustCryptoRsaPublicKey {
+    fn rsa_modulus(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(&self.modulus)
+    }
+
+    fn rsa_exponent(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(&self.exponent)
+    }
+
+    fn transport_with_provider(
+        &self,
+        provider: &dyn CryptoProvider,
+        parameters: &RsaOaepParameters,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        rustcrypto::transport_key(provider, &self.key, parameters, plaintext)
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+impl KeyTransportKey for rsa::RsaPublicKey {
+    fn rsa_modulus(&self) -> Cow<'_, [u8]> {
+        use rsa::traits::PublicKeyParts as _;
+        Cow::Owned(self.n().to_be_bytes_trimmed_vartime().into_vec())
+    }
+
+    fn rsa_exponent(&self) -> Cow<'_, [u8]> {
+        use rsa::traits::PublicKeyParts as _;
+        Cow::Owned(self.e().to_be_bytes_trimmed_vartime().into_vec())
+    }
+
+    fn transport_with_provider(
+        &self,
+        provider: &dyn CryptoProvider,
+        parameters: &RsaOaepParameters,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        rustcrypto::transport_key(provider, self, parameters, plaintext)
+    }
+}
+
+/// Opaque RSA private-key handle for the built-in RustCrypto provider.
+#[cfg(feature = "xmlenc")]
+#[derive(Clone)]
+pub struct RustCryptoRsaPrivateKey {
+    key: rsa::RsaPrivateKey,
+    ciphertext_len: usize,
+}
+
+#[cfg(feature = "xmlenc")]
+impl RustCryptoRsaPrivateKey {
+    /// Wrap an already parsed RustCrypto RSA private key.
+    #[must_use]
+    pub fn new(key: rsa::RsaPrivateKey) -> Self {
+        use rsa::traits::PublicKeyParts as _;
+        let ciphertext_len = key.size();
+        Self {
+            key,
+            ciphertext_len,
+        }
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+impl From<rsa::RsaPrivateKey> for RustCryptoRsaPrivateKey {
+    fn from(key: rsa::RsaPrivateKey) -> Self {
+        Self::new(key)
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+impl KeyRecoveryKey for RustCryptoRsaPrivateKey {
+    fn ciphertext_len(&self) -> usize {
+        self.ciphertext_len
+    }
+
+    fn recover_with_provider(
+        &self,
+        provider: &dyn CryptoProvider,
+        parameters: &RsaOaepParameters,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        rustcrypto::recover_key(provider, &self.key, parameters, ciphertext)
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+impl KeyRecoveryKey for rsa::RsaPrivateKey {
+    fn ciphertext_len(&self) -> usize {
+        use rsa::traits::PublicKeyParts as _;
+        self.size()
+    }
+
+    fn recover_with_provider(
+        &self,
+        provider: &dyn CryptoProvider,
+        parameters: &RsaOaepParameters,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        rustcrypto::recover_key(provider, self, parameters, ciphertext)
+    }
+}
 
 /// Process-wide immutable default provider. It contains no mutable state or keys.
 pub static RUST_CRYPTO_PROVIDER: RustCryptoProvider = RustCryptoProvider;
@@ -348,94 +683,29 @@ impl CryptoProvider for RustCryptoProvider {
         "rustcrypto"
     }
 
-    fn supports(&self, query: CapabilityQuery<'_>) -> bool {
-        match query.operation {
-            ProviderOperation::Digest => {
-                #[cfg(feature = "xmldsig")]
-                {
-                    query.algorithm.is_none_or(|algorithm| {
-                        matches!(
-                            algorithm,
-                            "http://www.w3.org/2000/09/xmldsig#sha1"
-                                | "http://www.w3.org/2001/04/xmlenc#sha256"
-                                | "http://www.w3.org/2001/04/xmldsig-more#sha384"
-                                | "http://www.w3.org/2001/04/xmlenc#sha512"
-                        )
-                    })
-                }
-                #[cfg(not(feature = "xmldsig"))]
-                {
-                    false
-                }
+    fn supports(&self, capability: ProviderCapability<'_>) -> bool {
+        match capability {
+            #[cfg(feature = "xmldsig")]
+            ProviderCapability::Digest(_) => true,
+            #[cfg(feature = "xmldsig")]
+            ProviderCapability::Sign(algorithm) => is_supported_signing_uri(algorithm.uri()),
+            #[cfg(feature = "xmldsig")]
+            ProviderCapability::Verify(algorithm) => is_supported_signature_uri(algorithm.uri()),
+            #[cfg(feature = "xmldsig")]
+            ProviderCapability::VerifyCertificate(algorithm) => {
+                is_supported_x509_signature(algorithm)
             }
-            ProviderOperation::Sign => {
-                #[cfg(feature = "xmldsig")]
-                {
-                    query.algorithm.is_none_or(is_supported_signing_uri)
-                }
-                #[cfg(not(feature = "xmldsig"))]
-                {
-                    false
-                }
+            #[cfg(feature = "xmlenc")]
+            ProviderCapability::Encrypt(_) | ProviderCapability::Decrypt(_) => true,
+            #[cfg(feature = "xmlenc")]
+            ProviderCapability::KeyWrap(_) | ProviderCapability::KeyUnwrap(_) => true,
+            #[cfg(feature = "xmlenc")]
+            ProviderCapability::KeyTransport(parameters) => {
+                parameters.algorithm != crate::xmlenc::KeyTransportAlgorithm::RsaOaepMgf1p
+                    || parameters.mgf_digest == crate::xmlenc::OaepDigestAlgorithm::Sha1
             }
-            ProviderOperation::Verify => {
-                #[cfg(feature = "xmldsig")]
-                {
-                    query.algorithm.is_none_or(is_supported_signature_uri)
-                }
-                #[cfg(not(feature = "xmldsig"))]
-                {
-                    false
-                }
-            }
-            ProviderOperation::VerifyCertificate => {
-                #[cfg(feature = "xmldsig")]
-                {
-                    query.algorithm.is_none_or(is_supported_x509_signature_oid)
-                }
-                #[cfg(not(feature = "xmldsig"))]
-                {
-                    false
-                }
-            }
-            ProviderOperation::Encrypt | ProviderOperation::Decrypt => {
-                #[cfg(feature = "xmlenc")]
-                {
-                    query.algorithm.is_none_or(is_supported_data_encryption_uri)
-                }
-                #[cfg(not(feature = "xmlenc"))]
-                {
-                    false
-                }
-            }
-            ProviderOperation::KeyWrap | ProviderOperation::KeyUnwrap => {
-                #[cfg(feature = "xmlenc")]
-                {
-                    query.algorithm.is_none_or(is_supported_key_wrap_uri)
-                }
-                #[cfg(not(feature = "xmlenc"))]
-                {
-                    false
-                }
-            }
-            ProviderOperation::KeyTransport => {
-                #[cfg(feature = "xmlenc")]
-                {
-                    query.algorithm.is_none_or(|algorithm| {
-                        matches!(
-                            algorithm,
-                            "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"
-                                | "http://www.w3.org/2009/xmlenc11#rsa-oaep"
-                        )
-                    })
-                }
-                #[cfg(not(feature = "xmlenc"))]
-                {
-                    false
-                }
-            }
-            ProviderOperation::Random => true,
-            ProviderOperation::KeyAgreement | ProviderOperation::Kdf => false,
+            ProviderCapability::Random => true,
+            ProviderCapability::KeyAgreement(_) | ProviderCapability::Kdf(_) => false,
         }
     }
 
@@ -464,7 +734,7 @@ impl CryptoProvider for RustCryptoProvider {
         algorithm: crate::xmldsig::SignatureAlgorithm,
         data: &[u8],
     ) -> Result<Vec<u8>, crate::xmldsig::SigningKeyError> {
-        self.require(ProviderOperation::Sign, Some(algorithm.uri()))?;
+        self.require_capability(ProviderCapability::Sign(algorithm))?;
         key.sign_with_provider(self, algorithm, data)
     }
 
@@ -476,7 +746,7 @@ impl CryptoProvider for RustCryptoProvider {
         data: &[u8],
         signature: &[u8],
     ) -> Result<bool, crate::xmldsig::DsigError> {
-        self.require(ProviderOperation::Verify, Some(algorithm.uri()))?;
+        self.require_capability(ProviderCapability::Verify(algorithm))?;
         key.verify(algorithm, data, signature)
     }
 
@@ -488,7 +758,6 @@ impl CryptoProvider for RustCryptoProvider {
         signature: &[u8],
         issuer_spki_der: &[u8],
     ) -> Result<bool, ProviderError> {
-        self.require(ProviderOperation::VerifyCertificate, Some(algorithm.oid()))?;
         rustcrypto_x509::verify_signature(algorithm, signed_data, signature, issuer_spki_der)
     }
 
@@ -535,49 +804,38 @@ impl CryptoProvider for RustCryptoProvider {
     #[cfg(feature = "xmlenc")]
     fn transport_key(
         &self,
-        key: &rsa::RsaPublicKey,
+        key: &dyn KeyTransportKey,
         parameters: &RsaOaepParameters,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
-        self.require(
-            ProviderOperation::KeyTransport,
-            Some(parameters.algorithm.uri()),
-        )?;
-        rustcrypto::transport_key(self, key, parameters, plaintext)
+        validate_oaep_parameters(parameters)?;
+        self.require_capability(ProviderCapability::KeyTransport(parameters))?;
+        key.transport_with_provider(self, parameters, plaintext)
     }
 
     #[cfg(feature = "xmlenc")]
     fn recover_key(
         &self,
-        key: &rsa::RsaPrivateKey,
+        key: &dyn KeyRecoveryKey,
         parameters: &RsaOaepParameters,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
-        self.require(
-            ProviderOperation::KeyTransport,
-            Some(parameters.algorithm.uri()),
-        )?;
-        rustcrypto::recover_key(self, key, parameters, ciphertext)
+        validate_oaep_parameters(parameters)?;
+        self.require_capability(ProviderCapability::KeyTransport(parameters))?;
+        key.recover_with_provider(self, parameters, ciphertext)
     }
 }
 
-impl RustCryptoProvider {
-    fn require(
-        &self,
-        operation: ProviderOperation,
-        algorithm: Option<&str>,
-    ) -> Result<(), ProviderError> {
-        if self.supports(CapabilityQuery {
-            operation,
-            algorithm,
-        }) {
-            Ok(())
-        } else {
-            Err(ProviderError::Unsupported {
-                operation,
-                algorithm: algorithm.map(str::to_owned),
-            })
-        }
+#[cfg(feature = "xmlenc")]
+fn validate_oaep_parameters(parameters: &RsaOaepParameters) -> Result<(), ProviderError> {
+    if parameters.algorithm == crate::xmlenc::KeyTransportAlgorithm::RsaOaepMgf1p
+        && parameters.mgf_digest != crate::xmlenc::OaepDigestAlgorithm::Sha1
+    {
+        Err(ProviderError::InvalidInput(
+            ProviderInputError::LegacyRsaOaepMgf,
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -609,20 +867,23 @@ fn is_supported_signing_uri(algorithm: &str) -> bool {
 }
 
 #[cfg(feature = "xmldsig")]
-fn is_supported_x509_signature_oid(algorithm: &str) -> bool {
-    matches!(
-        algorithm,
-        "1.2.840.10040.4.3"
-            | "1.2.840.113549.1.1.5"
-            | "1.3.14.3.2.29"
-            | "1.2.840.113549.1.1.10"
-            | "1.2.840.113549.1.1.11"
-            | "1.2.840.113549.1.1.12"
-            | "1.2.840.113549.1.1.13"
-            | "1.2.840.10045.4.3.2"
-            | "1.2.840.10045.4.3.3"
-            | "1.3.101.112"
-    )
+fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
+    match algorithm {
+        X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1)
+        | X509SignatureAlgorithm::RsaPkcs1v15(_)
+        | X509SignatureAlgorithm::Ecdsa(DigestAlgorithm::Sha256 | DigestAlgorithm::Sha384)
+        | X509SignatureAlgorithm::Ed25519 => true,
+        X509SignatureAlgorithm::RsaPss {
+            digest, mgf_digest, ..
+        } => {
+            matches!(
+                digest,
+                DigestAlgorithm::Sha256 | DigestAlgorithm::Sha384 | DigestAlgorithm::Sha512
+            ) && digest == mgf_digest
+        }
+        X509SignatureAlgorithm::Dsa(_)
+        | X509SignatureAlgorithm::Ecdsa(DigestAlgorithm::Sha1 | DigestAlgorithm::Sha512) => false,
+    }
 }
 
 #[cfg(feature = "xmldsig")]
@@ -846,25 +1107,6 @@ mod rustcrypto_x509 {
             algorithm: Some(algorithm.oid().to_owned()),
         })
     }
-}
-
-#[cfg(feature = "xmlenc")]
-fn is_supported_data_encryption_uri(algorithm: &str) -> bool {
-    matches!(
-        algorithm,
-        "http://www.w3.org/2001/04/xmlenc#aes128-cbc"
-            | "http://www.w3.org/2001/04/xmlenc#aes256-cbc"
-            | "http://www.w3.org/2009/xmlenc11#aes128-gcm"
-            | "http://www.w3.org/2009/xmlenc11#aes256-gcm"
-    )
-}
-
-#[cfg(feature = "xmlenc")]
-fn is_supported_key_wrap_uri(algorithm: &str) -> bool {
-    matches!(
-        algorithm,
-        "http://www.w3.org/2001/04/xmlenc#kw-aes128" | "http://www.w3.org/2001/04/xmlenc#kw-aes256"
-    )
 }
 
 #[cfg(feature = "xmlenc")]
@@ -1262,7 +1504,8 @@ mod rustcrypto {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "xmldsig")]
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
 
@@ -1280,8 +1523,8 @@ mod tests {
             "counting-random"
         }
 
-        fn supports(&self, query: CapabilityQuery<'_>) -> bool {
-            RUST_CRYPTO_PROVIDER.supports(query)
+        fn supports(&self, capability: ProviderCapability<'_>) -> bool {
+            RUST_CRYPTO_PROVIDER.supports(capability)
         }
 
         fn fill_random(&self, output: &mut [u8]) -> Result<(), ProviderError> {
@@ -1372,7 +1615,7 @@ mod tests {
         #[cfg(feature = "xmlenc")]
         fn transport_key(
             &self,
-            key: &rsa::RsaPublicKey,
+            key: &dyn KeyTransportKey,
             parameters: &RsaOaepParameters,
             plaintext: &[u8],
         ) -> Result<Vec<u8>, ProviderError> {
@@ -1382,7 +1625,7 @@ mod tests {
         #[cfg(feature = "xmlenc")]
         fn recover_key(
             &self,
-            key: &rsa::RsaPrivateKey,
+            key: &dyn KeyRecoveryKey,
             parameters: &RsaOaepParameters,
             ciphertext: &[u8],
         ) -> Result<Vec<u8>, ProviderError> {
@@ -1390,63 +1633,104 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "xmldsig")]
     #[test]
     fn capability_query_is_explicit_about_unimplemented_operations() {
-        assert!(RUST_CRYPTO_PROVIDER.supports(CapabilityQuery {
-            operation: ProviderOperation::Digest,
-            algorithm: None
-        }));
-        assert!(!RUST_CRYPTO_PROVIDER.supports(CapabilityQuery {
-            operation: ProviderOperation::KeyAgreement,
-            algorithm: None
-        }));
-        assert!(!RUST_CRYPTO_PROVIDER.supports(CapabilityQuery {
-            operation: ProviderOperation::Sign,
-            algorithm: Some("http://www.w3.org/2000/09/xmldsig#rsa-sha1")
-        }));
-        assert!(RUST_CRYPTO_PROVIDER.supports(CapabilityQuery {
-            operation: ProviderOperation::Verify,
-            algorithm: Some("http://www.w3.org/2000/09/xmldsig#rsa-sha1")
-        }));
-        assert!(!RUST_CRYPTO_PROVIDER.supports(CapabilityQuery {
-            operation: ProviderOperation::Verify,
-            algorithm: Some("urn:unsupported:signature"),
-        }));
+        assert!(RUST_CRYPTO_PROVIDER.supports(ProviderCapability::Digest(DigestAlgorithm::Sha256)));
+        let agreement = KeyAgreementParameters {
+            algorithm: "urn:unsupported:agreement",
+            peer_public_key: &[],
+        };
+        assert!(!RUST_CRYPTO_PROVIDER.supports(ProviderCapability::KeyAgreement(&agreement)));
+        assert!(!RUST_CRYPTO_PROVIDER.supports(ProviderCapability::Sign(
+            crate::xmldsig::SignatureAlgorithm::RsaSha1
+        )));
+        assert!(RUST_CRYPTO_PROVIDER.supports(ProviderCapability::Verify(
+            crate::xmldsig::SignatureAlgorithm::RsaSha1
+        )));
     }
 
-    #[cfg(not(feature = "xmlenc"))]
+    #[cfg(all(feature = "xmldsig", feature = "xmlenc"))]
     #[test]
-    fn capability_query_hides_xmlenc_operations_when_feature_is_disabled() {
-        // Capability discovery is a runtime API over the current build, so it
-        // must not advertise methods removed from CryptoProvider by cfg.
-        for operation in [
-            ProviderOperation::Encrypt,
-            ProviderOperation::Decrypt,
-            ProviderOperation::KeyWrap,
-            ProviderOperation::KeyUnwrap,
-            ProviderOperation::KeyTransport,
-        ] {
-            assert!(!RUST_CRYPTO_PROVIDER.supports(CapabilityQuery {
-                operation,
-                algorithm: None,
-            }));
+    fn capability_queries_include_oaep_and_pss_parameters() {
+        use crate::xmlenc::{KeyTransportAlgorithm, OaepDigestAlgorithm};
+
+        let invalid_legacy = RsaOaepParameters {
+            algorithm: KeyTransportAlgorithm::RsaOaepMgf1p,
+            digest: OaepDigestAlgorithm::Sha256,
+            mgf_digest: OaepDigestAlgorithm::Sha256,
+            label: Vec::new(),
+        };
+        assert!(!RUST_CRYPTO_PROVIDER.supports(ProviderCapability::KeyTransport(&invalid_legacy)));
+        let modern =
+            RsaOaepParameters::xmlenc11(OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha512)
+                .label(b"label".to_vec());
+        assert!(RUST_CRYPTO_PROVIDER.supports(ProviderCapability::KeyTransport(&modern)));
+
+        let supported_pss = X509SignatureAlgorithm::RsaPss {
+            digest: DigestAlgorithm::Sha256,
+            mgf_digest: DigestAlgorithm::Sha256,
+            salt_len: 32,
+        };
+        assert!(
+            RUST_CRYPTO_PROVIDER.supports(ProviderCapability::VerifyCertificate(supported_pss))
+        );
+        let unsupported_pss = X509SignatureAlgorithm::RsaPss {
+            digest: DigestAlgorithm::Sha256,
+            mgf_digest: DigestAlgorithm::Sha384,
+            salt_len: 32,
+        };
+        assert!(
+            !RUST_CRYPTO_PROVIDER.supports(ProviderCapability::VerifyCertificate(unsupported_pss))
+        );
+    }
+
+    struct RecordingAgreementKey(AtomicBool);
+
+    impl KeyAgreementKey for RecordingAgreementKey {
+        fn agree(
+            &self,
+            _parameters: &KeyAgreementParameters<'_>,
+        ) -> Result<Vec<u8>, ProviderError> {
+            self.0.store(true, Ordering::Relaxed);
+            Ok(vec![0x42])
         }
     }
 
-    #[cfg(not(feature = "xmldsig"))]
     #[test]
-    fn capability_query_hides_xmldsig_operations_when_feature_is_disabled() {
-        // Digest/sign/verify methods do not exist in an xmlenc-only provider.
-        for operation in [
-            ProviderOperation::Digest,
-            ProviderOperation::Sign,
-            ProviderOperation::Verify,
-        ] {
-            assert!(!RUST_CRYPTO_PROVIDER.supports(CapabilityQuery {
-                operation,
-                algorithm: None,
-            }));
-        }
+    fn unsupported_agreement_and_kdf_fail_without_dispatch_or_fallback() {
+        let agreement = KeyAgreementParameters {
+            algorithm: "urn:example:agreement",
+            peer_public_key: b"peer",
+        };
+        let key = RecordingAgreementKey(AtomicBool::new(false));
+        let error = RUST_CRYPTO_PROVIDER
+            .agree_key(&key, &agreement)
+            .expect_err("unsupported agreement must fail closed");
+        assert!(matches!(
+            error,
+            ProviderError::Unsupported {
+                operation: ProviderOperation::KeyAgreement,
+                algorithm: Some(ref algorithm),
+            } if algorithm == agreement.algorithm
+        ));
+        assert!(!key.0.load(Ordering::Relaxed));
+
+        let kdf = KdfParameters {
+            algorithm: "urn:example:kdf",
+            digest: Some("urn:example:digest"),
+            salt: b"salt",
+            info: b"info",
+            iterations: 1,
+            output_len: 32,
+        };
+        assert!(matches!(
+            RUST_CRYPTO_PROVIDER.derive_key(&kdf, b"secret"),
+            Err(ProviderError::Unsupported {
+                operation: ProviderOperation::Kdf,
+                algorithm: Some(ref algorithm),
+            }) if algorithm == kdf.algorithm
+        ));
     }
 
     #[cfg(feature = "xmldsig")]

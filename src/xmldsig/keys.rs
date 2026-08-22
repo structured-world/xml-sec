@@ -1056,8 +1056,8 @@ mod tests {
             "reject-second-sha512"
         }
 
-        fn supports(&self, query: crate::provider::CapabilityQuery<'_>) -> bool {
-            crate::provider::default_provider().supports(query)
+        fn supports(&self, capability: crate::provider::ProviderCapability<'_>) -> bool {
+            crate::provider::default_provider().supports(capability)
         }
 
         fn fill_random(&self, output: &mut [u8]) -> Result<(), crate::provider::ProviderError> {
@@ -1182,7 +1182,7 @@ mod tests {
         #[cfg(feature = "xmlenc")]
         fn transport_key(
             &self,
-            key: &rsa::RsaPublicKey,
+            key: &dyn crate::provider::KeyTransportKey,
             parameters: &crate::xmlenc::RsaOaepParameters,
             plaintext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
@@ -1192,7 +1192,7 @@ mod tests {
         #[cfg(feature = "xmlenc")]
         fn recover_key(
             &self,
-            key: &rsa::RsaPrivateKey,
+            key: &dyn crate::provider::KeyRecoveryKey,
             parameters: &crate::xmlenc::RsaOaepParameters,
             ciphertext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {

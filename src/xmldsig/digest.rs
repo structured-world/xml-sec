@@ -89,6 +89,7 @@ pub fn compute_digest_with_provider(
     algorithm: DigestAlgorithm,
     data: &[u8],
 ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+    provider.require_capability(crate::provider::ProviderCapability::Digest(algorithm))?;
     let digest = provider.digest(algorithm, data)?;
     let expected = algorithm.output_len();
     if digest.len() != expected {
@@ -126,8 +127,13 @@ mod tests {
             "rejecting-digest"
         }
 
-        fn supports(&self, query: crate::provider::CapabilityQuery<'_>) -> bool {
-            crate::provider::default_provider().supports(query)
+        fn supports(&self, capability: crate::provider::ProviderCapability<'_>) -> bool {
+            if self.output.is_none()
+                && matches!(capability, crate::provider::ProviderCapability::Digest(_))
+            {
+                return false;
+            }
+            crate::provider::default_provider().supports(capability)
         }
 
         fn fill_random(&self, output: &mut [u8]) -> Result<(), crate::provider::ProviderError> {
@@ -136,16 +142,13 @@ mod tests {
 
         fn digest(
             &self,
-            algorithm: DigestAlgorithm,
+            _algorithm: DigestAlgorithm,
             _data: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
             if let Some(output) = &self.output {
                 return Ok(output.clone());
             }
-            Err(crate::provider::ProviderError::Unsupported {
-                operation: crate::provider::ProviderOperation::Digest,
-                algorithm: Some(algorithm.uri().to_owned()),
-            })
+            panic!("an unavailable digest capability must not be dispatched")
         }
 
         fn sign(
@@ -210,7 +213,7 @@ mod tests {
         #[cfg(feature = "xmlenc")]
         fn transport_key(
             &self,
-            key: &rsa::RsaPublicKey,
+            key: &dyn crate::provider::KeyTransportKey,
             parameters: &crate::xmlenc::RsaOaepParameters,
             plaintext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {
@@ -220,7 +223,7 @@ mod tests {
         #[cfg(feature = "xmlenc")]
         fn recover_key(
             &self,
-            key: &rsa::RsaPrivateKey,
+            key: &dyn crate::provider::KeyRecoveryKey,
             parameters: &crate::xmlenc::RsaOaepParameters,
             ciphertext: &[u8],
         ) -> Result<Vec<u8>, crate::provider::ProviderError> {

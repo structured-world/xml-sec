@@ -802,6 +802,11 @@ fn verify_x509_signature_with_provider(
 ) -> Result<bool, X509ChainError> {
     let algorithm = x509_signature_algorithm(algorithm_identifier)?;
     provider
+        .require_capability(crate::provider::ProviderCapability::VerifyCertificate(
+            algorithm,
+        ))
+        .map_err(X509ChainError::from)?;
+    provider
         .verify_x509_signature(algorithm, signed_data, signature_der, issuer_spki_der)
         .map_err(Into::into)
 }

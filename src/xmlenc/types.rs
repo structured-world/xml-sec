@@ -1,6 +1,6 @@
 //! Public XMLEnc data structures and errors.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use rsa::RsaPublicKey;
 
@@ -327,8 +327,8 @@ impl Default for RsaOaepParameters {
 pub enum EncryptionRecipient {
     /// Wrap the content key with an RSA public key and OAEP.
     RsaOaep {
-        /// Recipient public key.
-        public_key: RsaPublicKey,
+        /// Opaque recipient public-key handle.
+        public_key: Arc<dyn crate::provider::KeyTransportKey>,
         /// OAEP algorithm parameters.
         parameters: RsaOaepParameters,
         /// Optional `Recipient` attribute.
@@ -387,6 +387,13 @@ impl EncryptionRecipient {
     /// omitted. Serialized keys therefore include both algorithm values
     /// explicitly instead of relying on the specification's legacy defaults.
     pub fn rsa_oaep(public_key: RsaPublicKey) -> Self {
+        Self::provider_key_transport(Arc::new(crate::provider::RustCryptoRsaPublicKey::new(
+            public_key,
+        )))
+    }
+
+    /// Create an RSA-OAEP recipient from an opaque provider key handle.
+    pub fn provider_key_transport(public_key: Arc<dyn crate::provider::KeyTransportKey>) -> Self {
         Self::RsaOaep {
             public_key,
             parameters: RsaOaepParameters::default(),

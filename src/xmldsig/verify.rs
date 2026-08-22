@@ -1299,6 +1299,10 @@ fn verify_signature_with_context(
             },
         });
     }
+    ctx.provider
+        .require_capability(crate::provider::ProviderCapability::Verify(
+            signed_info.signature_method,
+        ))?;
     let signature_valid = ctx.provider.verify(
         verifier,
         signed_info.signature_method,

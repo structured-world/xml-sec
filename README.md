@@ -21,6 +21,7 @@ XML Security in pure Rust, built to replace libxmlsec1.
 - **XMLEnc** — XML Encryption encrypt/decrypt pipelines (direct, RSA-OAEP, and AES-KW keys)
 - **X.509** — Certificate-based key extraction and validation
 - **Native CLI** — `xmlsec1` command surface backed by the same Rust policy and provider pipelines
+- **Provider-neutral crypto** — typed capabilities and opaque key handles with RustCrypto as the pure-Rust default
 
 ## Why?
 
@@ -55,6 +56,10 @@ Currently implemented (core paths):
   limits plus outbound RSA key-strength policy cover caller-constructed ciphertext and generated replacement output
   before expensive work. CBC failures expose no decrypted
   padding details, but CBC remains unauthenticated and can be excluded by policy
+- Provider-neutral digest, signature, X.509 signature, cipher, key-wrap,
+  key-transport, key-agreement, KDF, and RNG contracts. Capability checks include
+  operation parameters; unavailable mechanisms fail closed without falling back
+  to another provider. RustCrypto implements the currently supported algorithms.
 
 Still in progress:
 - XMLDSig DSA-SHA256, broader HMAC verification/signing, and RSA-PSS `SignatureMethod` algorithms
