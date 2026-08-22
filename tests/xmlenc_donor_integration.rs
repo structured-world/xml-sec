@@ -17,9 +17,8 @@ use roxmltree::{Document, ParsingOptions};
 use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePrivateKey};
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize, canonicalize_xml};
 use xml_sec::xmlenc::{
-    DecryptedContent, DocumentDecryptionOptions, KekDecryptor, PrivateKeyDecryptor,
-    SymmetricKeyDecryptor, XmlEncError, decrypt, decrypt_data, decrypt_document,
-    decrypt_document_with_options, parse_encrypted_data,
+    DecryptContext, DecryptedContent, KekDecryptor, PrivateKeyDecryptor, SymmetricKeyDecryptor,
+    XmlEncError, decrypt, decrypt_data, decrypt_document, parse_encrypted_data,
 };
 
 const VECTOR_DIR: &str = "tests/fixtures/xmlenc/aleksey-xmlenc-01";
@@ -137,15 +136,12 @@ fn replaces_merlin_aes256_cbc_encrypted_content() {
     let expected = std::fs::read(format!("{MERLIN_DIR}/encrypt-content-aes256-cbc-prop.data"))
         .expect("tracked Merlin plaintext document must be readable");
     let key = keys.get("jed").expect("Merlin jed key must exist");
-    let decrypted = decrypt_document_with_options(
-        &encrypted,
-        DocumentDecryptionOptions {
-            encrypted_data_id: Some("encrypt-data-0"),
-            allow_dtd: true,
-        },
-        &SymmetricKeyDecryptor::new(key.clone()),
-    )
-    .expect("Merlin encrypted Content must be replaced");
+    let mut policy = xml_sec::policy::DecryptionPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let decrypted = DecryptContext::new(&SymmetricKeyDecryptor::new(key.clone()))
+        .policy(policy)
+        .decrypt_document(&encrypted, Some("encrypt-data-0"))
+        .expect("Merlin encrypted Content must be replaced");
     let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
     let actual_c14n = canonicalize_dtd_document(&decrypted, &algorithm);
     let expected = std::str::from_utf8(&expected).expect("Merlin plaintext must be UTF-8");

@@ -8,6 +8,30 @@ use super::types::{
     MAX_CIPHER_VALUE_BASE64_LEN, ReferenceList, XMLDSIG_NS, XMLENC_NS, XMLENC11_NS, XmlEncError,
 };
 
+#[derive(Clone, Copy)]
+pub(super) struct ParsingPolicy<'a> {
+    xml: &'a crate::policy::XmlInputPolicy,
+    resources: &'a crate::policy::ResourcePolicy,
+}
+
+impl<'a> From<&'a crate::policy::EncryptionPolicy> for ParsingPolicy<'a> {
+    fn from(policy: &'a crate::policy::EncryptionPolicy) -> Self {
+        Self {
+            xml: &policy.xml,
+            resources: &policy.resources,
+        }
+    }
+}
+
+impl<'a> From<&'a crate::policy::DecryptionPolicy> for ParsingPolicy<'a> {
+    fn from(policy: &'a crate::policy::DecryptionPolicy) -> Self {
+        Self {
+            xml: &policy.xml,
+            resources: &policy.resources,
+        }
+    }
+}
+
 struct ParsedKeyInfo {
     key_name: Option<String>,
     encrypted_keys: Vec<EncryptedKey>,
@@ -38,7 +62,7 @@ pub(super) fn parse_encrypted_data_with_policy(
             entity_resolver: None,
         },
     )?;
-    parse_encrypted_data_node(document.root_element(), policy, false)
+    parse_encrypted_data_node(document.root_element(), policy.into(), false)
 }
 
 /// Parse a selected `xenc:EncryptedData` node under an immutable policy snapshot.
@@ -53,6 +77,7 @@ pub fn parse_encrypted_data_node_with_policy(
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
+    let policy = ParsingPolicy::from(policy);
     validate_node_document_policy(node, policy)?;
     parse_encrypted_data_node(node, policy, false)
 }
@@ -68,13 +93,14 @@ pub fn parse_encrypted_data_template_node_with_policy(
     policy: &crate::policy::EncryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
+    let policy = ParsingPolicy::from(policy);
     validate_node_document_policy(node, policy)?;
     parse_encrypted_data_node(node, policy, true)
 }
 
 fn validate_node_document_policy(
     node: Node<'_, '_>,
-    policy: &crate::policy::EncryptionPolicy,
+    policy: ParsingPolicy<'_>,
 ) -> Result<(), XmlEncError> {
     let resources = &policy.resources;
     resources
@@ -102,7 +128,7 @@ fn validate_node_document_policy(
 
 fn parse_encrypted_data_node(
     node: Node<'_, '_>,
-    policy: &crate::policy::DecryptionPolicy,
+    policy: ParsingPolicy<'_>,
     allow_empty_cipher_values: bool,
 ) -> Result<EncryptedData, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedData")?;
@@ -166,7 +192,7 @@ fn parse_encrypted_data_node(
 
 fn parse_key_info(
     node: Node<'_, '_>,
-    policy: &crate::policy::DecryptionPolicy,
+    policy: ParsingPolicy<'_>,
     allow_empty_cipher_values: bool,
 ) -> Result<ParsedKeyInfo, XmlEncError> {
     require_element(node, XMLDSIG_NS, "KeyInfo")?;
@@ -226,7 +252,7 @@ fn parse_key_info(
 
 fn parse_encrypted_key(
     node: Node<'_, '_>,
-    policy: &crate::policy::DecryptionPolicy,
+    policy: ParsingPolicy<'_>,
     allow_empty_cipher_values: bool,
 ) -> Result<EncryptedKey, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedKey")?;
@@ -305,7 +331,7 @@ fn parse_encrypted_key(
 
 fn parse_carried_key_name(
     node: Node<'_, '_>,
-    policy: &crate::policy::DecryptionPolicy,
+    policy: ParsingPolicy<'_>,
 ) -> Result<String, XmlEncError> {
     require_element(node, XMLENC_NS, "CarriedKeyName")?;
     let value = bounded_simple_text(node, "CarriedKeyName", policy)?;
@@ -319,7 +345,7 @@ fn parse_carried_key_name(
 
 fn parse_key_name_hint(
     node: Node<'_, '_>,
-    policy: &crate::policy::DecryptionPolicy,
+    policy: ParsingPolicy<'_>,
 ) -> Result<Option<String>, XmlEncError> {
     require_element(node, XMLDSIG_NS, "KeyInfo")?;
     let mut key_names = node
@@ -336,10 +362,7 @@ fn parse_key_name_hint(
     parse_key_name(key_name, policy).map(Some)
 }
 
-fn parse_key_name(
-    node: Node<'_, '_>,
-    policy: &crate::policy::DecryptionPolicy,
-) -> Result<String, XmlEncError> {
+fn parse_key_name(node: Node<'_, '_>, policy: ParsingPolicy<'_>) -> Result<String, XmlEncError> {
     let value = bounded_simple_text(node, "KeyName", policy)?;
     if value.is_empty() {
         return Err(XmlEncError::InvalidStructure("KeyName is empty".into()));
@@ -349,7 +372,7 @@ fn parse_key_name(
 
 fn parse_reference_list(
     node: Node<'_, '_>,
-    policy: &crate::policy::DecryptionPolicy,
+    policy: ParsingPolicy<'_>,
 ) -> Result<ReferenceList, XmlEncError> {
     require_element(node, XMLENC_NS, "ReferenceList")?;
     let mut data_references = Vec::new();
@@ -519,7 +542,7 @@ fn simple_text(node: Node<'_, '_>, element_name: &str) -> Result<String, XmlEncE
 fn bounded_simple_text(
     node: Node<'_, '_>,
     field: &'static str,
-    policy: &crate::policy::DecryptionPolicy,
+    policy: ParsingPolicy<'_>,
 ) -> Result<String, XmlEncError> {
     bounded_simple_text_with_limit(node, field, policy.resources.max_encryption_metadata_bytes)
 }
@@ -551,7 +574,7 @@ fn bounded_attribute(
     node: Node<'_, '_>,
     attribute: &str,
     field: &'static str,
-    policy: &crate::policy::DecryptionPolicy,
+    policy: ParsingPolicy<'_>,
 ) -> Result<Option<String>, XmlEncError> {
     let Some(value) = node.attribute(attribute) else {
         return Ok(None);
@@ -572,18 +595,20 @@ fn validate_metadata_len(
     if actual <= maximum {
         Ok(())
     } else {
-        Err(XmlEncError::EncryptionMetadataTooLarge {
-            field,
+        Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: field,
             maximum,
             actual,
-        })
+        }
+        .into())
     }
 }
 
-pub(super) fn validate_encrypted_data_metadata(
+pub(super) fn validate_encrypted_data_metadata<'a>(
     encrypted: &EncryptedData,
-    policy: &crate::policy::DecryptionPolicy,
+    policy: impl Into<ParsingPolicy<'a>>,
 ) -> Result<(), XmlEncError> {
+    let policy = policy.into();
     let maximum = policy.resources.max_encryption_metadata_bytes;
     let validate = |field, value: Option<&str>| {
         validate_metadata_len(field, value.map_or(0, str::len), maximum)
@@ -642,7 +667,7 @@ fn validate_encryption_method_metadata(
 fn validate_encrypted_type_attributes(
     node: Node<'_, '_>,
     element: EncryptedTypeElement,
-    policy: &crate::policy::DecryptionPolicy,
+    policy: ParsingPolicy<'_>,
 ) -> Result<(), XmlEncError> {
     // Both EncryptedData and EncryptedKey derive these attributes from the XML
     // Encryption EncryptedType schema. Template mutation preserves attributes
@@ -695,11 +720,12 @@ fn decode_bounded_base64_text(node: Node<'_, '_>, maximum: usize) -> Result<Vec<
         }
         if !character.is_ascii_whitespace() {
             if normalized.len() == encoded_limit {
-                return Err(XmlEncError::EncryptionMetadataTooLarge {
-                    field: "OAEPparams",
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "OAEPparams",
                     maximum,
                     actual: maximum.saturating_add(1),
-                });
+                }
+                .into());
             }
             normalized.push(character);
         }
@@ -910,11 +936,13 @@ mod tests {
             assert!(matches!(result, Err(XmlEncError::XmlParse(_))));
         }
 
-        let mut allowed = crate::policy::EncryptionPolicy::default();
-        allowed.xml.allow_internal_dtd = true;
-        parse_encrypted_data_node_with_policy(encrypted_data, &allowed)
+        let mut decryption_allowed = crate::policy::DecryptionPolicy::default();
+        decryption_allowed.xml.allow_internal_dtd = true;
+        parse_encrypted_data_node_with_policy(encrypted_data, &decryption_allowed)
             .expect("explicitly permitted internal DTD must remain accepted");
-        parse_encrypted_data_template_node_with_policy(encrypted_data, &allowed)
+        let mut encryption_allowed = crate::policy::EncryptionPolicy::default();
+        encryption_allowed.xml.allow_internal_dtd = true;
+        parse_encrypted_data_template_node_with_policy(encrypted_data, &encryption_allowed)
             .expect("template parsing must share the same explicit DTD policy");
     }
 
@@ -1105,11 +1133,13 @@ mod tests {
 
         assert!(matches!(
             parse_encryption_method_with_limit(document.root_element(), 64),
-            Err(XmlEncError::EncryptionMetadataTooLarge {
-                field: "OAEPparams",
-                maximum: 64,
-                actual: 65,
-            })
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "OAEPparams",
+                    maximum: 64,
+                    actual: 65,
+                }
+            ))
         ));
     }
 
@@ -1165,11 +1195,13 @@ mod tests {
 
         assert!(matches!(
             parse_encryption_method_with_limit(document.root_element(), 64),
-            Err(XmlEncError::EncryptionMetadataTooLarge {
-                field: "KeySize",
-                maximum: 64,
-                actual: 68,
-            })
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "KeySize",
+                    maximum: 64,
+                    actual: 68,
+                }
+            ))
         ));
     }
 
@@ -1322,11 +1354,11 @@ mod tests {
         ] {
             assert!(matches!(
                 parse_encrypted_data_with_policy(&xml, &policy),
-                Err(XmlEncError::EncryptionMetadataTooLarge {
+                Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                     maximum: 64,
                     actual: 65,
                     ..
-                })
+                }))
             ));
         }
     }
@@ -1360,11 +1392,11 @@ mod tests {
             );
             assert!(matches!(
                 parse_encrypted_data_with_policy(&xml, &decryption),
-                Err(XmlEncError::EncryptionMetadataTooLarge {
-                    field: actual_field,
+                Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: actual_field,
                     maximum: 64,
                     actual: 65,
-                }) if actual_field == field
+                })) if actual_field == field
             ));
 
             let document = Document::parse(&xml).expect("test template must be XML");
@@ -1373,11 +1405,11 @@ mod tests {
                     document.root_element(),
                     &encryption,
                 ),
-                Err(XmlEncError::EncryptionMetadataTooLarge {
-                    field: actual_field,
+                Err(XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: actual_field,
                     maximum: 64,
                     actual: 65,
-                }) if actual_field == field
+                })) if actual_field == field
             ));
         }
     }

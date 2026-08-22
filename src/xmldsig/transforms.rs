@@ -27,15 +27,18 @@ use roxmltree::{Document, Node, NodeId, NodeType};
 use sha2::{Digest as _, Sha256};
 
 use super::parse::XMLDSIG_NS;
-use super::types::{NodeSetMaterializationBudget, TransformData, TransformError};
+use super::types::{
+    NodeSetMaterializationBudget, TransformData, TransformError, transform_resource_limit,
+};
 use super::whitespace::is_xml_whitespace_only;
 use super::xpath::{
     XPathDocumentRelation, XPathWorkBudget, apply_xpath_filter_with_semantics_and_budget,
-    apply_xpath_filter2_with_semantics_and_budget, compile_xpath, is_xpath_whitespace,
+    apply_xpath_filter2_with_semantics_and_budget, is_xpath_whitespace,
     xpath_may_read_mutable_character_data,
 };
 use crate::c14n::xml_base::XmlBaseResolutionBudget;
 use crate::c14n::{self, C14nAlgorithm};
+#[cfg(test)]
 use crate::hard_limits::XML_DOCUMENT_NODE_CEILING;
 
 /// The algorithm URI for the enveloped signature transform.
@@ -54,24 +57,28 @@ pub const DEFAULT_IMPLICIT_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c
 /// Execution retains one stack frame when a binary-to-node-set adapter parses
 /// temporary XML, so this bounds recursion depth. The signature-wide C14N output
 /// budget below bounds both total work and buffers retained by those frames.
-pub const MAX_TRANSFORMS_PER_REFERENCE: usize = 64;
+pub const MAX_TRANSFORMS_PER_REFERENCE: usize = crate::hard_limits::REFERENCE_TRANSFORM_CEILING;
 /// xmlsec1 donor vectors use this XPath expression as a compatibility form of
 /// enveloped-signature exclusion.
 const ENVELOPED_SIGNATURE_XPATH_EXPR: &str = "not(ancestor-or-self::dsig:Signature)";
-pub(super) const MAX_XPATH_EXPRESSION_BYTES: usize = 16 * 1024;
-pub(super) const MAX_XPATH_FILTERS: usize = 64;
+pub(super) const MAX_XPATH_EXPRESSION_BYTES: usize =
+    crate::hard_limits::XPATH_EXPRESSION_BYTE_CEILING;
+pub(super) const MAX_XPATH_FILTERS: usize = crate::hard_limits::XPATH_FILTER_COUNT_CEILING;
 /// Maximum XPath programs retained and compiled while parsing one SignedInfo.
 ///
 /// Per-reference bounds remain necessary for transform shape, while this bound
 /// prevents their multiplication across all references in one signature.
-pub(super) const MAX_XPATH_EXPRESSIONS_PER_SIGNATURE: usize = 4_096;
-const MAX_XPATH_NAMESPACE_BINDINGS: usize = 1_024;
-const MAX_XPATH_NAMESPACE_BYTES: usize = 64 * 1024;
-const MAX_BASE64_TRANSFORM_INPUT_BYTES: usize = 16 * 1024 * 1024;
-const MAX_BASE64_TRANSFORM_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_C14N_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MAX_XPATH_EXPRESSIONS_PER_SIGNATURE: usize =
+    crate::hard_limits::XPATH_EXPRESSION_COUNT_CEILING;
+const MAX_XPATH_NAMESPACE_BINDINGS: usize = crate::hard_limits::XPATH_NAMESPACE_BINDING_CEILING;
+const MAX_XPATH_NAMESPACE_BYTES: usize = crate::hard_limits::XPATH_NAMESPACE_BYTE_CEILING;
+const MAX_BASE64_TRANSFORM_INPUT_BYTES: usize =
+    crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING;
+const MAX_BASE64_TRANSFORM_OUTPUT_BYTES: usize =
+    crate::hard_limits::BASE64_TRANSFORM_OUTPUT_BYTE_CEILING;
+const MAX_C14N_OUTPUT_BYTES: usize = crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING;
 /// Bound cumulative node-set visits performed by exclusion transforms.
-const MAX_NODE_SET_FILTER_WORK: usize = 6_000_000;
+const MAX_NODE_SET_FILTER_WORK: usize = crate::hard_limits::NODE_SET_FILTER_WORK_CEILING;
 
 /// Namespace URI for Exclusive C14N `<InclusiveNamespaces>` elements.
 const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
@@ -90,9 +97,9 @@ pub enum XPathHereSemantics {
     XmlSecLegacy,
 }
 
-/// Options controlling execution of an XMLDSig transform chain.
+/// Execution settings derived from one immutable operation policy snapshot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TransformOptions {
+pub(crate) struct TransformOptions {
     xpath_here_semantics: XPathHereSemantics,
     allow_internal_dtd: bool,
 }
@@ -109,36 +116,33 @@ pub(crate) struct TransformExecutionBudget {
 
 impl Default for TransformExecutionBudget {
     fn default() -> Self {
-        Self {
-            xpath: XPathWorkBudget::default(),
-            base64: Base64WorkBudget::default(),
-            c14n: C14nOutputBudget::default(),
-            node_filter: NodeFilterWorkBudget::default(),
-            node_set_materialization: NodeSetMaterializationBudget::default(),
-            xml_base_resolution: XmlBaseResolutionBudget::default(),
-            xml_node_limit: XML_DOCUMENT_NODE_CEILING,
-        }
+        Self::from_resources(&crate::policy::ResourcePolicy::default())
     }
 }
 
 struct NodeFilterWorkBudget {
     remaining: Cell<usize>,
+    maximum: usize,
 }
 
 impl Default for NodeFilterWorkBudget {
     fn default() -> Self {
         Self {
             remaining: Cell::new(MAX_NODE_SET_FILTER_WORK),
+            maximum: MAX_NODE_SET_FILTER_WORK,
         }
     }
 }
 
 impl NodeFilterWorkBudget {
     fn charge(&self, entries: usize) -> Result<(), TransformError> {
+        let consumed = self.maximum.saturating_sub(self.remaining.get());
         if !charge_byte_budget(&self.remaining, entries) {
-            return Err(TransformError::NodeSetFilterWorkTooLarge {
-                max_entries: MAX_NODE_SET_FILTER_WORK,
-            });
+            return Err(transform_resource_limit(
+                "node-set filter work",
+                self.maximum,
+                consumed.saturating_add(entries),
+            ));
         }
         Ok(())
     }
@@ -146,6 +150,8 @@ impl NodeFilterWorkBudget {
 
 struct Base64WorkBudget {
     remaining: Cell<usize>,
+    max_input_bytes: usize,
+    max_output_bytes: usize,
 }
 
 struct C14nOutputBudget {
@@ -184,10 +190,13 @@ impl C14nOutputBudget {
     }
 
     fn charge(&self, bytes: usize) -> Result<(), TransformError> {
+        let consumed = self.max_bytes.saturating_sub(self.remaining.get());
         if !charge_byte_budget(&self.remaining, bytes) {
-            return Err(TransformError::C14nOutputTooLarge {
-                max_bytes: self.max_bytes,
-            });
+            return Err(transform_resource_limit(
+                "canonicalized bytes",
+                self.max_bytes,
+                consumed.saturating_add(bytes),
+            ));
         }
         Ok(())
     }
@@ -225,7 +234,14 @@ mod c14n_budget_regression_tests {
         )
         .expect_err("canonicalized output must exceed the shared budget");
 
-        assert!(matches!(error, TransformError::C14nOutputTooLarge { .. }));
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "canonicalized bytes",
+                maximum: 8,
+                ..
+            })
+        ));
         assert_eq!(
             budget.remaining_c14n_output(),
             0,
@@ -238,16 +254,21 @@ impl Default for Base64WorkBudget {
     fn default() -> Self {
         Self {
             remaining: Cell::new(MAX_BASE64_TRANSFORM_INPUT_BYTES),
+            max_input_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES,
+            max_output_bytes: MAX_BASE64_TRANSFORM_OUTPUT_BYTES,
         }
     }
 }
 
 impl Base64WorkBudget {
     fn charge(&self, bytes: usize) -> Result<(), TransformError> {
+        let consumed = self.max_input_bytes.saturating_sub(self.remaining.get());
         if !charge_byte_budget(&self.remaining, bytes) {
-            return Err(TransformError::Base64InputTooLarge {
-                max_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES,
-            });
+            return Err(transform_resource_limit(
+                "Base64 transform input bytes",
+                self.max_input_bytes,
+                consumed.saturating_add(bytes),
+            ));
         }
         Ok(())
     }
@@ -274,6 +295,7 @@ impl TransformExecutionBudget {
             c14n: C14nOutputBudget::default(),
             node_filter: NodeFilterWorkBudget {
                 remaining: Cell::new(limit),
+                maximum: limit,
             },
             node_set_materialization: NodeSetMaterializationBudget::default(),
             xml_base_resolution: XmlBaseResolutionBudget::default(),
@@ -304,13 +326,27 @@ impl TransformExecutionBudget {
 impl TransformExecutionBudget {
     pub(crate) fn from_resources(resources: &crate::policy::ResourcePolicy) -> Self {
         Self {
+            xpath: XPathWorkBudget::with_limits(resources),
+            base64: Base64WorkBudget {
+                remaining: Cell::new(resources.max_base64_transform_input_bytes),
+                max_input_bytes: resources.max_base64_transform_input_bytes,
+                max_output_bytes: resources.max_base64_transform_output_bytes,
+            },
             c14n: C14nOutputBudget::with_limit(resources.effective_canonicalized_bytes()),
+            node_filter: NodeFilterWorkBudget {
+                remaining: Cell::new(resources.max_node_set_filter_work),
+                maximum: resources.max_node_set_filter_work,
+            },
+            node_set_materialization: NodeSetMaterializationBudget::with_limits(
+                resources.max_node_set_entries,
+                resources.max_node_set_owned_string_bytes,
+                resources.max_node_set_cumulative_owned_string_bytes,
+            ),
             xml_base_resolution: XmlBaseResolutionBudget::with_limits(
                 resources.effective_xml_base_components(),
                 resources.effective_xml_base_resolution_bytes(),
             ),
             xml_node_limit: resources.effective_xml_nodes(),
-            ..Self::default()
         }
     }
 
@@ -338,7 +374,7 @@ impl TransformExecutionBudget {
 impl TransformOptions {
     /// Select the node returned by the XPath `here()` extension function.
     #[must_use]
-    pub fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
+    pub(crate) fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
         self.xpath_here_semantics = semantics;
         self
     }
@@ -346,7 +382,7 @@ impl TransformOptions {
     /// Allow internal DTD declarations when a transform parses caller-supplied
     /// octets as XML. External entity resolution remains disabled.
     #[must_use]
-    pub fn allow_internal_dtd(mut self, enabled: bool) -> Self {
+    pub(crate) fn allow_internal_dtd(mut self, enabled: bool) -> Self {
         self.allow_internal_dtd = enabled;
         self
     }
@@ -722,7 +758,10 @@ fn apply_transform_with_options_and_state<'s, 'd>(
                     }
                 }
             }
-            Ok(TransformData::Binary(decode_base64_transform(&normalized)?))
+            Ok(TransformData::Binary(decode_base64_transform(
+                &normalized,
+                &budget.base64,
+            )?))
         }
     }
 }
@@ -784,17 +823,22 @@ fn is_rfc2045_base64_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
 }
 
-fn decode_base64_transform(normalized: &[u8]) -> Result<Vec<u8>, TransformError> {
+fn decode_base64_transform(
+    normalized: &[u8],
+    budget: &Base64WorkBudget,
+) -> Result<Vec<u8>, TransformError> {
     let padding = normalized
         .iter()
         .rev()
         .take_while(|byte| **byte == b'=')
         .count();
     let decoded_len = base64::decoded_len_estimate(normalized.len()).saturating_sub(padding);
-    if decoded_len > MAX_BASE64_TRANSFORM_OUTPUT_BYTES {
-        return Err(TransformError::Base64OutputTooLarge {
-            max_bytes: MAX_BASE64_TRANSFORM_OUTPUT_BYTES,
-        });
+    if decoded_len > budget.max_output_bytes {
+        return Err(transform_resource_limit(
+            "Base64 transform output bytes",
+            budget.max_output_bytes,
+            decoded_len,
+        ));
     }
 
     let mut decoded = vec![0_u8; decoded_len];
@@ -827,7 +871,7 @@ pub fn execute_transforms<'a>(
 }
 
 /// Execute a transform chain with explicit compatibility options.
-pub fn execute_transforms_with_options<'a>(
+pub(crate) fn execute_transforms_with_options<'a>(
     signature_node: Node<'a, 'a>,
     initial_data: TransformData<'a>,
     transforms: &[Transform],
@@ -969,9 +1013,11 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
 
 fn ensure_transform_count(count: usize) -> Result<(), TransformError> {
     if count > MAX_TRANSFORMS_PER_REFERENCE {
-        return Err(TransformError::TooManyTransforms {
-            max: MAX_TRANSFORMS_PER_REFERENCE,
-        });
+        return Err(transform_resource_limit(
+            "reference transforms",
+            MAX_TRANSFORMS_PER_REFERENCE,
+            count,
+        ));
     }
     Ok(())
 }
@@ -1020,7 +1066,11 @@ fn execute_transform_chain<'s, 'e, 'd>(
             },
         )
         .map_err(|error| match error {
-            roxmltree::Error::NodesLimitReached => TransformError::XmlNodeLimit,
+            roxmltree::Error::NodesLimitReached => transform_resource_limit(
+                "XML nodes",
+                context.budget.xml_node_limit as usize,
+                context.budget.xml_node_limit as usize + 1,
+            ),
             other => TransformError::XmlParse(other.to_string()),
         })?;
         context.state.document_reparsed();
@@ -1326,15 +1376,17 @@ fn map_c14n_limit_error(error: c14n::C14nError, budget: &C14nOutputBudget) -> Tr
             // Rendering already spent work up to the remaining allowance. Mark
             // it consumed so another Reference cannot spend the same budget.
             budget.exhaust();
-            TransformError::C14nOutputTooLarge {
-                max_bytes: budget.max_bytes,
-            }
+            transform_resource_limit(
+                "canonicalized bytes",
+                budget.max_bytes,
+                budget.max_bytes.saturating_add(1),
+            )
         }
         c14n::C14nError::XmlBaseComponentsTooLarge { max, actual } => {
-            TransformError::XmlBaseComponentsTooLarge { max, actual }
+            transform_resource_limit("XML Base components", max, actual)
         }
         c14n::C14nError::XmlBaseResolutionTooLarge { max_bytes, actual } => {
-            TransformError::XmlBaseResolutionTooLarge { max_bytes, actual }
+            transform_resource_limit("XML Base resolution bytes", max_bytes, actual)
         }
         error => TransformError::C14n(error),
     }
@@ -1529,10 +1581,12 @@ fn parse_xpath_filter2_transform(
                 "XPath Filter 2.0 allows only filter-namespace <XPath> children".into(),
             ));
         }
-        if filters.len() == MAX_XPATH_FILTERS {
-            return Err(TransformError::XPath(format!(
-                "XPath Filter 2.0 exceeds the maximum of {MAX_XPATH_FILTERS} expressions"
-            )));
+        if filters.len() == xpath_state.signature_budget.max_filters {
+            return Err(transform_resource_limit(
+                "XPath Filter 2.0 expressions",
+                xpath_state.signature_budget.max_filters,
+                filters.len().saturating_add(1),
+            ));
         }
         if child.attributes().len() != 1 || child.attribute("Filter").is_none() {
             return Err(TransformError::XPath(
@@ -1572,14 +1626,13 @@ fn parse_xpath_expression(
     for child in xpath_node.children() {
         if child.is_text() {
             let text = child.text().unwrap_or_default();
-            if source
-                .len()
-                .checked_add(text.len())
-                .is_none_or(|length| length > MAX_XPATH_EXPRESSION_BYTES)
-            {
-                return Err(TransformError::XPath(format!(
-                    "XPath expression exceeds {MAX_XPATH_EXPRESSION_BYTES} bytes"
-                )));
+            let attempted = source.len().saturating_add(text.len());
+            if attempted > xpath_state.signature_budget.max_expression_bytes {
+                return Err(transform_resource_limit(
+                    "XPath expression bytes",
+                    xpath_state.signature_budget.max_expression_bytes,
+                    attempted,
+                ));
             }
             source.push_str(text);
         } else if child.is_element() {
@@ -1595,7 +1648,27 @@ fn parse_xpath_expression(
         ));
     }
     xpath_state.signature_budget.charge()?;
-    compile_xpath(source).map_err(TransformError::XPath)?;
+    if source.len() > xpath_state.signature_budget.max_expression_bytes {
+        return Err(transform_resource_limit(
+            "XPath expression bytes",
+            xpath_state.signature_budget.max_expression_bytes,
+            source.len(),
+        ));
+    }
+    let complexity = crate::xmldsig::xpath::xpath_expression_complexity(source);
+    if complexity > xpath_state.signature_budget.max_expression_complexity {
+        return Err(transform_resource_limit(
+            "XPath expression complexity",
+            xpath_state.signature_budget.max_expression_complexity,
+            complexity,
+        ));
+    }
+    crate::xmldsig::xpath::compile_xpath_with_policy_limits(
+        source,
+        xpath_state.signature_budget.max_expression_bytes,
+        xpath_state.signature_budget.max_expression_complexity,
+    )
+    .map_err(TransformError::XPath)?;
 
     let mut xpath = XPathExpression {
         expression: source.to_owned(),
@@ -1633,7 +1706,10 @@ struct XPathParseState<'a> {
 impl<'a> XPathParseState<'a> {
     fn new(signature_budget: &'a mut XPathSignatureParseBudget) -> Self {
         Self {
-            namespace_budget: XPathNamespaceBudget::default(),
+            namespace_budget: XPathNamespaceBudget::with_limits(
+                signature_budget.max_namespace_bindings,
+                signature_budget.max_namespace_bytes,
+            ),
             document_identity: None,
             signature_budget,
         }
@@ -1646,62 +1722,166 @@ impl<'a> XPathParseState<'a> {
     }
 }
 
-#[derive(Default)]
 /// Parse/compile work shared by every Reference in one Signature, including
 /// repeated Manifest parses required by dependency-ordered signing.
 pub(crate) struct XPathSignatureParseBudget {
     expressions: usize,
+    max_expressions: usize,
+    max_expression_bytes: usize,
+    max_expression_complexity: usize,
+    max_namespace_bindings: usize,
+    max_namespace_bytes: usize,
+    max_filters: usize,
+}
+
+impl Default for XPathSignatureParseBudget {
+    fn default() -> Self {
+        Self {
+            expressions: 0,
+            max_expressions: MAX_XPATH_EXPRESSIONS_PER_SIGNATURE,
+            max_expression_bytes: MAX_XPATH_EXPRESSION_BYTES,
+            max_expression_complexity: crate::hard_limits::XPATH_EXPRESSION_COMPLEXITY_CEILING,
+            max_namespace_bindings: MAX_XPATH_NAMESPACE_BINDINGS,
+            max_namespace_bytes: MAX_XPATH_NAMESPACE_BYTES,
+            max_filters: MAX_XPATH_FILTERS,
+        }
+    }
 }
 
 impl XPathSignatureParseBudget {
+    pub(crate) fn from_resources(resources: &crate::policy::ResourcePolicy) -> Self {
+        Self {
+            expressions: 0,
+            max_expressions: resources.max_xpath_expressions,
+            max_expression_bytes: resources.max_xpath_expression_bytes,
+            max_expression_complexity: resources.max_xpath_expression_complexity,
+            max_namespace_bindings: resources.max_xpath_namespace_bindings,
+            max_namespace_bytes: resources.max_xpath_namespace_bytes,
+            max_filters: resources.max_xpath_filters,
+        }
+    }
+
     pub(crate) fn charge(&mut self) -> Result<(), TransformError> {
-        self.expressions = self.expressions.checked_add(1).ok_or_else(Self::error)?;
-        if self.expressions > MAX_XPATH_EXPRESSIONS_PER_SIGNATURE {
-            return Err(Self::error());
+        self.expressions = self
+            .expressions
+            .checked_add(1)
+            .ok_or_else(|| self.error())?;
+        if self.expressions > self.max_expressions {
+            return Err(self.error());
         }
         Ok(())
     }
 
-    fn error() -> TransformError {
-        TransformError::XPath(format!(
-            "signature-wide XPath expression budget exceeds {MAX_XPATH_EXPRESSIONS_PER_SIGNATURE} entries"
-        ))
+    pub(crate) fn validate_expression(&mut self, source: &str) -> Result<(), TransformError> {
+        if source.is_empty() {
+            return Err(TransformError::XPath(
+                "XPath expression must not be empty".into(),
+            ));
+        }
+        self.charge()?;
+        if source.len() > self.max_expression_bytes {
+            return Err(transform_resource_limit(
+                "XPath expression bytes",
+                self.max_expression_bytes,
+                source.len(),
+            ));
+        }
+        let complexity = crate::xmldsig::xpath::xpath_expression_complexity(source);
+        if complexity > self.max_expression_complexity {
+            return Err(transform_resource_limit(
+                "XPath expression complexity",
+                self.max_expression_complexity,
+                complexity,
+            ));
+        }
+        crate::xmldsig::xpath::compile_xpath_with_policy_limits(
+            source,
+            self.max_expression_bytes,
+            self.max_expression_complexity,
+        )
+        .map(|_| ())
+        .map_err(TransformError::XPath)
+    }
+
+    fn error(&self) -> TransformError {
+        transform_resource_limit(
+            "XPath expressions",
+            self.max_expressions,
+            self.expressions.max(self.max_expressions.saturating_add(1)),
+        )
     }
 }
 
-#[derive(Default)]
 struct XPathNamespaceBudget {
     bindings: usize,
     bytes: usize,
+    max_bindings: usize,
+    max_bytes: usize,
+}
+
+impl Default for XPathNamespaceBudget {
+    fn default() -> Self {
+        Self::with_limits(MAX_XPATH_NAMESPACE_BINDINGS, MAX_XPATH_NAMESPACE_BYTES)
+    }
 }
 
 impl XPathNamespaceBudget {
+    fn with_limits(max_bindings: usize, max_bytes: usize) -> Self {
+        Self {
+            bindings: 0,
+            bytes: 0,
+            max_bindings,
+            max_bytes,
+        }
+    }
+
     fn charge(&mut self, prefix: &str, uri: &str) -> Result<(), TransformError> {
-        self.bindings = self.bindings.checked_add(1).ok_or_else(Self::error)?;
-        self.bytes = self
+        let bindings = self.bindings.saturating_add(1);
+        let bytes = self
             .bytes
             .checked_add(prefix.len())
             .and_then(|bytes| bytes.checked_add(uri.len()))
-            .ok_or_else(Self::error)?;
-        if self.bindings > MAX_XPATH_NAMESPACE_BINDINGS || self.bytes > MAX_XPATH_NAMESPACE_BYTES {
-            return Err(Self::error());
+            .unwrap_or(usize::MAX);
+        if bindings > self.max_bindings {
+            return Err(transform_resource_limit(
+                "XPath namespace bindings",
+                self.max_bindings,
+                bindings,
+            ));
         }
+        if bytes > self.max_bytes {
+            return Err(transform_resource_limit(
+                "XPath namespace bytes",
+                self.max_bytes,
+                bytes,
+            ));
+        }
+        self.bindings = bindings;
+        self.bytes = bytes;
         Ok(())
-    }
-
-    fn error() -> TransformError {
-        TransformError::XPath(format!(
-            "XPath namespace binding budget exceeds {MAX_XPATH_NAMESPACE_BINDINGS} entries or \
-             {MAX_XPATH_NAMESPACE_BYTES} bytes per transform chain"
-        ))
     }
 }
 
-pub(crate) fn validate_xpath_namespace_budget(
+pub(crate) fn validate_xpath_namespace_budget_with_resources(
     transforms: &[Transform],
     inherited_namespace: Option<(&str, &str)>,
+    resources: &crate::policy::ResourcePolicy,
 ) -> Result<(), TransformError> {
-    let mut budget = XPathNamespaceBudget::default();
+    validate_xpath_namespace_budget_with_limits(
+        transforms,
+        inherited_namespace,
+        resources.max_xpath_namespace_bindings,
+        resources.max_xpath_namespace_bytes,
+    )
+}
+
+fn validate_xpath_namespace_budget_with_limits(
+    transforms: &[Transform],
+    inherited_namespace: Option<(&str, &str)>,
+    max_bindings: usize,
+    max_bytes: usize,
+) -> Result<(), TransformError> {
+    let mut budget = XPathNamespaceBudget::with_limits(max_bindings, max_bytes);
     for transform in transforms {
         match transform {
             Transform::XPath(xpath) => {
@@ -1932,7 +2112,11 @@ mod tests {
 
         assert!(matches!(
             error,
-            TransformError::XmlBaseComponentsTooLarge { max: 1, actual: 2 }
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "XML Base components",
+                maximum: 1,
+                actual: 2
+            })
         ));
     }
 
@@ -2035,9 +2219,13 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(TransformError::Base64InputTooLarge {
-                max_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES
-            })
+            Err(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "Base64 transform input bytes",
+                    maximum: MAX_BASE64_TRANSFORM_INPUT_BYTES,
+                    ..
+                }
+            ))
         ));
     }
 
@@ -2054,9 +2242,13 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(TransformError::Base64OutputTooLarge {
-                max_bytes: MAX_BASE64_TRANSFORM_OUTPUT_BYTES
-            })
+            Err(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "Base64 transform output bytes",
+                    maximum: MAX_BASE64_TRANSFORM_OUTPUT_BYTES,
+                    ..
+                }
+            ))
         ));
     }
 
@@ -2098,9 +2290,13 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(TransformError::Base64InputTooLarge {
-                max_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES
-            })
+            Err(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "Base64 transform input bytes",
+                    maximum: MAX_BASE64_TRANSFORM_INPUT_BYTES,
+                    ..
+                }
+            ))
         ));
     }
 
@@ -2119,9 +2315,13 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(TransformError::TooManyTransforms {
-                max: MAX_TRANSFORMS_PER_REFERENCE
-            })
+            Err(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "reference transforms",
+                    maximum: MAX_TRANSFORMS_PER_REFERENCE,
+                    ..
+                }
+            ))
         ));
     }
 
@@ -2142,26 +2342,40 @@ mod tests {
 
     #[test]
     fn pipeline_rejects_cumulative_c14n_output() {
-        // Every C14N result is individually moderate, but a long chain can
-        // multiply canonicalization work and adapter-buffer retention. The
-        // shared meter must reject their cumulative output.
-        let xml = format!("<root>{}</root>", "x".repeat(512 * 1024));
+        // Each C14N result fits independently, but reparsing a binary result for
+        // another C14N transform must charge the same pipeline-wide byte meter.
+        let xml = format!("<root>{}</root>", "x".repeat(4_096));
         let document = Document::parse(&xml).unwrap();
         let algorithm =
             C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315").unwrap();
-        let transforms = vec![Transform::C14n(algorithm); 40];
+        let transforms = vec![
+            Transform::C14n(algorithm.clone()),
+            Transform::C14n(algorithm),
+        ];
+        let one_output = execute_transforms(
+            document.root_element(),
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(&document).unwrap()),
+            &transforms[..1],
+        )
+        .expect("one canonicalization must succeed")
+        .len();
+        let limit = one_output * 2 - 1;
 
-        let result = execute_transforms(
+        let result = execute_transforms_with_options_and_budget(
             document.root_element(),
             TransformData::NodeSet(NodeSet::entire_document_without_comments(&document).unwrap()),
             &transforms,
+            TransformOptions::default(),
+            &TransformExecutionBudget::with_c14n_limit(limit),
         );
 
         assert!(matches!(
             result,
-            Err(TransformError::C14nOutputTooLarge {
-                max_bytes: MAX_C14N_OUTPUT_BYTES
-            })
+            Err(TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "canonicalized bytes",
+                maximum,
+                ..
+            })) if maximum == limit
         ));
     }
 
@@ -2185,7 +2399,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            TransformError::NodeSetCumulativeStringsTooLarge { .. }
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "cumulative node-set owned string bytes",
+                ..
+            })
         ));
     }
 
@@ -2214,7 +2431,13 @@ mod tests {
         )
         .expect_err("external XML exceeding the node ceiling must fail during parse");
 
-        assert!(matches!(error, TransformError::XmlNodeLimit));
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "XML nodes",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2237,7 +2460,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            TransformError::NodeSetCumulativeStringsTooLarge { .. }
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "cumulative node-set owned string bytes",
+                ..
+            })
         ));
     }
 
@@ -2265,7 +2491,11 @@ mod tests {
 
             assert!(matches!(
                 error,
-                TransformError::C14nOutputTooLarge { max_bytes: 64 }
+                TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "canonicalized bytes",
+                    maximum: 64,
+                    ..
+                })
             ));
         }
     }
@@ -2275,15 +2505,19 @@ mod tests {
         // Each Reference remains below the signature-wide output ceiling, but
         // signing and verification share one execution budget. Repeating the
         // same C14N work across References must not reset that meter.
-        let xml = format!("<root>{}</root>", "x".repeat(512 * 1024));
+        let xml = format!("<root>{}</root>", "x".repeat(4_096));
         let document = Document::parse(&xml).unwrap();
         let algorithm =
             C14nAlgorithm::from_uri("http://www.w3.org/TR/2001/REC-xml-c14n-20010315").unwrap();
-        let transforms = vec![Transform::C14n(algorithm); 20];
-        let execution_budget = TransformExecutionBudget::default();
+        let transforms = [Transform::C14n(algorithm)];
         let input = || {
             TransformData::NodeSet(NodeSet::entire_document_without_comments(&document).unwrap())
         };
+        let one_output = execute_transforms(document.root_element(), input(), &transforms)
+            .expect("one canonicalization must succeed")
+            .len();
+        let limit = one_output * 2 - 1;
+        let execution_budget = TransformExecutionBudget::with_c14n_limit(limit);
 
         execute_transforms_with_options_and_budget(
             document.root_element(),
@@ -2303,9 +2537,11 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(TransformError::C14nOutputTooLarge {
-                max_bytes: MAX_C14N_OUTPUT_BYTES
-            })
+            Err(TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "canonicalized bytes",
+                maximum,
+                ..
+            })) if maximum == limit
         ));
     }
 
@@ -2344,7 +2580,12 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(TransformError::NodeSetFilterWorkTooLarge { .. })
+                Err(TransformError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: "node-set filter work",
+                        ..
+                    }
+                ))
             ),
             "the second reference exclusion must exhaust the shared budget"
         );
@@ -2355,12 +2596,16 @@ mod tests {
         // References ending in node sets use implicit C14N 1.0. That terminal
         // coercion must share the same signature-wide byte ceiling as explicit
         // canonicalization transforms.
-        let xml = format!("<root>{}</root>", "x".repeat(6 * 1024 * 1024));
+        let xml = format!("<root>{}</root>", "x".repeat(4_096));
         let document = Document::parse(&xml).unwrap();
-        let execution_budget = TransformExecutionBudget::default();
         let input = || {
             TransformData::NodeSet(NodeSet::entire_document_without_comments(&document).unwrap())
         };
+        let one_output = execute_transforms(document.root_element(), input(), &[])
+            .expect("one implicit canonicalization must succeed")
+            .len();
+        let limit = one_output * 3 - 1;
+        let execution_budget = TransformExecutionBudget::with_c14n_limit(limit);
 
         for _ in 0..2 {
             execute_transforms_with_options_and_budget(
@@ -2382,9 +2627,11 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(TransformError::C14nOutputTooLarge {
-                max_bytes: MAX_C14N_OUTPUT_BYTES
-            })
+            Err(TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "canonicalized bytes",
+                maximum,
+                ..
+            })) if maximum == limit
         ));
     }
 
@@ -2696,9 +2943,13 @@ mod tests {
 
         assert!(matches!(
             parse_transforms(doc.root_element()),
-            Err(TransformError::TooManyTransforms {
-                max: MAX_TRANSFORMS_PER_REFERENCE
-            })
+            Err(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "reference transforms",
+                    maximum: MAX_TRANSFORMS_PER_REFERENCE,
+                    ..
+                }
+            ))
         ));
     }
 
@@ -2930,8 +3181,14 @@ mod tests {
         let error = parse_transforms(doc.root_element())
             .expect_err("raw XPath parameter text must obey the expression bound");
 
-        assert!(matches!(error, TransformError::XPath(_)));
-        assert!(error.to_string().contains("exceeds"));
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "XPath expression bytes",
+                maximum: MAX_XPATH_EXPRESSION_BYTES,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2962,7 +3219,16 @@ mod tests {
         let error = parse_transforms(doc.root_element())
             .expect_err("cumulative XPath namespace storage must be bounded");
 
-        assert!(error.to_string().contains("namespace binding budget"));
+        assert!(
+            matches!(
+                error,
+                TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "XPath namespace bytes",
+                    ..
+                })
+            ),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

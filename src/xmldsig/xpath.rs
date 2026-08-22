@@ -17,7 +17,9 @@ use super::transforms::{
     MAX_XPATH_EXPRESSION_BYTES, MAX_XPATH_FILTERS, XPathExpression, XPathFilter,
     XPathFilterOperation, XPathHereSemantics,
 };
-use super::types::{NodeSet, NodeSetMaterializationBudget, TransformError};
+use super::types::{
+    NodeSet, NodeSetMaterializationBudget, TransformError, transform_resource_limit,
+};
 use crate::c14n::NodeVisibility;
 use crate::c14n::prefix::{attribute_prefix, element_prefix};
 
@@ -29,17 +31,20 @@ const ALL_XPATH_NODES: &str = "//. | //@* | //namespace::*";
 /// documents: an arbitrary expression can traverse the complete mirrored DOM
 /// for every context node, and the XPath engine exposes no interrupt or step
 /// counter that could safely distinguish a cheap expression from an expensive one.
-const MAX_XPATH_CONTEXT_EVALUATIONS: usize = 4_096;
+const MAX_XPATH_CONTEXT_EVALUATIONS: usize = crate::hard_limits::XPATH_CONTEXT_EVALUATION_CEILING;
 /// Bound conservative XPath evaluator node visits across one signature.
-const MAX_XPATH_CUMULATIVE_EVALUATION_WORK: usize = 6_000_000;
+const MAX_XPATH_CUMULATIVE_EVALUATION_WORK: usize =
+    crate::hard_limits::XPATH_EVALUATION_WORK_CEILING;
 /// Bound operators, names, literals, and path punctuation in one expression.
-const MAX_XPATH_EXPRESSION_COMPLEXITY: usize = 256;
+const MAX_XPATH_EXPRESSION_COMPLEXITY: usize =
+    crate::hard_limits::XPATH_EXPRESSION_COMPLEXITY_CEILING;
 /// Bound strings copied into SXD before evaluating untrusted XPath.
-const MAX_XPATH_MIRROR_STRING_BYTES: usize = 8 * 1024 * 1024;
+const MAX_XPATH_MIRROR_STRING_BYTES: usize = crate::hard_limits::XPATH_MIRROR_STRING_BYTE_CEILING;
 /// Bound conservative SXD string processing across one signature. The ceiling
 /// accommodates comparison-heavy XMLDSig interoperability vectors while keeping
 /// repeated non-interruptible source scans finite.
-const MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES: usize = 512 * 1024 * 1024;
+const MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES: usize =
+    crate::hard_limits::XPATH_STRING_WORK_BYTE_CEILING;
 /// Namespace URI permanently bound to the reserved `xml` prefix.
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -51,16 +56,39 @@ thread_local! {
 #[derive(Clone)]
 pub(super) struct XPathWorkBudget {
     remaining: Rc<Cell<usize>>,
+    evaluation_limit_exceeded: Rc<Cell<bool>>,
     mirror_bytes_remaining: Rc<Cell<usize>>,
     string_work_bytes_remaining: Rc<Cell<usize>>,
+    limits: XPathWorkLimits,
+}
+
+#[derive(Clone, Copy)]
+struct XPathWorkLimits {
+    evaluation_work: usize,
+    mirror_string_bytes: usize,
+    string_work_bytes: usize,
+    expression_bytes: usize,
+    expression_complexity: usize,
+    context_evaluations: usize,
+    filters: usize,
 }
 
 impl Default for XPathWorkBudget {
     fn default() -> Self {
         Self {
             remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
+            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
             mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
             string_work_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES)),
+            limits: XPathWorkLimits {
+                evaluation_work: MAX_XPATH_CUMULATIVE_EVALUATION_WORK,
+                mirror_string_bytes: MAX_XPATH_MIRROR_STRING_BYTES,
+                string_work_bytes: MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES,
+                expression_bytes: MAX_XPATH_EXPRESSION_BYTES,
+                expression_complexity: MAX_XPATH_EXPRESSION_COMPLEXITY,
+                context_evaluations: MAX_XPATH_CONTEXT_EVALUATIONS,
+                filters: MAX_XPATH_FILTERS,
+            },
         }
     }
 }
@@ -70,8 +98,28 @@ impl XPathWorkBudget {
     pub(super) fn with_limit(limit: usize) -> Self {
         Self {
             remaining: Rc::new(Cell::new(limit)),
+            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
             mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
             string_work_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES)),
+            limits: Self::default().limits,
+        }
+    }
+
+    pub(super) fn with_limits(resources: &crate::policy::ResourcePolicy) -> Self {
+        Self {
+            remaining: Rc::new(Cell::new(resources.max_xpath_evaluation_work)),
+            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
+            mirror_bytes_remaining: Rc::new(Cell::new(resources.max_xpath_mirror_string_bytes)),
+            string_work_bytes_remaining: Rc::new(Cell::new(resources.max_xpath_string_work_bytes)),
+            limits: XPathWorkLimits {
+                evaluation_work: resources.max_xpath_evaluation_work,
+                mirror_string_bytes: resources.max_xpath_mirror_string_bytes,
+                string_work_bytes: resources.max_xpath_string_work_bytes,
+                expression_bytes: resources.max_xpath_expression_bytes,
+                expression_complexity: resources.max_xpath_expression_complexity,
+                context_evaluations: resources.max_xpath_context_evaluations,
+                filters: resources.max_xpath_filters,
+            },
         }
     }
 
@@ -79,10 +127,13 @@ impl XPathWorkBudget {
         let remaining = self.remaining.get();
         let Some(next) = remaining.checked_sub(work) else {
             self.remaining.set(0);
-            return Err(TransformError::XPath(format!(
-                "XPath transform exceeds signature-wide cumulative evaluation work budget of \
-                 {MAX_XPATH_CUMULATIVE_EVALUATION_WORK} node-evaluations"
-            )));
+            self.evaluation_limit_exceeded.set(true);
+            let consumed = self.limits.evaluation_work.saturating_sub(remaining);
+            return Err(transform_resource_limit(
+                "XPath evaluation work",
+                self.limits.evaluation_work,
+                consumed.saturating_add(work),
+            ));
         };
         self.remaining.set(next);
         Ok(())
@@ -94,13 +145,28 @@ impl XPathWorkBudget {
         })
     }
 
+    fn map_evaluation_error(&self, error: impl ToString) -> TransformError {
+        if self.evaluation_limit_exceeded.get() {
+            transform_resource_limit(
+                "XPath evaluation work",
+                self.limits.evaluation_work,
+                self.limits.evaluation_work.saturating_add(1),
+            )
+        } else {
+            TransformError::XPath(error.to_string())
+        }
+    }
+
     fn charge_mirror_bytes(&self, bytes: usize) -> Result<(), TransformError> {
         let remaining = self.mirror_bytes_remaining.get();
         let Some(next) = remaining.checked_sub(bytes) else {
             self.mirror_bytes_remaining.set(0);
-            return Err(TransformError::XPathMirrorTooLarge {
-                max_bytes: MAX_XPATH_MIRROR_STRING_BYTES,
-            });
+            let consumed = self.limits.mirror_string_bytes.saturating_sub(remaining);
+            return Err(transform_resource_limit(
+                "XPath mirror string bytes",
+                self.limits.mirror_string_bytes,
+                consumed.saturating_add(bytes),
+            ));
         };
         self.mirror_bytes_remaining.set(next);
         Ok(())
@@ -118,9 +184,12 @@ impl XPathWorkBudget {
         let remaining = self.string_work_bytes_remaining.get();
         let Some(next) = work.and_then(|work| remaining.checked_sub(work)) else {
             self.string_work_bytes_remaining.set(0);
-            return Err(TransformError::XPathStringWorkTooLarge {
-                max_bytes: MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES,
-            });
+            let consumed = self.limits.string_work_bytes.saturating_sub(remaining);
+            return Err(transform_resource_limit(
+                "XPath string-processing work bytes",
+                self.limits.string_work_bytes,
+                work.map_or(usize::MAX, |work| consumed.saturating_add(work)),
+            ));
         };
         self.string_work_bytes_remaining.set(next);
         Ok(())
@@ -178,15 +247,28 @@ pub(super) fn normalize_function_spacing(source: &str) -> String {
     output
 }
 
-pub(super) fn compile_xpath(source: &str) -> Result<sxd_xpath_no_unsafe::XPath, String> {
-    if source.is_empty() || source.len() > MAX_XPATH_EXPRESSION_BYTES {
+#[cfg(test)]
+fn compile_xpath(source: &str) -> Result<sxd_xpath_no_unsafe::XPath, String> {
+    compile_xpath_with_policy_limits(
+        source,
+        MAX_XPATH_EXPRESSION_BYTES,
+        MAX_XPATH_EXPRESSION_COMPLEXITY,
+    )
+}
+
+pub(super) fn compile_xpath_with_policy_limits(
+    source: &str,
+    max_expression_bytes: usize,
+    max_expression_complexity: usize,
+) -> Result<sxd_xpath_no_unsafe::XPath, String> {
+    if source.is_empty() || source.len() > max_expression_bytes {
         return Err(format!(
-            "XPath expression length must be between 1 and {MAX_XPATH_EXPRESSION_BYTES} bytes"
+            "XPath expression length must be between 1 and {max_expression_bytes} bytes"
         ));
     }
-    if xpath_expression_complexity(source) > MAX_XPATH_EXPRESSION_COMPLEXITY {
+    if xpath_expression_complexity(source) > max_expression_complexity {
         return Err(format!(
-            "XPath expression complexity exceeds {MAX_XPATH_EXPRESSION_COMPLEXITY} tokens"
+            "XPath expression complexity exceeds {max_expression_complexity} tokens"
         ));
     }
     Factory::new()
@@ -194,7 +276,7 @@ pub(super) fn compile_xpath(source: &str) -> Result<sxd_xpath_no_unsafe::XPath, 
         .map_err(|error| error.to_string())
 }
 
-fn xpath_expression_complexity(source: &str) -> usize {
+pub(super) fn xpath_expression_complexity(source: &str) -> usize {
     let mut chars = source.chars().peekable();
     let mut tokens = 0_usize;
     while let Some(character) = chars.next() {
@@ -1170,15 +1252,19 @@ impl<'d> Mirror<'d> {
 }
 
 fn charge_xpath_mirror_bytes(current: usize, additional: usize) -> Result<usize, TransformError> {
-    let total = current
-        .checked_add(additional)
-        .ok_or(TransformError::XPathMirrorTooLarge {
-            max_bytes: MAX_XPATH_MIRROR_STRING_BYTES,
-        })?;
+    let total = current.checked_add(additional).ok_or_else(|| {
+        transform_resource_limit(
+            "XPath mirror string bytes",
+            MAX_XPATH_MIRROR_STRING_BYTES,
+            usize::MAX,
+        )
+    })?;
     if total > MAX_XPATH_MIRROR_STRING_BYTES {
-        return Err(TransformError::XPathMirrorTooLarge {
-            max_bytes: MAX_XPATH_MIRROR_STRING_BYTES,
-        });
+        return Err(transform_resource_limit(
+            "XPath mirror string bytes",
+            MAX_XPATH_MIRROR_STRING_BYTES,
+            total,
+        ));
     }
     Ok(total)
 }
@@ -1442,7 +1528,28 @@ fn evaluate_expression<'a>(
         },
     );
 
-    let xpath = compile_xpath(expression.expression()).map_err(TransformError::XPath)?;
+    let expression_bytes = expression.expression().len();
+    if expression_bytes > work_budget.limits.expression_bytes {
+        return Err(transform_resource_limit(
+            "XPath expression bytes",
+            work_budget.limits.expression_bytes,
+            expression_bytes,
+        ));
+    }
+    let expression_complexity = xpath_expression_complexity(expression.expression());
+    if expression_complexity > work_budget.limits.expression_complexity {
+        return Err(transform_resource_limit(
+            "XPath expression complexity",
+            work_budget.limits.expression_complexity,
+            expression_complexity,
+        ));
+    }
+    let xpath = compile_xpath_with_policy_limits(
+        expression.expression(),
+        work_budget.limits.expression_bytes,
+        work_budget.limits.expression_complexity,
+    )
+    .map_err(TransformError::XPath)?;
     let evaluation_work = xpath_evaluation_work(expression.expression(), document_size, mode);
     let string_scans = xpath_string_scan_count(expression.expression()).max(1);
 
@@ -1457,7 +1564,7 @@ fn evaluate_expression<'a>(
         work_budget.charge(document_size)?;
         let all_nodes = all_nodes_xpath
             .evaluate(&context, target.root())
-            .map_err(|error| TransformError::XPath(error.to_string()))?;
+            .map_err(|error| work_budget.map_evaluation_error(error))?;
         let Value::Nodeset(all_nodes) = all_nodes else {
             unreachable!("the fixed all-nodes XPath expression returns a node-set");
         };
@@ -1466,10 +1573,12 @@ fn evaluate_expression<'a>(
             .into_iter()
             .filter(|node| mirror.input_contains(document, input, node))
             .collect::<Vec<_>>();
-        if ordered_nodes.len() > MAX_XPATH_CONTEXT_EVALUATIONS {
-            return Err(TransformError::XPath(format!(
-                "XPath transform input exceeds {MAX_XPATH_CONTEXT_EVALUATIONS} per-node evaluations"
-            )));
+        if ordered_nodes.len() > work_budget.limits.context_evaluations {
+            return Err(transform_resource_limit(
+                "XPath context evaluations",
+                work_budget.limits.context_evaluations,
+                ordered_nodes.len(),
+            ));
         }
         // SXD has no interrupt hook and XPath coercions can materialize or scan
         // any mirrored string. Charge the complete source string volume for
@@ -1483,7 +1592,7 @@ fn evaluate_expression<'a>(
             work_budget.charge(evaluation_work)?;
             let include = xpath
                 .evaluate(&context, node.clone())
-                .map_err(|error| TransformError::XPath(error.to_string()))?
+                .map_err(|error| work_budget.map_evaluation_error(error))?
                 .into_boolean();
             if include {
                 selected.add(node);
@@ -1501,7 +1610,7 @@ fn evaluate_expression<'a>(
     work_budget.charge_string_work(mirror_bytes, 1, string_scans)?;
     let value = xpath
         .evaluate(&context, target.root())
-        .map_err(|error| TransformError::XPath(error.to_string()))?;
+        .map_err(|error| work_budget.map_evaluation_error(error))?;
     let Value::Nodeset(selected) = value else {
         return Err(TransformError::XPath(
             "XPath Filter 2.0 expression must return a node-set".into(),
@@ -1608,10 +1717,17 @@ pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a>(
     work_budget: &XPathWorkBudget,
     materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
-    if filters.is_empty() || filters.len() > MAX_XPATH_FILTERS {
-        return Err(TransformError::XPath(format!(
-            "XPath Filter 2.0 requires between 1 and {MAX_XPATH_FILTERS} expressions"
-        )));
+    if filters.is_empty() || filters.len() > work_budget.limits.filters {
+        if filters.is_empty() {
+            return Err(TransformError::XPath(
+                "XPath Filter 2.0 requires at least one expression".into(),
+            ));
+        }
+        return Err(transform_resource_limit(
+            "XPath Filter 2.0 expressions",
+            work_budget.limits.filters,
+            filters.len(),
+        ));
     }
     let mut result =
         NodeSet::try_entire_document_with_budget(input.document(), materialization_budget)?;
@@ -1655,6 +1771,20 @@ mod tests {
         )
         .unwrap();
         String::from_utf8(output).unwrap()
+    }
+
+    fn assert_resource_limit(error: &TransformError, expected_resource: &'static str) {
+        assert!(
+            matches!(
+                error,
+                TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource,
+                    maximum,
+                    actual,
+                }) if *resource == expected_resource && actual > maximum
+            ),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]
@@ -1717,7 +1847,7 @@ mod tests {
         .err()
         .expect("oversized per-node XPath evaluation must fail before execution");
 
-        assert!(matches!(error, TransformError::XPath(_)));
+        assert_resource_limit(&error, "XPath context evaluations");
     }
 
     #[test]
@@ -1762,7 +1892,13 @@ mod tests {
         .err()
         .expect("XPath must reject the source before allocating an oversized mirror");
 
-        assert!(matches!(error, TransformError::NodeSetTooLarge { .. }));
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "node-set entries",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1790,7 +1926,13 @@ mod tests {
             .err()
             .expect("XPath must reject source values before building the mirror");
 
-            assert!(matches!(error, TransformError::XPathMirrorTooLarge { .. }));
+            assert!(matches!(
+                error,
+                TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "XPath mirror string bytes",
+                    ..
+                })
+            ));
         }
     }
 
@@ -1873,7 +2015,7 @@ mod tests {
         .err()
         .expect("excessive cumulative XPath evaluation work must fail closed");
 
-        assert!(error.to_string().contains("cumulative evaluation work"));
+        assert_resource_limit(&error, "XPath evaluation work");
     }
 
     #[test]
@@ -1893,7 +2035,7 @@ mod tests {
         .err()
         .expect("repeated XPath string scans must exhaust the shared work budget");
 
-        assert!(error.to_string().contains("string-processing work"));
+        assert_resource_limit(&error, "XPath string-processing work bytes");
     }
 
     #[test]
@@ -1915,8 +2057,10 @@ mod tests {
             initial_remaining - single_scan_budget.string_work_bytes_remaining.get();
         let repeated_scan_budget = XPathWorkBudget {
             remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
+            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
             mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
             string_work_bytes_remaining: Rc::new(Cell::new(one_scan_work)),
+            limits: XPathWorkBudget::default().limits,
         };
 
         let error = apply_xpath_filter_with_semantics(
@@ -1931,7 +2075,7 @@ mod tests {
         .err()
         .expect("two string scans must exceed a one-scan budget");
 
-        assert!(error.to_string().contains("string-processing work"));
+        assert_resource_limit(&error, "XPath string-processing work bytes");
     }
 
     #[test]
@@ -1954,8 +2098,10 @@ mod tests {
             initial_remaining - single_scan_budget.string_work_bytes_remaining.get();
         let repeated_scan_budget = XPathWorkBudget {
             remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
+            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
             mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
             string_work_bytes_remaining: Rc::new(Cell::new(one_scan_work)),
+            limits: XPathWorkBudget::default().limits,
         };
 
         let error = apply_xpath_filter_with_semantics(
@@ -1968,7 +2114,7 @@ mod tests {
         .err()
         .expect("repeated numeric conversions must exceed a one-conversion budget");
 
-        assert!(error.to_string().contains("string-processing work"));
+        assert_resource_limit(&error, "XPath string-processing work bytes");
     }
 
     #[test]
@@ -1993,8 +2139,10 @@ mod tests {
             initial_remaining - single_scan_budget.string_work_bytes_remaining.get();
         let repeated_scan_budget = XPathWorkBudget {
             remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
+            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
             mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
             string_work_bytes_remaining: Rc::new(Cell::new(one_scan_work)),
+            limits: XPathWorkBudget::default().limits,
         };
 
         let error = apply_xpath_filter_with_semantics(
@@ -2007,7 +2155,7 @@ mod tests {
         .err()
         .expect("repeated id conversions must exceed a one-conversion budget");
 
-        assert!(error.to_string().contains("string-processing work"));
+        assert_resource_limit(&error, "XPath string-processing work bytes");
     }
 
     #[test]
@@ -2029,8 +2177,10 @@ mod tests {
             initial_remaining - single_scan_budget.string_work_bytes_remaining.get();
         let repeated_scan_budget = XPathWorkBudget {
             remaining: Rc::new(Cell::new(MAX_XPATH_CUMULATIVE_EVALUATION_WORK)),
+            evaluation_limit_exceeded: Rc::new(Cell::new(false)),
             mirror_bytes_remaining: Rc::new(Cell::new(MAX_XPATH_MIRROR_STRING_BYTES)),
             string_work_bytes_remaining: Rc::new(Cell::new(one_scan_work)),
+            limits: XPathWorkBudget::default().limits,
         };
 
         let error = apply_xpath_filter_with_semantics(
@@ -2043,7 +2193,7 @@ mod tests {
         .err()
         .expect("two comparison scans must exceed a one-scan budget");
 
-        assert!(error.to_string().contains("string-processing work"));
+        assert_resource_limit(&error, "XPath string-processing work bytes");
     }
 
     #[test]
@@ -2063,7 +2213,13 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(matches!(error, TransformError::XPathMirrorTooLarge { .. }));
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "XPath mirror string bytes",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2085,7 +2241,7 @@ mod tests {
         .err()
         .expect("nested document scans must exhaust the shared XPath budget");
 
-        assert!(error.to_string().contains("cumulative evaluation work"));
+        assert_resource_limit(&error, "XPath evaluation work");
     }
 
     #[test]
@@ -2108,7 +2264,7 @@ mod tests {
         .err()
         .expect("repeated parent-axis steps must exhaust the shared XPath budget");
 
-        assert!(error.to_string().contains("cumulative evaluation work"));
+        assert_resource_limit(&error, "XPath evaluation work");
     }
 
     #[test]
@@ -2129,7 +2285,7 @@ mod tests {
         .err()
         .expect("composed top-level scans must exhaust the shared XPath budget");
 
-        assert!(error.to_string().contains("cumulative evaluation work"));
+        assert_resource_limit(&error, "XPath evaluation work");
     }
 
     #[test]
@@ -2153,7 +2309,7 @@ mod tests {
         .err()
         .expect("repeated child-axis branches must exhaust the shared XPath budget");
 
-        assert!(error.to_string().contains("cumulative evaluation work"));
+        assert_resource_limit(&error, "XPath evaluation work");
     }
 
     #[test]
@@ -2322,7 +2478,7 @@ mod tests {
         .err()
         .expect("repeated id() scans must exhaust the shared XPath budget");
 
-        assert!(error.to_string().contains("signature-wide"));
+        assert_resource_limit(&error, "XPath evaluation work");
     }
 
     #[test]
@@ -2339,7 +2495,7 @@ mod tests {
         .err()
         .expect("excessive XPath expression complexity must fail closed");
 
-        assert!(error.to_string().contains("complexity"));
+        assert_resource_limit(&error, "XPath expression complexity");
     }
 
     #[test]
@@ -2410,7 +2566,7 @@ mod tests {
         .err()
         .expect("ancestor walks must exhaust the shared XPath budget");
 
-        assert!(error.to_string().contains("evaluation work budget"));
+        assert_resource_limit(&error, "XPath evaluation work");
     }
 
     #[test]

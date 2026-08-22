@@ -39,6 +39,22 @@ fn legacy_policy(algorithm: SignatureAlgorithm) -> xml_sec::policy::Verification
     policy
 }
 
+fn legacy_chain_policy(
+    algorithm: SignatureAlgorithm,
+    check_crls: bool,
+) -> xml_sec::policy::VerificationPolicy {
+    let mut policy = legacy_policy(algorithm);
+    policy.key_trust = chain_policy(check_crls);
+    policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(algorithm);
+    if algorithm == SignatureAlgorithm::DsaSha1 {
+        policy.key_trust.dsa_keys.minimum_modulus_bits = 1024;
+    }
+    policy
+}
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -197,13 +213,12 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
             lookup_certs,
             trusted_certs: vec![cert("ca.pem")],
-            trust: chain_policy(false),
             ..KeyResolverConfig::default()
         });
         assert_valid(
             name,
             VerifyContext::new()
-                .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
+                .policy(legacy_chain_policy(SignatureAlgorithm::DsaSha1, false))
                 .key_resolver(&resolver)
                 .allowed_uri_types(UriTypeSet::ALL)
                 .external_resources(&resources)
@@ -214,13 +229,12 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
     let retrieval = DefaultKeyResolver::new(KeyResolverConfig {
         lookup_certs: vec![cert("balor.pem")],
         trusted_certs: vec![cert("ca.pem")],
-        trust: chain_policy(false),
         ..KeyResolverConfig::default()
     });
     assert_valid(
         "signature-retrievalmethod-rawx509crt",
         VerifyContext::new()
-            .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
+            .policy(legacy_chain_policy(SignatureAlgorithm::DsaSha1, false))
             .key_resolver(&retrieval)
             .allowed_uri_types(UriTypeSet::ALL)
             .allowed_retrieval_method_uri_types(UriTypeSet::ALL)
@@ -234,11 +248,10 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
     let revoked_resources = external_resources();
     let revoked = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![cert("ca.pem")],
-        trust: chain_policy(true),
         ..KeyResolverConfig::default()
     });
     let revoked_error = VerifyContext::new()
-        .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
+        .policy(legacy_chain_policy(SignatureAlgorithm::DsaSha1, true))
         .key_resolver(&revoked)
         .allowed_uri_types(UriTypeSet::ALL)
         .external_resources(&revoked_resources)
@@ -260,14 +273,13 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
 
     let complex = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![cert("merlin.pem")],
-        trust: KeyTrustPolicy {
-            verification_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005)),
-            ..KeyTrustPolicy::default()
-        },
         ..KeyResolverConfig::default()
     });
+    let mut complex_policy = legacy_policy(SignatureAlgorithm::DsaSha1);
+    complex_policy.key_trust.verification_time =
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005));
     let result = VerifyContext::new()
-        .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
+        .policy(complex_policy)
         .key_resolver(&complex)
         .allowed_uri_types(UriTypeSet::ALL)
         .external_resources(&resources)
@@ -583,19 +595,20 @@ fn rejects_dtd_and_unsupported_retrieval_defaults() {
     let retrieval = DefaultKeyResolver::new(KeyResolverConfig {
         lookup_certs: vec![cert("balor.pem")],
         trusted_certs: vec![cert("ca.pem")],
-        trust: chain_policy(false),
         ..KeyResolverConfig::default()
     });
     let reference_error = VerifyContext::new()
-        .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
+        .policy(legacy_chain_policy(SignatureAlgorithm::DsaSha1, false))
         .key_resolver(&retrieval)
         .external_resources(&resources)
         .verify(&xml("signature-retrievalmethod-rawx509crt"))
         .expect_err("external SignedInfo reference must require an explicit opt-in");
     assert!(matches!(
         reference_error,
-        DsigError::DisallowedUri { uri }
-            if uri == "http://www.w3.org/TR/xml-stylesheet"
+        DsigError::Policy(xml_sec::policy::PolicyViolation::Uri {
+            operation: "verification",
+            reason: "reference URI class is not permitted",
+        })
     ));
 
     let retrieval_error = VerifyContext::new()
@@ -607,7 +620,9 @@ fn rejects_dtd_and_unsupported_retrieval_defaults() {
         .expect_err("external key retrieval must require its own explicit opt-in");
     assert!(matches!(
         retrieval_error,
-        DsigError::DisallowedUri { uri }
-            if uri == "tests/merlin-xmldsig-twenty-three/certs/balor.der"
+        DsigError::Policy(xml_sec::policy::PolicyViolation::Uri {
+            operation: "verification",
+            reason: "retrieval method URI class is not permitted",
+        })
     ));
 }

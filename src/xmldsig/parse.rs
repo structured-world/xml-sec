@@ -325,6 +325,10 @@ pub enum X509PublicKeyInfo {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParseError {
+    /// The default low-level parsing policy rejected bounded input.
+    #[error("XMLDSig policy violation: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
+
     /// The selected cryptographic provider could not evaluate parsed key metadata.
     #[error("cryptographic provider error: {0}")]
     Provider(#[from] crate::provider::ProviderError),
@@ -339,13 +343,6 @@ pub enum ParseError {
     /// Invalid structure (wrong child order, unexpected element, etc.).
     #[error("invalid structure: {0}")]
     InvalidStructure(String),
-
-    /// `<SignedInfo>` declared more references than one signature may process.
-    #[error("SignedInfo contains more than {max} Reference elements")]
-    TooManyReferences {
-        /// Maximum references accepted for one signature.
-        max: usize,
-    },
 
     /// Unsupported algorithm URI.
     #[error("unsupported algorithm: {uri}")]
@@ -442,9 +439,12 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
     for child in children {
         verify_ds_element(child, "Reference")?;
         if references.len() == crate::hard_limits::SIGNATURE_REFERENCE_CEILING {
-            return Err(ParseError::TooManyReferences {
-                max: crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
-            });
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "signature references",
+                maximum: crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
+                actual: references.len().saturating_add(1),
+            }
+            .into());
         }
         references.push(parse_reference_with_xpath_budget(child, xpath_budget)?);
     }
@@ -2329,6 +2329,7 @@ fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Resu
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
     use super::*;
+    use crate::xmldsig::TransformError;
     use base64::Engine;
 
     fn fixture_rsa_cert_base64() -> String {
@@ -4339,9 +4340,11 @@ BA== </Modulus>
 
         assert!(matches!(
             error,
-            ParseError::TooManyReferences {
-                max: MAX_REFERENCES_PER_SIGNATURE
-            }
+            ParseError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "signature references",
+                maximum: MAX_REFERENCES_PER_SIGNATURE,
+                actual: 65,
+            })
         ));
     }
 
@@ -4387,11 +4390,15 @@ BA== </Modulus>
         let error = parse_signed_info(document.root_element())
             .expect_err("signature-wide XPath expression count must be bounded");
 
-        assert!(
-            error
-                .to_string()
-                .contains("signature-wide XPath expression budget")
-        );
+        assert!(matches!(
+            error,
+            ParseError::Transform(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "XPath expressions",
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]

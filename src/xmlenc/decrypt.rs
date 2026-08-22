@@ -34,7 +34,11 @@ pub struct KeyCandidateBudget {
 impl KeyCandidateBudget {
     /// Create the fixed implementation-wide budget for one operation.
     pub fn for_operation() -> Self {
-        let maximum = crate::hard_limits::KEY_CANDIDATE_CEILING;
+        Self::with_limit(crate::hard_limits::KEY_CANDIDATE_CEILING)
+    }
+
+    /// Create a budget from a validated operation policy ceiling.
+    pub fn with_limit(maximum: usize) -> Self {
         Self {
             maximum,
             remaining: maximum,
@@ -49,14 +53,15 @@ impl KeyCandidateBudget {
     /// Charge attempted candidate work before performing it.
     pub fn consume(&mut self, count: usize, resource: &'static str) -> Result<(), XmlEncError> {
         if count > self.remaining {
-            return Err(XmlEncError::KeyCandidateLimitExceeded {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource,
                 maximum: self.maximum,
                 actual: self
                     .maximum
                     .saturating_sub(self.remaining)
                     .saturating_add(count),
-            });
+            }
+            .into());
         }
         self.remaining -= count;
         Ok(())
@@ -106,16 +111,11 @@ pub trait DecryptionKeyResolver {
     }
 }
 
-/// XML parser controls for caller-owned document decryption.
+/// Caller-owned target selection for document decryption.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DocumentDecryptionOptions<'a> {
     /// Select a specific `EncryptedData` by its `Id` attribute.
     pub encrypted_data_id: Option<&'a str>,
-    /// Permit an internal DTD subset while parsing the caller's document.
-    ///
-    /// This is disabled by default. No external entity resolver is installed,
-    /// so external resources are never loaded by this API.
-    pub allow_dtd: bool,
 }
 
 /// Immutable XMLEnc decryption operation context.
@@ -127,7 +127,7 @@ pub struct DecryptContext<'a> {
 }
 
 impl<'a> DecryptContext<'a> {
-    /// Create a context with compatibility defaults and the RustCrypto provider.
+    /// Create a context with the default decryption policy and RustCrypto provider.
     pub fn new(resolver: &'a dyn DecryptionKeyResolver) -> Self {
         Self {
             resolver,
@@ -559,25 +559,21 @@ pub fn decrypt_document(
 ) -> Result<String, XmlEncError> {
     decrypt_document_with_options(
         xml,
-        DocumentDecryptionOptions {
-            encrypted_data_id,
-            allow_dtd: false,
-        },
+        DocumentDecryptionOptions { encrypted_data_id },
         resolver,
     )
 }
 
-/// Decrypt and replace one `EncryptedData` using explicit XML parser controls.
+/// Decrypt and replace one `EncryptedData` using the default decryption policy.
+///
+/// Use [`DecryptContext`] when XML-input or resource policy must differ from
+/// the secure defaults; options here contain request selection only.
 pub fn decrypt_document_with_options(
     xml: &str,
     options: DocumentDecryptionOptions<'_>,
     resolver: &dyn DecryptionKeyResolver,
 ) -> Result<String, XmlEncError> {
-    let mut policy = crate::policy::DecryptionPolicy::default();
-    policy.xml.allow_internal_dtd = options.allow_dtd;
-    DecryptContext::new(resolver)
-        .policy(policy)
-        .decrypt_document(xml, options.encrypted_data_id)
+    DecryptContext::new(resolver).decrypt_document(xml, options.encrypted_data_id)
 }
 
 #[derive(Clone, Copy)]
@@ -781,7 +777,7 @@ fn resolve_content_key_candidates(
     resolver: &dyn DecryptionKeyResolver,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<Vec<Vec<u8>>, XmlEncError> {
-    let mut budget = KeyCandidateBudget::for_operation();
+    let mut budget = KeyCandidateBudget::with_limit(policy.resources.max_key_candidates);
     let mut last_error = None;
     let mut candidates =
         match resolve_candidates_with_budget(resolver, provider, algorithm, None, &mut budget) {
@@ -824,7 +820,7 @@ fn record_candidate_source_error(
     // Candidate-specific failures permit the next ordered key source. The
     // shared work ceiling is operation-wide and must never be recoverable by
     // advancing to another recipient.
-    if matches!(&error, XmlEncError::KeyCandidateLimitExceeded { .. }) {
+    if matches!(&error, XmlEncError::Policy(_)) {
         return Err(error);
     }
     *last_error = Some(error);
@@ -1019,10 +1015,12 @@ fn validate_typed_cipher_values(
     };
     let projected = validate_cipher_value_len(&encrypted.cipher_data.value, maximum_ciphertext)?;
     if projected > maximum_ciphertext {
-        return Err(XmlEncError::PlaintextTooLarge {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "encryption plaintext bytes",
             maximum: maximum_plaintext,
             actual: projected.saturating_sub(algorithm.minimum_ciphertext_len()),
-        });
+        }
+        .into());
     }
 
     let mut aggregate_encoded = encrypted.cipher_data.value.len();
@@ -1143,7 +1141,12 @@ fn validate_plaintext_len(actual: usize, maximum: usize) -> Result<(), XmlEncErr
     if actual <= maximum {
         Ok(())
     } else {
-        Err(XmlEncError::PlaintextTooLarge { maximum, actual })
+        Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: "encryption plaintext bytes",
+            maximum,
+            actual,
+        }
+        .into())
     }
 }
 
@@ -1952,11 +1955,52 @@ mod tests {
 
         assert!(matches!(
             error,
-            XmlEncError::KeyCandidateLimitExceeded {
+            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                 resource: "decryption key candidates",
                 maximum: crate::hard_limits::KEY_CANDIDATE_CEILING,
                 actual: observed,
-            } if observed == actual
+            }) if observed == actual
+        ));
+    }
+
+    #[test]
+    fn operation_policy_controls_candidate_budget() {
+        // A deployment-selected ceiling must reach resolver accounting; the
+        // hard implementation ceiling is not the effective runtime policy.
+        let encrypted = EncryptedData {
+            id: None,
+            encrypted_type: None,
+            encryption_method: EncryptionMethod {
+                algorithm: DataEncryptionAlgorithm::Aes128Gcm.uri().into(),
+                key_size_bits: None,
+                oaep_digest: None,
+                mgf_algorithm: None,
+                oaep_params: None,
+            },
+            key_name: None,
+            encrypted_keys: Vec::new(),
+            cipher_data: CipherData {
+                value: STANDARD.encode(vec![0_u8; 28]),
+            },
+        };
+        let resolver = CandidateResolver {
+            keys: vec![vec![0_u8; 16]; 3],
+        };
+        let mut policy = crate::policy::DecryptionPolicy::default();
+        policy.resources.max_key_candidates = 2;
+
+        let error = DecryptContext::new(&resolver)
+            .policy(policy)
+            .decrypt_data(&encrypted)
+            .expect_err("candidate accounting must use the operation policy ceiling");
+
+        assert!(matches!(
+            error,
+            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "decryption key candidates",
+                maximum: 2,
+                actual: 3,
+            })
         ));
     }
 
@@ -2007,11 +2051,11 @@ mod tests {
 
         assert!(matches!(
             error,
-            XmlEncError::KeyCandidateLimitExceeded {
+            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                 resource: "RSA private-key candidates",
                 maximum: crate::hard_limits::KEY_CANDIDATE_CEILING,
                 actual,
-            } if actual == crate::hard_limits::KEY_CANDIDATE_CEILING + 1
+            }) if actual == crate::hard_limits::KEY_CANDIDATE_CEILING + 1
         ));
     }
 
@@ -2954,10 +2998,13 @@ mod tests {
             DecryptContext::new(&SymmetricKeyDecryptor::new([0_u8; 16]))
                 .policy(policy)
                 .decrypt_data(&bounded),
-            Err(XmlEncError::PlaintextTooLarge {
-                maximum: 3,
-                actual: 4
-            })
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "encryption plaintext bytes",
+                    maximum: 3,
+                    actual: 4
+                }
+            ))
         ));
 
         let cbc_ciphertext = crate::provider::default_provider()
@@ -3028,11 +3075,13 @@ mod tests {
             DecryptContext::new(&SymmetricKeyDecryptor::new([0_u8; 16]))
                 .policy(policy)
                 .decrypt_data(&encrypted),
-            Err(XmlEncError::EncryptionMetadataTooLarge {
-                field: "EncryptedData Id",
-                maximum: 8,
-                actual: 9,
-            })
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "EncryptedData Id",
+                    maximum: 8,
+                    actual: 9,
+                }
+            ))
         ));
     }
 
@@ -3072,7 +3121,12 @@ mod tests {
             DecryptContext::new(&SymmetricKeyDecryptor::new(key))
                 .policy(policy)
                 .decrypt_data(&encrypted),
-            Err(XmlEncError::PlaintextTooLarge { .. })
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "encryption plaintext bytes",
+                    ..
+                }
+            ))
         ));
 
         encrypted.cipher_data.value = STANDARD.encode([0_u8; 28]);
@@ -3596,17 +3650,14 @@ mod tests {
             decrypt_document(&with_dtd, None, &SymmetricKeyDecryptor::new(key)),
             Err(XmlEncError::XmlParse(roxmltree::Error::DtdDetected))
         ));
+        let mut policy = crate::policy::DecryptionPolicy::default();
+        policy.xml.allow_internal_dtd = true;
         assert!(
-            decrypt_document_with_options(
-                &with_dtd,
-                DocumentDecryptionOptions {
-                    encrypted_data_id: None,
-                    allow_dtd: true,
-                },
-                &SymmetricKeyDecryptor::new(key),
-            )
-            .expect("explicit internal-DTD opt-in must decrypt")
-            .contains("plaintext")
+            DecryptContext::new(&SymmetricKeyDecryptor::new(key))
+                .policy(policy)
+                .decrypt_document(&with_dtd, None)
+                .expect("explicit internal-DTD opt-in must decrypt")
+                .contains("plaintext")
         );
     }
 

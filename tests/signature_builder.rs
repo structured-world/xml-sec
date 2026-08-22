@@ -1,4 +1,5 @@
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::policy::{PolicyViolation, SigningPolicy};
 use xml_sec::xmldsig::transforms::MAX_TRANSFORMS_PER_REFERENCE;
 use xml_sec::xmldsig::{
     DigestAlgorithm, ReferenceBuilder, SignatureAlgorithm, SignatureBuilder, SignatureBuilderError,
@@ -170,7 +171,11 @@ fn rejects_too_many_references_before_serialization() {
 
     assert!(matches!(
         error,
-        SignatureBuilderError::TooManyReferences { count: 65, max: 64 }
+        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+            resource: "signature references",
+            maximum: 64,
+            actual: 65,
+        })
     ));
 }
 
@@ -187,7 +192,13 @@ fn rejects_transform_chains_that_execution_cannot_accept() {
         .build_template()
         .expect_err("builder must reject an oversized transform chain");
 
-    assert!(error.to_string().contains("transform chain"));
+    assert!(matches!(
+        error,
+        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+            resource: "reference transforms",
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -235,8 +246,13 @@ fn rejects_xpath_namespace_budget_before_serialization() {
         .build_template()
         .expect_err("builder must enforce the parser's aggregate namespace budget");
 
-    assert!(matches!(error, SignatureBuilderError::InvalidXPath(_)));
-    assert!(error.to_string().contains("namespace binding budget"));
+    assert!(matches!(
+        error,
+        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+            resource: "XPath namespace bindings",
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -271,12 +287,13 @@ fn rejects_signature_wide_xpath_expression_budget() {
         .build_template()
         .expect_err("builder must enforce the signature-wide XPath expression budget");
 
-    assert!(matches!(error, SignatureBuilderError::InvalidXPath(_)));
-    assert!(
-        error
-            .to_string()
-            .contains("signature-wide XPath expression budget")
-    );
+    assert!(matches!(
+        error,
+        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+            resource: "XPath expressions",
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -302,8 +319,37 @@ fn rejects_inherited_signature_prefix_over_namespace_budget() {
         .build_template()
         .expect_err("builder must count inherited namespace bindings on every XPath element");
 
-    assert!(matches!(error, SignatureBuilderError::InvalidXPath(_)));
-    assert!(error.to_string().contains("namespace binding budget"));
+    assert!(matches!(
+        error,
+        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+            resource: "XPath namespace bindings",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn policy_aware_builder_uses_the_callers_resource_snapshot() {
+    // The high-level signing path must not silently validate against defaults
+    // before applying its caller-selected immutable policy.
+    let mut policy = SigningPolicy::default();
+    policy.resources.max_references = 1;
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#first"))
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#second"));
+
+    let error = builder
+        .build_template_with_policy(&policy)
+        .expect_err("the selected signing policy must reach the builder");
+
+    assert!(matches!(
+        error,
+        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+            resource: "signature references",
+            maximum: 1,
+            actual: 2,
+        })
+    ));
 }
 
 #[test]
@@ -477,17 +523,27 @@ fn rejects_invalid_filter2_expression_counts() {
         })
         .collect::<Vec<_>>();
 
-    for filters in [Vec::new(), oversized] {
-        let error = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+    let build = |filters| {
+        SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
             .add_reference(
                 ReferenceBuilder::new(DigestAlgorithm::Sha256)
                     .transform(Transform::XPathFilter2(filters)),
             )
             .build_template()
-            .expect_err("invalid Filter2 cardinality must fail at the builder boundary");
+    };
 
-        assert!(error.to_string().contains("between 1 and 64"));
-    }
+    assert!(matches!(
+        build(Vec::new()).expect_err("empty Filter2 must fail at the builder boundary"),
+        SignatureBuilderError::InvalidXPath(_)
+    ));
+    assert!(matches!(
+        build(oversized).expect_err("oversized Filter2 must fail at the builder boundary"),
+        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+            resource: "XPath Filter 2.0 expressions",
+            maximum: 64,
+            actual: 65,
+        })
+    ));
 }
 
 #[test]
