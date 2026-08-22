@@ -352,14 +352,15 @@ fn policy_aware_builder_validates_optimized_xpath_wire_form() {
     };
     policies.push(("XPath namespace bindings", namespace_bindings));
 
-    for (resource, policy) in policies {
+    for (expected_resource, policy) in policies {
         let error = builder()
             .build_template_with_policy(&policy)
             .expect_err("optimized XPath wire content must obey builder policy");
-        assert!(
-            error.to_string().contains(resource),
-            "expected {resource} rejection, got {error}"
-        );
+        let SignatureBuilderError::Policy(PolicyViolation::ResourceLimit { resource, .. }) = error
+        else {
+            panic!("expected {expected_resource} resource rejection, got {error}");
+        };
+        assert_eq!(resource, expected_resource);
     }
 }
 
