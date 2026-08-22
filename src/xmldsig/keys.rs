@@ -309,7 +309,11 @@ impl KeyCandidateBudget {
     }
 
     fn charge(&mut self) -> Result<(), DsigError> {
-        self.attempted = self.attempted.saturating_add(1);
+        self.charge_many(1)
+    }
+
+    fn charge_many(&mut self, count: usize) -> Result<(), DsigError> {
+        self.attempted = self.attempted.saturating_add(count);
         if self.attempted > self.maximum {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::KEY_CANDIDATES,
@@ -347,14 +351,7 @@ impl DefaultKeyResolver {
             if trust.verify_x509_chains {
                 self.prepare_embedded_x509(info, signing_index, trust, provider, budget)?;
             } else {
-                let mut unique = Vec::<&[u8]>::new();
-                for certificate in &info.certificates {
-                    if unique.contains(&certificate.as_slice()) {
-                        continue;
-                    }
-                    budget.charge()?;
-                    unique.push(certificate);
-                }
+                budget.charge_many(info.certificates.len())?;
             }
             info.certificates
                 .get(signing_index)
@@ -425,6 +422,7 @@ impl DefaultKeyResolver {
         };
         let mut trusted_prefix_len = 0;
         for certificate in &self.config.trusted_certs {
+            budget.charge()?;
             if available
                 .certificates
                 .iter()
@@ -432,7 +430,6 @@ impl DefaultKeyResolver {
             {
                 continue;
             }
-            budget.charge()?;
             available.parsed_certificates.push(
                 parse_x509_certificate(certificate)
                     .map_err(|_| KeyResolutionError::InvalidCertificate)?,
@@ -441,6 +438,7 @@ impl DefaultKeyResolver {
             trusted_prefix_len += 1;
         }
         for certificate in self.config.lookup_certs.iter().chain(&info.certificates) {
+            budget.charge()?;
             if available
                 .certificates
                 .iter()
@@ -448,7 +446,6 @@ impl DefaultKeyResolver {
             {
                 continue;
             }
-            budget.charge()?;
             available.parsed_certificates.push(
                 parse_x509_certificate(certificate)
                     .map_err(|_| KeyResolutionError::InvalidCertificate)?,
@@ -608,6 +605,7 @@ impl DefaultKeyResolver {
                     .map(|certificate| (false, certificate)),
             )
         {
+            budget.charge()?;
             if available
                 .certificates
                 .iter()
@@ -615,7 +613,6 @@ impl DefaultKeyResolver {
             {
                 continue;
             }
-            budget.charge()?;
             let parsed = parse_x509_certificate(certificate_der)
                 .map_err(|_| KeyResolutionError::InvalidCertificate)?;
             let is_match =
@@ -2990,6 +2987,68 @@ mod tests {
             &policy,
         ) {
             Ok(_) => panic!("the second embedded certificate must exceed the candidate budget"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                maximum: 1,
+                actual: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn operation_policy_charges_duplicate_configured_x509_candidates() {
+        // Deduplication may avoid repeated parsing, but inspecting a duplicate
+        // resolver entry still consumes work and must not bypass the budget.
+        let certificate = certificate_der(RSA_4096_CERTIFICATE);
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![certificate.clone(), certificate],
+            ..KeyResolverConfig::default()
+        });
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_key_candidates = 1;
+
+        let error = super::super::VerifyContext::new()
+            .policy(policy)
+            .key_resolver(&resolver)
+            .verify(&x509_signature_with_leaf_subject())
+            .expect_err("the duplicate configured entry must consume candidate work");
+
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                maximum: 1,
+                actual: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn operation_policy_charges_duplicate_embedded_x509_candidates() {
+        // Public callers can construct KeyInfo without passing through parser
+        // entry limits, so duplicate embedded entries must consume the budget.
+        let certificate = certificate_der(RSA_4096_CERTIFICATE);
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                certificates: vec![certificate.clone(), certificate],
+                certificate_chain: vec![0],
+                ..X509DataInfo::default()
+            })],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_key_candidates = 1;
+
+        let error = match DefaultKeyResolver::default().resolve_with_policy(
+            Some(&key_info),
+            SignatureAlgorithm::RsaSha256,
+            &policy,
+        ) {
+            Ok(_) => panic!("the duplicate embedded entry must consume candidate work"),
             Err(error) => error,
         };
 

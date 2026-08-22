@@ -374,6 +374,13 @@ impl TransformExecutionBudget {
         self.xpath.charge(work)
     }
 
+    pub(crate) fn validate_xpath_context_evaluations(
+        &self,
+        actual: usize,
+    ) -> Result<(), TransformError> {
+        self.xpath.validate_context_evaluations(actual)
+    }
+
     pub(crate) fn charge_node_filter_work(&self, nodes: usize) -> Result<(), TransformError> {
         self.node_filter.charge(nodes)
     }
@@ -1866,6 +1873,20 @@ impl XPathSignatureParseBudget {
         )
         .map(|_| ())
         .map_err(TransformError::XPath)
+    }
+
+    pub(crate) fn validate_namespaces(
+        &self,
+        namespaces: &BTreeMap<String, String>,
+    ) -> Result<(), TransformError> {
+        let mut budget = XPathNamespaceBudget::with_limits(
+            self.max_namespace_bindings,
+            self.max_namespace_bytes,
+        );
+        for (prefix, uri) in namespaces {
+            budget.charge(prefix, uri)?;
+        }
+        Ok(())
     }
 
     fn error(&self) -> TransformError {

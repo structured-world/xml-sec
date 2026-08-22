@@ -1541,10 +1541,16 @@ fn materialize_retrieval_methods_with_budgets(
                         reason: "untransformed X509Data RetrievalMethod must target X509Data directly",
                     });
                 }
-                RetrievalMethodTransforms::X509DataNodeSetFilter { expression } => {
+                RetrievalMethodTransforms::X509DataNodeSetFilter {
+                    expression,
+                    namespaces,
+                } => {
                     enforce_transform_allowed(allowed_transforms, XPATH_TRANSFORM_URI)?;
                     xpath_parse_budget
                         .validate_expression(&expression)
+                        .map_err(ReferenceProcessingError::Transform)?;
+                    xpath_parse_budget
+                        .validate_namespaces(&namespaces)
                         .map_err(ReferenceProcessingError::Transform)?;
                     select_retrieved_x509_data_root(target, execution_budget)?
                 }
@@ -1581,6 +1587,9 @@ fn select_retrieved_x509_data_root<'a, 'input>(
     // dereferenced node-set. `ancestor-or-self::ds:X509Data` therefore retains
     // one X509Data descendant and its subtree; it cannot import an ancestor
     // that was outside the URI target's node-set.
+    execution_budget
+        .validate_xpath_context_evaluations(target.descendants().count())
+        .map_err(ReferenceProcessingError::Transform)?;
     let mut root = None;
     for candidate in target.descendants() {
         execution_budget
@@ -4297,6 +4306,78 @@ mod tests {
             ),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn retrieval_method_xpath_obeys_namespace_binding_limit() {
+        // The specialized RetrievalMethod path must retain the XPath element's
+        // in-scope namespaces and enforce the same limit as ordinary XPath.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xpath_namespace_bindings = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath namespaces must obey the binding limit");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_NAMESPACE_BINDINGS,
+                    maximum: 0,
+                    actual,
+                }
+            ) if actual > 0
+        ));
+    }
+
+    #[test]
+    fn retrieval_method_xpath_obeys_namespace_byte_limit() {
+        // Prefix and URI bytes retained from the XPath namespace axis consume
+        // the same per-expression byte budget as an ordinary XPath transform.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xpath_namespace_bytes = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath namespaces must obey the byte limit");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_NAMESPACE_BYTES,
+                    maximum: 0,
+                    actual,
+                }
+            ) if actual > 0
+        ));
+    }
+
+    #[test]
+    fn retrieval_method_xpath_obeys_context_evaluation_limit() {
+        // Even a recognized fixed expression is evaluated once per node in the
+        // dereferenced set and must obey the ordinary XPath context ceiling.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xpath_context_evaluations = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&retrieval_method_xpath_signature())
+            .expect_err("RetrievalMethod XPath contexts must obey the evaluation limit");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_CONTEXT_EVALUATIONS,
+                    maximum: 0,
+                    actual,
+                }
+            ) if actual > 0
+        ));
     }
 
     #[test]

@@ -139,6 +139,17 @@ impl XPathWorkBudget {
         Ok(())
     }
 
+    pub(super) fn validate_context_evaluations(&self, actual: usize) -> Result<(), TransformError> {
+        if actual > self.limits.context_evaluations {
+            return Err(transform_resource_limit(
+                crate::policy::resource_name::XPATH_CONTEXT_EVALUATIONS,
+                self.limits.context_evaluations,
+                actual,
+            ));
+        }
+        Ok(())
+    }
+
     fn charge_function(&self, work: usize) -> Result<(), function::Error> {
         self.charge(work).map_err(|error| function::Error::Other {
             what: error.to_string(),
@@ -1576,13 +1587,7 @@ fn evaluate_expression<'a>(
             .into_iter()
             .filter(|node| mirror.input_contains(document, input, node))
             .collect::<Vec<_>>();
-        if ordered_nodes.len() > work_budget.limits.context_evaluations {
-            return Err(transform_resource_limit(
-                crate::policy::resource_name::XPATH_CONTEXT_EVALUATIONS,
-                work_budget.limits.context_evaluations,
-                ordered_nodes.len(),
-            ));
-        }
+        work_budget.validate_context_evaluations(ordered_nodes.len())?;
         // SXD has no interrupt hook and XPath coercions can materialize or scan
         // any mirrored string. Charge the complete source string volume for
         // every context before entering the evaluator; syntax-based discounts

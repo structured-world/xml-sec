@@ -21,6 +21,7 @@ use der::{
     asn1::{Ia5StringRef, ObjectIdentifier},
 };
 use roxmltree::{Document, Node};
+use std::collections::BTreeMap;
 use x509_cert::ext::pkix::name::DirectoryString;
 use x509_cert::name::Name;
 use x509_parser::extensions::ParsedExtension;
@@ -208,6 +209,8 @@ pub enum RetrievalMethodTransforms {
     X509DataNodeSetFilter {
         /// Original expression retained for operation policy accounting.
         expression: String,
+        /// Namespace axis visible from the XPath parameter element.
+        namespaces: BTreeMap<String, String>,
     },
     /// A transform chain attached to a RetrievalMethod type this implementation
     /// does not materialize. Resolvers may ignore this advisory key source and
@@ -773,8 +776,17 @@ fn parse_retrieval_method_transforms(
             "unsupported RetrievalMethod XPath selection".into(),
         ));
     }
+    let namespaces = xpath
+        .namespaces()
+        .filter_map(|namespace| {
+            namespace
+                .name()
+                .map(|prefix| (prefix.to_owned(), namespace.uri().to_owned()))
+        })
+        .collect();
     Ok(RetrievalMethodTransforms::X509DataNodeSetFilter {
         expression: expression.to_owned(),
+        namespaces,
     })
 }
 
