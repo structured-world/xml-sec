@@ -295,6 +295,33 @@ pub struct DefaultKeyResolver {
     config: KeyResolverConfig,
 }
 
+struct KeyCandidateBudget {
+    maximum: usize,
+    attempted: usize,
+}
+
+impl KeyCandidateBudget {
+    fn new(maximum: usize) -> Self {
+        Self {
+            maximum,
+            attempted: 0,
+        }
+    }
+
+    fn charge(&mut self) -> Result<(), DsigError> {
+        self.attempted = self.attempted.saturating_add(1);
+        if self.attempted > self.maximum {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                maximum: self.maximum,
+                actual: self.attempted,
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
 impl DefaultKeyResolver {
     /// Construct a resolver from explicit caller-owned key and certificate stores.
     #[must_use]
@@ -314,19 +341,28 @@ impl DefaultKeyResolver {
         algorithm: SignatureAlgorithm,
         trust: &crate::policy::KeyTrustPolicy,
         provider: &dyn crate::provider::CryptoProvider,
+        budget: &mut KeyCandidateBudget,
     ) -> Result<Option<VerificationKey>, DsigError> {
         let certificate_der = if let Some(&signing_index) = info.certificate_chain.first() {
-            let certificate_der = info
-                .certificates
+            if trust.verify_x509_chains {
+                self.prepare_embedded_x509(info, signing_index, trust, provider, budget)?;
+            } else {
+                let mut unique = Vec::<&[u8]>::new();
+                for certificate in &info.certificates {
+                    if unique.contains(&certificate.as_slice()) {
+                        continue;
+                    }
+                    budget.charge()?;
+                    unique.push(certificate);
+                }
+            }
+            info.certificates
                 .get(signing_index)
                 .ok_or(KeyResolutionError::InvalidCertificate)?
-                .clone();
-            if trust.verify_x509_chains {
-                self.prepare_embedded_x509(info, signing_index, trust, provider)?;
-            }
-            certificate_der
+                .clone()
         } else {
-            let Some(selected) = self.resolve_configured_x509(info, trust, provider)? else {
+            let Some(selected) = self.resolve_configured_x509(info, trust, provider, budget)?
+            else {
                 return Ok(None);
             };
             selected
@@ -377,7 +413,8 @@ impl DefaultKeyResolver {
         signing_index: usize,
         trust: &crate::policy::KeyTrustPolicy,
         provider: &dyn crate::provider::CryptoProvider,
-    ) -> Result<X509DataInfo, KeyResolutionError> {
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<X509DataInfo, DsigError> {
         let signing_der = info
             .certificates
             .get(signing_index)
@@ -395,6 +432,7 @@ impl DefaultKeyResolver {
             {
                 continue;
             }
+            budget.charge()?;
             available.parsed_certificates.push(
                 parse_x509_certificate(certificate)
                     .map_err(|_| KeyResolutionError::InvalidCertificate)?,
@@ -410,6 +448,7 @@ impl DefaultKeyResolver {
             {
                 continue;
             }
+            budget.charge()?;
             available.parsed_certificates.push(
                 parse_x509_certificate(certificate)
                     .map_err(|_| KeyResolutionError::InvalidCertificate)?,
@@ -541,6 +580,7 @@ impl DefaultKeyResolver {
         info: &X509DataInfo,
         trust: &crate::policy::KeyTrustPolicy,
         provider: &dyn crate::provider::CryptoProvider,
+        budget: &mut KeyCandidateBudget,
     ) -> Result<Option<X509DataInfo>, DsigError> {
         if !x509_data_has_lookup_identifiers(info) {
             return Ok(None);
@@ -575,6 +615,7 @@ impl DefaultKeyResolver {
             {
                 continue;
             }
+            budget.charge()?;
             let parsed = parse_x509_certificate(certificate_der)
                 .map_err(|_| KeyResolutionError::InvalidCertificate)?;
             let is_match =
@@ -739,17 +780,9 @@ impl DefaultKeyResolver {
         let Some(key_info) = key_info else {
             return Ok(None);
         };
+        let mut candidate_budget = KeyCandidateBudget::new(resources.max_key_candidates);
         let mut deferred_key_value_error = None;
-        for (index, source) in key_info.sources.iter().enumerate() {
-            let attempted = index.saturating_add(1);
-            if attempted > resources.max_key_candidates {
-                return Err(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::KEY_CANDIDATES,
-                    maximum: resources.max_key_candidates,
-                    actual: attempted,
-                }
-                .into());
-            }
+        for source in &key_info.sources {
             let resolved = match source {
                 KeyInfoSource::X509Data(info) => {
                     if !sources.x509_data {
@@ -758,9 +791,10 @@ impl DefaultKeyResolver {
                         }
                         .into());
                     }
-                    self.resolve_x509(info, algorithm, trust, provider)?
+                    self.resolve_x509(info, algorithm, trust, provider, &mut candidate_budget)?
                 }
                 KeyInfoSource::DerEncodedKeyValue(public_key_bytes) => {
+                    candidate_budget.charge()?;
                     if !sources.der_encoded_key_value {
                         return Err(crate::policy::PolicyViolation::KeyTrust {
                             reason: "DEREncodedKeyValue key sources are disabled",
@@ -776,6 +810,7 @@ impl DefaultKeyResolver {
                     })
                 }
                 KeyInfoSource::KeyName(name) => {
+                    candidate_budget.charge()?;
                     if !sources.key_name {
                         return Err(crate::policy::PolicyViolation::KeyTrust {
                             reason: "KeyName key sources are disabled",
@@ -795,6 +830,7 @@ impl DefaultKeyResolver {
                         .transpose()?
                 }
                 KeyInfoSource::KeyValue(key_value) => {
+                    candidate_budget.charge()?;
                     if !sources.key_value {
                         return Err(crate::policy::PolicyViolation::KeyTrust {
                             reason: "KeyValue key sources are disabled",
@@ -810,7 +846,10 @@ impl DefaultKeyResolver {
                         Err(error) => return Err(error.into()),
                     }
                 }
-                KeyInfoSource::RetrievalMethod { .. } => None,
+                KeyInfoSource::RetrievalMethod { .. } => {
+                    candidate_budget.charge()?;
+                    None
+                }
             };
             if let Some(key) = resolved {
                 return Ok(Some(Box::new(PolicyBoundVerificationKey {
@@ -2894,6 +2933,74 @@ mod tests {
                 .expect("two allowed attempts must reach the named key")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn operation_policy_bounds_configured_x509_selector_candidates() {
+        // One X509Data selector can fan out across the resolver-owned store.
+        // Every distinct certificate inspected is candidate work, rather than
+        // the complete store counting as one KeyInfo source.
+        let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+            lookup_certs: vec![
+                certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
+                certificate_der(RSA_4096_CERTIFICATE),
+            ],
+            ..KeyResolverConfig::default()
+        });
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_key_candidates = 1;
+
+        let error = super::super::VerifyContext::new()
+            .policy(policy)
+            .key_resolver(&resolver)
+            .verify(&x509_signature_with_leaf_subject())
+            .expect_err("the second configured certificate must exceed the candidate budget");
+
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                maximum: 1,
+                actual: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn operation_policy_bounds_embedded_x509_certificate_candidates() {
+        // Embedded X509Data is also composite key material. Its certificate
+        // entries must not collapse into one candidate merely because they
+        // share a single KeyInfo source node.
+        let key_info = KeyInfo {
+            sources: vec![KeyInfoSource::X509Data(X509DataInfo {
+                certificates: vec![
+                    certificate_der(RSA_4096_CERTIFICATE),
+                    certificate_der(include_str!("../../tests/fixtures/keys/ca2cert.pem")),
+                ],
+                certificate_chain: vec![0],
+                ..X509DataInfo::default()
+            })],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_key_candidates = 1;
+
+        let error = match DefaultKeyResolver::default().resolve_with_policy(
+            Some(&key_info),
+            SignatureAlgorithm::RsaSha256,
+            &policy,
+        ) {
+            Ok(_) => panic!("the second embedded certificate must exceed the candidate budget"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                maximum: 1,
+                actual: 2,
+            })
+        ));
     }
 
     #[test]

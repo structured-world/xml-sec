@@ -30,6 +30,7 @@ pub(crate) mod resource_name {
     pub const EXTERNAL_RESOURCE_BYTES: &str = "external resource bytes";
     pub const AGGREGATE_EXTERNAL_RESOURCE_BYTES: &str = "aggregate external resource bytes";
     pub const ENCRYPTION_PLAINTEXT_BYTES: &str = "encryption plaintext bytes";
+    #[cfg(feature = "xmlenc")]
     pub const AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES: &str =
         "aggregate encryption CipherValue bytes";
     pub const XML_DOCUMENT: &str = "XML document";
@@ -306,7 +307,7 @@ pub struct ResourcePolicy {
     pub max_encryption_recipients: usize,
     /// Maximum caller-controlled XMLEnc metadata bytes per field.
     pub max_encryption_metadata_bytes: usize,
-    /// Maximum key candidates attempted by one operation.
+    /// Maximum key and certificate candidates inspected by one operation.
     pub max_key_candidates: usize,
     /// Maximum bytes accepted by Base64 transforms before decoding.
     pub max_base64_transform_input_bytes: usize,
