@@ -419,6 +419,102 @@ pub(super) fn fill_signature_value_at_index_with_options(
     )
 }
 
+pub(super) fn projected_signature_value_output_len_at_index_with_options(
+    xml: &str,
+    value_len: usize,
+    target_signature: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<usize, XmlMutationError> {
+    let document = parse_mutation_xml_with_options(xml, policy)?;
+    let Some(signature) = signature_node(&document, target_signature) else {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "SignatureValue",
+            expected: 0,
+            actual: 1,
+        });
+    };
+    let mut signature_values = signature
+        .children()
+        .filter(|node| is_dsig_node(*node, "SignatureValue"));
+    let Some(signature_value) = signature_values.next() else {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "SignatureValue",
+            expected: 0,
+            actual: 1,
+        });
+    };
+    let remaining = signature_values.count();
+    if remaining != 0 {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "SignatureValue",
+            expected: remaining + 1,
+            actual: 1,
+        });
+    }
+
+    let range = signature_value.range();
+    let element = &xml[range.clone()];
+    let replacement_len = if element.trim_end().ends_with("/>") {
+        let name_end = element[1..]
+            .find(|character: char| {
+                character.is_ascii_whitespace() || character == '/' || character == '>'
+            })
+            .map(|offset| offset + 1)
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let qualified_name_len = name_end - 1;
+        qualified_name_len
+            .checked_add(2)
+            .and_then(|closing_markup_len| {
+                element
+                    .len()
+                    .checked_add(value_len)
+                    .and_then(|length| length.checked_add(closing_markup_len))
+            })
+    } else {
+        let existing_content_len = element_inner_xml(xml, range.clone())?.len();
+        element
+            .len()
+            .checked_sub(existing_content_len)
+            .and_then(|length| length.checked_add(value_len))
+    };
+    let projected = replacement_len
+        .and_then(|replacement_len| {
+            xml.len()
+                .checked_sub(element.len())
+                .map(|base| (base, replacement_len))
+        })
+        .and_then(|(base, replacement_len)| base.checked_add(replacement_len));
+    projected.ok_or_else(|| projected_xml_length_overflow(policy))
+}
+
+pub(super) fn padded_base64_len_for_xml(
+    decoded_len: usize,
+    policy: &crate::policy::SigningPolicy,
+) -> Result<usize, XmlMutationError> {
+    base64::encoded_len(decoded_len, true)
+        .ok_or_else(|| projected_xml_length_overflow(Some(policy)))
+}
+
+pub(super) fn zero_base64_placeholder(decoded_len: usize, encoded_len: usize) -> String {
+    let padding_len = (3 - decoded_len % 3) % 3;
+    let mut placeholder = String::with_capacity(encoded_len);
+    placeholder.extend(std::iter::repeat_n('A', encoded_len - padding_len));
+    placeholder.extend(std::iter::repeat_n('=', padding_len));
+    placeholder
+}
+
+fn projected_xml_length_overflow(
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> XmlMutationError {
+    policy.map_or(XmlMutationError::InvalidAppendTarget, |policy| {
+        XmlMutationError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::XML_DOCUMENT,
+            maximum: policy.resources.max_xml_document_bytes,
+            actual: usize::MAX,
+        })
+    })
+}
+
 /// Fill the direct `<Signature>/<KeyInfo>` child with XML child content.
 pub fn fill_key_info(xml: &str, key_info_content: &str) -> Result<String, XmlMutationError> {
     fill_key_info_with_options(xml, key_info_content, None)
@@ -1475,6 +1571,37 @@ mod tests {
             );
         }
         builder.build_template().expect("valid template")
+    }
+
+    #[test]
+    fn signature_value_projection_matches_streaming_mutation() {
+        // Allocation preflight must predict the exact serializer output for
+        // both XML spellings accepted as an empty SignatureValue placeholder.
+        for placeholder in [
+            "<ds:SignatureValue/>",
+            "<ds:SignatureValue></ds:SignatureValue>",
+        ] {
+            let xml = format!(
+                "<root><ds:Signature xmlns:ds=\"{XMLDSIG_NS}\"><ds:SignedInfo/>{placeholder}</ds:Signature></root>"
+            );
+            let value = "A".repeat(341);
+            let projected = projected_signature_value_output_len_at_index_with_options(
+                &xml,
+                value.len(),
+                0,
+                Some(&crate::policy::SigningPolicy::default()),
+            )
+            .expect("project SignatureValue output length");
+            let mutated = fill_signature_value_at_index_with_options(
+                &xml,
+                &value,
+                0,
+                Some(&crate::policy::SigningPolicy::default()),
+            )
+            .expect("fill SignatureValue");
+
+            assert_eq!(projected, mutated.len());
+        }
     }
 
     #[test]

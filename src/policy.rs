@@ -550,6 +550,18 @@ impl ResourcePolicy {
         Ok(())
     }
 
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn validate_key_candidates(&self, actual: usize) -> Result<(), PolicyViolation> {
+        if actual > self.max_key_candidates {
+            return Err(PolicyViolation::ResourceLimit {
+                resource: resource_name::KEY_CANDIDATES,
+                maximum: self.max_key_candidates,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn effective_xml_nodes(&self) -> u32 {
         u32::try_from(self.max_xml_nodes)
             .unwrap_or(crate::hard_limits::XML_DOCUMENT_NODE_CEILING)

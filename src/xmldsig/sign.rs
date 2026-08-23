@@ -32,6 +32,8 @@ use super::mutation::{
     fill_signature_value_at_index_with_options, fill_signed_info_digest_values,
     fill_signed_info_digest_values_at_index_with_options,
     fill_signed_info_digest_values_with_options, merge_key_info_source_at_index_with_options,
+    padded_base64_len_for_xml, projected_signature_value_output_len_at_index_with_options,
+    zero_base64_placeholder,
 };
 use super::parse::{
     MAX_REFERENCES_PER_SIGNATURE, SignatureAlgorithm, XMLDSIG_NS,
@@ -285,6 +287,7 @@ pub fn validate_signing_key(
     algorithm: SignatureAlgorithm,
     policy: &crate::policy::SigningPolicy,
 ) -> Result<(), SigningError> {
+    policy.resources.validate_key_candidates(1)?;
     if !algorithm.signing_allowed() {
         return Err(SigningKeyError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_owned(),
@@ -871,6 +874,7 @@ impl<'a> SignContext<'a> {
             self.id_attributes,
             self.template_selection,
         )?;
+        self.policy.resources.validate_key_candidates(1)?;
         self.sign_template_at_index(xml, target_signature)
     }
 
@@ -954,8 +958,19 @@ impl<'a> SignContext<'a> {
         }
         let expected_signature_len =
             expected_signature_output_len(self.signing_key, algorithm, &self.policy)?;
+        let encoded_signature_len =
+            padded_base64_len_for_xml(expected_signature_len, &self.policy)?;
+        let projected_document_len = projected_signature_value_output_len_at_index_with_options(
+            &with_digests,
+            encoded_signature_len,
+            target_signature,
+            Some(&self.policy),
+        )?;
+        self.policy
+            .resources
+            .validate_xml_document_len(projected_document_len)?;
         let signature_placeholder =
-            base64::engine::general_purpose::STANDARD.encode(vec![0_u8; expected_signature_len]);
+            zero_base64_placeholder(expected_signature_len, encoded_signature_len);
         fill_signature_value_at_index_with_options(
             &with_digests,
             &signature_placeholder,
@@ -991,6 +1006,7 @@ impl<'a> SignContext<'a> {
     ) -> Result<String, SigningError> {
         self.policy.validate()?;
         self.policy.resources.validate_xml_document_len(xml.len())?;
+        self.policy.resources.validate_key_candidates(1)?;
         let expected_signature_len = expected_signature_output_len(
             self.signing_key,
             builder.signature_method(),

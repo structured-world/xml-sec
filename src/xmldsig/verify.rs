@@ -1982,15 +1982,10 @@ fn resolve_verifying_key<'k>(
 fn require_verifying_key_candidate_capacity(
     policy: &crate::policy::VerificationPolicy,
 ) -> Result<(), SignatureVerificationPipelineError> {
-    if policy.resources.max_key_candidates == 0 {
-        return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: crate::policy::resource_name::KEY_CANDIDATES,
-            maximum: 0,
-            actual: 1,
-        }
-        .into());
-    }
-    Ok(())
+    policy
+        .resources
+        .validate_key_candidates(1)
+        .map_err(Into::into)
 }
 
 fn enforce_reference_policies(

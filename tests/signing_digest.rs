@@ -589,6 +589,160 @@ fn signing_policy_bounds_document_bytes_before_parsing() {
 }
 
 #[test]
+fn signing_policy_charges_the_supplied_key_candidate_before_inspection() {
+    // A caller-supplied key is still one inspected candidate. A deny-all
+    // candidate policy must reject both public signing entry points before
+    // either key metadata or the signing primitive is touched.
+    struct CountingSigningKey {
+        metadata_calls: Arc<AtomicUsize>,
+        sign_calls: Arc<AtomicUsize>,
+    }
+
+    impl SigningKey for CountingSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            self.sign_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1_u8; 256])
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            self.metadata_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(SigningPublicKeyInfo::Rsa {
+                spki_der: Vec::new(),
+                modulus: vec![0x80_u8; 256],
+                exponent: vec![1, 0, 1],
+            })
+        }
+    }
+
+    let metadata_calls = Arc::new(AtomicUsize::new(0));
+    let sign_calls = Arc::new(AtomicUsize::new(0));
+    let key = CountingSigningKey {
+        metadata_calls: Arc::clone(&metadata_calls),
+        sign_calls: Arc::clone(&sign_calls),
+    };
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    let template = builder.build_template().expect("valid signature template");
+    let templated = append_signature_to_root(
+        "<root><payload ID=\"payload\">hello</payload></root>",
+        &template,
+    )
+    .expect("append signature template");
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_key_candidates: 0,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    for result in [
+        validate_signing_key(&key, SignatureAlgorithm::RsaSha256, &policy),
+        SignContext::new(&key)
+            .policy(policy.clone())
+            .sign_template(&templated)
+            .map(|_| ()),
+        SignContext::new(&key)
+            .policy(policy)
+            .sign_with_builder(
+                "<root><payload ID=\"payload\">hello</payload></root>",
+                &builder,
+            )
+            .map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(SigningError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimit {
+                    resource: "key candidates",
+                    maximum: 0,
+                    actual: 1,
+                }
+            ))
+        ));
+    }
+    assert_eq!(metadata_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(sign_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn signing_preflights_signature_placeholder_before_allocating_it() {
+    // Untrusted custom-key metadata can imply an arbitrarily wide ECDSA
+    // SignatureValue. The document policy must reject its projected Base64
+    // replacement directly, before allocating the placeholder or signing.
+    struct OversizedEcSigningKey {
+        sign_calls: Arc<AtomicUsize>,
+    }
+
+    impl SigningKey for OversizedEcSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            self.sign_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1_u8; 4_096])
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Ok(SigningPublicKeyInfo::Ec {
+                spki_der: Vec::new(),
+                curve_oid: "1.2.840.10045.3.1.7",
+                public_key: [vec![0x04], vec![1_u8; 4_096]].concat(),
+            })
+        }
+    }
+
+    let template = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        )
+        .build_template()
+        .expect("valid signature template");
+    let templated = append_signature_to_root(
+        "<root><payload ID=\"payload\">hello</payload></root>",
+        &template,
+    )
+    .expect("append signature template");
+    let maximum = templated.len() + 256;
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: maximum,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    let sign_calls = Arc::new(AtomicUsize::new(0));
+    let key = OversizedEcSigningKey {
+        sign_calls: Arc::clone(&sign_calls),
+    };
+
+    let error = SignContext::new(&key)
+        .policy(policy)
+        .sign_template(&templated)
+        .expect_err("projected SignatureValue must exceed the document policy");
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "XML document",
+            maximum: observed_maximum,
+            actual,
+        }) if observed_maximum == maximum && actual > observed_maximum
+    ));
+    assert_eq!(sign_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn signing_policy_rechecks_document_bytes_after_mutation() {
     // Filling DigestValue and SignatureValue grows the caller's document, so
     // the same byte ceiling must cover intermediate and returned XML.

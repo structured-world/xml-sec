@@ -10,6 +10,10 @@ use crate::c14n::{C14nAlgorithm, C14nMode, canonicalize_bounded_with_xml_base_bu
 use crate::policy::{PolicyViolation, SigningPolicy};
 use crate::xml::{is_xml_1_0_character, is_xml_ncname};
 
+use super::mutation::{
+    padded_base64_len_for_xml, projected_signature_value_output_len_at_index_with_options,
+    zero_base64_placeholder,
+};
 use super::transforms::{
     ENVELOPED_SIGNATURE_XPATH_EXPR, ENVELOPED_SIGNATURE_XPATH_PREFIX, TransformExecutionBudget,
     XPathSignatureParseBudget, map_c14n_resource_policy_violation,
@@ -288,8 +292,21 @@ impl SignatureBuilder {
             )
             .map_err(map_generated_mutation_error)?;
         let validation_template = if let Some(signature_output_len) = signature_output_len {
+            let encoded_signature_len = padded_base64_len_for_xml(signature_output_len, policy)
+                .map_err(map_generated_mutation_error)?;
+            let projected_document_len =
+                projected_signature_value_output_len_at_index_with_options(
+                    &digest_validation_template,
+                    encoded_signature_len,
+                    0,
+                    Some(policy),
+                )
+                .map_err(map_generated_mutation_error)?;
+            policy
+                .resources
+                .validate_xml_document_len(projected_document_len)?;
             let signature_placeholder =
-                base64::engine::general_purpose::STANDARD.encode(vec![0_u8; signature_output_len]);
+                zero_base64_placeholder(signature_output_len, encoded_signature_len);
             super::mutation::fill_signature_value_with_options(
                 &digest_validation_template,
                 &signature_placeholder,
