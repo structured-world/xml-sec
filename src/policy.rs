@@ -550,7 +550,7 @@ impl ResourcePolicy {
         Ok(())
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub(crate) fn validate_key_candidates(&self, actual: usize) -> Result<(), PolicyViolation> {
         if actual > self.max_key_candidates {
             return Err(PolicyViolation::ResourceLimit {

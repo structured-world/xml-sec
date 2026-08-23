@@ -339,6 +339,10 @@ impl EncryptedDataBuilder {
             }
             .into());
         }
+        let key_candidates = self.recipients.len() + usize::from(self.direct_key.is_some());
+        self.policy
+            .resources
+            .validate_key_candidates(key_candidates)?;
         self.validate_metadata("EncryptedData Id", self.id.as_deref())?;
         if self.id.as_deref().is_some_and(|id| !is_xml_ncname(id)) {
             return Err(XmlEncError::InvalidEncryptionConfig(
@@ -1869,6 +1873,72 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn encryption_enforces_key_candidate_budget_before_inspection() {
+        // Candidate accounting must reject configured keys before validating or
+        // dispatching them, while accepting the exact operation-wide boundary.
+        let deny_keys = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_key_candidates: 0,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+
+        for error in [
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 15])
+                .policy(deny_keys.clone())
+                .encrypt_binary(b"data")
+                .expect_err("a direct key must consume one candidate"),
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .recipient_aes_kw([0_u8; 15], KeyWrapAlgorithm::AesKw128)
+                .policy(deny_keys)
+                .encrypt_binary(b"data")
+                .expect_err("a recipient key must consume one candidate"),
+        ] {
+            assert!(matches!(
+                error,
+                XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_CANDIDATES,
+                    maximum: 0,
+                    actual: 1,
+                })
+            ));
+        }
+
+        let recipient =
+            || EncryptionRecipient::aes_key_wrap([0_u8; 16], KeyWrapAlgorithm::AesKw128);
+        let policy_with_candidate_limit = |maximum| crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_key_candidates: maximum,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let builder = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .add_recipient(recipient())
+            .add_recipient(recipient());
+
+        assert!(matches!(
+            builder
+                .clone()
+                .policy(policy_with_candidate_limit(1))
+                .encrypt_binary(b"data"),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_CANDIDATES,
+                    maximum: 1,
+                    actual: 2,
+                }
+            ))
+        ));
+        builder
+            .policy(policy_with_candidate_limit(2))
+            .encrypt_binary(b"data")
+            .expect("the exact key-candidate boundary must be accepted");
     }
 
     #[test]

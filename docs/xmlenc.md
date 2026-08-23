@@ -61,6 +61,10 @@ the existing `validate_rsa_recipient_key` remains the RustCrypto convenience for
 `EncryptionPolicy::rsa_keys` validates every recipient modulus and exponent before provider
 dispatch. New output defaults to 2048-8192-bit RSA keys; callers can explicitly tighten or relax
 the minimum for a deployment profile, but cannot exceed the implementation ceiling.
+Encryption preflight also applies the operation-wide `ResourcePolicy::max_key_candidates` limit
+before inspecting or dispatching any configured key: a direct content key consumes one candidate,
+while recipient mode consumes one candidate per independently wrapped recipient. The separate
+`max_encryption_recipients` ceiling still applies, so the tighter of the two limits wins.
 `validate_rsa_recipient_key` exposes that same preflight to ordered key registries, allowing them
 to skip policy-invalid candidates before committing to one without duplicating policy limits.
 Configuration validation rejects any non-SHA-1 MGF digest for the legacy URI before provider
