@@ -44,7 +44,7 @@ use super::transforms::{
     parse_transforms_with_budget, validate_signing_transform_policy,
 };
 use super::types::TransformError;
-use super::uri::UriReferenceResolver;
+use super::uri::{UriReferenceResolver, validate_signing_reference_uri};
 use super::verify::parse_signature_children;
 
 /// Result for one computed signing-template reference digest.
@@ -1380,13 +1380,7 @@ fn validate_signing_references(
         .into());
     }
     for reference in references {
-        if !policy.uris.references.allows(&reference.uri) {
-            return Err(crate::policy::PolicyViolation::Uri {
-                operation: "signing",
-                reason: "signing reference URI class is not permitted",
-            }
-            .into());
-        }
+        validate_signing_reference_uri(&reference.uri, policy)?;
         if reference.transforms.len() > policy.resources.max_transforms_per_reference {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,

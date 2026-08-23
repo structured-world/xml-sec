@@ -3,12 +3,13 @@
 use std::fs;
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::policy::SigningPolicy;
 use xml_sec::xmldsig::{
     DEFAULT_IMPLICIT_C14N_URI, DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus,
     FailureReason, ParseError, ReferenceBuilder, ReferenceProcessingError, RsaSigningKey,
     SignContext, SignatureAlgorithm, SignatureBuilder, SigningError, Transform, TransformError,
-    VerifyContext, X509CertificateKeyInfoWriter, XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI,
-    XPathExpression, XPathFilter, XPathFilterOperation, XPathHereSemantics,
+    UriTypeSet, VerifyContext, X509CertificateKeyInfoWriter, XPATH_FILTER2_TRANSFORM_URI,
+    XPATH_TRANSFORM_URI, XPathExpression, XPathFilter, XPathFilterOperation, XPathHereSemantics,
 };
 
 const DOCUMENT: &str = r#"<root>
@@ -304,4 +305,27 @@ fn signing_policy_rejects_external_reference_before_dereference() {
         ),
         "unexpected error: {error:?}"
     );
+}
+
+#[test]
+fn signing_rejects_external_reference_without_request_resources() {
+    // Permitting an external URI class is not a substitute for supplying its
+    // bytes, and the signing context intentionally has no such request input.
+    let template = r#"<root><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="https://example.invalid/data"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference></SignedInfo><SignatureValue/></Signature></root>"#;
+    let (key, _) = signing_material();
+    let mut policy = SigningPolicy::default();
+    policy.uris.references = UriTypeSet::ALL;
+
+    let error = SignContext::new(&key)
+        .policy(policy)
+        .sign_template(template)
+        .expect_err("external signing references require request-scoped bytes");
+
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::Uri {
+            operation: "signing",
+            reason: "external signing references require request-scoped resource bytes",
+        })
+    ));
 }

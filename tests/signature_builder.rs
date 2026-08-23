@@ -3,7 +3,7 @@ use xml_sec::policy::{PolicyViolation, SigningPolicy};
 use xml_sec::xmldsig::transforms::MAX_TRANSFORMS_PER_REFERENCE;
 use xml_sec::xmldsig::{
     DigestAlgorithm, ReferenceBuilder, SignatureAlgorithm, SignatureBuilder, SignatureBuilderError,
-    Transform, XPathExpression, XPathFilter, XPathFilterOperation, parse_transforms,
+    Transform, UriTypeSet, XPathExpression, XPathFilter, XPathFilterOperation, parse_transforms,
 };
 
 const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
@@ -504,6 +504,53 @@ fn policy_aware_builder_bounds_the_serialized_template() {
             resource: "XML nodes",
             maximum: 1,
             actual: 2,
+        })
+    ));
+}
+
+#[test]
+fn policy_aware_builder_bounds_signed_info_canonicalization() {
+    // The policy-aware builder must not emit a template that the signing path
+    // immediately rejects while canonicalizing the generated SignedInfo.
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256));
+    let mut policy = SigningPolicy::default();
+    policy.resources.max_canonicalized_bytes = 0;
+
+    let error = builder
+        .build_template_with_policy(&policy)
+        .expect_err("generated SignedInfo must obey the canonicalization budget");
+
+    assert!(matches!(
+        error,
+        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+            maximum: 0,
+            actual,
+            ..
+        }) if actual > 0
+    ));
+}
+
+#[test]
+fn policy_aware_builder_rejects_unavailable_external_references() {
+    // Allowing an external URI class does not provide the request-scoped bytes
+    // that the signing API would need to digest that resource.
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("https://example.invalid/payload"),
+        );
+    let mut policy = SigningPolicy::default();
+    policy.uris.references = UriTypeSet::ALL;
+
+    let error = builder
+        .build_template_with_policy(&policy)
+        .expect_err("builder must not emit a template the signing API cannot resolve");
+
+    assert!(matches!(
+        error,
+        SignatureBuilderError::Policy(PolicyViolation::Uri {
+            operation: "signing",
+            reason: "external signing references require request-scoped resource bytes",
         })
     ));
 }

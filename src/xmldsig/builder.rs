@@ -1,18 +1,20 @@
 //! Builders for deterministic XMLDSig signature templates.
 
-use std::io::Write;
+use std::{collections::HashSet, io::Write};
 
 use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 
-use crate::c14n::{C14nAlgorithm, C14nMode};
+use crate::c14n::{C14nAlgorithm, C14nMode, canonicalize_bounded_with_xml_base_budget};
 use crate::policy::{PolicyViolation, SigningPolicy};
 use crate::xml::{is_xml_1_0_character, is_xml_ncname};
 
 use super::transforms::{
-    ENVELOPED_SIGNATURE_XPATH_EXPR, ENVELOPED_SIGNATURE_XPATH_PREFIX, XPathSignatureParseBudget,
+    ENVELOPED_SIGNATURE_XPATH_EXPR, ENVELOPED_SIGNATURE_XPATH_PREFIX, TransformExecutionBudget,
+    XPathSignatureParseBudget, map_c14n_resource_policy_violation,
     validate_signing_transform_policy, validate_xpath_namespace_budget_with_resources,
 };
+use super::uri::validate_signing_reference_uri;
 use super::{
     BASE64_TRANSFORM_URI, DigestAlgorithm, ENVELOPED_SIGNATURE_URI, SignatureAlgorithm, Transform,
     XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI, XPathExpression,
@@ -64,6 +66,12 @@ pub enum SignatureBuilderError {
     /// The generated template could not be parsed under the selected policy.
     #[error("generated XML template is invalid: {0}")]
     GeneratedXml(#[from] roxmltree::Error),
+    /// The generated SignedInfo could not be canonicalized.
+    #[error("generated SignedInfo canonicalization failed: {0}")]
+    Canonicalization(#[from] crate::c14n::C14nError),
+    /// The generated template did not contain its required SignedInfo child.
+    #[error("generated XML template is missing SignedInfo")]
+    MissingGeneratedSignedInfo,
 }
 
 /// Builder for a single XMLDSig `<Reference>` template.
@@ -226,18 +234,46 @@ impl SignatureBuilder {
         // Field-level checks bound each input class; these checks cover the
         // completed artifact exactly as the signing operation will consume it.
         policy.resources.validate_xml_document_len(template.len())?;
-        super::mutation::parse_with_options(&template, Some(policy)).map_err(
-            |error| match error {
-                roxmltree::Error::NodesLimitReached => {
-                    SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
-                        resource: crate::policy::resource_name::XML_NODES,
-                        maximum: policy.resources.max_xml_nodes,
-                        actual: policy.resources.max_xml_nodes.saturating_add(1),
-                    })
+        let document =
+            super::mutation::parse_with_options(&template, Some(policy)).map_err(|error| {
+                match error {
+                    roxmltree::Error::NodesLimitReached => {
+                        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+                            resource: crate::policy::resource_name::XML_NODES,
+                            maximum: policy.resources.max_xml_nodes,
+                            actual: policy.resources.max_xml_nodes.saturating_add(1),
+                        })
+                    }
+                    other => SignatureBuilderError::GeneratedXml(other),
                 }
-                other => SignatureBuilderError::GeneratedXml(other),
-            },
-        )?;
+            })?;
+        let signed_info = document
+            .root_element()
+            .children()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "SignedInfo")))
+            .ok_or(SignatureBuilderError::MissingGeneratedSignedInfo)?;
+        let signed_info_subtree: HashSet<_> =
+            signed_info.descendants().map(|node| node.id()).collect();
+        let budget = TransformExecutionBudget::from_resources(&policy.resources);
+        canonicalize_bounded_with_xml_base_budget(
+            &document,
+            Some(&|node| signed_info_subtree.contains(&node.id())),
+            &self.c14n_method,
+            budget.remaining_c14n_output(),
+            budget.xml_base_resolution(),
+            &mut Vec::new(),
+        )
+        .map_err(|error| {
+            map_c14n_resource_policy_violation(
+                &error,
+                crate::policy::resource_name::CANONICALIZED_BYTES,
+                budget.c14n_output_limit(),
+            )
+            .map_or_else(
+                || SignatureBuilderError::Canonicalization(error),
+                SignatureBuilderError::Policy,
+            )
+        })?;
         Ok(template)
     }
 
@@ -271,13 +307,7 @@ impl SignatureBuilder {
         let mut xpath_signature_budget =
             XPathSignatureParseBudget::from_resources(&policy.resources);
         for reference in &self.references {
-            if !policy.uris.references.allows(&reference.uri) {
-                return Err(PolicyViolation::Uri {
-                    operation: "signing",
-                    reason: "signing reference URI class is not permitted",
-                }
-                .into());
-            }
+            validate_signing_reference_uri(&reference.uri, policy)?;
             if reference.transforms.len() > policy.resources.max_transforms_per_reference {
                 return Err(PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,

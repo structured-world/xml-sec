@@ -26,6 +26,29 @@ use super::types::{
     NodeSet, NodeSetMaterializationBudget, TransformData, TransformError, transform_resource_limit,
 };
 
+/// Validate both policy permission and request-context capability for signing URIs.
+///
+/// Signing currently has no external-resource request input. An allowlist may
+/// permit that URI class, but it cannot make the referenced bytes available.
+pub(crate) fn validate_signing_reference_uri(
+    uri: &str,
+    policy: &crate::policy::SigningPolicy,
+) -> Result<(), crate::policy::PolicyViolation> {
+    if !policy.uris.references.allows(uri) {
+        return Err(crate::policy::PolicyViolation::Uri {
+            operation: "signing",
+            reason: "signing reference URI class is not permitted",
+        });
+    }
+    if !uri.is_empty() && !uri.starts_with('#') {
+        return Err(crate::policy::PolicyViolation::Uri {
+            operation: "signing",
+            reason: "external signing references require request-scoped resource bytes",
+        });
+    }
+    Ok(())
+}
+
 struct ExternalResourceBudget {
     remaining_total_bytes: Cell<usize>,
     max_resource_bytes: usize,
