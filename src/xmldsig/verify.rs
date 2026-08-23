@@ -30,7 +30,7 @@ use super::parse::{
     RetrievalMethodTransforms, SignatureAlgorithm, XMLDSIG_NS,
 };
 use super::parse::{
-    parse_key_info_with_provider_and_xml_base_budget, parse_reference_with_xpath_budget,
+    parse_key_info_with_policy_budgets, parse_reference_with_xpath_budget,
     parse_signed_info_with_xpath_budget, parse_x509_certificate,
     parse_x509_data_dispatch_with_budget_and_provider, reference_digest_method,
 };
@@ -1148,10 +1148,11 @@ fn verify_signature_with_context(
         signature_children
             .key_info_node
             .map(|node| {
-                parse_key_info_with_provider_and_xml_base_budget(
+                parse_key_info_with_policy_budgets(
                     node,
                     ctx.provider,
                     execution_budget.xml_base_resolution(),
+                    &ctx.policy.resources,
                 )
             })
             .transpose()
@@ -1231,14 +1232,18 @@ fn verify_signature_with_context(
         }
     }
     let retrieval_materialization = if let Some(info) = key_info.as_mut() {
+        let mut retrieval_budgets = RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse_budget,
+            execution: &execution_budget,
+            resources: &ctx.policy.resources,
+        };
         materialize_retrieval_methods_with_budgets(
             info,
             &resolver,
             ctx.policy.uris.retrieval_methods,
             ctx.allowed_transform_uris(),
             ctx.provider,
-            &mut xpath_parse_budget,
-            &execution_budget,
+            &mut retrieval_budgets,
         )?
     } else {
         RetrievalMaterialization::default()
@@ -1408,14 +1413,19 @@ struct RetrievalMaterialization {
     deferred_error: Option<SignatureVerificationPipelineError>,
 }
 
+struct RetrievalMaterializationBudgets<'a> {
+    xpath_parse: &'a mut XPathSignatureParseBudget,
+    execution: &'a TransformExecutionBudget,
+    resources: &'a crate::policy::ResourcePolicy,
+}
+
 fn materialize_retrieval_methods_with_budgets(
     key_info: &mut KeyInfo,
     resolver: &UriReferenceResolver<'_>,
     allowed_uri_types: UriTypeSet,
     allowed_transforms: Option<&HashSet<String>>,
     provider: &dyn crate::provider::CryptoProvider,
-    xpath_parse_budget: &mut XPathSignatureParseBudget,
-    execution_budget: &TransformExecutionBudget,
+    budgets: &mut RetrievalMaterializationBudgets<'_>,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
     let retrieval_count = key_info
         .sources
@@ -1429,6 +1439,12 @@ fn materialize_retrieval_methods_with_budgets(
     }
 
     let mut total_binary_len = existing_x509_binary_len(key_info)?;
+    let mut embedded_x509_candidates = key_info.sources.iter().fold(0usize, |count, source| {
+        count.saturating_add(match source {
+            super::parse::KeyInfoSource::X509Data(info) => info.certificates.len(),
+            _ => 0,
+        })
+    });
     let mut seen = HashSet::new();
     let mut materialized = Vec::with_capacity(key_info.sources.len());
     let mut outcome = RetrievalMaterialization::default();
@@ -1486,6 +1502,10 @@ fn materialize_retrieval_methods_with_budgets(
                 });
                 continue;
             };
+            embedded_x509_candidates = embedded_x509_candidates.saturating_add(1);
+            budgets
+                .resources
+                .validate_key_candidates(embedded_x509_candidates)?;
             if certificate.len() > MAX_X509_DECODED_BINARY_LEN {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "raw X509 RetrievalMethod certificate exceeds maximum allowed length",
@@ -1550,13 +1570,15 @@ fn materialize_retrieval_methods_with_budgets(
                     namespaces,
                 } => {
                     enforce_transform_allowed(allowed_transforms, XPATH_TRANSFORM_URI)?;
-                    xpath_parse_budget
+                    budgets
+                        .xpath_parse
                         .validate_expression(&expression)
                         .map_err(ReferenceProcessingError::Transform)?;
-                    xpath_parse_budget
+                    budgets
+                        .xpath_parse
                         .validate_namespaces(&namespaces)
                         .map_err(ReferenceProcessingError::Transform)?;
-                    select_retrieved_x509_data_root(target, execution_budget)?
+                    select_retrieved_x509_data_root(target, budgets.execution)?
                 }
                 RetrievalMethodTransforms::Unsupported => {
                     return Err(SignatureVerificationPipelineError::InvalidStructure {
@@ -1567,9 +1589,11 @@ fn materialize_retrieval_methods_with_budgets(
             let data = parse_x509_data_dispatch_with_budget_and_provider(
                 node,
                 &mut total_binary_len,
+                &mut embedded_x509_candidates,
                 provider,
+                budgets.resources,
             )
-            .map_err(SignatureVerificationPipelineError::ParseKeyInfo)?;
+            .map_err(map_key_info_parse_error)?;
             materialized.push(super::parse::KeyInfoSource::X509Data(data));
         } else {
             materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
@@ -1627,14 +1651,21 @@ fn materialize_retrieval_methods(
     allowed_transforms: Option<&HashSet<String>>,
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
+    let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+    let execution_budget = TransformExecutionBudget::default();
+    let resources = crate::policy::ResourcePolicy::default();
+    let mut budgets = RetrievalMaterializationBudgets {
+        xpath_parse: &mut xpath_parse_budget,
+        execution: &execution_budget,
+        resources: &resources,
+    };
     materialize_retrieval_methods_with_budgets(
         key_info,
         resolver,
         allowed_uri_types,
         allowed_transforms,
         provider,
-        &mut XPathSignatureParseBudget::default(),
-        &TransformExecutionBudget::default(),
+        &mut budgets,
     )
 }
 
@@ -4948,6 +4979,39 @@ mod tests {
                     resource: crate::policy::resource_name::KEY_CANDIDATES,
                     maximum: 0,
                     actual: 1,
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn verification_candidate_budget_precedes_embedded_x509_parsing() {
+        // The first certificate is valid and consumes the sole permitted slot;
+        // malformed bytes in the second must never reach the X.509 parser.
+        let first_certificate = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+            "../../tests/fixtures/xmldsig/phaos-xmldsig-three/certs/rsa-cert.der"
+        ));
+        let xml = signature_with_target_reference("AQ==").replace(
+            "</ds:SignatureValue>\n  </ds:Signature>",
+            &format!(
+                "</ds:SignatureValue>\n    <ds:KeyInfo><ds:X509Data><ds:X509Certificate>{first_certificate}</ds:X509Certificate><ds:X509Certificate>AQID</ds:X509Certificate></ds:X509Data></ds:KeyInfo>\n  </ds:Signature>"
+            ),
+        );
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_key_candidates = 1;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&xml)
+            .expect_err("candidate policy must run before embedded certificate parsing");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_CANDIDATES,
+                    maximum: 1,
+                    actual: 2,
                 }
             )
         ));

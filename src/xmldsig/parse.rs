@@ -629,19 +629,28 @@ pub(crate) fn parse_key_info_with_provider(
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<KeyInfo, ParseError> {
     let xml_base_budget = XmlBaseResolutionBudget::default();
-    parse_key_info_with_provider_and_xml_base_budget(key_info_node, provider, &xml_base_budget)
+    parse_key_info_with_policy_budgets(
+        key_info_node,
+        provider,
+        &xml_base_budget,
+        &crate::policy::ResourcePolicy::default(),
+    )
 }
 
-pub(crate) fn parse_key_info_with_provider_and_xml_base_budget(
+pub(crate) fn parse_key_info_with_policy_budgets(
     key_info_node: Node,
     provider: &dyn crate::provider::CryptoProvider,
     xml_base_budget: &XmlBaseResolutionBudget,
+    resources: &crate::policy::ResourcePolicy,
 ) -> Result<KeyInfo, ParseError> {
     verify_ds_element(key_info_node, "KeyInfo")?;
     ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
 
     let mut sources = Vec::new();
     let mut x509_total_binary_len = 0usize;
+    // KeyInfo is parsed before source selection, so cap unavoidable certificate
+    // parsing here. The resolver separately budgets only candidates it inspects.
+    let mut embedded_x509_candidates = 0usize;
     for (index, child) in element_children(key_info_node).enumerate() {
         if index >= MAX_KEY_INFO_CHILD_COUNT {
             return Err(ParseError::InvalidStructure(
@@ -663,7 +672,9 @@ pub(crate) fn parse_key_info_with_provider_and_xml_base_budget(
                 let x509 = parse_x509_data_dispatch_with_budget_and_provider(
                     child,
                     &mut x509_total_binary_len,
+                    &mut embedded_x509_candidates,
                     provider,
+                    resources,
                 )?;
                 sources.push(KeyInfoSource::X509Data(x509));
             }
@@ -1135,7 +1146,9 @@ fn decode_crypto_binary(
 pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
     node: Node,
     total_binary_len: &mut usize,
+    embedded_x509_candidates: &mut usize,
     provider: &dyn crate::provider::CryptoProvider,
+    resources: &crate::policy::ResourcePolicy,
 ) -> Result<X509DataInfo, ParseError> {
     verify_ds_element(node, "X509Data")?;
     ensure_no_non_whitespace_text(node, "X509Data")?;
@@ -1144,6 +1157,8 @@ pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
     for child in element_children(node) {
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "X509Certificate") => {
+                *embedded_x509_candidates = embedded_x509_candidates.saturating_add(1);
+                resources.validate_key_candidates(*embedded_x509_candidates)?;
                 ensure_no_element_children(child, "X509Certificate")?;
                 ensure_x509_data_entry_budget(&info)?;
                 let cert = decode_x509_base64(child, "X509Certificate")?;
