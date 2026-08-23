@@ -249,9 +249,14 @@ impl SignatureBuilder {
         let validation_template = super::mutation::fill_signed_info_digest_values_with_options(
             &template,
             digest_placeholders,
-            None,
+            Some(policy),
         )
-        .map_err(SignatureBuilderError::GeneratedMutation)?;
+        .map_err(|error| match error {
+            super::mutation::XmlMutationError::Policy(violation) => {
+                SignatureBuilderError::Policy(violation)
+            }
+            other => SignatureBuilderError::GeneratedMutation(other),
+        })?;
         policy
             .resources
             .validate_xml_document_len(validation_template.len())?;
