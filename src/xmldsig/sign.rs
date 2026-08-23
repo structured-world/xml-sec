@@ -1001,6 +1001,7 @@ impl<'a> SignContext<'a> {
             &self.policy,
             expected_signature_len,
             &budgets.transforms,
+            &mut budgets.xpath_parse,
         )?;
         let templated = if let Some(id) = self.start_node_id {
             let document = parse_signing_document(xml, Some(&self.policy))

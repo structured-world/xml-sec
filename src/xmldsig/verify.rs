@@ -2535,6 +2535,44 @@ mod tests {
     }
 
     #[test]
+    fn verification_policy_bounds_cumulative_base64_transform_output() {
+        // References share one operation budget. Validating each decoded value
+        // against the full ceiling would let a signature multiply output work.
+        let first_digest = base64::engine::general_purpose::STANDARD
+            .encode(compute_digest(DigestAlgorithm::Sha256, b"a"));
+        let second_digest = base64::engine::general_purpose::STANDARD
+            .encode(compute_digest(DigestAlgorithm::Sha256, b"b"));
+        let xml = format!(
+            r##"<root xmlns:ds="{XMLDSIG_NS}"><first ID="first">YQ==</first><second ID="second">Yg==</second><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#first"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{first_digest}</ds:DigestValue></ds:Reference><ds:Reference URI="#second"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{second_digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"##
+        );
+        let policy = crate::policy::VerificationPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_base64_transform_input_bytes: 8,
+                max_base64_transform_output_bytes: 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+
+        let error = VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .verify(&xml)
+            .expect_err("references must share the Base64 output allowance");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::BASE64_TRANSFORM_OUTPUT_BYTES,
+                    maximum: 1,
+                    actual: 2,
+                }
+            )
+        ));
+    }
+
+    #[test]
     fn verification_policy_bounds_xpath_source_before_compilation() {
         // XPath parser limits are part of the same operation snapshot as the
         // evaluator limits; parsing cannot use a separate hard-coded budget.

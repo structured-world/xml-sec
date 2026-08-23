@@ -15,7 +15,7 @@ use xml_sec::xmldsig::{
     EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriter, ReferenceBuilder, RsaSigningKey,
     SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError,
     SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, TransformError, VerificationKey,
-    VerifyContext, X509CertificateKeyInfoWriter, compute_reference_digest_values,
+    VerifyContext, X509CertificateKeyInfoWriter, XPathExpression, compute_reference_digest_values,
     fill_reference_digest_values, parse_key_info, validate_signing_key,
     verify_signature_with_pem_key,
 };
@@ -771,6 +771,48 @@ fn sign_with_builder_shares_canonicalization_budget_with_signing() {
             maximum,
             actual,
         }) if maximum == individual_pass_limit && actual > maximum
+    ));
+}
+
+#[test]
+fn sign_with_builder_shares_xpath_parse_budget_with_signing() {
+    // Builder validation and the signing parses are one public operation. A
+    // caller must not receive a fresh XPath expression allowance between them.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::XPath(XPathExpression::new("true()"))),
+        );
+    let xml = "<root><payload ID=\"payload\">content</payload></root>";
+    let mut policy = SigningPolicy::default();
+    policy.resources.max_xpath_expressions = 4;
+
+    builder
+        .build_template_with_policy(&policy)
+        .expect("builder validation must fit the individual expression limit");
+    let template = builder.build_template().expect("valid signature template");
+    let templated = append_signature_to_root(xml, &template).expect("append signature template");
+    SignContext::new(&private_key)
+        .policy(policy.clone())
+        .sign_template(&templated)
+        .expect("standalone signing must fit the individual expression limit");
+
+    let error = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_with_builder(xml, &builder)
+        .expect_err("builder validation and signing must share the expression limit");
+
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "XPath expressions",
+            maximum: 4,
+            actual,
+        }) if actual > 4
     ));
 }
 

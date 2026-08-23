@@ -150,7 +150,8 @@ impl NodeFilterWorkBudget {
 }
 
 struct Base64WorkBudget {
-    remaining: Cell<usize>,
+    remaining_input_bytes: Cell<usize>,
+    remaining_output_bytes: Cell<usize>,
     max_input_bytes: usize,
     max_output_bytes: usize,
 }
@@ -254,7 +255,8 @@ mod c14n_budget_regression_tests {
 impl Default for Base64WorkBudget {
     fn default() -> Self {
         Self {
-            remaining: Cell::new(MAX_BASE64_TRANSFORM_INPUT_BYTES),
+            remaining_input_bytes: Cell::new(MAX_BASE64_TRANSFORM_INPUT_BYTES),
+            remaining_output_bytes: Cell::new(MAX_BASE64_TRANSFORM_OUTPUT_BYTES),
             max_input_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES,
             max_output_bytes: MAX_BASE64_TRANSFORM_OUTPUT_BYTES,
         }
@@ -262,15 +264,38 @@ impl Default for Base64WorkBudget {
 }
 
 impl Base64WorkBudget {
-    fn charge(&self, bytes: usize) -> Result<(), TransformError> {
-        let consumed = self.max_input_bytes.saturating_sub(self.remaining.get());
-        if !charge_byte_budget(&self.remaining, bytes) {
+    fn charge_input(&self, bytes: usize) -> Result<(), TransformError> {
+        let consumed = self
+            .max_input_bytes
+            .saturating_sub(self.remaining_input_bytes.get());
+        if !charge_byte_budget(&self.remaining_input_bytes, bytes) {
             return Err(transform_resource_limit(
                 crate::policy::resource_name::BASE64_TRANSFORM_INPUT_BYTES,
                 self.max_input_bytes,
                 consumed.saturating_add(bytes),
             ));
         }
+        Ok(())
+    }
+
+    fn ensure_output_capacity(&self, bytes: usize) -> Result<(), TransformError> {
+        let consumed = self
+            .max_output_bytes
+            .saturating_sub(self.remaining_output_bytes.get());
+        if bytes > self.remaining_output_bytes.get() {
+            return Err(transform_resource_limit(
+                crate::policy::resource_name::BASE64_TRANSFORM_OUTPUT_BYTES,
+                self.max_output_bytes,
+                consumed.saturating_add(bytes),
+            ));
+        }
+        Ok(())
+    }
+
+    fn charge_output(&self, bytes: usize) -> Result<(), TransformError> {
+        self.ensure_output_capacity(bytes)?;
+        let charged = charge_byte_budget(&self.remaining_output_bytes, bytes);
+        debug_assert!(charged, "preflighted Base64 output charge must fit");
         Ok(())
     }
 }
@@ -329,7 +354,8 @@ impl TransformExecutionBudget {
         Self {
             xpath: XPathWorkBudget::with_limits(resources),
             base64: Base64WorkBudget {
-                remaining: Cell::new(resources.max_base64_transform_input_bytes),
+                remaining_input_bytes: Cell::new(resources.max_base64_transform_input_bytes),
+                remaining_output_bytes: Cell::new(resources.max_base64_transform_output_bytes),
                 max_input_bytes: resources.max_base64_transform_input_bytes,
                 max_output_bytes: resources.max_base64_transform_output_bytes,
             },
@@ -835,7 +861,7 @@ fn append_normalized_base64(
     normalized: &mut Vec<u8>,
     budget: &Base64WorkBudget,
 ) -> Result<(), TransformError> {
-    budget.charge(encoded.len())?;
+    budget.charge_input(encoded.len())?;
 
     let additional = encoded
         .iter()
@@ -865,18 +891,13 @@ fn decode_base64_transform(
         .take_while(|byte| **byte == b'=')
         .count();
     let decoded_len = base64::decoded_len_estimate(normalized.len()).saturating_sub(padding);
-    if decoded_len > budget.max_output_bytes {
-        return Err(transform_resource_limit(
-            crate::policy::resource_name::BASE64_TRANSFORM_OUTPUT_BYTES,
-            budget.max_output_bytes,
-            decoded_len,
-        ));
-    }
+    budget.ensure_output_capacity(decoded_len)?;
 
     let mut decoded = vec![0_u8; decoded_len];
     let written = STANDARD
         .decode_slice(normalized, &mut decoded)
         .map_err(|error| TransformError::Base64(error.to_string()))?;
+    budget.charge_output(written)?;
     decoded.truncate(written);
     Ok(decoded)
 }
@@ -2418,6 +2439,47 @@ mod tests {
     }
 
     #[test]
+    fn operation_rejects_cumulative_base64_output_past_budget() {
+        // Separate references share one operation budget. Each decoded value
+        // fits alone, but their cumulative output must not reuse the allowance.
+        let doc = Document::parse("<root/>").unwrap();
+        let resources = crate::policy::ResourcePolicy {
+            max_base64_transform_input_bytes: 8,
+            max_base64_transform_output_bytes: 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = TransformExecutionBudget::from_resources(&resources);
+
+        let first = apply_transform_with_options(
+            doc.root_element(),
+            &Transform::Base64Decode,
+            TransformData::Binary(b"YQ==".to_vec()),
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect("the first one-byte output must fit");
+        assert_eq!(first.into_binary().unwrap(), b"a");
+
+        let error = apply_transform_with_options(
+            doc.root_element(),
+            &Transform::Base64Decode,
+            TransformData::Binary(b"Yg==".to_vec()),
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect_err("the second output must exceed the cumulative allowance");
+
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::BASE64_TRANSFORM_OUTPUT_BYTES,
+                maximum: 1,
+                actual: 2,
+            })
+        ));
+    }
+
+    #[test]
     fn pipeline_rejects_unbounded_programmatic_transform_chain() {
         // The public executor is a trust boundary too: callers can bypass XML
         // parsing and must not be able to create an arbitrarily deep recursion.
@@ -2453,8 +2515,12 @@ mod tests {
         assert!(c14n.charge(1).is_err());
 
         let base64 = Base64WorkBudget::default();
-        assert!(base64.charge(MAX_BASE64_TRANSFORM_INPUT_BYTES + 1).is_err());
-        assert!(base64.charge(1).is_err());
+        assert!(
+            base64
+                .charge_input(MAX_BASE64_TRANSFORM_INPUT_BYTES + 1)
+                .is_err()
+        );
+        assert!(base64.charge_input(1).is_err());
     }
 
     #[test]

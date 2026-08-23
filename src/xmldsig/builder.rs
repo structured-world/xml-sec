@@ -200,7 +200,13 @@ impl SignatureBuilder {
         policy: &SigningPolicy,
     ) -> Result<String, SignatureBuilderError> {
         let budget = TransformExecutionBudget::from_resources(&policy.resources);
-        self.build_template_with_policy_and_signature_output_len(policy, None, &budget)
+        let mut xpath_parse_budget = XPathSignatureParseBudget::from_resources(&policy.resources);
+        self.build_template_with_policy_and_signature_output_len(
+            policy,
+            None,
+            &budget,
+            &mut xpath_parse_budget,
+        )
     }
 
     pub(super) fn build_template_with_policy_for_signature_output(
@@ -208,11 +214,13 @@ impl SignatureBuilder {
         policy: &SigningPolicy,
         signature_output_len: usize,
         budget: &TransformExecutionBudget,
+        xpath_parse_budget: &mut XPathSignatureParseBudget,
     ) -> Result<String, SignatureBuilderError> {
         self.build_template_with_policy_and_signature_output_len(
             policy,
             Some(signature_output_len),
             budget,
+            xpath_parse_budget,
         )
     }
 
@@ -221,9 +229,10 @@ impl SignatureBuilder {
         policy: &SigningPolicy,
         signature_output_len: Option<usize>,
         budget: &TransformExecutionBudget,
+        xpath_parse_budget: &mut XPathSignatureParseBudget,
     ) -> Result<String, SignatureBuilderError> {
         policy.validate()?;
-        self.validate(policy)?;
+        self.validate(policy, xpath_parse_budget)?;
 
         let prefix = self.ns_prefix.as_deref();
         let mut writer = Writer::new(Vec::new());
@@ -339,7 +348,11 @@ impl SignatureBuilder {
         self.sign_method
     }
 
-    fn validate(&self, policy: &SigningPolicy) -> Result<(), SignatureBuilderError> {
+    fn validate(
+        &self,
+        policy: &SigningPolicy,
+        xpath_signature_budget: &mut XPathSignatureParseBudget,
+    ) -> Result<(), SignatureBuilderError> {
         if let Some(prefix) = &self.ns_prefix
             && !is_namespace_prefix(prefix)
         {
@@ -366,8 +379,6 @@ impl SignatureBuilder {
             }
             .into());
         }
-        let mut xpath_signature_budget =
-            XPathSignatureParseBudget::from_resources(&policy.resources);
         for reference in &self.references {
             validate_signing_reference_uri(&reference.uri, policy)?;
             if reference.transforms.len() > policy.resources.max_transforms_per_reference {
@@ -389,11 +400,11 @@ impl SignatureBuilder {
                     Transform::XpathExcludeAllSignatures => {
                         validate_xpath_source(
                             ENVELOPED_SIGNATURE_XPATH_EXPR,
-                            &mut xpath_signature_budget,
+                            xpath_signature_budget,
                         )?;
                     }
                     Transform::XPath(xpath) => {
-                        validate_xpath_source(xpath.expression(), &mut xpath_signature_budget)?;
+                        validate_xpath_source(xpath.expression(), xpath_signature_budget)?;
                     }
                     Transform::XPathFilter2(filters) => {
                         if filters.is_empty() {
@@ -412,7 +423,7 @@ impl SignatureBuilder {
                         for filter in filters {
                             validate_xpath_source(
                                 filter.xpath().expression(),
-                                &mut xpath_signature_budget,
+                                xpath_signature_budget,
                             )?;
                         }
                     }

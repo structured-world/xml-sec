@@ -311,7 +311,7 @@ pub struct ResourcePolicy {
     pub max_key_candidates: usize,
     /// Maximum bytes accepted by Base64 transforms before decoding.
     pub max_base64_transform_input_bytes: usize,
-    /// Maximum bytes emitted by Base64 transforms after decoding.
+    /// Maximum cumulative bytes emitted by Base64 transforms in one operation.
     pub max_base64_transform_output_bytes: usize,
     /// Maximum XPath expressions evaluated by one signature operation.
     pub max_xpath_expressions: usize,
