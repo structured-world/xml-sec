@@ -1494,6 +1494,29 @@ fn evaluate_expression<'a>(
     work_budget: &XPathWorkBudget,
     materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
+    let expression_bytes = expression.expression().len();
+    if expression_bytes > work_budget.limits.expression_bytes {
+        return Err(transform_resource_limit(
+            crate::policy::resource_name::XPATH_EXPRESSION_BYTES,
+            work_budget.limits.expression_bytes,
+            expression_bytes,
+        ));
+    }
+    let expression_complexity = xpath_expression_complexity(expression.expression());
+    if expression_complexity > work_budget.limits.expression_complexity {
+        return Err(transform_resource_limit(
+            crate::policy::resource_name::XPATH_EXPRESSION_COMPLEXITY,
+            work_budget.limits.expression_complexity,
+            expression_complexity,
+        ));
+    }
+    let xpath = compile_xpath_with_policy_limits(
+        expression.expression(),
+        work_budget.limits.expression_bytes,
+        work_budget.limits.expression_complexity,
+    )
+    .map_err(TransformError::XPath)?;
+
     let document = input.document();
     let document_size = NodeSet::ensure_subtree_materialization_fits_with_budget(
         document.root(),
@@ -1543,28 +1566,6 @@ fn evaluate_expression<'a>(
         },
     );
 
-    let expression_bytes = expression.expression().len();
-    if expression_bytes > work_budget.limits.expression_bytes {
-        return Err(transform_resource_limit(
-            crate::policy::resource_name::XPATH_EXPRESSION_BYTES,
-            work_budget.limits.expression_bytes,
-            expression_bytes,
-        ));
-    }
-    let expression_complexity = xpath_expression_complexity(expression.expression());
-    if expression_complexity > work_budget.limits.expression_complexity {
-        return Err(transform_resource_limit(
-            crate::policy::resource_name::XPATH_EXPRESSION_COMPLEXITY,
-            work_budget.limits.expression_complexity,
-            expression_complexity,
-        ));
-    }
-    let xpath = compile_xpath_with_policy_limits(
-        expression.expression(),
-        work_budget.limits.expression_bytes,
-        work_budget.limits.expression_complexity,
-    )
-    .map_err(TransformError::XPath)?;
     let evaluation_work = xpath_evaluation_work(expression.expression(), document_size, mode);
     let string_scans = xpath_string_scan_count(expression.expression()).max(1);
 
@@ -1956,6 +1957,32 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn xpath_rejects_invalid_expression_before_mirror_preflight() {
+        // Programmatic expressions must fail their cheap policy gate before
+        // document mirroring can consume or reject the operation's work budget.
+        let document = Document::parse("<root/>").unwrap();
+        let input = NodeSet::entire_document_without_comments(&document).unwrap();
+        let resources = crate::policy::ResourcePolicy {
+            max_xpath_expression_bytes: 1,
+            max_xpath_mirror_string_bytes: 0,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = XPathWorkBudget::with_limits(&resources);
+
+        let error = apply_xpath_filter_with_semantics(
+            input,
+            &XPathExpression::new("true()"),
+            XPathHereSemantics::default(),
+            XPathDocumentRelation::SameDocument,
+            &budget,
+        )
+        .err()
+        .expect("expression policy must reject before mirror preflight");
+
+        assert_resource_limit(&error, "XPath expression bytes");
     }
 
     #[test]
