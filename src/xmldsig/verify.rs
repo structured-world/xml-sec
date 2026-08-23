@@ -46,6 +46,7 @@ use super::transforms::{
     execute_transforms_with_options_and_budget, map_c14n_resource_policy_violation,
     transform_chain_produces_binary,
 };
+use super::types::{NodeSet, TransformError};
 use super::uri::{UriReferenceResolver, same_document_reference_id};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
@@ -873,6 +874,17 @@ pub enum ReferenceProcessingError {
     Transform(#[source] super::types::TransformError),
 }
 
+impl ReferenceProcessingError {
+    fn into_policy_violation(self) -> Result<crate::policy::PolicyViolation, Self> {
+        match self {
+            Self::Policy(error)
+            | Self::UriDereference(TransformError::Policy(error))
+            | Self::Transform(TransformError::Policy(error)) => Ok(error),
+            error => Err(error),
+        }
+    }
+}
+
 /// End-to-end XMLDSig verification result for one `<Signature>`.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -1006,13 +1018,9 @@ fn map_manifest_parse_error(error: super::parse::ParseError) -> DsigError {
 
 impl From<ReferenceProcessingError> for DsigError {
     fn from(error: ReferenceProcessingError) -> Self {
-        match error {
-            ReferenceProcessingError::Policy(error) => Self::Policy(error),
-            ReferenceProcessingError::UriDereference(super::TransformError::Policy(error))
-            | ReferenceProcessingError::Transform(super::TransformError::Policy(error)) => {
-                Self::Policy(error)
-            }
-            error => Self::Reference(error),
+        match error.into_policy_violation() {
+            Ok(error) => Self::Policy(error),
+            Err(error) => Self::Reference(error),
         }
     }
 }
@@ -1612,11 +1620,17 @@ fn select_retrieved_x509_data_root<'a, 'input>(
     execution_budget: &TransformExecutionBudget,
 ) -> Result<Node<'a, 'input>, SignatureVerificationPipelineError> {
     // XMLDSig XPath filtering evaluates the predicate for every node in the
-    // dereferenced node-set. `ancestor-or-self::ds:X509Data` therefore retains
-    // one X509Data descendant and its subtree; it cannot import an ancestor
-    // that was outside the URI target's node-set.
+    // dereferenced node-set, including attribute and namespace nodes. The
+    // element-only scan below selects X509Data but must not undercount that
+    // XPath context cardinality.
+    let context_nodes = NodeSet::ensure_subtree_materialization_fits_with_budget(
+        target,
+        false,
+        execution_budget.node_set_materialization(),
+    )
+    .map_err(ReferenceProcessingError::Transform)?;
     execution_budget
-        .validate_xpath_context_evaluations(target.descendants().count())
+        .validate_xpath_context_evaluations(context_nodes)
         .map_err(ReferenceProcessingError::Transform)?;
     let mut root = None;
     for candidate in target.descendants() {
@@ -1708,6 +1722,16 @@ fn add_retrieval_binary_usage(
     Ok(())
 }
 
+fn manifest_reference_failure_reason(
+    error: ReferenceProcessingError,
+    ref_index: usize,
+) -> FailureReason {
+    match error.into_policy_violation() {
+        Ok(_) => FailureReason::ReferencePolicyViolation { ref_index },
+        Err(_) => FailureReason::ReferenceProcessingFailure { ref_index },
+    }
+}
+
 fn process_manifest_references(
     signature_node: Node<'_, '_>,
     resolver: &UriReferenceResolver<'_>,
@@ -1738,13 +1762,8 @@ fn process_manifest_references(
         }
         results.reserve(manifest_references.len());
         for (index, reference, reference_node_id) in &manifest_references {
-            let result = if execution.transform_budget.remaining_c14n_output() == 0 {
-                manifest_reference_invalid_result(
-                    reference,
-                    *index,
-                    FailureReason::ReferenceProcessingFailure { ref_index: *index },
-                )
-            } else if reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference
+            let result = if execution.transform_budget.remaining_c14n_output() == 0
+                || reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference
                 || ctx
                     .policy
                     .digest_algorithms
@@ -1771,11 +1790,11 @@ fn process_manifest_references(
                         resolver.node_for_node_id(*reference_node_id),
                         execution,
                     )
-                    .unwrap_or_else(|_| {
+                    .unwrap_or_else(|error| {
                         manifest_reference_invalid_result(
                             reference,
                             *index,
-                            FailureReason::ReferenceProcessingFailure { ref_index: *index },
+                            manifest_reference_failure_reason(error, *index),
                         )
                     }),
                     Err(SignatureVerificationPipelineError::Policy(_)) => {
@@ -2724,7 +2743,7 @@ mod tests {
         assert!(results.iter().all(|result| {
             matches!(
                 result.status,
-                DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { .. })
+                DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { .. })
             )
         }));
     }
@@ -4442,14 +4461,19 @@ mod tests {
 
     #[test]
     fn retrieval_method_xpath_obeys_context_evaluation_limit() {
-        // Even a recognized fixed expression is evaluated once per node in the
-        // dereferenced set and must obey the ordinary XPath context ceiling.
+        // A bare fragment includes attribute and namespace XPath nodes in
+        // addition to the four tree nodes below. Tree-only accounting would
+        // incorrectly admit this input at the configured ceiling.
         let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_xpath_context_evaluations = 0;
+        policy.resources.max_xpath_context_evaluations = 4;
+        let xml = retrieval_method_xpath_signature().replace(
+            "<holder Id=\"target\">",
+            "<holder Id=\"target\" role=\"signing\" xmlns:metadata=\"urn:metadata\">",
+        );
 
         let error = VerifyContext::new()
             .policy(policy)
-            .verify(&retrieval_method_xpath_signature())
+            .verify(&xml)
             .expect_err("RetrievalMethod XPath contexts must obey the evaluation limit");
 
         assert!(matches!(
@@ -4457,10 +4481,10 @@ mod tests {
             SignatureVerificationPipelineError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::XPATH_CONTEXT_EVALUATIONS,
-                    maximum: 0,
+                    maximum: 4,
                     actual,
                 }
-            ) if actual > 0
+            ) if actual > 4
         ));
     }
 
