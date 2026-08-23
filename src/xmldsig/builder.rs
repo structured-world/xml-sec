@@ -2,6 +2,7 @@
 
 use std::{collections::HashSet, io::Write};
 
+use base64::Engine;
 use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 
@@ -72,6 +73,9 @@ pub enum SignatureBuilderError {
     /// The generated template did not contain its required SignedInfo child.
     #[error("generated XML template is missing SignedInfo")]
     MissingGeneratedSignedInfo,
+    /// The generated template could not be prepared for policy validation.
+    #[error("generated XML template validation failed: {0}")]
+    GeneratedMutation(#[source] super::mutation::XmlMutationError),
 }
 
 /// Builder for a single XMLDSig `<Reference>` template.
@@ -234,18 +238,33 @@ impl SignatureBuilder {
         // Field-level checks bound each input class; these checks cover the
         // completed artifact exactly as the signing operation will consume it.
         policy.resources.validate_xml_document_len(template.len())?;
-        let document =
-            super::mutation::parse_with_options(&template, Some(policy)).map_err(|error| {
-                match error {
-                    roxmltree::Error::NodesLimitReached => {
-                        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
-                            resource: crate::policy::resource_name::XML_NODES,
-                            maximum: policy.resources.max_xml_nodes,
-                            actual: policy.resources.max_xml_nodes.saturating_add(1),
-                        })
-                    }
-                    other => SignatureBuilderError::GeneratedXml(other),
+        let digest_placeholders = self.references.iter().map(|reference| {
+            base64::engine::general_purpose::STANDARD.encode(vec![
+                0_u8;
+                reference
+                    .digest_method
+                    .output_len()
+            ])
+        });
+        let validation_template = super::mutation::fill_signed_info_digest_values_with_options(
+            &template,
+            digest_placeholders,
+            None,
+        )
+        .map_err(SignatureBuilderError::GeneratedMutation)?;
+        policy
+            .resources
+            .validate_xml_document_len(validation_template.len())?;
+        let document = super::mutation::parse_with_options(&validation_template, Some(policy))
+            .map_err(|error| match error {
+                roxmltree::Error::NodesLimitReached => {
+                    SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+                        resource: crate::policy::resource_name::XML_NODES,
+                        maximum: policy.resources.max_xml_nodes,
+                        actual: policy.resources.max_xml_nodes.saturating_add(1),
+                    })
                 }
+                other => SignatureBuilderError::GeneratedXml(other),
             })?;
         let signed_info = document
             .root_element()

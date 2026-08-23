@@ -1,4 +1,6 @@
-use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use std::collections::HashSet;
+
+use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::policy::{PolicyViolation, SigningPolicy};
 use xml_sec::xmldsig::transforms::MAX_TRANSFORMS_PER_REFERENCE;
 use xml_sec::xmldsig::{
@@ -528,6 +530,44 @@ fn policy_aware_builder_bounds_signed_info_canonicalization() {
             actual,
             ..
         }) if actual > 0
+    ));
+}
+
+#[test]
+fn policy_aware_builder_accounts_for_filled_digest_values() {
+    // Signing fills each DigestValue before canonicalizing SignedInfo, so an
+    // empty-template measurement would undercount every reference digest.
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256));
+    let template = builder.build_template().expect("valid empty template");
+    let document = roxmltree::Document::parse(&template).expect("builder output must parse");
+    let signed_info = document
+        .descendants()
+        .find(|node| node.has_tag_name((DSIG_NS, "SignedInfo")))
+        .expect("generated SignedInfo");
+    let signed_info_subtree: HashSet<_> = signed_info.descendants().map(|node| node.id()).collect();
+    let mut empty_canonical = Vec::new();
+    canonicalize(
+        &document,
+        Some(&|node| signed_info_subtree.contains(&node.id())),
+        &exclusive_c14n(),
+        &mut empty_canonical,
+    )
+    .expect("empty SignedInfo must canonicalize");
+    let mut policy = SigningPolicy::default();
+    policy.resources.max_canonicalized_bytes = empty_canonical.len();
+
+    let error = builder
+        .build_template_with_policy(&policy)
+        .expect_err("filled SHA-256 digest text must exceed the empty-form budget");
+
+    assert!(matches!(
+        error,
+        SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+            maximum,
+            actual,
+            ..
+        }) if maximum == empty_canonical.len() && actual > maximum
     ));
 }
 
