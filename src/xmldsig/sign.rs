@@ -945,6 +945,14 @@ impl<'a> SignContext<'a> {
         }
         let expected_signature_len =
             expected_signature_output_len(self.signing_key, algorithm, &self.policy)?;
+        let signature_placeholder =
+            base64::engine::general_purpose::STANDARD.encode(vec![0_u8; expected_signature_len]);
+        fill_signature_value_at_index_with_options(
+            &with_digests,
+            &signature_placeholder,
+            target_signature,
+            Some(&self.policy),
+        )?;
         self.provider
             .require_capability(crate::provider::ProviderCapability::Sign(algorithm))
             .map_err(SigningKeyError::from)?;
@@ -974,7 +982,15 @@ impl<'a> SignContext<'a> {
     ) -> Result<String, SigningError> {
         self.policy.validate()?;
         self.policy.resources.validate_xml_document_len(xml.len())?;
-        let template = builder.build_template_with_policy(&self.policy)?;
+        let expected_signature_len = expected_signature_output_len(
+            self.signing_key,
+            builder.signature_method(),
+            &self.policy,
+        )?;
+        let template = builder.build_template_with_policy_for_signature_output(
+            &self.policy,
+            expected_signature_len,
+        )?;
         let templated = if let Some(id) = self.start_node_id {
             let document = parse_signing_document(xml, Some(&self.policy))
                 .map_err(SigningDigestError::XmlParse)?;

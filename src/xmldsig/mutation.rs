@@ -118,7 +118,7 @@ pub(super) fn append_signature_to_root_with_options(
     signature_template: &str,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    validate_signature_template(signature_template)?;
+    validate_signature_template(signature_template, policy)?;
     let source = parse_mutation_xml_with_options(xml, policy)?;
     if !source.root().children().any(|node| node.is_element()) {
         return Err(XmlMutationError::MissingRootElement);
@@ -177,7 +177,7 @@ pub(super) fn append_signature_to_element_with_options(
     target: Range<usize>,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    validate_signature_template(signature_template)?;
+    validate_signature_template(signature_template, policy)?;
     let _source = parse_mutation_xml_with_options(xml, policy)?;
     let fragment = xml
         .get(target.clone())
@@ -1204,8 +1204,11 @@ fn fill_dsig_element_raw_matching(
     Ok(output)
 }
 
-fn validate_signature_template(signature_template: &str) -> Result<(), XmlMutationError> {
-    let document = roxmltree::Document::parse(signature_template)?;
+fn validate_signature_template(
+    signature_template: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<(), XmlMutationError> {
+    let document = parse_mutation_xml_with_options(signature_template, policy)?;
     let root = document.root_element();
     if root.tag_name().namespace() == Some(XMLDSIG_NS) && root.tag_name().name() == "Signature" {
         Ok(())
@@ -1541,6 +1544,54 @@ mod tests {
         let err = append_signature_to_root("<root/>", "<NotSignature/>")
             .expect_err("template must be a Signature");
         assert!(matches!(err, XmlMutationError::InvalidSignatureTemplate));
+    }
+
+    #[test]
+    fn signature_template_validation_applies_the_active_policy_first() {
+        // The separately supplied template is an untrusted XML allocation
+        // boundary. Reject it before parsing the source or constructing output.
+        let template = format!(
+            r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo>{}</ds:SignedInfo><ds:SignatureValue/></ds:Signature>"#,
+            "<part/>".repeat(16),
+        );
+
+        let byte_policy = crate::policy::SigningPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_document_bytes: template.len() - 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::SigningPolicy::default()
+        };
+        let byte_error =
+            append_signature_to_root_with_options("not XML", &template, Some(&byte_policy))
+                .expect_err("template byte policy must win before source parsing");
+        assert!(matches!(
+            byte_error,
+            XmlMutationError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DOCUMENT,
+                maximum,
+                actual,
+            }) if maximum == template.len() - 1 && actual == template.len()
+        ));
+
+        let node_policy = crate::policy::SigningPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_nodes: 2,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::SigningPolicy::default()
+        };
+        let node_error =
+            append_signature_to_root_with_options("not XML", &template, Some(&node_policy))
+                .expect_err("template node policy must win before source parsing");
+        assert!(matches!(
+            node_error,
+            XmlMutationError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum: 2,
+                actual: 3,
+            })
+        ));
     }
 
     #[test]

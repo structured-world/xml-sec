@@ -625,6 +625,92 @@ fn signing_policy_rechecks_document_bytes_after_mutation() {
 }
 
 #[test]
+fn sign_with_builder_preflights_exact_signature_value_growth() {
+    // The key-aware builder path knows the exact RSA output width. It must
+    // reject a final-document ceiling before dispatching the signing primitive.
+    struct CountingSigningKey {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SigningKey for CountingSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1_u8; 256])
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Ok(SigningPublicKeyInfo::Rsa {
+                spki_der: Vec::new(),
+                modulus: vec![0x80_u8; 256],
+                exponent: vec![1, 0, 1],
+            })
+        }
+    }
+
+    let xml = "<root><payload ID=\"payload\">hello</payload></root>";
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    let baseline_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let final_len = SignContext::new(&baseline_key)
+        .sign_with_builder(xml, &builder)
+        .expect("baseline signing must succeed")
+        .len();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let key = CountingSigningKey {
+        calls: Arc::clone(&calls),
+    };
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: final_len - 1,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    let error = SignContext::new(&key)
+        .policy(policy)
+        .sign_with_builder(xml, &builder)
+        .expect_err("final SignatureValue growth must be rejected during preflight");
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "XML document",
+            maximum,
+            actual,
+        }) if maximum == final_len - 1 && actual == final_len
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    let allowed_calls = Arc::new(AtomicUsize::new(0));
+    let allowed_key = CountingSigningKey {
+        calls: Arc::clone(&allowed_calls),
+    };
+    let exact_policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: final_len,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    let signed = SignContext::new(&allowed_key)
+        .policy(exact_policy)
+        .sign_with_builder(xml, &builder)
+        .expect("an exact final-document ceiling must remain usable");
+    assert_eq!(signed.len(), final_len);
+    assert_eq!(allowed_calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn signing_policy_bounds_key_info_writer_bytes_before_parsing() {
     // Writer output is untrusted XML input. Its byte ceiling must win before
     // parsing, even when an oversized fragment is also malformed at its tail.

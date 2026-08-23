@@ -114,8 +114,12 @@ pub trait KeyResolver {
     /// Resolve under the operation's immutable policy snapshot.
     ///
     /// Implementations that make trust or key-source decisions must override
-    /// this method. The default preserves source-only custom resolvers whose
-    /// behavior is independent of policy.
+    /// this method. Resolver implementations that inspect multiple candidates
+    /// must enforce [`crate::policy::ResourcePolicy::max_key_candidates`] across
+    /// that internal search. The verification pipeline separately requires
+    /// capacity for the single candidate returned by any resolver. The default
+    /// preserves source-only custom resolvers whose behavior is independent of
+    /// other policy fields.
     fn resolve_with_policy<'a>(
         &'a self,
         key_info: Option<&KeyInfo>,
@@ -1959,9 +1963,11 @@ fn resolve_verifying_key<'k>(
             }
             .into());
         }
+        require_verifying_key_candidate_capacity(&ctx.policy)?;
         return Ok(Some(ResolvedVerifyingKey::Borrowed(key)));
     }
     if let Some(resolver) = ctx.key_resolver {
+        require_verifying_key_candidate_capacity(&ctx.policy)?;
         let resolved = resolver.resolve_with_policy_and_provider(
             key_info,
             algorithm,
@@ -1971,6 +1977,20 @@ fn resolve_verifying_key<'k>(
         return Ok(resolved.map(ResolvedVerifyingKey::Owned));
     }
     Ok(None)
+}
+
+fn require_verifying_key_candidate_capacity(
+    policy: &crate::policy::VerificationPolicy,
+) -> Result<(), SignatureVerificationPipelineError> {
+    if policy.resources.max_key_candidates == 0 {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::KEY_CANDIDATES,
+            maximum: 0,
+            actual: 1,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn enforce_reference_policies(
@@ -4856,6 +4876,47 @@ mod tests {
         assert!(matches!(
             result.signed_info_references[0].status,
             DsigStatus::Valid
+        ));
+    }
+
+    #[test]
+    fn verification_candidate_budget_covers_preset_and_custom_resolver_paths() {
+        // Zero is a valid deny-all ceiling. Neither an already-resolved key nor
+        // a custom resolver may bypass the operation-wide candidate policy.
+        let xml = signature_with_target_reference("AQ==");
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_key_candidates = 0;
+
+        let preset_error = VerifyContext::new()
+            .key(&RejectingKey)
+            .policy(policy.clone())
+            .verify(&xml)
+            .expect_err("a preset key consumes one candidate");
+        assert!(matches!(
+            preset_error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_CANDIDATES,
+                    maximum: 0,
+                    actual: 1,
+                }
+            )
+        ));
+
+        let resolver_error = VerifyContext::new()
+            .key_resolver(&PanicResolver)
+            .policy(policy)
+            .verify(&xml)
+            .expect_err("a custom resolver requires candidate capacity before dispatch");
+        assert!(matches!(
+            resolver_error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_CANDIDATES,
+                    maximum: 0,
+                    actual: 1,
+                }
+            )
         ));
     }
 

@@ -192,10 +192,28 @@ impl SignatureBuilder {
     }
 
     /// Build a template after enforcing the same immutable policy snapshot used
-    /// by the signing operation that will consume it.
+    /// by the signing operation that will consume it. This key-independent
+    /// method validates generated digest widths; `SignContext::sign_with_builder`
+    /// additionally validates the exact key-dependent `SignatureValue` width.
     pub fn build_template_with_policy(
         &self,
         policy: &SigningPolicy,
+    ) -> Result<String, SignatureBuilderError> {
+        self.build_template_with_policy_and_signature_output_len(policy, None)
+    }
+
+    pub(super) fn build_template_with_policy_for_signature_output(
+        &self,
+        policy: &SigningPolicy,
+        signature_output_len: usize,
+    ) -> Result<String, SignatureBuilderError> {
+        self.build_template_with_policy_and_signature_output_len(policy, Some(signature_output_len))
+    }
+
+    fn build_template_with_policy_and_signature_output_len(
+        &self,
+        policy: &SigningPolicy,
+        signature_output_len: Option<usize>,
     ) -> Result<String, SignatureBuilderError> {
         policy.validate()?;
         self.validate(policy)?;
@@ -246,17 +264,25 @@ impl SignatureBuilder {
                     .output_len()
             ])
         });
-        let validation_template = super::mutation::fill_signed_info_digest_values_with_options(
-            &template,
-            digest_placeholders,
-            Some(policy),
-        )
-        .map_err(|error| match error {
-            super::mutation::XmlMutationError::Policy(violation) => {
-                SignatureBuilderError::Policy(violation)
-            }
-            other => SignatureBuilderError::GeneratedMutation(other),
-        })?;
+        let digest_validation_template =
+            super::mutation::fill_signed_info_digest_values_with_options(
+                &template,
+                digest_placeholders,
+                Some(policy),
+            )
+            .map_err(map_generated_mutation_error)?;
+        let validation_template = if let Some(signature_output_len) = signature_output_len {
+            let signature_placeholder =
+                base64::engine::general_purpose::STANDARD.encode(vec![0_u8; signature_output_len]);
+            super::mutation::fill_signature_value_with_options(
+                &digest_validation_template,
+                &signature_placeholder,
+                Some(policy),
+            )
+            .map_err(map_generated_mutation_error)?
+        } else {
+            digest_validation_template
+        };
         policy
             .resources
             .validate_xml_document_len(validation_template.len())?;
@@ -299,6 +325,10 @@ impl SignatureBuilder {
             )
         })?;
         Ok(template)
+    }
+
+    pub(super) fn signature_method(&self) -> SignatureAlgorithm {
+        self.sign_method
     }
 
     fn validate(&self, policy: &SigningPolicy) -> Result<(), SignatureBuilderError> {
@@ -516,6 +546,15 @@ fn map_transform_validation_error(error: super::TransformError) -> SignatureBuil
     match error {
         super::TransformError::Policy(error) => SignatureBuilderError::Policy(error),
         error => SignatureBuilderError::InvalidXPath(error.to_string()),
+    }
+}
+
+fn map_generated_mutation_error(error: super::mutation::XmlMutationError) -> SignatureBuilderError {
+    match error {
+        super::mutation::XmlMutationError::Policy(violation) => {
+            SignatureBuilderError::Policy(violation)
+        }
+        other => SignatureBuilderError::GeneratedMutation(other),
     }
 }
 
