@@ -879,6 +879,16 @@ impl<'a> SignContext<'a> {
         xml: &str,
         target_signature: usize,
     ) -> Result<String, SigningError> {
+        let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
+        self.sign_template_at_index_with_budgets(xml, target_signature, &mut budgets)
+    }
+
+    fn sign_template_at_index_with_budgets(
+        &self,
+        xml: &str,
+        target_signature: usize,
+        budgets: &mut SigningOperationBudgets,
+    ) -> Result<String, SigningError> {
         let document = parse_signing_document(xml, Some(&self.policy))
             .map_err(SigningDigestError::XmlParse)?;
         let signature = find_signing_signature_node(
@@ -887,7 +897,6 @@ impl<'a> SignContext<'a> {
         )?;
         parse_signature_children(signature)
             .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
-        let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
         let transform_options = TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics);
@@ -917,7 +926,7 @@ impl<'a> SignContext<'a> {
             transform_options,
             &self.policy,
             self.provider,
-            &mut budgets,
+            budgets,
             target_signature,
             self.id_attributes,
         )?;
@@ -925,7 +934,7 @@ impl<'a> SignContext<'a> {
             .resources
             .validate_xml_document_len(with_digests.len())?;
         let (algorithm, canonical_signed_info) =
-            canonicalize_signed_info(&with_digests, &self.policy, &mut budgets, target_signature)?;
+            canonicalize_signed_info(&with_digests, &self.policy, budgets, target_signature)?;
         budgets
             .transforms
             .charge_c14n_output(canonical_signed_info.len())
@@ -987,9 +996,11 @@ impl<'a> SignContext<'a> {
             builder.signature_method(),
             &self.policy,
         )?;
+        let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
         let template = builder.build_template_with_policy_for_signature_output(
             &self.policy,
             expected_signature_len,
+            &budgets.transforms,
         )?;
         let templated = if let Some(id) = self.start_node_id {
             let document = parse_signing_document(xml, Some(&self.policy))
@@ -1024,7 +1035,7 @@ impl<'a> SignContext<'a> {
                 element: "Signature",
             })?;
         let target_signature = signature_index(&document, appended)?;
-        self.sign_template_at_index(&templated, target_signature)
+        self.sign_template_at_index_with_budgets(&templated, target_signature, &mut budgets)
     }
 }
 

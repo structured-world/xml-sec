@@ -199,21 +199,28 @@ impl SignatureBuilder {
         &self,
         policy: &SigningPolicy,
     ) -> Result<String, SignatureBuilderError> {
-        self.build_template_with_policy_and_signature_output_len(policy, None)
+        let budget = TransformExecutionBudget::from_resources(&policy.resources);
+        self.build_template_with_policy_and_signature_output_len(policy, None, &budget)
     }
 
     pub(super) fn build_template_with_policy_for_signature_output(
         &self,
         policy: &SigningPolicy,
         signature_output_len: usize,
+        budget: &TransformExecutionBudget,
     ) -> Result<String, SignatureBuilderError> {
-        self.build_template_with_policy_and_signature_output_len(policy, Some(signature_output_len))
+        self.build_template_with_policy_and_signature_output_len(
+            policy,
+            Some(signature_output_len),
+            budget,
+        )
     }
 
     fn build_template_with_policy_and_signature_output_len(
         &self,
         policy: &SigningPolicy,
         signature_output_len: Option<usize>,
+        budget: &TransformExecutionBudget,
     ) -> Result<String, SignatureBuilderError> {
         policy.validate()?;
         self.validate(policy)?;
@@ -304,14 +311,14 @@ impl SignatureBuilder {
             .ok_or(SignatureBuilderError::MissingGeneratedSignedInfo)?;
         let signed_info_subtree: HashSet<_> =
             signed_info.descendants().map(|node| node.id()).collect();
-        let budget = TransformExecutionBudget::from_resources(&policy.resources);
+        let mut canonical_signed_info = Vec::new();
         canonicalize_bounded_with_xml_base_budget(
             &document,
             Some(&|node| signed_info_subtree.contains(&node.id())),
             &self.c14n_method,
             budget.remaining_c14n_output(),
             budget.xml_base_resolution(),
-            &mut Vec::new(),
+            &mut canonical_signed_info,
         )
         .map_err(|error| {
             map_c14n_resource_policy_violation(
@@ -324,6 +331,7 @@ impl SignatureBuilder {
                 SignatureBuilderError::Policy,
             )
         })?;
+        budget.charge_c14n_output_policy(canonical_signed_info.len())?;
         Ok(template)
     }
 

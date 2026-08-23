@@ -213,7 +213,7 @@ impl<'a> NodeSet<'a> {
     /// Returns [`TransformError::Policy`] when projecting the document's tree,
     /// attribute, namespace, or owned string data would exceed its budget.
     pub fn entire_document_without_comments(doc: &'a Document<'a>) -> Result<Self, TransformError> {
-        Self::ensure_subtree_materialization_fits(doc.root())?;
+        Self::ensure_subtree_materialization_fits(doc.root(), false)?;
         Ok(Self::collect_document(doc, false))
     }
 
@@ -221,7 +221,7 @@ impl<'a> NodeSet<'a> {
         doc: &'a Document<'a>,
         budget: &NodeSetMaterializationBudget,
     ) -> Result<Self, TransformError> {
-        Self::charge_subtree_materialization(doc.root(), budget)?;
+        Self::charge_subtree_materialization(doc.root(), false, budget)?;
         Ok(Self::collect_document(doc, false))
     }
 
@@ -234,7 +234,7 @@ impl<'a> NodeSet<'a> {
     /// Returns [`TransformError::Policy`] when projecting the document's tree,
     /// attribute, namespace, or owned string data would exceed its budget.
     pub fn entire_document_with_comments(doc: &'a Document<'a>) -> Result<Self, TransformError> {
-        Self::ensure_subtree_materialization_fits(doc.root())?;
+        Self::ensure_subtree_materialization_fits(doc.root(), true)?;
         Ok(Self::collect_document(doc, true))
     }
 
@@ -242,7 +242,7 @@ impl<'a> NodeSet<'a> {
         doc: &'a Document<'a>,
         budget: &NodeSetMaterializationBudget,
     ) -> Result<Self, TransformError> {
-        Self::charge_subtree_materialization(doc.root(), budget)?;
+        Self::charge_subtree_materialization(doc.root(), true, budget)?;
         Ok(Self::collect_document(doc, true))
     }
 
@@ -255,7 +255,7 @@ impl<'a> NodeSet<'a> {
     /// Returns [`TransformError::Policy`] when projecting the subtree's tree,
     /// attribute, namespace, or owned string data would exceed its budget.
     pub fn subtree(element: Node<'a, 'a>) -> Result<Self, TransformError> {
-        Self::ensure_subtree_materialization_fits(element)?;
+        Self::ensure_subtree_materialization_fits(element, true)?;
         Ok(Self::collect_subtree(element))
     }
 
@@ -266,9 +266,9 @@ impl<'a> NodeSet<'a> {
         budget: Option<&NodeSetMaterializationBudget>,
     ) -> Result<Self, TransformError> {
         match budget {
-            Some(budget) => Self::charge_subtree_materialization(element, budget)?,
+            Some(budget) => Self::charge_subtree_materialization(element, false, budget)?,
             None => {
-                Self::ensure_subtree_materialization_fits(element)?;
+                Self::ensure_subtree_materialization_fits(element, false)?;
             }
         }
         let mut set = Self {
@@ -295,7 +295,7 @@ impl<'a> NodeSet<'a> {
         element: Node<'a, 'a>,
         budget: &NodeSetMaterializationBudget,
     ) -> Result<Self, TransformError> {
-        Self::charge_subtree_materialization(element, budget)?;
+        Self::charge_subtree_materialization(element, true, budget)?;
         Ok(Self::collect_subtree(element))
     }
 
@@ -595,16 +595,19 @@ impl<'a> NodeSet<'a> {
 
     pub(crate) fn ensure_subtree_materialization_fits(
         root: Node<'_, '_>,
+        with_comments: bool,
     ) -> Result<usize, TransformError> {
-        Ok(Self::subtree_materialization(root)?.entries)
+        Ok(Self::subtree_materialization(root, with_comments)?.entries)
     }
 
     pub(crate) fn ensure_subtree_materialization_fits_with_budget(
         root: Node<'_, '_>,
+        with_comments: bool,
         budget: &NodeSetMaterializationBudget,
     ) -> Result<usize, TransformError> {
         Ok(Self::subtree_materialization_with_limits(
             root,
+            with_comments,
             budget.max_entries,
             budget.max_owned_string_bytes,
         )?
@@ -613,10 +616,12 @@ impl<'a> NodeSet<'a> {
 
     fn charge_subtree_materialization(
         root: Node<'_, '_>,
+        with_comments: bool,
         budget: &NodeSetMaterializationBudget,
     ) -> Result<(), TransformError> {
         let materialization = Self::subtree_materialization_with_limits(
             root,
+            with_comments,
             budget.max_entries,
             budget.max_owned_string_bytes,
         )?;
@@ -625,9 +630,11 @@ impl<'a> NodeSet<'a> {
 
     fn subtree_materialization(
         root: Node<'_, '_>,
+        with_comments: bool,
     ) -> Result<NodeSetMaterialization, TransformError> {
         Self::subtree_materialization_with_limits(
             root,
+            with_comments,
             MAX_NODE_SET_ENTRIES,
             MAX_NODE_SET_OWNED_STRING_BYTES,
         )
@@ -635,6 +642,7 @@ impl<'a> NodeSet<'a> {
 
     fn subtree_materialization_with_limits(
         root: Node<'_, '_>,
+        with_comments: bool,
         max_entries: usize,
         max_owned_string_bytes: usize,
     ) -> Result<NodeSetMaterialization, TransformError> {
@@ -642,6 +650,9 @@ impl<'a> NodeSet<'a> {
         let mut owned_string_bytes = 0_usize;
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
+            if node.is_comment() && !with_comments {
+                continue;
+            }
             let projected = if node.is_element() {
                 for attribute in node.attributes() {
                     owned_string_bytes = charge_node_set_string_bytes(
@@ -913,6 +924,44 @@ mod tests {
             .expect("fixed fixture contains one comment");
 
         assert!(!nodes.contains(comment));
+        assert!(!nodes.with_comments());
+    }
+
+    #[test]
+    fn document_without_comments_preflights_the_materialized_set() {
+        // Empty-URI dereference excludes comments before the node-set exists, so
+        // comments must not consume the configured entry ceiling during preflight.
+        let document = Document::parse("<root><!-- one --><child/><!-- two --></root>")
+            .expect("fixed comment fixture must parse");
+        let budget = NodeSetMaterializationBudget::with_limits(3, 1, 1);
+
+        let nodes = NodeSet::entire_document_without_comments_with_budget(&document, &budget)
+            .expect("the three materialized tree nodes must fit exactly");
+
+        assert_eq!(nodes.nodes.len(), 3);
+        assert!(nodes.nodes.iter().all(|key| match key {
+            XmlNodeKey::Tree(id) => !document.get_node(*id).is_some_and(|node| node.is_comment()),
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn bare_fragment_preflights_the_materialized_set_without_comments() {
+        // Bare-name fragments apply the same XMLDSig comment omission rule to a
+        // subtree and therefore must charge only nodes that reach the result.
+        let document =
+            Document::parse("<root><target><!-- one --><child/><!-- two --></target></root>")
+                .expect("fixed comment fixture must parse");
+        let target = document
+            .descendants()
+            .find(|node| node.has_tag_name("target"))
+            .expect("fixed fixture contains the selected target");
+        let budget = NodeSetMaterializationBudget::with_limits(2, 1, 1);
+
+        let nodes = NodeSet::subtree_without_comments_with_budget(target, Some(&budget))
+            .expect("the target and child must fit exactly");
+
+        assert_eq!(nodes.nodes.len(), 2);
         assert!(!nodes.with_comments());
     }
 

@@ -1497,6 +1497,7 @@ fn evaluate_expression<'a>(
     let document = input.document();
     let document_size = NodeSet::ensure_subtree_materialization_fits_with_budget(
         document.root(),
+        true,
         materialization_budget,
     )?;
     // The node-set preflight bounds map cardinality and inherited namespace

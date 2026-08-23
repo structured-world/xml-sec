@@ -4,7 +4,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::policy::{ManifestProcessing, SigningPolicy};
 use xml_sec::xmldsig::mutation::append_signature_to_root;
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
@@ -708,6 +708,70 @@ fn sign_with_builder_preflights_exact_signature_value_growth() {
         .expect("an exact final-document ceiling must remain usable");
     assert_eq!(signed.len(), final_len);
     assert_eq!(allowed_calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn sign_with_builder_shares_canonicalization_budget_with_signing() {
+    // The builder canonicalizes the digest-filled SignedInfo before appending
+    // its template. That preflight and the real signing pass are one operation
+    // and must consume one cumulative canonicalization budget.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::Base64Decode),
+        );
+    let xml = "<root><payload ID=\"payload\">YQ==</payload></root>";
+    let template = builder.build_template().expect("valid signature template");
+    let templated = append_signature_to_root(xml, &template).expect("append signature template");
+    let digest_filled = fill_reference_digest_values(&templated)
+        .expect("base64 reference digest must be materialized");
+    let document = roxmltree::Document::parse(&digest_filled).expect("filled template must parse");
+    let signed_info = document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignedInfo")))
+        .expect("filled template contains SignedInfo");
+    let signed_info_subtree: HashSet<_> = signed_info.descendants().map(|node| node.id()).collect();
+    let mut canonical_signed_info = Vec::new();
+    canonicalize(
+        &document,
+        Some(&|node| signed_info_subtree.contains(&node.id())),
+        &exclusive_c14n(),
+        &mut canonical_signed_info,
+    )
+    .expect("filled SignedInfo must canonicalize");
+    let individual_pass_limit = canonical_signed_info.len();
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_canonicalized_bytes: individual_pass_limit,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    builder
+        .build_template_with_policy(&policy)
+        .expect("builder preflight must fit the individual pass limit");
+    SignContext::new(&private_key)
+        .policy(policy.clone())
+        .sign_template(&templated)
+        .expect("standalone signing must fit the individual pass limit");
+
+    let error = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_with_builder(xml, &builder)
+        .expect_err("builder preflight and signing must exceed one-pass capacity");
+
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "canonicalized bytes",
+            maximum,
+            actual,
+        }) if maximum == individual_pass_limit && actual > maximum
+    ));
 }
 
 #[test]

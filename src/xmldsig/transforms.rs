@@ -190,14 +190,14 @@ impl C14nOutputBudget {
         self.remaining.get()
     }
 
-    fn charge(&self, bytes: usize) -> Result<(), TransformError> {
+    fn charge(&self, bytes: usize) -> Result<(), crate::policy::PolicyViolation> {
         let consumed = self.max_bytes.saturating_sub(self.remaining.get());
         if !charge_byte_budget(&self.remaining, bytes) {
-            return Err(transform_resource_limit(
-                crate::policy::resource_name::CANONICALIZED_BYTES,
-                self.max_bytes,
-                consumed.saturating_add(bytes),
-            ));
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::CANONICALIZED_BYTES,
+                maximum: self.max_bytes,
+                actual: consumed.saturating_add(bytes),
+            });
         }
         Ok(())
     }
@@ -352,6 +352,13 @@ impl TransformExecutionBudget {
     }
 
     pub(crate) fn charge_c14n_output(&self, bytes: usize) -> Result<(), TransformError> {
+        self.c14n.charge(bytes).map_err(TransformError::from)
+    }
+
+    pub(crate) fn charge_c14n_output_policy(
+        &self,
+        bytes: usize,
+    ) -> Result<(), crate::policy::PolicyViolation> {
         self.c14n.charge(bytes)
     }
 
