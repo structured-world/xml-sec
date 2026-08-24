@@ -31,7 +31,7 @@ pub(crate) const XML_DOCUMENT_BYTE_CEILING: usize = ENCRYPTION_CIPHER_VALUE_BASE
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const ENCRYPTION_RECIPIENT_CEILING: usize = 64;
 /// Maximum symmetric keys attempted by one prepared decryption operation.
-#[cfg(feature = "xmlenc")]
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const KEY_CANDIDATE_CEILING: usize = 64;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const ENCRYPTION_METADATA_BYTE_CEILING: usize = 4 * 1024;
@@ -50,3 +50,37 @@ pub(crate) const REFERENCE_TRANSFORM_CEILING: usize = 64;
 pub(crate) const X509_CHAIN_DEPTH_CEILING: usize = 9;
 #[cfg(feature = "xmldsig")]
 pub(crate) const X509_CANDIDATE_PATH_CEILING: usize = 64;
+
+/// Absolute transform and XPath work ceilings. Operation policy may only tighten these.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const BASE64_TRANSFORM_INPUT_BYTE_CEILING: usize = 16 * 1024 * 1024;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const BASE64_TRANSFORM_OUTPUT_BYTE_CEILING: usize = 8 * 1024 * 1024;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XPATH_EXPRESSION_COUNT_CEILING: usize = 4_096;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XPATH_EXPRESSION_BYTE_CEILING: usize = 16 * 1024;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XPATH_EXPRESSION_COMPLEXITY_CEILING: usize = 256;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XPATH_CONTEXT_EVALUATION_CEILING: usize = 4_096;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XPATH_EVALUATION_WORK_CEILING: usize = 6_000_000;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XPATH_MIRROR_STRING_BYTE_CEILING: usize = 8 * 1024 * 1024;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XPATH_STRING_WORK_BYTE_CEILING: usize = 512 * 1024 * 1024;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XPATH_NAMESPACE_BINDING_CEILING: usize = 1_024;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XPATH_NAMESPACE_BYTE_CEILING: usize = 64 * 1024;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XPATH_FILTER_COUNT_CEILING: usize = 64;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const NODE_SET_FILTER_WORK_CEILING: usize = 6_000_000;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const NODE_SET_ENTRY_CEILING: usize = 65_536;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const NODE_SET_OWNED_STRING_BYTE_CEILING: usize = 8 * 1024 * 1024;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING: usize = 64 * 1024 * 1024;

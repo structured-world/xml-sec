@@ -30,14 +30,24 @@ pub(super) fn parse_with_options<'a>(
     )
 }
 
-fn parse_synthesized_xml_with_options<'a>(
+fn parse_mutation_xml_with_options<'a>(
     xml: &'a str,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<roxmltree::Document<'a>, XmlMutationError> {
     if let Some(policy) = policy {
         policy.resources.validate_xml_document_len(xml.len())?;
     }
-    parse_with_options(xml, policy).map_err(Into::into)
+    parse_with_options(xml, policy).map_err(|error| match (policy, error) {
+        (Some(policy), roxmltree::Error::NodesLimitReached) => {
+            let maximum = policy.resources.effective_xml_nodes() as usize;
+            XmlMutationError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum,
+                actual: maximum.saturating_add(1),
+            })
+        }
+        (_, error) => XmlMutationError::XmlParse(error),
+    })
 }
 
 /// Errors produced by XMLDSig XML mutation helpers.
@@ -108,8 +118,8 @@ pub(super) fn append_signature_to_root_with_options(
     signature_template: &str,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    validate_signature_template(signature_template)?;
-    let source = parse_with_options(xml, policy)?;
+    validate_signature_template(signature_template, policy)?;
+    let source = parse_mutation_xml_with_options(xml, policy)?;
     if !source.root().children().any(|node| node.is_element()) {
         return Err(XmlMutationError::MissingRootElement);
     }
@@ -157,7 +167,7 @@ pub(super) fn append_signature_to_root_with_options(
     }
 
     let output = String::from_utf8(writer.into_inner())?;
-    parse_synthesized_xml_with_options(&output, policy)?;
+    parse_mutation_xml_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -167,8 +177,8 @@ pub(super) fn append_signature_to_element_with_options(
     target: Range<usize>,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    validate_signature_template(signature_template)?;
-    let _source = parse_with_options(xml, policy)?;
+    validate_signature_template(signature_template, policy)?;
+    let _source = parse_mutation_xml_with_options(xml, policy)?;
     let fragment = xml
         .get(target.clone())
         .ok_or(XmlMutationError::InvalidAppendTarget)?;
@@ -196,7 +206,7 @@ pub(super) fn append_signature_to_element_with_options(
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
         output.insert_str(target.start + closing_start, signature_template);
     }
-    parse_synthesized_xml_with_options(&output, policy)?;
+    parse_mutation_xml_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -409,6 +419,102 @@ pub(super) fn fill_signature_value_at_index_with_options(
     )
 }
 
+pub(super) fn projected_signature_value_output_len_at_index_with_options(
+    xml: &str,
+    value_len: usize,
+    target_signature: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<usize, XmlMutationError> {
+    let document = parse_mutation_xml_with_options(xml, policy)?;
+    let Some(signature) = signature_node(&document, target_signature) else {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "SignatureValue",
+            expected: 0,
+            actual: 1,
+        });
+    };
+    let mut signature_values = signature
+        .children()
+        .filter(|node| is_dsig_node(*node, "SignatureValue"));
+    let Some(signature_value) = signature_values.next() else {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "SignatureValue",
+            expected: 0,
+            actual: 1,
+        });
+    };
+    let remaining = signature_values.count();
+    if remaining != 0 {
+        return Err(XmlMutationError::ValueCountMismatch {
+            element: "SignatureValue",
+            expected: remaining + 1,
+            actual: 1,
+        });
+    }
+
+    let range = signature_value.range();
+    let element = &xml[range.clone()];
+    let replacement_len = if element.trim_end().ends_with("/>") {
+        let name_end = element[1..]
+            .find(|character: char| {
+                character.is_ascii_whitespace() || character == '/' || character == '>'
+            })
+            .map(|offset| offset + 1)
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let qualified_name_len = name_end - 1;
+        qualified_name_len
+            .checked_add(2)
+            .and_then(|closing_markup_len| {
+                element
+                    .len()
+                    .checked_add(value_len)
+                    .and_then(|length| length.checked_add(closing_markup_len))
+            })
+    } else {
+        let existing_content_len = element_inner_xml(xml, range.clone())?.len();
+        element
+            .len()
+            .checked_sub(existing_content_len)
+            .and_then(|length| length.checked_add(value_len))
+    };
+    let projected = replacement_len
+        .and_then(|replacement_len| {
+            xml.len()
+                .checked_sub(element.len())
+                .map(|base| (base, replacement_len))
+        })
+        .and_then(|(base, replacement_len)| base.checked_add(replacement_len));
+    projected.ok_or_else(|| projected_xml_length_overflow(policy))
+}
+
+pub(super) fn padded_base64_len_for_xml(
+    decoded_len: usize,
+    policy: &crate::policy::SigningPolicy,
+) -> Result<usize, XmlMutationError> {
+    base64::encoded_len(decoded_len, true)
+        .ok_or_else(|| projected_xml_length_overflow(Some(policy)))
+}
+
+pub(super) fn zero_base64_placeholder(decoded_len: usize, encoded_len: usize) -> String {
+    let padding_len = (3 - decoded_len % 3) % 3;
+    let mut placeholder = String::with_capacity(encoded_len);
+    placeholder.extend(std::iter::repeat_n('A', encoded_len - padding_len));
+    placeholder.extend(std::iter::repeat_n('=', padding_len));
+    placeholder
+}
+
+fn projected_xml_length_overflow(
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> XmlMutationError {
+    policy.map_or(XmlMutationError::InvalidAppendTarget, |policy| {
+        XmlMutationError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::XML_DOCUMENT,
+            maximum: policy.resources.max_xml_document_bytes,
+            actual: usize::MAX,
+        })
+    })
+}
+
 /// Fill the direct `<Signature>/<KeyInfo>` child with XML child content.
 pub fn fill_key_info(xml: &str, key_info_content: &str) -> Result<String, XmlMutationError> {
     fill_key_info_with_options(xml, key_info_content, None)
@@ -453,7 +559,7 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    let document = parse_with_options(xml, policy)?;
+    let document = parse_mutation_xml_with_options(xml, policy)?;
     let Some(signature) = signature_node(&document, target_signature) else {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "Signature",
@@ -478,7 +584,7 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     // Parse it under the template's namespace context so multiple siblings and
     // inherited prefixes have exactly the semantics they will have in KeyInfo.
     let wrapped_source = wrap_key_info_children(key_info_source, key_info);
-    let source_document = parse_synthesized_xml_with_options(&wrapped_source, policy)?;
+    let source_document = parse_mutation_xml_with_options(&wrapped_source, policy)?;
     let sources = source_document
         .root_element()
         .children()
@@ -563,8 +669,8 @@ fn merge_one_key_info_source_at_index_with_options(
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    let document = parse_with_options(xml, policy)?;
-    let source_document = parse_with_options(key_info_source, policy)?;
+    let document = parse_mutation_xml_with_options(xml, policy)?;
+    let source_document = parse_mutation_xml_with_options(key_info_source, policy)?;
     let source = source_document.root_element();
     let source_content = element_inner_xml(key_info_source, source.range())?;
     let Some(signature) = signature_node(&document, target_signature) else {
@@ -684,7 +790,7 @@ fn merge_one_key_info_source_at_index_with_options(
                 &generated_attributes,
             )?
         };
-        parse_synthesized_xml_with_options(&output, policy)?;
+        parse_mutation_xml_with_options(&output, policy)?;
         return Ok(output);
     }
 
@@ -716,7 +822,7 @@ fn merge_one_key_info_source_at_index_with_options(
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
         output.insert_str(closing, key_info_source);
     }
-    parse_synthesized_xml_with_options(&output, policy)?;
+    parse_mutation_xml_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -1090,7 +1196,7 @@ fn fill_dsig_values_matching(
     }
 
     let output = String::from_utf8(writer.into_inner())?;
-    parse_synthesized_xml_with_options(&output, policy)?;
+    parse_mutation_xml_with_options(&output, policy)?;
     Ok(output)
 }
 
@@ -1190,12 +1296,15 @@ fn fill_dsig_element_raw_matching(
     }
 
     let output = String::from_utf8(writer.into_inner())?;
-    parse_synthesized_xml_with_options(&output, policy)?;
+    parse_mutation_xml_with_options(&output, policy)?;
     Ok(output)
 }
 
-fn validate_signature_template(signature_template: &str) -> Result<(), XmlMutationError> {
-    let document = roxmltree::Document::parse(signature_template)?;
+fn validate_signature_template(
+    signature_template: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<(), XmlMutationError> {
+    let document = parse_mutation_xml_with_options(signature_template, policy)?;
     let root = document.root_element();
     if root.tag_name().namespace() == Some(XMLDSIG_NS) && root.tag_name().name() == "Signature" {
         Ok(())
@@ -1221,7 +1330,7 @@ fn count_signed_info_digest_values(
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<usize, XmlMutationError> {
-    let document = parse_with_options(xml, policy)?;
+    let document = parse_mutation_xml_with_options(xml, policy)?;
     let Some(signature) = signature_node(&document, target_signature) else {
         return Ok(0);
     };
@@ -1236,7 +1345,7 @@ fn count_direct_signature_values(
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<usize, XmlMutationError> {
-    let document = parse_with_options(xml, policy)?;
+    let document = parse_mutation_xml_with_options(xml, policy)?;
     let Some(signature) = signature_node(&document, target_signature) else {
         return Ok(0);
     };
@@ -1256,7 +1365,7 @@ fn count_direct_key_infos(
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<usize, XmlMutationError> {
-    let document = parse_with_options(xml, policy)?;
+    let document = parse_mutation_xml_with_options(xml, policy)?;
     let Some(signature) = signature_node(&document, target_signature) else {
         return Ok(0);
     };
@@ -1276,7 +1385,7 @@ fn count_manifest_digest_values(
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<usize, XmlMutationError> {
-    let document = parse_with_options(xml, policy)?;
+    let document = parse_mutation_xml_with_options(xml, policy)?;
     let Some(signature) = signature_node(&document, target_signature) else {
         return Ok(0);
     };
@@ -1315,7 +1424,7 @@ fn last_signature_index(
     xml: &str,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<usize, XmlMutationError> {
-    let document = parse_with_options(xml, policy)?;
+    let document = parse_mutation_xml_with_options(xml, policy)?;
     document
         .descendants()
         .filter(|node| is_dsig_node(*node, "Signature"))
@@ -1465,6 +1574,37 @@ mod tests {
     }
 
     #[test]
+    fn signature_value_projection_matches_streaming_mutation() {
+        // Allocation preflight must predict the exact serializer output for
+        // both XML spellings accepted as an empty SignatureValue placeholder.
+        for placeholder in [
+            "<ds:SignatureValue/>",
+            "<ds:SignatureValue></ds:SignatureValue>",
+        ] {
+            let xml = format!(
+                "<root><ds:Signature xmlns:ds=\"{XMLDSIG_NS}\"><ds:SignedInfo/>{placeholder}</ds:Signature></root>"
+            );
+            let value = "A".repeat(341);
+            let projected = projected_signature_value_output_len_at_index_with_options(
+                &xml,
+                value.len(),
+                0,
+                Some(&crate::policy::SigningPolicy::default()),
+            )
+            .expect("project SignatureValue output length");
+            let mutated = fill_signature_value_at_index_with_options(
+                &xml,
+                &value,
+                0,
+                Some(&crate::policy::SigningPolicy::default()),
+            )
+            .expect("fill SignatureValue");
+
+            assert_eq!(projected, mutated.len());
+        }
+    }
+
+    #[test]
     fn appends_signature_template_to_non_empty_root() {
         let signed = append_signature_to_root("<root><payload ID=\"ref-0\"/></root>", &template(1))
             .expect("append signature");
@@ -1531,6 +1671,54 @@ mod tests {
         let err = append_signature_to_root("<root/>", "<NotSignature/>")
             .expect_err("template must be a Signature");
         assert!(matches!(err, XmlMutationError::InvalidSignatureTemplate));
+    }
+
+    #[test]
+    fn signature_template_validation_applies_the_active_policy_first() {
+        // The separately supplied template is an untrusted XML allocation
+        // boundary. Reject it before parsing the source or constructing output.
+        let template = format!(
+            r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo>{}</ds:SignedInfo><ds:SignatureValue/></ds:Signature>"#,
+            "<part/>".repeat(16),
+        );
+
+        let byte_policy = crate::policy::SigningPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_document_bytes: template.len() - 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::SigningPolicy::default()
+        };
+        let byte_error =
+            append_signature_to_root_with_options("not XML", &template, Some(&byte_policy))
+                .expect_err("template byte policy must win before source parsing");
+        assert!(matches!(
+            byte_error,
+            XmlMutationError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DOCUMENT,
+                maximum,
+                actual,
+            }) if maximum == template.len() - 1 && actual == template.len()
+        ));
+
+        let node_policy = crate::policy::SigningPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_nodes: 2,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::SigningPolicy::default()
+        };
+        let node_error =
+            append_signature_to_root_with_options("not XML", &template, Some(&node_policy))
+                .expect_err("template node policy must win before source parsing");
+        assert!(matches!(
+            node_error,
+            XmlMutationError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum: 2,
+                actual: 3,
+            })
+        ));
     }
 
     #[test]
@@ -1968,8 +2156,14 @@ mod tests {
             merge_key_info_source_at_index_with_options(source, &generated, 0, Some(&policy))
                 .expect_err("writer fragment must obey the signing node ceiling");
 
-        assert!(matches!(error, XmlMutationError::XmlParse(_)));
-        assert!(error.to_string().contains("nodes limit"));
+        assert!(matches!(
+            error,
+            XmlMutationError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum: 32,
+                actual: 33,
+            })
+        ));
     }
 
     #[test]
@@ -2004,7 +2198,7 @@ mod tests {
         assert!(matches!(
             error,
             XmlMutationError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "XML document",
+                resource: crate::policy::resource_name::XML_DOCUMENT,
                 maximum: observed_maximum,
                 actual,
             }) if observed_maximum == maximum && actual == wrapped.len()

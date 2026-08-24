@@ -4,7 +4,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::policy::{ManifestProcessing, SigningPolicy};
 use xml_sec::xmldsig::mutation::append_signature_to_root;
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
@@ -14,9 +14,10 @@ use xml_sec::xmldsig::{
     DEFAULT_IMPLICIT_C14N_URI, DefaultKeyResolver, DigestAlgorithm, DsigStatus,
     EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriter, ReferenceBuilder, RsaSigningKey,
     SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError,
-    SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, VerificationKey, VerifyContext,
-    X509CertificateKeyInfoWriter, compute_reference_digest_values, fill_reference_digest_values,
-    parse_key_info, validate_signing_key, verify_signature_with_pem_key,
+    SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, TransformError, VerificationKey,
+    VerifyContext, X509CertificateKeyInfoWriter, XPathExpression, compute_reference_digest_values,
+    fill_reference_digest_values, parse_key_info, validate_signing_key,
+    verify_signature_with_pem_key,
 };
 
 fn exclusive_c14n() -> C14nAlgorithm {
@@ -540,7 +541,10 @@ fn signing_policy_rejects_disallowed_reference_transform() {
     let xml =
         append_signature_to_root("<root><payload/></root>", &template).expect("append signature");
     let policy = SigningPolicy {
-        transforms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+        transforms: xml_sec::policy::TransformPolicy {
+            allowed_algorithms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+            ..xml_sec::policy::TransformPolicy::default()
+        },
         ..SigningPolicy::default()
     };
 
@@ -548,7 +552,9 @@ fn signing_policy_rejects_disallowed_reference_transform() {
         SignContext::new(&private_key)
             .policy(policy)
             .sign_template(&xml),
-        Err(SigningError::Digest(SigningDigestError::Policy(_)))
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::Algorithm { .. }
+        ))
     ));
 }
 
@@ -580,6 +586,160 @@ fn signing_policy_bounds_document_bytes_before_parsing() {
             }
         )) if maximum == xml.len() - 1 && actual == xml.len()
     ));
+}
+
+#[test]
+fn signing_policy_charges_the_supplied_key_candidate_before_inspection() {
+    // A caller-supplied key is still one inspected candidate. A deny-all
+    // candidate policy must reject both public signing entry points before
+    // either key metadata or the signing primitive is touched.
+    struct CountingSigningKey {
+        metadata_calls: Arc<AtomicUsize>,
+        sign_calls: Arc<AtomicUsize>,
+    }
+
+    impl SigningKey for CountingSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            self.sign_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1_u8; 256])
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            self.metadata_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(SigningPublicKeyInfo::Rsa {
+                spki_der: Vec::new(),
+                modulus: vec![0x80_u8; 256],
+                exponent: vec![1, 0, 1],
+            })
+        }
+    }
+
+    let metadata_calls = Arc::new(AtomicUsize::new(0));
+    let sign_calls = Arc::new(AtomicUsize::new(0));
+    let key = CountingSigningKey {
+        metadata_calls: Arc::clone(&metadata_calls),
+        sign_calls: Arc::clone(&sign_calls),
+    };
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    let template = builder.build_template().expect("valid signature template");
+    let templated = append_signature_to_root(
+        "<root><payload ID=\"payload\">hello</payload></root>",
+        &template,
+    )
+    .expect("append signature template");
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_key_candidates: 0,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    for result in [
+        validate_signing_key(&key, SignatureAlgorithm::RsaSha256, &policy),
+        SignContext::new(&key)
+            .policy(policy.clone())
+            .sign_template(&templated)
+            .map(|_| ()),
+        SignContext::new(&key)
+            .policy(policy)
+            .sign_with_builder(
+                "<root><payload ID=\"payload\">hello</payload></root>",
+                &builder,
+            )
+            .map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(SigningError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimit {
+                    resource: "key candidates",
+                    maximum: 0,
+                    actual: 1,
+                }
+            ))
+        ));
+    }
+    assert_eq!(metadata_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(sign_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn signing_preflights_signature_placeholder_before_allocating_it() {
+    // Untrusted custom-key metadata can imply an arbitrarily wide ECDSA
+    // SignatureValue. The document policy must reject its projected Base64
+    // replacement directly, before allocating the placeholder or signing.
+    struct OversizedEcSigningKey {
+        sign_calls: Arc<AtomicUsize>,
+    }
+
+    impl SigningKey for OversizedEcSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            self.sign_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1_u8; 4_096])
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Ok(SigningPublicKeyInfo::Ec {
+                spki_der: Vec::new(),
+                curve_oid: "1.2.840.10045.3.1.7",
+                public_key: [vec![0x04], vec![1_u8; 4_096]].concat(),
+            })
+        }
+    }
+
+    let template = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        )
+        .build_template()
+        .expect("valid signature template");
+    let templated = append_signature_to_root(
+        "<root><payload ID=\"payload\">hello</payload></root>",
+        &template,
+    )
+    .expect("append signature template");
+    let maximum = templated.len() + 256;
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: maximum,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    let sign_calls = Arc::new(AtomicUsize::new(0));
+    let key = OversizedEcSigningKey {
+        sign_calls: Arc::clone(&sign_calls),
+    };
+
+    let error = SignContext::new(&key)
+        .policy(policy)
+        .sign_template(&templated)
+        .expect_err("projected SignatureValue must exceed the document policy");
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "XML document",
+            maximum: observed_maximum,
+            actual,
+        }) if observed_maximum == maximum && actual > observed_maximum
+    ));
+    assert_eq!(sign_calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -615,6 +775,198 @@ fn signing_policy_rechecks_document_bytes_after_mutation() {
                 actual,
             }
         )) if maximum == xml.len() && actual > maximum
+    ));
+}
+
+#[test]
+fn sign_with_builder_preflights_exact_signature_value_growth() {
+    // The key-aware builder path knows the exact RSA output width. It must
+    // reject a final-document ceiling before dispatching the signing primitive.
+    struct CountingSigningKey {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SigningKey for CountingSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![1_u8; 256])
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Ok(SigningPublicKeyInfo::Rsa {
+                spki_der: Vec::new(),
+                modulus: vec![0x80_u8; 256],
+                exponent: vec![1, 0, 1],
+            })
+        }
+    }
+
+    let xml = "<root><payload ID=\"payload\">hello</payload></root>";
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    let baseline_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let final_len = SignContext::new(&baseline_key)
+        .sign_with_builder(xml, &builder)
+        .expect("baseline signing must succeed")
+        .len();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let key = CountingSigningKey {
+        calls: Arc::clone(&calls),
+    };
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: final_len - 1,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    let error = SignContext::new(&key)
+        .policy(policy)
+        .sign_with_builder(xml, &builder)
+        .expect_err("final SignatureValue growth must be rejected during preflight");
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "XML document",
+            maximum,
+            actual,
+        }) if maximum == final_len - 1 && actual == final_len
+    ));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    let allowed_calls = Arc::new(AtomicUsize::new(0));
+    let allowed_key = CountingSigningKey {
+        calls: Arc::clone(&allowed_calls),
+    };
+    let exact_policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: final_len,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    let signed = SignContext::new(&allowed_key)
+        .policy(exact_policy)
+        .sign_with_builder(xml, &builder)
+        .expect("an exact final-document ceiling must remain usable");
+    assert_eq!(signed.len(), final_len);
+    assert_eq!(allowed_calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn sign_with_builder_shares_canonicalization_budget_with_signing() {
+    // The builder canonicalizes the digest-filled SignedInfo before appending
+    // its template. That preflight and the real signing pass are one operation
+    // and must consume one cumulative canonicalization budget.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::Base64Decode),
+        );
+    let xml = "<root><payload ID=\"payload\">YQ==</payload></root>";
+    let template = builder.build_template().expect("valid signature template");
+    let templated = append_signature_to_root(xml, &template).expect("append signature template");
+    let digest_filled = fill_reference_digest_values(&templated)
+        .expect("base64 reference digest must be materialized");
+    let document = roxmltree::Document::parse(&digest_filled).expect("filled template must parse");
+    let signed_info = document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignedInfo")))
+        .expect("filled template contains SignedInfo");
+    let signed_info_subtree: HashSet<_> = signed_info.descendants().map(|node| node.id()).collect();
+    let mut canonical_signed_info = Vec::new();
+    canonicalize(
+        &document,
+        Some(&|node| signed_info_subtree.contains(&node.id())),
+        &exclusive_c14n(),
+        &mut canonical_signed_info,
+    )
+    .expect("filled SignedInfo must canonicalize");
+    let individual_pass_limit = canonical_signed_info.len();
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_canonicalized_bytes: individual_pass_limit,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    builder
+        .build_template_with_policy(&policy)
+        .expect("builder preflight must fit the individual pass limit");
+    SignContext::new(&private_key)
+        .policy(policy.clone())
+        .sign_template(&templated)
+        .expect("standalone signing must fit the individual pass limit");
+
+    let error = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_with_builder(xml, &builder)
+        .expect_err("builder preflight and signing must exceed one-pass capacity");
+
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "canonicalized bytes",
+            maximum,
+            actual,
+        }) if maximum == individual_pass_limit && actual > maximum
+    ));
+}
+
+#[test]
+fn sign_with_builder_shares_xpath_parse_budget_with_signing() {
+    // Builder validation and the signing parses are one public operation. A
+    // caller must not receive a fresh XPath expression allowance between them.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::XPath(XPathExpression::new("true()"))),
+        );
+    let xml = "<root><payload ID=\"payload\">content</payload></root>";
+    let mut policy = SigningPolicy::default();
+    policy.resources.max_xpath_expressions = 4;
+
+    builder
+        .build_template_with_policy(&policy)
+        .expect("builder validation must fit the individual expression limit");
+    let template = builder.build_template().expect("valid signature template");
+    let templated = append_signature_to_root(xml, &template).expect("append signature template");
+    SignContext::new(&private_key)
+        .policy(policy.clone())
+        .sign_template(&templated)
+        .expect("standalone signing must fit the individual expression limit");
+
+    let error = SignContext::new(&private_key)
+        .policy(policy)
+        .sign_with_builder(xml, &builder)
+        .expect_err("builder validation and signing must share the expression limit");
+
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "XPath expressions",
+            maximum: 4,
+            actual,
+        }) if actual > 4
     ));
 }
 
@@ -755,7 +1107,13 @@ fn signing_policy_shares_canonicalization_budget_with_signed_info() {
         SignContext::new(&private_key)
             .policy(constrained)
             .sign_template(&xml),
-        Err(SigningError::Digest(SigningDigestError::Transform(_)))
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "canonicalized bytes",
+                maximum: 64,
+                ..
+            }
+        ))
     ));
 
     let sufficient = SigningPolicy {
@@ -810,8 +1168,12 @@ fn signing_policy_applies_xml_base_budget_to_signed_info_c14n() {
     assert!(
         matches!(
             result,
-            Err(SigningError::Canonicalization(
-                xml_sec::c14n::C14nError::XmlBaseComponentsTooLarge { max: 1, actual: 2 }
+            Err(SigningError::Policy(
+                xml_sec::policy::PolicyViolation::ResourceLimit {
+                    resource: "XML Base components",
+                    maximum: 1,
+                    actual: 2,
+                }
             ))
         ),
         "unexpected signing result: {result:?}"
@@ -834,18 +1196,26 @@ fn signing_policy_covers_implicit_and_signed_info_canonicalization() {
     .expect("append signature");
 
     let implicit_disallowed = SigningPolicy {
-        transforms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+        transforms: xml_sec::policy::TransformPolicy {
+            allowed_algorithms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+            ..xml_sec::policy::TransformPolicy::default()
+        },
         ..SigningPolicy::default()
     };
     assert!(matches!(
         SignContext::new(&private_key)
             .policy(implicit_disallowed)
             .sign_template(&xml),
-        Err(SigningError::Digest(SigningDigestError::Policy(_)))
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::Algorithm { .. }
+        ))
     ));
 
     let signed_info_disallowed = SigningPolicy {
-        transforms: Some(HashSet::from([DEFAULT_IMPLICIT_C14N_URI.to_owned()])),
+        transforms: xml_sec::policy::TransformPolicy {
+            allowed_algorithms: Some(HashSet::from([DEFAULT_IMPLICIT_C14N_URI.to_owned()])),
+            ..xml_sec::policy::TransformPolicy::default()
+        },
         ..SigningPolicy::default()
     };
     assert!(matches!(
@@ -1229,13 +1599,11 @@ fn manifest_signing_rejects_malformed_structure_and_aggregate_overflow() {
         .expect_err("SignedInfo and Manifest must share one reference limit");
     assert!(matches!(
         error,
-        SigningError::Digest(SigningDigestError::Policy(
-            xml_sec::policy::PolicyViolation::ResourceLimit {
-                resource: "signature references",
-                maximum: 1,
-                actual: 2,
-            }
-        ))
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "signature references",
+            maximum: 1,
+            actual: 2,
+        })
     ));
 
     let malformed_overflow = manifest_signing_template()
@@ -1251,13 +1619,11 @@ fn manifest_signing_rejects_malformed_structure_and_aggregate_overflow() {
         .expect_err("exhausted reference capacity must stop before parsing overflow entries");
     assert!(matches!(
         error,
-        SigningError::Digest(SigningDigestError::Policy(
-            xml_sec::policy::PolicyViolation::ResourceLimit {
-                resource: "signature references",
-                maximum: 1,
-                actual: 2,
-            }
-        ))
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "signature references",
+            maximum: 1,
+            actual: 2,
+        })
     ));
 }
 
@@ -1301,8 +1667,10 @@ fn ignored_manifests_do_not_disable_signed_info_dependency_checks() {
 #[test]
 fn rejects_reference_without_uri() {
     // External/object reference support is not implicit: signing must know what
-    // bytes are being digested, so an omitted URI fails before mutation.
-    let template = template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256));
+    // bytes are being digested, so malformed input with an omitted URI fails
+    // before mutation. The builder itself always emits the explicit empty URI.
+    let template = template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256))
+        .replacen("<Reference URI=\"\">", "<Reference>", 1);
     let xml = append_signature_to_root("<root><payload>hello</payload></root>", &template)
         .expect("append signature");
 
@@ -1355,11 +1723,15 @@ fn signing_template_bounds_xpath_expressions_across_references() {
     let error = compute_reference_digest_values(&xml)
         .expect_err("signing parser must enforce the signature-wide XPath budget");
 
-    assert!(
-        error
-            .to_string()
-            .contains("signature-wide XPath expression budget")
-    );
+    assert!(matches!(
+        error,
+        SigningDigestError::Transform(TransformError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "XPath expressions",
+                ..
+            }
+        ))
+    ));
 }
 
 #[test]

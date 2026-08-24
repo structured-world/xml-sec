@@ -21,6 +21,7 @@ use der::{
     asn1::{Ia5StringRef, ObjectIdentifier},
 };
 use roxmltree::{Document, Node};
+use std::collections::BTreeMap;
 use x509_cert::ext::pkix::name::DirectoryString;
 use x509_cert::name::Name;
 use x509_parser::extensions::ParsedExtension;
@@ -175,6 +176,23 @@ pub struct KeyInfo {
     pub sources: Vec<KeyInfoSource>,
 }
 
+impl KeyInfo {
+    /// Count key material that parsing has already materialized as candidates.
+    ///
+    /// This is a cardinality preflight, not a consumed resolver-work counter:
+    /// resolution separately counts every candidate it actually inspects,
+    /// including embedded material and caller-owned stores.
+    pub(crate) fn embedded_candidate_count(&self) -> usize {
+        self.sources.iter().fold(0usize, |count, source| {
+            count.saturating_add(match source {
+                KeyInfoSource::KeyValue(_) | KeyInfoSource::DerEncodedKeyValue(_) => 1,
+                KeyInfoSource::X509Data(info) => info.certificates.len(),
+                KeyInfoSource::KeyName(_) | KeyInfoSource::RetrievalMethod { .. } => 0,
+            })
+        })
+    }
+}
+
 /// Top-level key material source parsed from `<KeyInfo>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -199,13 +217,18 @@ pub enum KeyInfoSource {
 }
 
 /// Transform forms accepted on `<RetrievalMethod>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RetrievalMethodTransforms {
     /// No transform chain is present.
     None,
     /// Filter a same-document node-set to one `ds:X509Data`-rooted subtree.
-    X509DataNodeSetFilter,
+    X509DataNodeSetFilter {
+        /// Original expression retained for operation policy accounting.
+        expression: String,
+        /// Namespace axis visible from the XPath parameter element.
+        namespaces: BTreeMap<String, String>,
+    },
     /// A transform chain attached to a RetrievalMethod type this implementation
     /// does not materialize. Resolvers may ignore this advisory key source and
     /// continue with later `<KeyInfo>` children.
@@ -325,6 +348,10 @@ pub enum X509PublicKeyInfo {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParseError {
+    /// The default low-level parsing policy rejected bounded input.
+    #[error("XMLDSig policy violation: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
+
     /// The selected cryptographic provider could not evaluate parsed key metadata.
     #[error("cryptographic provider error: {0}")]
     Provider(#[from] crate::provider::ProviderError),
@@ -339,13 +366,6 @@ pub enum ParseError {
     /// Invalid structure (wrong child order, unexpected element, etc.).
     #[error("invalid structure: {0}")]
     InvalidStructure(String),
-
-    /// `<SignedInfo>` declared more references than one signature may process.
-    #[error("SignedInfo contains more than {max} Reference elements")]
-    TooManyReferences {
-        /// Maximum references accepted for one signature.
-        max: usize,
-    },
 
     /// Unsupported algorithm URI.
     #[error("unsupported algorithm: {uri}")]
@@ -442,9 +462,12 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
     for child in children {
         verify_ds_element(child, "Reference")?;
         if references.len() == crate::hard_limits::SIGNATURE_REFERENCE_CEILING {
-            return Err(ParseError::TooManyReferences {
-                max: crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
-            });
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
+                maximum: crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
+                actual: references.len().saturating_add(1),
+            }
+            .into());
         }
         references.push(parse_reference_with_xpath_budget(child, xpath_budget)?);
     }
@@ -623,19 +646,29 @@ pub(crate) fn parse_key_info_with_provider(
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<KeyInfo, ParseError> {
     let xml_base_budget = XmlBaseResolutionBudget::default();
-    parse_key_info_with_provider_and_xml_base_budget(key_info_node, provider, &xml_base_budget)
+    parse_key_info_with_policy_budgets(
+        key_info_node,
+        provider,
+        &xml_base_budget,
+        &crate::policy::ResourcePolicy::default(),
+    )
 }
 
-pub(crate) fn parse_key_info_with_provider_and_xml_base_budget(
+pub(crate) fn parse_key_info_with_policy_budgets(
     key_info_node: Node,
     provider: &dyn crate::provider::CryptoProvider,
     xml_base_budget: &XmlBaseResolutionBudget,
+    resources: &crate::policy::ResourcePolicy,
 ) -> Result<KeyInfo, ParseError> {
     verify_ds_element(key_info_node, "KeyInfo")?;
     ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
 
     let mut sources = Vec::new();
     let mut x509_total_binary_len = 0usize;
+    // KeyInfo is parsed before source selection, so preflight the cardinality
+    // of every embedded key before decoding or algorithm-specific parsing.
+    // This does not consume the resolver's inspected-candidate work budget.
+    let mut embedded_candidate_preflight_count = 0usize;
     for (index, child) in element_children(key_info_node).enumerate() {
         if index >= MAX_KEY_INFO_CHILD_COUNT {
             return Err(ParseError::InvalidStructure(
@@ -650,6 +683,7 @@ pub(crate) fn parse_key_info_with_provider_and_xml_base_budget(
                 sources.push(KeyInfoSource::KeyName(key_name));
             }
             (Some(XMLDSIG_NS), "KeyValue") => {
+                charge_embedded_key_candidate(&mut embedded_candidate_preflight_count, resources)?;
                 let key_value = parse_key_value_dispatch(child)?;
                 sources.push(KeyInfoSource::KeyValue(key_value));
             }
@@ -657,7 +691,9 @@ pub(crate) fn parse_key_info_with_provider_and_xml_base_budget(
                 let x509 = parse_x509_data_dispatch_with_budget_and_provider(
                     child,
                     &mut x509_total_binary_len,
+                    &mut embedded_candidate_preflight_count,
                     provider,
+                    resources,
                 )?;
                 sources.push(KeyInfoSource::X509Data(x509));
             }
@@ -689,7 +725,7 @@ pub(crate) fn parse_key_info_with_provider_and_xml_base_budget(
                 let transforms = if resource_type.as_deref()
                     == Some("http://www.w3.org/2000/09/xmldsig#X509Data")
                 {
-                    parse_retrieval_method_transforms(child)?
+                    parse_retrieval_method_transforms(child, resources)?
                 } else if element_children(child).next().is_some() {
                     RetrievalMethodTransforms::Unsupported
                 } else {
@@ -702,6 +738,7 @@ pub(crate) fn parse_key_info_with_provider_and_xml_base_budget(
                 });
             }
             (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
+                charge_embedded_key_candidate(&mut embedded_candidate_preflight_count, resources)?;
                 ensure_no_element_children(child, "DEREncodedKeyValue")?;
                 let der = decode_der_encoded_key_value_base64(child)?;
                 sources.push(KeyInfoSource::DerEncodedKeyValue(der));
@@ -713,8 +750,18 @@ pub(crate) fn parse_key_info_with_provider_and_xml_base_budget(
     Ok(KeyInfo { sources })
 }
 
+fn charge_embedded_key_candidate(
+    embedded_key_candidates: &mut usize,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<(), ParseError> {
+    *embedded_key_candidates = embedded_key_candidates.saturating_add(1);
+    resources.validate_key_candidates(*embedded_key_candidates)?;
+    Ok(())
+}
+
 fn parse_retrieval_method_transforms(
     node: Node<'_, '_>,
+    resources: &crate::policy::ResourcePolicy,
 ) -> Result<RetrievalMethodTransforms, ParseError> {
     let mut children = element_children(node);
     let Some(transforms) = children.next() else {
@@ -758,8 +805,8 @@ fn parse_retrieval_method_transforms(
     ensure_no_element_children(xpath, "XPath")?;
     let expression =
         collect_text_content_bounded(xpath, MAX_RETRIEVAL_XPATH_TEXT_LEN, "RetrievalMethod XPath")?;
-    let expression = expression.trim();
-    let selects_x509_data = expression
+    let normalized_expression = expression.trim();
+    let selects_x509_data = normalized_expression
         .strip_prefix("ancestor-or-self::")
         .and_then(|step| step.split_once(':'))
         .is_some_and(|(prefix, local)| {
@@ -770,7 +817,11 @@ fn parse_retrieval_method_transforms(
             "unsupported RetrievalMethod XPath selection".into(),
         ));
     }
-    Ok(RetrievalMethodTransforms::X509DataNodeSetFilter)
+    let namespaces = transforms::collect_xpath_namespaces_with_resources(xpath, resources)?;
+    Ok(RetrievalMethodTransforms::X509DataNodeSetFilter {
+        expression,
+        namespaces,
+    })
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1118,7 +1169,9 @@ fn decode_crypto_binary(
 pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
     node: Node,
     total_binary_len: &mut usize,
+    embedded_key_candidates: &mut usize,
     provider: &dyn crate::provider::CryptoProvider,
+    resources: &crate::policy::ResourcePolicy,
 ) -> Result<X509DataInfo, ParseError> {
     verify_ds_element(node, "X509Data")?;
     ensure_no_non_whitespace_text(node, "X509Data")?;
@@ -1127,6 +1180,7 @@ pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
     for child in element_children(node) {
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "X509Certificate") => {
+                charge_embedded_key_candidate(embedded_key_candidates, resources)?;
                 ensure_no_element_children(child, "X509Certificate")?;
                 ensure_x509_data_entry_budget(&info)?;
                 let cert = decode_x509_base64(child, "X509Certificate")?;
@@ -2329,6 +2383,7 @@ fn ensure_no_non_whitespace_text(node: Node<'_, '_>, element_name: &str) -> Resu
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
     use super::*;
+    use crate::xmldsig::TransformError;
     use base64::Engine;
 
     fn fixture_rsa_cert_base64() -> String {
@@ -2451,6 +2506,100 @@ mod tests {
     }
 
     // ── parse_key_info: dispatch parsing ──────────────────────────────
+
+    #[test]
+    fn key_info_candidate_budget_precedes_key_value_parsing() {
+        // A denied embedded candidate must fail before malformed key material
+        // reaches the algorithm-specific parser.
+        let document = Document::parse(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <KeyValue><RSAKeyValue><Modulus>AQAB</Modulus></RSAKeyValue></KeyValue>
+            </KeyInfo>"#,
+        )
+        .expect("fixed KeyInfo fixture must parse as XML");
+        let resources = crate::policy::ResourcePolicy {
+            max_key_candidates: 0,
+            ..crate::policy::ResourcePolicy::default()
+        };
+
+        let error = parse_key_info_with_policy_budgets(
+            document.root_element(),
+            crate::provider::default_provider(),
+            &XmlBaseResolutionBudget::default(),
+            &resources,
+        )
+        .expect_err("candidate policy must reject KeyValue before RSA parsing");
+
+        assert!(matches!(
+            error,
+            ParseError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                maximum: 0,
+                actual: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn key_info_candidate_budget_precedes_der_key_decoding() {
+        // Candidate accounting must reject DEREncodedKeyValue before retaining
+        // or base64-decoding its attacker-controlled text.
+        let document = Document::parse(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                       xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+                <dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue>
+            </KeyInfo>"#,
+        )
+        .expect("fixed KeyInfo fixture must parse as XML");
+        let resources = crate::policy::ResourcePolicy {
+            max_key_candidates: 0,
+            ..crate::policy::ResourcePolicy::default()
+        };
+
+        let error = parse_key_info_with_policy_budgets(
+            document.root_element(),
+            crate::provider::default_provider(),
+            &XmlBaseResolutionBudget::default(),
+            &resources,
+        )
+        .expect_err("candidate policy must reject DEREncodedKeyValue before decoding");
+
+        assert!(matches!(
+            error,
+            ParseError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                maximum: 0,
+                actual: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn key_info_embedded_candidate_count_matches_materialized_key_kinds() {
+        // Only materialized cryptographic candidates belong to the parser
+        // preflight; names and unresolved RetrievalMethods become work later.
+        let key_info = KeyInfo {
+            sources: vec![
+                KeyInfoSource::KeyName("configured-key".into()),
+                KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
+                    namespace: Some(XMLDSIG_NS.into()),
+                    local_name: "FutureKeyValue".into(),
+                }),
+                KeyInfoSource::DerEncodedKeyValue(vec![1]),
+                KeyInfoSource::X509Data(X509DataInfo {
+                    certificates: vec![vec![2], vec![3]],
+                    ..X509DataInfo::default()
+                }),
+                KeyInfoSource::RetrievalMethod {
+                    uri: "urn:certificate".into(),
+                    resource_type: None,
+                    transforms: RetrievalMethodTransforms::None,
+                },
+            ],
+        };
+
+        assert_eq!(key_info.embedded_candidate_count(), 4);
+    }
 
     #[test]
     fn parse_key_info_dispatches_supported_children() {
@@ -3868,9 +4017,83 @@ BA== </Modulus>
             [KeyInfoSource::RetrievalMethod {
                 uri,
                 resource_type: Some(resource_type),
-                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter,
+                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter { .. },
             }] if uri == "#keys"
                 && resource_type == "http://www.w3.org/2000/09/xmldsig#X509Data"
+        ));
+    }
+
+    #[test]
+    fn retrieval_xpath_namespace_binding_policy_precedes_materialization() {
+        // RetrievalMethod must reject inherited namespace bindings before
+        // cloning their prefix and URI into the retained transform model.
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+          <RetrievalMethod Type="http://www.w3.org/2000/09/xmldsig#X509Data" URI="#keys">
+            <Transforms><Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+              <XPath xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">ancestor-or-self::dsig:X509Data</XPath>
+            </Transform></Transforms>
+          </RetrievalMethod>
+        </KeyInfo>"##;
+        let document = Document::parse(xml).expect("fixed KeyInfo fixture must parse");
+        let resources = crate::policy::ResourcePolicy {
+            max_xpath_namespace_bindings: 0,
+            ..crate::policy::ResourcePolicy::default()
+        };
+
+        let error = parse_key_info_with_policy_budgets(
+            document.root_element(),
+            crate::provider::default_provider(),
+            &XmlBaseResolutionBudget::default(),
+            &resources,
+        )
+        .expect_err("zero namespace bindings must reject RetrievalMethod XPath");
+
+        assert!(matches!(
+            error,
+            ParseError::Transform(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_NAMESPACE_BINDINGS,
+                    maximum: 0,
+                    actual: 1,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn retrieval_xpath_namespace_byte_policy_precedes_materialization() {
+        // The aggregate namespace byte limit applies to borrowed prefix and URI
+        // text before either attacker-controlled string is allocated.
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+          <RetrievalMethod Type="http://www.w3.org/2000/09/xmldsig#X509Data" URI="#keys">
+            <Transforms><Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+              <XPath xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">ancestor-or-self::dsig:X509Data</XPath>
+            </Transform></Transforms>
+          </RetrievalMethod>
+        </KeyInfo>"##;
+        let document = Document::parse(xml).expect("fixed KeyInfo fixture must parse");
+        let resources = crate::policy::ResourcePolicy {
+            max_xpath_namespace_bytes: 0,
+            ..crate::policy::ResourcePolicy::default()
+        };
+
+        let error = parse_key_info_with_policy_budgets(
+            document.root_element(),
+            crate::provider::default_provider(),
+            &XmlBaseResolutionBudget::default(),
+            &resources,
+        )
+        .expect_err("zero namespace bytes must reject RetrievalMethod XPath");
+
+        assert!(matches!(
+            error,
+            ParseError::Transform(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_NAMESPACE_BYTES,
+                    maximum: 0,
+                    actual,
+                }
+            )) if actual == "dsig".len() + XMLDSIG_NS.len()
         ));
     }
 
@@ -3972,7 +4195,7 @@ BA== </Modulus>
                 .sources
                 .as_slice(),
             [KeyInfoSource::RetrievalMethod {
-                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter,
+                transforms: RetrievalMethodTransforms::X509DataNodeSetFilter { .. },
                 ..
             }]
         ));
@@ -4339,9 +4562,11 @@ BA== </Modulus>
 
         assert!(matches!(
             error,
-            ParseError::TooManyReferences {
-                max: MAX_REFERENCES_PER_SIGNATURE
-            }
+            ParseError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
+                maximum: MAX_REFERENCES_PER_SIGNATURE,
+                actual: 65,
+            })
         ));
     }
 
@@ -4387,11 +4612,15 @@ BA== </Modulus>
         let error = parse_signed_info(document.root_element())
             .expect_err("signature-wide XPath expression count must be bounded");
 
-        assert!(
-            error
-                .to_string()
-                .contains("signature-wide XPath expression budget")
-        );
+        assert!(matches!(
+            error,
+            ParseError::Transform(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: "XPath expressions",
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]

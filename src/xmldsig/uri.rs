@@ -22,7 +22,32 @@ use crate::c14n::xml_base::{
 };
 use crate::xml::XmlIdIndex;
 
-use super::types::{NodeSet, NodeSetMaterializationBudget, TransformData, TransformError};
+use super::types::{
+    NodeSet, NodeSetMaterializationBudget, TransformData, TransformError, transform_resource_limit,
+};
+
+/// Validate both policy permission and request-context capability for signing URIs.
+///
+/// Signing currently has no external-resource request input. An allowlist may
+/// permit that URI class, but it cannot make the referenced bytes available.
+pub(crate) fn validate_signing_reference_uri(
+    uri: &str,
+    policy: &crate::policy::SigningPolicy,
+) -> Result<(), crate::policy::PolicyViolation> {
+    if !policy.uris.references.allows(uri) {
+        return Err(crate::policy::PolicyViolation::Uri {
+            operation: "signing",
+            reason: "signing reference URI class is not permitted",
+        });
+    }
+    if !uri.is_empty() && !uri.starts_with('#') {
+        return Err(crate::policy::PolicyViolation::Uri {
+            operation: "signing",
+            reason: "external signing references require request-scoped resource bytes",
+        });
+    }
+    Ok(())
+}
 
 struct ExternalResourceBudget {
     remaining_total_bytes: Cell<usize>,
@@ -50,20 +75,21 @@ impl ExternalResourceBudget {
 
     fn charge(&self, bytes: usize) -> Result<(), TransformError> {
         if bytes > self.max_resource_bytes {
-            return Err(TransformError::ExternalResourceTooLarge {
-                max_bytes: self.max_resource_bytes,
-                actual: bytes,
-            });
+            return Err(transform_resource_limit(
+                crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                self.max_resource_bytes,
+                bytes,
+            ));
         }
         let remaining = self.remaining_total_bytes.get();
         let Some(next) = remaining.checked_sub(bytes) else {
             self.remaining_total_bytes.set(0);
-            return Err(TransformError::ExternalResourceTotalTooLarge {
-                max_bytes: self.max_total_bytes,
-                actual: self
-                    .max_total_bytes
+            return Err(transform_resource_limit(
+                crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                self.max_total_bytes,
+                self.max_total_bytes
                     .saturating_add(bytes.saturating_sub(remaining)),
-            });
+            ));
         };
         self.remaining_total_bytes.set(next);
         Ok(())
@@ -336,18 +362,16 @@ impl<'a> UriReferenceResolver<'a> {
 
 fn map_xml_base_resolution_error(error: XmlBaseResolutionError) -> TransformError {
     match error {
-        XmlBaseResolutionError::Components { maximum, actual } => {
-            TransformError::XmlBaseComponentsTooLarge {
-                max: maximum,
-                actual,
-            }
-        }
-        XmlBaseResolutionError::Bytes { maximum, actual } => {
-            TransformError::XmlBaseResolutionTooLarge {
-                max_bytes: maximum,
-                actual,
-            }
-        }
+        XmlBaseResolutionError::Components { maximum, actual } => transform_resource_limit(
+            crate::policy::resource_name::XML_BASE_COMPONENTS,
+            maximum,
+            actual,
+        ),
+        XmlBaseResolutionError::Bytes { maximum, actual } => transform_resource_limit(
+            crate::policy::resource_name::XML_BASE_RESOLUTION_BYTES,
+            maximum,
+            actual,
+        ),
     }
 }
 

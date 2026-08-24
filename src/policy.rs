@@ -16,6 +16,46 @@ use crate::xmlenc::{
     DataEncryptionAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
 
+/// Canonical diagnostics for limits represented by [`ResourcePolicy`].
+///
+/// Validation and every enforcement point use the same names so callers can
+/// match typed policy violations without operation-specific string drift.
+pub(crate) mod resource_name {
+    pub const XML_NODES: &str = "XML nodes";
+    pub const SIGNATURE_REFERENCES: &str = "signature references";
+    pub const REFERENCE_TRANSFORMS: &str = "reference transforms";
+    pub const XML_BASE_COMPONENTS: &str = "XML Base components";
+    pub const XML_BASE_RESOLUTION_BYTES: &str = "XML Base resolution bytes";
+    pub const CANONICALIZED_BYTES: &str = "canonicalized bytes";
+    pub const EXTERNAL_RESOURCE_BYTES: &str = "external resource bytes";
+    pub const AGGREGATE_EXTERNAL_RESOURCE_BYTES: &str = "aggregate external resource bytes";
+    pub const ENCRYPTION_PLAINTEXT_BYTES: &str = "encryption plaintext bytes";
+    #[cfg(feature = "xmlenc")]
+    pub const AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES: &str =
+        "aggregate encryption CipherValue bytes";
+    pub const XML_DOCUMENT: &str = "XML document";
+    pub const ENCRYPTION_RECIPIENTS: &str = "encryption recipients";
+    pub const ENCRYPTION_METADATA_BYTES: &str = "encryption metadata bytes";
+    pub const KEY_CANDIDATES: &str = "key candidates";
+    pub const BASE64_TRANSFORM_INPUT_BYTES: &str = "Base64 transform input bytes";
+    pub const BASE64_TRANSFORM_OUTPUT_BYTES: &str = "Base64 transform output bytes";
+    pub const XPATH_EXPRESSIONS: &str = "XPath expressions";
+    pub const XPATH_EXPRESSION_BYTES: &str = "XPath expression bytes";
+    pub const XPATH_EXPRESSION_COMPLEXITY: &str = "XPath expression complexity";
+    pub const XPATH_CONTEXT_EVALUATIONS: &str = "XPath context evaluations";
+    pub const XPATH_EVALUATION_WORK: &str = "XPath evaluation work";
+    pub const XPATH_MIRROR_STRING_BYTES: &str = "XPath mirror string bytes";
+    pub const XPATH_STRING_WORK_BYTES: &str = "XPath string-processing work bytes";
+    pub const XPATH_NAMESPACE_BINDINGS: &str = "XPath namespace bindings";
+    pub const XPATH_NAMESPACE_BYTES: &str = "XPath namespace bytes";
+    pub const XPATH_FILTERS: &str = "XPath filters";
+    pub const NODE_SET_FILTER_WORK: &str = "node-set filter work";
+    pub const NODE_SET_ENTRIES: &str = "node-set entries";
+    pub const NODE_SET_OWNED_STRING_BYTES: &str = "node-set owned string bytes";
+    pub const NODE_SET_CUMULATIVE_OWNED_STRING_BYTES: &str =
+        "cumulative node-set owned string bytes";
+}
+
 /// A typed rejection produced by an operation policy.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -58,6 +98,14 @@ pub enum PolicyViolation {
     #[error("XML input policy rejected the operation: {reason}")]
     XmlInput {
         /// Non-secret reason suitable for diagnostics.
+        reason: &'static str,
+    },
+    /// A URI class is outside the operation policy.
+    #[error("{operation} URI policy rejected the operation: {reason}")]
+    Uri {
+        /// Operation evaluating the URI.
+        operation: &'static str,
+        /// Non-sensitive reason suitable for diagnostics.
         reason: &'static str,
     },
     /// An RSA key falls outside the operation's configured strength range.
@@ -259,6 +307,40 @@ pub struct ResourcePolicy {
     pub max_encryption_recipients: usize,
     /// Maximum caller-controlled XMLEnc metadata bytes per field.
     pub max_encryption_metadata_bytes: usize,
+    /// Maximum key and certificate candidates inspected by one operation.
+    pub max_key_candidates: usize,
+    /// Maximum bytes accepted by Base64 transforms before decoding.
+    pub max_base64_transform_input_bytes: usize,
+    /// Maximum cumulative bytes emitted by Base64 transforms in one operation.
+    pub max_base64_transform_output_bytes: usize,
+    /// Maximum XPath expressions evaluated by one signature operation.
+    pub max_xpath_expressions: usize,
+    /// Maximum UTF-8 bytes in one XPath expression.
+    pub max_xpath_expression_bytes: usize,
+    /// Maximum structural complexity accepted for one XPath expression.
+    pub max_xpath_expression_complexity: usize,
+    /// Maximum context-node evaluations for one ordinary XPath transform.
+    pub max_xpath_context_evaluations: usize,
+    /// Maximum conservative XPath node-evaluation work per operation.
+    pub max_xpath_evaluation_work: usize,
+    /// Maximum source strings copied into the XPath mirror.
+    pub max_xpath_mirror_string_bytes: usize,
+    /// Maximum conservative XPath string-processing work per operation.
+    pub max_xpath_string_work_bytes: usize,
+    /// Maximum namespace bindings captured by one XPath expression.
+    pub max_xpath_namespace_bindings: usize,
+    /// Maximum aggregate namespace prefix and URI bytes per XPath expression.
+    pub max_xpath_namespace_bytes: usize,
+    /// Maximum filters in one XPath Filter 2.0 transform.
+    pub max_xpath_filters: usize,
+    /// Maximum cumulative node-set entries visited by filtering transforms.
+    pub max_node_set_filter_work: usize,
+    /// Maximum entries materialized in one exact node set.
+    pub max_node_set_entries: usize,
+    /// Maximum owned string bytes in one materialized node set.
+    pub max_node_set_owned_string_bytes: usize,
+    /// Maximum cumulative owned node-set string bytes per operation.
+    pub max_node_set_cumulative_owned_string_bytes: usize,
 }
 
 impl Default for ResourcePolicy {
@@ -277,6 +359,27 @@ impl Default for ResourcePolicy {
             max_xml_document_bytes: crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
             max_encryption_recipients: crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
             max_encryption_metadata_bytes: crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
+            max_key_candidates: crate::hard_limits::KEY_CANDIDATE_CEILING,
+            max_base64_transform_input_bytes:
+                crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
+            max_base64_transform_output_bytes:
+                crate::hard_limits::BASE64_TRANSFORM_OUTPUT_BYTE_CEILING,
+            max_xpath_expressions: crate::hard_limits::XPATH_EXPRESSION_COUNT_CEILING,
+            max_xpath_expression_bytes: crate::hard_limits::XPATH_EXPRESSION_BYTE_CEILING,
+            max_xpath_expression_complexity:
+                crate::hard_limits::XPATH_EXPRESSION_COMPLEXITY_CEILING,
+            max_xpath_context_evaluations: crate::hard_limits::XPATH_CONTEXT_EVALUATION_CEILING,
+            max_xpath_evaluation_work: crate::hard_limits::XPATH_EVALUATION_WORK_CEILING,
+            max_xpath_mirror_string_bytes: crate::hard_limits::XPATH_MIRROR_STRING_BYTE_CEILING,
+            max_xpath_string_work_bytes: crate::hard_limits::XPATH_STRING_WORK_BYTE_CEILING,
+            max_xpath_namespace_bindings: crate::hard_limits::XPATH_NAMESPACE_BINDING_CEILING,
+            max_xpath_namespace_bytes: crate::hard_limits::XPATH_NAMESPACE_BYTE_CEILING,
+            max_xpath_filters: crate::hard_limits::XPATH_FILTER_COUNT_CEILING,
+            max_node_set_filter_work: crate::hard_limits::NODE_SET_FILTER_WORK_CEILING,
+            max_node_set_entries: crate::hard_limits::NODE_SET_ENTRY_CEILING,
+            max_node_set_owned_string_bytes: crate::hard_limits::NODE_SET_OWNED_STRING_BYTE_CEILING,
+            max_node_set_cumulative_owned_string_bytes:
+                crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING,
         }
     }
 }
@@ -285,72 +388,174 @@ impl ResourcePolicy {
     /// Validate policy values against non-configurable implementation ceilings.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         Self::within(
-            "XML nodes",
+            resource_name::XML_NODES,
             self.max_xml_nodes,
             crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
         )?;
         Self::within(
-            "canonicalized bytes",
+            resource_name::CANONICALIZED_BYTES,
             self.max_canonicalized_bytes,
             crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING,
         )?;
         Self::within(
-            "signature references",
+            resource_name::SIGNATURE_REFERENCES,
             self.max_references,
             crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
         )?;
         Self::within(
-            "reference transforms",
+            resource_name::REFERENCE_TRANSFORMS,
             self.max_transforms_per_reference,
             crate::hard_limits::REFERENCE_TRANSFORM_CEILING,
         )?;
         Self::within(
-            "XML Base components",
+            resource_name::XML_BASE_COMPONENTS,
             self.max_xml_base_components,
             crate::hard_limits::XML_BASE_COMPONENT_CEILING,
         )?;
         Self::within(
-            "XML Base resolution bytes",
+            resource_name::XML_BASE_RESOLUTION_BYTES,
             self.max_xml_base_resolution_bytes,
             crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING,
         )?;
         Self::within(
-            "XML document",
+            resource_name::XML_DOCUMENT,
             self.max_xml_document_bytes,
             crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
         )?;
         Self::within(
-            "external resource bytes",
+            resource_name::EXTERNAL_RESOURCE_BYTES,
             self.max_external_resource_bytes,
             crate::hard_limits::EXTERNAL_RESOURCE_BYTE_CEILING,
         )?;
         Self::within(
-            "aggregate external resource bytes",
+            resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
             self.max_external_resource_total_bytes,
             crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING,
         )?;
         Self::within(
-            "encryption plaintext bytes",
+            resource_name::ENCRYPTION_PLAINTEXT_BYTES,
             self.max_encryption_plaintext_bytes,
             crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING,
         )?;
         Self::within(
-            "encryption recipients",
+            resource_name::ENCRYPTION_RECIPIENTS,
             self.max_encryption_recipients,
             crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
         )?;
         Self::within(
-            "encryption metadata bytes",
+            resource_name::ENCRYPTION_METADATA_BYTES,
             self.max_encryption_metadata_bytes,
             crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
-        )
+        )?;
+        for (resource, selected, ceiling) in [
+            (
+                resource_name::KEY_CANDIDATES,
+                self.max_key_candidates,
+                crate::hard_limits::KEY_CANDIDATE_CEILING,
+            ),
+            (
+                resource_name::BASE64_TRANSFORM_INPUT_BYTES,
+                self.max_base64_transform_input_bytes,
+                crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
+            ),
+            (
+                resource_name::BASE64_TRANSFORM_OUTPUT_BYTES,
+                self.max_base64_transform_output_bytes,
+                crate::hard_limits::BASE64_TRANSFORM_OUTPUT_BYTE_CEILING,
+            ),
+            (
+                resource_name::XPATH_EXPRESSIONS,
+                self.max_xpath_expressions,
+                crate::hard_limits::XPATH_EXPRESSION_COUNT_CEILING,
+            ),
+            (
+                resource_name::XPATH_EXPRESSION_BYTES,
+                self.max_xpath_expression_bytes,
+                crate::hard_limits::XPATH_EXPRESSION_BYTE_CEILING,
+            ),
+            (
+                resource_name::XPATH_EXPRESSION_COMPLEXITY,
+                self.max_xpath_expression_complexity,
+                crate::hard_limits::XPATH_EXPRESSION_COMPLEXITY_CEILING,
+            ),
+            (
+                resource_name::XPATH_CONTEXT_EVALUATIONS,
+                self.max_xpath_context_evaluations,
+                crate::hard_limits::XPATH_CONTEXT_EVALUATION_CEILING,
+            ),
+            (
+                resource_name::XPATH_EVALUATION_WORK,
+                self.max_xpath_evaluation_work,
+                crate::hard_limits::XPATH_EVALUATION_WORK_CEILING,
+            ),
+            (
+                resource_name::XPATH_MIRROR_STRING_BYTES,
+                self.max_xpath_mirror_string_bytes,
+                crate::hard_limits::XPATH_MIRROR_STRING_BYTE_CEILING,
+            ),
+            (
+                resource_name::XPATH_STRING_WORK_BYTES,
+                self.max_xpath_string_work_bytes,
+                crate::hard_limits::XPATH_STRING_WORK_BYTE_CEILING,
+            ),
+            (
+                resource_name::XPATH_NAMESPACE_BINDINGS,
+                self.max_xpath_namespace_bindings,
+                crate::hard_limits::XPATH_NAMESPACE_BINDING_CEILING,
+            ),
+            (
+                resource_name::XPATH_NAMESPACE_BYTES,
+                self.max_xpath_namespace_bytes,
+                crate::hard_limits::XPATH_NAMESPACE_BYTE_CEILING,
+            ),
+            (
+                resource_name::XPATH_FILTERS,
+                self.max_xpath_filters,
+                crate::hard_limits::XPATH_FILTER_COUNT_CEILING,
+            ),
+            (
+                resource_name::NODE_SET_FILTER_WORK,
+                self.max_node_set_filter_work,
+                crate::hard_limits::NODE_SET_FILTER_WORK_CEILING,
+            ),
+            (
+                resource_name::NODE_SET_ENTRIES,
+                self.max_node_set_entries,
+                crate::hard_limits::NODE_SET_ENTRY_CEILING,
+            ),
+            (
+                resource_name::NODE_SET_OWNED_STRING_BYTES,
+                self.max_node_set_owned_string_bytes,
+                crate::hard_limits::NODE_SET_OWNED_STRING_BYTE_CEILING,
+            ),
+            (
+                resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
+                self.max_node_set_cumulative_owned_string_bytes,
+                crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING,
+            ),
+        ] {
+            Self::within(resource, selected, ceiling)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_xml_document_len(&self, actual: usize) -> Result<(), PolicyViolation> {
         if actual > self.max_xml_document_bytes {
             return Err(PolicyViolation::ResourceLimit {
-                resource: "XML document",
+                resource: resource_name::XML_DOCUMENT,
                 maximum: self.max_xml_document_bytes,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    pub(crate) fn validate_key_candidates(&self, actual: usize) -> Result<(), PolicyViolation> {
+        if actual > self.max_key_candidates {
+            return Err(PolicyViolation::ResourceLimit {
+                resource: resource_name::KEY_CANDIDATES,
+                maximum: self.max_key_candidates,
                 actual,
             });
         }
@@ -418,6 +623,65 @@ impl ResourcePolicy {
 pub struct XmlInputPolicy {
     /// Permit bounded internal DTD declarations. External resolution stays off.
     pub allow_internal_dtd: bool,
+}
+
+/// XMLDSig transform and canonicalization decisions shared by signing and verification.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransformPolicy {
+    /// Allowed transform and canonicalization URIs; `None` accepts every implemented algorithm.
+    pub allowed_algorithms: Option<HashSet<String>>,
+    /// Node selected for the XPath `here()` extension function.
+    pub xpath_here_semantics: XPathHereSemantics,
+}
+
+/// URI-class decisions shared by XMLDSig reference and key retrieval processing.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UriPolicy {
+    /// URI classes accepted by SignedInfo and Manifest references.
+    pub references: UriTypeSet,
+    /// URI classes accepted by RetrievalMethod processing.
+    pub retrieval_methods: UriTypeSet,
+}
+
+#[cfg(feature = "xmldsig")]
+impl Default for UriPolicy {
+    fn default() -> Self {
+        Self {
+            references: UriTypeSet::SAME_DOCUMENT,
+            retrieval_methods: UriTypeSet::SAME_DOCUMENT,
+        }
+    }
+}
+
+/// KeyInfo sources an XMLDSig verification operation is permitted to trust.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeySourcePolicy {
+    /// Permit a caller-supplied pre-resolved key.
+    pub preset_key: bool,
+    /// Permit keys selected by document `KeyName`.
+    pub key_name: bool,
+    /// Permit public keys embedded in `KeyValue`.
+    pub key_value: bool,
+    /// Permit public keys embedded in `DEREncodedKeyValue`.
+    pub der_encoded_key_value: bool,
+    /// Permit certificates and selectors embedded in `X509Data`.
+    pub x509_data: bool,
+}
+
+#[cfg(feature = "xmldsig")]
+impl Default for KeySourcePolicy {
+    fn default() -> Self {
+        Self {
+            preset_key: true,
+            key_name: true,
+            key_value: true,
+            der_encoded_key_value: true,
+            x509_data: true,
+        }
+    }
 }
 
 /// An RFC 5280 extended-key-purpose identifier accepted for XML signing.
@@ -546,18 +810,16 @@ pub struct VerificationPolicy {
     pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
     /// Key and certificate trust rules.
     pub key_trust: KeyTrustPolicy,
-    /// Allowed Reference URI classes.
-    pub reference_uri_types: UriTypeSet,
-    /// Allowed RetrievalMethod URI classes.
-    pub retrieval_uri_types: UriTypeSet,
-    /// Allowed transform and canonicalization URIs; `None` accepts every implemented algorithm.
-    pub transforms: Option<HashSet<String>>,
+    /// KeyInfo source permissions.
+    pub key_sources: KeySourcePolicy,
+    /// Reference and key-retrieval URI permissions.
+    pub uris: UriPolicy,
+    /// Transform and canonicalization permissions.
+    pub transforms: TransformPolicy,
     /// Whether authenticated Manifest references are processed.
     pub manifest_processing: ManifestProcessing,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
-    /// Node selected for the XPath `here()` extension function.
-    pub xpath_here_semantics: XPathHereSemantics,
     /// Resource ceilings.
     pub resources: ResourcePolicy,
 }
@@ -614,14 +876,15 @@ pub struct SigningPolicy {
     pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
     /// RSA requirements enforced before producing a signature.
     pub rsa_keys: RsaKeyPolicy,
-    /// Allowed transform URIs; `None` accepts every implemented transform.
-    pub transforms: Option<HashSet<String>>,
+    /// Reference URI permissions. External URIs remain unsupported until the
+    /// caller supplies request-scoped external bytes through the signing API.
+    pub uris: UriPolicy,
+    /// Transform and canonicalization permissions.
+    pub transforms: TransformPolicy,
     /// Whether direct `<Object>/<Manifest>` reference digests are populated.
     pub manifest_processing: ManifestProcessing,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
-    /// Node selected for the XPath `here()` extension function.
-    pub xpath_here_semantics: XPathHereSemantics,
     /// Resource ceilings.
     pub resources: ResourcePolicy,
 }
@@ -666,7 +929,29 @@ impl EncryptionPolicy {
 
 /// Immutable policy snapshot for XMLEnc decryption.
 #[cfg(feature = "xmlenc")]
-pub type DecryptionPolicy = EncryptionPolicy;
+#[derive(Debug, Clone, Default)]
+pub struct DecryptionPolicy {
+    /// Allowed content-decryption algorithms.
+    pub data_algorithms: Option<HashSet<DataEncryptionAlgorithm>>,
+    /// Allowed RSA key-transport algorithms accepted on input.
+    pub key_transport_algorithms: Option<HashSet<KeyTransportAlgorithm>>,
+    /// Allowed symmetric key-wrap algorithms accepted on input.
+    pub key_wrap_algorithms: Option<HashSet<KeyWrapAlgorithm>>,
+    /// Allowed OAEP digest algorithms accepted on input.
+    pub oaep_digests: Option<HashSet<OaepDigestAlgorithm>>,
+    /// XML parser rules.
+    pub xml: XmlInputPolicy,
+    /// Resource ceilings.
+    pub resources: ResourcePolicy,
+}
+
+#[cfg(feature = "xmlenc")]
+impl DecryptionPolicy {
+    /// Validate the complete snapshot before inbound decryption work begins.
+    pub fn validate(&self) -> Result<(), PolicyViolation> {
+        self.resources.validate()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -681,7 +966,7 @@ mod tests {
         assert!(matches!(
             policy.validate(),
             Err(PolicyViolation::ResourceLimit {
-                resource: "XML nodes",
+                resource: resource_name::XML_NODES,
                 maximum: 100_000,
                 actual: 100_001,
             })
@@ -691,38 +976,170 @@ mod tests {
     #[test]
     fn every_resource_policy_field_obeys_its_hard_ceiling() {
         // Each public tuning knob is only a stricter operational limit; none
-        // may raise the implementation's allocation ceiling.
-        let mut policies = Vec::new();
-        let mut external = ResourcePolicy::default();
-        external.max_external_resource_bytes += 1;
-        policies.push(external);
-        let mut aggregate = ResourcePolicy::default();
-        aggregate.max_external_resource_total_bytes += 1;
-        policies.push(aggregate);
-        let mut xml_base_components = ResourcePolicy::default();
-        xml_base_components.max_xml_base_components += 1;
-        policies.push(xml_base_components);
-        let mut xml_base_bytes = ResourcePolicy::default();
-        xml_base_bytes.max_xml_base_resolution_bytes += 1;
-        policies.push(xml_base_bytes);
-        let mut plaintext = ResourcePolicy::default();
-        plaintext.max_encryption_plaintext_bytes += 1;
-        policies.push(plaintext);
-        let mut document = ResourcePolicy::default();
-        document.max_xml_document_bytes += 1;
-        policies.push(document);
-        let mut recipients = ResourcePolicy::default();
-        recipients.max_encryption_recipients += 1;
-        policies.push(recipients);
-        let mut metadata = ResourcePolicy::default();
-        metadata.max_encryption_metadata_bytes += 1;
-        policies.push(metadata);
+        // may raise the implementation's allocation ceiling. Exact diagnostics
+        // also catch a field accidentally paired with another field's ceiling.
+        type Case = (&'static str, usize, fn(&mut ResourcePolicy) -> &mut usize);
+        let cases: &[Case] = &[
+            (
+                resource_name::XML_NODES,
+                crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
+                |p| &mut p.max_xml_nodes,
+            ),
+            (
+                resource_name::SIGNATURE_REFERENCES,
+                crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
+                |p| &mut p.max_references,
+            ),
+            (
+                resource_name::REFERENCE_TRANSFORMS,
+                crate::hard_limits::REFERENCE_TRANSFORM_CEILING,
+                |p| &mut p.max_transforms_per_reference,
+            ),
+            (
+                resource_name::XML_BASE_COMPONENTS,
+                crate::hard_limits::XML_BASE_COMPONENT_CEILING,
+                |p| &mut p.max_xml_base_components,
+            ),
+            (
+                resource_name::XML_BASE_RESOLUTION_BYTES,
+                crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING,
+                |p| &mut p.max_xml_base_resolution_bytes,
+            ),
+            (
+                resource_name::CANONICALIZED_BYTES,
+                crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING,
+                |p| &mut p.max_canonicalized_bytes,
+            ),
+            (
+                resource_name::EXTERNAL_RESOURCE_BYTES,
+                crate::hard_limits::EXTERNAL_RESOURCE_BYTE_CEILING,
+                |p| &mut p.max_external_resource_bytes,
+            ),
+            (
+                resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING,
+                |p| &mut p.max_external_resource_total_bytes,
+            ),
+            (
+                resource_name::ENCRYPTION_PLAINTEXT_BYTES,
+                crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING,
+                |p| &mut p.max_encryption_plaintext_bytes,
+            ),
+            (
+                resource_name::XML_DOCUMENT,
+                crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
+                |p| &mut p.max_xml_document_bytes,
+            ),
+            (
+                resource_name::ENCRYPTION_RECIPIENTS,
+                crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
+                |p| &mut p.max_encryption_recipients,
+            ),
+            (
+                resource_name::ENCRYPTION_METADATA_BYTES,
+                crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
+                |p| &mut p.max_encryption_metadata_bytes,
+            ),
+            (
+                resource_name::KEY_CANDIDATES,
+                crate::hard_limits::KEY_CANDIDATE_CEILING,
+                |p| &mut p.max_key_candidates,
+            ),
+            (
+                resource_name::BASE64_TRANSFORM_INPUT_BYTES,
+                crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
+                |p| &mut p.max_base64_transform_input_bytes,
+            ),
+            (
+                resource_name::BASE64_TRANSFORM_OUTPUT_BYTES,
+                crate::hard_limits::BASE64_TRANSFORM_OUTPUT_BYTE_CEILING,
+                |p| &mut p.max_base64_transform_output_bytes,
+            ),
+            (
+                resource_name::XPATH_EXPRESSIONS,
+                crate::hard_limits::XPATH_EXPRESSION_COUNT_CEILING,
+                |p| &mut p.max_xpath_expressions,
+            ),
+            (
+                resource_name::XPATH_EXPRESSION_BYTES,
+                crate::hard_limits::XPATH_EXPRESSION_BYTE_CEILING,
+                |p| &mut p.max_xpath_expression_bytes,
+            ),
+            (
+                resource_name::XPATH_EXPRESSION_COMPLEXITY,
+                crate::hard_limits::XPATH_EXPRESSION_COMPLEXITY_CEILING,
+                |p| &mut p.max_xpath_expression_complexity,
+            ),
+            (
+                resource_name::XPATH_CONTEXT_EVALUATIONS,
+                crate::hard_limits::XPATH_CONTEXT_EVALUATION_CEILING,
+                |p| &mut p.max_xpath_context_evaluations,
+            ),
+            (
+                resource_name::XPATH_EVALUATION_WORK,
+                crate::hard_limits::XPATH_EVALUATION_WORK_CEILING,
+                |p| &mut p.max_xpath_evaluation_work,
+            ),
+            (
+                resource_name::XPATH_MIRROR_STRING_BYTES,
+                crate::hard_limits::XPATH_MIRROR_STRING_BYTE_CEILING,
+                |p| &mut p.max_xpath_mirror_string_bytes,
+            ),
+            (
+                resource_name::XPATH_STRING_WORK_BYTES,
+                crate::hard_limits::XPATH_STRING_WORK_BYTE_CEILING,
+                |p| &mut p.max_xpath_string_work_bytes,
+            ),
+            (
+                resource_name::XPATH_NAMESPACE_BINDINGS,
+                crate::hard_limits::XPATH_NAMESPACE_BINDING_CEILING,
+                |p| &mut p.max_xpath_namespace_bindings,
+            ),
+            (
+                resource_name::XPATH_NAMESPACE_BYTES,
+                crate::hard_limits::XPATH_NAMESPACE_BYTE_CEILING,
+                |p| &mut p.max_xpath_namespace_bytes,
+            ),
+            (
+                resource_name::XPATH_FILTERS,
+                crate::hard_limits::XPATH_FILTER_COUNT_CEILING,
+                |p| &mut p.max_xpath_filters,
+            ),
+            (
+                resource_name::NODE_SET_FILTER_WORK,
+                crate::hard_limits::NODE_SET_FILTER_WORK_CEILING,
+                |p| &mut p.max_node_set_filter_work,
+            ),
+            (
+                resource_name::NODE_SET_ENTRIES,
+                crate::hard_limits::NODE_SET_ENTRY_CEILING,
+                |p| &mut p.max_node_set_entries,
+            ),
+            (
+                resource_name::NODE_SET_OWNED_STRING_BYTES,
+                crate::hard_limits::NODE_SET_OWNED_STRING_BYTE_CEILING,
+                |p| &mut p.max_node_set_owned_string_bytes,
+            ),
+            (
+                resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
+                crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING,
+                |p| &mut p.max_node_set_cumulative_owned_string_bytes,
+            ),
+        ];
 
-        for policy in policies {
-            assert!(matches!(
+        for &(resource, ceiling, field) in cases {
+            let mut policy = ResourcePolicy::default();
+            let actual = ceiling.saturating_add(1);
+            *field(&mut policy) = actual;
+            assert_eq!(
                 policy.validate(),
-                Err(PolicyViolation::ResourceLimit { .. })
-            ));
+                Err(PolicyViolation::ResourceLimit {
+                    resource,
+                    maximum: ceiling,
+                    actual,
+                }),
+                "wrong hard-ceiling validation for {resource}",
+            );
         }
     }
 
@@ -743,6 +1160,23 @@ mod tests {
             max_xml_document_bytes: 0,
             max_encryption_recipients: 0,
             max_encryption_metadata_bytes: 0,
+            max_key_candidates: 0,
+            max_base64_transform_input_bytes: 0,
+            max_base64_transform_output_bytes: 0,
+            max_xpath_expressions: 0,
+            max_xpath_expression_bytes: 0,
+            max_xpath_expression_complexity: 0,
+            max_xpath_context_evaluations: 0,
+            max_xpath_evaluation_work: 0,
+            max_xpath_mirror_string_bytes: 0,
+            max_xpath_string_work_bytes: 0,
+            max_xpath_namespace_bindings: 0,
+            max_xpath_namespace_bytes: 0,
+            max_xpath_filters: 0,
+            max_node_set_filter_work: 0,
+            max_node_set_entries: 0,
+            max_node_set_owned_string_bytes: 0,
+            max_node_set_cumulative_owned_string_bytes: 0,
         };
 
         assert_eq!(policy.validate(), Ok(()));

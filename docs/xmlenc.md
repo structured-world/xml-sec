@@ -61,6 +61,10 @@ the existing `validate_rsa_recipient_key` remains the RustCrypto convenience for
 `EncryptionPolicy::rsa_keys` validates every recipient modulus and exponent before provider
 dispatch. New output defaults to 2048-8192-bit RSA keys; callers can explicitly tighten or relax
 the minimum for a deployment profile, but cannot exceed the implementation ceiling.
+Encryption preflight also applies the operation-wide `ResourcePolicy::max_key_candidates` limit
+before inspecting or dispatching any configured key: a direct content key consumes one candidate,
+while recipient mode consumes one candidate per independently wrapped recipient. The separate
+`max_encryption_recipients` ceiling still applies, so the tighter of the two limits wins.
 `validate_rsa_recipient_key` exposes that same preflight to ordered key registries, allowing them
 to skip policy-invalid candidates before committing to one without duplicating policy limits.
 Configuration validation rejects any non-SHA-1 MGF digest for the legacy URI before provider
@@ -129,8 +133,11 @@ The operation shares one `KeyCandidateBudget` across the direct lookup and every
 custom `DecryptionKeyResolver` implementations must charge it before each lookup or unwrap attempt.
 The context additionally accounts for returned candidates, so a resolver cannot multiply work by
 resetting a per-recipient allowance. Candidate-local lookup or unwrap failures may be recorded while
-later recipients are tried, but `KeyCandidateLimitExceeded` is terminal and stops the operation as
-soon as the shared budget is exhausted. Explicit `ReferenceList/DataReference` and `CarriedKeyName`
+later recipients are tried, but any policy violation returned by
+`DecryptionKeyResolver::resolve_key_candidates` is terminal for the complete operation. Resolution
+does not continue after a resolver rejects resource bounds, key trust, or any other compiled-policy
+requirement. Explicit
+`ReferenceList/DataReference` and `CarriedKeyName`
 metadata restricts an embedded key to the referenced `EncryptedData` or matching `ds:KeyName`.
 Association metadata may be omitted, but an explicit contradiction is skipped rather than tried.
 Wrong-width symmetric candidates are discarded before AES-CBC ambiguity checks because they cannot
@@ -153,10 +160,8 @@ the shared `ResourcePolicy::max_xml_document_bytes` ceiling before DOM allocatio
 XML node ceiling to
 the initial document, replacement-boundary validation, and final output reparse. The projected
 output byte length is checked before constructing the replacement. DTD parsing remains disabled by
-default; legacy documents that need an internal DTD can opt in only when both
-`DecryptionPolicy::xml.allow_internal_dtd` and `DocumentDecryptionOptions::allow_dtd` are enabled.
-The per-call option cannot weaken the operation policy, and the API never installs an external
-entity resolver.
+default; legacy documents that need an internal DTD can opt in only through
+`DecryptionPolicy::xml.allow_internal_dtd`. The API never installs an external entity resolver.
 
 `encrypt_document` also checks the exact projected document byte length and XML node count after
 cipher framing, base64, and `EncryptedData` serialization but before allocating the replacement

@@ -79,17 +79,25 @@ fn empty_uri_rejects_quadratic_namespace_materialization() {
         Ok(_) => panic!("oversized namespace projection must fail before materialization"),
     };
 
-    assert!(error.to_string().contains("node-set materialization"));
+    assert!(matches!(
+        error,
+        xml_sec::xmldsig::TransformError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "node-set entries",
+            ..
+        })
+    ));
 
     let direct_error = match NodeSet::entire_document_without_comments(&document) {
         Err(error) => error,
         Ok(_) => panic!("public constructors must enforce the materialization budget"),
     };
-    assert!(
-        direct_error
-            .to_string()
-            .contains("node-set materialization")
-    );
+    assert!(matches!(
+        direct_error,
+        xml_sec::xmldsig::TransformError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "node-set entries",
+            ..
+        })
+    ));
 }
 
 // ─── #id: subtree by ID ─────────────────────────────────────────────────────

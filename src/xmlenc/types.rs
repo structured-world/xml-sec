@@ -463,16 +463,11 @@ pub struct EncryptionResult {
     pub replacement: ReplacementMode,
 }
 
-/// XML parser controls and target selection for document encryption.
+/// Caller-owned target selection for document encryption.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DocumentEncryptionOptions<'a> {
     /// Select an element by `Id`, `ID`, or `id`; `None` selects the document root.
     pub element_id: Option<&'a str>,
-    /// Request internal-DTD parsing for this call.
-    ///
-    /// The operation policy must also permit internal DTDs; either control can
-    /// deny parsing, so a permissive caller option cannot weaken policy.
-    pub allow_dtd: bool,
 }
 
 /// Parsed `EncryptionMethod` data.
@@ -608,17 +603,6 @@ pub enum XmlEncError {
     #[error("XML Encryption policy violation: {0}")]
     Policy(#[from] crate::policy::PolicyViolation),
 
-    /// One cryptographic operation exhausted its aggregate key-candidate work ceiling.
-    #[error("key candidate limit exceeded by {resource}: maximum {maximum}, attempted {actual}")]
-    KeyCandidateLimitExceeded {
-        /// Resolver-provided description of the candidate source being charged.
-        resource: &'static str,
-        /// Fixed operation-wide candidate ceiling.
-        maximum: usize,
-        /// Candidate work that would have been consumed.
-        actual: usize,
-    },
-
     /// The selected cryptographic provider rejected or failed an operation.
     #[error("cryptographic provider error: {0}")]
     Provider(#[from] crate::provider::ProviderError),
@@ -702,40 +686,6 @@ pub enum XmlEncError {
         /// Exact wrapped length required by the algorithm and key context.
         expected: usize,
         /// Actual input or provider output length.
-        actual: usize,
-    },
-    /// Plaintext exceeds the bounded encryption input size.
-    #[error("encryption plaintext exceeds {maximum}-byte limit: got {actual} bytes")]
-    PlaintextTooLarge {
-        /// Maximum accepted bytes.
-        maximum: usize,
-        /// Actual input bytes.
-        actual: usize,
-    },
-    /// Caller-owned XML exceeds the bounded document parser input size.
-    #[error("encryption document exceeds {maximum}-byte limit: got {actual} bytes")]
-    DocumentTooLarge {
-        /// Maximum accepted document bytes.
-        maximum: usize,
-        /// Actual document bytes.
-        actual: usize,
-    },
-    /// More independently wrapped recipient keys were configured than allowed.
-    #[error("encryption recipient count exceeds {maximum}: got {actual}")]
-    TooManyRecipients {
-        /// Maximum supported recipients.
-        maximum: usize,
-        /// Actual configured recipients.
-        actual: usize,
-    },
-    /// Caller-controlled XML metadata exceeds the generated-output bound.
-    #[error("{field} exceeds {maximum}-byte encryption metadata limit: got {actual} bytes")]
-    EncryptionMetadataTooLarge {
-        /// Metadata field being validated.
-        field: &'static str,
-        /// Maximum accepted bytes.
-        maximum: usize,
-        /// Actual input bytes.
         actual: usize,
     },
     /// Encryption configuration is internally inconsistent.

@@ -41,7 +41,7 @@ Currently implemented (core paths):
 - XMLDSig parsing, same-document URI dereference, enveloped/C14N/Base64/XPath 1.0/XPath Filter 2.0 transform chains, and digest verification
 - XMLDSig full verify pipeline (`SignedInfo` canonicalization + `SignatureValue` verification)
 - XMLDSig template signing pipeline (`DigestValue` fill + `SignedInfo` canonicalization + `SignatureValue` fill), including enveloped SAML Response templates
-- Typed signing and verification policy covers XML parsing, explicit transforms, implicit reference canonicalization, `SignedInfo` canonicalization, and outbound RSA key strength under shared work limits
+- Unified typed verify/sign/encrypt/decrypt policies own algorithms, key-source and X.509 trust rules, URI/transform semantics, Manifest handling, XML parsing, and shared resource budgets. Caller keys, selected targets, and external bytes remain request context; resolver or per-call options cannot override policy.
 - XMLDSig signing KeyInfo writer for embedded X.509 certificates
 - Built-in verification-key resolution from embedded X.509/DER/`KeyValue` sources and configured `KeyName`, X.509 subject, issuer/serial, SKI, or digest selectors
 - RSA PKCS#1 v1.5 verification helpers for SHA-1 / SHA-256 / SHA-384 / SHA-512
@@ -52,8 +52,9 @@ Currently implemented (core paths):
 - Caller-supplied external references and X.509 `RetrievalMethod` resolution with bounded RFC 3986 `xml:base` processing and no implicit I/O
 - XMLEnc AES-128/256-CBC and AES-128/256-GCM encryption/decryption with direct
   keys, RSA-OAEP key transport, AES-128/256-KW, multiple recipients, and
-  Element/Content document replacement; document, node, and aggregate recipient
-  limits plus outbound RSA key-strength policy cover caller-constructed ciphertext and generated replacement output
+  Element/Content document replacement; document, node, metadata, aggregate
+  recipient, and key-candidate limits plus separate inbound/outbound algorithm
+  policies and outbound RSA key-strength policy cover caller-constructed ciphertext and generated replacement output
   before expensive work. CBC failures expose no decrypted
   padding details, but CBC remains unauthenticated and can be excluded by policy
 - Provider-neutral digest, signature, X.509 signature, cipher, key-wrap,

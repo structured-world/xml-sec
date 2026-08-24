@@ -370,7 +370,6 @@ fn document_encryption_selects_one_id_and_preserves_surrounding_xml() {
                 document,
                 DocumentEncryptionOptions {
                     element_id: Some("chosen"),
-                    allow_dtd: false,
                 },
             )
             .expect("selected document node must encrypt");
@@ -401,7 +400,6 @@ fn content_encryption_preserves_cdata_with_closing_markers() {
             document,
             DocumentEncryptionOptions {
                 element_id: Some("chosen"),
-                allow_dtd: false,
             },
         )
         .expect("CDATA content containing a closing marker must encrypt");
@@ -472,7 +470,6 @@ fn invalid_targets_configuration_and_keys_fail_closed() {
             "<root><a Id=\"same\"/><b id=\"same\"/></root>",
             DocumentEncryptionOptions {
                 element_id: Some("same"),
-                allow_dtd: false,
             }
         ),
         Err(XmlEncError::AmbiguousEncryptionTarget)
@@ -482,7 +479,6 @@ fn invalid_targets_configuration_and_keys_fail_closed() {
             "<root/>",
             DocumentEncryptionOptions {
                 element_id: Some("missing"),
-                allow_dtd: false,
             }
         ),
         Err(XmlEncError::EncryptionTargetNotFound)

@@ -3,11 +3,12 @@
 use std::fs;
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::policy::SigningPolicy;
 use xml_sec::xmldsig::{
     DEFAULT_IMPLICIT_C14N_URI, DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus,
     FailureReason, ParseError, ReferenceBuilder, ReferenceProcessingError, RsaSigningKey,
-    SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError, Transform,
-    TransformError, VerifyContext, X509CertificateKeyInfoWriter, XPATH_FILTER2_TRANSFORM_URI,
+    SignContext, SignatureAlgorithm, SignatureBuilder, SigningError, Transform, TransformError,
+    UriTypeSet, VerifyContext, X509CertificateKeyInfoWriter, XPATH_FILTER2_TRANSFORM_URI,
     XPATH_TRANSFORM_URI, XPathExpression, XPathFilter, XPathFilterOperation, XPathHereSemantics,
 };
 
@@ -138,9 +139,13 @@ fn filter2_transform_is_enforced_by_the_allowlist() {
         .verify(&signed)
         .expect_err("unlisted Filter 2.0 transform must be rejected");
 
-    assert!(
-        matches!(error, DsigError::DisallowedTransform { algorithm } if algorithm == XPATH_FILTER2_TRANSFORM_URI)
-    );
+    assert!(matches!(
+        error,
+        DsigError::Policy(xml_sec::policy::PolicyViolation::Algorithm {
+            operation: "verification transform",
+            algorithm,
+        }) if algorithm == XPATH_FILTER2_TRANSFORM_URI
+    ));
 }
 
 #[test]
@@ -162,6 +167,7 @@ fn filter2_union_restores_a_subtree_to_the_signed_set() {
         ),
     ];
     let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
         .add_reference(
             ReferenceBuilder::new(DigestAlgorithm::Sha256)
                 .uri("")
@@ -268,7 +274,58 @@ fn signing_shares_xpath_work_across_references() {
 
     assert!(matches!(
         error,
-        SigningError::Digest(SigningDigestError::Transform(TransformError::XPath(message)))
-            if message.contains("signature-wide")
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "XPath evaluation work",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn signing_policy_rejects_external_reference_before_dereference() {
+    // URI acceptance belongs to the immutable signing policy. The resolver must
+    // not become the first component deciding whether an external URI is trusted.
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("https://example.invalid/data"),
+        );
+    let (key, _) = signing_material();
+
+    let error = SignContext::new(&key)
+        .sign_with_builder("<root/>", &builder)
+        .expect_err("the default signing policy must reject external references");
+
+    assert!(
+        matches!(
+            error,
+            SigningError::Policy(xml_sec::policy::PolicyViolation::Uri {
+                operation: "signing",
+                ..
+            })
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn signing_rejects_external_reference_without_request_resources() {
+    // Permitting an external URI class is not a substitute for supplying its
+    // bytes, and the signing context intentionally has no such request input.
+    let template = r#"<root><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="https://example.invalid/data"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference></SignedInfo><SignatureValue/></Signature></root>"#;
+    let (key, _) = signing_material();
+    let mut policy = SigningPolicy::default();
+    policy.uris.references = UriTypeSet::ALL;
+
+    let error = SignContext::new(&key)
+        .policy(policy)
+        .sign_template(template)
+        .expect_err("external signing references require request-scoped bytes");
+
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::Uri {
+            operation: "signing",
+            reason: "external signing references require request-scoped resource bytes",
+        })
     ));
 }
