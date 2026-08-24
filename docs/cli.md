@@ -110,8 +110,9 @@ are recognized but reported as inapplicable for other commands.
   representation and DER is rejected rather than auto-detected.
 - `--enable-visa3d-hack` resolves a bare fragment by direct registered-ID
   lookup instead of constructing libxmlsec1's default `xpointer(id('...'))`
-  expression. This matters for registered ID values that cannot be represented
-  safely by that expression. It does not register attributes or weaken
+  expression. The default expression accepts registered non-NCName values such
+  as numeric IDs, but not values containing a single quote; the compatibility
+  flag handles those through direct lookup. It does not register attributes or weaken
   duplicate-ID rejection; use `--add-id-attr` or `--id-attr` separately.
 
 The flags compile into the same immutable typed policies used by the library.

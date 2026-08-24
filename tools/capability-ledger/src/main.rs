@@ -383,8 +383,7 @@ fn validate_behavior_evidence(evidence: &BTreeMap<String, BehaviorEvidence>) -> 
             }
             let source = fs::read_to_string(path)
                 .map_err(|error| format!("read evidence test {}: {error}", path.display()))?;
-            let declaration = format!("fn {}", test.test);
-            if !source.contains(&declaration) {
+            if !contains_test_declaration(&source, &test.test)? {
                 return Err(format!(
                     "evidence {id} test {} is absent from {}",
                     test.test, test.file
@@ -393,6 +392,32 @@ fn validate_behavior_evidence(evidence: &BTreeMap<String, BehaviorEvidence>) -> 
         }
     }
     Ok(())
+}
+
+fn contains_test_declaration(source: &str, test_name: &str) -> Result<bool, String> {
+    let declaration = Regex::new(&format!(
+        r"^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+{}\s*\(",
+        regex::escape(test_name)
+    ))
+    .map_err(|error| format!("compile evidence declaration matcher: {error}"))?;
+    let mut pending_test_attribute = false;
+
+    for line in source.lines() {
+        let line = line.trim();
+        if line == "#[test]" {
+            pending_test_attribute = true;
+            continue;
+        }
+        if !pending_test_attribute || line.is_empty() || line.starts_with("#[") {
+            continue;
+        }
+        if declaration.is_match(line) {
+            return Ok(true);
+        }
+        pending_test_attribute = false;
+    }
+
+    Ok(false)
 }
 
 fn resolve_donor_anchor(donor: &Path, anchor: DonorAnchorRule) -> Result<DonorAnchor, String> {
@@ -1655,6 +1680,39 @@ mod tests {
             rationale: "not implemented".into(),
             evidence: "test".into(),
         }
+    }
+
+    #[test]
+    fn behavior_evidence_requires_an_exact_test_declaration() {
+        // A renamed test whose new name extends the old one, or a comment that
+        // retains the old spelling, must not keep stale ledger evidence alive.
+        let path = format!(
+            "target/capability-ledger-evidence-{}.rs",
+            std::process::id()
+        );
+        fs::create_dir_all("target").expect("target directory must be creatable");
+        fs::write(
+            &path,
+            "// fn expected\n#[test]\nfn expected_for_case() {}\n",
+        )
+        .expect("evidence fixture must be writable");
+        let test = BehaviorTest {
+            file: path.clone(),
+            test: "expected".into(),
+            description: "stale evidence fixture".into(),
+        };
+        let evidence = BTreeMap::from([(
+            "stale".into(),
+            BehaviorEvidence {
+                positive: vec![test.clone()],
+                negative: vec![test],
+            },
+        )]);
+
+        let result = validate_behavior_evidence(&evidence);
+        fs::remove_file(path).expect("evidence fixture must be removable");
+        let error = result.expect_err("substring and comment matches must not satisfy evidence");
+        assert!(error.contains("expected"), "{error}");
     }
 
     #[test]

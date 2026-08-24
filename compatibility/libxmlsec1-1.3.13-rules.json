@@ -132,7 +132,7 @@
     {
       "id": "native-cli-behavior-options",
       "kinds": ["cli-option"],
-      "name_regex": "^--(?:add-id-attr|binary-data|help|id-attr|ignore-manifests|insecure|lax-key-search|node-id|output|print-debug|print-xml-debug|verify-crls|xml-data)$",
+      "name_regex": "^--(?:add-id-attr|binary-data|enable-asn1-signatures-hack|enable-visa3d-hack|help|id-attr|ignore-manifests|insecure|lax-key-search|node-id|output|print-debug|print-xml-debug|verify-crls|xml-data)$",
       "outcome": "behavior-compatible",
       "rationale": "The native CLI implements this provider-independent option with donor-compatible parsing and command behavior.",
       "evidence": "native-cli-tests"

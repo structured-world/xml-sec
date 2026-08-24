@@ -314,10 +314,16 @@ impl<'a> UriReferenceResolver<'a> {
             Err(TransformError::UnsupportedUri(format!("#{fragment}")))
         } else {
             // Bare-name fragment: #foo → element by ID
-            if self.same_document_id_semantics == SameDocumentIdSemantics::Specification
-                && !is_xml_ncname(fragment)
-            {
-                return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
+            match self.same_document_id_semantics {
+                SameDocumentIdSemantics::Specification if !is_xml_ncname(fragment) => {
+                    return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
+                }
+                SameDocumentIdSemantics::XmlSecXPointer if fragment.contains('\'') => {
+                    return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
+                }
+                SameDocumentIdSemantics::Specification
+                | SameDocumentIdSemantics::XmlSecXPointer
+                | SameDocumentIdSemantics::XmlSecVisa3d => {}
             }
             self.resolve_id(fragment, budget, false)
         }
@@ -1088,6 +1094,22 @@ mod tests {
             .with_same_document_id_semantics(SameDocumentIdSemantics::XmlSecVisa3d);
 
         assert!(resolver.dereference("#12345").is_ok());
+    }
+
+    #[test]
+    fn xmlsec_xpointer_compatibility_matches_donor_literal_limits() {
+        // The donor's default XPointer wrapper accepts numeric registered IDs,
+        // but an apostrophe breaks its single-quoted id() expression.
+        let xml = r#"<root><item ID="12345">numeric</item><item ID="visa'3d">quoted</item></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let resolver = UriReferenceResolver::new(&doc)
+            .with_same_document_id_semantics(SameDocumentIdSemantics::XmlSecXPointer);
+
+        assert!(resolver.dereference("#12345").is_ok());
+        assert!(matches!(
+            resolver.dereference("#visa'3d"),
+            Err(TransformError::UnsupportedUri(uri)) if uri == "#visa'3d"
+        ));
     }
 
     #[test]

@@ -1020,7 +1020,7 @@ fn same_document_id_semantics(invocation: &Invocation) -> SameDocumentIdSemantic
     if invocation.flag("enable-visa3d-hack") {
         SameDocumentIdSemantics::XmlSecVisa3d
     } else {
-        SameDocumentIdSemantics::Specification
+        SameDocumentIdSemantics::XmlSecXPointer
     }
 }
 
@@ -1506,16 +1506,15 @@ struct CandidateVerifyingKey<'a> {
     candidates: Vec<Box<dyn VerifyingKey + 'a>>,
 }
 
-impl VerifyingKey for CandidateVerifyingKey<'_> {
-    fn validate_signature_value(
+impl CandidateVerifyingKey<'_> {
+    fn first_accepting(
         &self,
-        algorithm: SignatureAlgorithm,
-        signature_value: &[u8],
+        mut attempt: impl FnMut(&dyn VerifyingKey) -> Result<bool, DsigError>,
     ) -> Result<bool, DsigError> {
         let mut saw_mismatch = false;
         let mut last_error = None;
         for candidate in &self.candidates {
-            match candidate.validate_signature_value(algorithm, signature_value) {
+            match attempt(candidate.as_ref()) {
                 Ok(true) => return Ok(true),
                 Ok(false) => saw_mismatch = true,
                 Err(error) => last_error = Some(error),
@@ -1524,11 +1523,20 @@ impl VerifyingKey for CandidateVerifyingKey<'_> {
         if saw_mismatch {
             Ok(false)
         } else {
-            match last_error {
-                Some(error) => Err(error),
-                None => Ok(false),
-            }
+            last_error.map_or(Ok(false), Err)
         }
+    }
+}
+
+impl VerifyingKey for CandidateVerifyingKey<'_> {
+    fn validate_signature_value(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.first_accepting(|candidate| {
+            candidate.validate_signature_value(algorithm, signature_value)
+        })
     }
 
     fn validate_signature_value_with_policy(
@@ -1537,24 +1545,9 @@ impl VerifyingKey for CandidateVerifyingKey<'_> {
         algorithm: SignatureAlgorithm,
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        let mut saw_mismatch = false;
-        let mut last_error = None;
-        for candidate in &self.candidates {
-            match candidate.validate_signature_value_with_policy(policy, algorithm, signature_value)
-            {
-                Ok(true) => return Ok(true),
-                Ok(false) => saw_mismatch = true,
-                Err(error) => last_error = Some(error),
-            }
-        }
-        if saw_mismatch {
-            Ok(false)
-        } else {
-            match last_error {
-                Some(error) => Err(error),
-                None => Ok(false),
-            }
-        }
+        self.first_accepting(|candidate| {
+            candidate.validate_signature_value_with_policy(policy, algorithm, signature_value)
+        })
     }
 
     fn verify(
@@ -1563,23 +1556,7 @@ impl VerifyingKey for CandidateVerifyingKey<'_> {
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        let mut saw_mismatch = false;
-        let mut last_error = None;
-        for candidate in &self.candidates {
-            match candidate.verify(algorithm, signed_data, signature_value) {
-                Ok(true) => return Ok(true),
-                Ok(false) => saw_mismatch = true,
-                Err(error) => last_error = Some(error),
-            }
-        }
-        if saw_mismatch {
-            Ok(false)
-        } else {
-            match last_error {
-                Some(error) => Err(error),
-                None => Ok(false),
-            }
-        }
+        self.first_accepting(|candidate| candidate.verify(algorithm, signed_data, signature_value))
     }
 
     fn verify_with_policy(
@@ -1589,23 +1566,9 @@ impl VerifyingKey for CandidateVerifyingKey<'_> {
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        let mut saw_mismatch = false;
-        let mut last_error = None;
-        for candidate in &self.candidates {
-            match candidate.verify_with_policy(policy, algorithm, signed_data, signature_value) {
-                Ok(true) => return Ok(true),
-                Ok(false) => saw_mismatch = true,
-                Err(error) => last_error = Some(error),
-            }
-        }
-        if saw_mismatch {
-            Ok(false)
-        } else {
-            match last_error {
-                Some(error) => Err(error),
-                None => Ok(false),
-            }
-        }
+        self.first_accepting(|candidate| {
+            candidate.verify_with_policy(policy, algorithm, signed_data, signature_value)
+        })
     }
 }
 
@@ -3414,6 +3377,53 @@ mod tests {
             self.calls.set(self.calls.get() + 1);
             Ok(self.accepts)
         }
+    }
+
+    struct FailingVerificationKey {
+        reason: &'static str,
+    }
+
+    impl VerifyingKey for FailingVerificationKey {
+        fn verify(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _signed_data: &[u8],
+            _signature_value: &[u8],
+        ) -> Result<bool, DsigError> {
+            Err(DsigError::InvalidStructure {
+                reason: self.reason,
+            })
+        }
+    }
+
+    #[test]
+    fn candidate_verifier_preserves_mismatch_and_error_precedence() {
+        // A definitive cryptographic mismatch outranks provider errors, while
+        // an all-error candidate set reports the final attempted provider.
+        let mismatch_then_error = CandidateVerifyingKey {
+            candidates: vec![
+                Box::new(CountingVerificationKey {
+                    accepts: false,
+                    calls: Rc::new(Cell::new(0)),
+                }),
+                Box::new(FailingVerificationKey { reason: "last" }),
+            ],
+        };
+        assert!(matches!(
+            mismatch_then_error.verify(SignatureAlgorithm::RsaSha256, b"data", b"signature"),
+            Ok(false)
+        ));
+
+        let errors = CandidateVerifyingKey {
+            candidates: vec![
+                Box::new(FailingVerificationKey { reason: "first" }),
+                Box::new(FailingVerificationKey { reason: "last" }),
+            ],
+        };
+        assert!(matches!(
+            errors.verify(SignatureAlgorithm::RsaSha256, b"data", b"signature"),
+            Err(DsigError::InvalidStructure { reason: "last" })
+        ));
     }
 
     #[test]

@@ -95,7 +95,9 @@ Before document-signature provider dispatch, the facade calls
 `VerifyingKey::validate_signature_value`. Built-in resolved keys enforce the exact RSA modulus or
 EC curve width there, so a permissive custom provider cannot reinterpret malformed XMLDSig wire
 framing. Custom opaque keys must override that hook when their accepted framing depends on key
-metadata unavailable through the generic algorithm URI.
+metadata unavailable through the generic algorithm URI. Providers that implement policy-selected
+framing must also override `validate_signature_value_with_policy` and `verify_with_policy`; their
+defaults intentionally preserve the standard-only hooks.
 
 ## Verification Policy
 
@@ -105,10 +107,13 @@ default for both signing and verification. Set
 `VerificationPolicy::ecdsa_signature_value_encoding` to
 `EcdsaSignatureValueEncoding::XmlSecAsn1Der` only at a trusted compatibility
 boundary. DER is never auto-detected. Same-document bare fragments use
-`TransformPolicy::same_document_id_semantics`; the default requires the
-standards form, while `SameDocumentIdSemantics::XmlSecVisa3d` performs direct
-registered-ID lookup for libxmlsec1 Visa3D compatibility. ID registrations
-remain request context and duplicate IDs fail in either mode.
+`TransformPolicy::same_document_id_semantics`; the library default requires the
+standards form. `SameDocumentIdSemantics::XmlSecXPointer` models libxmlsec1's
+default single-quoted `xpointer(id(...))` wrapper, while
+`SameDocumentIdSemantics::XmlSecVisa3d` performs direct registered-ID lookup.
+The native CLI selects the XPointer mode by default and the direct mode for
+`--enable-visa3d-hack`. ID registrations remain request context and duplicate
+IDs fail in every mode.
 
 For production verification, configure `KeyResolverConfig::lookup_certs` with untrusted
 certificates that selector-only `X509Data` may address or use as path intermediates, and configure

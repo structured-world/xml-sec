@@ -296,6 +296,48 @@ fn cli_visa3d_mode_bypasses_xpointer_for_registered_ids() {
 }
 
 #[test]
+fn cli_default_xpointer_mode_accepts_numeric_registered_ids() {
+    // libxmlsec1's default wraps a bare ID in xpointer(id('...')), so a numeric
+    // registered value works without enabling the direct Visa3D lookup path.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("numeric-id-template.xml");
+    let signed = temp.path().join("numeric-id-signed.xml");
+    fs::write(
+        &template,
+        visa3d_signature_template().replace("visa'3d", "12345"),
+    )
+    .unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+
+    let sign = Command::new(binary())
+        .args(["sign", "--add-id-attr", "ID", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--output"])
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--add-id-attr", "ID", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
 fn signing_rejects_preserved_key_info_for_another_key() {
     // A successful signature must not retain a cryptographic identity that
     // directs ordinary KeyInfo resolution to a different public key.

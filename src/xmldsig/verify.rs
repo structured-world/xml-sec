@@ -87,6 +87,12 @@ pub trait VerifyingKey {
     }
 
     /// Validate wire framing under the operation's immutable compatibility policy.
+    ///
+    /// The default delegates to [`VerifyingKey::validate_signature_value`] and
+    /// therefore implements only the standard XMLDSig framing contract. Custom
+    /// keys that support policy-selected wire formats, such as
+    /// [`crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der`], must
+    /// override this hook rather than accepting both formats implicitly.
     fn validate_signature_value_with_policy(
         &self,
         policy: &crate::policy::VerificationPolicy,
@@ -106,6 +112,10 @@ pub trait VerifyingKey {
     ) -> Result<bool, DsigError>;
 
     /// Verify after applying operation-scoped compatibility semantics.
+    ///
+    /// The default delegates to [`VerifyingKey::verify`]. Custom keys whose
+    /// provider input depends on compatibility policy must override this hook
+    /// consistently with [`VerifyingKey::validate_signature_value_with_policy`].
     fn verify_with_policy(
         &self,
         policy: &crate::policy::VerificationPolicy,
