@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/structured-world/xml-sec/compare/v0.1.12...v0.1.13) - 2026-08-24
+
+### Fixed
+
+- *(xmldsig)* preflight key source policy
+- *(xmldsig)* unify key candidate preflight
+- *(policy)* preflight xpath namespaces
+- *(policy)* preflight bounded materialization
+- *(policy)* align resource boundary accounting
+- *(xmldsig)* account raw retrieval XPath bytes
+- *(xmldsig)* preserve policy budget semantics
+- *(xmldsig)* budget certificates before parsing
+- *(xmlenc)* enforce key candidate budget
+- *(policy)* bound signing key resources
+- *(policy)* share transform operation budgets
+- *(policy)* share signing resource budgets
+- *(policy)* enforce signing and key budgets
+- *(xmldsig)* type mutation policy failures
+- *(xmldsig)* account for digest placeholders
+- *(xmldsig)* validate signing templates
+- *(policy)* preserve XPath work budgets
+- *(xmldsig)* align builder policy paths
+- *(policy)* close resolver budget bypasses
+- *(policy)* bound X.509 candidate expansion
+- *(policy)* enforce public resource boundaries
+- *(policy)* enforce review invariants
+- *(policy)* close review enforcement gaps
+- *(policy)* close enforcement gaps
+- *(crypto)* enforce provider capabilities
+
+### Performance
+
+- *(xpath)* reject invalid programs early
+
+### Refactored
+
+- *(policy)* unify operation enforcement
+- *(crypto)* complete provider contract
+
 ## [0.1.12](https://github.com/structured-world/xml-sec/compare/v0.1.11...v0.1.12) - 2026-08-22
 
 ### Added
