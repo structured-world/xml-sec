@@ -775,8 +775,8 @@ fn parse_retrieval_method_transforms(
     ensure_no_element_children(xpath, "XPath")?;
     let expression =
         collect_text_content_bounded(xpath, MAX_RETRIEVAL_XPATH_TEXT_LEN, "RetrievalMethod XPath")?;
-    let expression = expression.trim();
-    let selects_x509_data = expression
+    let normalized_expression = expression.trim();
+    let selects_x509_data = normalized_expression
         .strip_prefix("ancestor-or-self::")
         .and_then(|step| step.split_once(':'))
         .is_some_and(|(prefix, local)| {
@@ -796,7 +796,7 @@ fn parse_retrieval_method_transforms(
         })
         .collect();
     Ok(RetrievalMethodTransforms::X509DataNodeSetFilter {
-        expression: expression.to_owned(),
+        expression,
         namespaces,
     })
 }

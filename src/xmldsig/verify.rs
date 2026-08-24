@@ -4331,15 +4331,17 @@ mod tests {
 
     #[test]
     fn retrieval_method_xpath_obeys_expression_byte_limit() {
-        // The parser recognizes this restricted XPath shape, but the original
-        // untrusted expression still belongs to the operation policy budget.
+        // Edge whitespace is semantically harmless for this restricted shape,
+        // but its raw untrusted bytes still belong to the operation budget.
         let expression = "ancestor-or-self::ds:X509Data";
+        let padded_expression = format!("  {expression}  ");
+        let xml = retrieval_method_xpath_signature().replace(expression, &padded_expression);
         let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_xpath_expression_bytes = expression.len() - 1;
+        policy.resources.max_xpath_expression_bytes = expression.len();
 
         let error = VerifyContext::new()
             .policy(policy)
-            .verify(&retrieval_method_xpath_signature())
+            .verify(&xml)
             .expect_err("RetrievalMethod XPath must obey the expression byte limit");
 
         assert!(
@@ -4351,7 +4353,7 @@ mod tests {
                         maximum,
                         actual,
                     }
-                ) if *maximum == expression.len() - 1 && *actual == expression.len()
+                ) if *maximum == expression.len() && *actual == padded_expression.len()
             ),
             "unexpected error: {error:?}"
         );
