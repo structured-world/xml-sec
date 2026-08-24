@@ -331,6 +331,37 @@ impl InspectedKeyCandidateBudget {
     }
 }
 
+fn validate_key_info_source_permissions(
+    key_info: &KeyInfo,
+    allowed: crate::policy::KeySourcePolicy,
+) -> Result<(), crate::policy::PolicyViolation> {
+    for source in &key_info.sources {
+        let disabled_reason = match source {
+            KeyInfoSource::X509Data(_) if !allowed.x509_data => {
+                Some("X509Data key sources are disabled")
+            }
+            KeyInfoSource::DerEncodedKeyValue(_) if !allowed.der_encoded_key_value => {
+                Some("DEREncodedKeyValue key sources are disabled")
+            }
+            KeyInfoSource::KeyName(_) if !allowed.key_name => {
+                Some("KeyName key sources are disabled")
+            }
+            KeyInfoSource::KeyValue(_) if !allowed.key_value => {
+                Some("KeyValue key sources are disabled")
+            }
+            KeyInfoSource::X509Data(_)
+            | KeyInfoSource::DerEncodedKeyValue(_)
+            | KeyInfoSource::KeyName(_)
+            | KeyInfoSource::KeyValue(_)
+            | KeyInfoSource::RetrievalMethod { .. } => None,
+        };
+        if let Some(reason) = disabled_reason {
+            return Err(crate::policy::PolicyViolation::KeyTrust { reason });
+        }
+    }
+    Ok(())
+}
+
 impl DefaultKeyResolver {
     /// Construct a resolver from explicit caller-owned key and certificate stores.
     #[must_use]
@@ -782,27 +813,16 @@ impl DefaultKeyResolver {
         let Some(key_info) = key_info else {
             return Ok(None);
         };
+        validate_key_info_source_permissions(key_info, sources)?;
         let mut candidate_budget = InspectedKeyCandidateBudget::new(resources.max_key_candidates);
         let mut deferred_key_value_error = None;
         for source in &key_info.sources {
             let resolved = match source {
                 KeyInfoSource::X509Data(info) => {
-                    if !sources.x509_data {
-                        return Err(crate::policy::PolicyViolation::KeyTrust {
-                            reason: "X509Data key sources are disabled",
-                        }
-                        .into());
-                    }
                     self.resolve_x509(info, algorithm, trust, provider, &mut candidate_budget)?
                 }
                 KeyInfoSource::DerEncodedKeyValue(public_key_bytes) => {
                     candidate_budget.charge()?;
-                    if !sources.der_encoded_key_value {
-                        return Err(crate::policy::PolicyViolation::KeyTrust {
-                            reason: "DEREncodedKeyValue key sources are disabled",
-                        }
-                        .into());
-                    }
                     validate_spki_algorithm(public_key_bytes, algorithm)?;
                     Some(VerificationKey {
                         algorithm,
@@ -813,12 +833,6 @@ impl DefaultKeyResolver {
                 }
                 KeyInfoSource::KeyName(name) => {
                     candidate_budget.charge()?;
-                    if !sources.key_name {
-                        return Err(crate::policy::PolicyViolation::KeyTrust {
-                            reason: "KeyName key sources are disabled",
-                        }
-                        .into());
-                    }
                     self.config
                         .named_keys
                         .get(name)
@@ -833,12 +847,6 @@ impl DefaultKeyResolver {
                 }
                 KeyInfoSource::KeyValue(key_value) => {
                     candidate_budget.charge()?;
-                    if !sources.key_value {
-                        return Err(crate::policy::PolicyViolation::KeyTrust {
-                            reason: "KeyValue key sources are disabled",
-                        }
-                        .into());
-                    }
                     match Self::resolve_key_value(key_value, algorithm) {
                         Ok(resolved) => resolved,
                         Err(error) if key_value_error_allows_fallback(key_value, &error) => {
@@ -2879,6 +2887,52 @@ mod tests {
                 reason: "KeyValue key sources are disabled"
             })
         ));
+    }
+
+    #[test]
+    fn operation_policy_preflights_every_key_info_source_before_resolution() {
+        // A permitted source resolving first must not hide a later source that
+        // the immutable operation policy rejects.
+        let mut config = KeyResolverConfig::default();
+        config.named_keys.insert(
+            "idp-signing".into(),
+            VerificationKey {
+                algorithm: SignatureAlgorithm::EcdsaSha256,
+                public_key_bytes: public_key_der(SAML_PUBLIC_KEY),
+                certificate_der: None,
+                name: Some("idp-signing".into()),
+            },
+        );
+        let resolver = DefaultKeyResolver::new(config);
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_sources.x509_data = false;
+
+        for sources in [
+            vec![
+                KeyInfoSource::KeyName("idp-signing".into()),
+                KeyInfoSource::X509Data(X509DataInfo::default()),
+            ],
+            vec![
+                KeyInfoSource::X509Data(X509DataInfo::default()),
+                KeyInfoSource::KeyName("idp-signing".into()),
+            ],
+        ] {
+            let error = match resolver.resolve_with_policy(
+                Some(&KeyInfo { sources }),
+                SignatureAlgorithm::EcdsaSha256,
+                &policy,
+            ) {
+                Ok(_) => panic!("source order must not hide disabled X509Data"),
+                Err(error) => error,
+            };
+
+            assert!(matches!(
+                error,
+                DsigError::Policy(crate::policy::PolicyViolation::KeyTrust {
+                    reason: "X509Data key sources are disabled"
+                })
+            ));
+        }
     }
 
     #[test]
