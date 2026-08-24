@@ -922,6 +922,7 @@ mod rustcrypto_x509 {
     use x509_parser::prelude::FromDer as _;
 
     use super::{ProviderError, X509SignatureAlgorithm};
+    use crate::xmldsig::signature::verify_ecdsa_signature_spki_asn1_der;
     use crate::xmldsig::{
         DigestAlgorithm, DsigError, SignatureAlgorithm, VerificationKey, VerifyingKey as _,
     };
@@ -956,7 +957,17 @@ mod rustcrypto_x509 {
                 let Some(algorithm) = ecdsa_algorithm(digest) else {
                     return unsupported(X509SignatureAlgorithm::Ecdsa(digest));
                 };
-                verify_xml_signature(algorithm, signed_data, signature, issuer_spki_der)
+                // RFC 5280 ECDSA certificate signatures are always ASN.1 DER;
+                // XMLDSig's SignatureValue framing policy is irrelevant here.
+                match verify_ecdsa_signature_spki_asn1_der(
+                    algorithm,
+                    issuer_spki_der,
+                    signed_data,
+                    signature,
+                ) {
+                    Ok(verified) => Ok(verified),
+                    Err(_) => Ok(false),
+                }
             }
             X509SignatureAlgorithm::RsaPss {
                 digest,

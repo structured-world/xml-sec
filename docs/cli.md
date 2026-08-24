@@ -100,6 +100,24 @@ option parsing. The first positional argument also ends option parsing. After
 either event, every later argument, including `--`, is positional even when it
 begins with `-`.
 
+### XMLDSig compatibility modes
+
+`sign` and `verify` accept two explicit libxmlsec1 compatibility flags. They
+are recognized but reported as inapplicable for other commands.
+
+- `--enable-asn1-signatures-hack` emits and accepts ECDSA `SignatureValue` as
+  canonical ASN.1 DER. Without it, ECDSA uses the XMLDSig fixed-width `r || s`
+  representation and DER is rejected rather than auto-detected.
+- `--enable-visa3d-hack` resolves a bare fragment by direct registered-ID
+  lookup instead of constructing libxmlsec1's default `xpointer(id('...'))`
+  expression. This matters for registered ID values that cannot be represented
+  safely by that expression. It does not register attributes or weaken
+  duplicate-ID rejection; use `--add-id-attr` or `--id-attr` separately.
+
+The flags compile into the same immutable typed policies used by the library.
+They do not create parser-local exceptions or infer compatibility mode from
+attacker-controlled XML.
+
 ## Examples
 
 Sign an existing XMLDSig template and verify it with an explicit public key:

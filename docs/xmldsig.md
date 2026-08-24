@@ -99,6 +99,17 @@ metadata unavailable through the generic algorithm URI.
 
 ## Verification Policy
 
+ECDSA `SignatureValue` uses the XMLDSig fixed-width `r || s` representation by
+default for both signing and verification. Set
+`SigningPolicy::ecdsa_signature_value_encoding` or
+`VerificationPolicy::ecdsa_signature_value_encoding` to
+`EcdsaSignatureValueEncoding::XmlSecAsn1Der` only at a trusted compatibility
+boundary. DER is never auto-detected. Same-document bare fragments use
+`TransformPolicy::same_document_id_semantics`; the default requires the
+standards form, while `SameDocumentIdSemantics::XmlSecVisa3d` performs direct
+registered-ID lookup for libxmlsec1 Visa3D compatibility. ID registrations
+remain request context and duplicate IDs fail in either mode.
+
 For production verification, configure `KeyResolverConfig::lookup_certs` with untrusted
 certificates that selector-only `X509Data` may address or use as path intermediates, and configure
 `KeyResolverConfig::trusted_certs` only with explicit trust anchors. With chain validation

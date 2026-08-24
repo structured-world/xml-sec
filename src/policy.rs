@@ -627,12 +627,38 @@ pub struct XmlInputPolicy {
 
 /// XMLDSig transform and canonicalization decisions shared by signing and verification.
 #[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SameDocumentIdSemantics {
+    /// Require bare fragment identifiers to satisfy the XML NCName grammar.
+    #[default]
+    Specification,
+    /// Resolve the fragment text directly as an ID, including non-NCName values.
+    ///
+    /// This reproduces libxmlsec1's explicit Visa3D compatibility flag.
+    XmlSecVisa3d,
+}
+
+/// Wire representation used for ECDSA `SignatureValue` bytes.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EcdsaSignatureValueEncoding {
+    /// XMLDSig fixed-width `r || s` representation.
+    #[default]
+    XmlDsig,
+    /// ASN.1 DER `SEQUENCE(INTEGER(r), INTEGER(s))` compatibility representation.
+    XmlSecAsn1Der,
+}
+
+/// XMLDSig transform and canonicalization decisions shared by signing and verification.
+#[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransformPolicy {
     /// Allowed transform and canonicalization URIs; `None` accepts every implemented algorithm.
     pub allowed_algorithms: Option<HashSet<String>>,
     /// Node selected for the XPath `here()` extension function.
     pub xpath_here_semantics: XPathHereSemantics,
+    /// Interpretation of bare same-document ID fragments.
+    pub same_document_id_semantics: SameDocumentIdSemantics,
 }
 
 /// URI-class decisions shared by XMLDSig reference and key retrieval processing.
@@ -808,6 +834,8 @@ pub struct VerificationPolicy {
     pub signature_algorithms: Option<HashSet<SignatureAlgorithm>>,
     /// Allowed reference digest methods; `None` accepts every implemented method.
     pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
+    /// Required ECDSA `SignatureValue` wire representation.
+    pub ecdsa_signature_value_encoding: EcdsaSignatureValueEncoding,
     /// Key and certificate trust rules.
     pub key_trust: KeyTrustPolicy,
     /// KeyInfo source permissions.
@@ -874,6 +902,8 @@ pub struct SigningPolicy {
     pub signature_algorithms: Option<HashSet<SignatureAlgorithm>>,
     /// Allowed reference digest methods; `None` uses the implemented secure defaults.
     pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
+    /// ECDSA `SignatureValue` wire representation emitted by signing.
+    pub ecdsa_signature_value_encoding: EcdsaSignatureValueEncoding,
     /// RSA requirements enforced before producing a signature.
     pub rsa_keys: RsaKeyPolicy,
     /// Reference URI permissions. External URIs remain unsupported until the

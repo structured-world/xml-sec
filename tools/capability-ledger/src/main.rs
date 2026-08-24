@@ -106,10 +106,92 @@ struct AvailabilitySpan {
     conditions: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BehaviorRulesFile {
+    schema_version: u32,
+    evidence: BTreeMap<String, BehaviorEvidence>,
+    behaviors: Vec<BehaviorRule>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BehaviorEvidence {
+    positive: Vec<BehaviorTest>,
+    negative: Vec<BehaviorTest>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BehaviorTest {
+    file: String,
+    test: String,
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BehaviorRule {
+    id: String,
+    category: String,
+    summary: String,
+    classification: BehaviorClassification,
+    control: BehaviorControl,
+    evidence: String,
+    donor_anchors: Vec<DonorAnchorRule>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum BehaviorClassification {
+    Native,
+    CompatibilityPolicy,
+    PlannedCCompatibilityBoundary,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BehaviorControl {
+    boundary: String,
+    setting: String,
+    default: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DonorAnchorRule {
+    source: String,
+    needle: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BehaviorLedger {
+    schema_version: u32,
+    upstream: Upstream,
+    generated_by: String,
+    evidence: BTreeMap<String, BehaviorEvidence>,
+    behaviors: Vec<BehaviorLedgerItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct BehaviorLedgerItem {
+    id: String,
+    category: String,
+    summary: String,
+    classification: BehaviorClassification,
+    control: BehaviorControl,
+    evidence: String,
+    donor_anchors: Vec<DonorAnchor>,
+}
+
+#[derive(Debug, Serialize)]
+struct DonorAnchor {
+    source: String,
+    line: usize,
+    needle: String,
+}
+
 fn main() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or_else(usage)?;
-    if command != "generate" && command != "check" {
+    if !matches!(
+        command.as_str(),
+        "generate" | "check" | "behavior-generate" | "behavior-check"
+    ) {
         return Err(usage());
     }
     let donor = PathBuf::from(args.next().ok_or_else(usage)?);
@@ -122,6 +204,14 @@ fn main() -> Result<(), String> {
     verify_donor(&donor)?;
     let donor_snapshot = snapshot_donor(&donor, EXPECTED_COMMIT.trim())?;
     verify_donor_version(donor_snapshot.path())?;
+    if command.starts_with("behavior-") {
+        return generate_behavior_ledger(
+            command == "behavior-check",
+            donor_snapshot.path(),
+            &rules_path,
+            &output,
+        );
+    }
     let rules: RulesFile = serde_json::from_slice(
         &fs::read(&rules_path)
             .map_err(|error| format!("read {}: {error}", rules_path.display()))?,
@@ -157,7 +247,180 @@ fn main() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: xml-sec-capability-ledger <generate|check> <donor> <rules.json> <ledger.json>".into()
+    "usage: xml-sec-capability-ledger <generate|check|behavior-generate|behavior-check> <donor> <rules.json> <ledger.json>".into()
+}
+
+fn generate_behavior_ledger(
+    check: bool,
+    donor: &Path,
+    rules_path: &Path,
+    output: &Path,
+) -> Result<(), String> {
+    let rules: BehaviorRulesFile = serde_json::from_slice(
+        &fs::read(rules_path).map_err(|error| format!("read {}: {error}", rules_path.display()))?,
+    )
+    .map_err(|error| format!("parse {}: {error}", rules_path.display()))?;
+    if rules.schema_version != 1 {
+        return Err(format!(
+            "unsupported behavior rules schema {}",
+            rules.schema_version
+        ));
+    }
+    validate_behavior_categories(&rules.behaviors)?;
+    validate_behavior_evidence(&rules.evidence)?;
+
+    let mut ids = BTreeSet::new();
+    let mut behaviors = Vec::with_capacity(rules.behaviors.len());
+    for rule in rules.behaviors {
+        if !ids.insert(rule.id.clone()) {
+            return Err(format!("duplicate behavior id {}", rule.id));
+        }
+        if !rules.evidence.contains_key(&rule.evidence) {
+            return Err(format!(
+                "behavior {} references missing evidence {}",
+                rule.id, rule.evidence
+            ));
+        }
+        if rule.control.boundary.trim().is_empty()
+            || rule.control.setting.trim().is_empty()
+            || rule.control.default.trim().is_empty()
+        {
+            return Err(format!(
+                "behavior {} has an incomplete control boundary",
+                rule.id
+            ));
+        }
+        if rule.donor_anchors.is_empty() {
+            return Err(format!("behavior {} has no donor anchors", rule.id));
+        }
+        let donor_anchors = rule
+            .donor_anchors
+            .into_iter()
+            .map(|anchor| resolve_donor_anchor(donor, anchor))
+            .collect::<Result<Vec<_>, _>>()?;
+        behaviors.push(BehaviorLedgerItem {
+            id: rule.id,
+            category: rule.category,
+            summary: rule.summary,
+            classification: rule.classification,
+            control: rule.control,
+            evidence: rule.evidence,
+            donor_anchors,
+        });
+    }
+    behaviors.sort_by(|left, right| left.id.cmp(&right.id));
+    let ledger = BehaviorLedger {
+        schema_version: 1,
+        upstream: Upstream {
+            project: "libxmlsec1".into(),
+            version: EXPECTED_VERSION.into(),
+            commit: EXPECTED_COMMIT.trim().into(),
+            repository: "https://github.com/lsh123/xmlsec".into(),
+        },
+        generated_by: "xml-sec-capability-ledger behavior-generate".into(),
+        evidence: rules.evidence,
+        behaviors,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&ledger).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    if check {
+        let existing = fs::read(output)
+            .map_err(|error| format!("read generated ledger {}: {error}", output.display()))?;
+        if existing != bytes {
+            return Err(format!(
+                "{} is stale; regenerate it with behavior-generate",
+                output.display()
+            ));
+        }
+    } else {
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        }
+        fs::write(output, bytes).map_err(|error| format!("write {}: {error}", output.display()))?;
+    }
+    Ok(())
+}
+
+fn validate_behavior_categories(behaviors: &[BehaviorRule]) -> Result<(), String> {
+    let actual = behaviors
+        .iter()
+        .map(|behavior| behavior.category.as_str())
+        .collect::<BTreeSet<_>>();
+    let required = [
+        "callback-ordering",
+        "context-after-failure",
+        "dom-mutation",
+        "dtd-xml-id-caller-id",
+        "empty-uri-xpointer",
+        "error-invalid-classification",
+        "here-semantics",
+        "implicit-c14n-adapters",
+        "manifest-status",
+        "multiple-signatures",
+        "signature-value-encoding",
+        "visa3d-ids",
+    ];
+    for category in required {
+        if !actual.contains(category) {
+            return Err(format!("behavior ledger is missing category {category}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_behavior_evidence(evidence: &BTreeMap<String, BehaviorEvidence>) -> Result<(), String> {
+    for (id, evidence) in evidence {
+        if evidence.positive.is_empty() || evidence.negative.is_empty() {
+            return Err(format!(
+                "evidence {id} must have positive and negative tests"
+            ));
+        }
+        for test in evidence.positive.iter().chain(&evidence.negative) {
+            let path = Path::new(&test.file);
+            if path.is_absolute() || test.file.contains("..") {
+                return Err(format!("evidence {id} has unsafe test path {}", test.file));
+            }
+            let source = fs::read_to_string(path)
+                .map_err(|error| format!("read evidence test {}: {error}", path.display()))?;
+            let declaration = format!("fn {}", test.test);
+            if !source.contains(&declaration) {
+                return Err(format!(
+                    "evidence {id} test {} is absent from {}",
+                    test.test, test.file
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_donor_anchor(donor: &Path, anchor: DonorAnchorRule) -> Result<DonorAnchor, String> {
+    let source_path = Path::new(&anchor.source);
+    if source_path.is_absolute() || anchor.source.contains("..") {
+        return Err(format!("unsafe donor source {}", anchor.source));
+    }
+    let source = fs::read_to_string(donor.join(source_path))
+        .map_err(|error| format!("read donor source {}: {error}", anchor.source))?;
+    let matches = source.match_indices(&anchor.needle).collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(format!(
+            "donor anchor {:?} in {} matched {} times; expected exactly one",
+            anchor.needle,
+            anchor.source,
+            matches.len()
+        ));
+    }
+    let line = source[..matches[0].0]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    Ok(DonorAnchor {
+        source: anchor.source,
+        line,
+        needle: anchor.needle,
+    })
 }
 
 fn verify_donor(donor: &Path) -> Result<(), String> {

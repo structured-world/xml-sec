@@ -86,6 +86,17 @@ pub trait VerifyingKey {
         ))
     }
 
+    /// Validate wire framing under the operation's immutable compatibility policy.
+    fn validate_signature_value_with_policy(
+        &self,
+        policy: &crate::policy::VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        let _ = policy;
+        self.validate_signature_value(algorithm, signature_value)
+    }
+
     /// Verify `signature_value` over `signed_data` with the declared algorithm.
     fn verify(
         &self,
@@ -93,6 +104,18 @@ pub trait VerifyingKey {
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError>;
+
+    /// Verify after applying operation-scoped compatibility semantics.
+    fn verify_with_policy(
+        &self,
+        policy: &crate::policy::VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        let _ = policy;
+        self.verify(algorithm, signed_data, signature_value)
+    }
 }
 
 /// Key resolver hook used by [`VerifyContext`] when no pre-set key is provided.
@@ -1096,6 +1119,7 @@ fn verify_signature_with_context(
         },
     )?;
     let resolver = UriReferenceResolver::with_id_registrations(&doc, ctx.id_attributes)
+        .with_same_document_id_semantics(ctx.policy.transforms.same_document_id_semantics)
         .with_external_resource_limits(
             ctx.policy.resources.max_external_resource_bytes,
             ctx.policy.resources.max_external_resource_total_bytes,
@@ -1342,7 +1366,11 @@ fn verify_signature_with_context(
     };
     let verifier = resolved_key.as_ref();
     verifier.validate_policy(&ctx.policy)?;
-    if !verifier.validate_signature_value(signed_info.signature_method, &signature_value)? {
+    if !verifier.validate_signature_value_with_policy(
+        &ctx.policy,
+        signed_info.signature_method,
+        &signature_value,
+    )? {
         return Ok(VerifyResult {
             status: DsigStatus::Invalid(FailureReason::SignatureMismatch),
             signed_info_references: references.results,
@@ -1358,8 +1386,12 @@ fn verify_signature_with_context(
         .require_capability(crate::provider::ProviderCapability::Verify(
             signed_info.signature_method,
         ))?;
+    let policy_verifier = PolicyVerifyingKey {
+        key: verifier,
+        policy: &ctx.policy,
+    };
     let signature_valid = ctx.provider.verify(
-        verifier,
+        &policy_verifier,
         signed_info.signature_method,
         &canonical_signed_info,
         &signature_value,
@@ -1414,6 +1446,36 @@ fn verify_signature_with_context(
             None
         },
     })
+}
+
+struct PolicyVerifyingKey<'a> {
+    key: &'a dyn VerifyingKey,
+    policy: &'a crate::policy::VerificationPolicy,
+}
+
+impl VerifyingKey for PolicyVerifyingKey<'_> {
+    fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
+        self.key.validate_policy(policy)
+    }
+
+    fn validate_signature_value(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.key
+            .validate_signature_value_with_policy(self.policy, algorithm, signature_value)
+    }
+
+    fn verify(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.key
+            .verify_with_policy(self.policy, algorithm, signed_data, signature_value)
+    }
 }
 
 #[derive(Debug, Default)]

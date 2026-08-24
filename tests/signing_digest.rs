@@ -4,8 +4,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+use base64::Engine as _;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
-use xml_sec::policy::{ManifestProcessing, SigningPolicy};
+use xml_sec::policy::{
+    EcdsaSignatureValueEncoding, ManifestProcessing, SigningPolicy, VerificationPolicy,
+};
 use xml_sec::xmldsig::mutation::append_signature_to_root;
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::uri::UriReferenceResolver;
@@ -2400,6 +2403,83 @@ fn signs_ecdsa_p256_template_and_verifies_round_trip() {
     assert_eq!(verify_result.status, DsigStatus::Valid);
     assert!(signed.contains("<SignatureValue>"));
     assert!(!signed.contains("<DigestValue></DigestValue>"));
+}
+
+#[test]
+fn ecdsa_asn1_compatibility_is_explicit_across_the_signing_pipeline() {
+    // libxmlsec1's ASN.1 mode is a compatibility wire format, not an
+    // auto-detected alternative. Both producer and consumer must select it.
+    let private_key = EcdsaP256SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime256v1-key.pem",
+    ))
+    .expect("P-256 private key fixture must parse");
+    let verification_key = match private_key.public_key_info().expect("public key info") {
+        SigningPublicKeyInfo::Ec { spki_der, .. } => VerificationKey {
+            algorithm: SignatureAlgorithm::EcdsaSha256,
+            public_key_bytes: spki_der,
+            certificate_der: None,
+            name: None,
+        },
+        _ => panic!("P-256 key must expose EC public-key info"),
+    };
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::EcdsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    let signing_policy = SigningPolicy {
+        ecdsa_signature_value_encoding: EcdsaSignatureValueEncoding::XmlSecAsn1Der,
+        ..SigningPolicy::default()
+    };
+
+    let signed = SignContext::new(&private_key)
+        .policy(signing_policy)
+        .sign_with_builder(
+            "<root><payload ID=\"payload\">hello</payload></root>",
+            &builder,
+        )
+        .expect("explicit ASN.1 signing must succeed");
+    let document = roxmltree::Document::parse(&signed).expect("signed XML must parse");
+    let encoded = document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue")))
+        .and_then(|node| node.text())
+        .expect("SignatureValue must have text")
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("SignatureValue must be base64");
+    assert_eq!(
+        signature.first(),
+        Some(&0x30),
+        "DER must start with SEQUENCE"
+    );
+    assert_ne!(signature.len(), 64, "DER must not be fixed-width r||s");
+
+    let default_error = VerifyContext::new()
+        .key(&verification_key)
+        .verify(&signed)
+        .expect_err("standards-default verification must reject DER framing");
+    assert!(
+        default_error
+            .to_string()
+            .contains("invalid ECDSA signature encoding"),
+        "unexpected default-mode error: {default_error}"
+    );
+
+    let verification_policy = VerificationPolicy {
+        ecdsa_signature_value_encoding: EcdsaSignatureValueEncoding::XmlSecAsn1Der,
+        ..VerificationPolicy::default()
+    };
+    let result = VerifyContext::new()
+        .key(&verification_key)
+        .policy(verification_policy)
+        .verify(&signed)
+        .expect("explicit ASN.1 verification must run");
+    assert_eq!(result.status, DsigStatus::Valid);
 }
 
 #[test]

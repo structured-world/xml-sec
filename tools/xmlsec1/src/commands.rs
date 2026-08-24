@@ -17,8 +17,9 @@ use x509_parser::prelude::FromDer as _;
 use xml_sec::{
     IdAttributeRegistration,
     policy::{
-        DecryptionPolicy, EncryptionPolicy, ManifestProcessing, ResourcePolicy, SigningPolicy,
-        TransformPolicy, UriPolicy, VerificationPolicy, XmlInputPolicy,
+        DecryptionPolicy, EcdsaSignatureValueEncoding, EncryptionPolicy, ManifestProcessing,
+        ResourcePolicy, SameDocumentIdSemantics, SigningPolicy, TransformPolicy, UriPolicy,
+        VerificationPolicy, XmlInputPolicy,
     },
     provider::{CryptoProvider, default_provider},
     xmldsig::{
@@ -70,6 +71,8 @@ const SIGN_OPTIONS: &[&str] = &[
     "node-xpath",
     "id-attr",
     "add-id-attr",
+    "enable-visa3d-hack",
+    "enable-asn1-signatures-hack",
 ];
 const VERIFY_OPTIONS: &[&str] = &[
     "print-debug",
@@ -98,6 +101,8 @@ const VERIFY_OPTIONS: &[&str] = &[
     "id-attr",
     "add-id-attr",
     "url-map",
+    "enable-visa3d-hack",
+    "enable-asn1-signatures-hack",
 ];
 const ENCRYPT_OPTIONS: &[&str] = &[
     "print-debug",
@@ -666,8 +671,10 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         },
         transforms: TransformPolicy {
             xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
+            same_document_id_semantics: same_document_id_semantics(invocation),
             ..TransformPolicy::default()
         },
+        ecdsa_signature_value_encoding: ecdsa_signature_value_encoding(invocation),
         ..SigningPolicy::default()
     };
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
@@ -980,8 +987,10 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         },
         transforms: TransformPolicy {
             xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
+            same_document_id_semantics: same_document_id_semantics(invocation),
             ..TransformPolicy::default()
         },
+        ecdsa_signature_value_encoding: ecdsa_signature_value_encoding(invocation),
         ..VerificationPolicy::default()
     };
     policy.key_trust.allowed_legacy_signature_algorithms = HashSet::from([
@@ -1005,6 +1014,22 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
     // flag here documents that the compatibility no-op is deliberate.
     let _skip_backend_strict_checks = invocation.flag("X509-skip-strict-checks");
     policy
+}
+
+fn same_document_id_semantics(invocation: &Invocation) -> SameDocumentIdSemantics {
+    if invocation.flag("enable-visa3d-hack") {
+        SameDocumentIdSemantics::XmlSecVisa3d
+    } else {
+        SameDocumentIdSemantics::Specification
+    }
+}
+
+fn ecdsa_signature_value_encoding(invocation: &Invocation) -> EcdsaSignatureValueEncoding {
+    if invocation.flag("enable-asn1-signatures-hack") {
+        EcdsaSignatureValueEncoding::XmlSecAsn1Der
+    } else {
+        EcdsaSignatureValueEncoding::XmlDsig
+    }
 }
 
 fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
@@ -1506,6 +1531,32 @@ impl VerifyingKey for CandidateVerifyingKey<'_> {
         }
     }
 
+    fn validate_signature_value_with_policy(
+        &self,
+        policy: &VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        let mut saw_mismatch = false;
+        let mut last_error = None;
+        for candidate in &self.candidates {
+            match candidate.validate_signature_value_with_policy(policy, algorithm, signature_value)
+            {
+                Ok(true) => return Ok(true),
+                Ok(false) => saw_mismatch = true,
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if saw_mismatch {
+            Ok(false)
+        } else {
+            match last_error {
+                Some(error) => Err(error),
+                None => Ok(false),
+            }
+        }
+    }
+
     fn verify(
         &self,
         algorithm: SignatureAlgorithm,
@@ -1516,6 +1567,32 @@ impl VerifyingKey for CandidateVerifyingKey<'_> {
         let mut last_error = None;
         for candidate in &self.candidates {
             match candidate.verify(algorithm, signed_data, signature_value) {
+                Ok(true) => return Ok(true),
+                Ok(false) => saw_mismatch = true,
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if saw_mismatch {
+            Ok(false)
+        } else {
+            match last_error {
+                Some(error) => Err(error),
+                None => Ok(false),
+            }
+        }
+    }
+
+    fn verify_with_policy(
+        &self,
+        policy: &VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        let mut saw_mismatch = false;
+        let mut last_error = None;
+        for candidate in &self.candidates {
+            match candidate.verify_with_policy(policy, algorithm, signed_data, signature_value) {
                 Ok(true) => return Ok(true),
                 Ok(false) => saw_mismatch = true,
                 Err(error) => last_error = Some(error),

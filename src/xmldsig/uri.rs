@@ -20,7 +20,8 @@ use roxmltree::{Document, Node, NodeId};
 use crate::c14n::xml_base::{
     XmlBaseResolutionBudget, XmlBaseResolutionError, resolve_uri_from_node_with_budget,
 };
-use crate::xml::XmlIdIndex;
+use crate::policy::SameDocumentIdSemantics;
+use crate::xml::{XmlIdIndex, is_xml_ncname};
 
 use super::types::{
     NodeSet, NodeSetMaterializationBudget, TransformData, TransformError, transform_resource_limit,
@@ -122,6 +123,7 @@ pub struct UriReferenceResolver<'a> {
     id_index: XmlIdIndex<'a>,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
     external_resource_budget: ExternalResourceBudget,
+    same_document_id_semantics: SameDocumentIdSemantics,
 }
 
 impl<'a> UriReferenceResolver<'a> {
@@ -146,6 +148,7 @@ impl<'a> UriReferenceResolver<'a> {
             id_index: XmlIdIndex::with_extra_attrs(doc, extra_attrs),
             external_resources: None,
             external_resource_budget: ExternalResourceBudget::default(),
+            same_document_id_semantics: SameDocumentIdSemantics::Specification,
         }
     }
 
@@ -159,7 +162,16 @@ impl<'a> UriReferenceResolver<'a> {
             id_index: XmlIdIndex::with_registrations(doc, registrations),
             external_resources: None,
             external_resource_budget: ExternalResourceBudget::default(),
+            same_document_id_semantics: SameDocumentIdSemantics::Specification,
         }
+    }
+
+    pub(crate) fn with_same_document_id_semantics(
+        mut self,
+        semantics: SameDocumentIdSemantics,
+    ) -> Self {
+        self.same_document_id_semantics = semantics;
+        self
     }
 
     /// Attach an explicit caller-owned external-resource map.
@@ -302,6 +314,11 @@ impl<'a> UriReferenceResolver<'a> {
             Err(TransformError::UnsupportedUri(format!("#{fragment}")))
         } else {
             // Bare-name fragment: #foo → element by ID
+            if self.same_document_id_semantics == SameDocumentIdSemantics::Specification
+                && !is_xml_ncname(fragment)
+            {
+                return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
+            }
             self.resolve_id(fragment, budget, false)
         }
     }
@@ -1044,6 +1061,33 @@ mod tests {
             result.unwrap_err(),
             TransformError::UnsupportedUri(_)
         ));
+    }
+
+    #[test]
+    fn bare_fragment_rejects_non_ncname_without_visa3d_compatibility() {
+        // XMLDSig bare-name fragments use an XML Name. Numeric identifiers are
+        // accepted by libxmlsec1 only through its explicit Visa3D compatibility
+        // mode and must not leak into the standards-default resolver.
+        let xml = r#"<root><item ID="12345">content</item></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let resolver = UriReferenceResolver::new(&doc);
+
+        assert!(matches!(
+            resolver.dereference("#12345"),
+            Err(TransformError::UnsupportedUri(uri)) if uri == "#12345"
+        ));
+    }
+
+    #[test]
+    fn visa3d_compatibility_resolves_non_ncname_id_directly() {
+        // The compatibility mode is deliberately narrow: it changes only the
+        // bare-fragment lookup grammar and retains duplicate-safe ID indexing.
+        let xml = r#"<root><item ID="12345">content</item></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        let resolver = UriReferenceResolver::new(&doc)
+            .with_same_document_id_semantics(SameDocumentIdSemantics::XmlSecVisa3d);
+
+        assert!(resolver.dereference("#12345").is_ok());
     }
 
     #[test]

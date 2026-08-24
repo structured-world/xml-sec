@@ -11,9 +11,11 @@ use p384::ecdsa::signature::Signer;
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey};
 use p384::pkcs8::DecodePrivateKey;
 use xml_sec::c14n::canonicalize;
+use xml_sec::policy::EcdsaSignatureValueEncoding;
 use xml_sec::xmldsig::parse::{SignatureAlgorithm, find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::{
-    SignatureVerificationError, verify_ecdsa_signature_pem, verify_ecdsa_signature_spki,
+    SignatureVerificationError, verify_ecdsa_signature_pem,
+    verify_ecdsa_signature_pem_with_encoding, verify_ecdsa_signature_spki,
 };
 
 fn read_fixture(path: &Path) -> String {
@@ -126,7 +128,7 @@ fn local_p384_signature_matches() {
 }
 
 #[test]
-fn local_p384_der_signature_matches() {
+fn local_p384_der_signature_requires_explicit_compatibility() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha384-ecdsa-sha384.xml",
     ));
@@ -149,15 +151,28 @@ fn local_p384_der_signature_matches() {
     let signature: P384Signature = signing_key.sign(&canonical_signed_info);
     let signature_der = signature.to_der();
 
-    let valid = verify_ecdsa_signature_pem(
+    let error = verify_ecdsa_signature_pem(
         SignatureAlgorithm::EcdsaSha384,
         &public_key_pem,
         &canonical_signed_info,
         signature_der.as_bytes(),
     )
-    .expect("P-384 DER verification should not error on valid fixtures");
+    .expect_err("standards-default verification must reject ASN.1 ECDSA framing");
 
-    assert!(valid, "locally signed DER P-384 signature should verify");
+    assert!(matches!(
+        error,
+        SignatureVerificationError::InvalidSignatureFormat
+    ));
+
+    let valid = verify_ecdsa_signature_pem_with_encoding(
+        SignatureAlgorithm::EcdsaSha384,
+        &public_key_pem,
+        &canonical_signed_info,
+        signature_der.as_bytes(),
+        EcdsaSignatureValueEncoding::XmlSecAsn1Der,
+    )
+    .expect("explicit ASN.1 compatibility must parse valid DER");
+    assert!(valid, "explicit ASN.1 compatibility must verify valid DER");
 }
 
 #[test]

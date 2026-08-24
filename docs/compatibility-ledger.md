@@ -18,6 +18,22 @@ pin:
   syntax, topic availability, value types, and flags), and exit statuses;
 - top-level upstream conformance and interoperability test families.
 
+The companion behavioral ledger at
+[`compatibility/libxmlsec1-1.3.13-behavior.json`](../compatibility/libxmlsec1-1.3.13-behavior.json)
+tracks operation semantics that a declaration inventory cannot express: XPath
+`here()` bindings, direct Visa3D ID lookup, ASN.1 ECDSA framing, implicit
+adapters, URI identity, ID registration, signature selection, Manifest status,
+error classification, callback order, mutable context state, and DOM mutation.
+Every entry identifies its typed policy, request, CLI, or future C-boundary
+control and references both positive and negative tests. Donor source anchors
+are resolved to exact lines during generation. Ambiguous or missing anchors,
+missing categories, incomplete controls, and stale test names fail generation.
+Context, callback, and in-place libxml2 mutation behavior is deliberately
+classified as future C compatibility work rather than being attributed to the
+owned native Rust API. A test-only C probe is compiled through the pinned
+`xmlsec1-config` and measures success, invalid-result, callback-abort, and
+signing-mutation state; libxmlsec1 remains absent from the product runtime.
+
 The ledger is an honest parity map, not a blanket compatibility claim. Every
 item references one entry in the top-level `classifications` table, which owns
 the outcome, rationale, and evidence reference without repeating that metadata
@@ -78,10 +94,24 @@ cargo run -p xml-sec-capability-ledger -- check \
   compatibility/libxmlsec1-1.3.13.json
 ```
 
-Both commands reject any donor version or commit other than the pinned
-baseline. They also reject tracked, untracked, or ignored donor worktree files,
-because extraction must describe the recorded Git object rather than local
-configure output or edits. CI performs the same check from a clean upstream
-checkout. Updating the donor requires reviewing the extracted diff, changing
-classification rules where capabilities changed, and updating category-count
-regression tests.
+Generate and check the behavioral artifact with the same donor checkout:
+
+```sh
+cargo run -p xml-sec-capability-ledger -- behavior-generate \
+  donors/xmlsec \
+  compatibility/libxmlsec1-1.3.13-behavior-rules.json \
+  compatibility/libxmlsec1-1.3.13-behavior.json
+
+cargo run -p xml-sec-capability-ledger -- behavior-check \
+  donors/xmlsec \
+  compatibility/libxmlsec1-1.3.13-behavior-rules.json \
+  compatibility/libxmlsec1-1.3.13-behavior.json
+```
+
+All four commands reject any donor version or commit other than the pinned
+baseline. Extraction reads a detached snapshot of the recorded Git object, so
+tracked edits and build-generated files in the donor checkout cannot affect the
+artifact or be overwritten by generation. CI performs the same check from a
+clean upstream checkout. Updating the donor requires reviewing the extracted
+diff, changing classification rules where capabilities changed, and updating
+category-count regression tests.
