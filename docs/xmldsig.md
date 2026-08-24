@@ -108,10 +108,11 @@ default for both signing and verification. Set
 `EcdsaSignatureValueEncoding::XmlSecAsn1Der` only at a trusted compatibility
 boundary. DER is never auto-detected. Same-document bare fragments use
 `TransformPolicy::same_document_id_semantics`; the library default requires the
-standards form. `SameDocumentIdSemantics::XmlSecXPointer` models libxmlsec1's
-default single-quoted `xpointer(id(...))` wrapper, while
+standards form. `SameDocumentIdSemantics::XmlSecBarename` models libxmlsec1's
+default barename grammar backed by its single-quoted `xpointer(id(...))` wrapper,
+while preserving the barename rule that excludes comments. In contrast,
 `SameDocumentIdSemantics::XmlSecVisa3d` performs direct registered-ID lookup.
-The native CLI selects the XPointer mode by default and the direct mode for
+The native CLI selects the donor barename mode by default and the direct mode for
 `--enable-visa3d-hack`. ID registrations remain request context and duplicate
 IDs fail in every mode.
 

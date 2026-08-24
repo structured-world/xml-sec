@@ -47,7 +47,7 @@ use super::transforms::{
     transform_chain_produces_binary,
 };
 use super::types::{NodeSet, TransformError};
-use super::uri::{UriReferenceResolver, same_document_reference_id};
+use super::uri::UriReferenceResolver;
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
@@ -1620,16 +1620,12 @@ fn materialize_retrieval_methods_with_budgets(
                 }
                 .into());
             }
-            let id = same_document_reference_id(&resolved_uri).ok_or(
-                SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "X509Data RetrievalMethod requires a same-document URI",
-                },
-            )?;
-            let target = resolver.node_for_id(id).ok_or(
-                SignatureVerificationPipelineError::InvalidStructure {
+            let target = resolver
+                .node_for_same_document_reference(&resolved_uri)
+                .map_err(ReferenceProcessingError::Transform)?
+                .ok_or(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "X509Data RetrievalMethod target is missing or ambiguous",
-                },
-            )?;
+                })?;
             let node = match transforms {
                 RetrievalMethodTransforms::None
                     if target.has_tag_name((XMLDSIG_NS, "X509Data")) =>
@@ -1885,11 +1881,10 @@ fn process_manifest_references(
                     .transforms
                     .iter()
                     .all(transform_preserves_manifest_structure)
-                && let Some(target_id) = reference
-                    .uri
-                    .as_deref()
-                    .and_then(same_document_reference_id)
-                    .and_then(|id| resolver.node_id_for_id(id))
+                && let Ok(Some(target_id)) = reference.uri.as_deref().map_or_else(
+                    || Ok(None),
+                    |uri| resolver.node_id_for_same_document_reference(uri),
+                )
             {
                 // A valid Manifest digest extends trust only to the exact
                 // same-document structure preserved by its transform chain.
@@ -2045,8 +2040,12 @@ fn collect_authenticated_signed_info_reference_nodes(
                 .all(transform_preserves_manifest_structure)
         })
         .filter_map(|reference| reference.uri.as_deref())
-        .filter_map(same_document_reference_id)
-        .filter_map(|id| resolver.node_id_for_id(id))
+        .filter_map(|uri| {
+            resolver
+                .node_id_for_same_document_reference(uri)
+                .ok()
+                .flatten()
+        })
         .collect()
 }
 
@@ -4645,6 +4644,68 @@ mod tests {
             [super::super::parse::KeyInfoSource::X509Data(info)]
                 if info.subject_names == ["CN=leaf"]
         ));
+    }
+
+    #[test]
+    fn retrieval_method_respects_configured_same_document_id_semantics() {
+        // RetrievalMethod is another consumer of same-document URIs and must
+        // not bypass the grammar selected for normal Reference dereferencing.
+        fn materialize(
+            uri: &str,
+            id: &str,
+            semantics: crate::policy::SameDocumentIdSemantics,
+        ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
+            let xml = format!(
+                r#"<root xmlns:ds="{XMLDSIG_NS}">
+                  <ds:KeyInfo><ds:RetrievalMethod URI="{uri}" Type="{XMLDSIG_NS}X509Data"/></ds:KeyInfo>
+                  <ds:X509Data Id="{id}"><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data>
+                </root>"#
+            );
+            let document = Document::parse(&xml).unwrap();
+            let key_info_node = document
+                .descendants()
+                .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+                .unwrap();
+            let mut key_info = parse_key_info(key_info_node).unwrap();
+            let resolver =
+                UriReferenceResolver::new(&document).with_same_document_id_semantics(semantics);
+
+            materialize_retrieval_methods(
+                &mut key_info,
+                &resolver,
+                UriTypeSet::SAME_DOCUMENT,
+                None,
+                crate::provider::default_provider(),
+            )
+        }
+
+        assert!(
+            materialize(
+                "#12345",
+                "12345",
+                crate::policy::SameDocumentIdSemantics::Specification,
+            )
+            .is_err(),
+            "the standards mode must reject a non-NCName bare fragment"
+        );
+        assert!(
+            materialize(
+                "#visa'3d",
+                "visa'3d",
+                crate::policy::SameDocumentIdSemantics::XmlSecBarename,
+            )
+            .is_err(),
+            "the donor barename wrapper cannot represent an apostrophe"
+        );
+        assert!(
+            materialize(
+                "#visa'3d",
+                "visa'3d",
+                crate::policy::SameDocumentIdSemantics::XmlSecVisa3d,
+            )
+            .is_ok(),
+            "Visa3D mode resolves the registered ID without an XPointer literal"
+        );
     }
 
     #[test]

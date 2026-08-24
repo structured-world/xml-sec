@@ -217,7 +217,7 @@
       "control": {
         "boundary": "typed operation policy and native CLI flag",
         "setting": "TransformPolicy.same_document_id_semantics / --enable-visa3d-hack",
-        "default": "library API uses XMLDSig grammar; native CLI uses libxmlsec1 XPointer-compatible fragments"
+        "default": "library API uses XMLDSig grammar; native CLI uses libxmlsec1 wrapped-barename grammar with comments excluded"
       },
       "evidence": "visa3d-ids",
       "donor_anchors": [

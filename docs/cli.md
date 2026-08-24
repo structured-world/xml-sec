@@ -112,8 +112,10 @@ are recognized but reported as inapplicable for other commands.
   lookup instead of constructing libxmlsec1's default `xpointer(id('...'))`
   expression. The default expression accepts registered non-NCName values such
   as numeric IDs, but not values containing a single quote; the compatibility
-  flag handles those through direct lookup. It does not register attributes or weaken
-  duplicate-ID rejection; use `--add-id-attr` or `--id-attr` separately.
+  flag handles those through direct lookup. Both paths retain barename node-set
+  semantics and exclude comments; only an explicit `xpointer(id(...))` URI
+  retains them. The flag does not register attributes or weaken duplicate-ID
+  rejection; use `--add-id-attr` or `--id-attr` separately.
 
 The flags compile into the same immutable typed policies used by the library.
 They do not create parser-local exceptions or infer compatibility mode from

@@ -632,11 +632,12 @@ pub enum SameDocumentIdSemantics {
     /// Require bare fragment identifiers to satisfy the XML NCName grammar.
     #[default]
     Specification,
-    /// Apply libxmlsec1's default `xpointer(id('...'))` compatibility grammar.
+    /// Apply libxmlsec1's default barename compatibility grammar.
     ///
     /// Registered non-NCName values are accepted unless a single quote makes
     /// them unrepresentable in the donor's single-quoted XPointer expression.
-    XmlSecXPointer,
+    /// The resulting node set retains barename semantics and excludes comments.
+    XmlSecBarename,
     /// Resolve the fragment text directly as an ID, including non-NCName values.
     ///
     /// This reproduces libxmlsec1's explicit Visa3D compatibility flag.

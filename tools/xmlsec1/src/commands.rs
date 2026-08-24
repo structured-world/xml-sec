@@ -1020,7 +1020,7 @@ fn same_document_id_semantics(invocation: &Invocation) -> SameDocumentIdSemantic
     if invocation.flag("enable-visa3d-hack") {
         SameDocumentIdSemantics::XmlSecVisa3d
     } else {
-        SameDocumentIdSemantics::XmlSecXPointer
+        SameDocumentIdSemantics::XmlSecBarename
     }
 }
 

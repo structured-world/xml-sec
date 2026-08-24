@@ -302,31 +302,39 @@ impl<'a> UriReferenceResolver<'a> {
                 None => NodeSet::entire_document_with_comments(self.doc)?,
             };
             Ok(TransformData::NodeSet(nodes))
-        } else if let Some(id) = parse_xpointer_id_fragment(fragment) {
-            // XPointer dereference retains comments, unlike a bare-name fragment.
-            // Reject empty parsed ID (e.g., xpointer(id(''))) — not a valid XML Name
+        } else {
+            let (id, with_comments) = self.same_document_id_fragment(fragment)?;
+            self.resolve_id(id, budget, with_comments)
+        }
+    }
+
+    fn same_document_id_fragment<'uri>(
+        &self,
+        fragment: &'uri str,
+    ) -> Result<(&'uri str, bool), TransformError> {
+        if let Some(id) = parse_xpointer_id_fragment(fragment) {
+            // Explicit XPointer dereference retains comments, unlike every
+            // barename mode, including libxmlsec1's internal wrapper.
             if id.is_empty() {
                 return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
             }
-            self.resolve_id(id, budget, true)
-        } else if fragment.starts_with("xpointer(") {
-            // Any other XPointer expression is unsupported
-            Err(TransformError::UnsupportedUri(format!("#{fragment}")))
-        } else {
-            // Bare-name fragment: #foo → element by ID
-            match self.same_document_id_semantics {
-                SameDocumentIdSemantics::Specification if !is_xml_ncname(fragment) => {
-                    return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
-                }
-                SameDocumentIdSemantics::XmlSecXPointer if fragment.contains('\'') => {
-                    return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
-                }
-                SameDocumentIdSemantics::Specification
-                | SameDocumentIdSemantics::XmlSecXPointer
-                | SameDocumentIdSemantics::XmlSecVisa3d => {}
-            }
-            self.resolve_id(fragment, budget, false)
+            return Ok((id, true));
         }
+        if fragment.starts_with("xpointer(") {
+            return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
+        }
+        match self.same_document_id_semantics {
+            SameDocumentIdSemantics::Specification if !is_xml_ncname(fragment) => {
+                return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
+            }
+            SameDocumentIdSemantics::XmlSecBarename if fragment.contains('\'') => {
+                return Err(TransformError::UnsupportedUri(format!("#{fragment}")));
+            }
+            SameDocumentIdSemantics::Specification
+            | SameDocumentIdSemantics::XmlSecBarename
+            | SameDocumentIdSemantics::XmlSecVisa3d => {}
+        }
+        Ok((fragment, false))
     }
 
     /// Look up an element by its ID attribute value and return a subtree node set.
@@ -357,20 +365,38 @@ impl<'a> UriReferenceResolver<'a> {
         self.id_index.contains(id)
     }
 
-    /// Resolve a same-document ID token to a stable node identity.
-    ///
-    /// Returns `None` when the ID is absent or ambiguous (duplicate ID collision),
-    /// matching the resolver behavior used by `dereference()`.
-    pub(crate) fn node_id_for_id(&self, id: &str) -> Option<NodeId> {
-        self.id_index.node_id(id)
-    }
-
     /// Resolve an unambiguous XML ID to its element node.
     ///
     /// Returns `None` when the ID is absent or duplicated, matching fragment
     /// dereferencing and operation start-node selection.
     pub fn node_for_id(&self, id: &str) -> Option<Node<'a, 'a>> {
         self.id_index.node(id)
+    }
+
+    /// Resolve a same-document URI to an element under the configured grammar.
+    pub(crate) fn node_for_same_document_reference(
+        &self,
+        uri: &str,
+    ) -> Result<Option<Node<'a, 'a>>, TransformError> {
+        Ok(self
+            .node_id_for_same_document_reference(uri)?
+            .and_then(|id| self.doc.get_node(id)))
+    }
+
+    /// Resolve a same-document URI to a stable node identity under the
+    /// configured grammar, for secondary consumers such as Manifest trust.
+    pub(crate) fn node_id_for_same_document_reference(
+        &self,
+        uri: &str,
+    ) -> Result<Option<NodeId>, TransformError> {
+        let fragment = uri
+            .strip_prefix('#')
+            .ok_or_else(|| TransformError::UnsupportedUri(uri.to_owned()))?;
+        if fragment.is_empty() || fragment == "xpointer(/)" {
+            return Err(TransformError::UnsupportedUri(uri.to_owned()));
+        }
+        let (id, _) = self.same_document_id_fragment(fragment)?;
+        Ok(self.id_index.node_id(id))
     }
 
     pub(crate) fn node_for_node_id(&self, id: NodeId) -> Option<Node<'a, 'a>> {
@@ -412,21 +438,6 @@ pub(crate) fn parse_xpointer_id_fragment(fragment: &str) -> Option<&str> {
     } else {
         None
     }
-}
-
-/// Extract the ID selected by a supported same-document URI.
-///
-/// This keeps secondary consumers such as KeyInfo and Manifest processing in
-/// lockstep with the resolver's bare-fragment and XPointer ID semantics.
-pub(crate) fn same_document_reference_id(uri: &str) -> Option<&str> {
-    let fragment = uri.strip_prefix('#')?;
-    if fragment.is_empty() || fragment == "xpointer(/)" {
-        return None;
-    }
-    if let Some(id) = parse_xpointer_id_fragment(fragment) {
-        return (!id.is_empty()).then_some(id);
-    }
-    (!fragment.starts_with("xpointer(")).then_some(fragment)
 }
 
 #[cfg(test)]
@@ -1097,15 +1108,25 @@ mod tests {
     }
 
     #[test]
-    fn xmlsec_xpointer_compatibility_matches_donor_literal_limits() {
-        // The donor's default XPointer wrapper accepts numeric registered IDs,
-        // but an apostrophe breaks its single-quoted id() expression.
-        let xml = r#"<root><item ID="12345">numeric</item><item ID="visa'3d">quoted</item></root>"#;
+    fn xmlsec_barename_compatibility_matches_donor_literal_and_comment_semantics() {
+        // The donor internally wraps a barename in XPointer to accept numeric
+        // IDs, but still selects TreeWithoutComments; an apostrophe cannot be
+        // represented in the wrapper's single-quoted expression.
+        let xml = r#"<root><item ID="12345"><!-- excluded -->numeric</item><item ID="visa'3d">quoted</item></root>"#;
         let doc = Document::parse(xml).unwrap();
         let resolver = UriReferenceResolver::new(&doc)
-            .with_same_document_id_semantics(SameDocumentIdSemantics::XmlSecXPointer);
+            .with_same_document_id_semantics(SameDocumentIdSemantics::XmlSecBarename);
 
-        assert!(resolver.dereference("#12345").is_ok());
+        let nodes = resolver
+            .dereference("#12345")
+            .unwrap()
+            .into_node_set()
+            .unwrap();
+        assert!(
+            doc.descendants()
+                .filter(|node| node.is_comment())
+                .all(|node| !nodes.contains(node))
+        );
         assert!(matches!(
             resolver.dereference("#visa'3d"),
             Err(TransformError::UnsupportedUri(uri)) if uri == "#visa'3d"
@@ -1139,16 +1160,21 @@ mod tests {
     }
 
     #[test]
-    fn same_document_reference_id_rejects_non_id_fragments() {
-        assert_eq!(super::same_document_reference_id("#target"), Some("target"));
-        assert_eq!(
-            super::same_document_reference_id("#xpointer(id('target'))"),
-            Some("target")
-        );
-        assert_eq!(
-            super::same_document_reference_id(r#"#xpointer(id("target"))"#),
-            Some("target")
-        );
+    fn same_document_reference_nodes_reject_non_id_fragments() {
+        let document = Document::parse(r#"<root><item ID="target"/></root>"#).unwrap();
+        let resolver = UriReferenceResolver::new(&document);
+        for uri in [
+            "#target",
+            "#xpointer(id('target'))",
+            r#"#xpointer(id("target"))"#,
+        ] {
+            assert!(
+                resolver
+                    .node_id_for_same_document_reference(uri)
+                    .unwrap()
+                    .is_some()
+            );
+        }
         for uri in [
             "",
             "target",
@@ -1157,7 +1183,10 @@ mod tests {
             "#xpointer(id(''))",
             "#xpointer(id(target))",
         ] {
-            assert_eq!(super::same_document_reference_id(uri), None, "{uri}");
+            assert!(
+                resolver.node_id_for_same_document_reference(uri).is_err(),
+                "{uri}"
+            );
         }
     }
 
