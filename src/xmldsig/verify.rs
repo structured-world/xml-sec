@@ -1632,14 +1632,14 @@ fn select_retrieved_x509_data_root<'a, 'input>(
     execution_budget
         .validate_xpath_context_evaluations(context_nodes)
         .map_err(ReferenceProcessingError::Transform)?;
+    execution_budget
+        .charge_xpath_work(context_nodes)
+        .map_err(ReferenceProcessingError::Transform)?;
+    execution_budget
+        .charge_node_filter_work(context_nodes)
+        .map_err(ReferenceProcessingError::Transform)?;
     let mut root = None;
     for candidate in target.descendants() {
-        execution_budget
-            .charge_xpath_work(1)
-            .map_err(ReferenceProcessingError::Transform)?;
-        execution_budget
-            .charge_node_filter_work(1)
-            .map_err(ReferenceProcessingError::Transform)?;
         if !candidate.is_element()
             || candidate.tag_name().namespace() != Some(XMLDSIG_NS)
             || candidate.tag_name().name() != "X509Data"
@@ -1754,6 +1754,7 @@ fn process_manifest_references(
             &mut remaining_reference_capacity,
             &mut next_reference_index,
             xpath_parse_budget,
+            ctx.allowed_transform_uris(),
         )?;
         let manifest_references = parsed.references;
         results.extend(parsed.invalid_results);
@@ -1858,6 +1859,7 @@ fn parse_manifest_references(
     remaining_reference_capacity: &mut usize,
     next_reference_index: &mut usize,
     xpath_parse_budget: &mut XPathSignatureParseBudget,
+    allowed_transforms: Option<&HashSet<String>>,
 ) -> Result<ParsedManifestReferences, SignatureVerificationPipelineError> {
     let mut references = Vec::new();
     let mut invalid = Vec::new();
@@ -1919,19 +1921,27 @@ fn parse_manifest_references(
                 *next_reference_index += 1;
                 match parse_reference_with_xpath_budget(child, xpath_parse_budget) {
                     Ok(reference) => references.push((reference_index, reference, child.id())),
-                    Err(ParseError::Transform(super::TransformError::UnsupportedTransform(_))) => {
+                    Err(ParseError::Transform(super::TransformError::UnsupportedTransform(
+                        uri,
+                    ))) => {
                         let digest_algorithm =
                             reference_digest_method(child).map_err(map_manifest_parse_error)?;
+                        let reason =
+                            if allowed_transforms.is_some_and(|allowed| !allowed.contains(&uri)) {
+                                FailureReason::ReferencePolicyViolation {
+                                    ref_index: reference_index,
+                                }
+                            } else {
+                                FailureReason::ReferenceProcessingFailure {
+                                    ref_index: reference_index,
+                                }
+                            };
                         invalid.push(ReferenceResult {
                             reference_set: ReferenceSet::Manifest,
                             reference_index,
                             uri: child.attribute("URI").unwrap_or("<omitted>").to_owned(),
                             digest_algorithm,
-                            status: DsigStatus::Invalid(
-                                FailureReason::ReferenceProcessingFailure {
-                                    ref_index: reference_index,
-                                },
-                            ),
+                            status: DsigStatus::Invalid(reason),
                             pre_digest_data: None,
                         });
                     }
@@ -4090,6 +4100,20 @@ mod tests {
             result.manifest_references[0].status,
             DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
         ));
+
+        let restricted = VerifyContext::new()
+            .key(&AcceptingKey)
+            .process_manifests(true)
+            .allowed_transforms([
+                DEFAULT_IMPLICIT_C14N_URI,
+                "http://www.w3.org/2001/10/xml-exc-c14n#",
+            ])
+            .verify(&xml)
+            .expect("a disallowed Manifest transform is a per-reference policy result");
+        assert!(matches!(
+            restricted.manifest_references[0].status,
+            DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
+        ));
     }
 
     #[test]
@@ -4119,6 +4143,7 @@ mod tests {
             &mut remaining,
             &mut next_index,
             &mut XPathSignatureParseBudget::default(),
+            None,
         ) {
             Ok(_) => panic!("unsupported references must consume the same aggregate limit"),
             Err(error) => error,
@@ -4158,6 +4183,7 @@ mod tests {
             &mut remaining,
             &mut next_index,
             &mut xpath_budget,
+            None,
         )
         .expect("outer Manifest must be discovered");
         assert_eq!(first.references.len(), 1);
@@ -4171,6 +4197,7 @@ mod tests {
             &mut remaining,
             &mut next_index,
             &mut xpath_budget,
+            None,
         )
         .expect("newly authenticated sibling Manifest must remain eligible");
         assert_eq!(second.references.len(), 1);
@@ -4388,14 +4415,18 @@ mod tests {
 
     #[test]
     fn retrieval_method_xpath_uses_node_filter_work_budget() {
-        // The fixed ancestor-or-self predicate scans the dereferenced node-set
-        // and therefore consumes the operation-wide node-filter allowance.
+        // Attribute and namespace XPath nodes participate in filtering even
+        // though the optimized X509Data locator scans only tree descendants.
         let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_node_set_filter_work = 0;
+        policy.resources.max_node_set_filter_work = 4;
+        let xml = retrieval_method_xpath_signature().replace(
+            "<holder Id=\"target\">",
+            "<holder Id=\"target\" role=\"signing\" xmlns:metadata=\"urn:metadata\">",
+        );
 
         let error = VerifyContext::new()
             .policy(policy)
-            .verify(&retrieval_method_xpath_signature())
+            .verify(&xml)
             .expect_err("RetrievalMethod XPath must consume node-filter work");
 
         assert!(
@@ -4404,13 +4435,41 @@ mod tests {
                 SignatureVerificationPipelineError::Policy(
                     crate::policy::PolicyViolation::ResourceLimit {
                         resource: crate::policy::resource_name::NODE_SET_FILTER_WORK,
-                        maximum: 0,
+                        maximum: 4,
                         actual,
                     }
-                ) if *actual > 0
+                ) if *actual > 4
             ),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn retrieval_method_xpath_charges_every_context_to_evaluation_work() {
+        // The optimized predicate avoids a generic XPath engine, but every
+        // attribute and namespace context still consumes evaluation work.
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xpath_evaluation_work = 4;
+        let xml = retrieval_method_xpath_signature().replace(
+            "<holder Id=\"target\">",
+            "<holder Id=\"target\" role=\"signing\" xmlns:metadata=\"urn:metadata\">",
+        );
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(&xml)
+            .expect_err("RetrievalMethod XPath must charge every evaluation context");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_EVALUATION_WORK,
+                    maximum: 4,
+                    actual,
+                }
+            ) if actual > 4
+        ));
     }
 
     #[test]
