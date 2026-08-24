@@ -648,9 +648,10 @@ pub(crate) fn parse_key_info_with_policy_budgets(
 
     let mut sources = Vec::new();
     let mut x509_total_binary_len = 0usize;
-    // KeyInfo is parsed before source selection, so cap unavoidable certificate
-    // parsing here. The resolver separately budgets only candidates it inspects.
-    let mut embedded_x509_candidates = 0usize;
+    // KeyInfo is parsed before source selection, so cap every embedded key
+    // before decoding or algorithm-specific parsing. The resolver separately
+    // budgets indirect candidates only when it inspects them.
+    let mut embedded_key_candidates = 0usize;
     for (index, child) in element_children(key_info_node).enumerate() {
         if index >= MAX_KEY_INFO_CHILD_COUNT {
             return Err(ParseError::InvalidStructure(
@@ -665,6 +666,7 @@ pub(crate) fn parse_key_info_with_policy_budgets(
                 sources.push(KeyInfoSource::KeyName(key_name));
             }
             (Some(XMLDSIG_NS), "KeyValue") => {
+                charge_embedded_key_candidate(&mut embedded_key_candidates, resources)?;
                 let key_value = parse_key_value_dispatch(child)?;
                 sources.push(KeyInfoSource::KeyValue(key_value));
             }
@@ -672,7 +674,7 @@ pub(crate) fn parse_key_info_with_policy_budgets(
                 let x509 = parse_x509_data_dispatch_with_budget_and_provider(
                     child,
                     &mut x509_total_binary_len,
-                    &mut embedded_x509_candidates,
+                    &mut embedded_key_candidates,
                     provider,
                     resources,
                 )?;
@@ -719,6 +721,7 @@ pub(crate) fn parse_key_info_with_policy_budgets(
                 });
             }
             (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
+                charge_embedded_key_candidate(&mut embedded_key_candidates, resources)?;
                 ensure_no_element_children(child, "DEREncodedKeyValue")?;
                 let der = decode_der_encoded_key_value_base64(child)?;
                 sources.push(KeyInfoSource::DerEncodedKeyValue(der));
@@ -728,6 +731,15 @@ pub(crate) fn parse_key_info_with_policy_budgets(
     }
 
     Ok(KeyInfo { sources })
+}
+
+fn charge_embedded_key_candidate(
+    embedded_key_candidates: &mut usize,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<(), ParseError> {
+    *embedded_key_candidates = embedded_key_candidates.saturating_add(1);
+    resources.validate_key_candidates(*embedded_key_candidates)?;
+    Ok(())
 }
 
 fn parse_retrieval_method_transforms(
@@ -1146,7 +1158,7 @@ fn decode_crypto_binary(
 pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
     node: Node,
     total_binary_len: &mut usize,
-    embedded_x509_candidates: &mut usize,
+    embedded_key_candidates: &mut usize,
     provider: &dyn crate::provider::CryptoProvider,
     resources: &crate::policy::ResourcePolicy,
 ) -> Result<X509DataInfo, ParseError> {
@@ -1157,8 +1169,7 @@ pub(crate) fn parse_x509_data_dispatch_with_budget_and_provider(
     for child in element_children(node) {
         match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "X509Certificate") => {
-                *embedded_x509_candidates = embedded_x509_candidates.saturating_add(1);
-                resources.validate_key_candidates(*embedded_x509_candidates)?;
+                charge_embedded_key_candidate(embedded_key_candidates, resources)?;
                 ensure_no_element_children(child, "X509Certificate")?;
                 ensure_x509_data_entry_budget(&info)?;
                 let cert = decode_x509_base64(child, "X509Certificate")?;
@@ -2484,6 +2495,73 @@ mod tests {
     }
 
     // ── parse_key_info: dispatch parsing ──────────────────────────────
+
+    #[test]
+    fn key_info_candidate_budget_precedes_key_value_parsing() {
+        // A denied embedded candidate must fail before malformed key material
+        // reaches the algorithm-specific parser.
+        let document = Document::parse(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+                <KeyValue><RSAKeyValue><Modulus>AQAB</Modulus></RSAKeyValue></KeyValue>
+            </KeyInfo>"#,
+        )
+        .expect("fixed KeyInfo fixture must parse as XML");
+        let resources = crate::policy::ResourcePolicy {
+            max_key_candidates: 0,
+            ..crate::policy::ResourcePolicy::default()
+        };
+
+        let error = parse_key_info_with_policy_budgets(
+            document.root_element(),
+            crate::provider::default_provider(),
+            &XmlBaseResolutionBudget::default(),
+            &resources,
+        )
+        .expect_err("candidate policy must reject KeyValue before RSA parsing");
+
+        assert!(matches!(
+            error,
+            ParseError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                maximum: 0,
+                actual: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn key_info_candidate_budget_precedes_der_key_decoding() {
+        // Candidate accounting must reject DEREncodedKeyValue before retaining
+        // or base64-decoding its attacker-controlled text.
+        let document = Document::parse(
+            r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+                       xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+                <dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue>
+            </KeyInfo>"#,
+        )
+        .expect("fixed KeyInfo fixture must parse as XML");
+        let resources = crate::policy::ResourcePolicy {
+            max_key_candidates: 0,
+            ..crate::policy::ResourcePolicy::default()
+        };
+
+        let error = parse_key_info_with_policy_budgets(
+            document.root_element(),
+            crate::provider::default_provider(),
+            &XmlBaseResolutionBudget::default(),
+            &resources,
+        )
+        .expect_err("candidate policy must reject DEREncodedKeyValue before decoding");
+
+        assert!(matches!(
+            error,
+            ParseError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                maximum: 0,
+                actual: 1,
+            })
+        ));
+    }
 
     #[test]
     fn parse_key_info_dispatches_supported_children() {

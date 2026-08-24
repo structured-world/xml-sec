@@ -185,21 +185,6 @@ impl XmlNodeKey {
             Self::Namespace { prefix, uri, .. } => prefix.len().saturating_add(uri.len()),
         }
     }
-
-    fn checked_owned_string_bytes(&self) -> Option<usize> {
-        match self {
-            Self::Tree(_) => Some(0),
-            Self::Attribute {
-                namespace,
-                local_name,
-                ..
-            } => namespace
-                .as_ref()
-                .map_or(0, String::len)
-                .checked_add(local_name.len()),
-            Self::Namespace { prefix, uri, .. } => prefix.len().checked_add(uri.len()),
-        }
-    }
 }
 
 impl<'a> NodeSet<'a> {
@@ -414,9 +399,24 @@ impl<'a> NodeSet<'a> {
         budget: &NodeSetMaterializationBudget,
     ) -> Result<(), TransformError> {
         if self.owns(owner) {
+            let owner_id = owner.id();
+            let additional_bytes = namespace.map_or(0, str::len).checked_add(local_name.len());
             self.insert_projected_key_with_budget(
-                XmlNodeKey::Attribute {
-                    owner: owner.id(),
+                additional_bytes,
+                |key| {
+                    matches!(
+                        key,
+                        XmlNodeKey::Attribute {
+                            owner,
+                            namespace: stored_namespace,
+                            local_name: stored_local_name,
+                        } if *owner == owner_id
+                            && stored_namespace.as_deref() == namespace
+                            && stored_local_name == local_name
+                    )
+                },
+                || XmlNodeKey::Attribute {
+                    owner: owner_id,
                     namespace: namespace.map(str::to_owned),
                     local_name: local_name.to_owned(),
                 },
@@ -450,9 +450,21 @@ impl<'a> NodeSet<'a> {
         budget: &NodeSetMaterializationBudget,
     ) -> Result<(), TransformError> {
         if self.owns(owner) {
+            let owner_id = owner.id();
             self.insert_projected_key_with_budget(
-                XmlNodeKey::Namespace {
-                    owner: owner.id(),
+                prefix.len().checked_add(uri.len()),
+                |key| {
+                    matches!(
+                        key,
+                        XmlNodeKey::Namespace {
+                            owner,
+                            prefix: stored_prefix,
+                            uri: stored_uri,
+                        } if *owner == owner_id && stored_prefix == prefix && stored_uri == uri
+                    )
+                },
+                || XmlNodeKey::Namespace {
+                    owner: owner_id,
                     prefix: prefix.to_owned(),
                     uri: uri.to_owned(),
                 },
@@ -462,35 +474,69 @@ impl<'a> NodeSet<'a> {
         Ok(())
     }
 
-    fn insert_projected_key_with_budget(
+    fn insert_projected_key_with_budget<D, F>(
         &mut self,
-        key: XmlNodeKey,
+        additional_bytes: Option<usize>,
+        is_duplicate: D,
+        build_key: F,
         budget: &NodeSetMaterializationBudget,
-    ) -> Result<(), TransformError> {
+    ) -> Result<(), TransformError>
+    where
+        D: Fn(&XmlNodeKey) -> bool,
+        F: FnOnce() -> XmlNodeKey,
+    {
+        let (additional_bytes, preflight_error) = match additional_bytes {
+            None => (
+                0,
+                Some(transform_resource_limit(
+                    crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+                    budget.max_owned_string_bytes,
+                    usize::MAX,
+                )),
+            ),
+            Some(additional_bytes) => {
+                let total_bytes = self.owned_string_bytes.saturating_add(additional_bytes);
+                let error = if total_bytes > budget.max_owned_string_bytes {
+                    Some(transform_resource_limit(
+                        crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+                        budget.max_owned_string_bytes,
+                        total_bytes,
+                    ))
+                } else if self.nodes.len() >= budget.max_entries {
+                    Some(transform_resource_limit(
+                        crate::policy::resource_name::NODE_SET_ENTRIES,
+                        budget.max_entries,
+                        self.nodes.len().saturating_add(1),
+                    ))
+                } else {
+                    let remaining = budget.remaining_owned_string_bytes.get();
+                    remaining.checked_sub(additional_bytes).is_none().then(|| {
+                        let consumed = budget
+                            .max_cumulative_owned_string_bytes
+                            .saturating_sub(remaining);
+                        transform_resource_limit(
+                            crate::policy::resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
+                            budget.max_cumulative_owned_string_bytes,
+                            consumed.saturating_add(additional_bytes),
+                        )
+                    })
+                };
+                (additional_bytes, error)
+            }
+        };
+        if let Some(error) = preflight_error {
+            // Duplicate projections consume no capacity. Scan only when a new
+            // key would fail so the normal insertion path keeps hash-set cost.
+            if self.nodes.iter().any(is_duplicate) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+
+        let total_bytes = self.owned_string_bytes.saturating_add(additional_bytes);
+        let key = build_key();
         if self.nodes.contains(&key) {
             return Ok(());
-        }
-        let additional_bytes = key.checked_owned_string_bytes().ok_or_else(|| {
-            transform_resource_limit(
-                crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
-                budget.max_owned_string_bytes,
-                usize::MAX,
-            )
-        })?;
-        let total_bytes = self.owned_string_bytes.saturating_add(additional_bytes);
-        if total_bytes > budget.max_owned_string_bytes {
-            return Err(transform_resource_limit(
-                crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
-                budget.max_owned_string_bytes,
-                total_bytes,
-            ));
-        }
-        if self.nodes.len() >= budget.max_entries {
-            return Err(transform_resource_limit(
-                crate::policy::resource_name::NODE_SET_ENTRIES,
-                budget.max_entries,
-                self.nodes.len().saturating_add(1),
-            ));
         }
         budget.charge(additional_bytes)?;
         let inserted = self.nodes.insert(key);
@@ -906,6 +952,83 @@ mod tests {
                 resource: "cumulative node-set owned string bytes",
                 maximum: 3,
                 actual: 4,
+            })
+        ));
+    }
+
+    #[test]
+    fn denied_attribute_projection_does_not_construct_owned_key() {
+        // A zero string budget must reject borrowed attribute names before
+        // cloning attacker-controlled namespace or local-name text.
+        let document = Document::parse("<root/>").expect("fixed XML must parse");
+        let root = document.root_element();
+        let mut nodes = NodeSet::empty(&document);
+        let budget = NodeSetMaterializationBudget::with_limits(16, 0, 0);
+        let constructed = Cell::new(false);
+
+        let error = nodes
+            .insert_projected_key_with_budget(
+                Some(1),
+                |_| false,
+                || {
+                    constructed.set(true);
+                    XmlNodeKey::Attribute {
+                        owner: root.id(),
+                        namespace: None,
+                        local_name: "a".to_owned(),
+                    }
+                },
+                &budget,
+            )
+            .expect_err("the borrowed attribute name exceeds the zero-byte budget");
+
+        assert!(!constructed.get(), "denied names must not be cloned");
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "node-set owned string bytes",
+                maximum: 0,
+                actual: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn denied_namespace_projection_does_not_construct_owned_key() {
+        // Namespace prefix and URI follow the same borrowed preflight path as
+        // attribute names rather than allocating before cumulative rejection.
+        let document = Document::parse("<root/>").expect("fixed XML must parse");
+        let root = document.root_element();
+        let mut nodes = NodeSet::empty(&document);
+        let budget = NodeSetMaterializationBudget::with_limits(16, 16, 0);
+        let constructed = Cell::new(false);
+
+        let error = nodes
+            .insert_projected_key_with_budget(
+                Some(2),
+                |_| false,
+                || {
+                    constructed.set(true);
+                    XmlNodeKey::Namespace {
+                        owner: root.id(),
+                        prefix: "p".to_owned(),
+                        uri: "u".to_owned(),
+                    }
+                },
+                &budget,
+            )
+            .expect_err("borrowed namespace strings exceed the zero-byte budget");
+
+        assert!(
+            !constructed.get(),
+            "denied namespace strings must not be cloned"
+        );
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: "cumulative node-set owned string bytes",
+                maximum: 0,
+                actual: 2,
             })
         ));
     }
