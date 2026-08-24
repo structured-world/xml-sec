@@ -295,12 +295,17 @@ pub struct DefaultKeyResolver {
     config: KeyResolverConfig,
 }
 
-struct KeyCandidateBudget {
+/// Counts candidates actually inspected by one resolver invocation.
+///
+/// Parser cardinality preflights prevent expensive materialization, but do not
+/// replace this runtime accounting: embedded and indirect candidates both
+/// consume resolver work when inspected.
+struct InspectedKeyCandidateBudget {
     maximum: usize,
     attempted: usize,
 }
 
-impl KeyCandidateBudget {
+impl InspectedKeyCandidateBudget {
     fn new(maximum: usize) -> Self {
         Self {
             maximum,
@@ -345,7 +350,7 @@ impl DefaultKeyResolver {
         algorithm: SignatureAlgorithm,
         trust: &crate::policy::KeyTrustPolicy,
         provider: &dyn crate::provider::CryptoProvider,
-        budget: &mut KeyCandidateBudget,
+        budget: &mut InspectedKeyCandidateBudget,
     ) -> Result<Option<VerificationKey>, DsigError> {
         let certificate_der = if let Some(&signing_index) = info.certificate_chain.first() {
             if trust.verify_x509_chains {
@@ -410,7 +415,7 @@ impl DefaultKeyResolver {
         signing_index: usize,
         trust: &crate::policy::KeyTrustPolicy,
         provider: &dyn crate::provider::CryptoProvider,
-        budget: &mut KeyCandidateBudget,
+        budget: &mut InspectedKeyCandidateBudget,
     ) -> Result<X509DataInfo, DsigError> {
         let signing_der = info
             .certificates
@@ -577,7 +582,7 @@ impl DefaultKeyResolver {
         info: &X509DataInfo,
         trust: &crate::policy::KeyTrustPolicy,
         provider: &dyn crate::provider::CryptoProvider,
-        budget: &mut KeyCandidateBudget,
+        budget: &mut InspectedKeyCandidateBudget,
     ) -> Result<Option<X509DataInfo>, DsigError> {
         if !x509_data_has_lookup_identifiers(info) {
             return Ok(None);
@@ -777,7 +782,7 @@ impl DefaultKeyResolver {
         let Some(key_info) = key_info else {
             return Ok(None);
         };
-        let mut candidate_budget = KeyCandidateBudget::new(resources.max_key_candidates);
+        let mut candidate_budget = InspectedKeyCandidateBudget::new(resources.max_key_candidates);
         let mut deferred_key_value_error = None;
         for source in &key_info.sources {
             let resolved = match source {

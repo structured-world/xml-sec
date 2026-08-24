@@ -176,6 +176,23 @@ pub struct KeyInfo {
     pub sources: Vec<KeyInfoSource>,
 }
 
+impl KeyInfo {
+    /// Count key material that parsing has already materialized as candidates.
+    ///
+    /// This is a cardinality preflight, not a consumed resolver-work counter:
+    /// resolution separately counts every candidate it actually inspects,
+    /// including embedded material and caller-owned stores.
+    pub(crate) fn embedded_candidate_count(&self) -> usize {
+        self.sources.iter().fold(0usize, |count, source| {
+            count.saturating_add(match source {
+                KeyInfoSource::KeyValue(_) | KeyInfoSource::DerEncodedKeyValue(_) => 1,
+                KeyInfoSource::X509Data(info) => info.certificates.len(),
+                KeyInfoSource::KeyName(_) | KeyInfoSource::RetrievalMethod { .. } => 0,
+            })
+        })
+    }
+}
+
 /// Top-level key material source parsed from `<KeyInfo>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -648,10 +665,10 @@ pub(crate) fn parse_key_info_with_policy_budgets(
 
     let mut sources = Vec::new();
     let mut x509_total_binary_len = 0usize;
-    // KeyInfo is parsed before source selection, so cap every embedded key
-    // before decoding or algorithm-specific parsing. The resolver separately
-    // budgets indirect candidates only when it inspects them.
-    let mut embedded_key_candidates = 0usize;
+    // KeyInfo is parsed before source selection, so preflight the cardinality
+    // of every embedded key before decoding or algorithm-specific parsing.
+    // This does not consume the resolver's inspected-candidate work budget.
+    let mut embedded_candidate_preflight_count = 0usize;
     for (index, child) in element_children(key_info_node).enumerate() {
         if index >= MAX_KEY_INFO_CHILD_COUNT {
             return Err(ParseError::InvalidStructure(
@@ -666,7 +683,7 @@ pub(crate) fn parse_key_info_with_policy_budgets(
                 sources.push(KeyInfoSource::KeyName(key_name));
             }
             (Some(XMLDSIG_NS), "KeyValue") => {
-                charge_embedded_key_candidate(&mut embedded_key_candidates, resources)?;
+                charge_embedded_key_candidate(&mut embedded_candidate_preflight_count, resources)?;
                 let key_value = parse_key_value_dispatch(child)?;
                 sources.push(KeyInfoSource::KeyValue(key_value));
             }
@@ -674,7 +691,7 @@ pub(crate) fn parse_key_info_with_policy_budgets(
                 let x509 = parse_x509_data_dispatch_with_budget_and_provider(
                     child,
                     &mut x509_total_binary_len,
-                    &mut embedded_key_candidates,
+                    &mut embedded_candidate_preflight_count,
                     provider,
                     resources,
                 )?;
@@ -721,7 +738,7 @@ pub(crate) fn parse_key_info_with_policy_budgets(
                 });
             }
             (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
-                charge_embedded_key_candidate(&mut embedded_key_candidates, resources)?;
+                charge_embedded_key_candidate(&mut embedded_candidate_preflight_count, resources)?;
                 ensure_no_element_children(child, "DEREncodedKeyValue")?;
                 let der = decode_der_encoded_key_value_base64(child)?;
                 sources.push(KeyInfoSource::DerEncodedKeyValue(der));
@@ -2555,6 +2572,33 @@ mod tests {
                 actual: 1,
             })
         ));
+    }
+
+    #[test]
+    fn key_info_embedded_candidate_count_matches_materialized_key_kinds() {
+        // Only materialized cryptographic candidates belong to the parser
+        // preflight; names and unresolved RetrievalMethods become work later.
+        let key_info = KeyInfo {
+            sources: vec![
+                KeyInfoSource::KeyName("configured-key".into()),
+                KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
+                    namespace: Some(XMLDSIG_NS.into()),
+                    local_name: "FutureKeyValue".into(),
+                }),
+                KeyInfoSource::DerEncodedKeyValue(vec![1]),
+                KeyInfoSource::X509Data(X509DataInfo {
+                    certificates: vec![vec![2], vec![3]],
+                    ..X509DataInfo::default()
+                }),
+                KeyInfoSource::RetrievalMethod {
+                    uri: "urn:certificate".into(),
+                    resource_type: None,
+                    transforms: RetrievalMethodTransforms::None,
+                },
+            ],
+        };
+
+        assert_eq!(key_info.embedded_candidate_count(), 4);
     }
 
     #[test]

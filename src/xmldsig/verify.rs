@@ -1447,12 +1447,7 @@ fn materialize_retrieval_methods_with_budgets(
     }
 
     let mut total_binary_len = existing_x509_binary_len(key_info)?;
-    let mut embedded_x509_candidates = key_info.sources.iter().fold(0usize, |count, source| {
-        count.saturating_add(match source {
-            super::parse::KeyInfoSource::X509Data(info) => info.certificates.len(),
-            _ => 0,
-        })
-    });
+    let mut materialized_candidate_preflight_count = key_info.embedded_candidate_count();
     let mut seen = HashSet::new();
     let mut materialized = Vec::with_capacity(key_info.sources.len());
     let mut outcome = RetrievalMaterialization::default();
@@ -1510,10 +1505,11 @@ fn materialize_retrieval_methods_with_budgets(
                 });
                 continue;
             };
-            embedded_x509_candidates = embedded_x509_candidates.saturating_add(1);
+            materialized_candidate_preflight_count =
+                materialized_candidate_preflight_count.saturating_add(1);
             budgets
                 .resources
-                .validate_key_candidates(embedded_x509_candidates)?;
+                .validate_key_candidates(materialized_candidate_preflight_count)?;
             if certificate.len() > MAX_X509_DECODED_BINARY_LEN {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "raw X509 RetrievalMethod certificate exceeds maximum allowed length",
@@ -1597,7 +1593,7 @@ fn materialize_retrieval_methods_with_budgets(
             let data = parse_x509_data_dispatch_with_budget_and_provider(
                 node,
                 &mut total_binary_len,
-                &mut embedded_x509_candidates,
+                &mut materialized_candidate_preflight_count,
                 provider,
                 budgets.resources,
             )
@@ -4820,6 +4816,63 @@ mod tests {
             key_info.sources.as_slice(),
             [super::super::parse::KeyInfoSource::X509Data(info)]
                 if info.certificates.len() == 1
+        ));
+    }
+
+    #[test]
+    fn retrieval_method_candidate_budget_includes_embedded_key_values() {
+        // A previously parsed KeyValue consumes the sole candidate slot, so
+        // malformed retrieved DER must be rejected by policy before X.509 parsing.
+        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
+        let resources = HashMap::from([("urn:certificate".to_string(), vec![1, 2, 3])]);
+        let mut key_info = KeyInfo {
+            sources: vec![
+                super::super::parse::KeyInfoSource::KeyValue(
+                    super::super::parse::KeyValueInfo::Unsupported {
+                        namespace: Some(XMLDSIG_NS.into()),
+                        local_name: "FutureKeyValue".into(),
+                    },
+                ),
+                super::super::parse::KeyInfoSource::RetrievalMethod {
+                    uri: "urn:certificate".into(),
+                    resource_type: Some(RAW_X509_TYPE.into()),
+                    transforms: RetrievalMethodTransforms::None,
+                },
+            ],
+        };
+        let document = Document::parse("<root/>").unwrap();
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+        let execution_budget = TransformExecutionBudget::default();
+        let resource_policy = crate::policy::ResourcePolicy {
+            max_key_candidates: 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let mut budgets = RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse_budget,
+            execution: &execution_budget,
+            resources: &resource_policy,
+        };
+
+        let error = materialize_retrieval_methods_with_budgets(
+            &mut key_info,
+            &resolver,
+            UriTypeSet::ALL,
+            None,
+            crate::provider::default_provider(),
+            &mut budgets,
+        )
+        .expect_err("the retrieved certificate must exceed the aggregate candidate limit");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_CANDIDATES,
+                    maximum: 1,
+                    actual: 2,
+                }
+            )
         ));
     }
 
