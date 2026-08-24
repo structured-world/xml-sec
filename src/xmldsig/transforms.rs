@@ -1783,9 +1783,14 @@ fn parse_xpath_expression(
     )
     .map_err(TransformError::XPath)?;
 
-    let mut xpath = XPathExpression {
+    let namespaces = collect_xpath_namespaces_with_limits(
+        xpath_node,
+        xpath_state.signature_budget.max_namespace_bindings,
+        xpath_state.signature_budget.max_namespace_bytes,
+    )?;
+    let xpath = XPathExpression {
         expression: source.to_owned(),
-        namespaces: BTreeMap::new(),
+        namespaces,
         here_nodes: Some(XPathHereNodes {
             // XMLDSig defines here() as the parent element of the text node
             // bearing the expression, not as the text node itself.
@@ -1797,18 +1802,6 @@ fn parse_xpath_expression(
             document: xpath_state.document_identity(xpath_node.document()),
         }),
     };
-    let mut namespace_budget = XPathNamespaceBudget::with_limits(
-        xpath_state.signature_budget.max_namespace_bindings,
-        xpath_state.signature_budget.max_namespace_bytes,
-    );
-    for namespace in xpath_node.namespaces() {
-        if let Some(prefix) = namespace.name() {
-            namespace_budget.charge(prefix, namespace.uri())?;
-            xpath
-                .namespaces
-                .insert(prefix.to_owned(), namespace.uri().to_owned());
-        }
-    }
     Ok(xpath)
 }
 
@@ -1984,6 +1977,38 @@ impl XPathNamespaceBudget {
         self.bytes = bytes;
         Ok(())
     }
+}
+
+pub(crate) fn collect_xpath_namespaces_with_resources(
+    xpath_node: Node<'_, '_>,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<BTreeMap<String, String>, TransformError> {
+    collect_xpath_namespaces_with_limits(
+        xpath_node,
+        resources.max_xpath_namespace_bindings,
+        resources.max_xpath_namespace_bytes,
+    )
+}
+
+fn collect_xpath_namespaces_with_limits(
+    xpath_node: Node<'_, '_>,
+    max_bindings: usize,
+    max_bytes: usize,
+) -> Result<BTreeMap<String, String>, TransformError> {
+    let mut budget = XPathNamespaceBudget::with_limits(max_bindings, max_bytes);
+    for namespace in xpath_node.namespaces() {
+        if let Some(prefix) = namespace.name() {
+            budget.charge(prefix, namespace.uri())?;
+        }
+    }
+    Ok(xpath_node
+        .namespaces()
+        .filter_map(|namespace| {
+            namespace
+                .name()
+                .map(|prefix| (prefix.to_owned(), namespace.uri().to_owned()))
+        })
+        .collect())
 }
 
 pub(crate) fn validate_xpath_namespace_budget_with_resources(

@@ -708,7 +708,7 @@ pub(crate) fn parse_key_info_with_policy_budgets(
                 let transforms = if resource_type.as_deref()
                     == Some("http://www.w3.org/2000/09/xmldsig#X509Data")
                 {
-                    parse_retrieval_method_transforms(child)?
+                    parse_retrieval_method_transforms(child, resources)?
                 } else if element_children(child).next().is_some() {
                     RetrievalMethodTransforms::Unsupported
                 } else {
@@ -744,6 +744,7 @@ fn charge_embedded_key_candidate(
 
 fn parse_retrieval_method_transforms(
     node: Node<'_, '_>,
+    resources: &crate::policy::ResourcePolicy,
 ) -> Result<RetrievalMethodTransforms, ParseError> {
     let mut children = element_children(node);
     let Some(transforms) = children.next() else {
@@ -799,14 +800,7 @@ fn parse_retrieval_method_transforms(
             "unsupported RetrievalMethod XPath selection".into(),
         ));
     }
-    let namespaces = xpath
-        .namespaces()
-        .filter_map(|namespace| {
-            namespace
-                .name()
-                .map(|prefix| (prefix.to_owned(), namespace.uri().to_owned()))
-        })
-        .collect();
+    let namespaces = transforms::collect_xpath_namespaces_with_resources(xpath, resources)?;
     Ok(RetrievalMethodTransforms::X509DataNodeSetFilter {
         expression,
         namespaces,
@@ -3982,6 +3976,80 @@ BA== </Modulus>
                 transforms: RetrievalMethodTransforms::X509DataNodeSetFilter { .. },
             }] if uri == "#keys"
                 && resource_type == "http://www.w3.org/2000/09/xmldsig#X509Data"
+        ));
+    }
+
+    #[test]
+    fn retrieval_xpath_namespace_binding_policy_precedes_materialization() {
+        // RetrievalMethod must reject inherited namespace bindings before
+        // cloning their prefix and URI into the retained transform model.
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+          <RetrievalMethod Type="http://www.w3.org/2000/09/xmldsig#X509Data" URI="#keys">
+            <Transforms><Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+              <XPath xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">ancestor-or-self::dsig:X509Data</XPath>
+            </Transform></Transforms>
+          </RetrievalMethod>
+        </KeyInfo>"##;
+        let document = Document::parse(xml).expect("fixed KeyInfo fixture must parse");
+        let resources = crate::policy::ResourcePolicy {
+            max_xpath_namespace_bindings: 0,
+            ..crate::policy::ResourcePolicy::default()
+        };
+
+        let error = parse_key_info_with_policy_budgets(
+            document.root_element(),
+            crate::provider::default_provider(),
+            &XmlBaseResolutionBudget::default(),
+            &resources,
+        )
+        .expect_err("zero namespace bindings must reject RetrievalMethod XPath");
+
+        assert!(matches!(
+            error,
+            ParseError::Transform(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_NAMESPACE_BINDINGS,
+                    maximum: 0,
+                    actual: 1,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn retrieval_xpath_namespace_byte_policy_precedes_materialization() {
+        // The aggregate namespace byte limit applies to borrowed prefix and URI
+        // text before either attacker-controlled string is allocated.
+        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+          <RetrievalMethod Type="http://www.w3.org/2000/09/xmldsig#X509Data" URI="#keys">
+            <Transforms><Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116">
+              <XPath xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">ancestor-or-self::dsig:X509Data</XPath>
+            </Transform></Transforms>
+          </RetrievalMethod>
+        </KeyInfo>"##;
+        let document = Document::parse(xml).expect("fixed KeyInfo fixture must parse");
+        let resources = crate::policy::ResourcePolicy {
+            max_xpath_namespace_bytes: 0,
+            ..crate::policy::ResourcePolicy::default()
+        };
+
+        let error = parse_key_info_with_policy_budgets(
+            document.root_element(),
+            crate::provider::default_provider(),
+            &XmlBaseResolutionBudget::default(),
+            &resources,
+        )
+        .expect_err("zero namespace bytes must reject RetrievalMethod XPath");
+
+        assert!(matches!(
+            error,
+            ParseError::Transform(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XPATH_NAMESPACE_BYTES,
+                    maximum: 0,
+                    actual,
+                }
+            )) if actual == "dsig".len() + XMLDSIG_NS.len()
         ));
     }
 
