@@ -106,10 +106,96 @@ struct AvailabilitySpan {
     conditions: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BehaviorRulesFile {
+    schema_version: u32,
+    evidence: BTreeMap<String, BehaviorEvidence>,
+    behaviors: Vec<BehaviorRule>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BehaviorEvidence {
+    /// Assertions proving accepted/successful behavior. A differential test may
+    /// also appear in `negative` when it proves both outcomes in one execution.
+    positive: Vec<BehaviorTest>,
+    /// Assertions proving rejected/failing behavior, not necessarily separate
+    /// test executables from the paired positive assertions.
+    negative: Vec<BehaviorTest>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BehaviorTest {
+    file: String,
+    test: String,
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BehaviorRule {
+    id: String,
+    category: String,
+    summary: String,
+    classification: BehaviorClassification,
+    control: BehaviorControl,
+    evidence: String,
+    donor_anchors: Vec<DonorAnchorRule>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum BehaviorClassification {
+    Native,
+    CompatibilityPolicy,
+    PlannedCCompatibilityBoundary,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BehaviorControl {
+    boundary: String,
+    setting: String,
+    default: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DonorAnchorRule {
+    source: String,
+    needle: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BehaviorLedger {
+    schema_version: u32,
+    upstream: Upstream,
+    generated_by: String,
+    evidence: BTreeMap<String, BehaviorEvidence>,
+    behaviors: Vec<BehaviorLedgerItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct BehaviorLedgerItem {
+    id: String,
+    category: String,
+    summary: String,
+    classification: BehaviorClassification,
+    control: BehaviorControl,
+    evidence: String,
+    donor_anchors: Vec<DonorAnchor>,
+}
+
+#[derive(Debug, Serialize)]
+struct DonorAnchor {
+    source: String,
+    line: usize,
+    needle: String,
+}
+
 fn main() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or_else(usage)?;
-    if command != "generate" && command != "check" {
+    if !matches!(
+        command.as_str(),
+        "generate" | "check" | "behavior-generate" | "behavior-check"
+    ) {
         return Err(usage());
     }
     let donor = PathBuf::from(args.next().ok_or_else(usage)?);
@@ -122,6 +208,14 @@ fn main() -> Result<(), String> {
     verify_donor(&donor)?;
     let donor_snapshot = snapshot_donor(&donor, EXPECTED_COMMIT.trim())?;
     verify_donor_version(donor_snapshot.path())?;
+    if command.starts_with("behavior-") {
+        return generate_behavior_ledger(
+            command == "behavior-check",
+            donor_snapshot.path(),
+            &rules_path,
+            &output,
+        );
+    }
     let rules: RulesFile = serde_json::from_slice(
         &fs::read(&rules_path)
             .map_err(|error| format!("read {}: {error}", rules_path.display()))?,
@@ -157,7 +251,280 @@ fn main() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: xml-sec-capability-ledger <generate|check> <donor> <rules.json> <ledger.json>".into()
+    "usage: xml-sec-capability-ledger <generate|check|behavior-generate|behavior-check> <donor> <rules.json> <ledger.json>".into()
+}
+
+fn generate_behavior_ledger(
+    check: bool,
+    donor: &Path,
+    rules_path: &Path,
+    output: &Path,
+) -> Result<(), String> {
+    let rules: BehaviorRulesFile = serde_json::from_slice(
+        &fs::read(rules_path).map_err(|error| format!("read {}: {error}", rules_path.display()))?,
+    )
+    .map_err(|error| format!("parse {}: {error}", rules_path.display()))?;
+    if rules.schema_version != 1 {
+        return Err(format!(
+            "unsupported behavior rules schema {}",
+            rules.schema_version
+        ));
+    }
+    validate_behavior_categories(&rules.behaviors)?;
+    validate_behavior_evidence(&rules.evidence)?;
+    let referenced_evidence = rules
+        .behaviors
+        .iter()
+        .map(|behavior| behavior.evidence.clone())
+        .collect::<BTreeSet<_>>();
+    validate_behavior_evidence_references(&rules.evidence, &referenced_evidence)?;
+
+    let mut ids = BTreeSet::new();
+    let mut behaviors = Vec::with_capacity(rules.behaviors.len());
+    for rule in rules.behaviors {
+        if !ids.insert(rule.id.clone()) {
+            return Err(format!("duplicate behavior id {}", rule.id));
+        }
+        if !rules.evidence.contains_key(&rule.evidence) {
+            return Err(format!(
+                "behavior {} references missing evidence {}",
+                rule.id, rule.evidence
+            ));
+        }
+        if rule.control.boundary.trim().is_empty()
+            || rule.control.setting.trim().is_empty()
+            || rule.control.default.trim().is_empty()
+        {
+            return Err(format!(
+                "behavior {} has an incomplete control boundary",
+                rule.id
+            ));
+        }
+        if rule.donor_anchors.is_empty() {
+            return Err(format!("behavior {} has no donor anchors", rule.id));
+        }
+        let donor_anchors = rule
+            .donor_anchors
+            .into_iter()
+            .map(|anchor| resolve_donor_anchor(donor, anchor))
+            .collect::<Result<Vec<_>, _>>()?;
+        behaviors.push(BehaviorLedgerItem {
+            id: rule.id,
+            category: rule.category,
+            summary: rule.summary,
+            classification: rule.classification,
+            control: rule.control,
+            evidence: rule.evidence,
+            donor_anchors,
+        });
+    }
+    behaviors.sort_by(|left, right| left.id.cmp(&right.id));
+    let ledger = BehaviorLedger {
+        schema_version: 1,
+        upstream: Upstream {
+            project: "libxmlsec1".into(),
+            version: EXPECTED_VERSION.into(),
+            commit: EXPECTED_COMMIT.trim().into(),
+            repository: "https://github.com/lsh123/xmlsec".into(),
+        },
+        generated_by: "xml-sec-capability-ledger behavior-generate".into(),
+        evidence: rules.evidence,
+        behaviors,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&ledger).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    if check {
+        let existing = fs::read(output)
+            .map_err(|error| format!("read generated ledger {}: {error}", output.display()))?;
+        if existing != bytes {
+            return Err(format!(
+                "{} is stale; regenerate it with behavior-generate",
+                output.display()
+            ));
+        }
+    } else {
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        }
+        fs::write(output, bytes).map_err(|error| format!("write {}: {error}", output.display()))?;
+    }
+    Ok(())
+}
+
+fn validate_behavior_categories(behaviors: &[BehaviorRule]) -> Result<(), String> {
+    let actual = behaviors
+        .iter()
+        .map(|behavior| behavior.category.as_str())
+        .collect::<BTreeSet<_>>();
+    let required = [
+        "callback-ordering",
+        "context-after-failure",
+        "dom-mutation",
+        "dtd-xml-id-caller-id",
+        "empty-uri-xpointer",
+        "error-invalid-classification",
+        "here-semantics",
+        "implicit-c14n-adapters",
+        "manifest-status",
+        "multiple-signatures",
+        "signature-value-encoding",
+        "visa3d-ids",
+    ];
+    for category in required {
+        if !actual.contains(category) {
+            return Err(format!("behavior ledger is missing category {category}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_behavior_evidence(evidence: &BTreeMap<String, BehaviorEvidence>) -> Result<(), String> {
+    for (id, evidence) in evidence {
+        if evidence.positive.is_empty() || evidence.negative.is_empty() {
+            return Err(format!(
+                "evidence {id} must have positive and negative tests"
+            ));
+        }
+        validate_unique_behavior_assertions(id, "positive", &evidence.positive)?;
+        validate_unique_behavior_assertions(id, "negative", &evidence.negative)?;
+        for negative in &evidence.negative {
+            if evidence.positive.iter().any(|positive| {
+                behavior_assertion_key(positive) == behavior_assertion_key(negative)
+            }) {
+                return Err(format!(
+                    "evidence {id} repeats an identical positive and negative assertion for {}",
+                    negative.test
+                ));
+            }
+        }
+        for test in evidence.positive.iter().chain(&evidence.negative) {
+            let path = Path::new(&test.file);
+            if path.is_absolute() || test.file.contains("..") {
+                return Err(format!("evidence {id} has unsafe test path {}", test.file));
+            }
+            let source = fs::read_to_string(path)
+                .map_err(|error| format!("read evidence test {}: {error}", path.display()))?;
+            if !contains_test_declaration(&source, &test.test)? {
+                return Err(format!(
+                    "evidence {id} test {} is absent from {}",
+                    test.test, test.file
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_behavior_assertions(
+    evidence_id: &str,
+    polarity: &str,
+    assertions: &[BehaviorTest],
+) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for assertion in assertions {
+        if !seen.insert(behavior_assertion_key(assertion)) {
+            return Err(format!(
+                "evidence {evidence_id} has a duplicate {polarity} assertion for {}",
+                assertion.test
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn behavior_assertion_key(assertion: &BehaviorTest) -> (&str, &str, &str) {
+    (&assertion.file, &assertion.test, &assertion.description)
+}
+
+fn validate_behavior_evidence_references(
+    evidence: &BTreeMap<String, BehaviorEvidence>,
+    referenced: &BTreeSet<String>,
+) -> Result<(), String> {
+    for id in evidence.keys() {
+        if !referenced.contains(id) {
+            return Err(format!("evidence {id} is referenced by no behavior"));
+        }
+    }
+    Ok(())
+}
+
+fn contains_test_declaration(source: &str, test_name: &str) -> Result<bool, String> {
+    let file =
+        syn::parse_file(source).map_err(|error| format!("parse Rust evidence source: {error}"))?;
+    Ok(attributes_allow_behavior_evidence(&file.attrs)
+        && enabled_test_declaration_count(&file.items, test_name) == 1)
+}
+
+fn enabled_test_declaration_count(items: &[syn::Item], test_name: &str) -> usize {
+    items
+        .iter()
+        .map(|item| match item {
+            syn::Item::Fn(function) => usize::from(is_enabled_test(function, test_name)),
+            syn::Item::Mod(module) if attributes_allow_behavior_evidence(&module.attrs) => {
+                module.content.as_ref().map_or(0, |(_, nested)| {
+                    enabled_test_declaration_count(nested, test_name)
+                })
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+fn is_enabled_test(function: &syn::ItemFn, test_name: &str) -> bool {
+    function.sig.ident == test_name
+        && function
+            .attrs
+            .iter()
+            .any(|attribute| attribute.path().is_ident("test"))
+        // Ledger evidence must execute in every supported build, not merely
+        // exist behind a target/feature condition or ignore.
+        && !function.attrs.iter().any(|attribute| {
+            ["ignore", "should_panic", "cfg", "cfg_attr"]
+                .iter()
+                .any(|name| attribute.path().is_ident(name))
+        })
+}
+
+fn attributes_allow_behavior_evidence(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().all(|attribute| {
+        if attribute.path().is_ident("cfg") {
+            // Unit tests conventionally live in a cfg(test) module. Any other
+            // module condition means the evidence is absent from some builds.
+            return attribute
+                .parse_args::<syn::Ident>()
+                .is_ok_and(|condition| condition == "test");
+        }
+        !attribute.path().is_ident("cfg_attr") && !attribute.path().is_ident("ignore")
+    })
+}
+
+fn resolve_donor_anchor(donor: &Path, anchor: DonorAnchorRule) -> Result<DonorAnchor, String> {
+    let source_path = Path::new(&anchor.source);
+    if source_path.is_absolute() || anchor.source.contains("..") {
+        return Err(format!("unsafe donor source {}", anchor.source));
+    }
+    let source = fs::read_to_string(donor.join(source_path))
+        .map_err(|error| format!("read donor source {}: {error}", anchor.source))?;
+    let matches = source.match_indices(&anchor.needle).collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(format!(
+            "donor anchor {:?} in {} matched {} times; expected exactly one",
+            anchor.needle,
+            anchor.source,
+            matches.len()
+        ));
+    }
+    let line = source[..matches[0].0]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    Ok(DonorAnchor {
+        source: anchor.source,
+        line,
+        needle: anchor.needle,
+    })
 }
 
 fn verify_donor(donor: &Path) -> Result<(), String> {
@@ -1392,6 +1759,219 @@ mod tests {
             rationale: "not implemented".into(),
             evidence: "test".into(),
         }
+    }
+
+    #[test]
+    fn behavior_evidence_requires_an_exact_test_declaration() {
+        // A renamed test whose new name extends the old one, or a comment that
+        // retains the old spelling, must not keep stale ledger evidence alive.
+        let source = "// fn expected\n#[test]\nfn expected_for_case() {}\n";
+        assert!(
+            !contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
+        );
+    }
+
+    #[test]
+    fn behavior_evidence_finds_tests_after_rust_comments() {
+        // Rust comments are item trivia and may legally separate an attribute
+        // from the function to which it applies.
+        let source =
+            "#[test]\n// rationale\n/* more\n * /* nested */ rationale\n */\nfn expected() {}\n";
+        assert!(
+            contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
+        );
+    }
+
+    #[test]
+    fn behavior_evidence_ignores_test_syntax_inside_raw_strings() {
+        let source = "const FIXTURE: &str = r#\"\n#[test]\nfn expected() {}\n\"#;\n";
+        assert!(
+            !contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
+        );
+    }
+
+    #[test]
+    fn behavior_evidence_rejects_disabled_or_conditional_tests() {
+        for source in [
+            "#[test]\n#[ignore]\nfn expected() {}\n",
+            "#[test]\n#[should_panic]\nfn expected() {}\n",
+            "#[test]\n#[cfg(any())]\nfn expected() {}\n",
+            "#[test]\n#[cfg_attr(all(), ignore)]\nfn expected() {}\n",
+        ] {
+            assert!(
+                !contains_test_declaration(source, "expected")
+                    .expect("test declaration matching must run"),
+                "disabled or conditional test must not certify evidence: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn behavior_evidence_rejects_conditionally_compiled_source_files() {
+        for source in [
+            "#![cfg(feature = \"optional\")]\n#[test]\nfn expected() {}\n",
+            "#![cfg_attr(all(), cfg(any()))]\n#[test]\nfn expected() {}\n",
+        ] {
+            assert!(
+                !contains_test_declaration(source, "expected")
+                    .expect("test declaration matching must run"),
+                "conditional source file must not certify evidence: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn behavior_evidence_allows_an_unconditional_source_file() {
+        let source = "#![allow(dead_code)]\n#[test]\nfn expected() {}\n";
+        assert!(
+            contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
+        );
+    }
+
+    #[test]
+    fn behavior_evidence_finds_unconditional_tests_in_nested_modules() {
+        let source = "mod nested {\n    #[test]\n    fn expected() {}\n}\n";
+        assert!(
+            contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
+        );
+    }
+
+    #[test]
+    fn behavior_evidence_rejects_ambiguous_test_names() {
+        // A stale assertion must not be kept alive by an unrelated test with
+        // the same leaf name in a different module.
+        let source = "mod first {\n    #[test]\n    fn expected() {}\n}\n\
+                      mod second {\n    #[test]\n    fn expected() {}\n}\n";
+        assert!(
+            !contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
+        );
+    }
+
+    #[test]
+    fn behavior_evidence_rejects_tests_in_conditional_modules() {
+        for module_attribute in [
+            "#[cfg(feature = \"optional\")]",
+            "#[cfg(any())]",
+            "#[cfg_attr(all(), cfg(any()))]",
+        ] {
+            let source = format!(
+                "{module_attribute}\nmod nested {{\n    #[test]\n    fn expected() {{}}\n}}\n"
+            );
+            assert!(
+                !contains_test_declaration(&source, "expected")
+                    .expect("test declaration matching must run"),
+                "conditional module must not certify evidence: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn behavior_evidence_allows_the_test_harness_module_condition() {
+        let source = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn expected() {}\n}\n";
+        assert!(
+            contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
+        );
+    }
+
+    #[test]
+    fn behavior_evidence_rejects_an_exact_duplicate_assertion() {
+        let assertion = BehaviorTest {
+            file: "tests/behavioral_compatibility.rs".into(),
+            test: "c_boundary_behaviors_are_explicitly_planned".into(),
+            description: "same assertion".into(),
+        };
+        let evidence = BTreeMap::from([(
+            "duplicate".into(),
+            BehaviorEvidence {
+                positive: vec![assertion.clone()],
+                negative: vec![assertion],
+            },
+        )]);
+
+        let error = validate_behavior_evidence(&evidence)
+            .expect_err("identical assertions must not represent both outcomes");
+        assert!(error.contains("duplicate"), "{error}");
+    }
+
+    #[test]
+    fn behavior_evidence_rejects_duplicates_within_each_polarity() {
+        let positive = BehaviorTest {
+            file: "src/main.rs".into(),
+            test: "behavior_evidence_rejects_duplicates_within_each_polarity".into(),
+            description: "positive assertion".into(),
+        };
+        let negative = BehaviorTest {
+            file: "src/main.rs".into(),
+            test: "behavior_evidence_allows_paired_assertions_from_one_test".into(),
+            description: "negative assertion".into(),
+        };
+
+        for (duplicate_positive, duplicate_negative) in [(true, false), (false, true)] {
+            let evidence = BTreeMap::from([(
+                "duplicate-polarity".into(),
+                BehaviorEvidence {
+                    positive: if duplicate_positive {
+                        vec![positive.clone(), positive.clone()]
+                    } else {
+                        vec![positive.clone()]
+                    },
+                    negative: if duplicate_negative {
+                        vec![negative.clone(), negative.clone()]
+                    } else {
+                        vec![negative.clone()]
+                    },
+                },
+            )]);
+
+            let error = validate_behavior_evidence(&evidence)
+                .expect_err("one polarity must not repeat an identical assertion");
+            assert!(error.contains("duplicate"), "{error}");
+        }
+    }
+
+    #[test]
+    fn behavior_evidence_allows_paired_assertions_from_one_test() {
+        let assertion = BehaviorTest {
+            file: "src/main.rs".into(),
+            test: "behavior_evidence_allows_paired_assertions_from_one_test".into(),
+            description: "acceptance outcome".into(),
+        };
+        let evidence = BTreeMap::from([(
+            "differential".into(),
+            BehaviorEvidence {
+                positive: vec![assertion.clone()],
+                negative: vec![BehaviorTest {
+                    description: "rejection outcome".into(),
+                    ..assertion
+                }],
+            },
+        )]);
+
+        validate_behavior_evidence(&evidence)
+            .expect("one differential test may prove distinct paired assertions");
+    }
+
+    #[test]
+    fn behavior_evidence_rejects_unreferenced_entries() {
+        let evidence = BTreeMap::from([(
+            "orphan".into(),
+            BehaviorEvidence {
+                positive: Vec::new(),
+                negative: Vec::new(),
+            },
+        )]);
+        let referenced = BTreeSet::new();
+
+        let error = validate_behavior_evidence_references(&evidence, &referenced)
+            .expect_err("orphan evidence must not reach the generated ledger");
+        assert!(error.contains("orphan"), "{error}");
     }
 
     #[test]

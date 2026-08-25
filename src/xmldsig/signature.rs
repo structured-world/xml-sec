@@ -27,10 +27,23 @@ use x509_parser::public_key::{ECPoint, PublicKey};
 use x509_parser::x509::SubjectPublicKeyInfo;
 
 use super::parse::SignatureAlgorithm;
+use crate::policy::EcdsaSignatureValueEncoding;
 
 pub(crate) fn signature_value_matches_algorithm(
     algorithm: SignatureAlgorithm,
     signature_value: &[u8],
+) -> bool {
+    signature_value_matches_algorithm_with_encoding(
+        algorithm,
+        signature_value,
+        EcdsaSignatureValueEncoding::XmlDsig,
+    )
+}
+
+pub(crate) fn signature_value_matches_algorithm_with_encoding(
+    algorithm: SignatureAlgorithm,
+    signature_value: &[u8],
+    encoding: EcdsaSignatureValueEncoding,
 ) -> bool {
     match algorithm {
         SignatureAlgorithm::DsaSha1 => signature_value.len() == 40,
@@ -44,11 +57,15 @@ pub(crate) fn signature_value_matches_algorithm(
         | SignatureAlgorithm::RsaSha512 => {
             (1..=crate::hard_limits::RSA_MODULUS_BIT_CEILING / 8).contains(&signature_value.len())
         }
-        SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384 => {
-            [32, 48, 66].into_iter().any(|component_len| {
-                classify_ecdsa_signature_encoding(signature_value, component_len).is_ok()
-            })
-        }
+        SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384 => [32, 48, 66]
+            .into_iter()
+            .any(|component_len| match encoding {
+                EcdsaSignatureValueEncoding::XmlDsig => signature_value.len() == component_len * 2,
+                EcdsaSignatureValueEncoding::XmlSecAsn1Der => {
+                    inspect_der_encoded_ecdsa_signature(signature_value, component_len)
+                        .is_ok_and(|value| value.is_some())
+                }
+            }),
     }
 }
 
@@ -56,6 +73,20 @@ pub(crate) fn signature_value_matches_spki(
     algorithm: SignatureAlgorithm,
     public_key_spki_der: &[u8],
     signature_value: &[u8],
+) -> Result<bool, SignatureVerificationError> {
+    signature_value_matches_spki_with_encoding(
+        algorithm,
+        public_key_spki_der,
+        signature_value,
+        EcdsaSignatureValueEncoding::XmlDsig,
+    )
+}
+
+pub(crate) fn signature_value_matches_spki_with_encoding(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signature_value: &[u8],
+    encoding: EcdsaSignatureValueEncoding,
 ) -> Result<bool, SignatureVerificationError> {
     let (rest, spki) = SubjectPublicKeyInfo::from_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
@@ -82,7 +113,14 @@ pub(crate) fn signature_value_matches_spki(
         (SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384, PublicKey::EC(ec)) => {
             validate_ec_public_key_encoding(&ec, &spki.subject_public_key.data)?;
             let (_, component_len) = ecdsa_curve_and_component_len(&spki, &ec)?;
-            classify_ecdsa_signature_encoding(signature_value, component_len)?;
+            match encoding {
+                EcdsaSignatureValueEncoding::XmlDsig
+                    if signature_value.len() == component_len * 2 => {}
+                EcdsaSignatureValueEncoding::XmlSecAsn1Der
+                    if inspect_der_encoded_ecdsa_signature(signature_value, component_len)?
+                        .is_some() => {}
+                _ => return Err(SignatureVerificationError::InvalidSignatureFormat),
+            }
             Ok(true)
         }
         (SignatureAlgorithm::HmacSha1, _) => {
@@ -133,8 +171,8 @@ pub enum SignatureVerificationError {
         uri: String,
     },
 
-    /// The provided ECDSA signature bytes were neither XMLDSig fixed-width
-    /// nor ASN.1 DER encoded.
+    /// The provided ECDSA signature bytes do not use the encoding selected by
+    /// the active verification policy.
     #[error("invalid ECDSA signature encoding")]
     InvalidSignatureFormat,
 }
@@ -163,11 +201,9 @@ pub fn verify_rsa_signature_pem(
 ///
 /// The PEM must contain a `PUBLIC KEY` block. The signature value is expected
 /// to use the XMLDSig fixed-width `r || s` format required by RFC 6931 /
-/// XMLDSig 1.1, but ASN.1 DER-encoded ECDSA signatures are also accepted as an
-/// interop fallback. Returns `Ok(false)` for signature mismatch and `Err` for
-/// algorithm/key/signature-format preparation errors (including
-/// `InvalidSignatureFormat` when the bytes are neither valid fixed-width
-/// `r || s` nor valid ASN.1 DER ECDSA).
+/// XMLDSig 1.1. Use [`verify_ecdsa_signature_pem_with_encoding`] to opt into
+/// libxmlsec1's ASN.1 compatibility representation. Returns `Ok(false)` for a
+/// signature mismatch and `Err` for key or signature-format errors.
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_ecdsa_signature_pem(
     algorithm: SignatureAlgorithm,
@@ -175,12 +211,31 @@ pub fn verify_ecdsa_signature_pem(
     signed_data: &[u8],
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
+    verify_ecdsa_signature_pem_with_encoding(
+        algorithm,
+        public_key_pem,
+        signed_data,
+        signature_value,
+        EcdsaSignatureValueEncoding::XmlDsig,
+    )
+}
+
+/// Verify an ECDSA signature using an explicit XMLDSig compatibility encoding.
+#[must_use = "discarding the verification result skips signature validation"]
+pub fn verify_ecdsa_signature_pem_with_encoding(
+    algorithm: SignatureAlgorithm,
+    public_key_pem: &str,
+    signed_data: &[u8],
+    signature_value: &[u8],
+    encoding: EcdsaSignatureValueEncoding,
+) -> Result<bool, SignatureVerificationError> {
     let public_key_spki_der = parse_public_key_pem(public_key_pem)?;
-    verify_ecdsa_signature_spki(
+    verify_ecdsa_signature_spki_with_encoding(
         algorithm,
         &public_key_spki_der,
         signed_data,
         signature_value,
+        encoding,
     )
 }
 
@@ -365,16 +420,33 @@ pub(crate) fn verify_dsa_signature_spki_primitive(
 /// Verify an ECDSA XMLDSig signature using DER-encoded SPKI public key bytes.
 ///
 /// The input must be an X.509 `SubjectPublicKeyInfo` wrapping an EC key. The
-/// signature value may be either XMLDSig fixed-width `r || s` bytes or ASN.1
-/// DER-encoded ECDSA for interop compatibility. Returns `Ok(false)` for
-/// signature mismatch and `Err` for algorithm/key/signature-format preparation
-/// errors.
+/// signature value must use XMLDSig fixed-width `r || s` bytes. Use
+/// [`verify_ecdsa_signature_spki_with_encoding`] to select libxmlsec1's ASN.1
+/// compatibility representation explicitly.
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_ecdsa_signature_spki(
     algorithm: SignatureAlgorithm,
     public_key_spki_der: &[u8],
     signed_data: &[u8],
     signature_value: &[u8],
+) -> Result<bool, SignatureVerificationError> {
+    verify_ecdsa_signature_spki_with_encoding(
+        algorithm,
+        public_key_spki_der,
+        signed_data,
+        signature_value,
+        EcdsaSignatureValueEncoding::XmlDsig,
+    )
+}
+
+/// Verify an ECDSA signature using an explicit XMLDSig compatibility encoding.
+#[must_use = "discarding the verification result skips signature validation"]
+pub fn verify_ecdsa_signature_spki_with_encoding(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+    encoding: EcdsaSignatureValueEncoding,
 ) -> Result<bool, SignatureVerificationError> {
     if !matches!(
         algorithm,
@@ -398,8 +470,22 @@ pub fn verify_ecdsa_signature_spki(
         PublicKey::EC(ec) => {
             validate_ec_public_key_encoding(&ec, &spki.subject_public_key.data)?;
             let (curve, component_len) = ecdsa_curve_and_component_len(&spki, &ec)?;
-            let signature_encoding =
-                classify_ecdsa_signature_encoding(signature_value, component_len)?;
+            let signature_encoding = match encoding {
+                EcdsaSignatureValueEncoding::XmlDsig => {
+                    if signature_value.len() != component_len * 2 {
+                        return Err(SignatureVerificationError::InvalidSignatureFormat);
+                    }
+                    EcdsaSignatureEncoding::XmlDsigFixed
+                }
+                EcdsaSignatureValueEncoding::XmlSecAsn1Der => {
+                    if inspect_der_encoded_ecdsa_signature(signature_value, component_len)?
+                        .is_none()
+                    {
+                        return Err(SignatureVerificationError::InvalidSignatureFormat);
+                    }
+                    EcdsaSignatureEncoding::Asn1Der
+                }
+            };
             let prehash = match algorithm {
                 SignatureAlgorithm::EcdsaSha256 => Sha256::digest(signed_data).to_vec(),
                 SignatureAlgorithm::EcdsaSha384 => Sha384::digest(signed_data).to_vec(),
@@ -430,6 +516,26 @@ pub fn verify_ecdsa_signature_spki(
             uri: algorithm.uri().to_string(),
         }),
     }
+}
+
+/// Verify the ASN.1 DER ECDSA representation required by X.509 signatures.
+///
+/// This is intentionally separate from the XMLDSig policy-aware entry point:
+/// certificate signature framing is fixed by X.509 and must not inherit the
+/// document's `SignatureValue` compatibility mode.
+pub(crate) fn verify_ecdsa_signature_spki_asn1_der(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationError> {
+    verify_ecdsa_signature_spki_with_encoding(
+        algorithm,
+        public_key_spki_der,
+        signed_data,
+        signature_value,
+        EcdsaSignatureValueEncoding::XmlSecAsn1Der,
+    )
 }
 
 fn validate_rsa_public_key(
@@ -548,17 +654,6 @@ fn verify_p256_signature(
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
             Ok(key.verify_prehash(prehash, &signature).is_ok())
         }
-        EcdsaSignatureEncoding::Ambiguous => {
-            if let Ok(signature) = P256Signature::from_der(signature_value)
-                && key.verify_prehash(prehash, &signature).is_ok()
-            {
-                return Ok(true);
-            }
-
-            let signature = P256Signature::from_slice(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
     }
 }
 
@@ -576,17 +671,6 @@ fn verify_p384_signature(
         }
         EcdsaSignatureEncoding::Asn1Der => {
             let signature = P384Signature::from_der(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
-        EcdsaSignatureEncoding::Ambiguous => {
-            if let Ok(signature) = P384Signature::from_der(signature_value)
-                && key.verify_prehash(prehash, &signature).is_ok()
-            {
-                return Ok(true);
-            }
-
-            let signature = P384Signature::from_slice(signature_value)
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
             Ok(key.verify_prehash(prehash, &signature).is_ok())
         }
@@ -610,17 +694,6 @@ fn verify_p521_signature(
                 .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
             Ok(key.verify_prehash(prehash, &signature).is_ok())
         }
-        EcdsaSignatureEncoding::Ambiguous => {
-            if let Ok(signature) = P521Signature::from_der(signature_value)
-                && key.verify_prehash(prehash, &signature).is_ok()
-            {
-                return Ok(true);
-            }
-
-            let signature = P521Signature::from_slice(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
     }
 }
 
@@ -628,27 +701,76 @@ fn verify_p521_signature(
 enum EcdsaSignatureEncoding {
     XmlDsigFixed,
     Asn1Der,
-    Ambiguous,
 }
 
-fn classify_ecdsa_signature_encoding(
-    signature_value: &[u8],
-    component_len: usize,
-) -> Result<EcdsaSignatureEncoding, SignatureVerificationError> {
-    let expected_len = component_len
-        .checked_mul(2)
-        .ok_or(SignatureVerificationError::InvalidSignatureFormat)?;
-
-    match inspect_der_encoded_ecdsa_signature(signature_value, component_len) {
-        Ok(Some(())) if signature_value.len() == expected_len => {
-            Ok(EcdsaSignatureEncoding::Ambiguous)
-        }
-        Ok(Some(())) => Ok(EcdsaSignatureEncoding::Asn1Der),
-        Ok(None) | Err(_) if signature_value.len() == expected_len => {
-            Ok(EcdsaSignatureEncoding::XmlDsigFixed)
-        }
-        Ok(None) | Err(_) => Err(SignatureVerificationError::InvalidSignatureFormat),
+pub(crate) fn encode_ecdsa_signature_as_der(signature: &[u8]) -> Option<Vec<u8>> {
+    if signature.is_empty() || !signature.len().is_multiple_of(2) {
+        return None;
     }
+    let component_len = signature.len() / 2;
+    let mut content = Vec::with_capacity(signature.len() + 8);
+    encode_der_integer(&signature[..component_len], &mut content);
+    encode_der_integer(&signature[component_len..], &mut content);
+
+    let mut encoded = Vec::with_capacity(content.len() + 3);
+    encoded.push(0x30);
+    encode_der_length(content.len(), &mut encoded);
+    encoded.extend_from_slice(&content);
+    Some(encoded)
+}
+
+pub(crate) fn maximum_ecdsa_der_signature_len(raw_signature_len: usize) -> Option<usize> {
+    if raw_signature_len == 0 || !raw_signature_len.is_multiple_of(2) {
+        return None;
+    }
+    let component_len = raw_signature_len / 2;
+    let integer_content_len = component_len.checked_add(1)?;
+    let integer_len = 1_usize
+        .checked_add(der_length_octets(integer_content_len)?)?
+        .checked_add(integer_content_len)?;
+    let sequence_content_len = integer_len.checked_mul(2)?;
+    1_usize
+        .checked_add(der_length_octets(sequence_content_len)?)?
+        .checked_add(sequence_content_len)
+}
+
+fn encode_der_integer(component: &[u8], output: &mut Vec<u8>) {
+    let first_nonzero = component
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(component.len() - 1);
+    let magnitude = &component[first_nonzero..];
+    let needs_sign_octet = magnitude[0] & 0x80 != 0;
+    output.push(0x02);
+    encode_der_length(magnitude.len() + usize::from(needs_sign_octet), output);
+    if needs_sign_octet {
+        output.push(0);
+    }
+    output.extend_from_slice(magnitude);
+}
+
+fn encode_der_length(len: usize, output: &mut Vec<u8>) {
+    if len < 128 {
+        output.push(len as u8);
+        return;
+    }
+
+    let bytes = len.to_be_bytes();
+    let first_nonzero = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .expect("non-short DER lengths are nonzero");
+    let encoded = &bytes[first_nonzero..];
+    output.push(0x80 | encoded.len() as u8);
+    output.extend_from_slice(encoded);
+}
+
+fn der_length_octets(len: usize) -> Option<usize> {
+    if len < 128 {
+        return Some(1);
+    }
+    let significant_bytes = (usize::BITS - len.leading_zeros()).div_ceil(8) as usize;
+    significant_bytes.checked_add(1)
 }
 
 fn inspect_der_encoded_ecdsa_signature(
@@ -847,14 +969,12 @@ mod tests {
     }
 
     #[test]
-    fn der_like_prefix_with_fixed_width_len_is_classified_as_raw() {
+    fn der_like_prefix_with_fixed_width_len_is_not_valid_der() {
         let mut signature = vec![0xAA_u8; 96];
         signature[0] = 0x30;
         signature[1] = 0x20;
 
-        let encoding = classify_ecdsa_signature_encoding(&signature, 48)
-            .expect("same-width signature with invalid DER must fall back to raw");
-        assert_eq!(encoding, EcdsaSignatureEncoding::XmlDsigFixed);
+        assert!(inspect_der_encoded_ecdsa_signature(&signature, 48).is_err());
     }
 
     #[test]
@@ -876,16 +996,17 @@ mod tests {
     }
 
     #[test]
-    fn same_width_valid_der_is_marked_ambiguous() {
+    fn same_width_valid_der_is_recognized_in_explicit_mode() {
         let mut signature = Vec::with_capacity(64);
         signature.extend_from_slice(&[0x30, 0x3e, 0x02, 0x1d]);
         signature.extend(std::iter::repeat_n(0x11_u8, 29));
         signature.extend_from_slice(&[0x02, 0x1d]);
         signature.extend(std::iter::repeat_n(0x22_u8, 29));
 
-        let encoding = classify_ecdsa_signature_encoding(&signature, 32)
-            .expect("same-width structurally valid DER should classify as ambiguous");
-        assert_eq!(encoding, EcdsaSignatureEncoding::Ambiguous);
+        assert_eq!(
+            inspect_der_encoded_ecdsa_signature(&signature, 32).unwrap(),
+            Some(())
+        );
     }
 
     #[test]
@@ -896,10 +1017,45 @@ mod tests {
         signature.extend_from_slice(&[0x02, 0x21, 0x01]);
         signature.extend(std::iter::repeat_n(0x22_u8, 32));
 
-        let encoding = classify_ecdsa_signature_encoding(&signature, 32);
+        let encoding = inspect_der_encoded_ecdsa_signature(&signature, 32);
         assert!(matches!(
             encoding,
             Err(SignatureVerificationError::InvalidSignatureFormat)
         ));
+    }
+
+    #[test]
+    fn fixed_width_ecdsa_is_encoded_as_canonical_der() {
+        // Leading zeroes are stripped, while a high-bit magnitude receives the
+        // sign-protecting zero octet required by DER INTEGER canonicalization.
+        let mut raw = vec![0_u8; 64];
+        raw[31] = 1;
+        raw[32] = 0x80;
+
+        let encoded = encode_ecdsa_signature_as_der(&raw).unwrap();
+        assert_eq!(
+            encoded,
+            [
+                &[0x30, 0x26, 0x02, 0x01, 0x01, 0x02, 0x21, 0x00][..],
+                &[0x80],
+                &[0; 31],
+            ]
+            .concat()
+        );
+        assert_eq!(
+            inspect_der_encoded_ecdsa_signature(&encoded, 32).unwrap(),
+            Some(())
+        );
+    }
+
+    #[test]
+    fn maximum_der_length_covers_supported_curve_widths() {
+        // Signing preflight must reserve the worst-case canonical DER framing
+        // for every supported curve and reject impossible raw widths.
+        assert_eq!(maximum_ecdsa_der_signature_len(64), Some(72));
+        assert_eq!(maximum_ecdsa_der_signature_len(96), Some(104));
+        assert_eq!(maximum_ecdsa_der_signature_len(132), Some(141));
+        assert_eq!(maximum_ecdsa_der_signature_len(0), None);
+        assert_eq!(maximum_ecdsa_der_signature_len(65), None);
     }
 }

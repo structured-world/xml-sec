@@ -67,10 +67,11 @@ Still in progress:
 - Complete XMLDSig and XMLEnc conformance-suite classification
 - Expanded fuzz coverage, benchmarks, production hardening, and API stabilization
 
-The [libxmlsec1 compatibility ledger](docs/compatibility-ledger.md) tracks the
-complete upstream 1.3.13 public surface as generated, evidence-linked data. It
-separates implemented wire behavior from policy-gated compatibility, planned
-parity work, provider-specific differences, and the not-yet-implemented C ABI.
+The [libxmlsec1 compatibility ledgers](docs/compatibility-ledger.md) track both
+the complete upstream 1.3.13 public surface and operation-level behavior as
+generated, evidence-linked data. They separate implemented wire behavior from
+explicit compatibility policy, planned parity work, provider differences, and
+the not-yet-implemented C ABI.
 
 ## Native CLI
 

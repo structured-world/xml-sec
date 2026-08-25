@@ -45,6 +45,11 @@ jobs:
           donors/xmlsec
           compatibility/libxmlsec1-1.3.13-rules.json
           compatibility/libxmlsec1-1.3.13.json
+      - run: >-
+          cargo run -p xml-sec-capability-ledger -- behavior-check
+          donors/xmlsec
+          compatibility/libxmlsec1-1.3.13-behavior-rules.json
+          compatibility/libxmlsec1-1.3.13-behavior.json
 
   build-matrix:
     name: build-matrix (${{ matrix.rust }})

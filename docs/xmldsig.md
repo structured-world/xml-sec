@@ -95,9 +95,26 @@ Before document-signature provider dispatch, the facade calls
 `VerifyingKey::validate_signature_value`. Built-in resolved keys enforce the exact RSA modulus or
 EC curve width there, so a permissive custom provider cannot reinterpret malformed XMLDSig wire
 framing. Custom opaque keys must override that hook when their accepted framing depends on key
-metadata unavailable through the generic algorithm URI.
+metadata unavailable through the generic algorithm URI. Providers that implement policy-selected
+framing must also override `validate_signature_value_with_policy` and `verify_with_policy`; their
+defaults intentionally preserve the standard-only hooks.
 
 ## Verification Policy
+
+ECDSA `SignatureValue` uses the XMLDSig fixed-width `r || s` representation by
+default for both signing and verification. Set
+`SigningPolicy::ecdsa_signature_value_encoding` or
+`VerificationPolicy::ecdsa_signature_value_encoding` to
+`EcdsaSignatureValueEncoding::XmlSecAsn1Der` only at a trusted compatibility
+boundary. DER is never auto-detected. Same-document bare fragments use
+`TransformPolicy::same_document_id_semantics`; the library default requires the
+standards form. `SameDocumentIdSemantics::XmlSecBarename` models libxmlsec1's
+default barename grammar backed by its single-quoted `xpointer(id(...))` wrapper,
+while preserving the barename rule that excludes comments. In contrast,
+`SameDocumentIdSemantics::XmlSecVisa3d` performs direct registered-ID lookup.
+The native CLI selects the donor barename mode by default and the direct mode for
+`--enable-visa3d-hack`. ID registrations remain request context and duplicate
+IDs fail in every mode.
 
 For production verification, configure `KeyResolverConfig::lookup_certs` with untrusted
 certificates that selector-only `X509Data` may address or use as path intermediates, and configure
@@ -212,7 +229,9 @@ rather than bypassing a separate policy gate. The decision applies consistently 
 document and caller-supplied detached XML parsed by node-set transforms. Direct transform callers
 can set the corresponding option with `TransformOptions::allow_internal_dtd(true)`. Signing uses
 `SigningPolicy::xml.allow_internal_dtd` across its complete pipeline. External entity resolution
-remains disabled. XSLT is intentionally not executed because transforms operate on
+remains disabled. Internal-DTD parsing does not import DTD attribute types into the owned Rust ID
+index; attributes outside the built-in XMLDSig spellings and `xml:id` still require an explicit
+request-scoped ID registration. XSLT is intentionally not executed because transforms operate on
 attacker-controlled documents; an authenticated Manifest reference using unsupported XSLT is
 reported as an invalid per-reference result without changing core `SignedInfo` validity.
 

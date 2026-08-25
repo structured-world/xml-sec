@@ -12,10 +12,10 @@ use x509_parser::{
 };
 
 use super::signature::{
-    signature_value_matches_spki, validate_dsa_signature_spki_with_minimum,
-    validate_rsa_signature_spki_with_minimum, verify_dsa_signature_spki_primitive,
-    verify_dsa_signature_spki_with_minimum, verify_rsa_signature_spki_primitive,
-    verify_rsa_signature_spki_with_minimum,
+    signature_value_matches_spki, signature_value_matches_spki_with_encoding,
+    validate_dsa_signature_spki_with_minimum, validate_rsa_signature_spki_with_minimum,
+    verify_dsa_signature_spki_primitive, verify_dsa_signature_spki_with_minimum,
+    verify_rsa_signature_spki_primitive, verify_rsa_signature_spki_with_minimum,
 };
 use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
@@ -27,7 +27,7 @@ use super::{
         parse_x509_certificate, x509_certificate_matches_any_selector,
         x509_data_has_lookup_identifiers, x509_selector_categories_match_chain,
     },
-    verify_ecdsa_signature_spki,
+    verify_ecdsa_signature_spki, verify_ecdsa_signature_spki_with_encoding,
     x509::verify_x509_certificate_chain_with_provider,
 };
 
@@ -152,6 +152,24 @@ impl VerifyingKey for VerificationKey {
             .map_err(DsigError::Crypto)
     }
 
+    fn validate_signature_value_with_policy(
+        &self,
+        policy: &crate::policy::VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        if algorithm != self.algorithm {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        signature_value_matches_spki_with_encoding(
+            algorithm,
+            &self.public_key_bytes,
+            signature_value,
+            policy.ecdsa_signature_value_encoding,
+        )
+        .map_err(DsigError::Crypto)
+    }
+
     fn verify(
         &self,
         algorithm: SignatureAlgorithm,
@@ -191,6 +209,32 @@ impl VerifyingKey for VerificationKey {
         };
         result.map_err(DsigError::Crypto)
     }
+
+    fn verify_with_policy(
+        &self,
+        policy: &crate::policy::VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        if algorithm != self.algorithm {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        if matches!(
+            algorithm,
+            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384
+        ) {
+            return verify_ecdsa_signature_spki_with_encoding(
+                algorithm,
+                &self.public_key_bytes,
+                signed_data,
+                signature_value,
+                policy.ecdsa_signature_value_encoding,
+            )
+            .map_err(DsigError::Crypto);
+        }
+        self.verify(algorithm, signed_data, signature_value)
+    }
 }
 
 struct PolicyBoundVerificationKey {
@@ -207,6 +251,16 @@ impl VerifyingKey for PolicyBoundVerificationKey {
     ) -> Result<bool, DsigError> {
         self.key
             .validate_signature_value(algorithm, signature_value)
+    }
+
+    fn validate_signature_value_with_policy(
+        &self,
+        policy: &crate::policy::VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.key
+            .validate_signature_value_with_policy(policy, algorithm, signature_value)
     }
 
     fn verify(
@@ -239,6 +293,24 @@ impl VerifyingKey for PolicyBoundVerificationKey {
             _ => return self.key.verify(algorithm, signed_data, signature_value),
         };
         result.map_err(DsigError::Crypto)
+    }
+
+    fn verify_with_policy(
+        &self,
+        policy: &crate::policy::VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        if matches!(
+            algorithm,
+            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384
+        ) {
+            return self
+                .key
+                .verify_with_policy(policy, algorithm, signed_data, signature_value);
+        }
+        self.verify(algorithm, signed_data, signature_value)
     }
 }
 

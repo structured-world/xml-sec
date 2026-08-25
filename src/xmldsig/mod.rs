@@ -86,7 +86,8 @@ pub use sign::{
 };
 pub use signature::{
     SignatureVerificationError, verify_dsa_signature_spki, verify_ecdsa_signature_pem,
-    verify_ecdsa_signature_spki, verify_rsa_signature_pem, verify_rsa_signature_spki,
+    verify_ecdsa_signature_pem_with_encoding, verify_ecdsa_signature_spki,
+    verify_ecdsa_signature_spki_with_encoding, verify_rsa_signature_pem, verify_rsa_signature_spki,
 };
 pub use transforms::{
     BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, ENVELOPED_SIGNATURE_URI, Transform,

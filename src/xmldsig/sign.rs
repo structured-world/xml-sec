@@ -39,6 +39,7 @@ use super::parse::{
     MAX_REFERENCES_PER_SIGNATURE, SignatureAlgorithm, XMLDSIG_NS,
     parse_signed_info_with_xpath_budget,
 };
+use super::signature::{encode_ecdsa_signature_as_der, maximum_ecdsa_der_signature_len};
 use super::transforms::{
     Transform, TransformExecutionBudget, TransformOptions, XPathHereSemantics,
     XPathSignatureParseBudget, execute_transforms_with_dependency_nodes,
@@ -958,8 +959,13 @@ impl<'a> SignContext<'a> {
         }
         let expected_signature_len =
             expected_signature_output_len(self.signing_key, algorithm, &self.policy)?;
+        let projected_signature_len = projected_signature_output_len(
+            algorithm,
+            expected_signature_len,
+            self.policy.ecdsa_signature_value_encoding,
+        )?;
         let encoded_signature_len =
-            padded_base64_len_for_xml(expected_signature_len, &self.policy)?;
+            padded_base64_len_for_xml(projected_signature_len, &self.policy)?;
         let projected_document_len = projected_signature_value_output_len_at_index_with_options(
             &with_digests,
             encoded_signature_len,
@@ -970,7 +976,7 @@ impl<'a> SignContext<'a> {
             .resources
             .validate_xml_document_len(projected_document_len)?;
         let signature_placeholder =
-            zero_base64_placeholder(expected_signature_len, encoded_signature_len);
+            zero_base64_placeholder(projected_signature_len, encoded_signature_len);
         fill_signature_value_at_index_with_options(
             &with_digests,
             &signature_placeholder,
@@ -984,6 +990,11 @@ impl<'a> SignContext<'a> {
             self.provider
                 .sign(self.signing_key, algorithm, &canonical_signed_info)?;
         validate_signature_output(expected_signature_len, &signature_value)?;
+        let signature_value = encode_signature_output(
+            algorithm,
+            signature_value,
+            self.policy.ecdsa_signature_value_encoding,
+        )?;
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature_value);
         let signed = fill_signature_value_at_index_with_options(
             &with_digests,
@@ -1056,6 +1067,42 @@ impl<'a> SignContext<'a> {
     }
 }
 
+fn projected_signature_output_len(
+    algorithm: SignatureAlgorithm,
+    raw_signature_len: usize,
+    encoding: crate::policy::EcdsaSignatureValueEncoding,
+) -> Result<usize, SigningError> {
+    if matches!(
+        (algorithm, encoding),
+        (
+            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384,
+            crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der
+        )
+    ) {
+        return maximum_ecdsa_der_signature_len(raw_signature_len)
+            .ok_or(SigningKeyError::InvalidPublicKeyInfo.into());
+    }
+    Ok(raw_signature_len)
+}
+
+fn encode_signature_output(
+    algorithm: SignatureAlgorithm,
+    signature: Vec<u8>,
+    encoding: crate::policy::EcdsaSignatureValueEncoding,
+) -> Result<Vec<u8>, SigningError> {
+    if matches!(
+        (algorithm, encoding),
+        (
+            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384,
+            crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der
+        )
+    ) {
+        return encode_ecdsa_signature_as_der(&signature)
+            .ok_or(SigningKeyError::InvalidPublicKeyInfo.into());
+    }
+    Ok(signature)
+}
+
 #[derive(Debug, Clone)]
 struct SigningReference {
     uri: String,
@@ -1125,7 +1172,13 @@ fn compute_reference_digest_values_with_options(
         transform_options,
         provider,
         execution_budget,
-        id_attributes,
+        SigningUriResolution {
+            id_attributes,
+            same_document_id_semantics: policy.map_or(
+                crate::policy::SameDocumentIdSemantics::Specification,
+                |policy| policy.transforms.same_document_id_semantics,
+            ),
+        },
     )
 }
 
@@ -1219,6 +1272,7 @@ fn fill_reference_digest_values_in_dependency_order(
         transform_options,
         &budgets.transforms,
         id_attributes,
+        policy.transforms.same_document_id_semantics,
     )?;
     let mut filled = xml.to_owned();
     for level in dependency_plan {
@@ -1280,7 +1334,10 @@ fn fill_reference_digest_values_in_dependency_order(
             transform_options,
             provider,
             &budgets.transforms,
-            id_attributes,
+            SigningUriResolution {
+                id_attributes,
+                same_document_id_semantics: policy.transforms.same_document_id_semantics,
+            },
         )?;
         if computed.len() != destinations.len() {
             return Err(SigningDigestError::InvalidStructure(
@@ -1322,8 +1379,10 @@ fn reference_dependency_levels(
     transform_options: TransformOptions,
     execution_budget: &TransformExecutionBudget,
     id_attributes: &[crate::IdAttributeRegistration],
+    same_document_id_semantics: crate::policy::SameDocumentIdSemantics,
 ) -> Result<Vec<Vec<usize>>, SigningDigestError> {
-    let resolver = UriReferenceResolver::with_id_registrations(doc, id_attributes);
+    let resolver = UriReferenceResolver::with_id_registrations(doc, id_attributes)
+        .with_same_document_id_semantics(same_document_id_semantics);
     let terminal_signature_value_index = references.len();
     let signature_value = find_required_child(signature, "SignatureValue")?;
     let mut tracked_mutable_nodes = references
@@ -1454,6 +1513,11 @@ fn validate_signing_references(
     Ok(())
 }
 
+struct SigningUriResolution<'a> {
+    id_attributes: &'a [crate::IdAttributeRegistration],
+    same_document_id_semantics: crate::policy::SameDocumentIdSemantics,
+}
+
 fn compute_signing_reference_digests(
     doc: &Document<'_>,
     signature: Node<'_, '_>,
@@ -1461,9 +1525,10 @@ fn compute_signing_reference_digests(
     transform_options: TransformOptions,
     provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
-    id_attributes: &[crate::IdAttributeRegistration],
+    uri_resolution: SigningUriResolution<'_>,
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
-    let resolver = UriReferenceResolver::with_id_registrations(doc, id_attributes);
+    let resolver = UriReferenceResolver::with_id_registrations(doc, uri_resolution.id_attributes)
+        .with_same_document_id_semantics(uri_resolution.same_document_id_semantics);
     references
         .into_iter()
         .enumerate()

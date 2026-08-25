@@ -51,6 +51,28 @@ fn signature_template_without_key_info() -> &'static str {
 </Signature>"##
 }
 
+fn ecdsa_signature_template() -> &'static str {
+    r##"<root><payload ID="payload">payload</payload><Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
+<SignedInfo>
+<CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+<SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"/>
+<Reference URI="#payload"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference>
+</SignedInfo>
+<SignatureValue/>
+</Signature></root>"##
+}
+
+fn visa3d_signature_template() -> &'static str {
+    r##"<root><payload ID="visa'3d">payload</payload><Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
+<SignedInfo>
+<CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+<SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+<Reference URI="#visa'3d"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference>
+</SignedInfo>
+<SignatureValue/>
+</Signature></root>"##
+}
+
 fn signature_template_with_key_info(key_info: &str) -> String {
     signature_template_without_key_info()
         .replacen(
@@ -152,6 +174,167 @@ fn signs_verifies_and_rejects_tampering_through_process_api() {
         .unwrap();
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("invalid"));
+}
+
+#[test]
+fn cli_asn1_signature_mode_requires_the_explicit_donor_flag() {
+    // The compatibility option controls both emitted and accepted framing;
+    // standards-default verification must not auto-detect DER.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("ecdsa-template.xml");
+    let signed = temp.path().join("ecdsa-signed.xml");
+    fs::write(&template, ecdsa_signature_template()).unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/ec/ec-prime256v1-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem");
+
+    let sign = Command::new(binary())
+        .args(["sign", "--enable-asn1-signatures-hack", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--output"])
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let signed_xml = fs::read_to_string(&signed).unwrap();
+    let document = roxmltree::Document::parse(&signed_xml).unwrap();
+    let encoded = document
+        .descendants()
+        .find(|node| node.has_tag_name("SignatureValue"))
+        .and_then(|node| node.text())
+        .unwrap();
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .unwrap();
+    assert_eq!(signature.first(), Some(&0x30));
+    assert_ne!(signature.len(), 64);
+
+    let rejected = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("invalid ECDSA signature encoding"));
+
+    let accepted = Command::new(binary())
+        .args(["verify", "--enable-asn1-signatures-hack", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+}
+
+#[test]
+fn cli_visa3d_mode_bypasses_xpointer_for_registered_ids() {
+    // The apostrophe makes libxmlsec1's default xpointer(id('...')) wrapper
+    // invalid. Visa3D mode performs direct registered-ID lookup instead.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("visa3d-template.xml");
+    let signed = temp.path().join("visa3d-signed.xml");
+    fs::write(&template, visa3d_signature_template()).unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+
+    let rejected = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    let rejected_stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        rejected_stderr.contains("unsupported URI: #visa'3d"),
+        "unexpected standards-mode diagnostic: {rejected_stderr}"
+    );
+
+    let sign = Command::new(binary())
+        .args(["sign", "--enable-visa3d-hack", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--output"])
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let default_verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(!default_verify.status.success());
+
+    let compatible_verify = Command::new(binary())
+        .args(["verify", "--enable-visa3d-hack", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        compatible_verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compatible_verify.stderr)
+    );
+}
+
+#[test]
+fn cli_default_xpointer_mode_accepts_numeric_registered_ids() {
+    // libxmlsec1's default wraps a bare ID in xpointer(id('...')), so a numeric
+    // registered value works without enabling the direct Visa3D lookup path.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("numeric-id-template.xml");
+    let signed = temp.path().join("numeric-id-signed.xml");
+    fs::write(
+        &template,
+        visa3d_signature_template().replace("visa'3d", "12345"),
+    )
+    .unwrap();
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+
+    let sign = Command::new(binary())
+        .args(["sign", "--add-id-attr", "ID", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--output"])
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--add-id-attr", "ID", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
 }
 
 #[test]

@@ -803,6 +803,8 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
     let behavior_compatible = BTreeSet::from([
         "add-id-attr",
         "binary-data",
+        "enable-asn1-signatures-hack",
+        "enable-visa3d-hack",
         "help",
         "id-attr",
         "ignore-manifests",

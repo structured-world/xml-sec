@@ -232,6 +232,7 @@ pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
     option_spec!("xml-data", [], VALUE, false, SINGLE),
     option_spec!("session-key", [], VALUE, false, SINGLE),
     option_spec!("url-map", [], VALUE, true, MULTIPLE),
+    option_spec!("enable-visa3d-hack", [], FLAG, false, SINGLE),
     option_spec!("enable-asn1-signatures-hack", [], FLAG, false, SINGLE),
     option_spec!("help", ["h"], FLAG, false, SINGLE),
 ];

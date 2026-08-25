@@ -9,11 +9,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod xmlsec1;
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::policy::{
+    EcdsaSignatureValueEncoding, SameDocumentIdSemantics, SigningPolicy, TransformPolicy,
+    VerificationPolicy,
+};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, DsigStatus, EcdsaP256SigningKey, EcdsaP384SigningKey,
     FailureReason, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
-    SignatureBuilder, SigningKey, Transform, VerifyContext, XPathExpression, XPathFilter,
-    XPathFilterOperation,
+    SignatureBuilder, SigningKey, SigningPublicKeyInfo, Transform, VerificationKey, VerifyContext,
+    XPathExpression, XPathFilter, XPathFilterOperation,
 };
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -148,6 +152,158 @@ fn xmlsec1_version_gate_requires_pinned_snapshot() {
             "malformed xmlsec1 version output {malformed:?} must fail closed"
         );
     }
+}
+
+#[test]
+fn asn1_ecdsa_compatibility_matches_pinned_xmlsec1() {
+    // The upstream vector is intentionally invalid under XMLDSig framing and
+    // valid only when both implementations select libxmlsec1's ASN.1 mode.
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
+        return;
+    }
+    let fixture = Path::new(
+        "donors/xmlsec/tests/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256-with-asn1.xml",
+    );
+    let public_key = Path::new("donors/xmlsec/tests/keys/ec/ec-prime256v1-pubkey.pem");
+    let donor_key_option = "--pubkey-pem:TestKeyName-ec-prime256v1";
+
+    let donor_default = xmlsec1::command()
+        .args(["--verify", donor_key_option])
+        .arg(public_key)
+        .arg(fixture)
+        .output()
+        .expect("pinned xmlsec1 must run");
+    assert!(!donor_default.status.success());
+    let donor_compatible = xmlsec1::command()
+        .args([
+            "--verify",
+            "--enable-asn1-signatures-hack",
+            donor_key_option,
+        ])
+        .arg(public_key)
+        .arg(fixture)
+        .output()
+        .expect("pinned xmlsec1 must run");
+    assert!(
+        donor_compatible.status.success(),
+        "{}",
+        String::from_utf8_lossy(&donor_compatible.stderr)
+    );
+
+    let xml = fs::read_to_string(fixture).expect("upstream ASN.1 fixture must load");
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&fs::read(public_key).unwrap())
+        .expect("upstream EC public key must parse");
+    let key = VerificationKey {
+        algorithm: SignatureAlgorithm::EcdsaSha256,
+        public_key_bytes: pem.contents,
+        certificate_der: None,
+        name: Some("TestKeyName-ec-prime256v1".into()),
+    };
+    assert!(VerifyContext::new().key(&key).verify(&xml).is_err());
+    let policy = VerificationPolicy {
+        ecdsa_signature_value_encoding: EcdsaSignatureValueEncoding::XmlSecAsn1Der,
+        ..VerificationPolicy::default()
+    };
+    let native = VerifyContext::new()
+        .key(&key)
+        .policy(policy)
+        .verify(&xml)
+        .expect("native ASN.1 compatibility verification must run");
+    assert_eq!(native.status, DsigStatus::Valid);
+}
+
+#[test]
+fn visa3d_direct_id_compatibility_matches_pinned_xmlsec1() {
+    // An apostrophe breaks libxmlsec1's default xpointer(id('...')) wrapper.
+    // Visa3D direct lookup resolves the caller-registered ID in both boundaries.
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
+        return;
+    }
+    let private_key = RsaSigningKey::from_pkcs8_pem(
+        &fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-key.pem").unwrap(),
+    )
+    .expect("RSA fixture must parse");
+    let verification_key = match private_key.public_key_info().expect("public key info") {
+        SigningPublicKeyInfo::Rsa { spki_der, .. } => VerificationKey {
+            algorithm: SignatureAlgorithm::RsaSha256,
+            public_key_bytes: spki_der,
+            certificate_der: None,
+            name: None,
+        },
+        _ => panic!("RSA signing key must expose RSA public key info"),
+    };
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#visa'3d")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    let transforms = TransformPolicy {
+        same_document_id_semantics: SameDocumentIdSemantics::XmlSecVisa3d,
+        ..TransformPolicy::default()
+    };
+    let signed = SignContext::new(&private_key)
+        .policy(SigningPolicy {
+            transforms: transforms.clone(),
+            ..SigningPolicy::default()
+        })
+        .sign_with_builder(
+            "<root><payload ID=\"visa'3d\">visa payload</payload></root>",
+            &builder,
+        )
+        .expect("Visa3D compatibility signing must succeed");
+
+    assert!(
+        VerifyContext::new()
+            .key(&verification_key)
+            .verify(&signed)
+            .is_err()
+    );
+    let native = VerifyContext::new()
+        .key(&verification_key)
+        .policy(VerificationPolicy {
+            transforms,
+            ..VerificationPolicy::default()
+        })
+        .verify(&signed)
+        .expect("Visa3D compatibility verification must run");
+    assert_eq!(native.status, DsigStatus::Valid);
+
+    let input = TemporaryXmlFile::write("visa3d-differential", &signed);
+    let public_key = Path::new("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let donor_default = xmlsec1::command()
+        .args([
+            "--verify",
+            "--lax-key-search",
+            "--add-id-attr",
+            "ID",
+            "--pubkey-pem",
+        ])
+        .arg(public_key)
+        .arg(&input.path)
+        .output()
+        .expect("pinned xmlsec1 must run");
+    assert!(!donor_default.status.success());
+    let donor_compatible = xmlsec1::command()
+        .args([
+            "--verify",
+            "--enable-visa3d-hack",
+            "--lax-key-search",
+            "--add-id-attr",
+            "ID",
+            "--pubkey-pem",
+        ])
+        .arg(public_key)
+        .arg(&input.path)
+        .output()
+        .expect("pinned xmlsec1 must run");
+    assert!(
+        donor_compatible.status.success(),
+        "{}",
+        String::from_utf8_lossy(&donor_compatible.stderr)
+    );
 }
 
 fn signed_payload_xml(key: &dyn SigningKey, builder: &SignatureBuilder) -> String {

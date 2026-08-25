@@ -1,0 +1,507 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "project": "libxmlsec1",
+    "version": "1.3.13",
+    "commit": "5fdd47dc35753438bdc38b6e96c1a3805c67a483",
+    "repository": "https://github.com/lsh123/xmlsec"
+  },
+  "generated_by": "xml-sec-capability-ledger behavior-generate",
+  "evidence": {
+    "asn1-signatures": {
+      "positive": [
+        {
+          "file": "tests/xmlsec1_interop.rs",
+          "test": "asn1_ecdsa_compatibility_matches_pinned_xmlsec1",
+          "description": "Pinned donor and native verification accept the upstream DER fixture only in explicit compatibility mode."
+        },
+        {
+          "file": "tests/signing_digest.rs",
+          "test": "ecdsa_asn1_compatibility_is_explicit_across_the_signing_pipeline",
+          "description": "Native signing emits ASN.1 DER only under explicit policy and verifies the result under the matching policy."
+        },
+        {
+          "file": "tools/xmlsec1/tests/process_contract.rs",
+          "test": "cli_asn1_signature_mode_requires_the_explicit_donor_flag",
+          "description": "The native CLI flag controls both ASN.1 signing output and verification acceptance."
+        }
+      ],
+      "negative": [
+        {
+          "file": "tests/xmlsec1_interop.rs",
+          "test": "asn1_ecdsa_compatibility_matches_pinned_xmlsec1",
+          "description": "Pinned donor and native standards defaults both reject the upstream DER fixture."
+        },
+        {
+          "file": "tests/signing_digest.rs",
+          "test": "ecdsa_asn1_compatibility_is_explicit_across_the_signing_pipeline",
+          "description": "Standards-default native verification rejects DER emitted by compatibility-mode signing."
+        },
+        {
+          "file": "tools/xmlsec1/tests/process_contract.rs",
+          "test": "cli_asn1_signature_mode_requires_the_explicit_donor_flag",
+          "description": "CLI verification without the compatibility flag rejects ASN.1 DER SignatureValue framing."
+        }
+      ]
+    },
+    "c-boundary-state": {
+      "positive": [
+        {
+          "file": "tests/behavioral_compatibility.rs",
+          "test": "pinned_c_oracle_reports_context_callback_and_dom_contracts",
+          "description": "A compiled probe measures successful and invalid context state, retained references, pre-execution callback order, userData propagation, and in-place signing mutation against pinned libxmlsec1."
+        },
+        {
+          "file": "tests/behavioral_compatibility.rs",
+          "test": "c_boundary_behaviors_are_explicitly_planned",
+          "description": "Measured donor-only context, callback, and in-place mutation contracts are named compatibility work."
+        }
+      ],
+      "negative": [
+        {
+          "file": "tests/behavioral_compatibility.rs",
+          "test": "pinned_c_oracle_reports_context_callback_and_dom_contracts",
+          "description": "The probe measures callback-abort error state and its retained failed reference, distinguishing processing errors from invalid results."
+        },
+        {
+          "file": "tests/behavioral_compatibility.rs",
+          "test": "c_boundary_behaviors_are_not_claimed_as_native",
+          "description": "The ledger prevents native Rust APIs from implying C object-state parity."
+        }
+      ]
+    },
+    "error-invalid": {
+      "positive": [
+        {
+          "file": "tests/signature_pipeline_integration.rs",
+          "test": "tampered_signature_value_fails_after_references_pass",
+          "description": "Cryptographic mismatch returns an invalid verification result."
+        }
+      ],
+      "negative": [
+        {
+          "file": "tests/signature_pipeline_integration.rs",
+          "test": "malformed_signature_value_base64_returns_decode_error",
+          "description": "Malformed wire syntax remains a processing error."
+        },
+        {
+          "file": "tests/donor_negative_vectors.rs",
+          "test": "phaos_bad_signature_artifact_fails_on_its_unsupported_md5_reference",
+          "description": "An unsupported Reference digest algorithm remains a typed processing error rather than an invalid verification result."
+        }
+      ]
+    },
+    "here-semantics": {
+      "positive": [
+        {
+          "file": "tests/xpath_transform_integration.rs",
+          "test": "here_semantics_are_explicit_across_signing_and_verification",
+          "description": "Both standards and libxmlsec1 here() bindings round-trip when selected explicitly."
+        }
+      ],
+      "negative": [
+        {
+          "file": "tests/base64_transform_integration.rs",
+          "test": "decoded_xml_rejects_here_from_the_signature_document",
+          "description": "here() provenance cannot cross a binary-to-XML document boundary."
+        }
+      ]
+    },
+    "id-resolution": {
+      "positive": [
+        {
+          "file": "tools/xmlsec1/tests/process_contract.rs",
+          "test": "scoped_id_attribute_selects_and_signs_the_registered_element",
+          "description": "Caller-registered ID attributes reach signing selection and dereference."
+        },
+        {
+          "file": "tests/signing_digest.rs",
+          "test": "signing_internal_dtd_policy_reaches_builder_and_mutation_reparses",
+          "description": "Explicit internal-DTD policy reaches the complete signing pipeline."
+        },
+        {
+          "file": "src/xml.rs",
+          "test": "dtd_id_declarations_do_not_replace_request_registration",
+          "description": "Caller registration indexes a custom attribute even when its ID type is also declared in an allowed internal DTD."
+        }
+      ],
+      "negative": [
+        {
+          "file": "tests/merlin_interop.rs",
+          "test": "rejects_dtd_and_unsupported_retrieval_defaults",
+          "description": "DTD parsing and unsupported retrieval remain disabled by default."
+        },
+        {
+          "file": "src/xml.rs",
+          "test": "dtd_id_declarations_do_not_replace_request_registration",
+          "description": "Allowing an internal DTD does not implicitly register its custom ID-typed attributes in the owned Rust tree."
+        }
+      ]
+    },
+    "manifest-status": {
+      "positive": [
+        {
+          "file": "tests/signing_digest.rs",
+          "test": "sign_context_processes_manifests_before_signed_info",
+          "description": "Authenticated Manifest references are processed before SignedInfo signing."
+        }
+      ],
+      "negative": [
+        {
+          "file": "tests/signing_digest.rs",
+          "test": "manifest_signing_rejects_digest_dependency_cycles",
+          "description": "Cyclic Manifest dependencies fail closed."
+        }
+      ]
+    },
+    "multiple-signatures": {
+      "positive": [
+        {
+          "file": "tests/signing_digest.rs",
+          "test": "sign_context_targets_the_last_signature_template_by_default",
+          "description": "Signing has an explicit deterministic target among multiple templates."
+        }
+      ],
+      "negative": [
+        {
+          "file": "tests/signature_pipeline_integration.rs",
+          "test": "multiple_signature_elements_are_rejected",
+          "description": "Verification default rejects ambiguous multiple signatures."
+        }
+      ]
+    },
+    "transform-adapters": {
+      "positive": [
+        {
+          "file": "tests/signing_digest.rs",
+          "test": "signing_policy_covers_implicit_and_signed_info_canonicalization",
+          "description": "Implicit C14N participates in the operation policy and budgets."
+        }
+      ],
+      "negative": [
+        {
+          "file": "tests/base64_transform_integration.rs",
+          "test": "binary_to_node_set_adapter_rejects_malformed_xml",
+          "description": "The octet-to-XML adapter rejects malformed XML rather than coercing it."
+        }
+      ]
+    },
+    "uri-identity": {
+      "positive": [
+        {
+          "file": "tests/uri_integration.rs",
+          "test": "xpointer_id_canonicalizes_same_as_bare_name",
+          "description": "Bare ID and xpointer(id()) select the same subtree."
+        }
+      ],
+      "negative": [
+        {
+          "file": "tests/uri_integration.rs",
+          "test": "xpointer_root_vs_empty_uri_comment_difference",
+          "description": "Empty URI and xpointer(/) preserve their normative comment difference."
+        }
+      ]
+    },
+    "visa3d-ids": {
+      "positive": [
+        {
+          "file": "tests/xmlsec1_interop.rs",
+          "test": "visa3d_direct_id_compatibility_matches_pinned_xmlsec1",
+          "description": "Pinned donor and native compatibility mode resolve an ID that cannot be embedded in the default XPointer wrapper."
+        }
+      ],
+      "negative": [
+        {
+          "file": "src/xmldsig/uri.rs",
+          "test": "bare_fragment_rejects_non_ncname_without_visa3d_compatibility",
+          "description": "Standards-default resolution rejects a non-NCName bare fragment."
+        }
+      ]
+    }
+  },
+  "behaviors": [
+    {
+      "id": "behavior-001",
+      "category": "here-semantics",
+      "summary": "XPath here() has explicit standards and libxmlsec1 node bindings.",
+      "classification": "compatibility-policy",
+      "control": {
+        "boundary": "typed operation policy",
+        "setting": "TransformPolicy.xpath_here_semantics",
+        "default": "XMLDSig specification binding"
+      },
+      "evidence": "here-semantics",
+      "donor_anchors": [
+        {
+          "source": "src/xpath.c",
+          "line": 481,
+          "needle": "xmlSecTransformXPathNodeRead(xmlSecTransformPtr transform, xmlNodePtr node, xmlSecTransformCtxPtr transformCtx)"
+        },
+        {
+          "source": "src/xpath.c",
+          "line": 219,
+          "needle": "xmlXPathRegisterFunc(data->ctx, (xmlChar *)\"here\", xmlSecXPathHereFunction);"
+        }
+      ]
+    },
+    {
+      "id": "behavior-002",
+      "category": "visa3d-ids",
+      "summary": "Visa3D mode resolves registered bare-fragment IDs directly instead of constructing an XPointer expression.",
+      "classification": "compatibility-policy",
+      "control": {
+        "boundary": "typed operation policy and native CLI flag",
+        "setting": "TransformPolicy.same_document_id_semantics / --enable-visa3d-hack",
+        "default": "library API uses XMLDSig grammar; native CLI uses libxmlsec1 wrapped-barename grammar with comments excluded"
+      },
+      "evidence": "visa3d-ids",
+      "donor_anchors": [
+        {
+          "source": "apps/xmlsec.c",
+          "line": 837,
+          "needle": "\"--enable-visa3d-hack\","
+        },
+        {
+          "source": "src/xmldsig.c",
+          "line": 1252,
+          "needle": "XMLSEC_DSIG_FLAGS_USE_VISA3D_HACK"
+        }
+      ]
+    },
+    {
+      "id": "behavior-003",
+      "category": "signature-value-encoding",
+      "summary": "ASN.1 DER ECDSA SignatureValue is an explicit libxmlsec1 compatibility wire format.",
+      "classification": "compatibility-policy",
+      "control": {
+        "boundary": "typed signing/verification policy and native CLI flag",
+        "setting": "EcdsaSignatureValueEncoding / --enable-asn1-signatures-hack",
+        "default": "XMLDSig fixed-width r||s"
+      },
+      "evidence": "asn1-signatures",
+      "donor_anchors": [
+        {
+          "source": "apps/xmlsec.c",
+          "line": 851,
+          "needle": "\"--enable-asn1-signatures-hack\","
+        },
+        {
+          "source": "src/openssl/signatures.c",
+          "line": 2137,
+          "needle": "static int\nxmlSecOpenSSLEvpSignatureEcdsa_XmlDSig2OpenSSL("
+        },
+        {
+          "source": "src/openssl/signatures.c",
+          "line": 2243,
+          "needle": "static int\nxmlSecOpenSSLEvpSignatureEcdsa_OpenSSL2XmlDSig("
+        }
+      ]
+    },
+    {
+      "id": "behavior-004",
+      "category": "implicit-c14n-adapters",
+      "summary": "Transform chains insert XML/octet adapters and implicit inclusive C14N according to adjacent data types.",
+      "classification": "native",
+      "control": {
+        "boundary": "typed transform policy and shared operation budgets",
+        "setting": "TransformPolicy.allowed_algorithms and ResourcePolicy",
+        "default": "implemented adapters enabled within limits"
+      },
+      "evidence": "transform-adapters",
+      "donor_anchors": [
+        {
+          "source": "src/transforms.c",
+          "line": 1924,
+          "needle": "middleId = xmlSecTransformXmlParserId;"
+        },
+        {
+          "source": "src/transforms.c",
+          "line": 1932,
+          "needle": "middleId = xmlSecTransformInclC14NId;"
+        }
+      ]
+    },
+    {
+      "id": "behavior-005",
+      "category": "empty-uri-xpointer",
+      "summary": "Empty URI excludes comments while xpointer(/) retains them; xpointer(id()) and bare IDs share target identity.",
+      "classification": "native",
+      "control": {
+        "boundary": "typed URI policy",
+        "setting": "UriPolicy.references",
+        "default": "same-document references only"
+      },
+      "evidence": "uri-identity",
+      "donor_anchors": [
+        {
+          "source": "src/transforms.c",
+          "line": 969,
+          "needle": "transform = xmlSecTransformCtxCreateAndPrepend(ctx, xmlSecTransformXPointerId);"
+        },
+        {
+          "source": "src/transforms.c",
+          "line": 990,
+          "needle": "transform = xmlSecTransformCtxCreateAndPrepend(ctx, xmlSecTransformVisa3DHackId);"
+        }
+      ]
+    },
+    {
+      "id": "behavior-006",
+      "category": "dtd-xml-id-caller-id",
+      "summary": "Internal-DTD parsing and ID registration are separate controls; DTD declarations do not implicitly register custom ID attributes in the owned Rust tree.",
+      "classification": "native",
+      "control": {
+        "boundary": "typed XML policy plus request-scoped ID registrations",
+        "setting": "XmlInputPolicy.allow_internal_dtd and VerifyContext/SignContext id_attributes",
+        "default": "DTD disabled; xml:id and built-in XMLDSig ID spellings indexed; custom attributes require caller registration"
+      },
+      "evidence": "id-resolution",
+      "donor_anchors": [
+        {
+          "source": "src/xmltree.c",
+          "line": 873,
+          "needle": "xmlSecAddIDs(xmlDocPtr doc, xmlNodePtr node, const xmlChar** ids)"
+        },
+        {
+          "source": "apps/xmlsec.c",
+          "line": 3265,
+          "needle": "xmlSecAddIDs(data->doc, NULL, idAttr);"
+        }
+      ]
+    },
+    {
+      "id": "behavior-007",
+      "category": "multiple-signatures",
+      "summary": "Operations select one Signature deterministically and reject ambiguous verification by default.",
+      "classification": "native",
+      "control": {
+        "boundary": "request-scoped operation selection",
+        "setting": "SignatureSelection and SignatureTemplateSelection",
+        "default": "unique verification signature; last signing template"
+      },
+      "evidence": "multiple-signatures",
+      "donor_anchors": [
+        {
+          "source": "src/xmldsig.c",
+          "line": 326,
+          "needle": "xmlSecDSigCtxVerify(xmlSecDSigCtxPtr dsigCtx, xmlNodePtr node)"
+        }
+      ]
+    },
+    {
+      "id": "behavior-008",
+      "category": "manifest-status",
+      "summary": "Manifest processing is explicit and reports authenticated nested reference results separately.",
+      "classification": "compatibility-policy",
+      "control": {
+        "boundary": "typed operation policy",
+        "setting": "ManifestProcessing",
+        "default": "ignore Manifest references"
+      },
+      "evidence": "manifest-status",
+      "donor_anchors": [
+        {
+          "source": "src/xmldsig.c",
+          "line": 932,
+          "needle": "dsigRefCtx = xmlSecDSigReferenceCtxCreate(dsigCtx, xmlSecDSigReferenceOriginManifest);"
+        },
+        {
+          "source": "src/xmldsig.c",
+          "line": 499,
+          "needle": "if((dsigCtx->flags & XMLSEC_DSIG_FLAGS_IGNORE_MANIFESTS) == 0)"
+        }
+      ]
+    },
+    {
+      "id": "behavior-009",
+      "category": "error-invalid-classification",
+      "summary": "Well-formed verification mismatches are invalid results; malformed or unsupported processing is an error.",
+      "classification": "native",
+      "control": {
+        "boundary": "public verification result and typed error contract",
+        "setting": "DsigStatus / DsigError",
+        "default": "fail closed without coercing errors to invalid"
+      },
+      "evidence": "error-invalid",
+      "donor_anchors": [
+        {
+          "source": "src/xmldsig.c",
+          "line": 382,
+          "needle": "dsigCtx->status = xmlSecDSigStatusInvalid;"
+        },
+        {
+          "source": "src/xmldsig.c",
+          "line": 326,
+          "needle": "xmlSecDSigCtxVerify(xmlSecDSigCtxPtr dsigCtx, xmlNodePtr node)"
+        }
+      ]
+    },
+    {
+      "id": "behavior-010",
+      "category": "context-after-failure",
+      "summary": "Mutable xmlSecDSigCtx status, failure reason, and retained reference state after failure belong to the future C boundary.",
+      "classification": "planned-c-compatibility-boundary",
+      "control": {
+        "boundary": "future C compatibility crate",
+        "setting": "C context lifecycle compatibility profile",
+        "default": "native Rust returns immutable results or typed errors"
+      },
+      "evidence": "c-boundary-state",
+      "donor_anchors": [
+        {
+          "source": "src/xmldsig.c",
+          "line": 379,
+          "needle": "xmlSecDSigCtxMarkAsFailed(xmlSecDSigCtxPtr dsigCtx, xmlSecDSigFailureReason failureReason)"
+        }
+      ]
+    },
+    {
+      "id": "behavior-011",
+      "category": "callback-ordering",
+      "summary": "Reference pre-execute callback ordering and userData propagation belong to the future C boundary.",
+      "classification": "planned-c-compatibility-boundary",
+      "control": {
+        "boundary": "future C compatibility crate",
+        "setting": "C callback lifecycle compatibility profile",
+        "default": "native core exposes no global or implicit callbacks"
+      },
+      "evidence": "c-boundary-state",
+      "donor_anchors": [
+        {
+          "source": "src/xmldsig.c",
+          "line": 1248,
+          "needle": "dsigRefCtx->transformCtx.preExecCallback = dsigCtx->referencePreExecuteCallback;"
+        },
+        {
+          "source": "src/xmldsig.c",
+          "line": 1250,
+          "needle": "dsigRefCtx->transformCtx.userData = dsigCtx->userData;"
+        }
+      ]
+    },
+    {
+      "id": "behavior-012",
+      "category": "dom-mutation",
+      "summary": "libxmlsec1 mutates SignatureValue and DigestValue nodes in place; native Rust returns a new serialized document.",
+      "classification": "planned-c-compatibility-boundary",
+      "control": {
+        "boundary": "future libxml2 C DOM adapter",
+        "setting": "C DOM mutation compatibility profile",
+        "default": "owned immutable Rust input with explicit returned output"
+      },
+      "evidence": "c-boundary-state",
+      "donor_anchors": [
+        {
+          "source": "src/xmldsig.c",
+          "line": 308,
+          "needle": "xmlNodeSetContentLen(dsigCtx->signValueNode, outBuf, outLen);"
+        },
+        {
+          "source": "src/xmldsig.c",
+          "line": 1460,
+          "needle": "xmlNodeSetContentLen(digestValueNode, outBuf, outLen);"
+        }
+      ]
+    }
+  ]
+}

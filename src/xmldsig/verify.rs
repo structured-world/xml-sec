@@ -47,7 +47,7 @@ use super::transforms::{
     transform_chain_produces_binary,
 };
 use super::types::{NodeSet, TransformError};
-use super::uri::{UriReferenceResolver, same_document_reference_id};
+use super::uri::UriReferenceResolver;
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
@@ -86,6 +86,23 @@ pub trait VerifyingKey {
         ))
     }
 
+    /// Validate wire framing under the operation's immutable compatibility policy.
+    ///
+    /// The default delegates to [`VerifyingKey::validate_signature_value`] and
+    /// therefore implements only the standard XMLDSig framing contract. Custom
+    /// keys that support policy-selected wire formats, such as
+    /// [`crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der`], must
+    /// override this hook rather than accepting both formats implicitly.
+    fn validate_signature_value_with_policy(
+        &self,
+        policy: &crate::policy::VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        let _ = policy;
+        self.validate_signature_value(algorithm, signature_value)
+    }
+
     /// Verify `signature_value` over `signed_data` with the declared algorithm.
     fn verify(
         &self,
@@ -93,6 +110,22 @@ pub trait VerifyingKey {
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError>;
+
+    /// Verify after applying operation-scoped compatibility semantics.
+    ///
+    /// The default delegates to [`VerifyingKey::verify`]. Custom keys whose
+    /// provider input depends on compatibility policy must override this hook
+    /// consistently with [`VerifyingKey::validate_signature_value_with_policy`].
+    fn verify_with_policy(
+        &self,
+        policy: &crate::policy::VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        let _ = policy;
+        self.verify(algorithm, signed_data, signature_value)
+    }
 }
 
 /// Key resolver hook used by [`VerifyContext`] when no pre-set key is provided.
@@ -1096,6 +1129,7 @@ fn verify_signature_with_context(
         },
     )?;
     let resolver = UriReferenceResolver::with_id_registrations(&doc, ctx.id_attributes)
+        .with_same_document_id_semantics(ctx.policy.transforms.same_document_id_semantics)
         .with_external_resource_limits(
             ctx.policy.resources.max_external_resource_bytes,
             ctx.policy.resources.max_external_resource_total_bytes,
@@ -1342,7 +1376,11 @@ fn verify_signature_with_context(
     };
     let verifier = resolved_key.as_ref();
     verifier.validate_policy(&ctx.policy)?;
-    if !verifier.validate_signature_value(signed_info.signature_method, &signature_value)? {
+    if !verifier.validate_signature_value_with_policy(
+        &ctx.policy,
+        signed_info.signature_method,
+        &signature_value,
+    )? {
         return Ok(VerifyResult {
             status: DsigStatus::Invalid(FailureReason::SignatureMismatch),
             signed_info_references: references.results,
@@ -1358,8 +1396,12 @@ fn verify_signature_with_context(
         .require_capability(crate::provider::ProviderCapability::Verify(
             signed_info.signature_method,
         ))?;
+    let policy_verifier = PolicyVerifyingKey {
+        key: verifier,
+        policy: &ctx.policy,
+    };
     let signature_valid = ctx.provider.verify(
-        verifier,
+        &policy_verifier,
         signed_info.signature_method,
         &canonical_signed_info,
         &signature_value,
@@ -1414,6 +1456,36 @@ fn verify_signature_with_context(
             None
         },
     })
+}
+
+struct PolicyVerifyingKey<'a> {
+    key: &'a dyn VerifyingKey,
+    policy: &'a crate::policy::VerificationPolicy,
+}
+
+impl VerifyingKey for PolicyVerifyingKey<'_> {
+    fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
+        self.key.validate_policy(policy)
+    }
+
+    fn validate_signature_value(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.key
+            .validate_signature_value_with_policy(self.policy, algorithm, signature_value)
+    }
+
+    fn verify(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.key
+            .verify_with_policy(self.policy, algorithm, signed_data, signature_value)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1548,16 +1620,12 @@ fn materialize_retrieval_methods_with_budgets(
                 }
                 .into());
             }
-            let id = same_document_reference_id(&resolved_uri).ok_or(
-                SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "X509Data RetrievalMethod requires a same-document URI",
-                },
-            )?;
-            let target = resolver.node_for_id(id).ok_or(
-                SignatureVerificationPipelineError::InvalidStructure {
+            let target = resolver
+                .node_for_same_document_reference(&resolved_uri)
+                .map_err(ReferenceProcessingError::Transform)?
+                .ok_or(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "X509Data RetrievalMethod target is missing or ambiguous",
-                },
-            )?;
+                })?;
             let node = match transforms {
                 RetrievalMethodTransforms::None
                     if target.has_tag_name((XMLDSIG_NS, "X509Data")) =>
@@ -1813,11 +1881,10 @@ fn process_manifest_references(
                     .transforms
                     .iter()
                     .all(transform_preserves_manifest_structure)
-                && let Some(target_id) = reference
-                    .uri
-                    .as_deref()
-                    .and_then(same_document_reference_id)
-                    .and_then(|id| resolver.node_id_for_id(id))
+                && let Ok(Some(target_id)) = reference.uri.as_deref().map_or_else(
+                    || Ok(None),
+                    |uri| resolver.node_id_for_same_document_reference(uri),
+                )
             {
                 // A valid Manifest digest extends trust only to the exact
                 // same-document structure preserved by its transform chain.
@@ -1973,8 +2040,12 @@ fn collect_authenticated_signed_info_reference_nodes(
                 .all(transform_preserves_manifest_structure)
         })
         .filter_map(|reference| reference.uri.as_deref())
-        .filter_map(same_document_reference_id)
-        .filter_map(|id| resolver.node_id_for_id(id))
+        .filter_map(|uri| {
+            resolver
+                .node_id_for_same_document_reference(uri)
+                .ok()
+                .flatten()
+        })
         .collect()
 }
 
@@ -4573,6 +4644,68 @@ mod tests {
             [super::super::parse::KeyInfoSource::X509Data(info)]
                 if info.subject_names == ["CN=leaf"]
         ));
+    }
+
+    #[test]
+    fn retrieval_method_respects_configured_same_document_id_semantics() {
+        // RetrievalMethod is another consumer of same-document URIs and must
+        // not bypass the grammar selected for normal Reference dereferencing.
+        fn materialize(
+            uri: &str,
+            id: &str,
+            semantics: crate::policy::SameDocumentIdSemantics,
+        ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
+            let xml = format!(
+                r#"<root xmlns:ds="{XMLDSIG_NS}">
+                  <ds:KeyInfo><ds:RetrievalMethod URI="{uri}" Type="{XMLDSIG_NS}X509Data"/></ds:KeyInfo>
+                  <ds:X509Data Id="{id}"><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data>
+                </root>"#
+            );
+            let document = Document::parse(&xml).unwrap();
+            let key_info_node = document
+                .descendants()
+                .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+                .unwrap();
+            let mut key_info = parse_key_info(key_info_node).unwrap();
+            let resolver =
+                UriReferenceResolver::new(&document).with_same_document_id_semantics(semantics);
+
+            materialize_retrieval_methods(
+                &mut key_info,
+                &resolver,
+                UriTypeSet::SAME_DOCUMENT,
+                None,
+                crate::provider::default_provider(),
+            )
+        }
+
+        assert!(
+            materialize(
+                "#12345",
+                "12345",
+                crate::policy::SameDocumentIdSemantics::Specification,
+            )
+            .is_err(),
+            "the standards mode must reject a non-NCName bare fragment"
+        );
+        assert!(
+            materialize(
+                "#visa'3d",
+                "visa'3d",
+                crate::policy::SameDocumentIdSemantics::XmlSecBarename,
+            )
+            .is_err(),
+            "the donor barename wrapper cannot represent an apostrophe"
+        );
+        assert!(
+            materialize(
+                "#visa'3d",
+                "visa'3d",
+                crate::policy::SameDocumentIdSemantics::XmlSecVisa3d,
+            )
+            .is_ok(),
+            "Visa3D mode resolves the registered ID without an XPointer literal"
+        );
     }
 
     #[test]
