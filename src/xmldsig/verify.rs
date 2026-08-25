@@ -500,6 +500,10 @@ impl<'a> VerifyContext<'a> {
     }
 
     /// Verify a signature against a retained owned document generation.
+    ///
+    /// The active XML input policy is revalidated against the document's parse
+    /// provenance as well as its current byte and node counts. In particular, a
+    /// strict context rejects a document that required internal DTD support.
     pub fn verify_document(&self, document: &XmlDocument) -> Result<VerifyResult, DsigError> {
         verify_signature_document_with_context(document, self)
     }
@@ -1149,6 +1153,7 @@ fn verify_signature_document_with_context(
     document: &XmlDocument,
     ctx: &VerifyContext<'_>,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
+    document.validate_xml_input_policy(ctx.policy.xml.allow_internal_dtd)?;
     document.with_view(|view| verify_signature_view(view, ctx))
 }
 
@@ -2596,6 +2601,38 @@ mod tests {
             external_entity_error,
             SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
                 crate::xmldsig::TransformError::XmlParse(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn owned_verification_revalidates_internal_dtd_provenance() {
+        // A document accepted by one permissive operation must not bypass a
+        // later verification context's stricter XML input policy.
+        let document = XmlDocument::parse_with_settings(
+            "<!DOCTYPE root [<!ENTITY value \"ok\">]><root>&value;</root>".into(),
+            DocumentParseSettings::new(
+                true,
+                crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
+                crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
+            ),
+        )
+        .expect("explicitly permitted DTD fixture must parse");
+
+        assert!(matches!(
+            VerifyContext::new().verify_document(&document),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::XmlInput {
+                    reason: "owned document requires internal DTD support"
+                }
+            ))
+        ));
+        assert!(!matches!(
+            VerifyContext::new()
+                .allow_internal_dtd(true)
+                .verify_document(&document),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::XmlInput { .. }
             ))
         ));
     }

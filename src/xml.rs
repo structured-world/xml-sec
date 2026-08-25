@@ -80,22 +80,7 @@ impl IdAttributeRegistration {
     }
 
     fn matches(&self, node: Node<'_, '_>, attribute_name: &str) -> bool {
-        if self.attribute_local_name != attribute_name {
-            return false;
-        }
-        match &self.element_scope {
-            IdAttributeElementScope::AnyElement => true,
-            IdAttributeElementScope::AnyNamespace { local_name } => {
-                node.tag_name().name() == local_name
-            }
-            IdAttributeElementScope::ExpandedName {
-                local_name,
-                namespace,
-            } => {
-                node.tag_name().name() == local_name
-                    && node.tag_name().namespace() == namespace.as_deref()
-            }
-        }
+        self.attribute_local_name == attribute_name && self.matches_node(node)
     }
 
     pub(crate) fn attribute_local_name(&self) -> &str {

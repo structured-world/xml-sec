@@ -162,7 +162,10 @@ the initial document and every replacement generation. `encrypt_owned_document` 
 `decrypt_owned_document` reuse the retained parsed view, validate replacement XML in the parent
 namespace context, and invalidate prior node identities after a successful mutation. String APIs
 remain adapters over this boundary. The projected output byte length is checked before constructing
-the replacement. DTD parsing remains disabled by
+the replacement, and expanded decryption plaintext is parsed against the operation's projected
+node ceiling before any generation is committed. Owned entry points also revalidate parse
+provenance, preventing a document that required internal DTD support from crossing into a stricter
+operation context. DTD parsing remains disabled by
 default; legacy documents that need an internal DTD can opt in only through
 `DecryptionPolicy::xml.allow_internal_dtd`. The API never installs an external entity resolver.
 

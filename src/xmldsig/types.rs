@@ -78,8 +78,6 @@ impl<'a> TransformData<'a> {
 pub struct NodeSet<'a> {
     /// Reference to the parsed document.
     doc: &'a Document<'a>,
-    document_identity: Option<crate::DocumentIdentity>,
-    generation: Option<u64>,
     nodes: HashSet<XmlNodeKey>,
     owned_string_bytes: usize,
     /// Whether comment nodes are included. For empty URI dereference (whole
@@ -216,14 +214,12 @@ impl<'a> NodeSet<'a> {
         view: crate::DocumentView<'a>,
         budget: Option<&NodeSetMaterializationBudget>,
     ) -> Result<Self, TransformError> {
-        let mut set = match budget {
+        let set = match budget {
             Some(budget) => {
                 Self::entire_document_without_comments_with_budget(view.document(), budget)?
             }
             None => Self::entire_document_without_comments(view.document())?,
         };
-        set.document_identity = Some(view.identity());
-        set.generation = Some(view.generation());
         Ok(set)
     }
 
@@ -252,14 +248,12 @@ impl<'a> NodeSet<'a> {
         view: crate::DocumentView<'a>,
         budget: Option<&NodeSetMaterializationBudget>,
     ) -> Result<Self, TransformError> {
-        let mut set = match budget {
+        let set = match budget {
             Some(budget) => {
                 Self::entire_document_with_comments_with_budget(view.document(), budget)?
             }
             None => Self::entire_document_with_comments(view.document())?,
         };
-        set.document_identity = Some(view.identity());
-        set.generation = Some(view.generation());
         Ok(set)
     }
 
@@ -290,8 +284,6 @@ impl<'a> NodeSet<'a> {
         }
         let mut set = Self {
             doc: element.document(),
-            document_identity: None,
-            generation: None,
             nodes: HashSet::new(),
             owned_string_bytes: 0,
             with_comments: false,
@@ -319,12 +311,12 @@ impl<'a> NodeSet<'a> {
     }
 
     pub(crate) fn subtree_from_view(
-        view: crate::DocumentView<'a>,
+        _view: crate::DocumentView<'a>,
         element: Node<'a, 'a>,
         with_comments: bool,
         budget: Option<&NodeSetMaterializationBudget>,
     ) -> Result<Self, TransformError> {
-        let mut set = if with_comments {
+        let set = if with_comments {
             match budget {
                 Some(budget) => Self::subtree_with_budget(element, budget)?,
                 None => Self::subtree(element)?,
@@ -332,16 +324,12 @@ impl<'a> NodeSet<'a> {
         } else {
             Self::subtree_without_comments_with_budget(element, budget)?
         };
-        set.document_identity = Some(view.identity());
-        set.generation = Some(view.generation());
         Ok(set)
     }
 
     fn collect_subtree(element: Node<'a, 'a>) -> Self {
         let mut set = Self {
             doc: element.document(),
-            document_identity: None,
-            generation: None,
             nodes: HashSet::new(),
             owned_string_bytes: 0,
             with_comments: true,
@@ -353,18 +341,6 @@ impl<'a> NodeSet<'a> {
     /// Reference to the underlying document.
     pub fn document(&self) -> &'a Document<'a> {
         self.doc
-    }
-
-    /// Return owned-document provenance when this set came from an [`XmlDocument`](crate::XmlDocument).
-    #[must_use]
-    pub fn document_identity(&self) -> Option<crate::DocumentIdentity> {
-        self.document_identity
-    }
-
-    /// Return the owned-document generation represented by this set.
-    #[must_use]
-    pub fn document_generation(&self) -> Option<u64> {
-        self.generation
     }
 
     /// Check whether a node is in this set.
@@ -408,8 +384,6 @@ impl<'a> NodeSet<'a> {
     pub(crate) fn empty(doc: &'a Document<'a>) -> Self {
         Self {
             doc,
-            document_identity: None,
-            generation: None,
             nodes: HashSet::new(),
             owned_string_bytes: 0,
             with_comments: false,
@@ -419,8 +393,6 @@ impl<'a> NodeSet<'a> {
     pub(crate) fn empty_like(input: &Self) -> Self {
         Self {
             doc: input.doc,
-            document_identity: input.document_identity,
-            generation: input.generation,
             nodes: HashSet::new(),
             owned_string_bytes: 0,
             with_comments: false,

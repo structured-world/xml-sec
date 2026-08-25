@@ -896,7 +896,23 @@ impl<'a> SignContext<'a> {
     /// Template and value mutations advance the document generation;
     /// identities captured before signing are therefore stale afterwards.
     pub fn sign_document(&self, document: &mut XmlDocument) -> Result<(), SigningError> {
+        self.validate_owned_document_input(document)?;
+        let target_signature = document.with_view(|view| {
+            signing_signature_index(
+                view.document(),
+                self.start_node_id,
+                self.id_attributes,
+                self.template_selection,
+            )
+        })?;
+        self.policy.resources.validate_key_candidates(1)?;
+        self.sign_template_at_index(document, target_signature)?;
+        Ok(())
+    }
+
+    fn validate_owned_document_input(&self, document: &XmlDocument) -> Result<(), SigningError> {
         self.policy.validate()?;
+        document.validate_xml_input_policy(self.policy.xml.allow_internal_dtd)?;
         self.policy
             .resources
             .validate_xml_document_len(document.as_xml().len())?;
@@ -909,16 +925,6 @@ impl<'a> SignContext<'a> {
             }
             .into());
         }
-        let target_signature = document.with_view(|view| {
-            signing_signature_index(
-                view.document(),
-                self.start_node_id,
-                self.id_attributes,
-                self.template_selection,
-            )
-        })?;
-        self.policy.resources.validate_key_candidates(1)?;
-        self.sign_template_at_index(document, target_signature)?;
         Ok(())
     }
 
@@ -1078,10 +1084,7 @@ impl<'a> SignContext<'a> {
         document: &mut XmlDocument,
         builder: &SignatureBuilder,
     ) -> Result<(), SigningError> {
-        self.policy.validate()?;
-        self.policy
-            .resources
-            .validate_xml_document_len(document.as_xml().len())?;
+        self.validate_owned_document_input(document)?;
         self.policy.resources.validate_key_candidates(1)?;
         let expected_signature_len = expected_signature_output_len(
             self.signing_key,
@@ -1103,6 +1106,13 @@ impl<'a> SignContext<'a> {
         } else {
             document.with_view(|view| view.root_element())
         };
+        document
+            .validate_node_limit_after_append_child(
+                signature_parent,
+                &template,
+                self.policy.resources.effective_xml_nodes() as usize,
+            )
+            .map_err(map_owned_document_mutation_error)?;
         document.append_child(signature_parent, &template)?;
         self.policy
             .resources
@@ -1142,6 +1152,20 @@ fn projected_signature_output_len(
             .ok_or(SigningKeyError::InvalidPublicKeyInfo.into());
     }
     Ok(raw_signature_len)
+}
+
+fn map_owned_document_mutation_error(error: XmlDocumentError) -> SigningError {
+    match error {
+        XmlDocumentError::ProjectedNodeLimit { maximum } => {
+            crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum,
+                actual: maximum.saturating_add(1),
+            }
+            .into()
+        }
+        error => SigningError::Document(error),
+    }
 }
 
 fn encode_signature_output(

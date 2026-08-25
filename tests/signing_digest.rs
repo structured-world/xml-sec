@@ -5,6 +5,7 @@ use std::sync::{
 };
 
 use base64::Engine as _;
+use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::policy::{
     EcdsaSignatureValueEncoding, ManifestProcessing, SigningPolicy, VerificationPolicy,
@@ -25,6 +26,66 @@ use xml_sec::xmldsig::{
 
 fn exclusive_c14n() -> C14nAlgorithm {
     C14nAlgorithm::new(C14nMode::Exclusive1_0, false)
+}
+
+#[test]
+fn owned_builder_signing_rejects_projected_node_limit_atomically() {
+    // A document parsed under a broader creation ceiling must still obey the
+    // signing operation's node policy before the generated template is appended.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(""));
+    let mut document =
+        XmlDocument::parse("<root><payload/></root>").expect("owned input must parse");
+    let input_nodes = document.with_view(|view| view.node_count());
+    let before = document.as_xml().to_owned();
+    let input_policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_nodes: input_nodes - 1,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    let input_error = SignContext::new(&key)
+        .policy(input_policy)
+        .sign_document_with_builder(&mut document, &builder)
+        .expect_err("owned input must obey the active signing node ceiling");
+    assert!(matches!(
+        input_error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "XML nodes",
+            maximum,
+            actual,
+        }) if maximum == input_nodes - 1 && actual == input_nodes
+    ));
+    assert_eq!(document.as_xml(), before);
+    assert_eq!(document.generation(), 0);
+
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_nodes: input_nodes,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    let error = SignContext::new(&key)
+        .policy(policy)
+        .sign_document_with_builder(&mut document, &builder)
+        .expect_err("appended signature must exceed the active node ceiling");
+
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "XML nodes",
+            maximum,
+            ..
+        }) if maximum == input_nodes
+    ));
+    assert_eq!(document.as_xml(), before);
+    assert_eq!(document.generation(), 0);
 }
 
 fn template_with_reference(reference: ReferenceBuilder) -> String {

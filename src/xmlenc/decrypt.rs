@@ -626,6 +626,7 @@ fn decrypt_owned_document_with_context(
     context: &DecryptContext<'_>,
 ) -> Result<(), XmlEncError> {
     context.policy.resources.validate()?;
+    document.validate_xml_input_policy(context.policy.xml.allow_internal_dtd)?;
     validate_encryption_document_len(document.as_xml().len(), &context.policy)?;
     let document_nodes = document.with_view(|view| view.node_count());
     if document_nodes > context.policy.resources.effective_xml_nodes() as usize {
@@ -683,6 +684,13 @@ fn decrypt_owned_document_with_context(
                 .saturating_add(plaintext.len()),
             &context.policy,
         )?;
+        document
+            .validate_node_limit_after_node_replacement(
+                target,
+                &plaintext,
+                context.policy.resources.effective_xml_nodes() as usize,
+            )
+            .map_err(map_document_mutation_error)?;
         match encrypted.encrypted_type.as_ref() {
             Some(EncryptedDataType::Element) => document
                 .replace_element(target, &plaintext)
@@ -701,6 +709,14 @@ fn decrypt_owned_document_with_context(
 fn map_document_mutation_error(error: crate::document::XmlDocumentError) -> XmlEncError {
     match error {
         crate::document::XmlDocumentError::Parse(error) => XmlEncError::XmlParse(error),
+        crate::document::XmlDocumentError::ProjectedNodeLimit { maximum } => {
+            crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum,
+                actual: maximum.saturating_add(1),
+            }
+            .into()
+        }
         error => XmlEncError::Document(error),
     }
 }
@@ -3771,6 +3787,50 @@ mod tests {
                 .expect("temporary wrapper must not consume caller node budget"),
             expected
         );
+    }
+
+    #[test]
+    fn owned_decryption_rejects_projected_node_limit_atomically() {
+        // The owned document may have been parsed under a broader ceiling than
+        // this operation; expanded plaintext must be bounded before mutation.
+        let key = [0x3a_u8; 16];
+        let plaintext = "<item/>".repeat(64);
+        let encrypted = encrypted_gcm_element(
+            "http://www.w3.org/2001/04/xmlenc#Content",
+            &plaintext,
+            None,
+            false,
+            &key,
+        );
+        let mut document = XmlDocument::parse(format!(
+            "<root xmlns:xenc=\"{XMLENC_NS}\">{encrypted}</root>"
+        ))
+        .expect("owned encrypted fixture must parse");
+        let input_nodes = document.with_view(|view| view.node_count());
+        let before = document.as_xml().to_owned();
+        let policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_nodes: input_nodes,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+
+        let error = DecryptContext::new(&SymmetricKeyDecryptor::new(key))
+            .policy(policy)
+            .decrypt_owned_document(&mut document, None)
+            .expect_err("expanded plaintext must exceed the operation node ceiling");
+
+        assert!(matches!(
+            error,
+            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum,
+                ..
+            }) if maximum == input_nodes
+        ));
+        assert_eq!(document.as_xml(), before);
+        assert_eq!(document.generation(), 0);
     }
 
     #[test]

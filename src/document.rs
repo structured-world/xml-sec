@@ -14,6 +14,9 @@ use self_cell::self_cell;
 use crate::IdAttributeRegistration;
 
 static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(1);
+const VALIDATION_WRAPPER_NS: &str = "urn:xml-sec:owned-document-validation";
+const VALIDATION_WRAPPER_OPEN: &str = "<xmlsec_owned_document:wrapper xmlns:xmlsec_owned_document=\"urn:xml-sec:owned-document-validation\">";
+const VALIDATION_WRAPPER_CLOSE: &str = "</xmlsec_owned_document:wrapper>";
 
 /// Process-local provenance of one owned XML document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -177,6 +180,12 @@ pub enum XmlDocumentError {
     /// Process-local document provenance space is exhausted.
     #[error("XML document identity space is exhausted")]
     IdentityExhausted,
+    /// A projected mutation exceeds the caller's active node ceiling.
+    #[error("projected XML document exceeds the maximum node count of {maximum}")]
+    ProjectedNodeLimit {
+        /// Maximum accepted parser node count.
+        maximum: usize,
+    },
 }
 
 /// Reusable owned XML document.
@@ -187,6 +196,7 @@ pub enum XmlDocumentError {
 pub struct XmlDocument {
     identity: DocumentIdentity,
     generation: u64,
+    requires_internal_dtd: bool,
     settings: DocumentParseSettings,
     cell: DocumentCell,
 }
@@ -215,16 +225,13 @@ impl XmlDocument {
                 actual: xml.len(),
             });
         }
+        let requires_internal_dtd = document_requires_internal_dtd(&xml, settings);
         let cell = build_cell(xml, settings)?;
-        let identity = NEXT_DOCUMENT_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map(DocumentIdentity)
-            .map_err(|_| XmlDocumentError::IdentityExhausted)?;
+        let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
         Ok(Self {
             identity,
             generation: 0,
+            requires_internal_dtd,
             settings,
             cell,
         })
@@ -240,6 +247,18 @@ impl XmlDocument {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn validate_xml_input_policy(
+        &self,
+        allow_internal_dtd: bool,
+    ) -> Result<(), crate::policy::PolicyViolation> {
+        if self.requires_internal_dtd && !allow_internal_dtd {
+            return Err(crate::policy::PolicyViolation::XmlInput {
+                reason: "owned document requires internal DTD support",
+            });
+        }
+        Ok(())
     }
 
     /// Return the deterministic serialized representation of this generation.
@@ -294,25 +313,7 @@ impl XmlDocument {
         self.validate_fragment_in_parent_context(target, replacement)?;
         let range =
             self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
-        let projected = self
-            .as_xml()
-            .len()
-            .checked_sub(range.len())
-            .and_then(|len| len.checked_add(replacement.len()))
-            .ok_or(XmlDocumentError::DocumentTooLarge {
-                maximum: self.settings.max_bytes,
-                actual: usize::MAX,
-            })?;
-        let mut candidate = String::with_capacity(projected);
-        candidate.push_str(&self.as_xml()[..range.start]);
-        candidate.push_str(replacement);
-        candidate.push_str(&self.as_xml()[range.end..]);
-        let next = build_cell(candidate, self.settings)?;
-        self.cell = next;
-        self.generation = self.generation.checked_add(1).ok_or_else(|| {
-            XmlDocumentError::InvalidReplacement("document generation overflow".into())
-        })?;
-        Ok(())
+        self.replace_range(range, replacement)
     }
 
     /// Replace all children of one element with a well-formed XML fragment.
@@ -504,6 +505,85 @@ impl XmlDocument {
         })
     }
 
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn validate_node_limit_after_node_replacement(
+        &self,
+        target: NodeIdentity,
+        replacement: &str,
+        maximum: usize,
+    ) -> Result<(), XmlDocumentError> {
+        let range =
+            self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
+        self.validate_node_limit_after_range_replacement(range, replacement, maximum)
+    }
+
+    pub(crate) fn validate_node_limit_after_append_child(
+        &self,
+        target: NodeIdentity,
+        child: &str,
+        maximum: usize,
+    ) -> Result<(), XmlDocumentError> {
+        let (range, replacement) = self.with_view(|view| {
+            let node = view.resolve_node(target)?;
+            if !node.is_element() {
+                return Err(XmlDocumentError::TargetNotElement);
+            }
+            let element_range = node.range();
+            let source = &view.xml()[element_range.clone()];
+            let (content, qualified_name, self_closing) = element_content_range(source)?;
+            if !self_closing {
+                let insertion = element_range.start + content.end;
+                return Ok((insertion..insertion, child.to_owned()));
+            }
+            let slash = source.rfind("/>").ok_or_else(|| {
+                XmlDocumentError::InvalidReplacement(
+                    "self-closing element has no terminator".into(),
+                )
+            })?;
+            Ok((
+                element_range,
+                format!("{}>{child}</{qualified_name}>", &source[..slash]),
+            ))
+        })?;
+        self.validate_node_limit_after_range_replacement(range, &replacement, maximum)
+    }
+
+    fn validate_node_limit_after_range_replacement(
+        &self,
+        range: std::ops::Range<usize>,
+        replacement: &str,
+        maximum: usize,
+    ) -> Result<(), XmlDocumentError> {
+        let projected = self
+            .as_xml()
+            .len()
+            .checked_sub(range.len())
+            .and_then(|length| length.checked_add(replacement.len()))
+            .ok_or(XmlDocumentError::DocumentTooLarge {
+                maximum: self.settings.max_bytes,
+                actual: usize::MAX,
+            })?;
+        let mut candidate = String::with_capacity(projected);
+        candidate.push_str(&self.as_xml()[..range.start]);
+        candidate.push_str(replacement);
+        candidate.push_str(&self.as_xml()[range.end..]);
+        let nodes_limit = u32::try_from(maximum).unwrap_or(u32::MAX);
+        match build_cell(
+            candidate,
+            DocumentParseSettings {
+                nodes_limit: self.settings.nodes_limit.min(nodes_limit),
+                max_bytes: projected,
+                ..self.settings
+            },
+        ) {
+            Ok(_) => Ok(()),
+            Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached)) => {
+                Err(XmlDocumentError::ProjectedNodeLimit { maximum })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn replace_range(
         &mut self,
         range: std::ops::Range<usize>,
@@ -536,9 +616,9 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
     ) -> Result<(), XmlDocumentError> {
-        let parsed = self.parse_fragment_in_parent_context(target, replacement)?;
+        let (parsed, wrapper_range) = self.parse_fragment_in_parent_context(target, replacement)?;
         parsed.with_dependent(|_, parsed| {
-            let wrapper = parsed.document.root_element();
+            let wrapper = validation_wrapper(parsed, wrapper_range.clone())?;
             if wrapper.children().filter(Node::is_element).count() != 1
                 || wrapper.children().any(|node| {
                     !node.is_element()
@@ -568,17 +648,10 @@ impl XmlDocument {
         &self,
         target: NodeIdentity,
         replacement: &str,
-    ) -> Result<DocumentCell, XmlDocumentError> {
-        let namespace_attributes = self.with_view(|view| {
-            let target = view.resolve_node(target)?;
-            Ok::<_, XmlDocumentError>(
-                target
-                    .parent_element()
-                    .map(|parent| namespace_attributes(parent.namespaces()))
-                    .unwrap_or_default(),
-            )
-        })?;
-        self.parse_wrapped_fragment(&namespace_attributes, replacement)
+    ) -> Result<(DocumentCell, std::ops::Range<usize>), XmlDocumentError> {
+        let range =
+            self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
+        self.parse_wrapped_range(range, replacement)
     }
 
     fn validate_content_in_element_context(
@@ -586,54 +659,86 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
     ) -> Result<(), XmlDocumentError> {
-        let namespace_attributes = self.with_view(|view| {
-            let target = view.resolve_node(target)?;
-            if !target.is_element() {
-                return Err(XmlDocumentError::TargetNotElement);
-            }
-            Ok(namespace_attributes(target.namespaces()))
+        let (element_range, content_range, qualified_name, self_closing) =
+            self.with_view(|view| {
+                let target = view.resolve_node(target)?;
+                if !target.is_element() {
+                    return Err(XmlDocumentError::TargetNotElement);
+                }
+                let element_range = target.range();
+                let source = &view.xml()[element_range.clone()];
+                let (content, qualified_name, self_closing) = element_content_range(source)?;
+                Ok::<_, XmlDocumentError>((
+                    element_range.clone(),
+                    (element_range.start + content.start)..(element_range.start + content.end),
+                    qualified_name,
+                    self_closing,
+                ))
+            })?;
+        if !self_closing {
+            return self
+                .parse_wrapped_range(content_range, replacement)
+                .map(|_| ());
+        }
+
+        let source = &self.as_xml()[element_range.clone()];
+        let slash = source.rfind("/>").ok_or_else(|| {
+            XmlDocumentError::InvalidReplacement("self-closing element has no terminator".into())
         })?;
-        self.parse_wrapped_fragment(&namespace_attributes, replacement)
-            .map(|_| ())
+        let wrapped = wrapped_fragment(replacement);
+        let wrapper_start = element_range.start + slash + 1;
+        let expanded = format!("{}>{wrapped}</{qualified_name}>", &source[..slash]);
+        self.parse_wrapped_edit(
+            element_range,
+            &expanded,
+            wrapper_start..(wrapper_start + wrapped.len()),
+        )
+        .map(|_| ())
     }
 
-    fn parse_wrapped_fragment(
+    fn parse_wrapped_range(
         &self,
-        namespace_attributes: &str,
+        range: std::ops::Range<usize>,
         replacement: &str,
-    ) -> Result<DocumentCell, XmlDocumentError> {
-        let wrapped = format!(
-            "<xmlsec-owned-document-wrapper{namespace_attributes}>{replacement}</xmlsec-owned-document-wrapper>"
-        );
-        let wrapped_len = wrapped.len();
-        build_cell(
-            wrapped,
+    ) -> Result<(DocumentCell, std::ops::Range<usize>), XmlDocumentError> {
+        let wrapped = wrapped_fragment(replacement);
+        let wrapper_range = range.start..(range.start + wrapped.len());
+        self.parse_wrapped_edit(range, &wrapped, wrapper_range)
+    }
+
+    fn parse_wrapped_edit(
+        &self,
+        range: std::ops::Range<usize>,
+        replacement: &str,
+        wrapper_range: std::ops::Range<usize>,
+    ) -> Result<(DocumentCell, std::ops::Range<usize>), XmlDocumentError> {
+        let projected = self
+            .as_xml()
+            .len()
+            .checked_sub(range.len())
+            .and_then(|length| length.checked_add(replacement.len()))
+            .ok_or_else(|| {
+                XmlDocumentError::InvalidReplacement("validation length overflow".into())
+            })?;
+        let mut candidate = String::with_capacity(projected);
+        candidate.push_str(&self.as_xml()[..range.start]);
+        candidate.push_str(replacement);
+        candidate.push_str(&self.as_xml()[range.end..]);
+        let parsed = build_cell(
+            candidate,
             DocumentParseSettings {
                 nodes_limit: self.settings.nodes_limit.saturating_add(1),
                 // Wrapper markup is validation scaffolding, not document input.
                 // The committed candidate is checked against the real ceiling.
-                max_bytes: wrapped_len,
+                max_bytes: projected,
                 ..self.settings
             },
-        )
+        )?;
+        parsed.with_dependent(|_, document| {
+            validation_wrapper(document, wrapper_range.clone()).map(|_| ())
+        })?;
+        Ok((parsed, wrapper_range))
     }
-}
-
-fn namespace_attributes<'a, 'input>(
-    namespaces: impl Iterator<Item = &'a roxmltree::Namespace<'input>>,
-) -> String
-where
-    'input: 'a,
-{
-    namespaces
-        .filter(|namespace| namespace.name() != Some("xml"))
-        .map(|namespace| match namespace.name() {
-            Some(prefix) => {
-                format!(" xmlns:{prefix}=\"{}\"", escape_attribute(namespace.uri()))
-            }
-            None => format!(" xmlns=\"{}\"", escape_attribute(namespace.uri())),
-        })
-        .collect()
 }
 
 impl<'a> DocumentView<'a> {
@@ -681,8 +786,12 @@ impl<'a> DocumentView<'a> {
         registrations: &[IdAttributeRegistration],
     ) -> Option<NodeIdentity> {
         let mut matches = HashSet::new();
-        if let Some(Some(node)) = self.parsed.indexes.default_ids.get(value) {
-            matches.insert(*node);
+        match self.parsed.indexes.default_ids.get(value) {
+            Some(Some(node)) => {
+                matches.insert(*node);
+            }
+            Some(None) => return None,
+            None => {}
         }
         for registration in registrations {
             let key = (
@@ -924,6 +1033,56 @@ fn build_cell(
     .map_err(XmlDocumentError::Parse)
 }
 
+fn allocate_document_identity(counter: &AtomicU64) -> Result<DocumentIdentity, XmlDocumentError> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .ok_or(XmlDocumentError::IdentityExhausted)?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(DocumentIdentity(current)),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn document_requires_internal_dtd(xml: &str, settings: DocumentParseSettings) -> bool {
+    // Parse provenance records what the source actually requires, not merely
+    // whether its creator used a permissive policy. This lets a later strict
+    // operation accept ordinary XML while rejecting DTD-dependent documents.
+    settings.allow_dtd
+        && Document::parse_with_options(
+            xml,
+            ParsingOptions {
+                allow_dtd: false,
+                nodes_limit: settings.nodes_limit,
+                entity_resolver: None,
+            },
+        )
+        .is_err()
+}
+
+fn wrapped_fragment(replacement: &str) -> String {
+    format!("{VALIDATION_WRAPPER_OPEN}{replacement}{VALIDATION_WRAPPER_CLOSE}")
+}
+
+fn validation_wrapper<'a, 'input>(
+    parsed: &'a ParsedDocument<'input>,
+    expected_range: std::ops::Range<usize>,
+) -> Result<Node<'a, 'input>, XmlDocumentError> {
+    parsed
+        .document
+        .descendants()
+        .find(|node| {
+            node.has_tag_name((VALIDATION_WRAPPER_NS, "wrapper")) && node.range() == expected_range
+        })
+        .ok_or_else(|| {
+            XmlDocumentError::InvalidReplacement(
+                "replacement escaped its structural validation boundary".into(),
+            )
+        })
+}
+
 impl DocumentIndexes {
     fn build(document: &Document<'_>) -> Self {
         let mut order = HashMap::new();
@@ -979,19 +1138,10 @@ impl DocumentIndexes {
     }
 }
 
-fn escape_attribute(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-}
-
 fn element_content_range(
     element: &str,
 ) -> Result<(std::ops::Range<usize>, String, bool), XmlDocumentError> {
-    let start_end = element.find('>').ok_or_else(|| {
-        XmlDocumentError::InvalidReplacement("element start tag is incomplete".into())
-    })?;
+    let start_end = element_opening_end(element)?;
     let start_tag = &element[..=start_end];
     let qualified_name = start_tag[1..]
         .split(|character: char| character.is_ascii_whitespace() || matches!(character, '/' | '>'))
@@ -1006,6 +1156,24 @@ fn element_content_range(
         .rfind("</")
         .ok_or_else(|| XmlDocumentError::InvalidReplacement("element end tag is missing".into()))?;
     Ok(((start_end + 1)..close, qualified_name, false))
+}
+
+fn element_opening_end(element: &str) -> Result<usize, XmlDocumentError> {
+    let mut quote = None;
+    for (index, byte) in element.bytes().enumerate() {
+        match byte {
+            b'\'' | b'"' => match quote {
+                Some(active) if active == byte => quote = None,
+                None => quote = Some(byte),
+                Some(_) => {}
+            },
+            b'>' if quote.is_none() => return Ok(index),
+            _ => {}
+        }
+    }
+    Err(XmlDocumentError::InvalidReplacement(
+        "element start tag is incomplete".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -1045,6 +1213,21 @@ mod tests {
     }
 
     #[test]
+    fn document_identity_allocation_reports_exhaustion_without_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+
+        assert_eq!(
+            allocate_document_identity(&counter).expect("last identity must be allocated"),
+            DocumentIdentity(u64::MAX - 1)
+        );
+        assert!(matches!(
+            allocate_document_identity(&counter),
+            Err(XmlDocumentError::IdentityExhausted)
+        ));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
     fn duplicate_and_caller_registered_ids_share_one_index() {
         let document = XmlDocument::parse(
             "<root><a ID=\"duplicate\" custom=\"selected\"/><b Id=\"duplicate\"/></root>",
@@ -1059,6 +1242,21 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_default_id_stays_ambiguous_with_caller_registration() {
+        // A caller registration must not turn an already ambiguous standard ID
+        // into a unique match by selecting only one of the duplicate elements.
+        let document = XmlDocument::parse(
+            "<root><a ID=\"duplicate\" custom=\"duplicate\"/><b Id=\"duplicate\"/></root>",
+        )
+        .expect("fixture must parse");
+        let registrations = [IdAttributeRegistration::global("custom")];
+
+        document.with_view(|view| {
+            assert!(view.node_for_id("duplicate", &registrations).is_none());
+        });
+    }
+
+    #[test]
     fn content_replacement_uses_parent_namespace_context() {
         let mut document = XmlDocument::parse("<p:root xmlns:p=\"urn:test\"><p:old/></p:root>")
             .expect("fixture must parse");
@@ -1069,6 +1267,52 @@ mod tests {
         assert_eq!(
             document.as_xml(),
             "<p:root xmlns:p=\"urn:test\"><p:new/></p:root>"
+        );
+    }
+
+    #[test]
+    fn mutations_ignore_greater_than_inside_quoted_attributes() {
+        // The opening-tag boundary is the unquoted '>', not a character in an
+        // attribute value; both content replacement and append use that boundary.
+        let mut document =
+            XmlDocument::parse("<root marker=\">\"><old/></root>").expect("fixture must parse");
+        let root = document.with_view(|view| view.root_element());
+
+        document
+            .replace_content(root, "<first/>")
+            .expect("quoted greater-than must not corrupt content replacement");
+        let root = document.with_view(|view| view.root_element());
+        document
+            .append_child(root, "<second/>")
+            .expect("quoted greater-than must not corrupt child append");
+
+        assert_eq!(
+            document.as_xml(),
+            "<root marker=\">\"><first/><second/></root>"
+        );
+    }
+
+    #[test]
+    fn fragment_validation_reuses_internal_dtd_entities() {
+        // Validation must run in the original document context so an entity
+        // declared by its internal subset remains available during mutation.
+        let mut document = XmlDocument::parse_with_settings(
+            "<!DOCTYPE root [<!ENTITY custom \"replacement\">]><root><old/></root>".into(),
+            DocumentParseSettings::new(
+                true,
+                crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
+                crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
+            ),
+        )
+        .expect("DTD fixture must parse when explicitly enabled");
+        let root = document.with_view(|view| view.root_element());
+
+        document
+            .replace_content(root, "&custom;")
+            .expect("declared entity must remain valid in replacement context");
+        assert_eq!(
+            document.as_xml(),
+            "<!DOCTYPE root [<!ENTITY custom \"replacement\">]><root>&custom;</root>"
         );
     }
 

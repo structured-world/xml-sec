@@ -227,6 +227,7 @@ impl EncryptedDataBuilder {
         options: DocumentEncryptionOptions<'_>,
     ) -> Result<(), XmlEncError> {
         self.policy.validate()?;
+        document.validate_xml_input_policy(self.policy.xml.allow_internal_dtd)?;
         self.validate_document_len(document.as_xml().len())?;
         let (target, source, document_nodes, selected_nodes) = document.with_view(|view| {
             let selected = select_encryption_target(view.document(), options.element_id)?;
