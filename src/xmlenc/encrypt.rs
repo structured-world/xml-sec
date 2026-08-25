@@ -10,6 +10,7 @@ use quick_xml::{
 use roxmltree::{Document, Node, ParsingOptions};
 use rsa::RsaPublicKey;
 
+use crate::document::{DocumentParseSettings, XmlDocument};
 use crate::xml::{is_xml_1_0_character, is_xml_ncname};
 
 use super::types::{XMLDSIG_NS, XMLENC_NS, XMLENC11_NS};
@@ -200,11 +201,50 @@ impl EncryptedDataBuilder {
     ) -> Result<String, XmlEncError> {
         self.policy.validate()?;
         self.validate_document_len(xml.len())?;
-        let parsing_options = encryption_parsing_options(&self.policy);
-        let document = Document::parse_with_options(xml, parsing_options)?;
-        let selected = select_encryption_target(&document, options.element_id)?;
-        let range = selected.range();
-        let source = &xml[range.clone()];
+        let mut document = XmlDocument::parse_with_settings(
+            xml.to_owned(),
+            DocumentParseSettings::new(
+                self.policy.xml.allow_internal_dtd,
+                self.policy.resources.effective_xml_nodes(),
+                self.policy.resources.max_xml_document_bytes,
+            ),
+        )
+        .map_err(|error| match error {
+            crate::document::XmlDocumentError::Parse(error) => XmlEncError::XmlParse(error),
+            error => XmlEncError::Document(error),
+        })?;
+        self.encrypt_owned_document(&mut document, options)?;
+        Ok(document.into_xml())
+    }
+
+    /// Encrypt and replace a node in a reusable owned XML document.
+    ///
+    /// Successful mutation advances the document generation and invalidates
+    /// identities captured before this call.
+    pub fn encrypt_owned_document(
+        &self,
+        document: &mut XmlDocument,
+        options: DocumentEncryptionOptions<'_>,
+    ) -> Result<(), XmlEncError> {
+        self.policy.validate()?;
+        self.validate_document_len(document.as_xml().len())?;
+        let (target, source, document_nodes, selected_nodes) = document.with_view(|view| {
+            let selected = select_encryption_target(view.document(), options.element_id)?;
+            Ok::<_, XmlEncError>((
+                view.node_identity(selected),
+                view.xml()[selected.range()].to_owned(),
+                view.document().descendants().count(),
+                selected.descendants().count(),
+            ))
+        })?;
+        if document_nodes > self.policy.resources.effective_xml_nodes() as usize {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum: self.policy.resources.effective_xml_nodes() as usize,
+                actual: document_nodes,
+            }
+            .into());
+        }
 
         match self.encrypted_type {
             EncryptedDataType::Element => {
@@ -212,22 +252,23 @@ impl EncryptedDataBuilder {
                     self.encrypt_payload(source.as_bytes(), Some(EncryptedDataType::Element))?;
                 let result = generated.result;
                 validate_replacement_document_len(
-                    xml.len(),
-                    range.len(),
+                    document.as_xml().len(),
+                    source.len(),
                     result.encrypted_data_xml.len(),
                     self.policy.resources.max_xml_document_bytes,
                 )?;
-                validate_replacement_document_nodes(
-                    &document,
-                    selected,
+                validate_replacement_node_counts(
+                    document_nodes,
+                    selected_nodes,
                     generated.xml_nodes,
                     ReplacementMode::ReplaceElement,
                     self.policy.resources.effective_xml_nodes() as usize,
                 )?;
-                Ok(replace_range(xml, range, &result.encrypted_data_xml))
+                document.replace_element(target, &result.encrypted_data_xml)?;
+                Ok(())
             }
             EncryptedDataType::Content => {
-                let boundaries = element_content_boundaries(source)?;
+                let boundaries = element_content_boundaries(&source)?;
                 let plaintext = &source[boundaries.content.clone()];
                 let generated =
                     self.encrypt_payload(plaintext.as_bytes(), Some(EncryptedDataType::Content))?;
@@ -239,7 +280,7 @@ impl EncryptedDataBuilder {
                             XmlEncError::InvalidStructure("self-closing tag has no slash".into())
                         })?;
                     (
-                        range.len(),
+                        source.len(),
                         slash
                             .saturating_add(result.encrypted_data_xml.len())
                             .saturating_add(boundaries.qualified_name.len())
@@ -249,19 +290,20 @@ impl EncryptedDataBuilder {
                     (boundaries.content.len(), result.encrypted_data_xml.len())
                 };
                 validate_replacement_document_len(
-                    xml.len(),
+                    document.as_xml().len(),
                     removed,
                     inserted,
                     self.policy.resources.max_xml_document_bytes,
                 )?;
-                validate_replacement_document_nodes(
-                    &document,
-                    selected,
+                validate_replacement_node_counts(
+                    document_nodes,
+                    selected_nodes,
                     generated.xml_nodes,
                     ReplacementMode::ReplaceContent,
                     self.policy.resources.effective_xml_nodes() as usize,
                 )?;
-                replace_element_content(xml, range, source, boundaries, &result.encrypted_data_xml)
+                document.replace_content(target, &result.encrypted_data_xml)?;
+                Ok(())
             }
             EncryptedDataType::Other(_) => Err(XmlEncError::InvalidEncryptionConfig(
                 "document encryption requires Element or Content Type".into(),
@@ -568,22 +610,18 @@ fn validate_replacement_document_len(
     validate_document_len(actual, maximum)
 }
 
-fn validate_replacement_document_nodes(
-    document: &Document<'_>,
-    selected: Node<'_, '_>,
+fn validate_replacement_node_counts(
+    document_nodes: usize,
+    selected_nodes: usize,
     inserted_nodes: usize,
     replacement: ReplacementMode,
     maximum: usize,
 ) -> Result<(), XmlEncError> {
-    let selected_nodes = selected.descendants().count();
     let removed_nodes = match replacement {
         ReplacementMode::ReplaceElement => selected_nodes,
         ReplacementMode::ReplaceContent => selected_nodes.saturating_sub(1),
     };
-    let actual = document
-        .root()
-        .descendants()
-        .count()
+    let actual = document_nodes
         .saturating_sub(removed_nodes)
         .saturating_add(inserted_nodes);
     if actual > maximum {
@@ -966,39 +1004,6 @@ fn find_start_tag_end(source: &str) -> Result<usize, XmlEncError> {
     Err(XmlEncError::InvalidStructure(
         "source element start tag is unterminated".into(),
     ))
-}
-
-fn replace_element_content(
-    xml: &str,
-    range: std::ops::Range<usize>,
-    source: &str,
-    boundaries: ContentBoundaries,
-    encrypted_data: &str,
-) -> Result<String, XmlEncError> {
-    if !boundaries.self_closing {
-        let absolute = range.start + boundaries.content.start..range.start + boundaries.content.end;
-        return Ok(replace_range(xml, absolute, encrypted_data));
-    }
-
-    let slash = source[..boundaries.start_tag_end]
-        .rfind('/')
-        .ok_or_else(|| XmlEncError::InvalidStructure("self-closing tag has no slash".into()))?;
-    let mut expanded = String::with_capacity(source.len() + encrypted_data.len() + 16);
-    expanded.push_str(&source[..slash]);
-    expanded.push('>');
-    expanded.push_str(encrypted_data);
-    expanded.push_str("</");
-    expanded.push_str(&boundaries.qualified_name);
-    expanded.push('>');
-    Ok(replace_range(xml, range, &expanded))
-}
-
-fn replace_range(xml: &str, range: std::ops::Range<usize>, replacement: &str) -> String {
-    let mut output = String::with_capacity(xml.len() - range.len() + replacement.len());
-    output.push_str(&xml[..range.start]);
-    output.push_str(replacement);
-    output.push_str(&xml[range.end..]);
-    output
 }
 
 #[cfg(test)]

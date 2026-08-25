@@ -158,8 +158,11 @@ Use `decrypt_document` to replace one typed `EncryptedData` in a complete XML st
 `Id` when the document contains multiple encrypted regions. The compiled decryption policy checks
 the shared `ResourcePolicy::max_xml_document_bytes` ceiling before DOM allocation and applies its
 XML node ceiling to
-the initial document, replacement-boundary validation, and final output reparse. The projected
-output byte length is checked before constructing the replacement. DTD parsing remains disabled by
+the initial document and every replacement generation. `encrypt_owned_document` and
+`decrypt_owned_document` reuse the retained parsed view, validate replacement XML in the parent
+namespace context, and invalidate prior node identities after a successful mutation. String APIs
+remain adapters over this boundary. The projected output byte length is checked before constructing
+the replacement. DTD parsing remains disabled by
 default; legacy documents that need an internal DTD can opt in only through
 `DecryptionPolicy::xml.allow_internal_dtd`. The API never installs an external entity resolver.
 

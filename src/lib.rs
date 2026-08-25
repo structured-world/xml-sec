@@ -31,6 +31,7 @@
 #![warn(missing_docs)]
 
 pub mod c14n;
+pub mod document;
 pub mod encoding;
 pub mod error;
 mod hard_limits;
@@ -50,4 +51,8 @@ pub mod xmldsig;
 #[cfg(feature = "xmlenc")]
 pub mod xmlenc;
 
+pub use document::{
+    AttributeIdentity, DocumentIdentity, DocumentView, NamespaceIdentity, NodeIdentity,
+    SemanticOrder, XmlDocument, XmlDocumentError,
+};
 pub use error::XmlSecError;

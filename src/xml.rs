@@ -97,6 +97,26 @@ impl IdAttributeRegistration {
             }
         }
     }
+
+    pub(crate) fn attribute_local_name(&self) -> &str {
+        &self.attribute_local_name
+    }
+
+    pub(crate) fn matches_node(&self, node: Node<'_, '_>) -> bool {
+        match &self.element_scope {
+            IdAttributeElementScope::AnyElement => true,
+            IdAttributeElementScope::AnyNamespace { local_name } => {
+                node.tag_name().name() == local_name
+            }
+            IdAttributeElementScope::ExpandedName {
+                local_name,
+                namespace,
+            } => {
+                node.tag_name().name() == local_name
+                    && node.tag_name().namespace() == namespace.as_deref()
+            }
+        }
+    }
 }
 
 /// Duplicate-safe index of XML ID attributes in one parsed document.

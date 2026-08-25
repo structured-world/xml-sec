@@ -171,58 +171,6 @@ pub(super) fn append_signature_to_root_with_options(
     Ok(output)
 }
 
-pub(super) fn append_signature_to_element_with_options(
-    xml: &str,
-    signature_template: &str,
-    target: Range<usize>,
-    policy: Option<&crate::policy::SigningPolicy>,
-) -> Result<String, XmlMutationError> {
-    validate_signature_template(signature_template, policy)?;
-    let _source = parse_mutation_xml_with_options(xml, policy)?;
-    let fragment = xml
-        .get(target.clone())
-        .ok_or(XmlMutationError::InvalidAppendTarget)?;
-    let opening_end = opening_tag_end(fragment).ok_or(XmlMutationError::InvalidAppendTarget)?;
-    let mut output = xml.to_owned();
-    if fragment[..opening_end].trim_end().ends_with('/') {
-        let slash = fragment[..opening_end]
-            .trim_end()
-            .strip_suffix('/')
-            .map(str::len)
-            .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        let name_end = fragment[1..]
-            .find(|character: char| character.is_whitespace() || matches!(character, '/' | '>'))
-            .map(|offset| offset + 1)
-            .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        let qualified_name = &fragment[1..name_end];
-        let replacement = format!(
-            "{}>{signature_template}</{qualified_name}>",
-            &fragment[..slash]
-        );
-        output.replace_range(target, &replacement);
-    } else {
-        let closing_start = fragment
-            .rfind("</")
-            .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        output.insert_str(target.start + closing_start, signature_template);
-    }
-    parse_mutation_xml_with_options(&output, policy)?;
-    Ok(output)
-}
-
-fn opening_tag_end(fragment: &str) -> Option<usize> {
-    let mut quote = None;
-    for (offset, character) in fragment.char_indices() {
-        match (quote, character) {
-            (None, '\'' | '"') => quote = Some(character),
-            (Some(delimiter), current) if delimiter == current => quote = None,
-            (None, '>') => return Some(offset),
-            _ => {}
-        }
-    }
-    None
-}
-
 /// Fill XMLDSig `<DigestValue>` elements in document order.
 pub fn fill_digest_values<I, S>(xml: &str, values: I) -> Result<String, XmlMutationError>
 where
@@ -281,26 +229,6 @@ where
     }
 
     fill_dsig_values_matching(xml, "DigestValue", values, policy, |stack, namespace| {
-        is_signed_info_reference_context(stack, namespace, target_signature)
-    })
-}
-
-pub(super) fn fill_selected_signed_info_digest_values_at_index_with_options<I, S>(
-    xml: &str,
-    replacements: I,
-    target_signature: usize,
-    policy: Option<&crate::policy::SigningPolicy>,
-) -> Result<String, XmlMutationError>
-where
-    I: IntoIterator<Item = (usize, S)>,
-    S: AsRef<str>,
-{
-    let replacements = replacements
-        .into_iter()
-        .map(|(index, value)| (index, value.as_ref().to_owned()))
-        .collect::<Vec<_>>();
-    let expected = count_signed_info_digest_values(xml, target_signature, policy)?;
-    fill_selected_digest_values(xml, replacements, expected, policy, |stack, namespace| {
         is_signed_info_reference_context(stack, namespace, target_signature)
     })
 }
@@ -1644,14 +1572,16 @@ mod tests {
         // Selected builder targets may be self-closing; insertion must expand
         // the element without dropping its qualified name or attributes.
         let source = r#"<root xmlns:s="urn:scope"><s:scope Id="urn:selected/item"/></root>"#;
-        let document = roxmltree::Document::parse(source).expect("source must parse");
-        let scope = document
-            .descendants()
-            .find(|node| node.attribute("Id") == Some("urn:selected/item"))
-            .expect("selected scope");
-        let signed =
-            append_signature_to_element_with_options(source, &template(1), scope.range(), None)
-                .expect("selected empty element must accept a signature");
+        let mut document = crate::XmlDocument::parse(source).expect("source must parse");
+        let registrations = [crate::IdAttributeRegistration::global("Id")];
+        let scope = document.with_view(|view| {
+            view.node_for_id("urn:selected/item", &registrations)
+                .expect("selected scope")
+        });
+        document
+            .append_child(scope, &template(1))
+            .expect("selected empty element must accept a signature");
+        let signed = document.into_xml();
         let output = roxmltree::Document::parse(&signed).expect("output must parse");
         let scope = output
             .descendants()

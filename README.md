@@ -22,6 +22,7 @@ XML Security in pure Rust, built to replace libxmlsec1.
 - **X.509** — Certificate-based key extraction and validation
 - **Native CLI** — `xmlsec1` command surface backed by the same Rust policy and provider pipelines
 - **Provider-neutral crypto** — typed capabilities and opaque key handles with RustCrypto as the pure-Rust default
+- **Reusable XML documents** — retained parsing, stable semantic identities, shared indexes, and generation-safe mutation across C14N, XMLDSig, and XMLEnc
 
 ## Why?
 
@@ -41,6 +42,7 @@ Currently implemented (core paths):
 - XMLDSig parsing, same-document URI dereference, enveloped/C14N/Base64/XPath 1.0/XPath Filter 2.0 transform chains, and digest verification
 - XMLDSig full verify pipeline (`SignedInfo` canonicalization + `SignatureValue` verification)
 - XMLDSig template signing pipeline (`DigestValue` fill + `SignedInfo` canonicalization + `SignatureValue` fill), including enveloped SAML Response templates
+- Owned `XmlDocument` operation boundary with stale/cross-document identity rejection, exact attribute/namespace ownership, deterministic serialization, and reusable sign/verify/encrypt/decrypt entry points
 - Unified typed verify/sign/encrypt/decrypt policies own algorithms, key-source and X.509 trust rules, URI/transform semantics, Manifest handling, XML parsing, and shared resource budgets. Caller keys, selected targets, and external bytes remain request context; resolver or per-call options cannot override policy.
 - XMLDSig signing KeyInfo writer for embedded X.509 certificates
 - Built-in verification-key resolution from embedded X.509/DER/`KeyValue` sources and configured `KeyName`, X.509 subject, issuer/serial, SKI, or digest selectors

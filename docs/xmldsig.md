@@ -49,10 +49,12 @@ executes, including the default C14N 1.0 coercion when a reference transform cha
 set and the declared canonicalization method for `<SignedInfo>`. Reference output and
 `<SignedInfo>` serialization consume one bounded canonicalization budget, so policy rejection
 occurs during rendering rather than after an oversized buffer has already been allocated.
-The same immutable policy controls every signing parse and mutation reparse, including source
-validation in `sign_with_builder`, digest filling, `SignedInfo` parsing, signature filling, and
-optional `KeyInfo` filling. An internal-DTD opt-in and XML node ceiling therefore cannot be lost
-between stages. Custom `KeyInfoWriter` output is treated as a separate untrusted XML input: its
+The same immutable policy controls the retained owned document and every committed signing
+generation, including source validation in `sign_with_builder`, digest filling, `SignedInfo`
+parsing, signature filling, and optional `KeyInfo` filling. An internal-DTD opt-in and XML node
+ceiling therefore cannot be lost between stages. `SignContext::sign_document` and
+`sign_document_with_builder` reuse an `XmlDocument`; string APIs are adapters over that boundary.
+Custom `KeyInfoWriter` output is treated as a separate untrusted XML input: its
 byte ceiling is enforced before namespace wrapping or parsing, and the populated document is
 checked again after mutation.
 `IdAttributeRegistration` supplies immutable request context for non-standard ID attributes.
