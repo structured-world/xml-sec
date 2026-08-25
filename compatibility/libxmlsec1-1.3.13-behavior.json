@@ -14,6 +14,16 @@
           "file": "tests/xmlsec1_interop.rs",
           "test": "asn1_ecdsa_compatibility_matches_pinned_xmlsec1",
           "description": "Pinned donor and native verification accept the upstream DER fixture only in explicit compatibility mode."
+        },
+        {
+          "file": "tests/signing_digest.rs",
+          "test": "ecdsa_asn1_compatibility_is_explicit_across_the_signing_pipeline",
+          "description": "Native signing emits ASN.1 DER only under explicit policy and verifies the result under the matching policy."
+        },
+        {
+          "file": "tools/xmlsec1/tests/process_contract.rs",
+          "test": "cli_asn1_signature_mode_requires_the_explicit_donor_flag",
+          "description": "The native CLI flag controls both ASN.1 signing output and verification acceptance."
         }
       ],
       "negative": [
@@ -21,6 +31,16 @@
           "file": "tests/xmlsec1_interop.rs",
           "test": "asn1_ecdsa_compatibility_matches_pinned_xmlsec1",
           "description": "Pinned donor and native standards defaults both reject the upstream DER fixture."
+        },
+        {
+          "file": "tests/signing_digest.rs",
+          "test": "ecdsa_asn1_compatibility_is_explicit_across_the_signing_pipeline",
+          "description": "Standards-default native verification rejects DER emitted by compatibility-mode signing."
+        },
+        {
+          "file": "tools/xmlsec1/tests/process_contract.rs",
+          "test": "cli_asn1_signature_mode_requires_the_explicit_donor_flag",
+          "description": "CLI verification without the compatibility flag rejects ASN.1 DER SignatureValue framing."
         }
       ]
     },
@@ -93,6 +113,11 @@
           "file": "tests/signing_digest.rs",
           "test": "signing_internal_dtd_policy_reaches_builder_and_mutation_reparses",
           "description": "Explicit internal-DTD policy reaches the complete signing pipeline."
+        },
+        {
+          "file": "src/xml.rs",
+          "test": "dtd_id_declarations_do_not_replace_request_registration",
+          "description": "Caller registration indexes a custom attribute even when its ID type is also declared in an allowed internal DTD."
         }
       ],
       "negative": [
@@ -100,6 +125,11 @@
           "file": "tests/merlin_interop.rs",
           "test": "rejects_dtd_and_unsupported_retrieval_defaults",
           "description": "DTD parsing and unsupported retrieval remain disabled by default."
+        },
+        {
+          "file": "src/xml.rs",
+          "test": "dtd_id_declarations_do_not_replace_request_registration",
+          "description": "Allowing an internal DTD does not implicitly register its custom ID-typed attributes in the owned Rust tree."
         }
       ]
     },
@@ -313,12 +343,12 @@
     {
       "id": "behavior-006",
       "category": "dtd-xml-id-caller-id",
-      "summary": "DTD IDs, xml:id, and caller-registered ID attributes are distinct explicit input and request controls.",
+      "summary": "Internal-DTD parsing and ID registration are separate controls; DTD declarations do not implicitly register custom ID attributes in the owned Rust tree.",
       "classification": "native",
       "control": {
         "boundary": "typed XML policy plus request-scoped ID registrations",
         "setting": "XmlInputPolicy.allow_internal_dtd and VerifyContext/SignContext id_attributes",
-        "default": "DTD disabled; xml:id and built-in XMLDSig IDs indexed"
+        "default": "DTD disabled; xml:id and built-in XMLDSig ID spellings indexed; custom attributes require caller registration"
       },
       "evidence": "id-resolution",
       "donor_anchors": [

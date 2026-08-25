@@ -229,7 +229,9 @@ rather than bypassing a separate policy gate. The decision applies consistently 
 document and caller-supplied detached XML parsed by node-set transforms. Direct transform callers
 can set the corresponding option with `TransformOptions::allow_internal_dtd(true)`. Signing uses
 `SigningPolicy::xml.allow_internal_dtd` across its complete pipeline. External entity resolution
-remains disabled. XSLT is intentionally not executed because transforms operate on
+remains disabled. Internal-DTD parsing does not import DTD attribute types into the owned Rust ID
+index; attributes outside the built-in XMLDSig spellings and `xml:id` still require an explicit
+request-scoped ID registration. XSLT is intentionally not executed because transforms operate on
 attacker-controlled documents; an authenticated Manifest reference using unsupported XSLT is
 reported as an invalid per-reference result without changing core `SignedInfo` validity.
 

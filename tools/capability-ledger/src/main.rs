@@ -452,7 +452,8 @@ fn validate_behavior_evidence_references(
 fn contains_test_declaration(source: &str, test_name: &str) -> Result<bool, String> {
     let file =
         syn::parse_file(source).map_err(|error| format!("parse Rust evidence source: {error}"))?;
-    Ok(items_contain_enabled_test(&file.items, test_name))
+    Ok(attributes_allow_behavior_evidence(&file.attrs)
+        && items_contain_enabled_test(&file.items, test_name))
 }
 
 fn items_contain_enabled_test(items: &[syn::Item], test_name: &str) -> bool {
@@ -472,7 +473,7 @@ fn items_contain_enabled_test(items: &[syn::Item], test_name: &str) -> bool {
                 })
         }
         syn::Item::Mod(module) => {
-            module_allows_behavior_evidence(&module.attrs)
+            attributes_allow_behavior_evidence(&module.attrs)
                 && module
                     .content
                     .as_ref()
@@ -482,7 +483,7 @@ fn items_contain_enabled_test(items: &[syn::Item], test_name: &str) -> bool {
     })
 }
 
-fn module_allows_behavior_evidence(attributes: &[syn::Attribute]) -> bool {
+fn attributes_allow_behavior_evidence(attributes: &[syn::Attribute]) -> bool {
     attributes.iter().all(|attribute| {
         if attribute.path().is_ident("cfg") {
             // Unit tests conventionally live in a cfg(test) module. Any other
@@ -1802,6 +1803,29 @@ mod tests {
                 "disabled or conditional test must not certify evidence: {source}"
             );
         }
+    }
+
+    #[test]
+    fn behavior_evidence_rejects_conditionally_compiled_source_files() {
+        for source in [
+            "#![cfg(feature = \"optional\")]\n#[test]\nfn expected() {}\n",
+            "#![cfg_attr(all(), cfg(any()))]\n#[test]\nfn expected() {}\n",
+        ] {
+            assert!(
+                !contains_test_declaration(source, "expected")
+                    .expect("test declaration matching must run"),
+                "conditional source file must not certify evidence: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn behavior_evidence_allows_an_unconditional_source_file() {
+        let source = "#![allow(dead_code)]\n#[test]\nfn expected() {}\n";
+        assert!(
+            contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
+        );
     }
 
     #[test]

@@ -202,7 +202,7 @@ pub(crate) fn is_xml_ncname(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use roxmltree::Document;
+    use roxmltree::{Document, ParsingOptions};
 
     use super::{IdAttributeRegistration, XmlIdIndex, is_xml_1_0_character, is_xml_ncname};
 
@@ -311,5 +311,29 @@ mod tests {
         );
         assert!(exact_namespace.node("plain").is_none());
         assert!(exact_namespace.node("namespaced").is_some());
+    }
+
+    #[test]
+    fn dtd_id_declarations_do_not_replace_request_registration() {
+        // Internal-DTD policy controls parsing only. The owned Rust tree does
+        // not expose DTD attribute types, so custom IDs remain request context.
+        let document = Document::parse_with_options(
+            "<!DOCTYPE root [<!ATTLIST item Token ID #REQUIRED>]><root><item Token=\"target\"/></root>",
+            ParsingOptions {
+                allow_dtd: true,
+                ..ParsingOptions::default()
+            },
+        )
+        .expect("bounded internal DTD fixture must parse");
+
+        let implicit = XmlIdIndex::with_registrations(&document, &[]);
+        assert!(implicit.node("target").is_none());
+
+        let registered =
+            XmlIdIndex::with_registrations(&document, &[IdAttributeRegistration::global("Token")]);
+        assert_eq!(
+            registered.node("target").map(|node| node.tag_name().name()),
+            Some("item")
+        );
     }
 }
