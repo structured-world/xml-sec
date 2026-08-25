@@ -181,8 +181,20 @@ fn pinned_c_oracle_reports_context_callback_and_dom_contracts() {
     let output = String::from_utf8(run.stdout).expect("probe output must be UTF-8");
     let lines = output.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 4, "unexpected probe output: {output}");
-    assert_eq!(lines[0], "valid=0,OK,UNKNOWN,1", "{output}");
-    assert_eq!(lines[1], "invalid=0,FAILED,REFERENCE,1", "{output}");
-    assert_eq!(lines[2], "abort=-1,ERROR,UNKNOWN,1", "{output}");
+    assert_eq!(
+        lines[0],
+        "valid=0,OK,UNKNOWN,callback=1,user-data=1,pre-exec=1,signed-info=1,manifest=0,reference=OK",
+        "{output}"
+    );
+    assert_eq!(
+        lines[1],
+        "invalid=0,FAILED,REFERENCE,callback=1,user-data=1,pre-exec=1,signed-info=1,manifest=0,reference=FAILED",
+        "{output}"
+    );
+    assert_eq!(
+        lines[2],
+        "abort=-1,ERROR,UNKNOWN,callback=1,user-data=1,pre-exec=1,signed-info=1,manifest=0,reference=ERROR",
+        "{output}"
+    );
     assert_eq!(lines[3], "sign=0,1,1", "{output}");
 }

@@ -34,13 +34,15 @@ lists when distinct descriptions identify the accepted and rejected outcomes;
 an identical assertion repeated within either list or across both lists is
 rejected as duplicate evidence.
 Evidence declarations are parsed as Rust items and must be unconditional,
-non-ignored `#[test]` functions; syntax inside comments or literals and tests
-behind `cfg`, `cfg_attr`, or `ignore` cannot certify ledger behavior. The normal
-module-level `#[cfg(test)]` harness boundary is the sole permitted condition.
+non-ignored `#[test]` functions with ordinary assertion semantics; syntax inside
+comments or literals and tests behind `cfg`, `cfg_attr`, `ignore`, or
+`should_panic` cannot certify ledger behavior. The normal module-level
+`#[cfg(test)]` harness boundary is the sole permitted condition.
 Context, callback, and in-place libxml2 mutation behavior is deliberately
 classified as future C compatibility work rather than being attributed to the
 owned native Rust API. A test-only C probe is compiled through the pinned
-`xmlsec1-config` and measures success, invalid-result, callback-abort, and
+`xmlsec1-config` and measures success, invalid-result, callback-abort, retained
+reference state, pre-execution callback order, `userData` propagation, and
 signing-mutation state; libxmlsec1 remains absent from the product runtime.
 
 The ledger is an honest parity map, not a blanket compatibility claim. Every

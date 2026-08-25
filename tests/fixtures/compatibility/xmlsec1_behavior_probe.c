@@ -12,13 +12,33 @@
 
 static int callback_count = 0;
 static int abort_callback = 0;
+static int callback_user_data_matches = 0;
+static int callback_precedes_execution = 0;
+static void* expected_user_data = NULL;
 
 static int reference_pre_execute(xmlSecTransformCtxPtr transform_ctx) {
     if(transform_ctx == NULL) {
         return(-1);
     }
     callback_count += 1;
+    callback_user_data_matches += (transform_ctx->userData == expected_user_data);
+    /* The callback contract is prepared-chain visibility before execution starts. */
+    callback_precedes_execution +=
+        ((transform_ctx->status == xmlSecTransformStatusNone) &&
+         (transform_ctx->first != NULL) && (transform_ctx->last != NULL));
     return(abort_callback ? -1 : 0);
+}
+
+static const char* first_reference_status(xmlSecDSigCtxPtr context) {
+    xmlSecDSigReferenceCtxPtr reference;
+    if(xmlSecPtrListGetSize(&(context->signedInfoReferences)) == 0) {
+        return("MISSING");
+    }
+    reference = (xmlSecDSigReferenceCtxPtr)xmlSecPtrListGetItem(
+        &(context->signedInfoReferences),
+        0
+    );
+    return((reference == NULL) ? "MISSING" : xmlSecDSigCtxGetStatusString(reference->status));
 }
 
 static xmlDocPtr load_document(const char* path) {
@@ -68,6 +88,7 @@ static int verify_case(const char* document_path, const char* key_path, int muta
     xmlDocPtr document = load_document(document_path);
     xmlNodePtr signature;
     xmlSecDSigCtxPtr context;
+    int user_data_sentinel = 0;
     int result;
     if(document == NULL) {
         return(-1);
@@ -91,16 +112,27 @@ static int verify_case(const char* document_path, const char* key_path, int muta
         return(-1);
     }
     callback_count = 0;
+    callback_user_data_matches = 0;
+    callback_precedes_execution = 0;
     abort_callback = abort;
+    expected_user_data = &user_data_sentinel;
+    context->userData = expected_user_data;
     result = xmlSecDSigCtxVerify(context, signature);
     printf(
-        "%s=%d,%s,%s,%d\n",
+        "%s=%d,%s,%s,callback=%d,user-data=%d,pre-exec=%d,"
+        "signed-info=%lu,manifest=%lu,reference=%s\n",
         abort ? "abort" : (mutate ? "invalid" : "valid"),
         result,
         xmlSecDSigCtxGetStatusString(context->status),
         xmlSecDSigCtxGetFailureReasonString(context->failureReason),
-        callback_count
+        callback_count,
+        callback_user_data_matches == callback_count,
+        callback_precedes_execution == callback_count,
+        (unsigned long)xmlSecPtrListGetSize(&(context->signedInfoReferences)),
+        (unsigned long)xmlSecPtrListGetSize(&(context->manifestReferences)),
+        first_reference_status(context)
     );
+    expected_user_data = NULL;
     xmlSecDSigCtxDestroy(context);
     xmlFreeDoc(document);
     return(0);

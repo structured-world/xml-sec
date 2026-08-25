@@ -480,7 +480,7 @@ fn is_enabled_test(function: &syn::ItemFn, test_name: &str) -> bool {
         // Ledger evidence must execute in every supported build, not merely
         // exist behind a target/feature condition or ignore.
         && !function.attrs.iter().any(|attribute| {
-            ["ignore", "cfg", "cfg_attr"]
+            ["ignore", "should_panic", "cfg", "cfg_attr"]
                 .iter()
                 .any(|name| attribute.path().is_ident(name))
         })
@@ -1797,6 +1797,7 @@ mod tests {
     fn behavior_evidence_rejects_disabled_or_conditional_tests() {
         for source in [
             "#[test]\n#[ignore]\nfn expected() {}\n",
+            "#[test]\n#[should_panic]\nfn expected() {}\n",
             "#[test]\n#[cfg(any())]\nfn expected() {}\n",
             "#[test]\n#[cfg_attr(all(), ignore)]\nfn expected() {}\n",
         ] {

@@ -49,7 +49,7 @@
         {
           "file": "tests/behavioral_compatibility.rs",
           "test": "pinned_c_oracle_reports_context_callback_and_dom_contracts",
-          "description": "A compiled probe measures successful and invalid context state, callback execution, and in-place signing mutation against pinned libxmlsec1."
+          "description": "A compiled probe measures successful and invalid context state, retained references, pre-execution callback order, userData propagation, and in-place signing mutation against pinned libxmlsec1."
         },
         {
           "file": "tests/behavioral_compatibility.rs",
@@ -61,7 +61,7 @@
         {
           "file": "tests/behavioral_compatibility.rs",
           "test": "pinned_c_oracle_reports_context_callback_and_dom_contracts",
-          "description": "The probe measures callback-abort error state and distinguishes it from an invalid signature result."
+          "description": "The probe measures callback-abort error state and its retained failed reference, distinguishing processing errors from invalid results."
         },
         {
           "file": "tests/behavioral_compatibility.rs",
@@ -83,6 +83,11 @@
           "file": "tests/signature_pipeline_integration.rs",
           "test": "malformed_signature_value_base64_returns_decode_error",
           "description": "Malformed wire syntax remains a processing error."
+        },
+        {
+          "file": "tests/donor_negative_vectors.rs",
+          "test": "phaos_bad_signature_artifact_fails_on_its_unsupported_md5_reference",
+          "description": "An unsupported Reference digest algorithm remains a typed processing error rather than an invalid verification result."
         }
       ]
     },
