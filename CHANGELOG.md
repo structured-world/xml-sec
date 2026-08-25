@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14](https://github.com/structured-world/xml-sec/compare/v0.1.13...v0.1.14) - 2026-08-25
+
+### Fixed
+
+- *(compat)* reject ambiguous evidence names
+- *(compat)* align behavioral evidence
+- *(compat)* validate evidence invariants
+- *(compat)* parse evidence as Rust items
+- *(compat)* harden behavior evidence
+- *(xmldsig)* unify same-document ID semantics
+- *(compat)* align donor behavior contracts
+
 ## [0.1.13](https://github.com/structured-world/xml-sec/compare/v0.1.12...v0.1.13) - 2026-08-24
 
 ### Fixed
