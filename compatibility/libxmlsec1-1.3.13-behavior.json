@@ -203,9 +203,9 @@
           "needle": "xmlSecTransformXPathNodeRead(xmlSecTransformPtr transform, xmlNodePtr node, xmlSecTransformCtxPtr transformCtx)"
         },
         {
-          "source": "src/xmldsig.c",
-          "line": 1248,
-          "needle": "dsigRefCtx->transformCtx.preExecCallback = dsigCtx->referencePreExecuteCallback;"
+          "source": "src/xpath.c",
+          "line": 219,
+          "needle": "xmlXPathRegisterFunc(data->ctx, (xmlChar *)\"here\", xmlSecXPathHereFunction);"
         }
       ]
     },

@@ -28,6 +28,10 @@ Every entry identifies its typed policy, request, CLI, or future C-boundary
 control and references both positive and negative tests. Donor source anchors
 are resolved to exact lines during generation. Ambiguous or missing anchors,
 missing categories, incomplete controls, and stale test names fail generation.
+Positive and negative evidence entries are behavioral assertions rather than a
+requirement for separate test executables. A differential test may support both
+lists when distinct descriptions identify the accepted and rejected outcomes;
+an identical assertion in both lists is rejected as duplicate evidence.
 Context, callback, and in-place libxml2 mutation behavior is deliberately
 classified as future C compatibility work rather than being attributed to the
 owned native Rust API. A test-only C probe is compiled through the pinned

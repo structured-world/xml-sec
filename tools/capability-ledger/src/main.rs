@@ -115,7 +115,11 @@ struct BehaviorRulesFile {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct BehaviorEvidence {
+    /// Assertions proving accepted/successful behavior. A differential test may
+    /// also appear in `negative` when it proves both outcomes in one execution.
     positive: Vec<BehaviorTest>,
+    /// Assertions proving rejected/failing behavior, not necessarily separate
+    /// test executables from the paired positive assertions.
     negative: Vec<BehaviorTest>,
 }
 
@@ -268,6 +272,12 @@ fn generate_behavior_ledger(
     }
     validate_behavior_categories(&rules.behaviors)?;
     validate_behavior_evidence(&rules.evidence)?;
+    let referenced_evidence = rules
+        .behaviors
+        .iter()
+        .map(|behavior| behavior.evidence.clone())
+        .collect::<BTreeSet<_>>();
+    validate_behavior_evidence_references(&rules.evidence, &referenced_evidence)?;
 
     let mut ids = BTreeSet::new();
     let mut behaviors = Vec::with_capacity(rules.behaviors.len());
@@ -376,6 +386,18 @@ fn validate_behavior_evidence(evidence: &BTreeMap<String, BehaviorEvidence>) -> 
                 "evidence {id} must have positive and negative tests"
             ));
         }
+        for negative in &evidence.negative {
+            if evidence.positive.iter().any(|positive| {
+                positive.file == negative.file
+                    && positive.test == negative.test
+                    && positive.description == negative.description
+            }) {
+                return Err(format!(
+                    "evidence {id} repeats an identical positive and negative assertion for {}",
+                    negative.test
+                ));
+            }
+        }
         for test in evidence.positive.iter().chain(&evidence.negative) {
             let path = Path::new(&test.file);
             if path.is_absolute() || test.file.contains("..") {
@@ -394,6 +416,18 @@ fn validate_behavior_evidence(evidence: &BTreeMap<String, BehaviorEvidence>) -> 
     Ok(())
 }
 
+fn validate_behavior_evidence_references(
+    evidence: &BTreeMap<String, BehaviorEvidence>,
+    referenced: &BTreeSet<String>,
+) -> Result<(), String> {
+    for id in evidence.keys() {
+        if !referenced.contains(id) {
+            return Err(format!("evidence {id} is referenced by no behavior"));
+        }
+    }
+    Ok(())
+}
+
 fn contains_test_declaration(source: &str, test_name: &str) -> Result<bool, String> {
     let declaration = Regex::new(&format!(
         r"^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+{}\s*\(",
@@ -401,9 +435,10 @@ fn contains_test_declaration(source: &str, test_name: &str) -> Result<bool, Stri
     ))
     .map_err(|error| format!("compile evidence declaration matcher: {error}"))?;
     let mut pending_test_attribute = false;
+    let mut block_comment_depth = 0_usize;
 
     for line in source.lines() {
-        let line = line.trim();
+        let line = strip_leading_rust_comments(line, &mut block_comment_depth).trim();
         if line == "#[test]" {
             pending_test_attribute = true;
             continue;
@@ -418,6 +453,37 @@ fn contains_test_declaration(source: &str, test_name: &str) -> Result<bool, Stri
     }
 
     Ok(false)
+}
+
+fn strip_leading_rust_comments<'line>(
+    mut line: &'line str,
+    block_comment_depth: &mut usize,
+) -> &'line str {
+    loop {
+        line = line.trim_start();
+        while *block_comment_depth > 0 {
+            match (line.find("/*"), line.find("*/")) {
+                (Some(start), Some(end)) if start < end => {
+                    *block_comment_depth += 1;
+                    line = &line[start + 2..];
+                }
+                (_, Some(end)) => {
+                    *block_comment_depth -= 1;
+                    line = &line[end + 2..];
+                }
+                _ => return "",
+            }
+        }
+        if line.starts_with("//") {
+            return "";
+        }
+        if let Some(rest) = line.strip_prefix("/*") {
+            *block_comment_depth = 1;
+            line = rest;
+            continue;
+        }
+        return line;
+    }
 }
 
 fn resolve_donor_anchor(donor: &Path, anchor: DonorAnchorRule) -> Result<DonorAnchor, String> {
@@ -1686,33 +1752,81 @@ mod tests {
     fn behavior_evidence_requires_an_exact_test_declaration() {
         // A renamed test whose new name extends the old one, or a comment that
         // retains the old spelling, must not keep stale ledger evidence alive.
-        let path = format!(
-            "target/capability-ledger-evidence-{}.rs",
-            std::process::id()
+        let source = "// fn expected\n#[test]\nfn expected_for_case() {}\n";
+        assert!(
+            !contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
         );
-        fs::create_dir_all("target").expect("target directory must be creatable");
-        fs::write(
-            &path,
-            "// fn expected\n#[test]\nfn expected_for_case() {}\n",
-        )
-        .expect("evidence fixture must be writable");
-        let test = BehaviorTest {
-            file: path.clone(),
-            test: "expected".into(),
-            description: "stale evidence fixture".into(),
+    }
+
+    #[test]
+    fn behavior_evidence_finds_tests_after_rust_comments() {
+        // Rust comments are item trivia and may legally separate an attribute
+        // from the function to which it applies.
+        let source =
+            "#[test]\n// rationale\n/* more\n * /* nested */ rationale\n */\nfn expected() {}\n";
+        assert!(
+            contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
+        );
+    }
+
+    #[test]
+    fn behavior_evidence_rejects_an_exact_duplicate_assertion() {
+        let assertion = BehaviorTest {
+            file: "tests/behavioral_compatibility.rs".into(),
+            test: "c_boundary_behaviors_are_explicitly_planned".into(),
+            description: "same assertion".into(),
         };
         let evidence = BTreeMap::from([(
-            "stale".into(),
+            "duplicate".into(),
             BehaviorEvidence {
-                positive: vec![test.clone()],
-                negative: vec![test],
+                positive: vec![assertion.clone()],
+                negative: vec![assertion],
             },
         )]);
 
-        let result = validate_behavior_evidence(&evidence);
-        fs::remove_file(path).expect("evidence fixture must be removable");
-        let error = result.expect_err("substring and comment matches must not satisfy evidence");
-        assert!(error.contains("expected"), "{error}");
+        let error = validate_behavior_evidence(&evidence)
+            .expect_err("identical assertions must not represent both outcomes");
+        assert!(error.contains("duplicate"), "{error}");
+    }
+
+    #[test]
+    fn behavior_evidence_allows_paired_assertions_from_one_test() {
+        let assertion = BehaviorTest {
+            file: "src/main.rs".into(),
+            test: "behavior_evidence_allows_paired_assertions_from_one_test".into(),
+            description: "acceptance outcome".into(),
+        };
+        let evidence = BTreeMap::from([(
+            "differential".into(),
+            BehaviorEvidence {
+                positive: vec![assertion.clone()],
+                negative: vec![BehaviorTest {
+                    description: "rejection outcome".into(),
+                    ..assertion
+                }],
+            },
+        )]);
+
+        validate_behavior_evidence(&evidence)
+            .expect("one differential test may prove distinct paired assertions");
+    }
+
+    #[test]
+    fn behavior_evidence_rejects_unreferenced_entries() {
+        let evidence = BTreeMap::from([(
+            "orphan".into(),
+            BehaviorEvidence {
+                positive: Vec::new(),
+                negative: Vec::new(),
+            },
+        )]);
+        let referenced = BTreeSet::new();
+
+        let error = validate_behavior_evidence_references(&evidence, &referenced)
+            .expect_err("orphan evidence must not reach the generated ledger");
+        assert!(error.contains("orphan"), "{error}");
     }
 
     #[test]
