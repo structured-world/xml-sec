@@ -1,11 +1,24 @@
 [workspace]
 semver_check = false
-git_release_enable = true
+git_release_enable = false
+git_tag_enable = false
 changelog_update = true
-git_tag_name = "v{{ version }}"
+pr_name = "chore: release {{ version }}"
 publish = false
 release_always = false
-release_commits = "^(feat|fix|perf|refactor|docs)(\\((c14n|xmldsig|xmlenc|readme|test|ci|lint|review)\\))?!?:"
+release_commits = "^(feat|fix|perf|refactor|docs)(\\([^)]+\\))?!?:"
+
+[[package]]
+name = "xml-sec"
+version_group = "xml-sec"
+git_release_enable = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "xmlsec1-cli"
+version_group = "xml-sec"
+changelog_update = false
 
 [changelog]
 commit_parsers = [

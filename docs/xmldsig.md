@@ -54,10 +54,13 @@ generation, including source validation in `sign_with_builder`, digest filling, 
 parsing, signature filling, and optional `KeyInfo` filling. An internal-DTD opt-in and XML node
 ceiling therefore cannot be lost between stages. `SignContext::sign_document` and
 `sign_document_with_builder` reuse an `XmlDocument`; string APIs are adapters over that boundary.
+External callers that need non-default XML input rules construct that retained document with
+`XmlDocument::parse_with_policy(xml, &signing_or_verification_policy)`, so parsing and the later
+operation share one immutable policy snapshot rather than independent DTD or resource settings.
 Owned entry points revalidate the document's parse provenance, so a document that required the
 internal-DTD opt-in cannot cross into a stricter signing or verification context. Builder signing
-also checks the projected node count before appending its generated signature, leaving the source
-generation unchanged on rejection.
+also checks the projected node count before appending its generated signature and while filling
+every `DigestValue` and `SignatureValue`, leaving the source generation unchanged on rejection.
 Custom `KeyInfoWriter` output is treated as a separate untrusted XML input: its
 byte ceiling is enforced before namespace wrapping or parsing, and the populated document is
 checked again after mutation.

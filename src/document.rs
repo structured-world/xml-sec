@@ -126,8 +126,53 @@ struct DocumentIndexes {
     order: HashMap<NodeId, usize>,
     default_ids: HashMap<String, Option<NodeId>>,
     attributes_by_value: HashMap<(String, String), Vec<NodeId>>,
-    namespaces: HashMap<NodeId, Vec<(String, String)>>,
 }
+
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+mod policy_sealed {
+    pub trait Sealed {}
+}
+
+/// Operation policy snapshots that can configure owned-document parsing.
+///
+/// This sealed trait keeps XML parser policy derived from the same immutable
+/// signing, verification, encryption, or decryption snapshot used by the
+/// subsequent operation. Applications cannot create a second parser-only
+/// configuration path that drifts from operation enforcement.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub trait XmlDocumentPolicy: policy_sealed::Sealed {
+    #[doc(hidden)]
+    fn xml_input_policy(&self) -> &crate::policy::XmlInputPolicy;
+
+    #[doc(hidden)]
+    fn resource_policy(&self) -> &crate::policy::ResourcePolicy;
+}
+
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+macro_rules! impl_document_policy {
+    ($policy:ty) => {
+        impl policy_sealed::Sealed for $policy {}
+
+        impl XmlDocumentPolicy for $policy {
+            fn xml_input_policy(&self) -> &crate::policy::XmlInputPolicy {
+                &self.xml
+            }
+
+            fn resource_policy(&self) -> &crate::policy::ResourcePolicy {
+                &self.resources
+            }
+        }
+    };
+}
+
+#[cfg(feature = "xmldsig")]
+impl_document_policy!(crate::policy::SigningPolicy);
+#[cfg(feature = "xmldsig")]
+impl_document_policy!(crate::policy::VerificationPolicy);
+#[cfg(feature = "xmlenc")]
+impl_document_policy!(crate::policy::EncryptionPolicy);
+#[cfg(feature = "xmlenc")]
+impl_document_policy!(crate::policy::DecryptionPolicy);
 
 struct ParsedDocument<'input> {
     document: Document<'input>,
@@ -146,6 +191,11 @@ self_cell!(
 /// Errors from owned document parsing, identity validation, and mutation.
 #[derive(Debug, thiserror::Error)]
 pub enum XmlDocumentError {
+    /// The immutable operation policy contains invalid resource limits.
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    #[error("XML document policy violation: {0}")]
+    Policy(#[from] crate::policy::PolicyViolation),
+
     /// The input exceeds the active XML document byte limit.
     #[error("XML document exceeds the maximum size of {maximum} bytes: {actual} bytes")]
     DocumentTooLarge {
@@ -196,6 +246,7 @@ pub enum XmlDocumentError {
 pub struct XmlDocument {
     identity: DocumentIdentity,
     generation: u64,
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     requires_internal_dtd: bool,
     settings: DocumentParseSettings,
     cell: DocumentCell,
@@ -215,6 +266,24 @@ impl XmlDocument {
         Self::parse_with_settings(xml.into(), DocumentParseSettings::default())
     }
 
+    /// Parse and own XML under the same immutable policy used by an operation.
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    pub fn parse_with_policy(
+        xml: impl Into<String>,
+        policy: &impl XmlDocumentPolicy,
+    ) -> Result<Self, XmlDocumentError> {
+        let resources = policy.resource_policy();
+        resources.validate()?;
+        Self::parse_with_settings(
+            xml.into(),
+            DocumentParseSettings::new(
+                policy.xml_input_policy().allow_internal_dtd,
+                resources.effective_xml_nodes(),
+                resources.max_xml_document_bytes,
+            ),
+        )
+    }
+
     pub(crate) fn parse_with_settings(
         xml: String,
         settings: DocumentParseSettings,
@@ -225,12 +294,14 @@ impl XmlDocument {
                 actual: xml.len(),
             });
         }
+        #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
         let requires_internal_dtd = document_requires_internal_dtd(&xml, settings);
         let cell = build_cell(xml, settings)?;
         let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
         Ok(Self {
             identity,
             generation: 0,
+            #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
             requires_internal_dtd,
             settings,
             cell,
@@ -249,6 +320,7 @@ impl XmlDocument {
         self.generation
     }
 
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub(crate) fn validate_xml_input_policy(
         &self,
         allow_internal_dtd: bool,
@@ -322,8 +394,27 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
     ) -> Result<(), XmlDocumentError> {
+        self.replace_content_inner(target, replacement, None)
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn replace_content_with_node_limit(
+        &mut self,
+        target: NodeIdentity,
+        replacement: &str,
+        maximum: usize,
+    ) -> Result<(), XmlDocumentError> {
+        self.replace_content_inner(target, replacement, Some(maximum))
+    }
+
+    fn replace_content_inner(
+        &mut self,
+        target: NodeIdentity,
+        replacement: &str,
+        maximum: Option<usize>,
+    ) -> Result<(), XmlDocumentError> {
         self.validate_content_in_element_context(target, replacement)?;
-        let (range, qualified_name, self_closing) = self.with_view(|view| {
+        let (range, replacement) = self.with_view(|view| {
             let node = view.resolve_node(target)?;
             if !node.is_element() {
                 return Err(XmlDocumentError::TargetNotElement);
@@ -331,25 +422,27 @@ impl XmlDocument {
             let range = node.range();
             let source = &view.xml()[range.clone()];
             let (content, qualified_name, self_closing) = element_content_range(source)?;
+            if self_closing {
+                let slash = source.rfind("/>").ok_or_else(|| {
+                    XmlDocumentError::InvalidReplacement(
+                        "self-closing element has no terminator".into(),
+                    )
+                })?;
+                return Ok((
+                    range,
+                    format!("{}>{replacement}</{qualified_name}>", &source[..slash]),
+                ));
+            }
             Ok((
                 (range.start + content.start)..(range.start + content.end),
-                qualified_name,
-                self_closing,
+                replacement.to_owned(),
             ))
         })?;
-        if self_closing {
-            let element_range = self
-                .with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
-            let source = &self.as_xml()[element_range.clone()];
-            let slash = source.rfind("/>").ok_or_else(|| {
-                XmlDocumentError::InvalidReplacement(
-                    "self-closing element has no terminator".into(),
-                )
-            })?;
-            let expanded = format!("{}>{replacement}</{qualified_name}>", &source[..slash]);
-            return self.replace_range(element_range, &expanded);
+        if let Some(maximum) = maximum {
+            self.replace_range_with_node_limit(range, &replacement, maximum)
+        } else {
+            self.replace_range(range, &replacement)
         }
-        self.replace_range(range, replacement)
     }
 
     /// Replace the children of several non-overlapping elements atomically.
@@ -360,6 +453,23 @@ impl XmlDocument {
     pub fn replace_contents(
         &mut self,
         replacements: &[(NodeIdentity, String)],
+    ) -> Result<(), XmlDocumentError> {
+        self.replace_contents_inner(replacements, None)
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn replace_contents_with_node_limit(
+        &mut self,
+        replacements: &[(NodeIdentity, String)],
+        maximum: usize,
+    ) -> Result<(), XmlDocumentError> {
+        self.replace_contents_inner(replacements, Some(maximum))
+    }
+
+    fn replace_contents_inner(
+        &mut self,
+        replacements: &[(NodeIdentity, String)],
+        maximum: Option<usize>,
     ) -> Result<(), XmlDocumentError> {
         if replacements.is_empty() {
             return Ok(());
@@ -407,7 +517,11 @@ impl XmlDocument {
         for (range, replacement) in edits.into_iter().rev() {
             output.replace_range(range, &replacement);
         }
-        self.replace_serialized(output)
+        if let Some(maximum) = maximum {
+            self.replace_serialized_with_node_limit(output, maximum)
+        } else {
+            self.replace_serialized(output)
+        }
     }
 
     /// Append a well-formed XML fragment as the last child of an element.
@@ -448,6 +562,35 @@ impl XmlDocument {
 
     pub(crate) fn replace_serialized(&mut self, xml: String) -> Result<(), XmlDocumentError> {
         let next = build_cell(xml, self.settings)?;
+        self.commit_cell(next)
+    }
+
+    fn replace_serialized_with_node_limit(
+        &mut self,
+        xml: String,
+        maximum: usize,
+    ) -> Result<(), XmlDocumentError> {
+        let effective_maximum = maximum.min(self.settings.nodes_limit as usize);
+        let nodes_limit = u32::try_from(effective_maximum).unwrap_or(u32::MAX);
+        let next = build_cell(
+            xml,
+            DocumentParseSettings {
+                nodes_limit,
+                ..self.settings
+            },
+        )
+        .map_err(|error| match error {
+            XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached) => {
+                XmlDocumentError::ProjectedNodeLimit {
+                    maximum: effective_maximum,
+                }
+            }
+            error => error,
+        })?;
+        self.commit_cell(next)
+    }
+
+    fn commit_cell(&mut self, next: DocumentCell) -> Result<(), XmlDocumentError> {
         self.cell = next;
         self.generation = self.generation.checked_add(1).ok_or_else(|| {
             XmlDocumentError::InvalidReplacement("document generation overflow".into())
@@ -455,6 +598,7 @@ impl XmlDocument {
         Ok(())
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn projected_content_replacement_len(
         &self,
         target: NodeIdentity,
@@ -517,6 +661,7 @@ impl XmlDocument {
         self.validate_node_limit_after_range_replacement(range, replacement, maximum)
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn validate_node_limit_after_append_child(
         &self,
         target: NodeIdentity,
@@ -548,6 +693,7 @@ impl XmlDocument {
         self.validate_node_limit_after_range_replacement(range, &replacement, maximum)
     }
 
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn validate_node_limit_after_range_replacement(
         &self,
         range: std::ops::Range<usize>,
@@ -589,6 +735,25 @@ impl XmlDocument {
         range: std::ops::Range<usize>,
         replacement: &str,
     ) -> Result<(), XmlDocumentError> {
+        let output = self.replaced_range(range, replacement)?;
+        self.replace_serialized(output)
+    }
+
+    fn replace_range_with_node_limit(
+        &mut self,
+        range: std::ops::Range<usize>,
+        replacement: &str,
+        maximum: usize,
+    ) -> Result<(), XmlDocumentError> {
+        let output = self.replaced_range(range, replacement)?;
+        self.replace_serialized_with_node_limit(output, maximum)
+    }
+
+    fn replaced_range(
+        &self,
+        range: std::ops::Range<usize>,
+        replacement: &str,
+    ) -> Result<String, XmlDocumentError> {
         let projected = self
             .as_xml()
             .len()
@@ -608,7 +773,7 @@ impl XmlDocument {
         output.push_str(&self.as_xml()[..range.start]);
         output.push_str(replacement);
         output.push_str(&self.as_xml()[range.end..]);
-        self.replace_serialized(output)
+        Ok(output)
     }
 
     fn validate_single_element_in_parent_context(
@@ -817,6 +982,7 @@ impl<'a> DocumentView<'a> {
         }
     }
 
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn id_index(
         self,
         registrations: &[IdAttributeRegistration],
@@ -903,18 +1069,21 @@ impl<'a> DocumentView<'a> {
         self,
         identity: &NamespaceIdentity,
     ) -> Result<SemanticOrder, XmlDocumentError> {
-        self.resolve_node(identity.owner)?;
-        let position = self
-            .parsed
-            .indexes
-            .namespaces
-            .get(&identity.owner.backend)
-            .and_then(|namespaces| {
-                namespaces
-                    .iter()
-                    .position(|(prefix, uri)| prefix == &identity.prefix && uri == &identity.uri)
-            })
-            .ok_or(XmlDocumentError::MissingNode)?;
+        let owner = self.resolve_node(identity.owner)?;
+        let target = (identity.prefix.as_str(), identity.uri.as_str());
+        let mut found = false;
+        let mut position = 0;
+        for namespace in owner.namespaces() {
+            let candidate = (namespace.name().unwrap_or_default(), namespace.uri());
+            match candidate.cmp(&target) {
+                std::cmp::Ordering::Less => position += 1,
+                std::cmp::Ordering::Equal => found = true,
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        if !found {
+            return Err(XmlDocumentError::MissingNode);
+        }
         Ok(SemanticOrder {
             node: self.document_order(identity.owner)?,
             phase: 1,
@@ -976,22 +1145,21 @@ impl<'a> DocumentView<'a> {
         self,
         owner: NodeIdentity,
     ) -> Result<Vec<NamespaceIdentity>, XmlDocumentError> {
-        self.resolve_node(owner)?;
-        self.parsed
-            .indexes
-            .namespaces
-            .get(&owner.backend)
-            .ok_or(XmlDocumentError::MissingNode)
-            .map(|namespaces| {
-                namespaces
-                    .iter()
-                    .map(|(prefix, uri)| NamespaceIdentity {
-                        owner,
-                        prefix: prefix.clone(),
-                        uri: uri.clone(),
-                    })
-                    .collect()
+        let node = self.resolve_node(owner)?;
+        if !node.is_element() {
+            return Err(XmlDocumentError::MissingNode);
+        }
+        let mut namespaces = node
+            .namespaces()
+            .map(|namespace| NamespaceIdentity {
+                owner,
+                prefix: namespace.name().unwrap_or_default().to_owned(),
+                uri: namespace.uri().to_owned(),
             })
+            .collect::<Vec<_>>();
+        namespaces
+            .sort_by(|left, right| (&left.prefix, &left.uri).cmp(&(&right.prefix, &right.uri)));
+        Ok(namespaces)
     }
 
     fn validate_identity(self, identity: NodeIdentity) -> Result<(), XmlDocumentError> {
@@ -1046,6 +1214,7 @@ fn allocate_document_identity(counter: &AtomicU64) -> Result<DocumentIdentity, X
     }
 }
 
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 fn document_requires_internal_dtd(xml: &str, settings: DocumentParseSettings) -> bool {
     // Parse provenance records what the source actually requires, not merely
     // whether its creator used a permissive policy. This lets a later strict
@@ -1089,24 +1258,12 @@ impl DocumentIndexes {
         let mut default_ids = HashMap::new();
         let mut duplicate_ids = HashSet::new();
         let mut attributes_by_value: HashMap<(String, String), Vec<NodeId>> = HashMap::new();
-        let mut namespaces = HashMap::new();
 
         for (position, node) in document.descendants().enumerate() {
             order.insert(node.id(), position);
             if !node.is_element() {
                 continue;
             }
-            let mut node_namespaces = node
-                .namespaces()
-                .map(|namespace| {
-                    (
-                        namespace.name().unwrap_or_default().to_owned(),
-                        namespace.uri().to_owned(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            node_namespaces.sort();
-            namespaces.insert(node.id(), node_namespaces);
             for attribute in node.attributes() {
                 attributes_by_value
                     .entry((attribute.name().to_owned(), attribute.value().to_owned()))
@@ -1133,7 +1290,6 @@ impl DocumentIndexes {
             order,
             default_ids,
             attributes_by_value,
-            namespaces,
         }
     }
 }
@@ -1340,6 +1496,32 @@ mod tests {
     }
 
     #[test]
+    fn bounded_content_replacement_rejects_new_text_node_atomically() {
+        let mut document =
+            XmlDocument::parse("<root><target/></root>").expect("fixture must parse");
+        let target = document.with_view(|view| {
+            let root = view
+                .resolve_node(view.root_element())
+                .expect("root must resolve");
+            view.node_identity(
+                root.children()
+                    .find(Node::is_element)
+                    .expect("target must exist"),
+            )
+        });
+        let maximum = document.with_view(|view| view.node_count());
+        let before = document.as_xml().to_owned();
+
+        assert!(matches!(
+            document.replace_content_with_node_limit(target, "value", maximum),
+            Err(XmlDocumentError::ProjectedNodeLimit { maximum: rejected })
+                if rejected == maximum
+        ));
+        assert_eq!(document.as_xml(), before);
+        assert_eq!(document.generation(), 0);
+    }
+
+    #[test]
     fn semantic_order_covers_namespace_attribute_and_tree_nodes() {
         let document =
             XmlDocument::parse("<root xmlns:p=\"urn:test\" p:value=\"1\"><child/></root>")
@@ -1375,6 +1557,38 @@ mod tests {
             assert!(root_order < namespace_order);
             assert!(namespace_order < attribute_order);
             assert!(attribute_order < child_order);
+        });
+    }
+
+    #[test]
+    fn inherited_namespace_axes_are_materialized_only_for_the_requested_owner() {
+        // A wide namespace scope inherited by many descendants must remain in
+        // roxmltree's structural representation instead of being cloned into an
+        // O(elements * namespaces) eager document index.
+        let declarations = (0..128)
+            .map(|index| format!(r#" xmlns:p{index}="urn:namespace:{index}""#))
+            .collect::<String>();
+        let children = (0..1_024)
+            .map(|index| format!("<child index=\"{index}\"/>"))
+            .collect::<String>();
+        let document = XmlDocument::parse(format!("<root{declarations}>{children}</root>"))
+            .expect("wide namespace fixture must parse");
+
+        document.with_view(|view| {
+            let last_child = view
+                .document()
+                .descendants()
+                .rfind(|node| node.has_tag_name("child"))
+                .expect("last child must exist");
+            let owner = view.node_identity(last_child);
+            let namespaces = view
+                .namespace_identities(owner)
+                .expect("inherited namespace axis must materialize on demand");
+            assert_eq!(namespaces.len(), 128);
+            assert!(namespaces.windows(2).all(|pair| {
+                view.namespace_order(&pair[0]).expect("left order")
+                    < view.namespace_order(&pair[1]).expect("right order")
+            }));
         });
     }
 

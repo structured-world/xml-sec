@@ -17,7 +17,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
-      - name: Publish to crates.io
-        run: cargo publish
+      - name: Publish xml-sec to crates.io
+        run: cargo publish -p xml-sec
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: Wait for xml-sec registry propagation
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "xml-sec") | .version')"
+          for attempt in $(seq 1 30); do
+            if cargo info "xml-sec@${VERSION}" >/dev/null 2>&1; then
+              exit 0
+            fi
+            echo "xml-sec ${VERSION} is not visible yet (attempt ${attempt}/30)"
+            sleep 10
+          done
+          echo "xml-sec ${VERSION} did not propagate to crates.io" >&2
+          exit 1
+      - name: Publish xmlsec1-cli to crates.io
+        run: cargo publish -p xmlsec1-cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

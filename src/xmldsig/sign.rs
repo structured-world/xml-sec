@@ -1044,7 +1044,13 @@ impl<'a> SignContext<'a> {
             self.policy.ecdsa_signature_value_encoding,
         )?;
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature_value);
-        document.replace_content(signature_value_node, &signature_b64)?;
+        document
+            .replace_content_with_node_limit(
+                signature_value_node,
+                &signature_b64,
+                self.policy.resources.effective_xml_nodes() as usize,
+            )
+            .map_err(map_owned_document_mutation_error)?;
         self.policy
             .resources
             .validate_xml_document_len(document.as_xml().len())?;
@@ -1165,6 +1171,19 @@ fn map_owned_document_mutation_error(error: XmlDocumentError) -> SigningError {
             .into()
         }
         error => SigningError::Document(error),
+    }
+}
+
+fn map_owned_document_digest_mutation_error(error: XmlDocumentError) -> SigningDigestError {
+    match error {
+        XmlDocumentError::ProjectedNodeLimit { maximum } => {
+            SigningDigestError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum,
+                actual: maximum.saturating_add(1),
+            })
+        }
+        error => SigningDigestError::Document(error),
     }
 }
 
@@ -1431,7 +1450,12 @@ fn fill_reference_digest_values_in_dependency_order(
                     .collect::<Vec<_>>(),
             )
         })?;
-        document.replace_contents(&replacements)?;
+        document
+            .replace_contents_with_node_limit(
+                &replacements,
+                policy.resources.effective_xml_nodes() as usize,
+            )
+            .map_err(map_owned_document_digest_mutation_error)?;
     }
     Ok(())
 }

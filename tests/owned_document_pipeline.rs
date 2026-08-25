@@ -4,6 +4,7 @@
 
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_document};
+use xml_sec::policy::{ResourcePolicy, SigningPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, DsigStatus, ReferenceBuilder, RsaSigningKey, SignContext,
     SignatureAlgorithm, SignatureBuilder, Transform, VerifyContext, X509CertificateKeyInfoWriter,
@@ -16,6 +17,34 @@ use xml_sec::xmlenc::{
 
 const PRIVATE_KEY: &str = include_str!("fixtures/keys/rsa/rsa-2048-key.pem");
 const CERTIFICATE: &str = include_str!("fixtures/keys/rsa/rsa-2048-cert.pem");
+
+#[test]
+fn public_owned_parser_uses_the_operation_policy_snapshot() {
+    // External callers must be able to construct the same retained document
+    // accepted by policy-aware string APIs, without a second configuration path.
+    let dtd_xml = "<!DOCTYPE root [<!ENTITY value 'ok'>]><root>&value;</root>";
+    let permissive = SigningPolicy {
+        xml: xml_sec::policy::XmlInputPolicy {
+            allow_internal_dtd: true,
+        },
+        ..SigningPolicy::default()
+    };
+    let document = XmlDocument::parse_with_policy(dtd_xml, &permissive)
+        .expect("the operation policy must enable bounded internal DTD parsing");
+    assert_eq!(document.generation(), 0);
+
+    let strict = SigningPolicy::default();
+    assert!(XmlDocument::parse_with_policy(dtd_xml, &strict).is_err());
+
+    let bounded = SigningPolicy {
+        resources: ResourcePolicy {
+            max_xml_nodes: 1,
+            ..ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    assert!(XmlDocument::parse_with_policy("<root><child/></root>", &bounded).is_err());
+}
 
 fn signature_builder() -> SignatureBuilder {
     let canonicalization = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);

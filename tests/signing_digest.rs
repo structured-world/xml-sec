@@ -88,6 +88,43 @@ fn owned_builder_signing_rejects_projected_node_limit_atomically() {
     assert_eq!(document.generation(), 0);
 }
 
+#[test]
+fn owned_template_signing_rejects_value_node_growth_atomically() {
+    // DigestValue and SignatureValue text nodes are created after the initial
+    // owned-document policy check, so every fill must retain that same ceiling.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let xml = r##"<root><payload Id="payload"/><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>pending</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
+    let mut document = XmlDocument::parse(xml).expect("owned template must parse");
+    let before = document.as_xml().to_owned();
+    let input_nodes = document.with_view(|view| view.node_count());
+    let active_node_limit = input_nodes;
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_nodes: active_node_limit,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    let error = SignContext::new(&key)
+        .policy(policy)
+        .sign_document(&mut document)
+        .expect_err("value text nodes must not exceed the active signing ceiling");
+
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "XML nodes",
+            maximum,
+            ..
+        }) if maximum == active_node_limit
+    ));
+    assert_eq!(document.as_xml(), before);
+    assert_eq!(document.generation(), 0);
+}
+
 fn template_with_reference(reference: ReferenceBuilder) -> String {
     SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
         .add_reference(reference)
