@@ -59,11 +59,13 @@ External callers that need non-default XML input rules construct that retained d
 operation share one immutable policy snapshot rather than independent DTD or resource settings.
 Owned entry points revalidate the document's parse provenance, so a document that required the
 internal-DTD opt-in cannot cross into a stricter signing or verification context. Builder signing
-also checks the projected node count before appending its generated signature and while filling
-every `DigestValue` and `SignatureValue`, leaving the source generation unchanged on rejection.
+stages template append, optional `KeyInfo`, every `DigestValue`, and `SignatureValue` in a private
+document. A successful operation commits the complete result as one generation; any policy,
+provider, key, transform, or serialization failure leaves the caller's XML and generation
+unchanged. Every staged mutation checks the active projected node count before commit.
 Custom `KeyInfoWriter` output is treated as a separate untrusted XML input: its
-byte ceiling is enforced before namespace wrapping or parsing, and the populated document is
-checked again after mutation.
+byte ceiling is enforced before namespace wrapping or parsing, and its merged nodes remain under
+the same operation ceiling as the rest of the signature.
 `IdAttributeRegistration` supplies immutable request context for non-standard ID attributes.
 `SignContext::id_attributes` and `VerifyContext::id_attributes` apply the same global or
 element-scoped registrations to operation start-node selection and every same-document Reference.

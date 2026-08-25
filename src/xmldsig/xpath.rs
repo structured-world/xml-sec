@@ -1042,7 +1042,7 @@ impl<'d> Mirror<'d> {
             return self.project_expanded(source, input, selected, materialization_budget);
         }
 
-        let mut result = NodeSet::empty_like(input);
+        let mut result = NodeSet::empty(input.document());
         for node in selected.document_order() {
             match node {
                 nodeset::Node::Root(_) => {
@@ -1113,7 +1113,7 @@ impl<'d> Mirror<'d> {
         selected: nodeset::Nodeset<'d>,
         materialization_budget: &NodeSetMaterializationBudget,
     ) -> Result<NodeSet<'a>, TransformError> {
-        let mut result = NodeSet::empty_like(input);
+        let mut result = NodeSet::empty(input.document());
         let mut selected_elements = HashSet::new();
         let mut root_selected = false;
 

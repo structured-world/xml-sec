@@ -311,11 +311,14 @@ impl<'a> NodeSet<'a> {
     }
 
     pub(crate) fn subtree_from_view(
-        _view: crate::DocumentView<'a>,
+        view: crate::DocumentView<'a>,
         element: Node<'a, 'a>,
         with_comments: bool,
         budget: Option<&NodeSetMaterializationBudget>,
     ) -> Result<Self, TransformError> {
+        if !std::ptr::eq(element.document() as *const _, view.document() as *const _) {
+            return Err(TransformError::CrossDocumentNodeSetInput);
+        }
         let set = if with_comments {
             match budget {
                 Some(budget) => Self::subtree_with_budget(element, budget)?,
@@ -384,15 +387,6 @@ impl<'a> NodeSet<'a> {
     pub(crate) fn empty(doc: &'a Document<'a>) -> Self {
         Self {
             doc,
-            nodes: HashSet::new(),
-            owned_string_bytes: 0,
-            with_comments: false,
-        }
-    }
-
-    pub(crate) fn empty_like(input: &Self) -> Self {
-        Self {
-            doc: input.doc,
             nodes: HashSet::new(),
             owned_string_bytes: 0,
             with_comments: false,
@@ -930,6 +924,10 @@ pub enum TransformError {
     /// different `Document` than the input `NodeSet`.
     #[error("enveloped-signature transform: invalid Signature node for this document")]
     CrossDocumentSignatureNode,
+
+    /// A retained document view and a projected node came from different documents.
+    #[error("node-set projection: input node belongs to a different document")]
+    CrossDocumentNodeSetInput,
 }
 
 pub(crate) fn transform_resource_limit(

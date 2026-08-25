@@ -1,9 +1,9 @@
 //! Shared XML lexical invariants used before serialization.
 
-#[cfg(feature = "xmldsig")]
+#[cfg(any(feature = "xmldsig", test))]
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
-#[cfg(feature = "xmldsig")]
+#[cfg(any(feature = "xmldsig", test))]
 use roxmltree::Document;
 use roxmltree::Node;
 
@@ -11,7 +11,7 @@ use roxmltree::Node;
 use roxmltree::NodeId;
 
 /// Default ID attribute names shared by XMLDSig and XMLEnc selection.
-#[cfg(feature = "xmldsig")]
+#[cfg(any(feature = "xmldsig", test))]
 const DEFAULT_ID_ATTRS: &[&str] = &["ID", "Id", "id"];
 
 /// Caller-declared XML ID attribute registration.
@@ -83,7 +83,7 @@ impl IdAttributeRegistration {
         }
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(any(feature = "xmldsig", test))]
     fn matches(&self, node: Node<'_, '_>, attribute_name: &str) -> bool {
         self.attribute_local_name == attribute_name && self.matches_node(node)
     }
@@ -110,12 +110,12 @@ impl IdAttributeRegistration {
 }
 
 /// Duplicate-safe index of XML ID attributes in one parsed document.
-#[cfg(feature = "xmldsig")]
+#[cfg(any(feature = "xmldsig", test))]
 pub(crate) struct XmlIdIndex<'a> {
     nodes: HashMap<&'a str, Node<'a, 'a>>,
 }
 
-#[cfg(feature = "xmldsig")]
+#[cfg(any(feature = "xmldsig", test))]
 impl<'a> XmlIdIndex<'a> {
     /// Index standard ID spellings plus caller-declared local attribute names.
     #[cfg(feature = "xmldsig")]
@@ -214,12 +214,15 @@ pub(crate) fn is_xml_ncname(value: &str) -> bool {
         .is_ok_and(|document| document.root_element().tag_name().name() == value)
 }
 
-#[cfg(all(test, any(feature = "xmldsig", feature = "xmlenc")))]
+#[cfg(test)]
 mod tests {
     use roxmltree::{Document, ParsingOptions};
 
-    use super::{IdAttributeRegistration, XmlIdIndex, is_xml_1_0_character, is_xml_ncname};
+    use super::{IdAttributeRegistration, XmlIdIndex};
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    use super::{is_xml_1_0_character, is_xml_ncname};
 
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     #[test]
     fn xml_1_0_character_boundaries_match_production_two() {
         // Exercise each explicit singleton/range boundary in XML 1.0 [2].
@@ -243,6 +246,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     #[test]
     fn ncname_validation_uses_the_xml_unicode_grammar() {
         for valid in ["id", "_private", "Δοκιμή"] {

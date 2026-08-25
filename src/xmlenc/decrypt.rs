@@ -684,19 +684,13 @@ fn decrypt_owned_document_with_context(
                 .saturating_add(plaintext.len()),
             &context.policy,
         )?;
-        document
-            .validate_node_limit_after_node_replacement(
-                target,
-                &plaintext,
-                context.policy.resources.effective_xml_nodes() as usize,
-            )
-            .map_err(map_document_mutation_error)?;
+        let node_limit = context.policy.resources.effective_xml_nodes() as usize;
         match encrypted.encrypted_type.as_ref() {
             Some(EncryptedDataType::Element) => document
-                .replace_element(target, &plaintext)
+                .replace_element_with_node_limit(target, &plaintext, node_limit)
                 .map_err(map_document_mutation_error)?,
             Some(EncryptedDataType::Content) => document
-                .replace_node_with_fragment(target, &plaintext)
+                .replace_node_with_fragment_with_node_limit(target, &plaintext, node_limit)
                 .map_err(map_document_mutation_error)?,
             Some(EncryptedDataType::Other(_)) | None => {
                 return Err(XmlEncError::ReplacementRequiresXml);

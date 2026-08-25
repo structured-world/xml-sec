@@ -2,7 +2,6 @@
 
 #![cfg(all(feature = "xmldsig", feature = "xmlenc"))]
 
-use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_document};
 use xml_sec::policy::{ResourcePolicy, SigningPolicy};
 use xml_sec::xmldsig::{
@@ -14,6 +13,7 @@ use xml_sec::xmlenc::{
     DataEncryptionAlgorithm, DecryptContext, DocumentEncryptionOptions, EncryptedDataBuilder,
     SymmetricKeyDecryptor,
 };
+use xml_sec::{XmlDocument, XmlDocumentError};
 
 const PRIVATE_KEY: &str = include_str!("fixtures/keys/rsa/rsa-2048-key.pem");
 const CERTIFICATE: &str = include_str!("fixtures/keys/rsa/rsa-2048-cert.pem");
@@ -34,7 +34,10 @@ fn public_owned_parser_uses_the_operation_policy_snapshot() {
     assert_eq!(document.generation(), 0);
 
     let strict = SigningPolicy::default();
-    assert!(XmlDocument::parse_with_policy(dtd_xml, &strict).is_err());
+    assert!(matches!(
+        XmlDocument::parse_with_policy(dtd_xml, &strict),
+        Err(XmlDocumentError::Parse(roxmltree::Error::DtdDetected))
+    ));
 
     let bounded = SigningPolicy {
         resources: ResourcePolicy {
@@ -43,7 +46,10 @@ fn public_owned_parser_uses_the_operation_policy_snapshot() {
         },
         ..SigningPolicy::default()
     };
-    assert!(XmlDocument::parse_with_policy("<root><child/></root>", &bounded).is_err());
+    assert!(matches!(
+        XmlDocument::parse_with_policy("<root><child/></root>", &bounded),
+        Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached))
+    ));
 }
 
 fn signature_builder() -> SignatureBuilder {

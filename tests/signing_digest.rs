@@ -125,6 +125,64 @@ fn owned_template_signing_rejects_value_node_growth_atomically() {
     assert_eq!(document.generation(), 0);
 }
 
+#[test]
+fn owned_signing_failure_keeps_template_and_builder_documents_unchanged() {
+    struct FailingSigningKey;
+
+    impl SigningKey for FailingSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            Err(SigningKeyError::SigningFailed)
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Ok(SigningPublicKeyInfo::Rsa {
+                spki_der: Vec::new(),
+                modulus: vec![0x80; 256],
+                exponent: vec![1, 0, 1],
+            })
+        }
+    }
+
+    let template =
+        template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"));
+    let template_xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">content</payload></root>",
+        &template,
+    )
+    .expect("signature template must append");
+    let mut template_document =
+        XmlDocument::parse(template_xml.clone()).expect("template must parse");
+
+    let template_error = SignContext::new(&FailingSigningKey)
+        .sign_document(&mut template_document)
+        .expect_err("provider signing failure must be surfaced");
+    assert!(matches!(
+        template_error,
+        SigningError::Key(SigningKeyError::SigningFailed)
+    ));
+    assert_eq!(template_document.as_xml(), template_xml);
+    assert_eq!(template_document.generation(), 0);
+
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"));
+    let builder_xml = "<root><payload ID=\"payload\">content</payload></root>";
+    let mut builder_document = XmlDocument::parse(builder_xml).expect("builder input must parse");
+
+    let builder_error = SignContext::new(&FailingSigningKey)
+        .sign_document_with_builder(&mut builder_document, &builder)
+        .expect_err("provider signing failure must be surfaced");
+    assert!(matches!(
+        builder_error,
+        SigningError::Key(SigningKeyError::SigningFailed)
+    ));
+    assert_eq!(builder_document.as_xml(), builder_xml);
+    assert_eq!(builder_document.generation(), 0);
+}
+
 fn template_with_reference(reference: ReferenceBuilder) -> String {
     SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
         .add_reference(reference)
@@ -1175,6 +1233,56 @@ fn signing_policy_bounds_merged_key_info_before_reparsing() {
             }
         )) if observed_maximum == maximum && actual > maximum
     ));
+}
+
+#[test]
+fn signing_policy_bounds_key_info_nodes_and_preserves_owned_input() {
+    struct NodeWriter;
+
+    impl KeyInfoWriter for NodeWriter {
+        fn write_key_info(
+            &self,
+            _signing_key: &dyn SigningKey,
+        ) -> Result<String, xml_sec::xmldsig::KeyInfoWriteError> {
+            Ok(r#"<KeyName xmlns="http://www.w3.org/2000/09/xmldsig#">recipient</KeyName>"#.into())
+        }
+    }
+
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .key_info(true)
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(""))
+        .build_template()
+        .expect("valid signature template");
+    let xml = append_signature_to_root("<root/>", &template).expect("append signature");
+    let mut document = XmlDocument::parse(xml.clone()).expect("owned template must parse");
+    let input_nodes = document.with_view(|view| view.node_count());
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_nodes: input_nodes,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    let error = SignContext::new(&private_key)
+        .policy(policy)
+        .key_info_writer(&NodeWriter)
+        .sign_document(&mut document)
+        .expect_err("KeyInfo writer output must obey the active node ceiling");
+
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "XML nodes",
+            maximum,
+            ..
+        }) if maximum == input_nodes
+    ));
+    assert_eq!(document.as_xml(), xml);
+    assert_eq!(document.generation(), 0);
 }
 
 #[test]

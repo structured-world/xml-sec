@@ -345,6 +345,11 @@ impl XmlDocument {
         self.cell.into_owner()
     }
 
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn staged_copy(&self) -> Result<Self, XmlDocumentError> {
+        Self::parse_with_settings(self.as_xml().to_owned(), self.settings)
+    }
+
     /// Borrow the retained parsed view without reparsing.
     pub fn with_view<R>(&self, operation: impl for<'a> FnOnce(DocumentView<'a>) -> R) -> R {
         self.cell.with_dependent(|_, parsed| {
@@ -369,8 +374,28 @@ impl XmlDocument {
             }
             Ok(node.range())
         })?;
+        self.ensure_replacement_fits(&range, replacement.len())?;
         self.validate_single_element_in_parent_context(target, replacement)?;
         self.replace_range(range, replacement)
+    }
+
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn replace_element_with_node_limit(
+        &mut self,
+        target: NodeIdentity,
+        replacement: &str,
+        maximum: usize,
+    ) -> Result<(), XmlDocumentError> {
+        let range = self.with_view(|view| {
+            let node = view.resolve_node(target)?;
+            if !node.is_element() {
+                return Err(XmlDocumentError::TargetNotElement);
+            }
+            Ok(node.range())
+        })?;
+        self.ensure_replacement_fits(&range, replacement.len())?;
+        self.validate_single_element_in_parent_context(target, replacement)?;
+        self.replace_range_with_node_limit(range, replacement, maximum)
     }
 
     /// Replace one complete node with an XML fragment valid in its parent context.
@@ -382,10 +407,25 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
     ) -> Result<(), XmlDocumentError> {
-        self.validate_fragment_in_parent_context(target, replacement)?;
         let range =
             self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
+        self.ensure_replacement_fits(&range, replacement.len())?;
+        self.validate_fragment_in_parent_context(target, replacement)?;
         self.replace_range(range, replacement)
+    }
+
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn replace_node_with_fragment_with_node_limit(
+        &mut self,
+        target: NodeIdentity,
+        replacement: &str,
+        maximum: usize,
+    ) -> Result<(), XmlDocumentError> {
+        let range =
+            self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
+        self.ensure_replacement_fits(&range, replacement.len())?;
+        self.validate_fragment_in_parent_context(target, replacement)?;
+        self.replace_range_with_node_limit(range, replacement, maximum)
     }
 
     /// Replace all children of one element with a well-formed XML fragment.
@@ -413,8 +453,7 @@ impl XmlDocument {
         replacement: &str,
         maximum: Option<usize>,
     ) -> Result<(), XmlDocumentError> {
-        self.validate_content_in_element_context(target, replacement)?;
-        let (range, replacement) = self.with_view(|view| {
+        let (range, serialized_replacement) = self.with_view(|view| {
             let node = view.resolve_node(target)?;
             if !node.is_element() {
                 return Err(XmlDocumentError::TargetNotElement);
@@ -438,10 +477,12 @@ impl XmlDocument {
                 replacement.to_owned(),
             ))
         })?;
+        self.ensure_replacement_fits(&range, serialized_replacement.len())?;
+        self.validate_content_in_element_context(target, replacement)?;
         if let Some(maximum) = maximum {
-            self.replace_range_with_node_limit(range, &replacement, maximum)
+            self.replace_range_with_node_limit(range, &serialized_replacement, maximum)
         } else {
-            self.replace_range(range, &replacement)
+            self.replace_range(range, &serialized_replacement)
         }
     }
 
@@ -473,6 +514,26 @@ impl XmlDocument {
     ) -> Result<(), XmlDocumentError> {
         if replacements.is_empty() {
             return Ok(());
+        }
+        let mut targets = HashSet::with_capacity(replacements.len());
+        if replacements
+            .iter()
+            .any(|(target, _)| !targets.insert(*target))
+        {
+            return Err(XmlDocumentError::InvalidReplacement(
+                "replacement targets must be unique".into(),
+            ));
+        }
+        if let Some(actual) = replacements
+            .iter()
+            .map(|(_, replacement)| replacement.len())
+            .filter(|length| *length > self.settings.max_bytes)
+            .max()
+        {
+            return Err(XmlDocumentError::DocumentTooLarge {
+                maximum: self.settings.max_bytes,
+                actual,
+            });
         }
         for (target, replacement) in replacements {
             self.validate_content_in_element_context(*target, replacement)?;
@@ -513,6 +574,24 @@ impl XmlDocument {
                 "replacement targets overlap".into(),
             ));
         }
+        let projected =
+            edits
+                .iter()
+                .try_fold(self.as_xml().len(), |length, (range, replacement)| {
+                    length
+                        .checked_sub(range.len())
+                        .and_then(|length| length.checked_add(replacement.len()))
+                        .ok_or(XmlDocumentError::DocumentTooLarge {
+                            maximum: self.settings.max_bytes,
+                            actual: usize::MAX,
+                        })
+                })?;
+        if projected > self.settings.max_bytes {
+            return Err(XmlDocumentError::DocumentTooLarge {
+                maximum: self.settings.max_bytes,
+                actual: projected,
+            });
+        }
         let mut output = self.as_xml().to_owned();
         for (range, replacement) in edits.into_iter().rev() {
             output.replace_range(range, &replacement);
@@ -530,8 +609,26 @@ impl XmlDocument {
         target: NodeIdentity,
         child: &str,
     ) -> Result<(), XmlDocumentError> {
-        self.validate_content_in_element_context(target, child)?;
-        let (range, qualified_name, self_closing) = self.with_view(|view| {
+        self.append_child_inner(target, child, None)
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn append_child_with_node_limit(
+        &mut self,
+        target: NodeIdentity,
+        child: &str,
+        maximum: usize,
+    ) -> Result<(), XmlDocumentError> {
+        self.append_child_inner(target, child, Some(maximum))
+    }
+
+    fn append_child_inner(
+        &mut self,
+        target: NodeIdentity,
+        child: &str,
+        maximum: Option<usize>,
+    ) -> Result<(), XmlDocumentError> {
+        let (range, replacement) = self.with_view(|view| {
             let node = view.resolve_node(target)?;
             if !node.is_element() {
                 return Err(XmlDocumentError::TargetNotElement);
@@ -539,25 +636,29 @@ impl XmlDocument {
             let range = node.range();
             let source = &view.xml()[range.clone()];
             let (content, qualified_name, self_closing) = element_content_range(source)?;
+            if self_closing {
+                let slash = source.rfind("/>").ok_or_else(|| {
+                    XmlDocumentError::InvalidReplacement(
+                        "self-closing element has no terminator".into(),
+                    )
+                })?;
+                return Ok((
+                    range,
+                    format!("{}>{child}</{qualified_name}>", &source[..slash]),
+                ));
+            }
             Ok((
                 (range.start + content.end)..(range.start + content.end),
-                qualified_name,
-                self_closing,
+                child.to_owned(),
             ))
         })?;
-        if self_closing {
-            let element_range = self
-                .with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
-            let source = &self.as_xml()[element_range.clone()];
-            let slash = source.rfind("/>").ok_or_else(|| {
-                XmlDocumentError::InvalidReplacement(
-                    "self-closing element has no terminator".into(),
-                )
-            })?;
-            let expanded = format!("{}>{child}</{qualified_name}>", &source[..slash]);
-            return self.replace_range(element_range, &expanded);
+        self.ensure_replacement_fits(&range, replacement.len())?;
+        self.validate_content_in_element_context(target, child)?;
+        if let Some(maximum) = maximum {
+            self.replace_range_with_node_limit(range, &replacement, maximum)
+        } else {
+            self.replace_range(range, &replacement)
         }
-        self.replace_range(range, child)
     }
 
     pub(crate) fn replace_serialized(&mut self, xml: String) -> Result<(), XmlDocumentError> {
@@ -565,7 +666,7 @@ impl XmlDocument {
         self.commit_cell(next)
     }
 
-    fn replace_serialized_with_node_limit(
+    pub(crate) fn replace_serialized_with_node_limit(
         &mut self,
         xml: String,
         maximum: usize,
@@ -649,87 +750,6 @@ impl XmlDocument {
         })
     }
 
-    #[cfg(feature = "xmlenc")]
-    pub(crate) fn validate_node_limit_after_node_replacement(
-        &self,
-        target: NodeIdentity,
-        replacement: &str,
-        maximum: usize,
-    ) -> Result<(), XmlDocumentError> {
-        let range =
-            self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
-        self.validate_node_limit_after_range_replacement(range, replacement, maximum)
-    }
-
-    #[cfg(feature = "xmldsig")]
-    pub(crate) fn validate_node_limit_after_append_child(
-        &self,
-        target: NodeIdentity,
-        child: &str,
-        maximum: usize,
-    ) -> Result<(), XmlDocumentError> {
-        let (range, replacement) = self.with_view(|view| {
-            let node = view.resolve_node(target)?;
-            if !node.is_element() {
-                return Err(XmlDocumentError::TargetNotElement);
-            }
-            let element_range = node.range();
-            let source = &view.xml()[element_range.clone()];
-            let (content, qualified_name, self_closing) = element_content_range(source)?;
-            if !self_closing {
-                let insertion = element_range.start + content.end;
-                return Ok((insertion..insertion, child.to_owned()));
-            }
-            let slash = source.rfind("/>").ok_or_else(|| {
-                XmlDocumentError::InvalidReplacement(
-                    "self-closing element has no terminator".into(),
-                )
-            })?;
-            Ok((
-                element_range,
-                format!("{}>{child}</{qualified_name}>", &source[..slash]),
-            ))
-        })?;
-        self.validate_node_limit_after_range_replacement(range, &replacement, maximum)
-    }
-
-    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-    fn validate_node_limit_after_range_replacement(
-        &self,
-        range: std::ops::Range<usize>,
-        replacement: &str,
-        maximum: usize,
-    ) -> Result<(), XmlDocumentError> {
-        let projected = self
-            .as_xml()
-            .len()
-            .checked_sub(range.len())
-            .and_then(|length| length.checked_add(replacement.len()))
-            .ok_or(XmlDocumentError::DocumentTooLarge {
-                maximum: self.settings.max_bytes,
-                actual: usize::MAX,
-            })?;
-        let mut candidate = String::with_capacity(projected);
-        candidate.push_str(&self.as_xml()[..range.start]);
-        candidate.push_str(replacement);
-        candidate.push_str(&self.as_xml()[range.end..]);
-        let nodes_limit = u32::try_from(maximum).unwrap_or(u32::MAX);
-        match build_cell(
-            candidate,
-            DocumentParseSettings {
-                nodes_limit: self.settings.nodes_limit.min(nodes_limit),
-                max_bytes: projected,
-                ..self.settings
-            },
-        ) {
-            Ok(_) => Ok(()),
-            Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached)) => {
-                Err(XmlDocumentError::ProjectedNodeLimit { maximum })
-            }
-            Err(error) => Err(error),
-        }
-    }
-
     fn replace_range(
         &mut self,
         range: std::ops::Range<usize>,
@@ -754,11 +774,24 @@ impl XmlDocument {
         range: std::ops::Range<usize>,
         replacement: &str,
     ) -> Result<String, XmlDocumentError> {
+        let projected = self.ensure_replacement_fits(&range, replacement.len())?;
+        let mut output = String::with_capacity(projected);
+        output.push_str(&self.as_xml()[..range.start]);
+        output.push_str(replacement);
+        output.push_str(&self.as_xml()[range.end..]);
+        Ok(output)
+    }
+
+    fn ensure_replacement_fits(
+        &self,
+        range: &std::ops::Range<usize>,
+        replacement_len: usize,
+    ) -> Result<usize, XmlDocumentError> {
         let projected = self
             .as_xml()
             .len()
             .checked_sub(range.len())
-            .and_then(|len| len.checked_add(replacement.len()))
+            .and_then(|length| length.checked_add(replacement_len))
             .ok_or(XmlDocumentError::DocumentTooLarge {
                 maximum: self.settings.max_bytes,
                 actual: usize::MAX,
@@ -769,11 +802,7 @@ impl XmlDocument {
                 actual: projected,
             });
         }
-        let mut output = String::with_capacity(projected);
-        output.push_str(&self.as_xml()[..range.start]);
-        output.push_str(replacement);
-        output.push_str(&self.as_xml()[range.end..]);
-        Ok(output)
+        Ok(projected)
     }
 
     fn validate_single_element_in_parent_context(
@@ -1073,6 +1102,8 @@ impl<'a> DocumentView<'a> {
         let target = (identity.prefix.as_str(), identity.uri.as_str());
         let mut found = false;
         let mut position = 0;
+        // This is the same complete in-scope axis consumed by
+        // namespace_identities(), not only declarations written on `owner`.
         for namespace in owner.namespaces() {
             let candidate = (namespace.name().unwrap_or_default(), namespace.uri());
             match candidate.cmp(&target) {
@@ -1149,6 +1180,10 @@ impl<'a> DocumentView<'a> {
         if !node.is_element() {
             return Err(XmlDocumentError::MissingNode);
         }
+        // roxmltree stores each element's complete in-scope namespace axis as
+        // a compact range of shared namespace indices. This includes inherited
+        // bindings with prefix shadowing already applied; walking ancestors
+        // here would duplicate backend resolution and could diverge from it.
         let mut namespaces = node
             .namespaces()
             .map(|namespace| NamespaceIdentity {
@@ -1495,6 +1530,52 @@ mod tests {
         assert_eq!(document.generation(), 0);
     }
 
+    #[test]
+    fn oversized_invalid_fragment_fails_at_the_document_byte_boundary() {
+        // Resource rejection must happen before wrapper parsing, so malformed
+        // attacker input cannot force allocations beyond the document ceiling.
+        let mut document = XmlDocument::parse_with_settings(
+            "<root><child/></root>".into(),
+            DocumentParseSettings::new(false, 64, 64),
+        )
+        .expect("bounded fixture must parse");
+        let root = document.with_view(|view| view.root_element());
+        let replacement = "<".repeat(1_024);
+
+        assert!(matches!(
+            document.replace_content(root, &replacement),
+            Err(XmlDocumentError::DocumentTooLarge {
+                maximum: 64,
+                actual,
+            }) if actual > 64
+        ));
+        assert_eq!(document.as_xml(), "<root><child/></root>");
+        assert_eq!(document.generation(), 0);
+    }
+
+    #[test]
+    fn duplicate_empty_content_targets_are_rejected_atomically() {
+        let mut document =
+            XmlDocument::parse("<root><target></target></root>").expect("fixture must parse");
+        let target = document.with_view(|view| {
+            let target = view
+                .document()
+                .descendants()
+                .find(|node| node.has_tag_name("target"))
+                .expect("target must exist");
+            view.node_identity(target)
+        });
+
+        let error = document
+            .replace_contents(&[(target, "first".into()), (target, "second".into())])
+            .expect_err("one identity cannot be replaced twice");
+
+        assert!(matches!(error, XmlDocumentError::InvalidReplacement(_)));
+        assert_eq!(document.as_xml(), "<root><target></target></root>");
+        assert_eq!(document.generation(), 0);
+    }
+
+    #[cfg(feature = "xmldsig")]
     #[test]
     fn bounded_content_replacement_rejects_new_text_node_atomically() {
         let mut document =

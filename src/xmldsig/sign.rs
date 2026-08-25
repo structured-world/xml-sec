@@ -893,10 +893,21 @@ impl<'a> SignContext<'a> {
 
     /// Sign a template in a reusable owned document.
     ///
-    /// Template and value mutations advance the document generation;
-    /// identities captured before signing are therefore stale afterwards.
+    /// Signing is atomic: failures leave both serialization and generation
+    /// unchanged. Success commits the complete signature as one generation.
     pub fn sign_document(&self, document: &mut XmlDocument) -> Result<(), SigningError> {
         self.validate_owned_document_input(document)?;
+        let mut staged = document.staged_copy()?;
+        self.sign_document_in_place(&mut staged)?;
+        document
+            .replace_serialized_with_node_limit(
+                staged.into_xml(),
+                self.policy.resources.effective_xml_nodes() as usize,
+            )
+            .map_err(map_owned_document_mutation_error)
+    }
+
+    fn sign_document_in_place(&self, document: &mut XmlDocument) -> Result<(), SigningError> {
         let target_signature = document.with_view(|view| {
             signing_signature_index(
                 view.document(),
@@ -976,7 +987,12 @@ impl<'a> SignContext<'a> {
             None
         };
         if let Some(populated) = with_key_info {
-            document.replace_serialized(populated)?;
+            document
+                .replace_serialized_with_node_limit(
+                    populated,
+                    self.policy.resources.effective_xml_nodes() as usize,
+                )
+                .map_err(map_owned_document_mutation_error)?;
         }
         fill_reference_digest_values_in_dependency_order(
             document,
@@ -1091,6 +1107,21 @@ impl<'a> SignContext<'a> {
         builder: &SignatureBuilder,
     ) -> Result<(), SigningError> {
         self.validate_owned_document_input(document)?;
+        let mut staged = document.staged_copy()?;
+        self.sign_document_with_builder_in_place(&mut staged, builder)?;
+        document
+            .replace_serialized_with_node_limit(
+                staged.into_xml(),
+                self.policy.resources.effective_xml_nodes() as usize,
+            )
+            .map_err(map_owned_document_mutation_error)
+    }
+
+    fn sign_document_with_builder_in_place(
+        &self,
+        document: &mut XmlDocument,
+        builder: &SignatureBuilder,
+    ) -> Result<(), SigningError> {
         self.policy.resources.validate_key_candidates(1)?;
         let expected_signature_len = expected_signature_output_len(
             self.signing_key,
@@ -1113,13 +1144,12 @@ impl<'a> SignContext<'a> {
             document.with_view(|view| view.root_element())
         };
         document
-            .validate_node_limit_after_append_child(
+            .append_child_with_node_limit(
                 signature_parent,
                 &template,
                 self.policy.resources.effective_xml_nodes() as usize,
             )
             .map_err(map_owned_document_mutation_error)?;
-        document.append_child(signature_parent, &template)?;
         self.policy
             .resources
             .validate_xml_document_len(document.as_xml().len())?;
