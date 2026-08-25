@@ -429,61 +429,33 @@ fn validate_behavior_evidence_references(
 }
 
 fn contains_test_declaration(source: &str, test_name: &str) -> Result<bool, String> {
-    let declaration = Regex::new(&format!(
-        r"^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+{}\s*\(",
-        regex::escape(test_name)
-    ))
-    .map_err(|error| format!("compile evidence declaration matcher: {error}"))?;
-    let mut pending_test_attribute = false;
-    let mut block_comment_depth = 0_usize;
-
-    for line in source.lines() {
-        let line = strip_leading_rust_comments(line, &mut block_comment_depth).trim();
-        if line == "#[test]" {
-            pending_test_attribute = true;
-            continue;
-        }
-        if !pending_test_attribute || line.is_empty() || line.starts_with("#[") {
-            continue;
-        }
-        if declaration.is_match(line) {
-            return Ok(true);
-        }
-        pending_test_attribute = false;
-    }
-
-    Ok(false)
+    let file =
+        syn::parse_file(source).map_err(|error| format!("parse Rust evidence source: {error}"))?;
+    Ok(items_contain_enabled_test(&file.items, test_name))
 }
 
-fn strip_leading_rust_comments<'line>(
-    mut line: &'line str,
-    block_comment_depth: &mut usize,
-) -> &'line str {
-    loop {
-        line = line.trim_start();
-        while *block_comment_depth > 0 {
-            match (line.find("/*"), line.find("*/")) {
-                (Some(start), Some(end)) if start < end => {
-                    *block_comment_depth += 1;
-                    line = &line[start + 2..];
-                }
-                (_, Some(end)) => {
-                    *block_comment_depth -= 1;
-                    line = &line[end + 2..];
-                }
-                _ => return "",
-            }
+fn items_contain_enabled_test(items: &[syn::Item], test_name: &str) -> bool {
+    items.iter().any(|item| match item {
+        syn::Item::Fn(function) => {
+            function.sig.ident == test_name
+                && function
+                    .attrs
+                    .iter()
+                    .any(|attribute| attribute.path().is_ident("test"))
+                // Ledger evidence must execute in every supported build, not
+                // merely exist behind a target/feature condition or ignore.
+                && !function.attrs.iter().any(|attribute| {
+                    ["ignore", "cfg", "cfg_attr"]
+                        .iter()
+                        .any(|name| attribute.path().is_ident(name))
+                })
         }
-        if line.starts_with("//") {
-            return "";
-        }
-        if let Some(rest) = line.strip_prefix("/*") {
-            *block_comment_depth = 1;
-            line = rest;
-            continue;
-        }
-        return line;
-    }
+        syn::Item::Mod(module) => module
+            .content
+            .as_ref()
+            .is_some_and(|(_, nested)| items_contain_enabled_test(nested, test_name)),
+        _ => false,
+    })
 }
 
 fn resolve_donor_anchor(donor: &Path, anchor: DonorAnchorRule) -> Result<DonorAnchor, String> {
@@ -1765,6 +1737,39 @@ mod tests {
         // from the function to which it applies.
         let source =
             "#[test]\n// rationale\n/* more\n * /* nested */ rationale\n */\nfn expected() {}\n";
+        assert!(
+            contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
+        );
+    }
+
+    #[test]
+    fn behavior_evidence_ignores_test_syntax_inside_raw_strings() {
+        let source = "const FIXTURE: &str = r#\"\n#[test]\nfn expected() {}\n\"#;\n";
+        assert!(
+            !contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
+        );
+    }
+
+    #[test]
+    fn behavior_evidence_rejects_disabled_or_conditional_tests() {
+        for source in [
+            "#[test]\n#[ignore]\nfn expected() {}\n",
+            "#[test]\n#[cfg(any())]\nfn expected() {}\n",
+            "#[test]\n#[cfg_attr(all(), ignore)]\nfn expected() {}\n",
+        ] {
+            assert!(
+                !contains_test_declaration(source, "expected")
+                    .expect("test declaration matching must run"),
+                "disabled or conditional test must not certify evidence: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn behavior_evidence_finds_unconditional_tests_in_nested_modules() {
+        let source = "mod nested {\n    #[test]\n    fn expected() {}\n}\n";
         assert!(
             contains_test_declaration(source, "expected")
                 .expect("test declaration matching must run")

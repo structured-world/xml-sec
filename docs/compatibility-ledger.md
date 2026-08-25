@@ -32,6 +32,9 @@ Positive and negative evidence entries are behavioral assertions rather than a
 requirement for separate test executables. A differential test may support both
 lists when distinct descriptions identify the accepted and rejected outcomes;
 an identical assertion in both lists is rejected as duplicate evidence.
+Evidence declarations are parsed as Rust items and must be unconditional,
+non-ignored `#[test]` functions; syntax inside comments or literals and tests
+behind `cfg`, `cfg_attr`, or `ignore` cannot certify ledger behavior.
 Context, callback, and in-place libxml2 mutation behavior is deliberately
 classified as future C compatibility work rather than being attributed to the
 owned native Rust API. A test-only C probe is compiled through the pinned
