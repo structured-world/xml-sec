@@ -34,9 +34,6 @@ fn binary() -> &'static str {
 
 fn project_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .unwrap()
 }
 
 fn signature_template_without_key_info() -> &'static str {

@@ -21,7 +21,3 @@ jobs:
         run: bash .github/scripts/publish-crate.sh xml-sec
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      - name: Publish xmlsec1-cli to crates.io
-        run: bash .github/scripts/publish-crate.sh xmlsec1-cli
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

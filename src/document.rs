@@ -375,7 +375,7 @@ impl XmlDocument {
             Ok(node.range())
         })?;
         self.ensure_replacement_fits(&range, replacement.len())?;
-        self.validate_single_element_in_parent_context(target, replacement)?;
+        self.validate_single_element_in_parent_context(target, replacement, None)?;
         self.replace_range(range, replacement)
     }
 
@@ -394,7 +394,7 @@ impl XmlDocument {
             Ok(node.range())
         })?;
         self.ensure_replacement_fits(&range, replacement.len())?;
-        self.validate_single_element_in_parent_context(target, replacement)?;
+        self.validate_single_element_in_parent_context(target, replacement, Some(maximum))?;
         self.replace_range_with_node_limit(range, replacement, maximum)
     }
 
@@ -410,7 +410,7 @@ impl XmlDocument {
         let range =
             self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
         self.ensure_replacement_fits(&range, replacement.len())?;
-        self.validate_fragment_in_parent_context(target, replacement)?;
+        self.validate_fragment_in_parent_context(target, replacement, None)?;
         self.replace_range(range, replacement)
     }
 
@@ -424,7 +424,7 @@ impl XmlDocument {
         let range =
             self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
         self.ensure_replacement_fits(&range, replacement.len())?;
-        self.validate_fragment_in_parent_context(target, replacement)?;
+        self.validate_fragment_in_parent_context(target, replacement, Some(maximum))?;
         self.replace_range_with_node_limit(range, replacement, maximum)
     }
 
@@ -478,7 +478,7 @@ impl XmlDocument {
             ))
         })?;
         self.ensure_replacement_fits(&range, serialized_replacement.len())?;
-        self.validate_content_in_element_context(target, replacement)?;
+        self.validate_content_in_element_context(target, replacement, maximum)?;
         if let Some(maximum) = maximum {
             self.replace_range_with_node_limit(range, &serialized_replacement, maximum)
         } else {
@@ -536,7 +536,7 @@ impl XmlDocument {
             });
         }
         for (target, replacement) in replacements {
-            self.validate_content_in_element_context(*target, replacement)?;
+            self.validate_content_in_element_context(*target, replacement, maximum)?;
         }
         let mut edits = self.with_view(|view| {
             replacements
@@ -653,7 +653,7 @@ impl XmlDocument {
             ))
         })?;
         self.ensure_replacement_fits(&range, replacement.len())?;
-        self.validate_content_in_element_context(target, child)?;
+        self.validate_content_in_element_context(target, child, maximum)?;
         if let Some(maximum) = maximum {
             self.replace_range_with_node_limit(range, &replacement, maximum)
         } else {
@@ -809,8 +809,10 @@ impl XmlDocument {
         &self,
         target: NodeIdentity,
         replacement: &str,
+        maximum: Option<usize>,
     ) -> Result<(), XmlDocumentError> {
-        let (parsed, wrapper_range) = self.parse_fragment_in_parent_context(target, replacement)?;
+        let (parsed, wrapper_range) =
+            self.parse_fragment_in_parent_context(target, replacement, maximum)?;
         parsed.with_dependent(|_, parsed| {
             let wrapper = validation_wrapper(parsed, wrapper_range.clone())?;
             if wrapper.children().filter(Node::is_element).count() != 1
@@ -833,8 +835,9 @@ impl XmlDocument {
         &self,
         target: NodeIdentity,
         replacement: &str,
+        maximum: Option<usize>,
     ) -> Result<(), XmlDocumentError> {
-        self.parse_fragment_in_parent_context(target, replacement)
+        self.parse_fragment_in_parent_context(target, replacement, maximum)
             .map(|_| ())
     }
 
@@ -842,16 +845,18 @@ impl XmlDocument {
         &self,
         target: NodeIdentity,
         replacement: &str,
+        maximum: Option<usize>,
     ) -> Result<(DocumentCell, std::ops::Range<usize>), XmlDocumentError> {
         let range =
             self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
-        self.parse_wrapped_range(range, replacement)
+        self.parse_wrapped_range(range, replacement, maximum)
     }
 
     fn validate_content_in_element_context(
         &self,
         target: NodeIdentity,
         replacement: &str,
+        maximum: Option<usize>,
     ) -> Result<(), XmlDocumentError> {
         let (element_range, content_range, qualified_name, self_closing) =
             self.with_view(|view| {
@@ -871,7 +876,7 @@ impl XmlDocument {
             })?;
         if !self_closing {
             return self
-                .parse_wrapped_range(content_range, replacement)
+                .parse_wrapped_range(content_range, replacement, maximum)
                 .map(|_| ());
         }
 
@@ -886,6 +891,7 @@ impl XmlDocument {
             element_range,
             &expanded,
             wrapper_start..(wrapper_start + wrapped.len()),
+            maximum,
         )
         .map(|_| ())
     }
@@ -894,10 +900,11 @@ impl XmlDocument {
         &self,
         range: std::ops::Range<usize>,
         replacement: &str,
+        maximum: Option<usize>,
     ) -> Result<(DocumentCell, std::ops::Range<usize>), XmlDocumentError> {
         let wrapped = wrapped_fragment(replacement);
         let wrapper_range = range.start..(range.start + wrapped.len());
-        self.parse_wrapped_edit(range, &wrapped, wrapper_range)
+        self.parse_wrapped_edit(range, &wrapped, wrapper_range, maximum)
     }
 
     fn parse_wrapped_edit(
@@ -905,6 +912,7 @@ impl XmlDocument {
         range: std::ops::Range<usize>,
         replacement: &str,
         wrapper_range: std::ops::Range<usize>,
+        maximum: Option<usize>,
     ) -> Result<(DocumentCell, std::ops::Range<usize>), XmlDocumentError> {
         let projected = self
             .as_xml()
@@ -918,16 +926,28 @@ impl XmlDocument {
         candidate.push_str(&self.as_xml()[..range.start]);
         candidate.push_str(replacement);
         candidate.push_str(&self.as_xml()[range.end..]);
+        let active_nodes_limit = maximum
+            .map(|maximum| maximum.min(self.settings.nodes_limit as usize))
+            .map(|maximum| u32::try_from(maximum).unwrap_or(u32::MAX))
+            .unwrap_or(self.settings.nodes_limit);
         let parsed = build_cell(
             candidate,
             DocumentParseSettings {
-                nodes_limit: self.settings.nodes_limit.saturating_add(1),
+                nodes_limit: active_nodes_limit.saturating_add(1),
                 // Wrapper markup is validation scaffolding, not document input.
                 // The committed candidate is checked against the real ceiling.
                 max_bytes: projected,
                 ..self.settings
             },
-        )?;
+        )
+        .map_err(|error| match (maximum, error) {
+            (Some(_), XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached)) => {
+                XmlDocumentError::ProjectedNodeLimit {
+                    maximum: active_nodes_limit as usize,
+                }
+            }
+            (_, error) => error,
+        })?;
         parsed.with_dependent(|_, document| {
             validation_wrapper(document, wrapper_range.clone()).map(|_| ())
         })?;
@@ -1550,6 +1570,40 @@ mod tests {
             }) if actual > 64
         ));
         assert_eq!(document.as_xml(), "<root><child/></root>");
+        assert_eq!(document.generation(), 0);
+    }
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn bounded_fragment_validation_uses_the_active_node_ceiling() {
+        // The validation wrapper must not parse attacker-controlled plaintext
+        // under a broader document-creation ceiling before the operation limit.
+        let mut document = XmlDocument::parse_with_settings(
+            "<root><target/></root>".into(),
+            DocumentParseSettings::new(false, 128, 4_096),
+        )
+        .expect("fixture must parse");
+        let target = document.with_view(|view| {
+            let target = view
+                .document()
+                .descendants()
+                .find(|node| node.has_tag_name("target"))
+                .expect("target must exist");
+            view.node_identity(target)
+        });
+        let maximum = document.with_view(|view| view.node_count());
+        let before = document.as_xml().to_owned();
+
+        assert!(matches!(
+            document.replace_node_with_fragment_with_node_limit(
+                target,
+                "<replacement><child/><child/><malformed>",
+                maximum,
+            ),
+            Err(XmlDocumentError::ProjectedNodeLimit { maximum: rejected })
+                if rejected == maximum
+        ));
+        assert_eq!(document.as_xml(), before);
         assert_eq!(document.generation(), 0);
     }
 

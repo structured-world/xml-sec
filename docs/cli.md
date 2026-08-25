@@ -6,7 +6,7 @@ Security operations to the same `xml-sec` policy and provider pipelines as the
 library; it does not bind to libxml2, OpenSSL, or the libxmlsec1 C ABI.
 
 ```sh
-cargo install xmlsec1-cli
+cargo install xml-sec
 xmlsec1 version
 xmlsec1 list-transforms
 xmlsec1 list-key-data

@@ -1,11 +1,12 @@
-# xmlsec1-cli
+# xmlsec1 command-line target
 
-Pure-Rust `xmlsec1` command-line interface backed by the
+This directory contains the `xmlsec1` binary target shipped by the `xml-sec`
+package; it is not a separately published crate. The command is backed by the
 [`xml-sec`](https://crates.io/crates/xml-sec) XMLDSig, XMLEnc, policy, and
 cryptographic-provider pipelines.
 
 ```sh
-cargo install xmlsec1-cli
+cargo install xml-sec
 xmlsec1 version
 xmlsec1 list-transforms
 ```

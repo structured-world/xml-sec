@@ -229,15 +229,30 @@ impl EncryptedDataBuilder {
         self.policy.validate()?;
         document.validate_xml_input_policy(self.policy.xml.allow_internal_dtd)?;
         self.validate_document_len(document.as_xml().len())?;
-        let (target, source, document_nodes, selected_nodes) = document.with_view(|view| {
-            let selected = select_encryption_target(view.document(), options.element_id)?;
-            Ok::<_, XmlEncError>((
-                view.node_identity(selected),
-                view.xml()[selected.range()].to_owned(),
-                view.document().descendants().count(),
-                selected.descendants().count(),
-            ))
-        })?;
+        let (target, source, content_boundaries, document_nodes, selected_nodes) = document
+            .with_view(|view| {
+                let selected = select_encryption_target(view.document(), options.element_id)?;
+                let source = &view.xml()[selected.range()];
+                let content_boundaries = match self.encrypted_type {
+                    EncryptedDataType::Element => {
+                        self.validate_plaintext_len(source.len())?;
+                        None
+                    }
+                    EncryptedDataType::Content => {
+                        let boundaries = element_content_boundaries(source)?;
+                        self.validate_plaintext_len(boundaries.content.len())?;
+                        Some(boundaries)
+                    }
+                    EncryptedDataType::Other(_) => None,
+                };
+                Ok::<_, XmlEncError>((
+                    view.node_identity(selected),
+                    source.to_owned(),
+                    content_boundaries,
+                    view.document().descendants().count(),
+                    selected.descendants().count(),
+                ))
+            })?;
         if document_nodes > self.policy.resources.effective_xml_nodes() as usize {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_NODES,
@@ -269,7 +284,11 @@ impl EncryptedDataBuilder {
                 Ok(())
             }
             EncryptedDataType::Content => {
-                let boundaries = element_content_boundaries(&source)?;
+                let boundaries = content_boundaries.ok_or_else(|| {
+                    XmlEncError::InvalidStructure(
+                        "content encryption target boundaries are unavailable".into(),
+                    )
+                })?;
                 let plaintext = &source[boundaries.content.clone()];
                 let generated =
                     self.encrypt_payload(plaintext.as_bytes(), Some(EncryptedDataType::Content))?;

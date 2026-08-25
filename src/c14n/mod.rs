@@ -503,12 +503,10 @@ fn serialize_canonical_visible_with_position_dispatch(
 pub fn canonicalize_xml(xml: &[u8], algo: &C14nAlgorithm) -> Result<Vec<u8>, C14nError> {
     let xml_str =
         std::str::from_utf8(xml).map_err(|e| C14nError::Parse(format!("invalid UTF-8: {e}")))?;
-    let document = crate::XmlDocument::parse_with_settings(
-        xml_str.to_owned(),
-        crate::document::DocumentParseSettings::new(false, u32::MAX, usize::MAX),
-    )
-    .map_err(|error| C14nError::Parse(error.to_string()))?;
-    canonicalize_document(&document, algo)
+    let document = Document::parse(xml_str).map_err(|error| C14nError::Parse(error.to_string()))?;
+    let mut output = Vec::new();
+    canonicalize(&document, None, algo, &mut output)?;
+    Ok(output)
 }
 
 /// Canonicalize a retained owned document without reparsing it.

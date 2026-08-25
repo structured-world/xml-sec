@@ -1,6 +1,6 @@
 [package]
 name = "xml-sec"
-version.workspace = true
+version = "0.1.13"
 edition = "2024"
 rust-version = "1.92"
 license = "Apache-2.0"
@@ -13,11 +13,28 @@ categories = ["cryptography", "web-programming", "authentication"]
 readme = "README.md"
 
 [workspace]
-members = [".", "tools/capability-ledger", "tools/xmlsec1"]
+members = [".", "tools/capability-ledger"]
 resolver = "3"
 
-[workspace.package]
-version = "0.1.13"
+[[bin]]
+name = "xmlsec1"
+path = "tools/xmlsec1/src/main.rs"
+required-features = ["xmldsig", "xmlenc", "c14n"]
+
+[[test]]
+name = "cli_import_snapshot"
+path = "tools/xmlsec1/tests/import_snapshot.rs"
+required-features = ["xmldsig", "xmlenc", "c14n"]
+
+[[test]]
+name = "cli_process_contract"
+path = "tools/xmlsec1/tests/process_contract.rs"
+required-features = ["xmldsig", "xmlenc", "c14n"]
+
+[[test]]
+name = "cli_upstream_runner"
+path = "tools/xmlsec1/tests/upstream_runner.rs"
+required-features = ["xmldsig", "xmlenc", "c14n"]
 
 [[example]]
 name = "encrypt"
@@ -68,9 +85,10 @@ rand_chacha = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = "0.3.55"
+tempfile = "3"
 
 [features]
-default = ["xmldsig", "c14n"]
+default = ["xmldsig", "xmlenc", "c14n"]
 xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:der",
     "dep:crypto-bigint",
