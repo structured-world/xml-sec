@@ -453,34 +453,37 @@ fn contains_test_declaration(source: &str, test_name: &str) -> Result<bool, Stri
     let file =
         syn::parse_file(source).map_err(|error| format!("parse Rust evidence source: {error}"))?;
     Ok(attributes_allow_behavior_evidence(&file.attrs)
-        && items_contain_enabled_test(&file.items, test_name))
+        && enabled_test_declaration_count(&file.items, test_name) == 1)
 }
 
-fn items_contain_enabled_test(items: &[syn::Item], test_name: &str) -> bool {
-    items.iter().any(|item| match item {
-        syn::Item::Fn(function) => {
-            function.sig.ident == test_name
-                && function
-                    .attrs
-                    .iter()
-                    .any(|attribute| attribute.path().is_ident("test"))
-                // Ledger evidence must execute in every supported build, not
-                // merely exist behind a target/feature condition or ignore.
-                && !function.attrs.iter().any(|attribute| {
-                    ["ignore", "cfg", "cfg_attr"]
-                        .iter()
-                        .any(|name| attribute.path().is_ident(name))
+fn enabled_test_declaration_count(items: &[syn::Item], test_name: &str) -> usize {
+    items
+        .iter()
+        .map(|item| match item {
+            syn::Item::Fn(function) => usize::from(is_enabled_test(function, test_name)),
+            syn::Item::Mod(module) if attributes_allow_behavior_evidence(&module.attrs) => {
+                module.content.as_ref().map_or(0, |(_, nested)| {
+                    enabled_test_declaration_count(nested, test_name)
                 })
-        }
-        syn::Item::Mod(module) => {
-            attributes_allow_behavior_evidence(&module.attrs)
-                && module
-                    .content
-                    .as_ref()
-                    .is_some_and(|(_, nested)| items_contain_enabled_test(nested, test_name))
-        }
-        _ => false,
-    })
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+fn is_enabled_test(function: &syn::ItemFn, test_name: &str) -> bool {
+    function.sig.ident == test_name
+        && function
+            .attrs
+            .iter()
+            .any(|attribute| attribute.path().is_ident("test"))
+        // Ledger evidence must execute in every supported build, not merely
+        // exist behind a target/feature condition or ignore.
+        && !function.attrs.iter().any(|attribute| {
+            ["ignore", "cfg", "cfg_attr"]
+                .iter()
+                .any(|name| attribute.path().is_ident(name))
+        })
 }
 
 fn attributes_allow_behavior_evidence(attributes: &[syn::Attribute]) -> bool {
@@ -1833,6 +1836,18 @@ mod tests {
         let source = "mod nested {\n    #[test]\n    fn expected() {}\n}\n";
         assert!(
             contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
+        );
+    }
+
+    #[test]
+    fn behavior_evidence_rejects_ambiguous_test_names() {
+        // A stale assertion must not be kept alive by an unrelated test with
+        // the same leaf name in a different module.
+        let source = "mod first {\n    #[test]\n    fn expected() {}\n}\n\
+                      mod second {\n    #[test]\n    fn expected() {}\n}\n";
+        assert!(
+            !contains_test_declaration(source, "expected")
                 .expect("test declaration matching must run")
         );
     }
