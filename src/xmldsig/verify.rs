@@ -1134,32 +1134,73 @@ fn verify_signature_with_context(
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
     ctx.policy.validate()?;
     ctx.policy.resources.validate_xml_document_len(xml.len())?;
-    let document = XmlDocument::parse_with_settings(
+    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
+    let document = XmlDocument::parse_with_settings_and_budget(
         xml.to_owned(),
         DocumentParseSettings::new(
             ctx.policy.xml.allow_internal_dtd,
             ctx.policy.resources.effective_xml_nodes(),
             ctx.policy.resources.max_xml_document_bytes,
         ),
+        execution_budget.xml_parse_work(),
     )
     .map_err(|error| match error {
+        crate::document::XmlDocumentError::Policy(error) => DsigError::Policy(error),
         crate::document::XmlDocumentError::Parse(error) => DsigError::XmlParse(error),
         error => DsigError::Document(error),
     })?;
-    verify_signature_document_with_context(&document, ctx)
+    verify_signature_document_with_context_and_budget(&document, ctx, &execution_budget)
+}
+
+#[cfg(test)]
+mod xml_parse_budget_tests {
+    use super::*;
+
+    #[test]
+    fn verification_initial_parse_uses_the_policy_work_budget() {
+        // Even a structurally invalid signature must not reach parsing when
+        // the immutable operation snapshot denies all XML parse work.
+        let xml = "<root/>";
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xml_parse_work_bytes = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(xml)
+            .expect_err("a zero parse-work budget must reject the input parse");
+
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum: 0,
+                actual,
+            }) if actual == xml.len()
+        ));
+    }
 }
 
 fn verify_signature_document_with_context(
     document: &XmlDocument,
     ctx: &VerifyContext<'_>,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
+    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
+    verify_signature_document_with_context_and_budget(document, ctx, &execution_budget)
+}
+
+fn verify_signature_document_with_context_and_budget(
+    document: &XmlDocument,
+    ctx: &VerifyContext<'_>,
+    execution_budget: &TransformExecutionBudget,
+) -> Result<VerifyResult, SignatureVerificationPipelineError> {
     document.validate_xml_input_policy(ctx.policy.xml.allow_internal_dtd)?;
-    document.with_view(|view| verify_signature_view(view, ctx))
+    document.with_view(|view| verify_signature_view(view, ctx, execution_budget))
 }
 
 fn verify_signature_view<'a>(
     view: DocumentView<'a>,
     ctx: &VerifyContext<'_>,
+    execution_budget: &TransformExecutionBudget,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
     ctx.policy.validate()?;
     let xml = view.xml();
@@ -1184,7 +1225,6 @@ fn verify_signature_view<'a>(
         Some(resources) => resolver.with_external_resources(resources),
         None => resolver,
     };
-    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
     let start_node = match ctx.signature_selection {
         SignatureSelection::FirstSignatureUnderId(id) => {
             resolver.node_for_id(id).ok_or_else(|| {
@@ -1322,7 +1362,7 @@ fn verify_signature_view<'a>(
     let retrieval_materialization = if let Some(info) = key_info.as_mut() {
         let mut retrieval_budgets = RetrievalMaterializationBudgets {
             xpath_parse: &mut xpath_parse_budget,
-            execution: &execution_budget,
+            execution: execution_budget,
             resources: &ctx.policy.resources,
         };
         materialize_retrieval_methods_with_budgets(
@@ -1341,7 +1381,7 @@ fn verify_signature_view<'a>(
     let execution = ReferenceExecutionContext {
         store_pre_digest: ctx.store_pre_digest,
         transform_options: ctx.transform_options(),
-        transform_budget: &execution_budget,
+        transform_budget: execution_budget,
         canonicalized_data_budget: &canonicalized_data_budget,
         provider: ctx.provider,
     };

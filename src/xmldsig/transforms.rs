@@ -38,6 +38,7 @@ use super::xpath::{
 };
 use crate::c14n::xml_base::XmlBaseResolutionBudget;
 use crate::c14n::{self, C14nAlgorithm};
+use crate::document::XmlParseWorkBudget;
 #[cfg(test)]
 use crate::hard_limits::XML_DOCUMENT_NODE_CEILING;
 
@@ -112,6 +113,7 @@ pub(crate) struct TransformExecutionBudget {
     node_filter: NodeFilterWorkBudget,
     node_set_materialization: NodeSetMaterializationBudget,
     xml_base_resolution: XmlBaseResolutionBudget,
+    xml_parse_work: XmlParseWorkBudget,
     xml_node_limit: u32,
 }
 
@@ -310,6 +312,9 @@ impl TransformExecutionBudget {
             node_filter: NodeFilterWorkBudget::default(),
             node_set_materialization: NodeSetMaterializationBudget::default(),
             xml_base_resolution: XmlBaseResolutionBudget::default(),
+            xml_parse_work: XmlParseWorkBudget::from_resources(
+                &crate::policy::ResourcePolicy::default(),
+            ),
             xml_node_limit: XML_DOCUMENT_NODE_CEILING,
         }
     }
@@ -325,6 +330,9 @@ impl TransformExecutionBudget {
             },
             node_set_materialization: NodeSetMaterializationBudget::default(),
             xml_base_resolution: XmlBaseResolutionBudget::default(),
+            xml_parse_work: XmlParseWorkBudget::from_resources(
+                &crate::policy::ResourcePolicy::default(),
+            ),
             xml_node_limit: XML_DOCUMENT_NODE_CEILING,
         }
     }
@@ -337,6 +345,9 @@ impl TransformExecutionBudget {
             node_filter: NodeFilterWorkBudget::default(),
             node_set_materialization: NodeSetMaterializationBudget::with_limit(limit),
             xml_base_resolution: XmlBaseResolutionBudget::default(),
+            xml_parse_work: XmlParseWorkBudget::from_resources(
+                &crate::policy::ResourcePolicy::default(),
+            ),
             xml_node_limit: XML_DOCUMENT_NODE_CEILING,
         }
     }
@@ -373,6 +384,7 @@ impl TransformExecutionBudget {
                 resources.effective_xml_base_components(),
                 resources.effective_xml_base_resolution_bytes(),
             ),
+            xml_parse_work: XmlParseWorkBudget::from_resources(resources),
             xml_node_limit: resources.effective_xml_nodes(),
         }
     }
@@ -402,6 +414,10 @@ impl TransformExecutionBudget {
 
     pub(crate) fn xml_base_resolution(&self) -> &XmlBaseResolutionBudget {
         &self.xml_base_resolution
+    }
+
+    pub(crate) fn xml_parse_work(&self) -> &XmlParseWorkBudget {
+        &self.xml_parse_work
     }
 
     pub(crate) fn charge_xpath_work(&self, work: usize) -> Result<(), TransformError> {
@@ -1110,6 +1126,11 @@ fn execute_transform_chain<'s, 'e, 'd>(
         // signature-wide canonicalization work budget.
         let xml = crate::encoding::decode_xml_octets(&bytes)
             .map_err(|error| TransformError::XmlParse(error.to_string()))?;
+        context
+            .budget
+            .xml_parse_work
+            .charge_policy(xml.len())
+            .map_err(TransformError::from)?;
         let document = roxmltree::Document::parse_with_options(
             &xml,
             roxmltree::ParsingOptions {
@@ -2611,6 +2632,47 @@ mod tests {
                 resource: crate::policy::resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn recursive_binary_adapters_share_xml_parse_work() {
+        // Binary-to-node-set adaptation can recur across references and nested
+        // transform execution. Each decoded document must consume the same
+        // operation meter rather than receiving a parser-local allowance.
+        let signature_document = Document::parse("<Signature/>").unwrap();
+        let xml = b"<root/>";
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_parse_work_bytes: xml.len(),
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = TransformExecutionBudget::from_resources(&resources);
+        let transforms = [Transform::XPath(XPathExpression::new("true()"))];
+
+        execute_transforms_with_options_and_budget(
+            signature_document.root_element(),
+            TransformData::Binary(xml.to_vec()),
+            &transforms,
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect("the first adapter parse must consume the exact allowance");
+        let error = execute_transforms_with_options_and_budget(
+            signature_document.root_element(),
+            TransformData::Binary(xml.to_vec()),
+            &transforms,
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect_err("the second adapter parse must inherit exhausted work");
+
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum,
+                actual,
+            }) if maximum == xml.len() && actual == xml.len() * 2
         ));
     }
 

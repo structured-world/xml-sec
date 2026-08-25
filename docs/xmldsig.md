@@ -137,6 +137,10 @@ certificates provide key material and do not become trusted merely because they 
 certificate is present in both pools, its explicit trusted classification is retained.
 `ResourcePolicy::max_xml_document_bytes` rejects verification and signing inputs before DOM
 parsing; the same immutable ceiling is rechecked after signing mutations that enlarge the XML.
+`ResourcePolicy::max_xml_parse_work_bytes` separately bounds cumulative parser work across the
+whole operation. Initial parsing, generated-template validation, binary-to-node-set adapters,
+staged copies, digest dependency levels, Manifest recursion, and committed generations all charge
+the same monotonic allowance; failed parses do not restore it.
 Configured chain depth and candidate-path limits are validated after resolver defaults compose with
 the operation policy. Candidate-path accounting includes every generated partial path, and
 self-issued rollover certificates continue toward a distinct same-name issuer when its signature

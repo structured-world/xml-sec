@@ -6,11 +6,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 #[cfg(test)]
 use roxmltree::Document;
 
-use crate::document::{DocumentParseSettings, XmlDocument};
+use crate::document::{DocumentParseSettings, XmlDocument, XmlParseWorkBudget};
 use rsa::RsaPrivateKey;
 
 use super::parse::{
-    parse_encrypted_data_node_with_policy, parse_encrypted_data_with_policy,
+    parse_encrypted_data_node_with_policy_and_budget, parse_encrypted_data_with_policy,
     validate_encrypted_data_metadata,
 };
 use super::types::{MAX_CIPHER_VALUE_BASE64_LEN, XMLENC_NS, validate_ciphertext_framing};
@@ -277,10 +277,12 @@ impl<'a> DecryptContext<'a> {
         document: &mut XmlDocument,
         encrypted_data_id: Option<&str>,
     ) -> Result<(), XmlEncError> {
+        let parse_budget = XmlParseWorkBudget::from_resources(&self.policy.resources);
         decrypt_owned_document_with_context(
             document,
             DocumentEncryptedDataSelector::EncryptedDataId(encrypted_data_id),
             self,
+            &parse_budget,
         )
     }
 
@@ -604,19 +606,22 @@ fn decrypt_document_with_context(
 ) -> Result<String, XmlEncError> {
     context.policy.resources.validate()?;
     validate_encryption_document_len(xml.len(), &context.policy)?;
-    let mut document = XmlDocument::parse_with_settings(
+    let parse_budget = XmlParseWorkBudget::from_resources(&context.policy.resources);
+    let mut document = XmlDocument::parse_with_settings_and_budget(
         xml.to_owned(),
         DocumentParseSettings::new(
             context.policy.xml.allow_internal_dtd,
             context.policy.resources.effective_xml_nodes(),
             context.policy.resources.max_xml_document_bytes,
         ),
+        &parse_budget,
     )
     .map_err(|error| match error {
+        crate::document::XmlDocumentError::Policy(error) => XmlEncError::Policy(error),
         crate::document::XmlDocumentError::Parse(error) => XmlEncError::XmlParse(error),
         error => XmlEncError::Document(error),
     })?;
-    decrypt_owned_document_with_context(&mut document, selector, context)?;
+    decrypt_owned_document_with_context(&mut document, selector, context, &parse_budget)?;
     Ok(document.into_xml())
 }
 
@@ -624,6 +629,7 @@ fn decrypt_owned_document_with_context(
     document: &mut XmlDocument,
     selector: DocumentEncryptedDataSelector<'_>,
     context: &DecryptContext<'_>,
+    parse_budget: &XmlParseWorkBudget,
 ) -> Result<(), XmlEncError> {
     context.policy.resources.validate()?;
     document.validate_xml_input_policy(context.policy.xml.allow_internal_dtd)?;
@@ -669,7 +675,11 @@ fn decrypt_owned_document_with_context(
         Ok::<_, XmlEncError>((
             view.node_identity(selected),
             selected.range().len(),
-            parse_encrypted_data_node_with_policy(selected, &context.policy)?,
+            parse_encrypted_data_node_with_policy_and_budget(
+                selected,
+                &context.policy,
+                parse_budget,
+            )?,
         ))
     })?;
     context.process_decryption_candidates(&encrypted, |candidate| {
@@ -687,10 +697,15 @@ fn decrypt_owned_document_with_context(
         let node_limit = context.policy.resources.effective_xml_nodes() as usize;
         match encrypted.encrypted_type.as_ref() {
             Some(EncryptedDataType::Element) => document
-                .replace_element_with_node_limit(target, &plaintext, node_limit)
+                .replace_element_with_budget(target, &plaintext, node_limit, parse_budget)
                 .map_err(map_document_mutation_error)?,
             Some(EncryptedDataType::Content) => document
-                .replace_node_with_fragment_with_node_limit(target, &plaintext, node_limit)
+                .replace_node_with_fragment_with_budget(
+                    target,
+                    &plaintext,
+                    node_limit,
+                    parse_budget,
+                )
                 .map_err(map_document_mutation_error)?,
             Some(EncryptedDataType::Other(_)) | None => {
                 return Err(XmlEncError::ReplacementRequiresXml);
@@ -702,6 +717,7 @@ fn decrypt_owned_document_with_context(
 
 fn map_document_mutation_error(error: crate::document::XmlDocumentError) -> XmlEncError {
     match error {
+        crate::document::XmlDocumentError::Policy(error) => XmlEncError::Policy(error),
         crate::document::XmlDocumentError::Parse(error) => XmlEncError::XmlParse(error),
         crate::document::XmlDocumentError::ProjectedNodeLimit { maximum } => {
             crate::policy::PolicyViolation::ResourceLimit {
@@ -1199,6 +1215,35 @@ mod tests {
 
     struct CandidateResolver {
         keys: Vec<Vec<u8>>,
+    }
+
+    #[test]
+    fn document_decryption_initial_parse_uses_the_policy_work_budget() {
+        // Candidate retries and replacement validation must inherit the same
+        // allowance consumed by the caller document's initial parse.
+        let xml = "<root/>";
+        let policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_parse_work_bytes: 0,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        let resolver = SymmetricKeyDecryptor::new([0_u8; 16]);
+
+        let error = DecryptContext::new(&resolver)
+            .policy(policy)
+            .decrypt_document(xml, None)
+            .expect_err("a zero parse-work budget must reject the input parse");
+
+        assert!(matches!(
+            error,
+            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum: 0,
+                actual,
+            }) if actual == xml.len()
+        ));
     }
 
     struct AggregateRecipientResolver {

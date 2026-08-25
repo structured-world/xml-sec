@@ -26,6 +26,12 @@ pub(crate) const ENCRYPTION_CIPHER_VALUE_BASE64_BYTE_CEILING: usize = XML_DOCUME
 pub(crate) const ENCRYPTION_PLAINTEXT_BYTE_CEILING: usize =
     (ENCRYPTION_CIPHER_VALUE_BASE64_BYTE_CEILING / 4 * 3) - 32;
 pub(crate) const XML_DOCUMENT_BYTE_CEILING: usize = 16 * 1024 * 1024;
+/// Maximum cumulative bytes handed to an XML parser by one operation.
+///
+/// Sixteen full-size passes cover the ordinary staged sign/encrypt/decrypt
+/// pipelines while bounding adversarial dependency or key-candidate retries.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XML_PARSE_WORK_BYTE_CEILING: usize = 16 * XML_DOCUMENT_BYTE_CEILING;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const ENCRYPTION_RECIPIENT_CEILING: usize = 64;
 /// Maximum symmetric keys attempted by one prepared decryption operation.

@@ -161,7 +161,9 @@ XML node ceiling to
 the initial document and every replacement generation. `encrypt_owned_document` and
 `decrypt_owned_document` reuse the retained parsed view, validate replacement XML in the parent
 namespace context, and invalidate prior node identities after a successful mutation. String APIs
-remain adapters over this boundary. Use
+remain adapters over this boundary. `ResourcePolicy::max_xml_parse_work_bytes` is cumulative across
+the initial document, generated or decrypted fragment validation, committed generations, and all
+key-candidate retries, so nested helpers cannot reset parser work. Use
 `XmlDocument::parse_with_policy(xml, &encryption_or_decryption_policy)` when constructing a retained
 document with non-default XML rules; this derives parsing directly from the operation's immutable
 policy snapshot. The projected output byte length is checked before constructing

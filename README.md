@@ -71,6 +71,9 @@ Adding `xml-sec` as a dependency builds its library target, not the executable.
 The implementation is fail-closed: unsupported algorithms, unavailable provider
 capabilities, untrusted key sources, implicit external I/O, and exhausted resource
 budgets produce explicit errors rather than compatibility fallbacks.
+XML parsing work is cumulative per operation: initial input, recursive transform
+adapters, staged mutations, dependency levels, and decryption retries share one
+policy allowance rather than resetting limits inside helpers.
 
 ## Native CLI
 
