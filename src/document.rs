@@ -111,6 +111,7 @@ impl Default for DocumentParseSettings {
     }
 }
 
+#[cfg(any(feature = "xmldsig", feature = "xmlenc", test))]
 impl DocumentParseSettings {
     pub(crate) const fn new(allow_dtd: bool, nodes_limit: u32, max_bytes: usize) -> Self {
         Self {
@@ -628,6 +629,13 @@ impl XmlDocument {
         child: &str,
         maximum: Option<usize>,
     ) -> Result<(), XmlDocumentError> {
+        let projected = self.projected_child_append_len(target, child.len())?;
+        if projected > self.settings.max_bytes {
+            return Err(XmlDocumentError::DocumentTooLarge {
+                maximum: self.settings.max_bytes,
+                actual: projected,
+            });
+        }
         let (range, replacement) = self.with_view(|view| {
             let node = view.resolve_node(target)?;
             if !node.is_element() {
@@ -746,6 +754,48 @@ impl XmlDocument {
                     XmlDocumentError::InvalidReplacement(
                         "content replacement length overflow".into(),
                     )
+                })
+        })
+    }
+
+    pub(crate) fn projected_child_append_len(
+        &self,
+        target: NodeIdentity,
+        child_len: usize,
+    ) -> Result<usize, XmlDocumentError> {
+        self.with_view(|view| {
+            let node = view.resolve_node(target)?;
+            if !node.is_element() {
+                return Err(XmlDocumentError::TargetNotElement);
+            }
+            let range = node.range();
+            let source = &view.xml()[range.clone()];
+            let (_, qualified_name, self_closing) = element_content_range(source)?;
+            let (removed, added) = if self_closing {
+                let slash = source.rfind("/>").ok_or_else(|| {
+                    XmlDocumentError::InvalidReplacement(
+                        "self-closing element has no terminator".into(),
+                    )
+                })?;
+                let expanded = slash
+                    .checked_add(1)
+                    .and_then(|length| length.checked_add(child_len))
+                    .and_then(|length| length.checked_add(2))
+                    .and_then(|length| length.checked_add(qualified_name.len()))
+                    .and_then(|length| length.checked_add(1))
+                    .ok_or_else(|| {
+                        XmlDocumentError::InvalidReplacement("child append length overflow".into())
+                    })?;
+                (range.len(), expanded)
+            } else {
+                (0, child_len)
+            };
+            view.xml()
+                .len()
+                .checked_sub(removed)
+                .and_then(|length| length.checked_add(added))
+                .ok_or_else(|| {
+                    XmlDocumentError::InvalidReplacement("child append length overflow".into())
                 })
         })
     }
@@ -1421,6 +1471,21 @@ mod tests {
             .with_view(|view| view.resolve_node(root).map(|_| ()))
             .expect_err("foreign identity must fail closed");
         assert!(matches!(error, XmlDocumentError::ForeignIdentity));
+    }
+
+    #[test]
+    fn child_append_projection_matches_both_element_forms() {
+        // Signing must be able to enforce a tighter operation policy before
+        // append_child allocates either form of the replacement document.
+        for xml in ["<root></root>", "<root/>"] {
+            let document = XmlDocument::parse(xml).expect("fixture must parse");
+            let root = document.with_view(|view| view.root_element());
+            let projected = document
+                .projected_child_append_len(root, "<child/>".len())
+                .expect("append length must project");
+
+            assert_eq!(projected, "<root><child/></root>".len());
+        }
     }
 
     #[test]

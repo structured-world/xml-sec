@@ -511,7 +511,7 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     // The writer contract is XML child content, not a standalone document.
     // Parse it under the template's namespace context so multiple siblings and
     // inherited prefixes have exactly the semantics they will have in KeyInfo.
-    let wrapped_source = wrap_key_info_children(key_info_source, key_info);
+    let wrapped_source = wrap_key_info_children(key_info_source, key_info, policy)?;
     let source_document = parse_mutation_xml_with_options(&wrapped_source, policy)?;
     let sources = source_document
         .root_element()
@@ -709,6 +709,7 @@ fn merge_one_key_info_source_at_index_with_options(
                 placeholder.range(),
                 source_content,
                 &generated_attributes,
+                policy,
             )?
         } else {
             append_element_content(
@@ -716,6 +717,7 @@ fn merge_one_key_info_source_at_index_with_options(
                 placeholder.range(),
                 source_content,
                 &generated_attributes,
+                policy,
             )?
         };
         parse_mutation_xml_with_options(&output, policy)?;
@@ -724,8 +726,7 @@ fn merge_one_key_info_source_at_index_with_options(
 
     let range = key_info.range();
     let raw_key_info = &xml[range.clone()];
-    let mut output = xml.to_owned();
-    if raw_key_info.trim_end().ends_with("/>") {
+    let output = if raw_key_info.trim_end().ends_with("/>") {
         let name_end = raw_key_info[1..]
             .find(|character: char| {
                 character.is_ascii_whitespace() || character == '/' || character == '>'
@@ -736,26 +737,72 @@ fn merge_one_key_info_source_at_index_with_options(
         let empty_end = raw_key_info
             .rfind("/>")
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let expanded_len = empty_end
+            .checked_add(1)
+            .and_then(|length| length.checked_add(key_info_source.len()))
+            .and_then(|length| length.checked_add(2))
+            .and_then(|length| length.checked_add(qualified_name.len()))
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| projected_xml_length_overflow(policy))?;
+        validate_projected_replacement_len(xml, range.len(), expanded_len, policy)?;
         let expanded = format!(
             "{}>{}</{}>",
             &raw_key_info[..empty_end],
             key_info_source,
             qualified_name
         );
+        let mut output = xml.to_owned();
         output.replace_range(range, &expanded);
+        output
     } else {
         let closing = raw_key_info
             .rfind("</")
             .map(|offset| range.start + offset)
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        validate_projected_replacement_len(xml, 0, key_info_source.len(), policy)?;
+        let mut output = xml.to_owned();
         output.insert_str(closing, key_info_source);
-    }
+        output
+    };
     parse_mutation_xml_with_options(&output, policy)?;
     Ok(output)
 }
 
-fn wrap_key_info_children(source: &str, key_info: roxmltree::Node<'_, '_>) -> String {
-    let mut wrapper = String::from("<KeyInfoFragment");
+fn wrap_key_info_children(
+    source: &str,
+    key_info: roxmltree::Node<'_, '_>,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError> {
+    const OPEN: &str = "<KeyInfoFragment";
+    const CLOSE: &str = "</KeyInfoFragment>";
+    let projected = key_info
+        .namespaces()
+        .try_fold(OPEN.len(), |length, namespace| {
+            let declaration_len = match namespace.name() {
+                Some(prefix) => "xmlns:"
+                    .len()
+                    .checked_add(prefix.len())
+                    .ok_or_else(|| projected_xml_length_overflow(policy))?,
+                None => "xmlns".len(),
+            };
+            let escaped_uri = quick_xml::escape::escape(namespace.uri());
+            length
+                .checked_add(4)
+                .and_then(|length| length.checked_add(declaration_len))
+                .and_then(|length| length.checked_add(escaped_uri.len()))
+                .ok_or_else(|| projected_xml_length_overflow(policy))
+        })?;
+    let projected = projected
+        .checked_add(1)
+        .and_then(|length| length.checked_add(source.len()))
+        .and_then(|length| length.checked_add(CLOSE.len()))
+        .ok_or_else(|| projected_xml_length_overflow(policy))?;
+    if let Some(policy) = policy {
+        policy.resources.validate_xml_document_len(projected)?;
+    }
+
+    let mut wrapper = String::with_capacity(projected);
+    wrapper.push_str(OPEN);
     for namespace in key_info.namespaces() {
         let declaration = namespace
             .name()
@@ -767,8 +814,8 @@ fn wrap_key_info_children(source: &str, key_info: roxmltree::Node<'_, '_>) -> St
     }
     wrapper.push('>');
     wrapper.push_str(source);
-    wrapper.push_str("</KeyInfoFragment>");
-    wrapper
+    wrapper.push_str(CLOSE);
+    Ok(wrapper)
 }
 
 fn standalone_element(
@@ -912,8 +959,43 @@ fn replace_element_content(
     range: Range<usize>,
     content: &str,
     namespace_attributes: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
     let element = &xml[range.clone()];
+    let replacement_len = if element.trim_end().ends_with("/>") {
+        let name_end = element[1..]
+            .find(|character: char| {
+                character.is_ascii_whitespace() || character == '/' || character == '>'
+            })
+            .map(|offset| offset + 1)
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let qualified_name = &element[1..name_end];
+        let empty_end = element
+            .rfind("/>")
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        empty_end
+            .checked_add(namespace_attributes.len())
+            .and_then(|length| length.checked_add(1))
+            .and_then(|length| length.checked_add(content.len()))
+            .and_then(|length| length.checked_add(2))
+            .and_then(|length| length.checked_add(qualified_name.len()))
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| projected_xml_length_overflow(policy))?
+    } else {
+        let content_start =
+            element_opening_end(element).ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let content_end = element
+            .rfind("</")
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        (content_start - 1)
+            .checked_add(namespace_attributes.len())
+            .and_then(|length| length.checked_add(1))
+            .and_then(|length| length.checked_add(content.len()))
+            .and_then(|length| length.checked_add(element.len() - content_end))
+            .ok_or_else(|| projected_xml_length_overflow(policy))?
+    };
+    validate_projected_replacement_len(xml, range.len(), replacement_len, policy)?;
+
     let mut output = xml.to_owned();
     if element.trim_end().ends_with("/>") {
         let name_end = element[1..]
@@ -959,6 +1041,7 @@ fn append_element_content(
     range: Range<usize>,
     content: &str,
     namespace_attributes: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
     let element = &xml[range.clone()];
     let content_start =
@@ -966,6 +1049,14 @@ fn append_element_content(
     let content_end = element
         .rfind("</")
         .ok_or(XmlMutationError::InvalidAppendTarget)?;
+    let replacement_len = (content_start - 1)
+        .checked_add(namespace_attributes.len())
+        .and_then(|length| length.checked_add(1))
+        .and_then(|length| length.checked_add(content_end - content_start))
+        .and_then(|length| length.checked_add(content.len()))
+        .and_then(|length| length.checked_add(element.len() - content_end))
+        .ok_or_else(|| projected_xml_length_overflow(policy))?;
+    validate_projected_replacement_len(xml, range.len(), replacement_len, policy)?;
     let replacement = format!(
         "{}{}>{}{}{}",
         &element[..content_start - 1],
@@ -977,6 +1068,23 @@ fn append_element_content(
     let mut output = xml.to_owned();
     output.replace_range(range, &replacement);
     Ok(output)
+}
+
+fn validate_projected_replacement_len(
+    xml: &str,
+    removed_len: usize,
+    added_len: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<usize, XmlMutationError> {
+    let projected = xml
+        .len()
+        .checked_sub(removed_len)
+        .and_then(|length| length.checked_add(added_len))
+        .ok_or_else(|| projected_xml_length_overflow(policy))?;
+    if let Some(policy) = policy {
+        policy.resources.validate_xml_document_len(projected)?;
+    }
+    Ok(projected)
 }
 
 fn element_opening_end(fragment: &str) -> Option<usize> {
@@ -2109,7 +2217,8 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
             .expect("KeyInfo");
-        let wrapped = wrap_key_info_children(generated, key_info);
+        let wrapped =
+            wrap_key_info_children(generated, key_info, None).expect("wrapper must serialize");
         let maximum = wrapped.len() - 1;
         assert!(source.len() <= maximum);
         assert!(generated.len() <= maximum);

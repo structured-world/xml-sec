@@ -89,6 +89,44 @@ fn owned_builder_signing_rejects_projected_node_limit_atomically() {
 }
 
 #[test]
+fn owned_builder_signing_rejects_projected_byte_limit_atomically() {
+    // The active signing policy can be tighter than the document's parse
+    // ceiling, so template growth must be rejected before append allocation.
+    let key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(""));
+    let mut document =
+        XmlDocument::parse("<root><payload/></root>").expect("owned input must parse");
+    let before = document.as_xml().to_owned();
+    let maximum = before.len() + 1;
+    let policy = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: maximum,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+
+    let error = SignContext::new(&key)
+        .policy(policy)
+        .sign_document_with_builder(&mut document, &builder)
+        .expect_err("appended template must exceed the active byte ceiling");
+
+    assert!(matches!(
+        error,
+        SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
+            resource: "XML document",
+            maximum: observed_maximum,
+            actual,
+        }) if observed_maximum == maximum && actual > maximum
+    ));
+    assert_eq!(document.as_xml(), before);
+    assert_eq!(document.generation(), 0);
+}
+
+#[test]
 fn owned_template_signing_rejects_value_node_growth_atomically() {
     // DigestValue and SignatureValue text nodes are created after the initial
     // owned-document policy check, so every fill must retain that same ceiling.

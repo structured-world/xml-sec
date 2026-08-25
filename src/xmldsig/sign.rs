@@ -974,6 +974,8 @@ impl<'a> SignContext<'a> {
             self.policy
                 .resources
                 .validate_xml_document_len(key_info_content.len())?;
+            // The mutation helper checks its namespace wrapper and every
+            // projected replacement against this policy before allocation.
             let populated = merge_key_info_source_at_index_with_options(
                 document.as_xml(),
                 &key_info_content,
@@ -1145,6 +1147,11 @@ impl<'a> SignContext<'a> {
         } else {
             document.with_view(|view| view.root_element())
         };
+        let projected_document_len =
+            document.projected_child_append_len(signature_parent, template.len())?;
+        self.policy
+            .resources
+            .validate_xml_document_len(projected_document_len)?;
         document
             .append_child_with_node_limit(
                 signature_parent,
