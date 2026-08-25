@@ -1215,6 +1215,13 @@ fn map_owned_document_mutation_error(error: XmlDocumentError) -> SigningError {
 
 fn map_owned_document_digest_mutation_error(error: XmlDocumentError) -> SigningDigestError {
     match error {
+        XmlDocumentError::DocumentTooLarge { maximum, actual } => {
+            SigningDigestError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DOCUMENT,
+                maximum,
+                actual,
+            })
+        }
         XmlDocumentError::ProjectedNodeLimit { maximum } => {
             SigningDigestError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_NODES,
@@ -1490,8 +1497,9 @@ fn fill_reference_digest_values_in_dependency_order(
             )
         })?;
         document
-            .replace_contents_with_node_limit(
+            .replace_contents_with_limits(
                 &replacements,
+                policy.resources.max_xml_document_bytes,
                 policy.resources.effective_xml_nodes() as usize,
             )
             .map_err(map_owned_document_digest_mutation_error)?;

@@ -122,6 +122,69 @@ impl DocumentParseSettings {
     }
 }
 
+struct ContentReplacementEdit<'a> {
+    range: std::ops::Range<usize>,
+    replacement: &'a str,
+    self_closing: Option<SelfClosingContentEdit>,
+}
+
+struct SelfClosingContentEdit {
+    prefix_end: usize,
+    qualified_name: String,
+}
+
+impl ContentReplacementEdit<'_> {
+    fn output_len(&self) -> Option<usize> {
+        let Some(expansion) = &self.self_closing else {
+            return Some(self.replacement.len());
+        };
+        expansion
+            .prefix_end
+            .checked_add(1)
+            .and_then(|length| length.checked_add(self.replacement.len()))
+            .and_then(|length| length.checked_add(2))
+            .and_then(|length| length.checked_add(expansion.qualified_name.len()))
+            .and_then(|length| length.checked_add(1))
+    }
+
+    fn validation_output_len(&self) -> Option<usize> {
+        self.output_len()?
+            .checked_add(VALIDATION_WRAPPER_OPEN.len())?
+            .checked_add(VALIDATION_WRAPPER_CLOSE.len())
+    }
+
+    fn write_output(&self, source: &str, output: &mut String) {
+        if let Some(expansion) = &self.self_closing {
+            output.push_str(&source[self.range.start..self.range.start + expansion.prefix_end]);
+            output.push('>');
+        }
+        output.push_str(self.replacement);
+        if let Some(expansion) = &self.self_closing {
+            output.push_str("</");
+            output.push_str(&expansion.qualified_name);
+            output.push('>');
+        }
+    }
+
+    fn write_validation_output(&self, source: &str, output: &mut String) -> std::ops::Range<usize> {
+        if let Some(expansion) = &self.self_closing {
+            output.push_str(&source[self.range.start..self.range.start + expansion.prefix_end]);
+            output.push('>');
+        }
+        let wrapper_start = output.len();
+        output.push_str(VALIDATION_WRAPPER_OPEN);
+        output.push_str(self.replacement);
+        output.push_str(VALIDATION_WRAPPER_CLOSE);
+        let wrapper_range = wrapper_start..output.len();
+        if let Some(expansion) = &self.self_closing {
+            output.push_str("</");
+            output.push_str(&expansion.qualified_name);
+            output.push('>');
+        }
+        wrapper_range
+    }
+}
+
 #[derive(Debug)]
 struct DocumentIndexes {
     order: HashMap<NodeId, usize>,
@@ -496,22 +559,24 @@ impl XmlDocument {
         &mut self,
         replacements: &[(NodeIdentity, String)],
     ) -> Result<(), XmlDocumentError> {
-        self.replace_contents_inner(replacements, None)
+        self.replace_contents_inner(replacements, None, None)
     }
 
     #[cfg(feature = "xmldsig")]
-    pub(crate) fn replace_contents_with_node_limit(
+    pub(crate) fn replace_contents_with_limits(
         &mut self,
         replacements: &[(NodeIdentity, String)],
-        maximum: usize,
+        maximum_bytes: usize,
+        maximum_nodes: usize,
     ) -> Result<(), XmlDocumentError> {
-        self.replace_contents_inner(replacements, Some(maximum))
+        self.replace_contents_inner(replacements, Some(maximum_bytes), Some(maximum_nodes))
     }
 
     fn replace_contents_inner(
         &mut self,
         replacements: &[(NodeIdentity, String)],
-        maximum: Option<usize>,
+        maximum_bytes: Option<usize>,
+        maximum_nodes: Option<usize>,
     ) -> Result<(), XmlDocumentError> {
         if replacements.is_empty() {
             return Ok(());
@@ -524,20 +589,6 @@ impl XmlDocument {
             return Err(XmlDocumentError::InvalidReplacement(
                 "replacement targets must be unique".into(),
             ));
-        }
-        if let Some(actual) = replacements
-            .iter()
-            .map(|(_, replacement)| replacement.len())
-            .filter(|length| *length > self.settings.max_bytes)
-            .max()
-        {
-            return Err(XmlDocumentError::DocumentTooLarge {
-                maximum: self.settings.max_bytes,
-                actual,
-            });
-        }
-        for (target, replacement) in replacements {
-            self.validate_content_in_element_context(*target, replacement, maximum)?;
         }
         let mut edits = self.with_view(|view| {
             replacements
@@ -556,52 +607,119 @@ impl XmlDocument {
                                 "self-closing element has no terminator".into(),
                             )
                         })?;
-                        Ok((
+                        Ok(ContentReplacementEdit {
                             range,
-                            format!("{}>{replacement}</{qualified_name}>", &source[..slash]),
-                        ))
+                            replacement,
+                            self_closing: Some(SelfClosingContentEdit {
+                                prefix_end: slash,
+                                qualified_name,
+                            }),
+                        })
                     } else {
-                        Ok((
-                            (range.start + content.start)..(range.start + content.end),
-                            replacement.clone(),
-                        ))
+                        Ok(ContentReplacementEdit {
+                            range: (range.start + content.start)..(range.start + content.end),
+                            replacement,
+                            self_closing: None,
+                        })
                     }
                 })
                 .collect::<Result<Vec<_>, XmlDocumentError>>()
         })?;
-        edits.sort_by_key(|(range, _)| range.start);
-        if edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
+        edits.sort_by_key(|edit| edit.range.start);
+        if edits
+            .windows(2)
+            .any(|pair| pair[0].range.end > pair[1].range.start)
+        {
             return Err(XmlDocumentError::InvalidReplacement(
                 "replacement targets overlap".into(),
             ));
         }
-        let projected =
-            edits
-                .iter()
-                .try_fold(self.as_xml().len(), |length, (range, replacement)| {
-                    length
-                        .checked_sub(range.len())
-                        .and_then(|length| length.checked_add(replacement.len()))
-                        .ok_or(XmlDocumentError::DocumentTooLarge {
-                            maximum: self.settings.max_bytes,
-                            actual: usize::MAX,
-                        })
-                })?;
-        if projected > self.settings.max_bytes {
+        let active_maximum_bytes = maximum_bytes
+            .unwrap_or(self.settings.max_bytes)
+            .min(self.settings.max_bytes);
+        let projected = edits.iter().try_fold(self.as_xml().len(), |length, edit| {
+            length
+                .checked_sub(edit.range.len())
+                .and_then(|length| length.checked_add(edit.output_len()?))
+                .ok_or(XmlDocumentError::DocumentTooLarge {
+                    maximum: active_maximum_bytes,
+                    actual: usize::MAX,
+                })
+        })?;
+        if projected > active_maximum_bytes {
             return Err(XmlDocumentError::DocumentTooLarge {
-                maximum: self.settings.max_bytes,
+                maximum: active_maximum_bytes,
                 actual: projected,
             });
         }
-        let mut output = self.as_xml().to_owned();
-        for (range, replacement) in edits.into_iter().rev() {
-            output.replace_range(range, &replacement);
+
+        self.validate_content_edits(&edits, maximum_nodes)?;
+
+        let mut output = String::with_capacity(projected);
+        let mut cursor = 0;
+        for edit in &edits {
+            output.push_str(&self.as_xml()[cursor..edit.range.start]);
+            edit.write_output(self.as_xml(), &mut output);
+            cursor = edit.range.end;
         }
-        if let Some(maximum) = maximum {
-            self.replace_serialized_with_node_limit(output, maximum)
+        output.push_str(&self.as_xml()[cursor..]);
+        debug_assert_eq!(output.len(), projected);
+        if let Some(maximum_nodes) = maximum_nodes {
+            self.replace_serialized_with_node_limit(output, maximum_nodes)
         } else {
             self.replace_serialized(output)
         }
+    }
+
+    fn validate_content_edits(
+        &self,
+        edits: &[ContentReplacementEdit<'_>],
+        maximum_nodes: Option<usize>,
+    ) -> Result<(), XmlDocumentError> {
+        let projected = edits.iter().try_fold(self.as_xml().len(), |length, edit| {
+            length
+                .checked_sub(edit.range.len())
+                .and_then(|length| length.checked_add(edit.validation_output_len()?))
+                .ok_or_else(|| {
+                    XmlDocumentError::InvalidReplacement("validation length overflow".into())
+                })
+        })?;
+        let mut candidate = String::with_capacity(projected);
+        let mut wrapper_ranges = Vec::with_capacity(edits.len());
+        let mut cursor = 0;
+        for edit in edits {
+            candidate.push_str(&self.as_xml()[cursor..edit.range.start]);
+            wrapper_ranges.push(edit.write_validation_output(self.as_xml(), &mut candidate));
+            cursor = edit.range.end;
+        }
+        candidate.push_str(&self.as_xml()[cursor..]);
+        debug_assert_eq!(candidate.len(), projected);
+
+        let active_nodes_limit = maximum_nodes
+            .map(|maximum| maximum.min(self.settings.nodes_limit as usize))
+            .unwrap_or(self.settings.nodes_limit as usize);
+        let wrapper_allowance = edits.len();
+        let validation_nodes_limit = active_nodes_limit
+            .checked_add(wrapper_allowance)
+            .and_then(|maximum| u32::try_from(maximum).ok())
+            .unwrap_or(u32::MAX);
+        let parsed = build_cell(
+            candidate,
+            DocumentParseSettings {
+                nodes_limit: validation_nodes_limit,
+                max_bytes: projected,
+                ..self.settings
+            },
+        )
+        .map_err(|error| match (maximum_nodes, error) {
+            (Some(_), XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached)) => {
+                XmlDocumentError::ProjectedNodeLimit {
+                    maximum: active_nodes_limit,
+                }
+            }
+            (_, error) => error,
+        })?;
+        parsed.with_dependent(|_, document| validate_wrappers(document, &wrapper_ranges))
     }
 
     /// Append a well-formed XML fragment as the last child of an element.
@@ -1357,6 +1475,31 @@ fn validation_wrapper<'a, 'input>(
         })
 }
 
+fn validate_wrappers(
+    parsed: &ParsedDocument<'_>,
+    expected_ranges: &[std::ops::Range<usize>],
+) -> Result<(), XmlDocumentError> {
+    let mut remaining = expected_ranges
+        .iter()
+        .map(|range| (range.start, range.end))
+        .collect::<HashSet<_>>();
+    for node in parsed
+        .document
+        .descendants()
+        .filter(|node| node.has_tag_name((VALIDATION_WRAPPER_NS, "wrapper")))
+    {
+        let range = node.range();
+        remaining.remove(&(range.start, range.end));
+    }
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(XmlDocumentError::InvalidReplacement(
+            "replacement escaped its structural validation boundary".into(),
+        ))
+    }
+}
+
 impl DocumentIndexes {
     fn build(document: &Document<'_>) -> Self {
         let mut order = HashMap::new();
@@ -1691,6 +1834,108 @@ mod tests {
 
         assert!(matches!(error, XmlDocumentError::InvalidReplacement(_)));
         assert_eq!(document.as_xml(), "<root><target></target></root>");
+        assert_eq!(document.generation(), 0);
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn batched_content_replacements_obey_the_active_byte_ceiling() {
+        // A retained document can have broader parse settings than the current
+        // signing operation; the complete batch must use the active ceiling.
+        let mut document = XmlDocument::parse_with_settings(
+            "<root><first/><second/></root>".into(),
+            DocumentParseSettings::new(false, 128, 4_096),
+        )
+        .expect("fixture must parse");
+        let (first, second) = document.with_view(|view| {
+            let mut targets = view
+                .document()
+                .descendants()
+                .filter(|node| matches!(node.tag_name().name(), "first" | "second"));
+            (
+                view.node_identity(targets.next().expect("first target")),
+                view.node_identity(targets.next().expect("second target")),
+            )
+        });
+        let before = document.as_xml().to_owned();
+        let replacements = [(first, "alpha".into()), (second, "beta".into())];
+        let expected = "<root><first>alpha</first><second>beta</second></root>";
+        let maximum = expected.len() - 1;
+
+        let error = document
+            .replace_contents_with_limits(&replacements, maximum, 128)
+            .expect_err("the active byte ceiling must reject the complete batch");
+
+        assert!(matches!(
+            error,
+            XmlDocumentError::DocumentTooLarge {
+                maximum: observed_maximum,
+                actual,
+            } if observed_maximum == maximum && actual == expected.len()
+        ));
+        assert_eq!(document.as_xml(), before);
+        assert_eq!(document.generation(), 0);
+    }
+
+    #[test]
+    fn batched_content_replacements_validate_one_namespaced_candidate() {
+        // The combined validator must preserve each target's parent namespace
+        // context across both self-closing expansion and ordinary replacement.
+        let mut document = XmlDocument::parse(
+            r#"<root xmlns:p="urn:test"><first/><second><old/></second></root>"#,
+        )
+        .expect("fixture must parse");
+        let (first, second) = document.with_view(|view| {
+            let mut targets = view
+                .document()
+                .descendants()
+                .filter(|node| matches!(node.tag_name().name(), "first" | "second"));
+            (
+                view.node_identity(targets.next().expect("first target")),
+                view.node_identity(targets.next().expect("second target")),
+            )
+        });
+
+        document
+            .replace_contents(&[
+                (first, "<p:alpha/>".into()),
+                (second, "text<p:beta/>".into()),
+            ])
+            .expect("all fragments must validate in one candidate");
+
+        assert_eq!(
+            document.as_xml(),
+            r#"<root xmlns:p="urn:test"><first><p:alpha/></first><second>text<p:beta/></second></root>"#
+        );
+        assert_eq!(document.generation(), 1);
+    }
+
+    #[test]
+    fn batched_content_replacements_reject_one_escaped_boundary_atomically() {
+        // One fragment escaping its target must reject the whole batch even
+        // when every other replacement is structurally valid.
+        let mut document = XmlDocument::parse("<root><first></first><second></second></root>")
+            .expect("fixture must parse");
+        let (first, second) = document.with_view(|view| {
+            let mut targets = view
+                .document()
+                .descendants()
+                .filter(|node| matches!(node.tag_name().name(), "first" | "second"));
+            (
+                view.node_identity(targets.next().expect("first target")),
+                view.node_identity(targets.next().expect("second target")),
+            )
+        });
+        let before = document.as_xml().to_owned();
+
+        document
+            .replace_contents(&[
+                (first, "</first><attacker/><first>".into()),
+                (second, "safe".into()),
+            ])
+            .expect_err("a fragment must not escape its target boundary");
+
+        assert_eq!(document.as_xml(), before);
         assert_eq!(document.generation(), 0);
     }
 

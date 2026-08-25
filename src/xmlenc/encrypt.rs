@@ -229,30 +229,7 @@ impl EncryptedDataBuilder {
         self.policy.validate()?;
         document.validate_xml_input_policy(self.policy.xml.allow_internal_dtd)?;
         self.validate_document_len(document.as_xml().len())?;
-        let (target, source, content_boundaries, document_nodes, selected_nodes) = document
-            .with_view(|view| {
-                let selected = select_encryption_target(view.document(), options.element_id)?;
-                let source = &view.xml()[selected.range()];
-                let content_boundaries = match self.encrypted_type {
-                    EncryptedDataType::Element => {
-                        self.validate_plaintext_len(source.len())?;
-                        None
-                    }
-                    EncryptedDataType::Content => {
-                        let boundaries = element_content_boundaries(source)?;
-                        self.validate_plaintext_len(boundaries.content.len())?;
-                        Some(boundaries)
-                    }
-                    EncryptedDataType::Other(_) => None,
-                };
-                Ok::<_, XmlEncError>((
-                    view.node_identity(selected),
-                    source.to_owned(),
-                    content_boundaries,
-                    view.document().descendants().count(),
-                    selected.descendants().count(),
-                ))
-            })?;
+        let document_nodes = document.with_view(|view| view.node_count());
         if document_nodes > self.policy.resources.effective_xml_nodes() as usize {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_NODES,
@@ -261,6 +238,28 @@ impl EncryptedDataBuilder {
             }
             .into());
         }
+        let (target, source, content_boundaries, selected_nodes) = document.with_view(|view| {
+            let selected = select_encryption_target(view.document(), options.element_id)?;
+            let source = &view.xml()[selected.range()];
+            let content_boundaries = match self.encrypted_type {
+                EncryptedDataType::Element => {
+                    self.validate_plaintext_len(source.len())?;
+                    None
+                }
+                EncryptedDataType::Content => {
+                    let boundaries = element_content_boundaries(source)?;
+                    self.validate_plaintext_len(boundaries.content.len())?;
+                    Some(boundaries)
+                }
+                EncryptedDataType::Other(_) => None,
+            };
+            Ok::<_, XmlEncError>((
+                view.node_identity(selected),
+                source.to_owned(),
+                content_boundaries,
+                selected.descendants().count(),
+            ))
+        })?;
 
         match self.encrypted_type {
             EncryptedDataType::Element => {
@@ -1623,6 +1622,44 @@ mod tests {
             builder().encrypt_document(xml, DocumentEncryptionOptions::default()),
             Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
         ));
+    }
+
+    #[test]
+    fn owned_encryption_checks_active_node_limit_before_target_selection() {
+        // A missing selector must not bypass the active policy or make target
+        // discovery traverse a retained document parsed under a wider ceiling.
+        let policy = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_nodes: 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let mut document = XmlDocument::parse("<root><first/><second/></root>")
+            .expect("retained fixture must parse");
+        let before = document.as_xml().to_owned();
+
+        let error = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .policy(policy)
+            .encrypt_owned_document(
+                &mut document,
+                DocumentEncryptionOptions {
+                    element_id: Some("missing"),
+                },
+            )
+            .expect_err("active node ceiling must precede target selection");
+
+        assert!(matches!(
+            error,
+            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum: 1,
+                actual,
+            }) if actual > 1
+        ));
+        assert_eq!(document.as_xml(), before);
+        assert_eq!(document.generation(), 0);
     }
 
     #[test]

@@ -14,7 +14,9 @@ if [[ -z "${version}" ]]; then
 fi
 
 published() {
-  cargo info "${package}@${version}" >/dev/null 2>&1
+  # Without an explicit registry Cargo resolves the checked-out workspace
+  # package and falsely reports an unpublished release as already available.
+  cargo info --registry crates-io "${package}@${version}" >/dev/null 2>&1
 }
 
 wait_until_published() {
