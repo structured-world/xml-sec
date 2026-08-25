@@ -32,7 +32,7 @@ pub(crate) mod xml_base;
 
 use std::collections::HashSet;
 
-use roxmltree::{Document, Node, NodeId};
+use roxmltree::{Document, Node, NodeId, ParsingOptions};
 
 use ns_exclusive::ExclusiveNsRenderer;
 use ns_inclusive::InclusiveNsRenderer;
@@ -498,12 +498,29 @@ fn serialize_canonical_visible_with_position_dispatch(
 /// Convenience: parse XML bytes and canonicalize the whole document.
 ///
 /// Input must be valid UTF-8 (XML 1.0 documents are UTF-8 or declare their
-/// encoding; roxmltree only accepts UTF-8). Returns `C14nError::Parse` for
-/// invalid UTF-8 or malformed XML.
+/// encoding; roxmltree only accepts UTF-8). DTDs and external entity resolution
+/// are disabled, and the library's absolute XML byte and node ceilings apply.
+/// Returns `C14nError::Parse` for invalid UTF-8, malformed XML, or exceeded
+/// input ceilings.
 pub fn canonicalize_xml(xml: &[u8], algo: &C14nAlgorithm) -> Result<Vec<u8>, C14nError> {
+    if xml.len() > crate::hard_limits::XML_DOCUMENT_BYTE_CEILING {
+        return Err(C14nError::Parse(format!(
+            "input exceeds maximum XML document size of {} bytes: got {}",
+            crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
+            xml.len()
+        )));
+    }
     let xml_str =
         std::str::from_utf8(xml).map_err(|e| C14nError::Parse(format!("invalid UTF-8: {e}")))?;
-    let document = Document::parse(xml_str).map_err(|error| C14nError::Parse(error.to_string()))?;
+    let document = Document::parse_with_options(
+        xml_str,
+        ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
+            entity_resolver: None,
+        },
+    )
+    .map_err(|error| C14nError::Parse(error.to_string()))?;
     let mut output = Vec::new();
     canonicalize(&document, None, algo, &mut output)?;
     Ok(output)
@@ -565,6 +582,55 @@ mod tests {
             String::from_utf8(result).expect("utf8"),
             r#"<root a="1" b="2"><empty></empty></root>"#
         );
+    }
+
+    #[test]
+    fn canonicalize_xml_rejects_input_above_the_document_byte_ceiling_before_parsing() {
+        // The convenience parser accepts untrusted bytes, so allocation bounds
+        // must apply before UTF-8 or XML parsing can inspect the payload.
+        let xml = vec![b' '; crate::hard_limits::XML_DOCUMENT_BYTE_CEILING + 1];
+        let error = match canonicalize_xml(&xml, &C14nAlgorithm::new(C14nMode::Inclusive1_0, false))
+        {
+            Err(error) => error,
+            Ok(_) => panic!("oversized canonicalization input must be rejected"),
+        };
+        assert!(matches!(
+            error,
+            C14nError::Parse(message)
+                if message.contains("exceeds maximum XML document size")
+        ));
+    }
+
+    #[test]
+    fn canonicalize_xml_rejects_input_above_the_document_node_ceiling() {
+        // A compact document can otherwise force an effectively unbounded
+        // parser-node allocation despite staying below the byte ceiling.
+        let children = "<n/>".repeat(crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize);
+        let xml = format!("<root>{children}</root>");
+        let error = match canonicalize_xml(
+            xml.as_bytes(),
+            &C14nAlgorithm::new(C14nMode::Inclusive1_0, false),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("excessive canonicalization nodes must be rejected"),
+        };
+        assert!(matches!(
+            error,
+            C14nError::Parse(message) if message.contains("nodes limit reached")
+        ));
+    }
+
+    #[test]
+    fn canonicalize_xml_does_not_enable_dtd_or_external_entity_resolution() {
+        // Whole-document C14N is a convenience API, not an implicit opt-in to
+        // DTD parsing or external resource access.
+        let xml = br#"<!DOCTYPE root [<!ENTITY value 'expanded'>]><root>&value;</root>"#;
+        let error = canonicalize_xml(xml, &C14nAlgorithm::new(C14nMode::Inclusive1_0, false))
+            .expect_err("DTD input must remain disabled");
+        assert!(matches!(
+            error,
+            C14nError::Parse(message) if message.contains("DTD detected")
+        ));
     }
 
     #[test]

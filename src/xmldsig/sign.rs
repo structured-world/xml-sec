@@ -887,7 +887,8 @@ impl<'a> SignContext<'a> {
             }
             error => SigningError::Document(error),
         })?;
-        self.sign_document(&mut document)?;
+        self.validate_owned_document_input(&document)?;
+        self.sign_document_in_place(&mut document)?;
         Ok(document.into_xml())
     }
 
@@ -1096,7 +1097,8 @@ impl<'a> SignContext<'a> {
             }
             error => SigningError::Document(error),
         })?;
-        self.sign_document_with_builder(&mut document, builder)?;
+        self.validate_owned_document_input(&document)?;
+        self.sign_document_with_builder_in_place(&mut document, builder)?;
         Ok(document.into_xml())
     }
 
