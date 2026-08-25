@@ -386,11 +386,11 @@ fn validate_behavior_evidence(evidence: &BTreeMap<String, BehaviorEvidence>) -> 
                 "evidence {id} must have positive and negative tests"
             ));
         }
+        validate_unique_behavior_assertions(id, "positive", &evidence.positive)?;
+        validate_unique_behavior_assertions(id, "negative", &evidence.negative)?;
         for negative in &evidence.negative {
             if evidence.positive.iter().any(|positive| {
-                positive.file == negative.file
-                    && positive.test == negative.test
-                    && positive.description == negative.description
+                behavior_assertion_key(positive) == behavior_assertion_key(negative)
             }) {
                 return Err(format!(
                     "evidence {id} repeats an identical positive and negative assertion for {}",
@@ -414,6 +414,27 @@ fn validate_behavior_evidence(evidence: &BTreeMap<String, BehaviorEvidence>) -> 
         }
     }
     Ok(())
+}
+
+fn validate_unique_behavior_assertions(
+    evidence_id: &str,
+    polarity: &str,
+    assertions: &[BehaviorTest],
+) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for assertion in assertions {
+        if !seen.insert(behavior_assertion_key(assertion)) {
+            return Err(format!(
+                "evidence {evidence_id} has a duplicate {polarity} assertion for {}",
+                assertion.test
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn behavior_assertion_key(assertion: &BehaviorTest) -> (&str, &str, &str) {
+    (&assertion.file, &assertion.test, &assertion.description)
 }
 
 fn validate_behavior_evidence_references(
@@ -450,11 +471,27 @@ fn items_contain_enabled_test(items: &[syn::Item], test_name: &str) -> bool {
                         .any(|name| attribute.path().is_ident(name))
                 })
         }
-        syn::Item::Mod(module) => module
-            .content
-            .as_ref()
-            .is_some_and(|(_, nested)| items_contain_enabled_test(nested, test_name)),
+        syn::Item::Mod(module) => {
+            module_allows_behavior_evidence(&module.attrs)
+                && module
+                    .content
+                    .as_ref()
+                    .is_some_and(|(_, nested)| items_contain_enabled_test(nested, test_name))
+        }
         _ => false,
+    })
+}
+
+fn module_allows_behavior_evidence(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().all(|attribute| {
+        if attribute.path().is_ident("cfg") {
+            // Unit tests conventionally live in a cfg(test) module. Any other
+            // module condition means the evidence is absent from some builds.
+            return attribute
+                .parse_args::<syn::Ident>()
+                .is_ok_and(|condition| condition == "test");
+        }
+        !attribute.path().is_ident("cfg_attr") && !attribute.path().is_ident("ignore")
     })
 }
 
@@ -1777,6 +1814,33 @@ mod tests {
     }
 
     #[test]
+    fn behavior_evidence_rejects_tests_in_conditional_modules() {
+        for module_attribute in [
+            "#[cfg(feature = \"optional\")]",
+            "#[cfg(any())]",
+            "#[cfg_attr(all(), cfg(any()))]",
+        ] {
+            let source = format!(
+                "{module_attribute}\nmod nested {{\n    #[test]\n    fn expected() {{}}\n}}\n"
+            );
+            assert!(
+                !contains_test_declaration(&source, "expected")
+                    .expect("test declaration matching must run"),
+                "conditional module must not certify evidence: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn behavior_evidence_allows_the_test_harness_module_condition() {
+        let source = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn expected() {}\n}\n";
+        assert!(
+            contains_test_declaration(source, "expected")
+                .expect("test declaration matching must run")
+        );
+    }
+
+    #[test]
     fn behavior_evidence_rejects_an_exact_duplicate_assertion() {
         let assertion = BehaviorTest {
             file: "tests/behavioral_compatibility.rs".into(),
@@ -1794,6 +1858,42 @@ mod tests {
         let error = validate_behavior_evidence(&evidence)
             .expect_err("identical assertions must not represent both outcomes");
         assert!(error.contains("duplicate"), "{error}");
+    }
+
+    #[test]
+    fn behavior_evidence_rejects_duplicates_within_each_polarity() {
+        let positive = BehaviorTest {
+            file: "src/main.rs".into(),
+            test: "behavior_evidence_rejects_duplicates_within_each_polarity".into(),
+            description: "positive assertion".into(),
+        };
+        let negative = BehaviorTest {
+            file: "src/main.rs".into(),
+            test: "behavior_evidence_allows_paired_assertions_from_one_test".into(),
+            description: "negative assertion".into(),
+        };
+
+        for (duplicate_positive, duplicate_negative) in [(true, false), (false, true)] {
+            let evidence = BTreeMap::from([(
+                "duplicate-polarity".into(),
+                BehaviorEvidence {
+                    positive: if duplicate_positive {
+                        vec![positive.clone(), positive.clone()]
+                    } else {
+                        vec![positive.clone()]
+                    },
+                    negative: if duplicate_negative {
+                        vec![negative.clone(), negative.clone()]
+                    } else {
+                        vec![negative.clone()]
+                    },
+                },
+            )]);
+
+            let error = validate_behavior_evidence(&evidence)
+                .expect_err("one polarity must not repeat an identical assertion");
+            assert!(error.contains("duplicate"), "{error}");
+        }
     }
 
     #[test]
