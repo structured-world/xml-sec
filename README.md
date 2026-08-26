@@ -133,10 +133,9 @@ document replacement, input bounds, and parser security policy.
 
 ## Project Status
 
-`xml-sec` is an early-stage pre-release. The API is unstable and the project is
-not ready for production use. Current work focuses on remaining XMLDSig/XMLEnc
-algorithms, complete upstream conformance classification, fuzzing, benchmarks,
-hardening, and API stabilization.
+Current development focuses on remaining XMLDSig/XMLEnc algorithms, complete
+upstream conformance classification, fuzzing, benchmarks, hardening, and API
+stabilization.
 
 The [compatibility ledgers](docs/compatibility-ledger.md) track libxmlsec1 1.3.13
 public surface and operation-level behavior with source and test evidence. See

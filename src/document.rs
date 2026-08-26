@@ -19,6 +19,9 @@ static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(1);
 const VALIDATION_WRAPPER_NS: &str = "urn:xml-sec:owned-document-validation";
 const VALIDATION_WRAPPER_OPEN: &str = "<xmlsec_owned_document:wrapper xmlns:xmlsec_owned_document=\"urn:xml-sec:owned-document-validation\">";
 const VALIDATION_WRAPPER_CLOSE: &str = "</xmlsec_owned_document:wrapper>";
+// Validation adds one wrapper element and can prevent text-node merging at
+// both replacement boundaries. The committed candidate uses the real ceiling.
+const VALIDATION_WRAPPER_NODE_OVERHEAD: u32 = 3;
 
 /// Process-local provenance of one owned XML document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1232,7 +1235,7 @@ impl XmlDocument {
         let parsed = build_cell(
             candidate,
             DocumentParseSettings {
-                nodes_limit: active_nodes_limit.saturating_add(1),
+                nodes_limit: active_nodes_limit.saturating_add(VALIDATION_WRAPPER_NODE_OVERHEAD),
                 // Wrapper markup is validation scaffolding, not document input.
                 // The committed candidate is checked against the real ceiling.
                 max_bytes: projected,
@@ -2207,6 +2210,52 @@ mod tests {
         ));
         assert_eq!(document.as_xml(), before);
         assert_eq!(document.generation(), 0);
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn bounded_append_accepts_text_merged_with_existing_content() {
+        // Wrapper validation temporarily separates adjacent text, but the
+        // committed document merges it and therefore stays at the node ceiling.
+        let mut document = XmlDocument::parse_with_settings(
+            "<root>text</root>".into(),
+            DocumentParseSettings::new(false, 3, 1_024),
+        )
+        .expect("fixture must fit the exact node ceiling");
+        let root = document.with_view(|view| view.root_element());
+        let budget = XmlParseWorkBudget::from_resources(&crate::policy::ResourcePolicy::default());
+
+        document
+            .append_child_with_budget(root, "more", 3, &budget)
+            .expect("merged text must not consume another committed node");
+
+        assert_eq!(document.as_xml(), "<root>textmore</root>");
+        assert_eq!(document.with_view(|view| view.node_count()), 3);
+    }
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn bounded_fragment_accepts_two_boundary_text_merges() {
+        // A wrapper can prevent text merging on both sides of a replacement.
+        // The final candidate still contains one text node and fits exactly.
+        let mut document =
+            XmlDocument::parse("<root>left<target/>right</root>").expect("fixture must parse");
+        let target = document.with_view(|view| {
+            let target = view
+                .document()
+                .descendants()
+                .find(|node| node.has_tag_name("target"))
+                .expect("target must exist");
+            view.node_identity(target)
+        });
+        let budget = XmlParseWorkBudget::from_resources(&crate::policy::ResourcePolicy::default());
+
+        document
+            .replace_node_with_fragment_with_budget(target, "middle", 3, &budget)
+            .expect("both boundary text pairs must merge in the committed document");
+
+        assert_eq!(document.as_xml(), "<root>leftmiddleright</root>");
+        assert_eq!(document.with_view(|view| view.node_count()), 3);
     }
 
     #[test]
