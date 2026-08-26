@@ -400,21 +400,26 @@ pub struct DocumentView<'a> {
 
 impl XmlDocument {
     /// Parse and own an XML document using conservative XML input defaults.
-    pub fn parse(xml: impl Into<String>) -> Result<Self, XmlDocumentError> {
-        Self::parse_with_settings(xml.into(), DocumentParseSettings::default())
+    /// Borrowed input is size-checked before it is copied into owned storage.
+    pub fn parse(xml: impl AsRef<str> + Into<String>) -> Result<Self, XmlDocumentError> {
+        let settings = DocumentParseSettings::default();
+        let xml = own_bounded_xml(xml, settings.max_bytes)?;
+        Self::parse_with_settings(xml, settings)
     }
 
     /// Parse and own XML under the same immutable policy used by an operation.
+    /// The policy's byte ceiling is checked before borrowed input is copied.
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub fn parse_with_policy(
-        xml: impl Into<String>,
+        xml: impl AsRef<str> + Into<String>,
         policy: &impl XmlDocumentPolicy,
     ) -> Result<Self, XmlDocumentError> {
         let resources = policy.resource_policy();
         resources.validate()?;
         let budget = XmlParseWorkBudget::from_resources(resources);
+        let xml = own_bounded_xml(xml, resources.max_xml_document_bytes)?;
         Self::parse_with_settings_and_optional_budget(
-            xml.into(),
+            xml,
             DocumentParseSettings::new(
                 policy.xml_input_policy().allow_internal_dtd,
                 resources.effective_xml_nodes(),
@@ -605,7 +610,7 @@ impl XmlDocument {
         self.replace_content_inner(target, replacement, None, None)
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub(crate) fn replace_content_with_budget(
         &mut self,
         target: NodeIdentity,
@@ -623,7 +628,7 @@ impl XmlDocument {
         maximum: Option<usize>,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
-        let (range, serialized_replacement) = self.with_view(|view| {
+        let (range, self_closing_expansion, serialized_len) = self.with_view(|view| {
             let node = view.resolve_node(target)?;
             if !node.is_element() {
                 return Err(XmlDocumentError::TargetNotElement);
@@ -637,17 +642,26 @@ impl XmlDocument {
                         "self-closing element has no terminator".into(),
                     )
                 })?;
-                return Ok((
-                    range,
-                    format!("{}>{replacement}</{qualified_name}>", &source[..slash]),
-                ));
+                let serialized_len = slash
+                    .checked_add(replacement.len())
+                    .and_then(|length| length.checked_add(qualified_name.len()))
+                    .and_then(|length| length.checked_add(4))
+                    .ok_or(XmlDocumentError::DocumentTooLarge {
+                        maximum: self.settings.max_bytes,
+                        actual: usize::MAX,
+                    })?;
+                return Ok((range, Some((slash, qualified_name)), serialized_len));
             }
-            Ok((
-                (range.start + content.start)..(range.start + content.end),
-                replacement.to_owned(),
-            ))
+            let range = (range.start + content.start)..(range.start + content.end);
+            Ok((range, None, replacement.len()))
         })?;
-        self.ensure_replacement_fits(&range, serialized_replacement.len())?;
+        self.ensure_replacement_fits(&range, serialized_len)?;
+        let serialized_replacement = if let Some((slash, qualified_name)) = self_closing_expansion {
+            let source = &self.as_xml()[range.clone()];
+            format!("{}>{replacement}</{qualified_name}>", &source[..slash])
+        } else {
+            replacement.to_owned()
+        };
         self.validate_content_in_element_context(target, replacement, maximum, budget)?;
         if let Some(maximum) = maximum {
             self.replace_range_with_node_limit(range, &serialized_replacement, maximum, budget)
@@ -1558,6 +1572,17 @@ fn build_cell(
     .map_err(XmlDocumentError::Parse)
 }
 
+fn own_bounded_xml(
+    xml: impl AsRef<str> + Into<String>,
+    maximum: usize,
+) -> Result<String, XmlDocumentError> {
+    let actual = xml.as_ref().len();
+    if actual > maximum {
+        return Err(XmlDocumentError::DocumentTooLarge { maximum, actual });
+    }
+    Ok(xml.into())
+}
+
 fn allocate_document_identity(counter: &AtomicU64) -> Result<DocumentIdentity, XmlDocumentError> {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
@@ -1724,6 +1749,44 @@ fn element_opening_end(element: &str) -> Result<usize, XmlDocumentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct OversizedBorrowedInput<'a>(&'a str);
+
+    impl AsRef<str> for OversizedBorrowedInput<'_> {
+        fn as_ref(&self) -> &str {
+            self.0
+        }
+    }
+
+    impl From<OversizedBorrowedInput<'_>> for String {
+        fn from(_: OversizedBorrowedInput<'_>) -> Self {
+            panic!("oversized borrowed XML must be rejected before ownership conversion")
+        }
+    }
+
+    #[test]
+    fn oversized_borrowed_input_is_rejected_before_ownership_conversion() {
+        // Borrowed request bodies can be arbitrarily large. Both constructors
+        // must inspect their size before cloning them into the owned document.
+        let oversized = "x".repeat(crate::hard_limits::XML_DOCUMENT_BYTE_CEILING + 1);
+        assert!(matches!(
+            XmlDocument::parse(OversizedBorrowedInput(&oversized)),
+            Err(XmlDocumentError::DocumentTooLarge { .. })
+        ));
+
+        #[cfg(feature = "xmldsig")]
+        {
+            let mut policy = crate::policy::SigningPolicy::default();
+            policy.resources.max_xml_document_bytes = 8;
+            assert!(matches!(
+                XmlDocument::parse_with_policy(OversizedBorrowedInput("<root/>xx"), &policy),
+                Err(XmlDocumentError::DocumentTooLarge {
+                    maximum: 8,
+                    actual: 9,
+                })
+            ));
+        }
+    }
 
     #[test]
     fn views_reuse_identity_until_mutation_invalidates_generation() {
@@ -1903,23 +1966,26 @@ mod tests {
     fn oversized_invalid_fragment_fails_at_the_document_byte_boundary() {
         // Resource rejection must happen before wrapper parsing, so malformed
         // attacker input cannot force allocations beyond the document ceiling.
-        let mut document = XmlDocument::parse_with_settings(
-            "<root><child/></root>".into(),
-            DocumentParseSettings::new(false, 64, 64),
-        )
-        .expect("bounded fixture must parse");
-        let root = document.with_view(|view| view.root_element());
-        let replacement = "<".repeat(1_024);
+        // Cover both direct content replacement and self-closing expansion.
+        for xml in ["<root><child/></root>", "<root/>"] {
+            let mut document = XmlDocument::parse_with_settings(
+                xml.into(),
+                DocumentParseSettings::new(false, 64, 64),
+            )
+            .expect("bounded fixture must parse");
+            let root = document.with_view(|view| view.root_element());
+            let replacement = "<".repeat(1_024);
 
-        assert!(matches!(
-            document.replace_content(root, &replacement),
-            Err(XmlDocumentError::DocumentTooLarge {
-                maximum: 64,
-                actual,
-            }) if actual > 64
-        ));
-        assert_eq!(document.as_xml(), "<root><child/></root>");
-        assert_eq!(document.generation(), 0);
+            assert!(matches!(
+                document.replace_content(root, &replacement),
+                Err(XmlDocumentError::DocumentTooLarge {
+                    maximum: 64,
+                    actual,
+                }) if actual > 64
+            ));
+            assert_eq!(document.as_xml(), xml);
+            assert_eq!(document.generation(), 0);
+        }
     }
 
     #[cfg(feature = "xmlenc")]

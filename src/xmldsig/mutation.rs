@@ -1249,6 +1249,9 @@ fn fill_dsig_values_matching(
     budget: Option<&XmlParseWorkBudget>,
     mut should_replace: impl FnMut(&[(bool, Vec<u8>, Option<usize>)], &ResolveResult<'_>) -> bool,
 ) -> Result<String, XmlMutationError> {
+    if let Some(budget) = budget {
+        budget.charge_policy(xml.len())?;
+    }
     let mut reader = NsReader::from_str(xml);
     let mut writer = Writer::new(Vec::new());
     let mut buf = Vec::new();
@@ -1759,6 +1762,27 @@ mod tests {
 
             assert_eq!(projected, mutated.len());
         }
+    }
+
+    #[test]
+    fn streaming_mutation_scan_consumes_the_shared_parse_budget() {
+        // The quick-xml rewrite is a parser pass just like the structural DOM
+        // parses before and after it, so all three scans share one allowance.
+        let xml = format!(
+            "<root><ds:Signature xmlns:ds=\"{XMLDSIG_NS}\"><ds:SignatureValue/></ds:Signature></root>"
+        );
+        let resources = crate::policy::ResourcePolicy::default();
+        let budget = XmlParseWorkBudget::from_resources(&resources);
+        let output = fill_signature_value_at_index_with_budget(
+            &xml,
+            "signature",
+            0,
+            Some(&crate::policy::SigningPolicy::default()),
+            Some(&budget),
+        )
+        .expect("streaming mutation must succeed");
+
+        assert_eq!(budget.consumed(), xml.len() * 2 + output.len());
     }
 
     #[test]

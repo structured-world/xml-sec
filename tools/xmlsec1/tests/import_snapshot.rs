@@ -8,10 +8,41 @@ fn donor_tests() -> std::path::PathBuf {
     project_root().join("donors/xmlsec/tests")
 }
 
+fn donor_checkout_available() -> bool {
+    let donor_root = project_root().join("donors/xmlsec");
+    if !donor_tests().is_dir() {
+        return false;
+    }
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(&donor_root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(reported_root) = std::str::from_utf8(&output.stdout) else {
+        return false;
+    };
+    donor_root.canonicalize().ok().as_deref()
+        == Path::new(reported_root.trim())
+            .canonicalize()
+            .ok()
+            .as_deref()
+}
+
 #[test]
 fn check_mode_detects_drift_without_replacing_the_snapshot() {
     // The CI reproducibility gate must be observational: drift fails the check
-    // and leaves the candidate snapshot untouched for diagnosis.
+    // and leaves the candidate snapshot untouched for diagnosis. Published
+    // crates intentionally omit the donor checkout, so this repository-only
+    // assertion runs only when that exact nested Git checkout is available.
+    if !donor_checkout_available() {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("snapshot");
     let donor = donor_tests();
