@@ -325,7 +325,7 @@ impl SignatureBuilder {
             crate::document::DocumentParseSettings::from_policy(&policy.xml, &policy.resources);
         let document = super::mutation::parse_with_options_and_budget(
             &validation_template,
-            Some(policy),
+            settings,
             Some(budget.xml_parse_work()),
         )
         .map_err(|error| match error.into_policy_violation(settings) {

@@ -1827,7 +1827,7 @@ fn parse_signing_document<'a>(
     let settings = policy
         .map(|policy| DocumentParseSettings::from_policy(&policy.xml, &policy.resources))
         .unwrap_or_default();
-    super::mutation::parse_with_options_and_budget(xml, policy, Some(budget)).map_err(|error| {
+    super::mutation::parse_with_options_and_budget(xml, settings, Some(budget)).map_err(|error| {
         match error.into_policy_violation(settings) {
             Ok(error) => SigningDigestError::Policy(error),
             Err(XmlDocumentError::Parse(error)) => SigningDigestError::XmlParse(error),

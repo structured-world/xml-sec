@@ -20,29 +20,10 @@ use super::types::{XMLDSIG_NS, XMLENC_NS, XMLENC11_NS};
 use super::{
     DataEncryptionAlgorithm, DocumentEncryptionOptions, EncryptedDataType, EncryptionRecipient,
     EncryptionResult, KeyWrapAlgorithm, ReplacementMode, RsaOaepParameters, XmlEncError,
-    has_single_element_with_boundary_trivia,
+    has_single_element_with_boundary_trivia, map_document_error,
 };
 
 const XML_WHITESPACE: &[char] = &[' ', '\t', '\n', '\r'];
-
-fn map_document_mutation_error(
-    error: crate::document::XmlDocumentError,
-    settings: DocumentParseSettings,
-) -> XmlEncError {
-    match error.into_policy_violation(settings) {
-        Ok(error) => XmlEncError::Policy(error),
-        Err(crate::document::XmlDocumentError::Parse(error)) => XmlEncError::XmlParse(error),
-        Err(crate::document::XmlDocumentError::ProjectedNodeLimit { maximum }) => {
-            crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::XML_NODES,
-                maximum,
-                actual: maximum.saturating_add(1),
-            }
-            .into()
-        }
-        Err(error) => XmlEncError::Document(error),
-    }
-}
 
 /// Validate an RSA recipient key against the compiled encryption policy.
 ///
@@ -233,7 +214,7 @@ impl EncryptedDataBuilder {
         let settings = DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources);
         let mut document =
             XmlDocument::parse_with_settings_and_budget(xml.to_owned(), settings, &parse_budget)
-                .map_err(|error| map_encryption_parse_error(error, settings))?;
+                .map_err(|error| map_document_error(error, settings))?;
         self.encrypt_owned_document_with_budget(&mut document, options, &parse_budget)?;
         Ok(document.into_xml())
     }
@@ -313,7 +294,7 @@ impl EncryptedDataBuilder {
                         settings,
                         parse_budget,
                     )
-                    .map_err(|error| map_document_mutation_error(error, settings))?;
+                    .map_err(|error| map_document_error(error, settings))?;
                 Ok(())
             }
             EncryptedDataType::Content => {
@@ -367,7 +348,7 @@ impl EncryptedDataBuilder {
                         settings,
                         parse_budget,
                     )
-                    .map_err(|error| map_document_mutation_error(error, settings))?;
+                    .map_err(|error| map_document_error(error, settings))?;
                 Ok(())
             }
             EncryptedDataType::Other(_) => Err(XmlEncError::InvalidEncryptionConfig(
@@ -725,7 +706,7 @@ fn count_generated_encrypted_data_nodes(
                     actual: maximum_nodes as usize + 1,
                 })
             }
-            error => map_encryption_parse_error(error, settings),
+            error => map_document_error(error, settings),
         })?;
     Ok(generated.root_element().descendants().count())
 }
@@ -994,7 +975,7 @@ fn validate_xml_plaintext(
         EncryptedDataType::Element => {
             let document =
                 parse_borrowed_with_settings_and_budget(xml, settings, Some(parse_budget))
-                    .map_err(|error| map_encryption_parse_error(error, settings))?;
+                    .map_err(|error| map_document_error(error, settings))?;
             if !has_single_element_with_boundary_trivia(document.root()) {
                 return Err(XmlEncError::InvalidStructure(
                     "Element plaintext must contain exactly one element".into(),
@@ -1028,24 +1009,13 @@ fn validate_xml_plaintext(
                             actual: actual.saturating_sub(1),
                         })
                     }
-                    error => map_encryption_parse_error(error, wrapped_settings),
+                    error => map_document_error(error, wrapped_settings),
                 })?;
             Ok(())
         }
         EncryptedDataType::Other(_) => Err(XmlEncError::InvalidEncryptionConfig(
             "encrypt_xml requires Element or Content Type".into(),
         )),
-    }
-}
-
-fn map_encryption_parse_error(
-    error: XmlDocumentError,
-    settings: DocumentParseSettings,
-) -> XmlEncError {
-    match error.into_policy_violation(settings) {
-        Ok(error) => XmlEncError::Policy(error),
-        Err(XmlDocumentError::Parse(error)) => XmlEncError::XmlParse(error),
-        Err(error) => XmlEncError::Document(error),
     }
 }
 

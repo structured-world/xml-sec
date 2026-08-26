@@ -6,10 +6,10 @@ use roxmltree::Node;
 use roxmltree::{Document, ParsingOptions};
 
 use crate::document::{
-    DocumentParseSettings, XmlDocumentError, XmlParseWorkBudget,
-    parse_borrowed_with_settings_and_budget,
+    DocumentParseSettings, XmlParseWorkBudget, parse_borrowed_with_settings_and_budget,
 };
 
+use super::map_document_error;
 use super::types::{
     CipherData, EncryptedData, EncryptedDataType, EncryptedKey, EncryptionMethod,
     MAX_CIPHER_VALUE_BASE64_LEN, ReferenceList, XMLDSIG_NS, XMLENC_NS, XMLENC11_NS, XmlEncError,
@@ -119,15 +119,7 @@ fn parse_policy_document<'a>(
 ) -> Result<roxmltree::Document<'a>, XmlEncError> {
     let settings = DocumentParseSettings::from_policy(policy.xml, policy.resources);
     parse_borrowed_with_settings_and_budget(xml, settings, Some(parse_budget))
-        .map_err(|error| map_policy_parse_error(error, settings))
-}
-
-fn map_policy_parse_error(error: XmlDocumentError, settings: DocumentParseSettings) -> XmlEncError {
-    match error.into_policy_violation(settings) {
-        Ok(error) => XmlEncError::Policy(error),
-        Err(XmlDocumentError::Parse(error)) => XmlEncError::XmlParse(error),
-        Err(error) => XmlEncError::Document(error),
-    }
+        .map_err(|error| map_document_error(error, settings))
 }
 
 fn parse_encrypted_data_node(

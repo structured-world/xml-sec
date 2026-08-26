@@ -19,19 +19,10 @@ use crate::document::{
 
 pub(super) fn parse_with_options_and_budget<'a>(
     xml: &'a str,
-    policy: Option<&crate::policy::SigningPolicy>,
+    settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<roxmltree::Document<'a>, XmlDocumentError> {
-    let settings = policy
-        .map(|policy| DocumentParseSettings::from_policy(&policy.xml, &policy.resources))
-        .unwrap_or_default();
     parse_borrowed_with_settings_and_budget(xml, settings, budget)
-}
-
-fn mutation_parse_settings(policy: Option<&crate::policy::SigningPolicy>) -> DocumentParseSettings {
-    policy
-        .map(|policy| DocumentParseSettings::from_policy(&policy.xml, &policy.resources))
-        .unwrap_or_default()
 }
 
 fn map_mutation_parse_error(
@@ -57,8 +48,10 @@ fn parse_mutation_xml_with_budget<'a>(
     policy: Option<&crate::policy::SigningPolicy>,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<roxmltree::Document<'a>, XmlMutationError> {
-    let settings = mutation_parse_settings(policy);
-    parse_with_options_and_budget(xml, policy, budget)
+    let settings = policy
+        .map(|policy| DocumentParseSettings::from_policy(&policy.xml, &policy.resources))
+        .unwrap_or_default();
+    parse_with_options_and_budget(xml, settings, budget)
         .map_err(|error| map_mutation_parse_error(error, settings))
 }
 

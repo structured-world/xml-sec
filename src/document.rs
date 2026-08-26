@@ -31,10 +31,10 @@ trait XmlParserBackend {
     ) -> Result<DocumentMetrics, XmlDocumentError>;
 }
 
-#[cfg(any(not(feature = "xml-backend-xmloxide"), test))]
+#[cfg(not(feature = "xml-backend-xmloxide"))]
 struct RoxmltreeParser;
 
-#[cfg(any(not(feature = "xml-backend-xmloxide"), test))]
+#[cfg(not(feature = "xml-backend-xmloxide"))]
 impl XmlParserBackend for RoxmltreeParser {
     fn validate_after_bounded_projection(
         _xml: &str,
@@ -63,14 +63,7 @@ impl XmlParserBackend for XmloxideParser {
         // bounded retained projection here ensures wide input is rejected
         // before xmloxide can allocate its tree.
         charge_parse_work(budget, xml.len())?;
-        let maximum_depth = u32::try_from(settings.depth_limit).unwrap_or(u32::MAX);
-        let options = xmloxide::parser::ParseOptions::default()
-            .max_depth(maximum_depth)
-            .max_attributes(settings.nodes_limit)
-            .max_attribute_length(settings.max_bytes)
-            .max_text_length(settings.max_bytes)
-            .max_name_length(settings.max_bytes)
-            .max_entity_expansions(settings.nodes_limit);
+        let options = xmloxide_parse_options(settings);
         xmloxide::parser::parse_str_with_options(xml, &options).map_err(|error| {
             if error.message.contains("maximum nesting depth exceeded") {
                 XmlDocumentError::DocumentTooDeep {
@@ -89,6 +82,22 @@ impl XmlParserBackend for XmloxideParser {
         // contiguous entity/CDATA text, so it must not replace those metrics.
         Ok(bounded)
     }
+}
+
+#[cfg(feature = "xml-backend-xmloxide")]
+fn xmloxide_parse_options(settings: DocumentParseSettings) -> xmloxide::parser::ParseOptions {
+    let maximum_depth = u32::try_from(settings.depth_limit).unwrap_or(u32::MAX);
+    // Retained semantic nodes and source bytes are different resources from
+    // xmloxide's per-element and post-expansion lexical limits. Disable those
+    // backend-specific caps so selecting a parser cannot narrow the shared
+    // document contract; the bounded preflight remains authoritative.
+    xmloxide::parser::ParseOptions::default()
+        .max_depth(maximum_depth)
+        .max_attributes(u32::MAX)
+        .max_attribute_length(usize::MAX)
+        .max_text_length(usize::MAX)
+        .max_name_length(usize::MAX)
+        .max_entity_expansions(u32::MAX)
 }
 
 #[cfg(feature = "xml-backend-xmloxide")]
@@ -1864,24 +1873,89 @@ fn preflight_document_limits(
     xml: &str,
     settings: DocumentParseSettings,
 ) -> Result<(), XmlDocumentError> {
+    let mut entities = HashMap::new();
+    let mut expansion_stack = HashSet::new();
+    let mut state = DocumentPreflightState::default();
+    preflight_xml_fragment(
+        xml,
+        settings,
+        &mut entities,
+        &mut expansion_stack,
+        &mut state,
+        true,
+    )
+}
+
+#[derive(Default)]
+struct DocumentPreflightState {
+    depth: usize,
+    nodes: u32,
+    in_character_data: bool,
+}
+
+fn preflight_xml_fragment(
+    xml: &str,
+    settings: DocumentParseSettings,
+    entities: &mut HashMap<String, String>,
+    expansion_stack: &mut HashSet<String>,
+    state: &mut DocumentPreflightState,
+    collect_doctype: bool,
+) -> Result<(), XmlDocumentError> {
     let mut reader = QuickXmlReader::from_str(xml);
-    let mut depth = 0_usize;
-    // roxmltree exposes its document root as the first semantic node.
-    let mut nodes = 1_u32;
-    let mut in_character_data = false;
+    if state.nodes == 0 {
+        // roxmltree exposes its document root as the first semantic node.
+        state.nodes = 1;
+    }
     // Syntax diagnostics and exact parser precedence belong to the selected
     // DOM pipeline; this pass stops at malformed syntax after bounding its prefix.
     while let Ok(event) = reader.read_event() {
-        let is_character_data = matches!(
-            &event,
-            QuickXmlEvent::Text(_) | QuickXmlEvent::CData(_) | QuickXmlEvent::GeneralRef(_)
-        );
+        if let QuickXmlEvent::DocType(doctype) = &event {
+            if collect_doctype
+                && settings.allow_dtd
+                && let Ok(doctype) = doctype.decode()
+            {
+                collect_internal_general_entities(&doctype, entities);
+            }
+            state.in_character_data = false;
+            continue;
+        }
+
+        if let QuickXmlEvent::GeneralRef(reference) = &event {
+            let Ok(name) = reference.decode() else {
+                continue;
+            };
+            if reference.resolve_char_ref().ok().flatten().is_some()
+                || matches!(name.as_ref(), "amp" | "apos" | "gt" | "lt" | "quot")
+            {
+                observe_preflight_node(state, settings, true)?;
+                continue;
+            }
+            let name = name.into_owned();
+            if expansion_stack.insert(name.clone()) {
+                if let Some(replacement) = entities.remove(&name) {
+                    let result = preflight_xml_fragment(
+                        &replacement,
+                        settings,
+                        entities,
+                        expansion_stack,
+                        state,
+                        false,
+                    );
+                    entities.insert(name.clone(), replacement);
+                    result?;
+                }
+                expansion_stack.remove(&name);
+                continue;
+            }
+        }
+
+        let is_character_data = matches!(&event, QuickXmlEvent::Text(_) | QuickXmlEvent::CData(_));
         let adds_node = if is_character_data {
-            let starts_semantic_node = !in_character_data;
-            in_character_data = true;
+            let starts_semantic_node = !state.in_character_data;
+            state.in_character_data = true;
             starts_semantic_node
         } else {
-            in_character_data = false;
+            state.in_character_data = false;
             matches!(
                 &event,
                 QuickXmlEvent::Start(_)
@@ -1891,23 +1965,20 @@ fn preflight_document_limits(
             )
         };
         if adds_node {
-            nodes = nodes.saturating_add(1);
-            if nodes > settings.nodes_limit {
-                return Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached));
-            }
+            observe_preflight_node(state, settings, false)?;
         }
         match event {
             QuickXmlEvent::Start(_) => {
-                depth = depth.saturating_add(1);
-                if depth > settings.depth_limit {
+                state.depth = state.depth.saturating_add(1);
+                if state.depth > settings.depth_limit {
                     return Err(XmlDocumentError::DocumentTooDeep {
                         maximum: settings.depth_limit,
-                        actual: depth,
+                        actual: state.depth,
                     });
                 }
             }
             QuickXmlEvent::Empty(_) => {
-                let actual = depth.saturating_add(1);
+                let actual = state.depth.saturating_add(1);
                 if actual > settings.depth_limit {
                     return Err(XmlDocumentError::DocumentTooDeep {
                         maximum: settings.depth_limit,
@@ -1915,12 +1986,118 @@ fn preflight_document_limits(
                     });
                 }
             }
-            QuickXmlEvent::End(_) => depth = depth.saturating_sub(1),
+            QuickXmlEvent::End(_) => state.depth = state.depth.saturating_sub(1),
             QuickXmlEvent::Eof => break,
             _ => {}
         }
     }
     Ok(())
+}
+
+fn observe_preflight_node(
+    state: &mut DocumentPreflightState,
+    settings: DocumentParseSettings,
+    character_data: bool,
+) -> Result<(), XmlDocumentError> {
+    if character_data {
+        if state.in_character_data {
+            return Ok(());
+        }
+        state.in_character_data = true;
+    }
+    state.nodes = state.nodes.saturating_add(1);
+    if state.nodes > settings.nodes_limit {
+        return Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached));
+    }
+    Ok(())
+}
+
+fn collect_internal_general_entities(doctype: &str, entities: &mut HashMap<String, String>) {
+    let Some(subset_start) = find_unquoted_byte(doctype.as_bytes(), b'[', 0) else {
+        return;
+    };
+    let Some(subset_end) = doctype.rfind(']') else {
+        return;
+    };
+    let subset = &doctype[subset_start + 1..subset_end];
+    let mut offset = 0;
+    let bytes = subset.as_bytes();
+    while offset < bytes.len() {
+        if bytes[offset..].starts_with(b"<!--") {
+            let Some(end) = find_bytes(&bytes[offset + 4..], b"-->") else {
+                break;
+            };
+            offset += 4 + end + 3;
+        } else if bytes[offset..].starts_with(b"<?") {
+            let Some(end) = find_bytes(&bytes[offset + 2..], b"?>") else {
+                break;
+            };
+            offset += 2 + end + 2;
+        } else if bytes[offset..].starts_with(b"<!ENTITY") {
+            let declaration_start = offset + "<!ENTITY".len();
+            let Some(declaration_end) = find_unquoted_byte(bytes, b'>', declaration_start) else {
+                break;
+            };
+            let declaration = &subset[declaration_start..declaration_end];
+            if let Some((name, value)) = parse_internal_general_entity(declaration) {
+                // roxmltree resolves the first declaration with a matching name.
+                entities
+                    .entry(name.to_owned())
+                    .or_insert_with(|| value.to_owned());
+            }
+            offset = declaration_end + 1;
+        } else if bytes[offset..].starts_with(b"<!") {
+            let Some(declaration_end) = find_unquoted_byte(bytes, b'>', offset + 2) else {
+                break;
+            };
+            offset = declaration_end + 1;
+        } else {
+            offset += 1;
+        }
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn parse_internal_general_entity(declaration: &str) -> Option<(&str, &str)> {
+    let declaration = declaration.trim_start();
+    if declaration.starts_with('%') {
+        return None;
+    }
+    let name_end = declaration.find(char::is_whitespace)?;
+    let name = &declaration[..name_end];
+    let definition = declaration[name_end..].trim_start();
+    let quote = definition.as_bytes().first().copied()?;
+    if !matches!(quote, b'\'' | b'"') {
+        // External entities have no replacement text without an explicit
+        // resolver, which this crate never installs.
+        return None;
+    }
+    let value_end = definition.as_bytes()[1..]
+        .iter()
+        .position(|byte| *byte == quote)?
+        + 1;
+    Some((name, &definition[1..value_end]))
+}
+
+fn find_unquoted_byte(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (index, byte) in bytes.iter().copied().enumerate().skip(start) {
+        match byte {
+            b'\'' | b'"' => match quote {
+                Some(active) if active == byte => quote = None,
+                None => quote = Some(byte),
+                Some(_) => {}
+            },
+            _ if quote.is_none() && byte == needle => return Some(index),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_roxmltree_projection<'a>(
@@ -2157,33 +2334,44 @@ mod tests {
 
     #[cfg(feature = "xml-backend-xmloxide")]
     #[test]
-    fn parser_backends_agree_on_shared_xml_semantics() {
-        // Differential coverage protects the common backend contract rather
-        // than accepting parser-specific recovery or namespace behavior.
+    fn xmloxide_accepts_the_retained_semantic_projection() {
+        // The retained roxmltree projection owns shared metrics and indexes;
+        // the selected backend adds strict syntax validation without replacing
+        // those semantics with a backend-specific node model.
         let settings = DocumentParseSettings::default();
         let xml =
             r#"<root xmlns:p="urn:test"><p:item ID="target"><![CDATA[value]]></p:item></root>"#;
         let retained = build_roxmltree_cell(xml.to_owned(), settings)
             .expect("roxmltree semantic projection must parse");
         retained.with_dependent(|source, parsed| {
-            let roxmltree = RoxmltreeParser::validate_after_bounded_projection(
-                source,
-                settings,
-                parsed.metrics(),
-                None,
-            )
-            .expect("roxmltree metrics must be available");
-            let xmloxide = XmloxideParser::validate_after_bounded_projection(
+            XmloxideParser::validate_after_bounded_projection(
                 source,
                 settings,
                 parsed.metrics(),
                 None,
             )
             .expect("xmloxide must accept the fixture");
-            assert_eq!(roxmltree.node_count, xmloxide.node_count);
-            assert_eq!(roxmltree.max_depth, xmloxide.max_depth);
             assert!(parsed.indexes.default_ids.contains_key("target"));
         });
+    }
+
+    #[cfg(feature = "xml-backend-xmloxide")]
+    #[test]
+    fn xmloxide_attribute_capacity_is_independent_of_retained_node_limit() {
+        // Retained nodes and per-element attributes are different resources.
+        // A tight node limit must not make the selected backend reject an
+        // otherwise bounded element that the semantic projection accepts.
+        let xml = r#"<root a="1" b="2" c="3"/>"#;
+        let settings = DocumentParseSettings::new(false, 2, xml.len());
+        let options = xmloxide_parse_options(settings);
+
+        assert_eq!(options.max_attributes, u32::MAX);
+        assert_eq!(options.max_attribute_length, usize::MAX);
+        assert_eq!(options.max_text_length, usize::MAX);
+        assert_eq!(options.max_name_length, usize::MAX);
+        assert_eq!(options.max_entity_expansions, u32::MAX);
+        build_cell(xml.to_owned(), settings, None)
+            .expect("attributes must not consume the retained node allowance");
     }
 
     #[test]
@@ -2221,6 +2409,46 @@ mod tests {
             ),
             Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached))
         ));
+    }
+
+    #[test]
+    fn depth_preflight_expands_nested_internal_entity_markup() {
+        // Entity replacement markup contributes real retained element depth.
+        // The streaming guard must reject it before either DOM parser allocates
+        // the expanded tree, including references nested inside replacements.
+        let xml = r#"<!DOCTYPE root [
+            <!ENTITY inner "<b><c/></b>">
+            <!ENTITY deep "<a>&inner;</a>">
+        ]><root>&deep;</root>"#;
+        let settings = DocumentParseSettings::new_with_depth(true, 32, 3, xml.len());
+
+        assert!(matches!(
+            preflight_document_limits(xml, settings),
+            Err(XmlDocumentError::DocumentTooDeep {
+                maximum: 3,
+                actual: 4,
+            })
+        ));
+
+        let exact_settings = DocumentParseSettings::new_with_depth(true, 32, 4, xml.len());
+        preflight_document_limits(xml, exact_settings)
+            .expect("expanded markup at the exact depth boundary must be accepted");
+    }
+
+    #[test]
+    fn entity_preflight_ignores_declarations_inside_dtd_comments() {
+        // Comment text is not a declaration. Treating it as one would let a
+        // harmless reference acquire attacker-controlled phantom markup.
+        let xml = r#"<!DOCTYPE root [
+            <!-- <!ENTITY value "<a><b><c/></b></a>"> -->
+            <!ENTITY value "ok">
+        ]><root>&value;</root>"#;
+        let settings = DocumentParseSettings::new_with_depth(true, 8, 1, xml.len());
+
+        preflight_document_limits(xml, settings)
+            .expect("comment contents must not participate in entity expansion");
+        build_cell(xml.to_owned(), settings, None)
+            .expect("the real declaration contains only character data");
     }
 
     fn nested_document(depth: usize) -> String {

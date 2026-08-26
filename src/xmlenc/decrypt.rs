@@ -17,6 +17,7 @@ use super::types::{MAX_CIPHER_VALUE_BASE64_LEN, XMLENC_NS, validate_ciphertext_f
 use super::{
     DataEncryptionAlgorithm, DecryptedContent, EncryptedData, EncryptedDataType, EncryptedKey,
     KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm, RsaOaepParameters, XmlEncError,
+    map_document_error,
 };
 
 #[cfg(test)]
@@ -607,16 +608,11 @@ fn decrypt_document_with_context(
     context.policy.resources.validate()?;
     validate_encryption_document_len(xml.len(), &context.policy)?;
     let parse_budget = XmlParseWorkBudget::from_resources(&context.policy.resources);
-    let mut document = XmlDocument::parse_with_settings_and_budget(
-        xml.to_owned(),
-        DocumentParseSettings::from_policy(&context.policy.xml, &context.policy.resources),
-        &parse_budget,
-    )
-    .map_err(|error| match error {
-        crate::document::XmlDocumentError::Policy(error) => XmlEncError::Policy(error),
-        crate::document::XmlDocumentError::Parse(error) => XmlEncError::XmlParse(error),
-        error => XmlEncError::Document(error),
-    })?;
+    let settings =
+        DocumentParseSettings::from_policy(&context.policy.xml, &context.policy.resources);
+    let mut document =
+        XmlDocument::parse_with_settings_and_budget(xml.to_owned(), settings, &parse_budget)
+            .map_err(|error| map_document_error(error, settings))?;
     decrypt_owned_document_with_context(&mut document, selector, context, &parse_budget)?;
     Ok(document.into_xml())
 }
@@ -685,35 +681,16 @@ fn decrypt_owned_document_with_context(
         match encrypted.encrypted_type.as_ref() {
             Some(EncryptedDataType::Element) => document
                 .replace_element_with_budget(target, &plaintext, settings, parse_budget)
-                .map_err(|error| map_document_mutation_error(error, settings))?,
+                .map_err(|error| map_document_error(error, settings))?,
             Some(EncryptedDataType::Content) => document
                 .replace_node_with_fragment_with_budget(target, &plaintext, settings, parse_budget)
-                .map_err(|error| map_document_mutation_error(error, settings))?,
+                .map_err(|error| map_document_error(error, settings))?,
             Some(EncryptedDataType::Other(_)) | None => {
                 return Err(XmlEncError::ReplacementRequiresXml);
             }
         }
         Ok(())
     })
-}
-
-fn map_document_mutation_error(
-    error: crate::document::XmlDocumentError,
-    settings: DocumentParseSettings,
-) -> XmlEncError {
-    match error.into_policy_violation(settings) {
-        Ok(error) => XmlEncError::Policy(error),
-        Err(crate::document::XmlDocumentError::Parse(error)) => XmlEncError::XmlParse(error),
-        Err(crate::document::XmlDocumentError::ProjectedNodeLimit { maximum }) => {
-            crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::XML_NODES,
-                maximum,
-                actual: maximum.saturating_add(1),
-            }
-            .into()
-        }
-        Err(error) => XmlEncError::Document(error),
-    }
 }
 
 fn validate_encryption_document_len(
@@ -3771,7 +3748,13 @@ mod tests {
             DecryptContext::new(&SymmetricKeyDecryptor::new(key))
                 .policy(node_policy)
                 .decrypt_document(&document, None),
-            Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_NODES,
+                    maximum: 3,
+                    actual: 4,
+                }
+            ))
         ));
     }
 
@@ -3794,8 +3777,9 @@ mod tests {
             DecryptContext::new(&resolver)
                 .policy(policy.clone())
                 .decrypt_document(xml, None),
-            Err(XmlEncError::Document(
-                crate::document::XmlDocumentError::DocumentTooDeep {
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
                     maximum: 2,
                     actual: 3,
                 }
