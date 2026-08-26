@@ -10,7 +10,10 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use quick_xml::{Reader as QuickXmlReader, events::Event as QuickXmlEvent};
+use quick_xml::{
+    Reader as QuickXmlReader,
+    events::{BytesStart as QuickXmlBytesStart, Event as QuickXmlEvent},
+};
 use roxmltree::{Document, Node, NodeId, ParsingOptions};
 use self_cell::self_cell;
 
@@ -1919,10 +1922,18 @@ fn preflight_xml_fragment(
         Entity(String),
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FragmentContext {
+        Content,
+        Attribute,
+    }
+
     struct FragmentFrame {
         source: FragmentSource,
         offset: usize,
         collect_doctype: bool,
+        context: FragmentContext,
+        pending_attribute_references: Vec<String>,
     }
 
     enum PreflightEvent {
@@ -1931,9 +1942,11 @@ fn preflight_xml_fragment(
             name: Option<String>,
             is_character_reference: bool,
         },
-        CharacterData,
-        Start,
-        Empty,
+        CharacterData {
+            xml_whitespace: bool,
+        },
+        Start(Vec<String>),
+        Empty(Vec<String>),
         End,
         Node,
         Other,
@@ -1948,53 +1961,86 @@ fn preflight_xml_fragment(
         source: FragmentSource::Document,
         offset: 0,
         collect_doctype,
+        context: FragmentContext::Content,
+        pending_attribute_references: Vec::new(),
     }];
     // Syntax diagnostics and exact parser precedence belong to the selected
     // DOM pipeline; this pass stops at malformed syntax after bounding its prefix.
     while !fragments.is_empty() {
-        let (event, collect_doctype) = {
+        let (event, collect_doctype, context) = {
             let frame = fragments.last_mut().expect("fragment stack is not empty");
-            let source = match &frame.source {
-                FragmentSource::Document => xml,
-                FragmentSource::Entity(name) => entities
-                    .get(name)
-                    .expect("active entity replacement remains registered"),
-            };
-            let remaining = &source[frame.offset..];
-            let mut reader = QuickXmlReader::from_str(remaining);
-            // This pass observes lexical events one at a time and deliberately
-            // leaves structural diagnostics to the selected DOM parser.
-            reader.config_mut().check_end_names = false;
-            let event = match reader.read_event() {
-                Ok(QuickXmlEvent::DocType(doctype)) => {
-                    PreflightEvent::DocType(doctype.decode().ok().map(|value| value.into_owned()))
-                }
-                Ok(QuickXmlEvent::GeneralRef(reference)) => {
-                    let name = reference.decode().ok().map(|value| value.into_owned());
-                    let is_character_reference =
-                        reference.resolve_char_ref().ok().flatten().is_some()
-                            || name.as_deref().is_some_and(|name| {
-                                matches!(name, "amp" | "apos" | "gt" | "lt" | "quot")
-                            });
+            if let Some(name) = frame.pending_attribute_references.pop() {
+                (
                     PreflightEvent::GeneralRef {
-                        name,
-                        is_character_reference,
+                        name: Some(name),
+                        is_character_reference: false,
+                    },
+                    false,
+                    FragmentContext::Attribute,
+                )
+            } else {
+                let source = match &frame.source {
+                    FragmentSource::Document => xml,
+                    FragmentSource::Entity(name) => entities
+                        .get(name)
+                        .expect("active entity replacement remains registered"),
+                };
+                let remaining = &source[frame.offset..];
+                let mut reader = QuickXmlReader::from_str(remaining);
+                // This pass observes lexical events one at a time and deliberately
+                // leaves structural diagnostics to the selected DOM parser.
+                reader.config_mut().check_end_names = false;
+                let event = match reader.read_event() {
+                    Ok(QuickXmlEvent::DocType(doctype)) => PreflightEvent::DocType(
+                        doctype.decode().ok().map(|value| value.into_owned()),
+                    ),
+                    Ok(QuickXmlEvent::GeneralRef(reference)) => {
+                        let name = reference.decode().ok().map(|value| value.into_owned());
+                        let is_character_reference =
+                            reference.resolve_char_ref().ok().flatten().is_some()
+                                || name.as_deref().is_some_and(|name| {
+                                    matches!(name, "amp" | "apos" | "gt" | "lt" | "quot")
+                                });
+                        PreflightEvent::GeneralRef {
+                            name,
+                            is_character_reference,
+                        }
                     }
-                }
-                Ok(QuickXmlEvent::Text(_) | QuickXmlEvent::CData(_)) => {
-                    PreflightEvent::CharacterData
-                }
-                Ok(QuickXmlEvent::Start(_)) => PreflightEvent::Start,
-                Ok(QuickXmlEvent::Empty(_)) => PreflightEvent::Empty,
-                Ok(QuickXmlEvent::End(_)) => PreflightEvent::End,
-                Ok(QuickXmlEvent::Comment(_) | QuickXmlEvent::PI(_)) => PreflightEvent::Node,
-                Ok(QuickXmlEvent::Eof) | Err(_) => PreflightEvent::Done,
-                Ok(_) => PreflightEvent::Other,
-            };
-            frame.offset = frame.offset.saturating_add(
-                usize::try_from(reader.buffer_position()).unwrap_or(remaining.len()),
-            );
-            (event, frame.collect_doctype)
+                    Ok(QuickXmlEvent::Text(text)) => PreflightEvent::CharacterData {
+                        xml_whitespace: text
+                            .as_ref()
+                            .iter()
+                            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n')),
+                    },
+                    Ok(QuickXmlEvent::CData(_)) => PreflightEvent::CharacterData {
+                        xml_whitespace: false,
+                    },
+                    Ok(QuickXmlEvent::Start(element)) => {
+                        let references = if frame.context == FragmentContext::Content {
+                            attribute_general_references(&element)
+                        } else {
+                            Vec::new()
+                        };
+                        PreflightEvent::Start(references)
+                    }
+                    Ok(QuickXmlEvent::Empty(element)) => {
+                        let references = if frame.context == FragmentContext::Content {
+                            attribute_general_references(&element)
+                        } else {
+                            Vec::new()
+                        };
+                        PreflightEvent::Empty(references)
+                    }
+                    Ok(QuickXmlEvent::End(_)) => PreflightEvent::End,
+                    Ok(QuickXmlEvent::Comment(_) | QuickXmlEvent::PI(_)) => PreflightEvent::Node,
+                    Ok(QuickXmlEvent::Eof) | Err(_) => PreflightEvent::Done,
+                    Ok(_) => PreflightEvent::Other,
+                };
+                frame.offset = frame.offset.saturating_add(
+                    usize::try_from(reader.buffer_position()).unwrap_or(remaining.len()),
+                );
+                (event, frame.collect_doctype, frame.context)
+            }
         };
 
         match event {
@@ -2016,7 +2062,9 @@ fn preflight_xml_fragment(
                     continue;
                 };
                 if is_character_reference {
-                    observe_preflight_node(state, settings, true)?;
+                    if context == FragmentContext::Content {
+                        observe_preflight_node(state, settings, true)?;
+                    }
                     continue;
                 }
                 if expansion_stack.insert(name.clone()) {
@@ -2026,6 +2074,8 @@ fn preflight_xml_fragment(
                             source: FragmentSource::Entity(name),
                             offset: 0,
                             collect_doctype: false,
+                            context,
+                            pending_attribute_references: Vec::new(),
                         });
                     } else {
                         expansion_stack.remove(&name);
@@ -2040,7 +2090,14 @@ fn preflight_xml_fragment(
                 }
                 continue;
             }
-            PreflightEvent::CharacterData => {
+            PreflightEvent::CharacterData { xml_whitespace } => {
+                if context == FragmentContext::Attribute {
+                    continue;
+                }
+                if state.depth == 0 && xml_whitespace {
+                    state.in_character_data = false;
+                    continue;
+                }
                 let starts_semantic_node = !state.in_character_data;
                 state.in_character_data = true;
                 if starts_semantic_node {
@@ -2057,12 +2114,21 @@ fn preflight_xml_fragment(
                 state.in_character_data = false;
                 continue;
             }
-            PreflightEvent::Start | PreflightEvent::Empty | PreflightEvent::End => {}
+            PreflightEvent::Start(_) | PreflightEvent::Empty(_) | PreflightEvent::End => {}
         }
 
+        if context == FragmentContext::Attribute {
+            continue;
+        }
         state.in_character_data = false;
         match event {
-            PreflightEvent::Start => {
+            PreflightEvent::Start(mut attribute_references) => {
+                attribute_references.reverse();
+                fragments
+                    .last_mut()
+                    .expect("active element frame remains registered")
+                    .pending_attribute_references
+                    .extend(attribute_references);
                 observe_preflight_node(state, settings, false)?;
                 state.depth = state.depth.saturating_add(1);
                 if state.depth > settings.depth_limit {
@@ -2072,7 +2138,13 @@ fn preflight_xml_fragment(
                     });
                 }
             }
-            PreflightEvent::Empty => {
+            PreflightEvent::Empty(mut attribute_references) => {
+                attribute_references.reverse();
+                fragments
+                    .last_mut()
+                    .expect("active element frame remains registered")
+                    .pending_attribute_references
+                    .extend(attribute_references);
                 observe_preflight_node(state, settings, false)?;
                 let actual = state.depth.saturating_add(1);
                 if actual > settings.depth_limit {
@@ -2087,6 +2159,30 @@ fn preflight_xml_fragment(
         }
     }
     Ok(())
+}
+
+fn attribute_general_references(element: &QuickXmlBytesStart<'_>) -> Vec<String> {
+    let mut references = Vec::new();
+    for attribute in element.attributes().flatten() {
+        let value = attribute.value.as_ref();
+        let mut offset = 0;
+        while let Some(relative_start) = value[offset..].iter().position(|byte| *byte == b'&') {
+            let start = offset + relative_start + 1;
+            let Some(relative_end) = value[start..].iter().position(|byte| *byte == b';') else {
+                break;
+            };
+            let end = start + relative_end;
+            let name = &value[start..end];
+            if !name.starts_with(b"#")
+                && !matches!(name, b"amp" | b"apos" | b"gt" | b"lt" | b"quot")
+                && let Ok(name) = std::str::from_utf8(name)
+            {
+                references.push(name.to_owned());
+            }
+            offset = end + 1;
+        }
+    }
+    references
 }
 
 fn charge_entity_expansion_work(
@@ -2532,6 +2628,17 @@ mod tests {
     }
 
     #[test]
+    fn node_preflight_excludes_document_boundary_whitespace() {
+        // XML Misc whitespace outside the document element is not retained as
+        // a roxmltree text node and must not consume semantic-node policy.
+        let xml = " \n<root/>\n ";
+        let settings = DocumentParseSettings::new(false, 2, xml.len());
+
+        preflight_document_limits(xml, settings, None)
+            .expect("document plus root element must fit the exact node ceiling");
+    }
+
+    #[test]
     fn depth_preflight_expands_nested_internal_entity_markup() {
         // Entity replacement markup contributes real retained element depth.
         // The streaming guard must reject it before either DOM parser allocates
@@ -2572,7 +2679,7 @@ mod tests {
     }
 
     #[test]
-    fn entity_preflight_charges_recursive_replacement_work() {
+    fn entity_preflight_charges_nested_replacement_work() {
         // Repeated nested references must exhaust parser work during the
         // streaming pass, before either DOM parser receives the document.
         let xml = r#"<!DOCTYPE root [
@@ -2593,6 +2700,38 @@ mod tests {
                 actual,
             })) if observed_maximum == maximum
                 && actual == xml.len() + first_replacement + nested_replacement
+        ));
+    }
+
+    #[test]
+    fn entity_preflight_charges_nested_attribute_replacements() {
+        // Attribute values are part of parser expansion work even though their
+        // entity references are contained inside one lexical start-tag event.
+        let xml = r#"<!DOCTYPE root [
+            <!ENTITY a "0123456789">
+            <!ENTITY b "&a;&a;&a;&a;">
+        ]><root value="&b;"/>"#;
+        let first_replacement = "&a;&a;&a;&a;".len();
+        let nested_replacement = "0123456789".len();
+        let expected_work = xml.len() + first_replacement + 4 * nested_replacement;
+        let budget = XmlParseWorkBudget::with_limit(expected_work);
+        let settings = DocumentParseSettings::new_with_depth(true, 8, 1, xml.len());
+
+        preflight_document_limits(xml, settings, Some(&budget))
+            .expect("the exact repeated attribute expansion budget must be accepted");
+        assert_eq!(budget.consumed(), expected_work);
+
+        let maximum = expected_work - 1;
+        let budget = XmlParseWorkBudget::with_limit(maximum);
+
+        assert!(matches!(
+            preflight_document_limits(xml, settings, Some(&budget)),
+            Err(XmlDocumentError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum: observed_maximum,
+                actual,
+            })) if observed_maximum == maximum
+                && actual == expected_work
         ));
     }
 

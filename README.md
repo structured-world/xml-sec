@@ -54,7 +54,7 @@ xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c
 Select `xml-backend-roxmltree` instead to omit the xmloxide validation pass and use the retained
 roxmltree projection directly. Backend selection is compile-time only: document content and runtime
 policy cannot switch it. Both paths reject byte, node, and depth limits in the streaming preflight
-before building either DOM; recursive internal-entity traversal consumes the same cumulative parse
+before building either DOM; stack-safe internal-entity traversal consumes the same cumulative parse
 work budget. Both retain the original source bytes and use the same semantic view, policy snapshot,
 C14N, XPath, signature, encryption, and mutation pipelines.
 
