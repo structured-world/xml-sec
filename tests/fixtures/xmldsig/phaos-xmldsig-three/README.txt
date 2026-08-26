@@ -59,14 +59,14 @@ Contents of phaos-xmldsig-three
 
 	signature-hmac-sha1-40-c14n-comments-detached.xml
 	-------------------------------------------------
-	Contains a detached 40-byte SHA-1 HMAC signature and uses the XML
+	Contains a detached 80-bit SHA-1 HMAC signature and uses the XML
 	Canonicalization With Comments canonicalization method.  The HMAC secret is 
 	the ASCII encoding of the word "test".
 		
 
 	signature-hmac-sha1-40-exclusive-c14n-comments-detached.xml
 	-----------------------------------------------------------
-	Contains a detached 40 byte SHA-1 HMAC signature and uses the Exclusive
+	Contains a detached 80-bit SHA-1 HMAC signature and uses the Exclusive
 	XML Canonicalization With Comments canonicalization method.  The HMAC secret 
 	is the ASCII encoding of the word "test".
 

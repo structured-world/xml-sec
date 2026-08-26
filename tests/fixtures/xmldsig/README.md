@@ -91,11 +91,12 @@ certificate paths remain explicit fail-closed classifications until those
 capabilities are implemented; corpus accounting therefore does not imply
 blanket algorithm support.
 
-The historical `-40-` filenames contain 80-bit HMAC values. The artifacts are
-kept byte-for-byte rather than renamed, and the case configuration follows the
-encoded `HMACOutputLength`. The upstream corpus also lacks a separately named
-expired-certificate signature, so expiry coverage uses the original Phaos leaf
-and CA at a fixed modern verification time without modifying donor data.
+The historical `-40-` filenames contain 80-bit HMAC values. Executable donor
+artifacts are kept byte-for-byte rather than renamed, and the case configuration
+follows the encoded `HMACOutputLength`; the importer corrects only the matching
+unit error in the upstream README. The upstream corpus also lacks a separately
+named expired-certificate signature, so expiry coverage uses the original Phaos
+leaf and CA at a fixed modern verification time without modifying donor data.
 
 ## Test Contract
 

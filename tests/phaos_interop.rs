@@ -30,7 +30,7 @@ enum Setup {
 
 #[derive(Clone, Copy, Debug)]
 enum Expected {
-    Valid,
+    Valid { manifest_references: usize },
     ValidWithManifestFailure,
     BadDigest,
     UnsupportedSignature(&'static str),
@@ -55,22 +55,30 @@ const CASES: &[Case] = &[
     Case {
         name: "signature-dsa-detached.xml",
         setup: Setup::Dsa,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 0,
+        },
     },
     Case {
         name: "signature-dsa-enveloped.xml",
         setup: Setup::Dsa,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 0,
+        },
     },
     Case {
         name: "signature-dsa-enveloping.xml",
         setup: Setup::Dsa,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 0,
+        },
     },
     Case {
         name: "signature-dsa-manifest.xml",
         setup: Setup::Dsa,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 2,
+        },
     },
     Case {
         name: "signature-hmac-md5-c14n-enveloping.xml",
@@ -80,32 +88,44 @@ const CASES: &[Case] = &[
     Case {
         name: "signature-hmac-sha1-40-c14n-comments-detached.xml",
         setup: Setup::Hmac80,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 0,
+        },
     },
     Case {
         name: "signature-hmac-sha1-40-exclusive-c14n-comments-detached.xml",
         setup: Setup::Hmac80,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 0,
+        },
     },
     Case {
         name: "signature-hmac-sha1-exclusive-c14n-comments-detached.xml",
         setup: Setup::Hmac,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 0,
+        },
     },
     Case {
         name: "signature-hmac-sha1-exclusive-c14n-enveloped.xml",
         setup: Setup::Hmac,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 0,
+        },
     },
     Case {
         name: "signature-rsa-detached-b64-transform.xml",
         setup: Setup::Rsa,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 1,
+        },
     },
     Case {
         name: "signature-rsa-detached-xpath-transform.xml",
         setup: Setup::Rsa,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 1,
+        },
     },
     Case {
         name: "signature-rsa-detached-xslt-transform-bad-retrieval-method.xml",
@@ -125,7 +145,9 @@ const CASES: &[Case] = &[
     Case {
         name: "signature-rsa-detached.xml",
         setup: Setup::Rsa,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 0,
+        },
     },
     Case {
         name: "signature-rsa-enveloped-bad-digest-val.xml",
@@ -140,12 +162,16 @@ const CASES: &[Case] = &[
     Case {
         name: "signature-rsa-enveloped.xml",
         setup: Setup::Rsa,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 0,
+        },
     },
     Case {
         name: "signature-rsa-enveloping.xml",
         setup: Setup::Rsa,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 0,
+        },
     },
     Case {
         name: "signature-rsa-manifest-x509-data-cert-chain.xml",
@@ -175,12 +201,16 @@ const CASES: &[Case] = &[
     Case {
         name: "signature-rsa-manifest.xml",
         setup: Setup::Rsa,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 2,
+        },
     },
     Case {
         name: "signature-rsa-xpath-transform-enveloped.xml",
         setup: Setup::Rsa,
-        expected: Expected::Valid,
+        expected: Expected::Valid {
+            manifest_references: 0,
+        },
     },
     Case {
         name: "signature-rsa-~x509-data-crl.xml",
@@ -332,7 +362,19 @@ fn check_expected(
     result: Result<xml_sec::xmldsig::VerifyResult, DsigError>,
 ) -> Result<(), String> {
     let matches = match (case.expected, &result) {
-        (Expected::Valid, Ok(result)) => result.status == DsigStatus::Valid,
+        (
+            Expected::Valid {
+                manifest_references,
+            },
+            Ok(result),
+        ) => {
+            result.status == DsigStatus::Valid
+                && result.manifest_references.len() == manifest_references
+                && result
+                    .manifest_references
+                    .iter()
+                    .all(|reference| reference.status == DsigStatus::Valid)
+        }
         (Expected::ValidWithManifestFailure, Ok(result)) => {
             result.status == DsigStatus::Valid
                 && result.manifest_references.len() == 1

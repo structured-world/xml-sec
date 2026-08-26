@@ -38,7 +38,7 @@ replace_target() {
 normalize_imported_snapshot() {
   local relative_path="$1"
   local staging="$2"
-  local donor
+  local donor normalized readme
 
   if [[ "$relative_path" == "xmldsig/merlin-xmldsig-twenty-three" ]]; then
     # The donor README contains unresolved placeholders and is not executable
@@ -67,6 +67,24 @@ normalize_imported_snapshot() {
         return 1
       fi
     done
+  elif [[ "$relative_path" == "xmldsig/phaos-xmldsig-three" ]]; then
+    # The historical filenames are retained, but the donor README incorrectly
+    # labels their HMACOutputLength=80 values as 40-byte signatures.
+    readme="$staging/README.txt"
+    if [[ "$(grep -c 'detached 40-byte SHA-1 HMAC signature' "$readme")" -ne 1 \
+      || "$(grep -c 'detached 40 byte SHA-1 HMAC signature' "$readme")" -ne 1 ]]; then
+      printf 'Phaos README HMAC descriptions changed; update normalization\n' >&2
+      return 1
+    fi
+    normalized="$staging/.README.txt.normalized"
+    if ! sed \
+      -e 's/detached 40-byte SHA-1 HMAC signature/detached 80-bit SHA-1 HMAC signature/' \
+      -e 's/detached 40 byte SHA-1 HMAC signature/detached 80-bit SHA-1 HMAC signature/' \
+      "$readme" > "$normalized" \
+      || ! mv "$normalized" "$readme"; then
+      rm -f "$normalized"
+      return 1
+    fi
   fi
 }
 

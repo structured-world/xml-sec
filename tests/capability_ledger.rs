@@ -776,11 +776,17 @@ fn phaos_xmldsig_family_is_exhaustively_classified() {
     // The family claim remains honest while the dedicated integration suite
     // accounts for every vector and exposes unsupported dependencies exactly.
     let ledger = ledger();
-    let family = ledger
+    let families: Vec<_> = ledger
         .items
         .iter()
-        .find(|item| item.kind == "test-family" && item.name == "phaos-xmldsig-three")
-        .expect("Phaos XMLDSig family must remain in the upstream inventory");
+        .filter(|item| item.kind == "test-family" && item.name == "phaos-xmldsig-three")
+        .collect();
+    assert_eq!(
+        families.len(),
+        1,
+        "Phaos XMLDSig family must appear exactly once in the upstream inventory"
+    );
+    let family = families[0];
     let classification = classification(&ledger, family);
     assert_eq!(family.classification, "phaos-xmldsig-exhaustive");
     assert_eq!(classification.outcome, "planned");

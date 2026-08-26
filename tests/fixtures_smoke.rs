@@ -228,6 +228,32 @@ fn merlin_xmldsig_snapshot_normalizes_non_fixture_donor_artifacts() {
     assert!(fixture.contains("<HMACOutputLength>80</HMACOutputLength>"));
 }
 
+#[test]
+fn phaos_xmldsig_snapshot_corrects_hmac_units_in_donor_metadata() {
+    // The historical `-40` filenames remain intact, but both documents encode
+    // an 80-bit output and the imported README must describe that unit exactly.
+    let dir = fixtures_dir().join("xmldsig/phaos-xmldsig-three");
+    let readme = fs::read_to_string(dir.join("README.txt"))
+        .expect("normalized Phaos README must be readable");
+    assert_eq!(
+        readme
+            .matches("detached 80-bit SHA-1 HMAC signature")
+            .count(),
+        2
+    );
+    assert!(!readme.contains("detached 40-byte SHA-1 HMAC signature"));
+    assert!(!readme.contains("detached 40 byte SHA-1 HMAC signature"));
+
+    for fixture in [
+        "signature-hmac-sha1-40-c14n-comments-detached.xml",
+        "signature-hmac-sha1-40-exclusive-c14n-comments-detached.xml",
+    ] {
+        let xml = fs::read_to_string(dir.join(fixture))
+            .unwrap_or_else(|error| panic!("read Phaos fixture {fixture}: {error}"));
+        assert!(xml.contains("<dsig:HMACOutputLength>80</dsig:HMACOutputLength>"));
+    }
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Assert that a file exists and contains the expected PEM header marker.
