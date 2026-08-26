@@ -878,12 +878,12 @@ impl<'a> SignContext<'a> {
             DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
             budgets.transforms.xml_parse_work(),
         )
-        .map_err(|error| match error {
-            XmlDocumentError::Policy(error) => SigningError::Policy(error),
-            XmlDocumentError::Parse(error) => {
+        .map_err(|error| match owned_document_policy_violation(error) {
+            Ok(error) => SigningError::Policy(error),
+            Err(XmlDocumentError::Parse(error)) => {
                 SigningError::Digest(SigningDigestError::XmlParse(error))
             }
-            error => SigningError::Document(error),
+            Err(error) => SigningError::Document(error),
         })?;
         self.validate_owned_document_input(&document)?;
         self.sign_document_in_place(&mut document, &mut budgets)?;
@@ -1078,12 +1078,12 @@ impl<'a> SignContext<'a> {
             DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
             budgets.transforms.xml_parse_work(),
         )
-        .map_err(|error| match error {
-            XmlDocumentError::Policy(error) => SigningError::Policy(error),
-            XmlDocumentError::Parse(error) => {
+        .map_err(|error| match owned_document_policy_violation(error) {
+            Ok(error) => SigningError::Policy(error),
+            Err(XmlDocumentError::Parse(error)) => {
                 SigningError::XmlMutation(XmlMutationError::XmlParse(error))
             }
-            error => SigningError::Document(error),
+            Err(error) => SigningError::Document(error),
         })?;
         self.validate_owned_document_input(&document)?;
         self.sign_document_with_builder_in_place(&mut document, builder, &mut budgets)?;
@@ -1211,6 +1211,13 @@ fn owned_document_policy_violation(
         XmlDocumentError::DocumentTooLarge { maximum, actual } => {
             Ok(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_DOCUMENT,
+                maximum,
+                actual,
+            })
+        }
+        XmlDocumentError::DocumentTooDeep { maximum, actual } => {
+            Ok(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DEPTH,
                 maximum,
                 actual,
             })
@@ -2360,11 +2367,40 @@ mod error_conversion_tests {
             SignContext::new(&RejectingSigningKey)
                 .policy(policy)
                 .sign_template(xml),
-            Err(SigningError::Document(XmlDocumentError::DocumentTooDeep {
+            Err(SigningError::Policy(PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DEPTH,
                 maximum: 2,
                 actual: 3,
             }))
         ));
+    }
+
+    #[test]
+    fn builder_append_reports_policy_depth() {
+        // The generated template fits as a standalone tree, but its methods
+        // cross the same depth policy after the Signature is appended.
+        let mut policy = crate::policy::SigningPolicy::default();
+        policy.resources.max_xml_depth = 4;
+        let builder = SignatureBuilder::new(
+            crate::c14n::C14nAlgorithm::new(crate::c14n::C14nMode::Exclusive1_0, false),
+            SignatureAlgorithm::RsaSha256,
+        )
+        .add_reference(crate::xmldsig::ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(""));
+
+        let result = SignContext::new(&FixedRsaSigningKey)
+            .policy(policy)
+            .sign_with_builder("<root/>", &builder);
+        assert!(
+            matches!(
+                result,
+                Err(SigningError::Policy(PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
+                    maximum: 4,
+                    actual: 5,
+                }))
+            ),
+            "unexpected builder depth result: {result:?}"
+        );
     }
 
     #[test]

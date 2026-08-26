@@ -149,7 +149,8 @@ backend allocates a DOM, then rechecked on every staged copy, adapter parse, and
 `ResourcePolicy::max_xml_parse_work_bytes` separately bounds cumulative parser work across the
 whole operation. Initial parsing, generated-template validation, binary-to-node-set adapters,
 staged copies, digest dependency levels, Manifest recursion, and committed generations all charge
-the same monotonic allowance; failed parses do not restore it.
+the same monotonic allowance. Recursive internal-entity replacement traversal is charged before a
+DOM parser runs; failed parses do not restore the allowance.
 Configured chain depth and candidate-path limits are validated after resolver defaults compose with
 the operation policy. Candidate-path accounting includes every generated partial path, and
 self-issued rollover certificates continue toward a distinct same-name issuer when its signature

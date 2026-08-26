@@ -630,9 +630,10 @@ impl XmlDocument {
                 actual: xml.len(),
             });
         }
+        preflight_document_limits(&xml, settings, budget)?;
         #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
         let requires_internal_dtd = document_requires_internal_dtd(&xml, settings, budget)?;
-        let cell = build_cell(xml, settings, budget)?;
+        let cell = build_cell_after_preflight(xml, settings, budget)?;
         let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
         Ok(Self {
             identity,
@@ -1816,10 +1817,15 @@ fn build_cell(
             actual: xml.len(),
         });
     }
-    // A non-allocating event preflight protects both DOM implementations:
-    // roxmltree has no depth option and xmloxide 0.5 has no aggregate node option.
-    charge_parse_work(budget, xml.len())?;
-    preflight_document_limits(&xml, settings)?;
+    preflight_document_limits(&xml, settings, budget)?;
+    build_cell_after_preflight(xml, settings, budget)
+}
+
+fn build_cell_after_preflight(
+    xml: String,
+    settings: DocumentParseSettings,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<DocumentCell, XmlDocumentError> {
     charge_parse_work(budget, xml.len())?;
     let cell = build_roxmltree_cell(xml, settings)?;
     cell.with_dependent(|source, parsed| {
@@ -1861,8 +1867,7 @@ pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
             actual: xml.len(),
         });
     }
-    charge_parse_work(budget, xml.len())?;
-    preflight_document_limits(xml, settings)?;
+    preflight_document_limits(xml, settings, budget)?;
     charge_parse_work(budget, xml.len())?;
     let (document, metrics) = parse_roxmltree_projection(xml, settings)?;
     SelectedXmlParser::validate_after_bounded_projection(xml, settings, metrics, budget)?;
@@ -1872,7 +1877,11 @@ pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
 fn preflight_document_limits(
     xml: &str,
     settings: DocumentParseSettings,
+    budget: Option<&XmlParseWorkBudget>,
 ) -> Result<(), XmlDocumentError> {
+    // This allocation-free pass is the first parser stage for every entry
+    // point, before either backend is allowed to construct a DOM.
+    charge_parse_work(budget, xml.len())?;
     let mut entities = HashMap::new();
     let mut expansion_stack = HashSet::new();
     let mut state = DocumentPreflightState::default();
@@ -1882,6 +1891,7 @@ fn preflight_document_limits(
         &mut entities,
         &mut expansion_stack,
         &mut state,
+        budget,
         true,
     )
 }
@@ -1891,6 +1901,8 @@ struct DocumentPreflightState {
     depth: usize,
     nodes: u32,
     in_character_data: bool,
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    entity_expansion_work: usize,
 }
 
 fn preflight_xml_fragment(
@@ -1899,6 +1911,7 @@ fn preflight_xml_fragment(
     entities: &mut HashMap<String, String>,
     expansion_stack: &mut HashSet<String>,
     state: &mut DocumentPreflightState,
+    budget: Option<&XmlParseWorkBudget>,
     collect_doctype: bool,
 ) -> Result<(), XmlDocumentError> {
     let mut reader = QuickXmlReader::from_str(xml);
@@ -1933,12 +1946,14 @@ fn preflight_xml_fragment(
             let name = name.into_owned();
             if expansion_stack.insert(name.clone()) {
                 if let Some(replacement) = entities.remove(&name) {
+                    charge_entity_expansion_work(state, budget, replacement.len())?;
                     let result = preflight_xml_fragment(
                         &replacement,
                         settings,
                         entities,
                         expansion_stack,
                         state,
+                        budget,
                         false,
                     );
                     entities.insert(name.clone(), replacement);
@@ -1991,6 +2006,31 @@ fn preflight_xml_fragment(
             _ => {}
         }
     }
+    Ok(())
+}
+
+fn charge_entity_expansion_work(
+    state: &mut DocumentPreflightState,
+    budget: Option<&XmlParseWorkBudget>,
+    bytes: usize,
+) -> Result<(), XmlDocumentError> {
+    charge_parse_work(budget, bytes)?;
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    if budget.is_none() {
+        let actual = state.entity_expansion_work.saturating_add(bytes);
+        let maximum = crate::hard_limits::XML_PARSE_WORK_BYTE_CEILING;
+        if actual > maximum {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum,
+                actual,
+            }
+            .into());
+        }
+        state.entity_expansion_work = actual;
+    }
+    #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+    let _ = state;
     Ok(())
 }
 
@@ -2423,7 +2463,7 @@ mod tests {
         let settings = DocumentParseSettings::new_with_depth(true, 32, 3, xml.len());
 
         assert!(matches!(
-            preflight_document_limits(xml, settings),
+            preflight_document_limits(xml, settings, None),
             Err(XmlDocumentError::DocumentTooDeep {
                 maximum: 3,
                 actual: 4,
@@ -2431,7 +2471,7 @@ mod tests {
         ));
 
         let exact_settings = DocumentParseSettings::new_with_depth(true, 32, 4, xml.len());
-        preflight_document_limits(xml, exact_settings)
+        preflight_document_limits(xml, exact_settings, None)
             .expect("expanded markup at the exact depth boundary must be accepted");
     }
 
@@ -2445,10 +2485,56 @@ mod tests {
         ]><root>&value;</root>"#;
         let settings = DocumentParseSettings::new_with_depth(true, 8, 1, xml.len());
 
-        preflight_document_limits(xml, settings)
+        preflight_document_limits(xml, settings, None)
             .expect("comment contents must not participate in entity expansion");
         build_cell(xml.to_owned(), settings, None)
             .expect("the real declaration contains only character data");
+    }
+
+    #[test]
+    fn entity_preflight_charges_recursive_replacement_work() {
+        // Repeated nested references must exhaust parser work during the
+        // streaming pass, before either DOM parser receives the document.
+        let xml = r#"<!DOCTYPE root [
+            <!ENTITY a "0123456789">
+            <!ENTITY b "&a;&a;&a;&a;">
+        ]><root>&b;</root>"#;
+        let first_replacement = "&a;&a;&a;&a;".len();
+        let nested_replacement = "0123456789".len();
+        let maximum = xml.len() + first_replacement + nested_replacement - 1;
+        let budget = XmlParseWorkBudget::with_limit(maximum);
+        let settings = DocumentParseSettings::new_with_depth(true, 32, 4, xml.len());
+
+        assert!(matches!(
+            build_cell(xml.to_owned(), settings, Some(&budget)),
+            Err(XmlDocumentError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum: observed_maximum,
+                actual,
+            })) if observed_maximum == maximum
+                && actual == xml.len() + first_replacement + nested_replacement
+        ));
+    }
+
+    #[test]
+    fn owned_parse_preflights_depth_before_dtd_provenance() {
+        // Enabling internal DTD syntax must not move the provenance probe ahead
+        // of the allocation-free depth boundary for an ordinary document.
+        let xml = "<root><child><leaf/></child></root>";
+        let settings = DocumentParseSettings::new_with_depth(true, 16, 2, xml.len());
+        let budget = XmlParseWorkBudget::with_limit(xml.len());
+
+        assert!(matches!(
+            XmlDocument::parse_with_settings_and_optional_budget(
+                xml.to_owned(),
+                settings,
+                Some(&budget),
+            ),
+            Err(XmlDocumentError::DocumentTooDeep {
+                maximum: 2,
+                actual: 3,
+            })
+        ));
     }
 
     fn nested_document(depth: usize) -> String {
