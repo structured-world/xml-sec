@@ -1212,38 +1212,39 @@ fn projected_signature_output_len(
 }
 
 fn map_owned_document_mutation_error(error: XmlDocumentError) -> SigningError {
-    match error {
-        XmlDocumentError::Policy(error) => SigningError::Policy(error),
-        XmlDocumentError::ProjectedNodeLimit { maximum } => {
-            crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::XML_NODES,
-                maximum,
-                actual: maximum.saturating_add(1),
-            }
-            .into()
-        }
-        error => SigningError::Document(error),
+    match owned_document_policy_violation(error) {
+        Ok(error) => SigningError::Policy(error),
+        Err(error) => SigningError::Document(error),
     }
 }
 
 fn map_owned_document_digest_mutation_error(error: XmlDocumentError) -> SigningDigestError {
+    match owned_document_policy_violation(error) {
+        Ok(error) => SigningDigestError::Policy(error),
+        Err(error) => SigningDigestError::Document(error),
+    }
+}
+
+fn owned_document_policy_violation(
+    error: XmlDocumentError,
+) -> Result<crate::policy::PolicyViolation, XmlDocumentError> {
     match error {
-        XmlDocumentError::Policy(error) => SigningDigestError::Policy(error),
+        XmlDocumentError::Policy(error) => Ok(error),
         XmlDocumentError::DocumentTooLarge { maximum, actual } => {
-            SigningDigestError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+            Ok(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_DOCUMENT,
                 maximum,
                 actual,
             })
         }
         XmlDocumentError::ProjectedNodeLimit { maximum } => {
-            SigningDigestError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+            Ok(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_NODES,
                 maximum,
                 actual: maximum.saturating_add(1),
             })
         }
-        error => SigningDigestError::Document(error),
+        error => Err(error),
     }
 }
 
@@ -2387,6 +2388,58 @@ mod error_conversion_tests {
         ));
         assert_eq!(builder_document.as_xml(), builder_before);
         assert_eq!(builder_document.generation(), 0);
+    }
+
+    #[test]
+    fn dtd_capable_staged_copy_charges_both_parser_passes() {
+        // DTD-capable documents run a provenance parse before the retained
+        // document parse. Both passes belong to the signing operation budget.
+        let xml = "<root/>";
+        let mut parsing_policy = crate::policy::SigningPolicy::default();
+        parsing_policy.xml.allow_internal_dtd = true;
+        let document = XmlDocument::parse_with_policy(xml, &parsing_policy)
+            .expect("the fixture must retain DTD-capable parse settings");
+
+        parsing_policy.resources.max_xml_parse_work_bytes = xml.len();
+        let budget = XmlParseWorkBudget::from_resources(&parsing_policy.resources);
+        assert!(matches!(
+            document.staged_copy_with_budget(&budget),
+            Err(XmlDocumentError::Policy(PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum,
+                actual,
+            })) if maximum == xml.len() && actual == xml.len() * 2
+        ));
+    }
+
+    #[test]
+    fn owned_signing_mappers_preserve_document_size_policy_errors() {
+        // Template and digest mutations share one resource-error contract even
+        // though their surrounding signing error types differ.
+        let maximum = 8;
+        let actual = 9;
+        assert!(matches!(
+            map_owned_document_mutation_error(XmlDocumentError::DocumentTooLarge {
+                maximum,
+                actual,
+            }),
+            SigningError::Policy(PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DOCUMENT,
+                maximum: 8,
+                actual: 9,
+            })
+        ));
+        assert!(matches!(
+            map_owned_document_digest_mutation_error(XmlDocumentError::DocumentTooLarge {
+                maximum,
+                actual,
+            }),
+            SigningDigestError::Policy(PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DOCUMENT,
+                maximum: 8,
+                actual: 9,
+            })
+        ));
     }
 
     #[test]

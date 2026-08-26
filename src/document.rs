@@ -505,8 +505,7 @@ impl XmlDocument {
         &self,
         budget: &XmlParseWorkBudget,
     ) -> Result<Self, XmlDocumentError> {
-        budget.charge(self.as_xml().len())?;
-        Self::parse_with_settings(self.as_xml().to_owned(), self.settings)
+        Self::parse_with_settings_and_budget(self.as_xml().to_owned(), self.settings, budget)
     }
 
     /// Borrow the retained parsed view without reparsing.
