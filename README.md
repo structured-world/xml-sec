@@ -75,6 +75,12 @@ XML parsing work is cumulative per operation: initial input, recursive transform
 adapters, staged mutations, dependency levels, and decryption retries share one
 policy allowance rather than resetting limits inside helpers.
 
+Interoperability evidence is deterministic and offline. The complete Phaos
+XMLDSig 3 signature corpus is executed through the public verification API with
+exact valid, invalid, and fail-closed classifications; the generated
+[compatibility ledger](docs/compatibility-ledger.md) keeps remaining libxmlsec1
+parity work explicit.
+
 ## Native CLI
 
 Inspect the installed binary's runtime capability registry:

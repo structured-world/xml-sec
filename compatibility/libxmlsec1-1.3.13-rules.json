@@ -29,6 +29,10 @@
       "test": "capability_ledger::native_cli_claims_match_process_and_upstream_runner_tests",
       "description": "Process tests cover native command parsing, exit statuses, sign/verify and encrypt/decrypt paths; the unmodified upstream DSig, Enc, and Keys runners exercise the same binary and capability registry."
     },
+    "phaos-xmldsig-tests": {
+      "test": "capability_ledger::phaos_xmldsig_family_is_exhaustively_classified",
+      "description": "The exhaustive Phaos integration suite executes every signature document through the public verification API and asserts exact valid, invalid, or unsupported outcomes without skips."
+    },
     "planned-surface": {
       "test": "capability_ledger::planned_surface_is_never_reported_as_supported",
       "description": "Unimplemented backend APIs, CLI, registry, format, URI, and donor-suite entries remain machine-readable planned work."
@@ -166,6 +170,14 @@
       "outcome": "planned",
       "rationale": "Native Rust key parsing exists, but the libxmlsec1 key-format enum contract is not yet reproduced.",
       "evidence": "planned-surface"
+    },
+    {
+      "id": "phaos-xmldsig-exhaustive",
+      "kinds": ["test-family"],
+      "name_regex": "^phaos-xmldsig-three$",
+      "outcome": "planned",
+      "rationale": "Every signature vector is executable and classified by the native public-pipeline suite; full family parity remains planned until its explicitly reported XSLT, HMAC-MD5, and MD5-signed certificate dependencies are implemented.",
+      "evidence": "phaos-xmldsig-tests"
     },
     {
       "id": "planned-donor-families",

@@ -17,6 +17,13 @@ with P-256/P-384/P-521 verification keys,
 DSA-SHA1 and HMAC-SHA1 verification, embedded X.509 certificates, and configured key
 resolution.
 
+The complete Phaos XMLDSig 3 corpus is checked in for deterministic offline
+interoperability testing. Every signature document is executed through the
+public verification API and must be classified exactly once. Supported vectors
+must verify, invalid vectors must return their exact failure class, and vectors
+that depend on an unavailable capability such as XSLT or HMAC-MD5 must fail at
+an explicit typed boundary rather than being skipped.
+
 ## Examples
 
 `examples/sign.rs` builds an enveloped RSA-SHA256 signature with an embedded X.509
