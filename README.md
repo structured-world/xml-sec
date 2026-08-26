@@ -22,6 +22,7 @@ XML Security in pure Rust, built to replace libxmlsec1.
 - **X.509** — Certificate-based key extraction and validation
 - **Native CLI** — `xmlsec1` command surface backed by the same Rust policy and provider pipelines
 - **Provider-neutral crypto** — typed capabilities and opaque key handles with RustCrypto as the pure-Rust default
+- **Reusable XML documents** — policy-aware retained parsing, stable semantic identities, shared indexes, and generation-safe mutation across C14N, XMLDSig, and XMLEnc
 
 ## Why?
 
@@ -32,53 +33,53 @@ libxml2, a crypto backend, platform packages, and cross-compilation work to ever
 `quick-xml` for writing, RustCrypto for cryptography, and `x509-parser` for certificates. One
 Cargo dependency, no system XML or crypto libraries.
 
-## Status
+## Install
 
-**Pre-release.** API is unstable. Not ready for production use.
+Use the library from Rust code:
 
-Currently implemented (core paths):
-- C14N 1.0, C14N 1.1, and Exclusive C14N
-- XMLDSig parsing, same-document URI dereference, enveloped/C14N/Base64/XPath 1.0/XPath Filter 2.0 transform chains, and digest verification
-- XMLDSig full verify pipeline (`SignedInfo` canonicalization + `SignatureValue` verification)
-- XMLDSig template signing pipeline (`DigestValue` fill + `SignedInfo` canonicalization + `SignatureValue` fill), including enveloped SAML Response templates
-- Unified typed verify/sign/encrypt/decrypt policies own algorithms, key-source and X.509 trust rules, URI/transform semantics, Manifest handling, XML parsing, and shared resource budgets. Caller keys, selected targets, and external bytes remain request context; resolver or per-call options cannot override policy.
-- XMLDSig signing KeyInfo writer for embedded X.509 certificates
-- Built-in verification-key resolution from embedded X.509/DER/`KeyValue` sources and configured `KeyName`, X.509 subject, issuer/serial, SKI, or digest selectors
-- RSA PKCS#1 v1.5 verification helpers for SHA-1 / SHA-256 / SHA-384 / SHA-512
-- ECDSA SHA-256/SHA-384 verification for P-256, P-384, and P-521 keys
-- Legacy DSA-SHA1 and HMAC-SHA1 verification, including truncated HMAC output
-- RSA PKCS#1 v1.5 and ECDSA SHA-256/SHA-384 signing with P-256/P-384 PKCS#8 keys
-- Opt-in X.509 certificate-chain validation with explicit trust anchors, validity and path-length checks, NameConstraints, authenticated CRLs, typed path-wide ExtendedKeyUsage policy, and RSA-PSS/Ed25519 certificate-signature support. Duplicate certificate, CRL, and CRL-entry extension OIDs, malformed SAN identities, unsupported delta CRLs, `removeFromCRL` entries in complete CRLs, and invalid name constraints are rejected; implemented critical extensions are processed and every other critical extension fails closed.
-- Caller-supplied external references and X.509 `RetrievalMethod` resolution with bounded RFC 3986 `xml:base` processing and no implicit I/O
-- XMLEnc AES-128/256-CBC and AES-128/256-GCM encryption/decryption with direct
-  keys, RSA-OAEP key transport, AES-128/256-KW, multiple recipients, and
-  Element/Content document replacement; document, node, metadata, aggregate
-  recipient, and key-candidate limits plus separate inbound/outbound algorithm
-  policies and outbound RSA key-strength policy cover caller-constructed ciphertext and generated replacement output
-  before expensive work. CBC failures expose no decrypted
-  padding details, but CBC remains unauthenticated and can be excluded by policy
-- Provider-neutral digest, signature, X.509 signature, cipher, key-wrap,
-  key-transport, key-agreement, KDF, and RNG contracts. Capability checks include
-  operation parameters; unavailable mechanisms fail closed without falling back
-  to another provider. RustCrypto implements the currently supported algorithms.
+```sh
+cargo add xml-sec
+```
 
-Still in progress:
-- XMLDSig DSA-SHA256, broader HMAC verification/signing, and RSA-PSS `SignatureMethod` algorithms
-- Complete XMLDSig and XMLEnc conformance-suite classification
-- Expanded fuzz coverage, benchmarks, production hardening, and API stabilization
+Default features provide C14N, XMLDSig, and XMLEnc. Applications that need a
+smaller dependency graph can select only the required library capabilities:
 
-The [libxmlsec1 compatibility ledgers](docs/compatibility-ledger.md) track both
-the complete upstream 1.3.13 public surface and operation-level behavior as
-generated, evidence-linked data. They separate implemented wire behavior from
-explicit compatibility policy, planned parity work, provider differences, and
-the not-yet-implemented C ABI.
+```toml
+xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c14n"] }
+```
+
+Install the `xmlsec1` command from the same package:
+
+```sh
+cargo install xml-sec
+```
+
+Adding `xml-sec` as a dependency builds its library target, not the executable.
+`cargo install` builds and installs the binary target.
+
+## Capabilities
+
+| Area | Available today |
+|------|-----------------|
+| Canonicalization | C14N 1.0, C14N 1.1, Exclusive C14N, comments and document subsets |
+| Signatures | End-to-end XMLDSig signing and verification, same-document and caller-provided references, XPath transforms, `Manifest`, `KeyInfo`, and X.509 validation |
+| Encryption | AES-CBC/GCM, RSA-OAEP, AES Key Wrap, multiple recipients, and Element/Content replacement |
+| Policy | Typed immutable policies for algorithms, trust, parsing, external resources, transforms, and work limits |
+| Providers | Provider-neutral crypto contracts with a pure-Rust RustCrypto implementation |
+| CLI | Native `xmlsec1` process interface for sign, verify, encrypt, decrypt, keys, and capability discovery |
+
+The implementation is fail-closed: unsupported algorithms, unavailable provider
+capabilities, untrusted key sources, implicit external I/O, and exhausted resource
+budgets produce explicit errors rather than compatibility fallbacks.
+XML parsing work is cumulative per operation: initial input, recursive transform
+adapters, staged mutations, dependency levels, and decryption retries share one
+policy allowance rather than resetting limits inside helpers.
 
 ## Native CLI
 
-Install the command-line package and inspect its runtime capability registry:
+Inspect the installed binary's runtime capability registry:
 
 ```sh
-cargo install xmlsec1-cli
 xmlsec1 version
 xmlsec1 list-transforms
 xmlsec1 list-key-data
@@ -130,8 +131,18 @@ fn example() -> Result<(), Box<dyn std::error::Error>> {
 See [XML Encryption](docs/xmlenc.md) for reciprocal decryption, recipient transport,
 document replacement, input bounds, and parser security policy.
 
-Current toolchain target: latest stable Rust.
-Current MSRV: Rust 1.92.
+## Project Status
+
+Current development focuses on remaining XMLDSig/XMLEnc algorithms, complete
+upstream conformance classification, fuzzing, benchmarks, hardening, and API
+stabilization.
+
+The [compatibility ledgers](docs/compatibility-ledger.md) track libxmlsec1 1.3.13
+public surface and operation-level behavior with source and test evidence. See
+the [XMLDSig guide](docs/xmldsig.md), [XMLEnc guide](docs/xmlenc.md), and
+[CLI compatibility guide](docs/cli.md) for detailed contracts and limitations.
+
+The project tracks stable Rust and supports Rust 1.92 or newer.
 
 ## Specifications
 

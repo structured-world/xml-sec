@@ -31,6 +31,7 @@
 #![warn(missing_docs)]
 
 pub mod c14n;
+pub mod document;
 pub mod encoding;
 pub mod error;
 mod hard_limits;
@@ -38,10 +39,8 @@ mod hard_limits;
 pub mod policy;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub mod provider;
-#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 mod xml;
 
-#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub use xml::IdAttributeRegistration;
 
 #[cfg(feature = "xmldsig")]
@@ -50,4 +49,10 @@ pub mod xmldsig;
 #[cfg(feature = "xmlenc")]
 pub mod xmlenc;
 
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub use document::XmlDocumentPolicy;
+pub use document::{
+    AttributeIdentity, DocumentIdentity, DocumentView, NamespaceIdentity, NodeIdentity,
+    SemanticOrder, XmlDocument, XmlDocumentError,
+};
 pub use error::XmlSecError;

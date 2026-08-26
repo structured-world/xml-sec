@@ -11,11 +11,12 @@
 //! - [`verify_signature_with_pem_key`] for full pipeline validation (`SignedInfo` + `SignatureValue`)
 
 use base64::Engine;
-use roxmltree::{Document, Node, NodeId};
+use roxmltree::{Node, NodeId};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::c14n::canonicalize_bounded_with_xml_base_budget;
+use crate::document::{DocumentParseSettings, DocumentView, XmlDocument};
 use crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING;
 
 #[cfg(test)]
@@ -497,6 +498,15 @@ impl<'a> VerifyContext<'a> {
     pub fn verify(&self, xml: &str) -> Result<VerifyResult, DsigError> {
         verify_signature_with_context(xml, self)
     }
+
+    /// Verify a signature against a retained owned document generation.
+    ///
+    /// The active XML input policy is revalidated against the document's parse
+    /// provenance as well as its current byte and node counts. In particular, a
+    /// strict context rejects a document that required internal DTD support.
+    pub fn verify_document(&self, document: &XmlDocument) -> Result<VerifyResult, DsigError> {
+        verify_signature_document_with_context(document, self)
+    }
 }
 
 impl Default for VerifyContext<'_> {
@@ -963,6 +973,10 @@ pub enum DsigError {
     #[error("XML parse error: {0}")]
     XmlParse(#[from] roxmltree::Error),
 
+    /// The owned XML document boundary rejected the document or identity.
+    #[error("XML document error: {0}")]
+    Document(#[from] crate::document::XmlDocumentError),
+
     /// Required signature element is missing.
     #[error("missing required element: <{element}>")]
     MissingElement {
@@ -1120,15 +1134,88 @@ fn verify_signature_with_context(
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
     ctx.policy.validate()?;
     ctx.policy.resources.validate_xml_document_len(xml.len())?;
-    let doc = Document::parse_with_options(
-        xml,
-        roxmltree::ParsingOptions {
-            allow_dtd: ctx.policy.xml.allow_internal_dtd,
-            nodes_limit: ctx.policy.resources.effective_xml_nodes(),
-            entity_resolver: None,
-        },
-    )?;
-    let resolver = UriReferenceResolver::with_id_registrations(&doc, ctx.id_attributes)
+    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
+    let document = XmlDocument::parse_with_settings_and_budget(
+        xml.to_owned(),
+        DocumentParseSettings::new(
+            ctx.policy.xml.allow_internal_dtd,
+            ctx.policy.resources.effective_xml_nodes(),
+            ctx.policy.resources.max_xml_document_bytes,
+        ),
+        execution_budget.xml_parse_work(),
+    )
+    .map_err(|error| match error {
+        crate::document::XmlDocumentError::Policy(error) => DsigError::Policy(error),
+        crate::document::XmlDocumentError::Parse(error) => DsigError::XmlParse(error),
+        error => DsigError::Document(error),
+    })?;
+    verify_signature_document_with_context_and_budget(&document, ctx, &execution_budget)
+}
+
+#[cfg(test)]
+mod xml_parse_budget_tests {
+    use super::*;
+
+    #[test]
+    fn verification_initial_parse_uses_the_policy_work_budget() {
+        // Even a structurally invalid signature must not reach parsing when
+        // the immutable operation snapshot denies all XML parse work.
+        let xml = "<root/>";
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.resources.max_xml_parse_work_bytes = 0;
+
+        let error = VerifyContext::new()
+            .policy(policy)
+            .verify(xml)
+            .expect_err("a zero parse-work budget must reject the input parse");
+
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum: 0,
+                actual,
+            }) if actual == xml.len()
+        ));
+    }
+}
+
+fn verify_signature_document_with_context(
+    document: &XmlDocument,
+    ctx: &VerifyContext<'_>,
+) -> Result<VerifyResult, SignatureVerificationPipelineError> {
+    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
+    verify_signature_document_with_context_and_budget(document, ctx, &execution_budget)
+}
+
+fn verify_signature_document_with_context_and_budget(
+    document: &XmlDocument,
+    ctx: &VerifyContext<'_>,
+    execution_budget: &TransformExecutionBudget,
+) -> Result<VerifyResult, SignatureVerificationPipelineError> {
+    document.validate_xml_input_policy(ctx.policy.xml.allow_internal_dtd)?;
+    document.with_view(|view| verify_signature_view(view, ctx, execution_budget))
+}
+
+fn verify_signature_view<'a>(
+    view: DocumentView<'a>,
+    ctx: &VerifyContext<'_>,
+    execution_budget: &TransformExecutionBudget,
+) -> Result<VerifyResult, SignatureVerificationPipelineError> {
+    ctx.policy.validate()?;
+    let xml = view.xml();
+    ctx.policy.resources.validate_xml_document_len(xml.len())?;
+    let node_count = view.node_count();
+    if node_count > ctx.policy.resources.effective_xml_nodes() as usize {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::XML_NODES,
+            maximum: ctx.policy.resources.effective_xml_nodes() as usize,
+            actual: node_count,
+        }
+        .into());
+    }
+    let doc = view.document();
+    let resolver = UriReferenceResolver::with_document_view(view, ctx.id_attributes)
         .with_same_document_id_semantics(ctx.policy.transforms.same_document_id_semantics)
         .with_external_resource_limits(
             ctx.policy.resources.max_external_resource_bytes,
@@ -1138,7 +1225,6 @@ fn verify_signature_with_context(
         Some(resources) => resolver.with_external_resources(resources),
         None => resolver,
     };
-    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
     let start_node = match ctx.signature_selection {
         SignatureSelection::FirstSignatureUnderId(id) => {
             resolver.node_for_id(id).ok_or_else(|| {
@@ -1276,7 +1362,7 @@ fn verify_signature_with_context(
     let retrieval_materialization = if let Some(info) = key_info.as_mut() {
         let mut retrieval_budgets = RetrievalMaterializationBudgets {
             xpath_parse: &mut xpath_parse_budget,
-            execution: &execution_budget,
+            execution: execution_budget,
             resources: &ctx.policy.resources,
         };
         materialize_retrieval_methods_with_budgets(
@@ -1295,7 +1381,7 @@ fn verify_signature_with_context(
     let execution = ReferenceExecutionContext {
         store_pre_digest: ctx.store_pre_digest,
         transform_options: ctx.transform_options(),
-        transform_budget: &execution_budget,
+        transform_budget: execution_budget,
         canonicalized_data_budget: &canonicalized_data_budget,
         provider: ctx.provider,
     };
@@ -1325,7 +1411,7 @@ fn verify_signature_with_context(
         .remaining()
         .min(execution_budget.remaining_c14n_output());
     canonicalize_bounded_with_xml_base_budget(
-        &doc,
+        doc,
         Some(&|node| signed_info_subtree.contains(&node.id())),
         &signed_info.c14n_method,
         signed_info_limit,
@@ -2555,6 +2641,38 @@ mod tests {
             external_entity_error,
             SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
                 crate::xmldsig::TransformError::XmlParse(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn owned_verification_revalidates_internal_dtd_provenance() {
+        // A document accepted by one permissive operation must not bypass a
+        // later verification context's stricter XML input policy.
+        let document = XmlDocument::parse_with_settings(
+            "<!DOCTYPE root [<!ENTITY value \"ok\">]><root>&value;</root>".into(),
+            DocumentParseSettings::new(
+                true,
+                crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
+                crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
+            ),
+        )
+        .expect("explicitly permitted DTD fixture must parse");
+
+        assert!(matches!(
+            VerifyContext::new().verify_document(&document),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::XmlInput {
+                    reason: "owned document requires internal DTD support"
+                }
+            ))
+        ));
+        assert!(!matches!(
+            VerifyContext::new()
+                .allow_internal_dtd(true)
+                .verify_document(&document),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::XmlInput { .. }
             ))
         ));
     }

@@ -49,12 +49,23 @@ executes, including the default C14N 1.0 coercion when a reference transform cha
 set and the declared canonicalization method for `<SignedInfo>`. Reference output and
 `<SignedInfo>` serialization consume one bounded canonicalization budget, so policy rejection
 occurs during rendering rather than after an oversized buffer has already been allocated.
-The same immutable policy controls every signing parse and mutation reparse, including source
-validation in `sign_with_builder`, digest filling, `SignedInfo` parsing, signature filling, and
-optional `KeyInfo` filling. An internal-DTD opt-in and XML node ceiling therefore cannot be lost
-between stages. Custom `KeyInfoWriter` output is treated as a separate untrusted XML input: its
-byte ceiling is enforced before namespace wrapping or parsing, and the populated document is
-checked again after mutation.
+The same immutable policy controls the retained owned document and every committed signing
+generation, including source validation in `sign_with_builder`, digest filling, `SignedInfo`
+parsing, signature filling, and optional `KeyInfo` filling. An internal-DTD opt-in and XML node
+ceiling therefore cannot be lost between stages. `SignContext::sign_document` and
+`sign_document_with_builder` reuse an `XmlDocument`; string APIs are adapters over that boundary.
+External callers that need non-default XML input rules construct that retained document with
+`XmlDocument::parse_with_policy(xml, &signing_or_verification_policy)`, so parsing and the later
+operation share one immutable policy snapshot rather than independent DTD or resource settings.
+Owned entry points revalidate the document's parse provenance, so a document that required the
+internal-DTD opt-in cannot cross into a stricter signing or verification context. Builder signing
+stages template append, optional `KeyInfo`, every `DigestValue`, and `SignatureValue` in a private
+document. A successful operation commits the complete result as one generation; any policy,
+provider, key, transform, or serialization failure leaves the caller's XML and generation
+unchanged. Every staged mutation checks the active projected node count before commit.
+Custom `KeyInfoWriter` output is treated as a separate untrusted XML input: its
+byte ceiling is enforced before namespace wrapping or parsing, and its merged nodes remain under
+the same operation ceiling as the rest of the signature.
 `IdAttributeRegistration` supplies immutable request context for non-standard ID attributes.
 `SignContext::id_attributes` and `VerifyContext::id_attributes` apply the same global or
 element-scoped registrations to operation start-node selection and every same-document Reference.
@@ -126,6 +137,10 @@ certificates provide key material and do not become trusted merely because they 
 certificate is present in both pools, its explicit trusted classification is retained.
 `ResourcePolicy::max_xml_document_bytes` rejects verification and signing inputs before DOM
 parsing; the same immutable ceiling is rechecked after signing mutations that enlarge the XML.
+`ResourcePolicy::max_xml_parse_work_bytes` separately bounds cumulative parser work across the
+whole operation. Initial parsing, generated-template validation, binary-to-node-set adapters,
+staged copies, digest dependency levels, Manifest recursion, and committed generations all charge
+the same monotonic allowance; failed parses do not restore it.
 Configured chain depth and candidate-path limits are validated after resolver defaults compose with
 the operation policy. Candidate-path accounting includes every generated partial path, and
 self-issued rollover certificates continue toward a distinct same-name issuer when its signature

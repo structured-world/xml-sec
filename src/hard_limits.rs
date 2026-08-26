@@ -4,7 +4,6 @@
 //! permits larger inputs. Deployment policy may only select stricter values.
 
 /// Maximum XML nodes allocated while parsing one verification or transform document.
-#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const XML_DOCUMENT_NODE_CEILING: u32 = 100_000;
 
 /// Maximum inherited `xml:base` attributes considered for one URI resolution.
@@ -22,12 +21,17 @@ pub(crate) const EXTERNAL_RESOURCE_BYTE_CEILING: usize = 8 * 1024 * 1024;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING: usize = 32 * 1024 * 1024;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-pub(crate) const ENCRYPTION_CIPHER_VALUE_BASE64_BYTE_CEILING: usize = 16 * 1024 * 1024;
+pub(crate) const ENCRYPTION_CIPHER_VALUE_BASE64_BYTE_CEILING: usize = XML_DOCUMENT_BYTE_CEILING;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const ENCRYPTION_PLAINTEXT_BYTE_CEILING: usize =
     (ENCRYPTION_CIPHER_VALUE_BASE64_BYTE_CEILING / 4 * 3) - 32;
+pub(crate) const XML_DOCUMENT_BYTE_CEILING: usize = 16 * 1024 * 1024;
+/// Maximum cumulative bytes handed to an XML parser by one operation.
+///
+/// Sixteen full-size passes cover the ordinary staged sign/encrypt/decrypt
+/// pipelines while bounding adversarial dependency or key-candidate retries.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-pub(crate) const XML_DOCUMENT_BYTE_CEILING: usize = ENCRYPTION_CIPHER_VALUE_BASE64_BYTE_CEILING;
+pub(crate) const XML_PARSE_WORK_BYTE_CEILING: usize = 16 * XML_DOCUMENT_BYTE_CEILING;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const ENCRYPTION_RECIPIENT_CEILING: usize = 64;
 /// Maximum symmetric keys attempted by one prepared decryption operation.

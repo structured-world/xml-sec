@@ -3,6 +3,8 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use roxmltree::{Document, Node, ParsingOptions};
 
+use crate::document::XmlParseWorkBudget;
+
 use super::types::{
     CipherData, EncryptedData, EncryptedDataType, EncryptedKey, EncryptionMethod,
     MAX_CIPHER_VALUE_BASE64_LEN, ReferenceList, XMLDSIG_NS, XMLENC_NS, XMLENC11_NS, XmlEncError,
@@ -48,6 +50,8 @@ pub(super) fn parse_encrypted_data_with_policy(
 ) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
     policy.resources.validate_xml_document_len(xml.len())?;
+    let parse_budget = XmlParseWorkBudget::from_resources(&policy.resources);
+    parse_budget.charge_policy(xml.len())?;
     let document = Document::parse_with_options(
         xml,
         ParsingOptions {
@@ -70,9 +74,18 @@ pub fn parse_encrypted_data_node_with_policy(
     node: Node<'_, '_>,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
+    let parse_budget = XmlParseWorkBudget::from_resources(&policy.resources);
+    parse_encrypted_data_node_with_policy_and_budget(node, policy, &parse_budget)
+}
+
+pub(super) fn parse_encrypted_data_node_with_policy_and_budget(
+    node: Node<'_, '_>,
+    policy: &crate::policy::DecryptionPolicy,
+    parse_budget: &XmlParseWorkBudget,
+) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
     let policy = ParsingPolicy::from(policy);
-    validate_node_document_policy(node, policy)?;
+    validate_node_document_policy(node, policy, parse_budget)?;
     parse_encrypted_data_node(node, policy, false)
 }
 
@@ -86,15 +99,17 @@ pub fn parse_encrypted_data_template_node_with_policy(
     node: Node<'_, '_>,
     policy: &crate::policy::EncryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
+    let parse_budget = XmlParseWorkBudget::from_resources(&policy.resources);
     policy.validate()?;
     let policy = ParsingPolicy::from(policy);
-    validate_node_document_policy(node, policy)?;
+    validate_node_document_policy(node, policy, &parse_budget)?;
     parse_encrypted_data_node(node, policy, true)
 }
 
 fn validate_node_document_policy(
     node: Node<'_, '_>,
     policy: ParsingPolicy<'_>,
+    parse_budget: &XmlParseWorkBudget,
 ) -> Result<(), XmlEncError> {
     let resources = &policy.resources;
     resources
@@ -109,6 +124,7 @@ fn validate_node_document_policy(
         }
         .into());
     }
+    parse_budget.charge_policy(node.document().input_text().len())?;
     Document::parse_with_options(
         node.document().input_text(),
         ParsingOptions {

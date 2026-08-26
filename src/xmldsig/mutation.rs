@@ -12,6 +12,7 @@ use quick_xml::{Reader, Writer};
 
 use super::parse::XMLDSIG_NS;
 use super::whitespace::is_xml_whitespace_only;
+use crate::document::XmlParseWorkBudget;
 
 pub(super) fn parse_with_options<'a>(
     xml: &'a str,
@@ -34,8 +35,19 @@ fn parse_mutation_xml_with_options<'a>(
     xml: &'a str,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<roxmltree::Document<'a>, XmlMutationError> {
+    parse_mutation_xml_with_budget(xml, policy, None)
+}
+
+fn parse_mutation_xml_with_budget<'a>(
+    xml: &'a str,
+    policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<roxmltree::Document<'a>, XmlMutationError> {
     if let Some(policy) = policy {
         policy.resources.validate_xml_document_len(xml.len())?;
+    }
+    if let Some(budget) = budget {
+        budget.charge_policy(xml.len())?;
     }
     parse_with_options(xml, policy).map_err(|error| match (policy, error) {
         (Some(policy), roxmltree::Error::NodesLimitReached) => {
@@ -171,58 +183,6 @@ pub(super) fn append_signature_to_root_with_options(
     Ok(output)
 }
 
-pub(super) fn append_signature_to_element_with_options(
-    xml: &str,
-    signature_template: &str,
-    target: Range<usize>,
-    policy: Option<&crate::policy::SigningPolicy>,
-) -> Result<String, XmlMutationError> {
-    validate_signature_template(signature_template, policy)?;
-    let _source = parse_mutation_xml_with_options(xml, policy)?;
-    let fragment = xml
-        .get(target.clone())
-        .ok_or(XmlMutationError::InvalidAppendTarget)?;
-    let opening_end = opening_tag_end(fragment).ok_or(XmlMutationError::InvalidAppendTarget)?;
-    let mut output = xml.to_owned();
-    if fragment[..opening_end].trim_end().ends_with('/') {
-        let slash = fragment[..opening_end]
-            .trim_end()
-            .strip_suffix('/')
-            .map(str::len)
-            .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        let name_end = fragment[1..]
-            .find(|character: char| character.is_whitespace() || matches!(character, '/' | '>'))
-            .map(|offset| offset + 1)
-            .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        let qualified_name = &fragment[1..name_end];
-        let replacement = format!(
-            "{}>{signature_template}</{qualified_name}>",
-            &fragment[..slash]
-        );
-        output.replace_range(target, &replacement);
-    } else {
-        let closing_start = fragment
-            .rfind("</")
-            .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        output.insert_str(target.start + closing_start, signature_template);
-    }
-    parse_mutation_xml_with_options(&output, policy)?;
-    Ok(output)
-}
-
-fn opening_tag_end(fragment: &str) -> Option<usize> {
-    let mut quote = None;
-    for (offset, character) in fragment.char_indices() {
-        match (quote, character) {
-            (None, '\'' | '"') => quote = Some(character),
-            (Some(delimiter), current) if delimiter == current => quote = None,
-            (None, '>') => return Some(offset),
-            _ => {}
-        }
-    }
-    None
-}
-
 /// Fill XMLDSig `<DigestValue>` elements in document order.
 pub fn fill_digest_values<I, S>(xml: &str, values: I) -> Result<String, XmlMutationError>
 where
@@ -253,10 +213,30 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let target_signature = last_signature_index(xml, policy)?;
-    fill_signed_info_digest_values_at_index_with_options(xml, values, target_signature, policy)
+    fill_signed_info_digest_values_with_budget(xml, values, policy, None)
 }
 
+pub(super) fn fill_signed_info_digest_values_with_budget<I, S>(
+    xml: &str,
+    values: I,
+    policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<String, XmlMutationError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let target_signature = last_signature_index(xml, policy, budget)?;
+    fill_signed_info_digest_values_at_index_with_budget(
+        xml,
+        values,
+        target_signature,
+        policy,
+        budget,
+    )
+}
+
+#[cfg(test)]
 pub(super) fn fill_signed_info_digest_values_at_index_with_options<I, S>(
     xml: &str,
     values: I,
@@ -267,11 +247,25 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    fill_signed_info_digest_values_at_index_with_budget(xml, values, target_signature, policy, None)
+}
+
+pub(super) fn fill_signed_info_digest_values_at_index_with_budget<I, S>(
+    xml: &str,
+    values: I,
+    target_signature: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<String, XmlMutationError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let values: Vec<String> = values
         .into_iter()
         .map(|value| value.as_ref().to_owned())
         .collect();
-    let expected = count_signed_info_digest_values(xml, target_signature, policy)?;
+    let expected = count_signed_info_digest_values(xml, target_signature, policy, budget)?;
     if expected != values.len() {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "DigestValue",
@@ -280,16 +274,22 @@ where
         });
     }
 
-    fill_dsig_values_matching(xml, "DigestValue", values, policy, |stack, namespace| {
-        is_signed_info_reference_context(stack, namespace, target_signature)
-    })
+    fill_dsig_values_matching(
+        xml,
+        "DigestValue",
+        values,
+        policy,
+        budget,
+        |stack, namespace| is_signed_info_reference_context(stack, namespace, target_signature),
+    )
 }
 
-pub(super) fn fill_selected_signed_info_digest_values_at_index_with_options<I, S>(
+pub(super) fn fill_selected_manifest_digest_values_at_index_with_budget<I, S>(
     xml: &str,
     replacements: I,
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
 ) -> Result<String, XmlMutationError>
 where
     I: IntoIterator<Item = (usize, S)>,
@@ -299,30 +299,15 @@ where
         .into_iter()
         .map(|(index, value)| (index, value.as_ref().to_owned()))
         .collect::<Vec<_>>();
-    let expected = count_signed_info_digest_values(xml, target_signature, policy)?;
-    fill_selected_digest_values(xml, replacements, expected, policy, |stack, namespace| {
-        is_signed_info_reference_context(stack, namespace, target_signature)
-    })
-}
-
-pub(super) fn fill_selected_manifest_digest_values_at_index_with_options<I, S>(
-    xml: &str,
-    replacements: I,
-    target_signature: usize,
-    policy: Option<&crate::policy::SigningPolicy>,
-) -> Result<String, XmlMutationError>
-where
-    I: IntoIterator<Item = (usize, S)>,
-    S: AsRef<str>,
-{
-    let replacements = replacements
-        .into_iter()
-        .map(|(index, value)| (index, value.as_ref().to_owned()))
-        .collect::<Vec<_>>();
-    let expected = count_manifest_digest_values(xml, target_signature, policy)?;
-    fill_selected_digest_values(xml, replacements, expected, policy, |stack, namespace| {
-        is_manifest_reference_context(stack, namespace, target_signature)
-    })
+    let expected = count_manifest_digest_values(xml, target_signature, policy, budget)?;
+    fill_selected_digest_values(
+        xml,
+        replacements,
+        expected,
+        policy,
+        budget,
+        |stack, namespace| is_manifest_reference_context(stack, namespace, target_signature),
+    )
 }
 
 fn fill_selected_digest_values(
@@ -330,6 +315,7 @@ fn fill_selected_digest_values(
     replacements: Vec<(usize, String)>,
     expected: usize,
     policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
     mut in_context: impl FnMut(&[(bool, Vec<u8>, Option<usize>)], &ResolveResult<'_>) -> bool,
 ) -> Result<String, XmlMutationError> {
     if replacements
@@ -359,17 +345,24 @@ fn fill_selected_digest_values(
         .collect::<Vec<_>>();
     let mut context_index = 0usize;
     let mut replacement_index = 0usize;
-    fill_dsig_values_matching(xml, "DigestValue", values, policy, |stack, namespace| {
-        if !in_context(stack, namespace) {
-            return false;
-        }
-        let selected = replacement_indices.get(replacement_index) == Some(&context_index);
-        context_index += 1;
-        if selected {
-            replacement_index += 1;
-        }
-        selected
-    })
+    fill_dsig_values_matching(
+        xml,
+        "DigestValue",
+        values,
+        policy,
+        budget,
+        |stack, namespace| {
+            if !in_context(stack, namespace) {
+                return false;
+            }
+            let selected = replacement_indices.get(replacement_index) == Some(&context_index);
+            context_index += 1;
+            if selected {
+                replacement_index += 1;
+            }
+            selected
+        },
+    )
 }
 
 /// Fill XMLDSig `<SignatureValue>` elements in document order.
@@ -391,17 +384,37 @@ pub(super) fn fill_signature_value_with_options(
     value: &str,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    let target_signature = last_signature_index(xml, policy)?;
-    fill_signature_value_at_index_with_options(xml, value, target_signature, policy)
+    fill_signature_value_with_budget(xml, value, policy, None)
 }
 
+pub(super) fn fill_signature_value_with_budget(
+    xml: &str,
+    value: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<String, XmlMutationError> {
+    let target_signature = last_signature_index(xml, policy, budget)?;
+    fill_signature_value_at_index_with_budget(xml, value, target_signature, policy, budget)
+}
+
+#[cfg(test)]
 pub(super) fn fill_signature_value_at_index_with_options(
     xml: &str,
     value: &str,
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    let expected = count_direct_signature_values(xml, target_signature, policy)?;
+    fill_signature_value_at_index_with_budget(xml, value, target_signature, policy, None)
+}
+
+pub(super) fn fill_signature_value_at_index_with_budget(
+    xml: &str,
+    value: &str,
+    target_signature: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<String, XmlMutationError> {
+    let expected = count_direct_signature_values(xml, target_signature, policy, budget)?;
     if expected != 1 {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "SignatureValue",
@@ -415,17 +428,35 @@ pub(super) fn fill_signature_value_at_index_with_options(
         "SignatureValue",
         vec![value.to_owned()],
         policy,
+        budget,
         |stack, namespace| is_direct_signature_context(stack, namespace, target_signature),
     )
 }
 
+#[cfg(test)]
 pub(super) fn projected_signature_value_output_len_at_index_with_options(
     xml: &str,
     value_len: usize,
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<usize, XmlMutationError> {
-    let document = parse_mutation_xml_with_options(xml, policy)?;
+    projected_signature_value_output_len_at_index_with_budget(
+        xml,
+        value_len,
+        target_signature,
+        policy,
+        None,
+    )
+}
+
+pub(super) fn projected_signature_value_output_len_at_index_with_budget(
+    xml: &str,
+    value_len: usize,
+    target_signature: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<usize, XmlMutationError> {
+    let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
     let Some(signature) = signature_node(&document, target_signature) else {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "SignatureValue",
@@ -525,7 +556,7 @@ pub(super) fn fill_key_info_with_options(
     key_info_content: &str,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    let target_signature = last_signature_index(xml, policy)?;
+    let target_signature = last_signature_index(xml, policy, None)?;
     fill_key_info_at_index_with_options(xml, key_info_content, target_signature, policy)
 }
 
@@ -553,13 +584,24 @@ pub(super) fn fill_key_info_at_index_with_options(
     )
 }
 
+#[cfg(test)]
 pub(super) fn merge_key_info_source_at_index_with_options(
     xml: &str,
     key_info_source: &str,
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
-    let document = parse_mutation_xml_with_options(xml, policy)?;
+    merge_key_info_source_at_index_with_budget(xml, key_info_source, target_signature, policy, None)
+}
+
+pub(super) fn merge_key_info_source_at_index_with_budget(
+    xml: &str,
+    key_info_source: &str,
+    target_signature: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<String, XmlMutationError> {
+    let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
     let Some(signature) = signature_node(&document, target_signature) else {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "Signature",
@@ -583,8 +625,8 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     // The writer contract is XML child content, not a standalone document.
     // Parse it under the template's namespace context so multiple siblings and
     // inherited prefixes have exactly the semantics they will have in KeyInfo.
-    let wrapped_source = wrap_key_info_children(key_info_source, key_info);
-    let source_document = parse_mutation_xml_with_options(&wrapped_source, policy)?;
+    let wrapped_source = wrap_key_info_children(key_info_source, key_info, policy)?;
+    let source_document = parse_mutation_xml_with_budget(&wrapped_source, policy, budget)?;
     let sources = source_document
         .root_element()
         .children()
@@ -658,6 +700,7 @@ pub(super) fn merge_key_info_source_at_index_with_options(
             &source,
             target_signature,
             policy,
+            budget,
         )?;
     }
     Ok(output)
@@ -668,9 +711,10 @@ fn merge_one_key_info_source_at_index_with_options(
     key_info_source: &str,
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
 ) -> Result<String, XmlMutationError> {
-    let document = parse_mutation_xml_with_options(xml, policy)?;
-    let source_document = parse_mutation_xml_with_options(key_info_source, policy)?;
+    let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
+    let source_document = parse_mutation_xml_with_budget(key_info_source, policy, budget)?;
     let source = source_document.root_element();
     let source_content = element_inner_xml(key_info_source, source.range())?;
     let Some(signature) = signature_node(&document, target_signature) else {
@@ -781,6 +825,7 @@ fn merge_one_key_info_source_at_index_with_options(
                 placeholder.range(),
                 source_content,
                 &generated_attributes,
+                policy,
             )?
         } else {
             append_element_content(
@@ -788,16 +833,16 @@ fn merge_one_key_info_source_at_index_with_options(
                 placeholder.range(),
                 source_content,
                 &generated_attributes,
+                policy,
             )?
         };
-        parse_mutation_xml_with_options(&output, policy)?;
+        parse_mutation_xml_with_budget(&output, policy, budget)?;
         return Ok(output);
     }
 
     let range = key_info.range();
     let raw_key_info = &xml[range.clone()];
-    let mut output = xml.to_owned();
-    if raw_key_info.trim_end().ends_with("/>") {
+    let output = if raw_key_info.trim_end().ends_with("/>") {
         let name_end = raw_key_info[1..]
             .find(|character: char| {
                 character.is_ascii_whitespace() || character == '/' || character == '>'
@@ -808,26 +853,72 @@ fn merge_one_key_info_source_at_index_with_options(
         let empty_end = raw_key_info
             .rfind("/>")
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let expanded_len = empty_end
+            .checked_add(1)
+            .and_then(|length| length.checked_add(key_info_source.len()))
+            .and_then(|length| length.checked_add(2))
+            .and_then(|length| length.checked_add(qualified_name.len()))
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| projected_xml_length_overflow(policy))?;
+        validate_projected_replacement_len(xml, range.len(), expanded_len, policy)?;
         let expanded = format!(
             "{}>{}</{}>",
             &raw_key_info[..empty_end],
             key_info_source,
             qualified_name
         );
+        let mut output = xml.to_owned();
         output.replace_range(range, &expanded);
+        output
     } else {
         let closing = raw_key_info
             .rfind("</")
             .map(|offset| range.start + offset)
             .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        validate_projected_replacement_len(xml, 0, key_info_source.len(), policy)?;
+        let mut output = xml.to_owned();
         output.insert_str(closing, key_info_source);
-    }
-    parse_mutation_xml_with_options(&output, policy)?;
+        output
+    };
+    parse_mutation_xml_with_budget(&output, policy, budget)?;
     Ok(output)
 }
 
-fn wrap_key_info_children(source: &str, key_info: roxmltree::Node<'_, '_>) -> String {
-    let mut wrapper = String::from("<KeyInfoFragment");
+fn wrap_key_info_children(
+    source: &str,
+    key_info: roxmltree::Node<'_, '_>,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError> {
+    const OPEN: &str = "<KeyInfoFragment";
+    const CLOSE: &str = "</KeyInfoFragment>";
+    let projected = key_info
+        .namespaces()
+        .try_fold(OPEN.len(), |length, namespace| {
+            let declaration_len = match namespace.name() {
+                Some(prefix) => "xmlns:"
+                    .len()
+                    .checked_add(prefix.len())
+                    .ok_or_else(|| projected_xml_length_overflow(policy))?,
+                None => "xmlns".len(),
+            };
+            let escaped_uri = quick_xml::escape::escape(namespace.uri());
+            length
+                .checked_add(4)
+                .and_then(|length| length.checked_add(declaration_len))
+                .and_then(|length| length.checked_add(escaped_uri.len()))
+                .ok_or_else(|| projected_xml_length_overflow(policy))
+        })?;
+    let projected = projected
+        .checked_add(1)
+        .and_then(|length| length.checked_add(source.len()))
+        .and_then(|length| length.checked_add(CLOSE.len()))
+        .ok_or_else(|| projected_xml_length_overflow(policy))?;
+    if let Some(policy) = policy {
+        policy.resources.validate_xml_document_len(projected)?;
+    }
+
+    let mut wrapper = String::with_capacity(projected);
+    wrapper.push_str(OPEN);
     for namespace in key_info.namespaces() {
         let declaration = namespace
             .name()
@@ -839,8 +930,8 @@ fn wrap_key_info_children(source: &str, key_info: roxmltree::Node<'_, '_>) -> St
     }
     wrapper.push('>');
     wrapper.push_str(source);
-    wrapper.push_str("</KeyInfoFragment>");
-    wrapper
+    wrapper.push_str(CLOSE);
+    Ok(wrapper)
 }
 
 fn standalone_element(
@@ -984,8 +1075,43 @@ fn replace_element_content(
     range: Range<usize>,
     content: &str,
     namespace_attributes: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
     let element = &xml[range.clone()];
+    let replacement_len = if element.trim_end().ends_with("/>") {
+        let name_end = element[1..]
+            .find(|character: char| {
+                character.is_ascii_whitespace() || character == '/' || character == '>'
+            })
+            .map(|offset| offset + 1)
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let qualified_name = &element[1..name_end];
+        let empty_end = element
+            .rfind("/>")
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        empty_end
+            .checked_add(namespace_attributes.len())
+            .and_then(|length| length.checked_add(1))
+            .and_then(|length| length.checked_add(content.len()))
+            .and_then(|length| length.checked_add(2))
+            .and_then(|length| length.checked_add(qualified_name.len()))
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| projected_xml_length_overflow(policy))?
+    } else {
+        let content_start =
+            element_opening_end(element).ok_or(XmlMutationError::InvalidAppendTarget)?;
+        let content_end = element
+            .rfind("</")
+            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+        (content_start - 1)
+            .checked_add(namespace_attributes.len())
+            .and_then(|length| length.checked_add(1))
+            .and_then(|length| length.checked_add(content.len()))
+            .and_then(|length| length.checked_add(element.len() - content_end))
+            .ok_or_else(|| projected_xml_length_overflow(policy))?
+    };
+    validate_projected_replacement_len(xml, range.len(), replacement_len, policy)?;
+
     let mut output = xml.to_owned();
     if element.trim_end().ends_with("/>") {
         let name_end = element[1..]
@@ -1031,6 +1157,7 @@ fn append_element_content(
     range: Range<usize>,
     content: &str,
     namespace_attributes: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
     let element = &xml[range.clone()];
     let content_start =
@@ -1038,6 +1165,14 @@ fn append_element_content(
     let content_end = element
         .rfind("</")
         .ok_or(XmlMutationError::InvalidAppendTarget)?;
+    let replacement_len = (content_start - 1)
+        .checked_add(namespace_attributes.len())
+        .and_then(|length| length.checked_add(1))
+        .and_then(|length| length.checked_add(content_end - content_start))
+        .and_then(|length| length.checked_add(content.len()))
+        .and_then(|length| length.checked_add(element.len() - content_end))
+        .ok_or_else(|| projected_xml_length_overflow(policy))?;
+    validate_projected_replacement_len(xml, range.len(), replacement_len, policy)?;
     let replacement = format!(
         "{}{}>{}{}{}",
         &element[..content_start - 1],
@@ -1049,6 +1184,23 @@ fn append_element_content(
     let mut output = xml.to_owned();
     output.replace_range(range, &replacement);
     Ok(output)
+}
+
+fn validate_projected_replacement_len(
+    xml: &str,
+    removed_len: usize,
+    added_len: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<usize, XmlMutationError> {
+    let projected = xml
+        .len()
+        .checked_sub(removed_len)
+        .and_then(|length| length.checked_add(added_len))
+        .ok_or_else(|| projected_xml_length_overflow(policy))?;
+    if let Some(policy) = policy {
+        policy.resources.validate_xml_document_len(projected)?;
+    }
+    Ok(projected)
 }
 
 fn element_opening_end(fragment: &str) -> Option<usize> {
@@ -1086,7 +1238,7 @@ where
         });
     }
 
-    fill_dsig_values_matching(xml, local_name, values, None, |_, _| true)
+    fill_dsig_values_matching(xml, local_name, values, None, None, |_, _| true)
 }
 
 fn fill_dsig_values_matching(
@@ -1094,8 +1246,12 @@ fn fill_dsig_values_matching(
     local_name: &'static str,
     values: Vec<String>,
     policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
     mut should_replace: impl FnMut(&[(bool, Vec<u8>, Option<usize>)], &ResolveResult<'_>) -> bool,
 ) -> Result<String, XmlMutationError> {
+    if let Some(budget) = budget {
+        budget.charge_policy(xml.len())?;
+    }
     let mut reader = NsReader::from_str(xml);
     let mut writer = Writer::new(Vec::new());
     let mut buf = Vec::new();
@@ -1196,7 +1352,7 @@ fn fill_dsig_values_matching(
     }
 
     let output = String::from_utf8(writer.into_inner())?;
-    parse_mutation_xml_with_options(&output, policy)?;
+    parse_mutation_xml_with_budget(&output, policy, budget)?;
     Ok(output)
 }
 
@@ -1329,8 +1485,9 @@ fn count_signed_info_digest_values(
     xml: &str,
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
 ) -> Result<usize, XmlMutationError> {
-    let document = parse_mutation_xml_with_options(xml, policy)?;
+    let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
     let Some(signature) = signature_node(&document, target_signature) else {
         return Ok(0);
     };
@@ -1344,8 +1501,9 @@ fn count_direct_signature_values(
     xml: &str,
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
 ) -> Result<usize, XmlMutationError> {
-    let document = parse_mutation_xml_with_options(xml, policy)?;
+    let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
     let Some(signature) = signature_node(&document, target_signature) else {
         return Ok(0);
     };
@@ -1384,8 +1542,9 @@ fn count_manifest_digest_values(
     xml: &str,
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
 ) -> Result<usize, XmlMutationError> {
-    let document = parse_mutation_xml_with_options(xml, policy)?;
+    let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
     let Some(signature) = signature_node(&document, target_signature) else {
         return Ok(0);
     };
@@ -1423,8 +1582,9 @@ fn signature_node<'a>(
 fn last_signature_index(
     xml: &str,
     policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
 ) -> Result<usize, XmlMutationError> {
-    let document = parse_mutation_xml_with_options(xml, policy)?;
+    let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
     document
         .descendants()
         .filter(|node| is_dsig_node(*node, "Signature"))
@@ -1605,6 +1765,27 @@ mod tests {
     }
 
     #[test]
+    fn streaming_mutation_scan_consumes_the_shared_parse_budget() {
+        // The quick-xml rewrite is a parser pass just like the structural DOM
+        // parses before and after it, so all three scans share one allowance.
+        let xml = format!(
+            "<root><ds:Signature xmlns:ds=\"{XMLDSIG_NS}\"><ds:SignatureValue/></ds:Signature></root>"
+        );
+        let resources = crate::policy::ResourcePolicy::default();
+        let budget = XmlParseWorkBudget::from_resources(&resources);
+        let output = fill_signature_value_at_index_with_budget(
+            &xml,
+            "signature",
+            0,
+            Some(&crate::policy::SigningPolicy::default()),
+            Some(&budget),
+        )
+        .expect("streaming mutation must succeed");
+
+        assert_eq!(budget.consumed(), xml.len() * 2 + output.len());
+    }
+
+    #[test]
     fn appends_signature_template_to_non_empty_root() {
         let signed = append_signature_to_root("<root><payload ID=\"ref-0\"/></root>", &template(1))
             .expect("append signature");
@@ -1644,14 +1825,16 @@ mod tests {
         // Selected builder targets may be self-closing; insertion must expand
         // the element without dropping its qualified name or attributes.
         let source = r#"<root xmlns:s="urn:scope"><s:scope Id="urn:selected/item"/></root>"#;
-        let document = roxmltree::Document::parse(source).expect("source must parse");
-        let scope = document
-            .descendants()
-            .find(|node| node.attribute("Id") == Some("urn:selected/item"))
-            .expect("selected scope");
-        let signed =
-            append_signature_to_element_with_options(source, &template(1), scope.range(), None)
-                .expect("selected empty element must accept a signature");
+        let mut document = crate::XmlDocument::parse(source).expect("source must parse");
+        let registrations = [crate::IdAttributeRegistration::global("Id")];
+        let scope = document.with_view(|view| {
+            view.node_for_id("urn:selected/item", &registrations)
+                .expect("selected scope")
+        });
+        document
+            .append_child(scope, &template(1))
+            .expect("selected empty element must accept a signature");
+        let signed = document.into_xml();
         let output = roxmltree::Document::parse(&signed).expect("output must parse");
         let scope = output
             .descendants()
@@ -2179,7 +2362,8 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
             .expect("KeyInfo");
-        let wrapped = wrap_key_info_children(generated, key_info);
+        let wrapped =
+            wrap_key_info_children(generated, key_info, None).expect("wrapper must serialize");
         let maximum = wrapped.len() - 1;
         assert!(source.len() <= maximum);
         assert!(generated.len() <= maximum);

@@ -210,6 +210,19 @@ impl<'a> NodeSet<'a> {
         Ok(Self::collect_document(doc, false))
     }
 
+    pub(crate) fn entire_document_without_comments_from_view(
+        view: crate::DocumentView<'a>,
+        budget: Option<&NodeSetMaterializationBudget>,
+    ) -> Result<Self, TransformError> {
+        let set = match budget {
+            Some(budget) => {
+                Self::entire_document_without_comments_with_budget(view.document(), budget)?
+            }
+            None => Self::entire_document_without_comments(view.document())?,
+        };
+        Ok(set)
+    }
+
     /// Create a node set representing the entire document with comments.
     ///
     /// Used for `#xpointer(/)` which, unlike empty URI, includes comment nodes.
@@ -229,6 +242,19 @@ impl<'a> NodeSet<'a> {
     ) -> Result<Self, TransformError> {
         Self::charge_subtree_materialization(doc.root(), true, budget)?;
         Ok(Self::collect_document(doc, true))
+    }
+
+    pub(crate) fn entire_document_with_comments_from_view(
+        view: crate::DocumentView<'a>,
+        budget: Option<&NodeSetMaterializationBudget>,
+    ) -> Result<Self, TransformError> {
+        let set = match budget {
+            Some(budget) => {
+                Self::entire_document_with_comments_with_budget(view.document(), budget)?
+            }
+            None => Self::entire_document_with_comments(view.document())?,
+        };
+        Ok(set)
     }
 
     /// Create a node set rooted at `element`, containing that element and all
@@ -282,6 +308,26 @@ impl<'a> NodeSet<'a> {
     ) -> Result<Self, TransformError> {
         Self::charge_subtree_materialization(element, true, budget)?;
         Ok(Self::collect_subtree(element))
+    }
+
+    pub(crate) fn subtree_from_view(
+        view: crate::DocumentView<'a>,
+        element: Node<'a, 'a>,
+        with_comments: bool,
+        budget: Option<&NodeSetMaterializationBudget>,
+    ) -> Result<Self, TransformError> {
+        if !std::ptr::eq(element.document() as *const _, view.document() as *const _) {
+            return Err(TransformError::CrossDocumentNodeSetInput);
+        }
+        let set = if with_comments {
+            match budget {
+                Some(budget) => Self::subtree_with_budget(element, budget)?,
+                None => Self::subtree(element)?,
+            }
+        } else {
+            Self::subtree_without_comments_with_budget(element, budget)?
+        };
+        Ok(set)
     }
 
     fn collect_subtree(element: Node<'a, 'a>) -> Self {
@@ -878,6 +924,10 @@ pub enum TransformError {
     /// different `Document` than the input `NodeSet`.
     #[error("enveloped-signature transform: invalid Signature node for this document")]
     CrossDocumentSignatureNode,
+
+    /// A retained document view and a projected node came from different documents.
+    #[error("node-set projection: input node belongs to a different document")]
+    CrossDocumentNodeSetInput,
 }
 
 pub(crate) fn transform_resource_limit(

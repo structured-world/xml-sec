@@ -3358,7 +3358,7 @@ mod tests {
 
     fn testdata(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("testdata")
+            .join("tools/xmlsec1/testdata")
             .join(name)
     }
 

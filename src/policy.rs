@@ -34,6 +34,7 @@ pub(crate) mod resource_name {
     pub const AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES: &str =
         "aggregate encryption CipherValue bytes";
     pub const XML_DOCUMENT: &str = "XML document";
+    pub const XML_PARSE_WORK_BYTES: &str = "cumulative XML parse-work bytes";
     pub const ENCRYPTION_RECIPIENTS: &str = "encryption recipients";
     pub const ENCRYPTION_METADATA_BYTES: &str = "encryption metadata bytes";
     pub const KEY_CANDIDATES: &str = "key candidates";
@@ -303,6 +304,8 @@ pub struct ResourcePolicy {
     pub max_encryption_plaintext_bytes: usize,
     /// Maximum caller-owned XML bytes accepted by any document operation.
     pub max_xml_document_bytes: usize,
+    /// Maximum cumulative XML bytes parsed by one operation.
+    pub max_xml_parse_work_bytes: usize,
     /// Maximum independently wrapped recipients.
     pub max_encryption_recipients: usize,
     /// Maximum caller-controlled XMLEnc metadata bytes per field.
@@ -357,6 +360,7 @@ impl Default for ResourcePolicy {
                 crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING,
             max_encryption_plaintext_bytes: crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING,
             max_xml_document_bytes: crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
+            max_xml_parse_work_bytes: crate::hard_limits::XML_PARSE_WORK_BYTE_CEILING,
             max_encryption_recipients: crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
             max_encryption_metadata_bytes: crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
             max_key_candidates: crate::hard_limits::KEY_CANDIDATE_CEILING,
@@ -421,6 +425,11 @@ impl ResourcePolicy {
             resource_name::XML_DOCUMENT,
             self.max_xml_document_bytes,
             crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
+        )?;
+        Self::within(
+            resource_name::XML_PARSE_WORK_BYTES,
+            self.max_xml_parse_work_bytes,
+            crate::hard_limits::XML_PARSE_WORK_BYTE_CEILING,
         )?;
         Self::within(
             resource_name::EXTERNAL_RESOURCE_BYTES,
@@ -1010,6 +1019,24 @@ mod tests {
     }
 
     #[test]
+    fn xml_parse_work_policy_cannot_exceed_implementation_ceiling() {
+        let policy = ResourcePolicy {
+            max_xml_parse_work_bytes: crate::hard_limits::XML_PARSE_WORK_BYTE_CEILING
+                .saturating_add(1),
+            ..ResourcePolicy::default()
+        };
+
+        assert_eq!(
+            policy.validate(),
+            Err(PolicyViolation::ResourceLimit {
+                resource: resource_name::XML_PARSE_WORK_BYTES,
+                maximum: crate::hard_limits::XML_PARSE_WORK_BYTE_CEILING,
+                actual: crate::hard_limits::XML_PARSE_WORK_BYTE_CEILING.saturating_add(1),
+            })
+        );
+    }
+
+    #[test]
     fn every_resource_policy_field_obeys_its_hard_ceiling() {
         // Each public tuning knob is only a stricter operational limit; none
         // may raise the implementation's allocation ceiling. Exact diagnostics
@@ -1065,6 +1092,11 @@ mod tests {
                 resource_name::XML_DOCUMENT,
                 crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
                 |p| &mut p.max_xml_document_bytes,
+            ),
+            (
+                resource_name::XML_PARSE_WORK_BYTES,
+                crate::hard_limits::XML_PARSE_WORK_BYTE_CEILING,
+                |p| &mut p.max_xml_parse_work_bytes,
             ),
             (
                 resource_name::ENCRYPTION_RECIPIENTS,
@@ -1194,6 +1226,7 @@ mod tests {
             max_external_resource_total_bytes: 0,
             max_encryption_plaintext_bytes: 0,
             max_xml_document_bytes: 0,
+            max_xml_parse_work_bytes: 0,
             max_encryption_recipients: 0,
             max_encryption_metadata_bytes: 0,
             max_key_candidates: 0,

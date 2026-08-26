@@ -120,10 +120,46 @@ impl ExternalResourceBudget {
 /// ```
 pub struct UriReferenceResolver<'a> {
     doc: &'a Document<'a>,
-    id_index: XmlIdIndex<'a>,
+    view: Option<crate::DocumentView<'a>>,
+    id_index: ResolverIdIndex<'a>,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
     external_resource_budget: ExternalResourceBudget,
     same_document_id_semantics: SameDocumentIdSemantics,
+}
+
+enum ResolverIdIndex<'a> {
+    Borrowed(XmlIdIndex<'a>),
+    Retained(HashMap<String, NodeId>),
+}
+
+impl<'a> ResolverIdIndex<'a> {
+    fn node(&self, document: &'a Document<'a>, id: &str) -> Option<Node<'a, 'a>> {
+        match self {
+            Self::Borrowed(index) => index.node(id),
+            Self::Retained(index) => index.get(id).and_then(|node| document.get_node(*node)),
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        match self {
+            Self::Borrowed(index) => index.contains(id),
+            Self::Retained(index) => index.contains_key(id),
+        }
+    }
+
+    fn node_id(&self, id: &str) -> Option<NodeId> {
+        match self {
+            Self::Borrowed(index) => index.node_id(id),
+            Self::Retained(index) => index.get(id).copied(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(index) => index.len(),
+            Self::Retained(index) => index.len(),
+        }
+    }
 }
 
 impl<'a> UriReferenceResolver<'a> {
@@ -145,7 +181,8 @@ impl<'a> UriReferenceResolver<'a> {
     pub fn with_id_attrs(doc: &'a Document<'a>, extra_attrs: &[&str]) -> Self {
         Self {
             doc,
-            id_index: XmlIdIndex::with_extra_attrs(doc, extra_attrs),
+            view: None,
+            id_index: ResolverIdIndex::Borrowed(XmlIdIndex::with_extra_attrs(doc, extra_attrs)),
             external_resources: None,
             external_resource_budget: ExternalResourceBudget::default(),
             same_document_id_semantics: SameDocumentIdSemantics::Specification,
@@ -159,7 +196,22 @@ impl<'a> UriReferenceResolver<'a> {
     ) -> Self {
         Self {
             doc,
-            id_index: XmlIdIndex::with_registrations(doc, registrations),
+            view: None,
+            id_index: ResolverIdIndex::Borrowed(XmlIdIndex::with_registrations(doc, registrations)),
+            external_resources: None,
+            external_resource_budget: ExternalResourceBudget::default(),
+            same_document_id_semantics: SameDocumentIdSemantics::Specification,
+        }
+    }
+
+    pub(crate) fn with_document_view(
+        view: crate::DocumentView<'a>,
+        registrations: &[crate::IdAttributeRegistration],
+    ) -> Self {
+        Self {
+            doc: view.document(),
+            view: Some(view),
+            id_index: ResolverIdIndex::Retained(view.id_index(registrations)),
             external_resources: None,
             external_resource_budget: ExternalResourceBudget::default(),
             same_document_id_semantics: SameDocumentIdSemantics::Specification,
@@ -255,11 +307,14 @@ impl<'a> UriReferenceResolver<'a> {
             // Empty URI = entire document without comments
             // XMLDSig §4.3.3.2: "the reference is to the document [...],
             // and the comment nodes are not included"
-            let nodes = match budget {
-                Some(budget) => {
-                    NodeSet::entire_document_without_comments_with_budget(self.doc, budget)?
-                }
-                None => NodeSet::entire_document_without_comments(self.doc)?,
+            let nodes = match self.view {
+                Some(view) => NodeSet::entire_document_without_comments_from_view(view, budget)?,
+                None => match budget {
+                    Some(budget) => {
+                        NodeSet::entire_document_without_comments_with_budget(self.doc, budget)?
+                    }
+                    None => NodeSet::entire_document_without_comments(self.doc)?,
+                },
             };
             Ok(TransformData::NodeSet(nodes))
         } else if let Some(fragment) = uri.strip_prefix('#') {
@@ -295,11 +350,14 @@ impl<'a> UriReferenceResolver<'a> {
             // XPointer root: entire document WITH comments (unlike empty URI).
             // Per XMLDSig §4.3.3.3: "the XPointer expression [...] includes
             // comment nodes"
-            let nodes = match budget {
-                Some(budget) => {
-                    NodeSet::entire_document_with_comments_with_budget(self.doc, budget)?
-                }
-                None => NodeSet::entire_document_with_comments(self.doc)?,
+            let nodes = match self.view {
+                Some(view) => NodeSet::entire_document_with_comments_from_view(view, budget)?,
+                None => match budget {
+                    Some(budget) => {
+                        NodeSet::entire_document_with_comments_with_budget(self.doc, budget)?
+                    }
+                    None => NodeSet::entire_document_with_comments(self.doc)?,
+                },
             };
             Ok(TransformData::NodeSet(nodes))
         } else {
@@ -344,9 +402,11 @@ impl<'a> UriReferenceResolver<'a> {
         budget: Option<&NodeSetMaterializationBudget>,
         with_comments: bool,
     ) -> Result<TransformData<'a>, TransformError> {
-        match self.id_index.node(id) {
+        match self.id_index.node(self.doc, id) {
             Some(element) => {
-                let nodes = if with_comments {
+                let nodes = if let Some(view) = self.view {
+                    NodeSet::subtree_from_view(view, element, with_comments, budget)?
+                } else if with_comments {
                     match budget {
                         Some(budget) => NodeSet::subtree_with_budget(element, budget)?,
                         None => NodeSet::subtree(element)?,
@@ -370,7 +430,7 @@ impl<'a> UriReferenceResolver<'a> {
     /// Returns `None` when the ID is absent or duplicated, matching fragment
     /// dereferencing and operation start-node selection.
     pub fn node_for_id(&self, id: &str) -> Option<Node<'a, 'a>> {
-        self.id_index.node(id)
+        self.id_index.node(self.doc, id)
     }
 
     /// Resolve a same-document URI to an element under the configured grammar.

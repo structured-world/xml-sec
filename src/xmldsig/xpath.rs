@@ -1033,15 +1033,16 @@ impl<'d> Mirror<'d> {
     fn project<'a>(
         &self,
         source: &'a Document<'a>,
+        input: &NodeSet<'a>,
         selected: nodeset::Nodeset<'d>,
         mode: ProjectionMode,
         materialization_budget: &NodeSetMaterializationBudget,
     ) -> Result<NodeSet<'a>, TransformError> {
         if matches!(mode, ProjectionMode::ExpandToSubtrees) {
-            return self.project_expanded(source, selected, materialization_budget);
+            return self.project_expanded(source, input, selected, materialization_budget);
         }
 
-        let mut result = NodeSet::empty(source);
+        let mut result = NodeSet::empty(input.document());
         for node in selected.document_order() {
             match node {
                 nodeset::Node::Root(_) => {
@@ -1108,10 +1109,11 @@ impl<'d> Mirror<'d> {
     fn project_expanded<'a>(
         &self,
         source: &'a Document<'a>,
+        input: &NodeSet<'a>,
         selected: nodeset::Nodeset<'d>,
         materialization_budget: &NodeSetMaterializationBudget,
     ) -> Result<NodeSet<'a>, TransformError> {
-        let mut result = NodeSet::empty(source);
+        let mut result = NodeSet::empty(input.document());
         let mut selected_elements = HashSet::new();
         let mut root_selected = false;
 
@@ -1610,6 +1612,7 @@ fn evaluate_expression<'a>(
         }
         return mirror.project(
             document,
+            input,
             selected,
             ProjectionMode::ExactNodes,
             materialization_budget,
@@ -1628,6 +1631,7 @@ fn evaluate_expression<'a>(
     };
     mirror.project(
         document,
+        input,
         selected,
         ProjectionMode::ExpandToSubtrees,
         materialization_budget,

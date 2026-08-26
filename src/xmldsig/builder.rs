@@ -11,7 +11,8 @@ use crate::policy::{PolicyViolation, SigningPolicy};
 use crate::xml::{is_xml_1_0_character, is_xml_ncname};
 
 use super::mutation::{
-    padded_base64_len_for_xml, projected_signature_value_output_len_at_index_with_options,
+    fill_signature_value_with_budget, fill_signed_info_digest_values_with_budget,
+    padded_base64_len_for_xml, projected_signature_value_output_len_at_index_with_budget,
     zero_base64_placeholder,
 };
 use super::transforms::{
@@ -284,33 +285,34 @@ impl SignatureBuilder {
                     .output_len()
             ])
         });
-        let digest_validation_template =
-            super::mutation::fill_signed_info_digest_values_with_options(
-                &template,
-                digest_placeholders,
-                Some(policy),
-            )
-            .map_err(map_generated_mutation_error)?;
+        let digest_validation_template = fill_signed_info_digest_values_with_budget(
+            &template,
+            digest_placeholders,
+            Some(policy),
+            Some(budget.xml_parse_work()),
+        )
+        .map_err(map_generated_mutation_error)?;
         let validation_template = if let Some(signature_output_len) = signature_output_len {
             let encoded_signature_len = padded_base64_len_for_xml(signature_output_len, policy)
                 .map_err(map_generated_mutation_error)?;
-            let projected_document_len =
-                projected_signature_value_output_len_at_index_with_options(
-                    &digest_validation_template,
-                    encoded_signature_len,
-                    0,
-                    Some(policy),
-                )
-                .map_err(map_generated_mutation_error)?;
+            let projected_document_len = projected_signature_value_output_len_at_index_with_budget(
+                &digest_validation_template,
+                encoded_signature_len,
+                0,
+                Some(policy),
+                Some(budget.xml_parse_work()),
+            )
+            .map_err(map_generated_mutation_error)?;
             policy
                 .resources
                 .validate_xml_document_len(projected_document_len)?;
             let signature_placeholder =
                 zero_base64_placeholder(signature_output_len, encoded_signature_len);
-            super::mutation::fill_signature_value_with_options(
+            fill_signature_value_with_budget(
                 &digest_validation_template,
                 &signature_placeholder,
                 Some(policy),
+                Some(budget.xml_parse_work()),
             )
             .map_err(map_generated_mutation_error)?
         } else {
@@ -319,6 +321,9 @@ impl SignatureBuilder {
         policy
             .resources
             .validate_xml_document_len(validation_template.len())?;
+        budget
+            .xml_parse_work()
+            .charge_policy(validation_template.len())?;
         let document = super::mutation::parse_with_options(&validation_template, Some(policy))
             .map_err(|error| match error {
                 roxmltree::Error::NodesLimitReached => {

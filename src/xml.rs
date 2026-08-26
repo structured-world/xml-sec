@@ -1,13 +1,17 @@
 //! Shared XML lexical invariants used before serialization.
 
+#[cfg(any(feature = "xmldsig", test))]
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
-use roxmltree::{Document, Node};
+#[cfg(any(feature = "xmldsig", test))]
+use roxmltree::Document;
+use roxmltree::Node;
 
 #[cfg(feature = "xmldsig")]
 use roxmltree::NodeId;
 
 /// Default ID attribute names shared by XMLDSig and XMLEnc selection.
+#[cfg(any(feature = "xmldsig", test))]
 const DEFAULT_ID_ATTRS: &[&str] = &["ID", "Id", "id"];
 
 /// Caller-declared XML ID attribute registration.
@@ -79,10 +83,16 @@ impl IdAttributeRegistration {
         }
     }
 
+    #[cfg(any(feature = "xmldsig", test))]
     fn matches(&self, node: Node<'_, '_>, attribute_name: &str) -> bool {
-        if self.attribute_local_name != attribute_name {
-            return false;
-        }
+        self.attribute_local_name == attribute_name && self.matches_node(node)
+    }
+
+    pub(crate) fn attribute_local_name(&self) -> &str {
+        &self.attribute_local_name
+    }
+
+    pub(crate) fn matches_node(&self, node: Node<'_, '_>) -> bool {
         match &self.element_scope {
             IdAttributeElementScope::AnyElement => true,
             IdAttributeElementScope::AnyNamespace { local_name } => {
@@ -100,10 +110,12 @@ impl IdAttributeRegistration {
 }
 
 /// Duplicate-safe index of XML ID attributes in one parsed document.
+#[cfg(any(feature = "xmldsig", test))]
 pub(crate) struct XmlIdIndex<'a> {
     nodes: HashMap<&'a str, Node<'a, 'a>>,
 }
 
+#[cfg(any(feature = "xmldsig", test))]
 impl<'a> XmlIdIndex<'a> {
     /// Index standard ID spellings plus caller-declared local attribute names.
     #[cfg(feature = "xmldsig")]
@@ -174,6 +186,7 @@ impl<'a> XmlIdIndex<'a> {
 }
 
 /// Return whether a Unicode scalar is permitted by XML 1.0 Fifth Edition [2].
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) fn is_xml_1_0_character(character: char) -> bool {
     // Rust `char` cannot represent the surrogate range between D7FF and E000,
     // but the split keeps that exclusion explicit alongside XML's upper bound.
@@ -189,6 +202,7 @@ pub(crate) fn is_xml_1_0_character(character: char) -> bool {
 }
 
 /// Return whether a string is an XML 1.0 NCName.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) fn is_xml_ncname(value: &str) -> bool {
     if value.is_empty() || value.contains(':') {
         return false;
@@ -204,8 +218,11 @@ pub(crate) fn is_xml_ncname(value: &str) -> bool {
 mod tests {
     use roxmltree::{Document, ParsingOptions};
 
-    use super::{IdAttributeRegistration, XmlIdIndex, is_xml_1_0_character, is_xml_ncname};
+    use super::{IdAttributeRegistration, XmlIdIndex};
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    use super::{is_xml_1_0_character, is_xml_ncname};
 
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     #[test]
     fn xml_1_0_character_boundaries_match_production_two() {
         // Exercise each explicit singleton/range boundary in XML 1.0 [2].
@@ -229,6 +246,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     #[test]
     fn ncname_validation_uses_the_xml_unicode_grammar() {
         for valid in ["id", "_private", "Δοκιμή"] {
