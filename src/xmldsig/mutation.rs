@@ -12,23 +12,37 @@ use quick_xml::{Reader, Writer};
 
 use super::parse::XMLDSIG_NS;
 use super::whitespace::is_xml_whitespace_only;
-use crate::document::XmlParseWorkBudget;
+use crate::document::{
+    DocumentParseSettings, XmlDocumentError, XmlParseWorkBudget,
+    parse_borrowed_with_settings_and_budget,
+};
 
-pub(super) fn parse_with_options<'a>(
+pub(super) fn parse_with_options_and_budget<'a>(
     xml: &'a str,
     policy: Option<&crate::policy::SigningPolicy>,
-) -> Result<roxmltree::Document<'a>, roxmltree::Error> {
-    let Some(policy) = policy else {
-        return roxmltree::Document::parse(xml);
-    };
-    roxmltree::Document::parse_with_options(
-        xml,
-        roxmltree::ParsingOptions {
-            allow_dtd: policy.xml.allow_internal_dtd,
-            nodes_limit: policy.resources.effective_xml_nodes(),
-            entity_resolver: None,
-        },
-    )
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<roxmltree::Document<'a>, XmlDocumentError> {
+    let settings = policy
+        .map(|policy| DocumentParseSettings::from_policy(&policy.xml, &policy.resources))
+        .unwrap_or_default();
+    parse_borrowed_with_settings_and_budget(xml, settings, budget)
+}
+
+fn mutation_parse_settings(policy: Option<&crate::policy::SigningPolicy>) -> DocumentParseSettings {
+    policy
+        .map(|policy| DocumentParseSettings::from_policy(&policy.xml, &policy.resources))
+        .unwrap_or_default()
+}
+
+fn map_mutation_parse_error(
+    error: XmlDocumentError,
+    settings: DocumentParseSettings,
+) -> XmlMutationError {
+    match error.into_policy_violation(settings) {
+        Ok(error) => XmlMutationError::Policy(error),
+        Err(XmlDocumentError::Parse(error)) => XmlMutationError::XmlParse(error),
+        Err(error) => XmlMutationError::Document(error),
+    }
 }
 
 fn parse_mutation_xml_with_options<'a>(
@@ -43,23 +57,9 @@ fn parse_mutation_xml_with_budget<'a>(
     policy: Option<&crate::policy::SigningPolicy>,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<roxmltree::Document<'a>, XmlMutationError> {
-    if let Some(policy) = policy {
-        policy.resources.validate_xml_document_len(xml.len())?;
-    }
-    if let Some(budget) = budget {
-        budget.charge_policy(xml.len())?;
-    }
-    parse_with_options(xml, policy).map_err(|error| match (policy, error) {
-        (Some(policy), roxmltree::Error::NodesLimitReached) => {
-            let maximum = policy.resources.effective_xml_nodes() as usize;
-            XmlMutationError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::XML_NODES,
-                maximum,
-                actual: maximum.saturating_add(1),
-            })
-        }
-        (_, error) => XmlMutationError::XmlParse(error),
-    })
+    let settings = mutation_parse_settings(policy);
+    parse_with_options_and_budget(xml, policy, budget)
+        .map_err(|error| map_mutation_parse_error(error, settings))
 }
 
 /// Errors produced by XMLDSig XML mutation helpers.
@@ -71,6 +71,9 @@ pub enum XmlMutationError {
     /// Input XML or generated template is not parseable XML.
     #[error("XML parsing error: {0}")]
     XmlParse(#[from] roxmltree::Error),
+    /// The backend-neutral document boundary rejected generated XML.
+    #[error("XML document error: {0}")]
+    Document(#[from] XmlDocumentError),
     /// The streaming XML reader failed.
     #[error("XML read error: {0}")]
     Read(#[from] quick_xml::Error),
@@ -1470,7 +1473,7 @@ fn validate_signature_template(
 }
 
 fn count_dsig_elements(xml: &str, local_name: &str) -> Result<usize, XmlMutationError> {
-    let document = roxmltree::Document::parse(xml)?;
+    let document = parse_mutation_xml_with_options(xml, None)?;
     Ok(document
         .descendants()
         .filter(|node| {
@@ -1766,8 +1769,8 @@ mod tests {
 
     #[test]
     fn streaming_mutation_scan_consumes_the_shared_parse_budget() {
-        // The quick-xml rewrite is a parser pass just like the structural DOM
-        // parses before and after it, so all three scans share one allowance.
+        // The quick-xml rewrite and every bounded backend pass before and after
+        // it consume one operation-wide allowance.
         let xml = format!(
             "<root><ds:Signature xmlns:ds=\"{XMLDSIG_NS}\"><ds:SignatureValue/></ds:Signature></root>"
         );
@@ -1782,7 +1785,11 @@ mod tests {
         )
         .expect("streaming mutation must succeed");
 
-        assert_eq!(budget.consumed(), xml.len() * 2 + output.len());
+        let dom_passes = 2 + usize::from(cfg!(feature = "xml-backend-xmloxide"));
+        assert_eq!(
+            budget.consumed(),
+            xml.len() * (dom_passes + 1) + output.len() * dom_passes
+        );
     }
 
     #[test]

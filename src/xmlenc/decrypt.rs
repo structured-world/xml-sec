@@ -680,18 +680,14 @@ fn decrypt_owned_document_with_context(
                 .saturating_add(plaintext.len()),
             &context.policy,
         )?;
-        let node_limit = context.policy.resources.effective_xml_nodes() as usize;
+        let settings =
+            DocumentParseSettings::from_policy(&context.policy.xml, &context.policy.resources);
         match encrypted.encrypted_type.as_ref() {
             Some(EncryptedDataType::Element) => document
-                .replace_element_with_budget(target, &plaintext, node_limit, parse_budget)
+                .replace_element_with_budget(target, &plaintext, settings, parse_budget)
                 .map_err(map_document_mutation_error)?,
             Some(EncryptedDataType::Content) => document
-                .replace_node_with_fragment_with_budget(
-                    target,
-                    &plaintext,
-                    node_limit,
-                    parse_budget,
-                )
+                .replace_node_with_fragment_with_budget(target, &plaintext, settings, parse_budget)
                 .map_err(map_document_mutation_error)?,
             Some(EncryptedDataType::Other(_)) | None => {
                 return Err(XmlEncError::ReplacementRequiresXml);

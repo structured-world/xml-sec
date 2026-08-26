@@ -38,7 +38,10 @@ use super::xpath::{
 };
 use crate::c14n::xml_base::XmlBaseResolutionBudget;
 use crate::c14n::{self, C14nAlgorithm};
-use crate::document::XmlParseWorkBudget;
+use crate::document::{
+    DocumentParseSettings, XmlDocumentError, XmlParseWorkBudget,
+    parse_borrowed_with_settings_and_budget,
+};
 #[cfg(test)]
 use crate::hard_limits::XML_DOCUMENT_NODE_CEILING;
 
@@ -114,7 +117,7 @@ pub(crate) struct TransformExecutionBudget {
     node_set_materialization: NodeSetMaterializationBudget,
     xml_base_resolution: XmlBaseResolutionBudget,
     xml_parse_work: XmlParseWorkBudget,
-    xml_node_limit: u32,
+    xml_parse_settings: DocumentParseSettings,
 }
 
 impl Default for TransformExecutionBudget {
@@ -315,7 +318,7 @@ impl TransformExecutionBudget {
             xml_parse_work: XmlParseWorkBudget::from_resources(
                 &crate::policy::ResourcePolicy::default(),
             ),
-            xml_node_limit: XML_DOCUMENT_NODE_CEILING,
+            xml_parse_settings: DocumentParseSettings::default(),
         }
     }
 
@@ -333,7 +336,7 @@ impl TransformExecutionBudget {
             xml_parse_work: XmlParseWorkBudget::from_resources(
                 &crate::policy::ResourcePolicy::default(),
             ),
-            xml_node_limit: XML_DOCUMENT_NODE_CEILING,
+            xml_parse_settings: DocumentParseSettings::default(),
         }
     }
 
@@ -348,7 +351,7 @@ impl TransformExecutionBudget {
             xml_parse_work: XmlParseWorkBudget::from_resources(
                 &crate::policy::ResourcePolicy::default(),
             ),
-            xml_node_limit: XML_DOCUMENT_NODE_CEILING,
+            xml_parse_settings: DocumentParseSettings::default(),
         }
     }
 
@@ -385,7 +388,12 @@ impl TransformExecutionBudget {
                 resources.effective_xml_base_resolution_bytes(),
             ),
             xml_parse_work: XmlParseWorkBudget::from_resources(resources),
-            xml_node_limit: resources.effective_xml_nodes(),
+            xml_parse_settings: DocumentParseSettings::new_with_depth(
+                false,
+                resources.effective_xml_nodes(),
+                resources.max_xml_depth,
+                resources.max_xml_document_bytes,
+            ),
         }
     }
 
@@ -1126,27 +1134,16 @@ fn execute_transform_chain<'s, 'e, 'd>(
         // signature-wide canonicalization work budget.
         let xml = crate::encoding::decode_xml_octets(&bytes)
             .map_err(|error| TransformError::XmlParse(error.to_string()))?;
-        context
-            .budget
-            .xml_parse_work
-            .charge_policy(xml.len())
-            .map_err(TransformError::from)?;
-        let document = roxmltree::Document::parse_with_options(
+        let settings = DocumentParseSettings {
+            allow_dtd: context.options.internal_dtd_allowed(),
+            ..context.budget.xml_parse_settings
+        };
+        let document = parse_borrowed_with_settings_and_budget(
             &xml,
-            roxmltree::ParsingOptions {
-                allow_dtd: context.options.internal_dtd_allowed(),
-                nodes_limit: context.budget.xml_node_limit,
-                entity_resolver: None,
-            },
+            settings,
+            Some(&context.budget.xml_parse_work),
         )
-        .map_err(|error| match error {
-            roxmltree::Error::NodesLimitReached => transform_resource_limit(
-                crate::policy::resource_name::XML_NODES,
-                context.budget.xml_node_limit as usize,
-                context.budget.xml_node_limit as usize + 1,
-            ),
-            other => TransformError::XmlParse(other.to_string()),
-        })?;
+        .map_err(|error| map_transform_xml_parse_error(error, settings))?;
         context.state.document_reparsed();
         let nodes = super::types::NodeSet::entire_document_with_comments_with_budget(
             &document,
@@ -1397,6 +1394,16 @@ fn execute_transform_chain<'s, 'e, 'd>(
         dependency_tracking,
         context,
     )
+}
+
+fn map_transform_xml_parse_error(
+    error: XmlDocumentError,
+    settings: DocumentParseSettings,
+) -> TransformError {
+    match error.into_policy_violation(settings) {
+        Ok(error) => TransformError::Policy(error),
+        Err(error) => TransformError::XmlParse(error.to_string()),
+    }
 }
 
 fn dependency_indexes(tracking: Option<DependencyTracking>) -> HashSet<usize> {
@@ -2642,8 +2649,9 @@ mod tests {
         // operation meter rather than receiving a parser-local allowance.
         let signature_document = Document::parse("<Signature/>").unwrap();
         let xml = b"<root/>";
+        let parser_passes = 2 + usize::from(cfg!(feature = "xml-backend-xmloxide"));
         let resources = crate::policy::ResourcePolicy {
-            max_xml_parse_work_bytes: xml.len(),
+            max_xml_parse_work_bytes: xml.len() * parser_passes,
             ..crate::policy::ResourcePolicy::default()
         };
         let budget = TransformExecutionBudget::from_resources(&resources);
@@ -2672,7 +2680,8 @@ mod tests {
                 resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
                 maximum,
                 actual,
-            }) if maximum == xml.len() && actual == xml.len() * 2
+            }) if maximum == xml.len() * parser_passes
+                && actual == xml.len() * (parser_passes + 1)
         ));
     }
 
@@ -2706,6 +2715,37 @@ mod tests {
             TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_NODES,
                 ..
+            })
+        ));
+    }
+
+    #[test]
+    fn binary_to_node_set_adapter_enforces_operation_depth() {
+        // Transform-produced XML is a fresh untrusted document and must use
+        // the same depth snapshot as the signature document's initial parse.
+        let signature_document = Document::parse("<Signature/>").unwrap();
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_depth: 2,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = TransformExecutionBudget::from_resources(&resources);
+        let transforms = [Transform::XPath(XPathExpression::new("true()"))];
+
+        let error = execute_transforms_with_options_and_budget(
+            signature_document.root_element(),
+            TransformData::Binary(b"<root><child><leaf/></child></root>".to_vec()),
+            &transforms,
+            TransformOptions::default(),
+            &budget,
+        )
+        .expect_err("over-depth transform XML must be rejected before XPath");
+
+        assert!(matches!(
+            error,
+            TransformError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DEPTH,
+                maximum: 2,
+                actual: 3,
             })
         ));
     }

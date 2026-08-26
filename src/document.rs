@@ -10,17 +10,25 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use quick_xml::{Reader as QuickXmlReader, events::Event as QuickXmlEvent};
 use roxmltree::{Document, Node, NodeId, ParsingOptions};
 use self_cell::self_cell;
 
 use crate::IdAttributeRegistration;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DocumentMetrics {
+    node_count: usize,
+    max_depth: usize,
+}
+
 trait XmlParserBackend {
-    fn validate(
+    fn validate_after_bounded_projection(
         xml: &str,
         settings: DocumentParseSettings,
+        bounded: DocumentMetrics,
         budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<(), XmlDocumentError>;
+    ) -> Result<DocumentMetrics, XmlDocumentError>;
 }
 
 #[cfg(any(not(feature = "xml-backend-xmloxide"), test))]
@@ -28,14 +36,15 @@ struct RoxmltreeParser;
 
 #[cfg(any(not(feature = "xml-backend-xmloxide"), test))]
 impl XmlParserBackend for RoxmltreeParser {
-    fn validate(
+    fn validate_after_bounded_projection(
         _xml: &str,
         _settings: DocumentParseSettings,
+        bounded: DocumentMetrics,
         _budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<(), XmlDocumentError> {
+    ) -> Result<DocumentMetrics, XmlDocumentError> {
         // The retained semantic projection below is itself the roxmltree
         // validation pass, so this adapter must not parse the document twice.
-        Ok(())
+        Ok(bounded)
     }
 }
 
@@ -44,11 +53,15 @@ struct XmloxideParser;
 
 #[cfg(feature = "xml-backend-xmloxide")]
 impl XmlParserBackend for XmloxideParser {
-    fn validate(
+    fn validate_after_bounded_projection(
         xml: &str,
         settings: DocumentParseSettings,
+        bounded: DocumentMetrics,
         budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<(), XmlDocumentError> {
+    ) -> Result<DocumentMetrics, XmlDocumentError> {
+        // xmloxide 0.5 has no aggregate node-count parser option. Requiring a
+        // bounded retained projection here ensures wide input is rejected
+        // before xmloxide can allocate its tree.
         charge_parse_work(budget, xml.len())?;
         let maximum_depth = u32::try_from(settings.depth_limit).unwrap_or(u32::MAX);
         let options = xmloxide::parser::ParseOptions::default()
@@ -58,39 +71,25 @@ impl XmlParserBackend for XmloxideParser {
             .max_text_length(settings.max_bytes)
             .max_name_length(settings.max_bytes)
             .max_entity_expansions(settings.nodes_limit);
-        let document = match xmloxide::parser::parse_str_with_options(xml, &options) {
-            Ok(document) => document,
-            Err(error) => {
+        let document =
+            xmloxide::parser::parse_str_with_options(xml, &options).map_err(|error| {
                 if error.message.contains("maximum nesting depth exceeded") {
-                    return Err(XmlDocumentError::DocumentTooDeep {
+                    XmlDocumentError::DocumentTooDeep {
                         maximum: settings.depth_limit,
                         actual: settings.depth_limit.saturating_add(1),
-                    });
+                    }
+                } else {
+                    XmlDocumentError::BackendParse {
+                        backend: "xmloxide",
+                        message: error.to_string(),
+                    }
                 }
-                // Public failure precedence belongs to the backend-neutral
-                // document contract. An exhausted node budget wins over a
-                // later syntax error on the same input.
-                charge_parse_work(budget, xml.len())?;
-                if let Err(contract_error) = Document::parse_with_options(
-                    xml,
-                    ParsingOptions {
-                        allow_dtd: settings.allow_dtd,
-                        nodes_limit: settings.nodes_limit,
-                        entity_resolver: None,
-                    },
-                ) {
-                    return Err(XmlDocumentError::Parse(contract_error));
-                }
-                return Err(XmlDocumentError::BackendParse {
-                    backend: "xmloxide",
-                    message: error.to_string(),
-                });
-            }
-        };
-        if document.node_count() > settings.nodes_limit as usize {
-            return Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached));
-        }
-        Ok(())
+            })?;
+        debug_assert!(document.node_count() <= settings.nodes_limit as usize);
+        Ok(DocumentMetrics {
+            node_count: document.node_count(),
+            max_depth: bounded.max_depth,
+        })
     }
 }
 
@@ -109,7 +108,7 @@ const VALIDATION_WRAPPER_NODE_OVERHEAD: u32 = 3;
 
 #[cfg(test)]
 fn selected_parser_passes() -> usize {
-    1 + usize::from(cfg!(feature = "xml-backend-xmloxide"))
+    2 + usize::from(cfg!(feature = "xml-backend-xmloxide"))
 }
 
 /// Process-local provenance of one owned XML document.
@@ -438,6 +437,15 @@ struct ParsedDocument<'input> {
     max_depth: usize,
 }
 
+impl ParsedDocument<'_> {
+    const fn metrics(&self) -> DocumentMetrics {
+        DocumentMetrics {
+            node_count: self.node_count,
+            max_depth: self.max_depth,
+        }
+    }
+}
+
 self_cell!(
     struct DocumentCell {
         owner: String,
@@ -511,6 +519,41 @@ pub enum XmlDocumentError {
         /// Maximum accepted parser node count.
         maximum: usize,
     },
+}
+
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+impl XmlDocumentError {
+    pub(crate) fn into_policy_violation(
+        self,
+        settings: DocumentParseSettings,
+    ) -> Result<crate::policy::PolicyViolation, Self> {
+        let violation = match self {
+            Self::Policy(error) => error,
+            Self::DocumentTooLarge { maximum, actual } => {
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DOCUMENT,
+                    maximum,
+                    actual,
+                }
+            }
+            Self::DocumentTooDeep { maximum, actual } => {
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
+                    maximum,
+                    actual,
+                }
+            }
+            Self::Parse(roxmltree::Error::NodesLimitReached) => {
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_NODES,
+                    maximum: settings.nodes_limit as usize,
+                    actual: settings.nodes_limit as usize + 1,
+                }
+            }
+            error => return Err(error),
+        };
+        Ok(violation)
+    }
 }
 
 /// Reusable owned XML document.
@@ -673,9 +716,10 @@ impl XmlDocument {
     #[cfg(feature = "xmldsig")]
     pub(crate) fn staged_copy_with_budget(
         &self,
+        settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<Self, XmlDocumentError> {
-        Self::parse_with_settings_and_budget(self.as_xml().to_owned(), self.settings, budget)
+        Self::parse_with_settings_and_budget(self.as_xml().to_owned(), settings, budget)
     }
 
     /// Borrow the retained parsed view without reparsing.
@@ -702,8 +746,14 @@ impl XmlDocument {
             }
             Ok(node.range())
         })?;
-        self.ensure_replacement_fits(&range, replacement.len())?;
-        self.validate_single_element_in_parent_context(target, replacement, None, None)?;
+        self.ensure_replacement_fits(&range, replacement.len(), self.settings.max_bytes)?;
+        self.validate_single_element_in_parent_context(
+            target,
+            replacement,
+            None,
+            self.settings,
+            None,
+        )?;
         self.replace_range(range, replacement, None)
     }
 
@@ -712,7 +762,7 @@ impl XmlDocument {
         &mut self,
         target: NodeIdentity,
         replacement: &str,
-        maximum: usize,
+        settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
         let range = self.with_view(|view| {
@@ -722,14 +772,15 @@ impl XmlDocument {
             }
             Ok(node.range())
         })?;
-        self.ensure_replacement_fits(&range, replacement.len())?;
+        self.ensure_replacement_fits(&range, replacement.len(), settings.max_bytes)?;
         self.validate_single_element_in_parent_context(
             target,
             replacement,
-            Some(maximum),
+            Some(settings.nodes_limit as usize),
+            settings,
             Some(budget),
         )?;
-        self.replace_range_with_node_limit(range, replacement, maximum, Some(budget))
+        self.replace_range_with_settings(range, replacement, settings, Some(budget))
     }
 
     /// Replace one complete node with an XML fragment valid in its parent context.
@@ -743,8 +794,8 @@ impl XmlDocument {
     ) -> Result<(), XmlDocumentError> {
         let range =
             self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
-        self.ensure_replacement_fits(&range, replacement.len())?;
-        self.validate_fragment_in_parent_context(target, replacement, None, None)?;
+        self.ensure_replacement_fits(&range, replacement.len(), self.settings.max_bytes)?;
+        self.validate_fragment_in_parent_context(target, replacement, None, self.settings, None)?;
         self.replace_range(range, replacement, None)
     }
 
@@ -753,14 +804,20 @@ impl XmlDocument {
         &mut self,
         target: NodeIdentity,
         replacement: &str,
-        maximum: usize,
+        settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
         let range =
             self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
-        self.ensure_replacement_fits(&range, replacement.len())?;
-        self.validate_fragment_in_parent_context(target, replacement, Some(maximum), Some(budget))?;
-        self.replace_range_with_node_limit(range, replacement, maximum, Some(budget))
+        self.ensure_replacement_fits(&range, replacement.len(), settings.max_bytes)?;
+        self.validate_fragment_in_parent_context(
+            target,
+            replacement,
+            Some(settings.nodes_limit as usize),
+            settings,
+            Some(budget),
+        )?;
+        self.replace_range_with_settings(range, replacement, settings, Some(budget))
     }
 
     /// Replace all children of one element with a well-formed XML fragment.
@@ -769,7 +826,7 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
     ) -> Result<(), XmlDocumentError> {
-        self.replace_content_inner(target, replacement, None, None)
+        self.replace_content_inner(target, replacement, None, self.settings, None)
     }
 
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
@@ -777,10 +834,16 @@ impl XmlDocument {
         &mut self,
         target: NodeIdentity,
         replacement: &str,
-        maximum: usize,
+        settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
-        self.replace_content_inner(target, replacement, Some(maximum), Some(budget))
+        self.replace_content_inner(
+            target,
+            replacement,
+            Some(settings.nodes_limit as usize),
+            settings,
+            Some(budget),
+        )
     }
 
     fn replace_content_inner(
@@ -788,6 +851,7 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
         maximum: Option<usize>,
+        settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
         let (range, self_closing_expansion, serialized_len) = self.with_view(|view| {
@@ -809,7 +873,7 @@ impl XmlDocument {
                     .and_then(|length| length.checked_add(qualified_name.len()))
                     .and_then(|length| length.checked_add(4))
                     .ok_or(XmlDocumentError::DocumentTooLarge {
-                        maximum: self.settings.max_bytes,
+                        maximum: settings.max_bytes,
                         actual: usize::MAX,
                     })?;
                 return Ok((range, Some((slash, qualified_name)), serialized_len));
@@ -817,16 +881,17 @@ impl XmlDocument {
             let range = (range.start + content.start)..(range.start + content.end);
             Ok((range, None, replacement.len()))
         })?;
-        self.ensure_replacement_fits(&range, serialized_len)?;
+        self.ensure_replacement_fits(&range, serialized_len, settings.max_bytes)?;
         let serialized_replacement = if let Some((slash, qualified_name)) = self_closing_expansion {
             let source = &self.as_xml()[range.clone()];
             format!("{}>{replacement}</{qualified_name}>", &source[..slash])
         } else {
             replacement.to_owned()
         };
-        self.validate_content_in_element_context(target, replacement, maximum, budget)?;
+        self.validate_content_in_element_context(target, replacement, maximum, settings, budget)?;
         if let Some(maximum) = maximum {
-            self.replace_range_with_node_limit(range, &serialized_replacement, maximum, budget)
+            debug_assert_eq!(maximum, settings.nodes_limit as usize);
+            self.replace_range_with_settings(range, &serialized_replacement, settings, budget)
         } else {
             self.replace_range(range, &serialized_replacement, budget)
         }
@@ -841,30 +906,24 @@ impl XmlDocument {
         &mut self,
         replacements: &[(NodeIdentity, String)],
     ) -> Result<(), XmlDocumentError> {
-        self.replace_contents_inner(replacements, None, None, None)
+        self.replace_contents_inner(replacements, self.settings, false, None)
     }
 
     #[cfg(feature = "xmldsig")]
     pub(crate) fn replace_contents_with_budget(
         &mut self,
         replacements: &[(NodeIdentity, String)],
-        maximum_bytes: usize,
-        maximum_nodes: usize,
+        settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
-        self.replace_contents_inner(
-            replacements,
-            Some(maximum_bytes),
-            Some(maximum_nodes),
-            Some(budget),
-        )
+        self.replace_contents_inner(replacements, settings, true, Some(budget))
     }
 
     fn replace_contents_inner(
         &mut self,
         replacements: &[(NodeIdentity, String)],
-        maximum_bytes: Option<usize>,
-        maximum_nodes: Option<usize>,
+        settings: DocumentParseSettings,
+        policy_bounded: bool,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
         if replacements.is_empty() {
@@ -923,9 +982,7 @@ impl XmlDocument {
                 "replacement targets overlap".into(),
             ));
         }
-        let active_maximum_bytes = maximum_bytes
-            .unwrap_or(self.settings.max_bytes)
-            .min(self.settings.max_bytes);
+        let active_maximum_bytes = settings.max_bytes;
         let projected = edits.iter().try_fold(self.as_xml().len(), |length, edit| {
             length
                 .checked_sub(edit.range.len())
@@ -942,7 +999,7 @@ impl XmlDocument {
             });
         }
 
-        self.validate_content_edits(&edits, maximum_nodes, budget)?;
+        self.validate_content_edits(&edits, settings, policy_bounded, budget)?;
 
         let mut output = String::with_capacity(projected);
         let mut cursor = 0;
@@ -953,8 +1010,8 @@ impl XmlDocument {
         }
         output.push_str(&self.as_xml()[cursor..]);
         debug_assert_eq!(output.len(), projected);
-        if let Some(maximum_nodes) = maximum_nodes {
-            self.replace_serialized_with_node_limit(output, maximum_nodes, budget)
+        if policy_bounded {
+            self.replace_serialized_with_settings(output, settings, budget)
         } else {
             self.replace_serialized(output, budget)
         }
@@ -963,7 +1020,8 @@ impl XmlDocument {
     fn validate_content_edits(
         &self,
         edits: &[ContentReplacementEdit<'_>],
-        maximum_nodes: Option<usize>,
+        settings: DocumentParseSettings,
+        policy_bounded: bool,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
         let projected = edits.iter().try_fold(self.as_xml().len(), |length, edit| {
@@ -985,9 +1043,7 @@ impl XmlDocument {
         candidate.push_str(&self.as_xml()[cursor..]);
         debug_assert_eq!(candidate.len(), projected);
 
-        let active_nodes_limit = maximum_nodes
-            .map(|maximum| maximum.min(self.settings.nodes_limit as usize))
-            .unwrap_or(self.settings.nodes_limit as usize);
+        let active_nodes_limit = settings.nodes_limit as usize;
         let wrapper_allowance = edits.len();
         let validation_nodes_limit = active_nodes_limit
             .checked_add(wrapper_allowance)
@@ -997,21 +1053,21 @@ impl XmlDocument {
             candidate,
             DocumentParseSettings {
                 nodes_limit: validation_nodes_limit,
-                depth_limit: self.settings.depth_limit.saturating_add(1),
+                depth_limit: settings.depth_limit.saturating_add(1),
                 max_bytes: projected,
-                ..self.settings
+                ..settings
             },
             budget,
         )
-        .map_err(|error| match (maximum_nodes, error) {
-            (Some(_), XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached)) => {
+        .map_err(|error| match (policy_bounded, error) {
+            (true, XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached)) => {
                 XmlDocumentError::ProjectedNodeLimit {
                     maximum: active_nodes_limit,
                 }
             }
             (_, XmlDocumentError::DocumentTooDeep { actual, .. }) => {
                 XmlDocumentError::DocumentTooDeep {
-                    maximum: self.settings.depth_limit,
+                    maximum: settings.depth_limit,
                     actual: actual.saturating_sub(1),
                 }
             }
@@ -1026,7 +1082,7 @@ impl XmlDocument {
         target: NodeIdentity,
         child: &str,
     ) -> Result<(), XmlDocumentError> {
-        self.append_child_inner(target, child, None, None)
+        self.append_child_inner(target, child, None, self.settings, None)
     }
 
     #[cfg(feature = "xmldsig")]
@@ -1034,10 +1090,16 @@ impl XmlDocument {
         &mut self,
         target: NodeIdentity,
         child: &str,
-        maximum: usize,
+        settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
-        self.append_child_inner(target, child, Some(maximum), Some(budget))
+        self.append_child_inner(
+            target,
+            child,
+            Some(settings.nodes_limit as usize),
+            settings,
+            Some(budget),
+        )
     }
 
     fn append_child_inner(
@@ -1045,12 +1107,13 @@ impl XmlDocument {
         target: NodeIdentity,
         child: &str,
         maximum: Option<usize>,
+        settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
         let projected = self.projected_child_append_len(target, child.len())?;
-        if projected > self.settings.max_bytes {
+        if projected > settings.max_bytes {
             return Err(XmlDocumentError::DocumentTooLarge {
-                maximum: self.settings.max_bytes,
+                maximum: settings.max_bytes,
                 actual: projected,
             });
         }
@@ -1078,10 +1141,11 @@ impl XmlDocument {
                 child.to_owned(),
             ))
         })?;
-        self.ensure_replacement_fits(&range, replacement.len())?;
-        self.validate_content_in_element_context(target, child, maximum, budget)?;
+        self.ensure_replacement_fits(&range, replacement.len(), settings.max_bytes)?;
+        self.validate_content_in_element_context(target, child, maximum, settings, budget)?;
         if let Some(maximum) = maximum {
-            self.replace_range_with_node_limit(range, &replacement, maximum, budget)
+            debug_assert_eq!(maximum, settings.nodes_limit as usize);
+            self.replace_range_with_settings(range, &replacement, settings, budget)
         } else {
             self.replace_range(range, &replacement, budget)
         }
@@ -1096,26 +1160,16 @@ impl XmlDocument {
         self.commit_cell(next)
     }
 
-    pub(crate) fn replace_serialized_with_node_limit(
+    pub(crate) fn replace_serialized_with_settings(
         &mut self,
         xml: String,
-        maximum: usize,
+        settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
-        let effective_maximum = maximum.min(self.settings.nodes_limit as usize);
-        let nodes_limit = u32::try_from(effective_maximum).unwrap_or(u32::MAX);
-        let next = build_cell(
-            xml,
-            DocumentParseSettings {
-                nodes_limit,
-                ..self.settings
-            },
-            budget,
-        )
-        .map_err(|error| match error {
+        let next = build_cell(xml, settings, budget).map_err(|error| match error {
             XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached) => {
                 XmlDocumentError::ProjectedNodeLimit {
-                    maximum: effective_maximum,
+                    maximum: settings.nodes_limit as usize,
                 }
             }
             error => error,
@@ -1230,27 +1284,28 @@ impl XmlDocument {
         replacement: &str,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
-        let output = self.replaced_range(range, replacement)?;
+        let output = self.replaced_range(range, replacement, self.settings.max_bytes)?;
         self.replace_serialized(output, budget)
     }
 
-    fn replace_range_with_node_limit(
+    fn replace_range_with_settings(
         &mut self,
         range: std::ops::Range<usize>,
         replacement: &str,
-        maximum: usize,
+        settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
-        let output = self.replaced_range(range, replacement)?;
-        self.replace_serialized_with_node_limit(output, maximum, budget)
+        let output = self.replaced_range(range, replacement, settings.max_bytes)?;
+        self.replace_serialized_with_settings(output, settings, budget)
     }
 
     fn replaced_range(
         &self,
         range: std::ops::Range<usize>,
         replacement: &str,
+        maximum_bytes: usize,
     ) -> Result<String, XmlDocumentError> {
-        let projected = self.ensure_replacement_fits(&range, replacement.len())?;
+        let projected = self.ensure_replacement_fits(&range, replacement.len(), maximum_bytes)?;
         let mut output = String::with_capacity(projected);
         output.push_str(&self.as_xml()[..range.start]);
         output.push_str(replacement);
@@ -1262,6 +1317,7 @@ impl XmlDocument {
         &self,
         range: &std::ops::Range<usize>,
         replacement_len: usize,
+        maximum_bytes: usize,
     ) -> Result<usize, XmlDocumentError> {
         let projected = self
             .as_xml()
@@ -1269,12 +1325,12 @@ impl XmlDocument {
             .checked_sub(range.len())
             .and_then(|length| length.checked_add(replacement_len))
             .ok_or(XmlDocumentError::DocumentTooLarge {
-                maximum: self.settings.max_bytes,
+                maximum: maximum_bytes,
                 actual: usize::MAX,
             })?;
-        if projected > self.settings.max_bytes {
+        if projected > maximum_bytes {
             return Err(XmlDocumentError::DocumentTooLarge {
-                maximum: self.settings.max_bytes,
+                maximum: maximum_bytes,
                 actual: projected,
             });
         }
@@ -1286,10 +1342,11 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
         maximum: Option<usize>,
+        settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
         let (parsed, wrapper_range) =
-            self.parse_fragment_in_parent_context(target, replacement, maximum, budget)?;
+            self.parse_fragment_in_parent_context(target, replacement, maximum, settings, budget)?;
         parsed.with_dependent(|_, parsed| {
             let wrapper = validation_wrapper(parsed, wrapper_range.clone())?;
             if wrapper.children().filter(Node::is_element).count() != 1
@@ -1313,9 +1370,10 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
         maximum: Option<usize>,
+        settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
-        self.parse_fragment_in_parent_context(target, replacement, maximum, budget)
+        self.parse_fragment_in_parent_context(target, replacement, maximum, settings, budget)
             .map(|_| ())
     }
 
@@ -1324,11 +1382,12 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
         maximum: Option<usize>,
+        settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(DocumentCell, std::ops::Range<usize>), XmlDocumentError> {
         let range =
             self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
-        self.parse_wrapped_range(range, replacement, maximum, budget)
+        self.parse_wrapped_range(range, replacement, maximum, settings, budget)
     }
 
     fn validate_content_in_element_context(
@@ -1336,6 +1395,7 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
         maximum: Option<usize>,
+        settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
         let (element_range, content_range, qualified_name, self_closing) =
@@ -1356,7 +1416,7 @@ impl XmlDocument {
             })?;
         if !self_closing {
             return self
-                .parse_wrapped_range(content_range, replacement, maximum, budget)
+                .parse_wrapped_range(content_range, replacement, maximum, settings, budget)
                 .map(|_| ());
         }
 
@@ -1372,6 +1432,7 @@ impl XmlDocument {
             &expanded,
             wrapper_start..(wrapper_start + wrapped.len()),
             maximum,
+            settings,
             budget,
         )
         .map(|_| ())
@@ -1382,11 +1443,12 @@ impl XmlDocument {
         range: std::ops::Range<usize>,
         replacement: &str,
         maximum: Option<usize>,
+        settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(DocumentCell, std::ops::Range<usize>), XmlDocumentError> {
         let wrapped = wrapped_fragment(replacement);
         let wrapper_range = range.start..(range.start + wrapped.len());
-        self.parse_wrapped_edit(range, &wrapped, wrapper_range, maximum, budget)
+        self.parse_wrapped_edit(range, &wrapped, wrapper_range, maximum, settings, budget)
     }
 
     fn parse_wrapped_edit(
@@ -1395,6 +1457,7 @@ impl XmlDocument {
         replacement: &str,
         wrapper_range: std::ops::Range<usize>,
         maximum: Option<usize>,
+        settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(DocumentCell, std::ops::Range<usize>), XmlDocumentError> {
         let projected = self
@@ -1410,18 +1473,18 @@ impl XmlDocument {
         candidate.push_str(replacement);
         candidate.push_str(&self.as_xml()[range.end..]);
         let active_nodes_limit = maximum
-            .map(|maximum| maximum.min(self.settings.nodes_limit as usize))
+            .map(|maximum| maximum.min(settings.nodes_limit as usize))
             .map(|maximum| u32::try_from(maximum).unwrap_or(u32::MAX))
-            .unwrap_or(self.settings.nodes_limit);
+            .unwrap_or(settings.nodes_limit);
         let parsed = build_cell(
             candidate,
             DocumentParseSettings {
                 nodes_limit: active_nodes_limit.saturating_add(VALIDATION_WRAPPER_NODE_OVERHEAD),
                 // Wrapper markup is validation scaffolding, not document input.
                 // The committed candidate is checked against the real ceiling.
-                depth_limit: self.settings.depth_limit.saturating_add(1),
+                depth_limit: settings.depth_limit.saturating_add(1),
                 max_bytes: projected,
-                ..self.settings
+                ..settings
             },
             budget,
         )
@@ -1433,7 +1496,7 @@ impl XmlDocument {
             }
             (_, XmlDocumentError::DocumentTooDeep { actual, .. }) => {
                 XmlDocumentError::DocumentTooDeep {
-                    maximum: self.settings.depth_limit,
+                    maximum: settings.depth_limit,
                     actual: actual.saturating_sub(1),
                 }
             }
@@ -1737,11 +1800,22 @@ fn build_cell(
             actual: xml.len(),
         });
     }
-    // Backends only validate borrowed input. The type contract prevents a
-    // parser serializer from rewriting bytes consumed by XMLDSig or mutation.
-    SelectedXmlParser::validate(&xml, settings, budget)?;
+    // A non-allocating event preflight protects both DOM implementations:
+    // roxmltree has no depth option and xmloxide 0.5 has no aggregate node option.
     charge_parse_work(budget, xml.len())?;
-    build_roxmltree_cell(xml, settings)
+    preflight_document_limits(&xml, settings)?;
+    charge_parse_work(budget, xml.len())?;
+    let cell = build_roxmltree_cell(xml, settings)?;
+    cell.with_dependent(|source, parsed| {
+        SelectedXmlParser::validate_after_bounded_projection(
+            source,
+            settings,
+            parsed.metrics(),
+            budget,
+        )
+        .map(|_| ())
+    })?;
+    Ok(cell)
 }
 
 fn build_roxmltree_cell(
@@ -1749,16 +1823,7 @@ fn build_roxmltree_cell(
     settings: DocumentParseSettings,
 ) -> Result<DocumentCell, XmlDocumentError> {
     DocumentCell::try_new(xml, |source| {
-        let document = Document::parse_with_options(
-            source,
-            ParsingOptions {
-                allow_dtd: settings.allow_dtd,
-                nodes_limit: settings.nodes_limit,
-                entity_resolver: None,
-            },
-        )
-        .map_err(XmlDocumentError::Parse)?;
-        let metrics = validate_document_metrics(&document, settings.depth_limit)?;
+        let (document, metrics) = parse_roxmltree_projection(source, settings)?;
         let indexes = DocumentIndexes::build(&document);
         Ok::<_, XmlDocumentError>(ParsedDocument {
             document,
@@ -1769,9 +1834,93 @@ fn build_roxmltree_cell(
     })
 }
 
-struct DocumentMetrics {
-    node_count: usize,
-    max_depth: usize,
+pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
+    xml: &'a str,
+    settings: DocumentParseSettings,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<Document<'a>, XmlDocumentError> {
+    if xml.len() > settings.max_bytes {
+        return Err(XmlDocumentError::DocumentTooLarge {
+            maximum: settings.max_bytes,
+            actual: xml.len(),
+        });
+    }
+    charge_parse_work(budget, xml.len())?;
+    preflight_document_limits(xml, settings)?;
+    charge_parse_work(budget, xml.len())?;
+    let (document, metrics) = parse_roxmltree_projection(xml, settings)?;
+    SelectedXmlParser::validate_after_bounded_projection(xml, settings, metrics, budget)?;
+    Ok(document)
+}
+
+fn preflight_document_limits(
+    xml: &str,
+    settings: DocumentParseSettings,
+) -> Result<(), XmlDocumentError> {
+    let mut reader = QuickXmlReader::from_str(xml);
+    let mut depth = 0_usize;
+    // roxmltree exposes its document root as the first semantic node.
+    let mut nodes = 1_u32;
+    // Syntax diagnostics and exact parser precedence belong to the selected
+    // DOM pipeline; this pass stops at malformed syntax after bounding its prefix.
+    while let Ok(event) = reader.read_event() {
+        let adds_node = matches!(
+            event,
+            QuickXmlEvent::Start(_)
+                | QuickXmlEvent::Empty(_)
+                | QuickXmlEvent::Text(_)
+                | QuickXmlEvent::CData(_)
+                | QuickXmlEvent::Comment(_)
+                | QuickXmlEvent::PI(_)
+        );
+        if adds_node {
+            nodes = nodes.saturating_add(1);
+            if nodes > settings.nodes_limit {
+                return Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached));
+            }
+        }
+        match event {
+            QuickXmlEvent::Start(_) => {
+                depth = depth.saturating_add(1);
+                if depth > settings.depth_limit {
+                    return Err(XmlDocumentError::DocumentTooDeep {
+                        maximum: settings.depth_limit,
+                        actual: depth,
+                    });
+                }
+            }
+            QuickXmlEvent::Empty(_) => {
+                let actual = depth.saturating_add(1);
+                if actual > settings.depth_limit {
+                    return Err(XmlDocumentError::DocumentTooDeep {
+                        maximum: settings.depth_limit,
+                        actual,
+                    });
+                }
+            }
+            QuickXmlEvent::End(_) => depth = depth.saturating_sub(1),
+            QuickXmlEvent::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn parse_roxmltree_projection<'a>(
+    source: &'a str,
+    settings: DocumentParseSettings,
+) -> Result<(Document<'a>, DocumentMetrics), XmlDocumentError> {
+    let document = Document::parse_with_options(
+        source,
+        ParsingOptions {
+            allow_dtd: settings.allow_dtd,
+            nodes_limit: settings.nodes_limit,
+            entity_resolver: None,
+        },
+    )
+    .map_err(XmlDocumentError::Parse)?;
+    let metrics = validate_document_metrics(&document, settings.depth_limit)?;
+    Ok((document, metrics))
 }
 
 fn validate_document_metrics(
@@ -1997,21 +2146,45 @@ mod tests {
         let settings = DocumentParseSettings::default();
         let xml =
             r#"<root xmlns:p="urn:test"><p:item ID="target"><![CDATA[value]]></p:item></root>"#;
-        RoxmltreeParser::validate(xml, settings, None).expect("roxmltree must accept the fixture");
-        XmloxideParser::validate(xml, settings, None).expect("xmloxide must accept the fixture");
-        let roxmltree = build_roxmltree_cell(xml.to_owned(), settings)
+        let retained = build_roxmltree_cell(xml.to_owned(), settings)
             .expect("roxmltree semantic projection must parse");
-        let xmloxide = build_roxmltree_cell(xml.to_owned(), settings)
-            .expect("xmloxide semantic projection must parse");
-        roxmltree.with_dependent(|_, parsed| {
-            xmloxide.with_dependent(|_, candidate| {
-                assert_eq!(
-                    parsed.document.descendants().count(),
-                    candidate.document.descendants().count()
-                );
-                assert_eq!(parsed.indexes.default_ids, candidate.indexes.default_ids);
-            });
+        retained.with_dependent(|source, parsed| {
+            let roxmltree = RoxmltreeParser::validate_after_bounded_projection(
+                source,
+                settings,
+                parsed.metrics(),
+                None,
+            )
+            .expect("roxmltree metrics must be available");
+            let xmloxide = XmloxideParser::validate_after_bounded_projection(
+                source,
+                settings,
+                parsed.metrics(),
+                None,
+            )
+            .expect("xmloxide must accept the fixture");
+            assert_eq!(roxmltree.node_count, xmloxide.node_count);
+            assert_eq!(roxmltree.max_depth, xmloxide.max_depth);
+            assert!(parsed.indexes.default_ids.contains_key("target"));
         });
+    }
+
+    #[test]
+    fn node_preflight_rejects_wide_input_before_any_dom_pass() {
+        // The allowance covers only the streaming preflight. Reaching either
+        // DOM would exhaust parser work before it could report the node bound.
+        let xml = "<root><first/><second/></root>";
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_parse_work_bytes: xml.len(),
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let budget = XmlParseWorkBudget::from_resources(&resources);
+        let settings = DocumentParseSettings::new(false, 3, xml.len());
+
+        assert!(matches!(
+            build_cell(xml.to_owned(), settings, Some(&budget)),
+            Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached))
+        ));
     }
 
     fn nested_document(depth: usize) -> String {
@@ -2026,13 +2199,9 @@ mod tests {
         // policy as the default parser rather than relying on backend defaults.
         let settings = DocumentParseSettings::new_with_depth(false, 128, 2, 4_096);
         let accepted = nested_document(2);
-        RoxmltreeParser::validate(&accepted, settings, None)
-            .expect("adapter must accept the exact boundary");
         build_roxmltree_cell(accepted, settings).expect("exact depth must parse");
 
         let rejected = nested_document(3);
-        RoxmltreeParser::validate(&rejected, settings, None)
-            .expect("adapter defers retained-view validation");
         assert!(matches!(
             build_roxmltree_cell(rejected, settings),
             Err(XmlDocumentError::DocumentTooDeep {
@@ -2049,12 +2218,11 @@ mod tests {
         // while exposing the same backend-neutral document error.
         let settings = DocumentParseSettings::new_with_depth(false, 128, 2, 4_096);
         let accepted = nested_document(2);
-        XmloxideParser::validate(&accepted, settings, None).expect("exact depth must be accepted");
-        build_roxmltree_cell(accepted, settings).expect("exact depth must parse");
+        build_cell(accepted, settings, None).expect("exact depth must parse");
 
         let rejected = nested_document(3);
         assert!(matches!(
-            XmloxideParser::validate(&rejected, settings, None),
+            build_cell(rejected, settings, None),
             Err(XmlDocumentError::DocumentTooDeep {
                 maximum: 2,
                 actual: 3,
@@ -2415,7 +2583,7 @@ mod tests {
             document.replace_node_with_fragment_with_budget(
                 target,
                 "<replacement><child/><child/><malformed>",
-                maximum,
+                DocumentParseSettings::new(false, maximum as u32, 4_096),
                 &budget,
             ),
             Err(XmlDocumentError::ProjectedNodeLimit { maximum: rejected })
@@ -2474,7 +2642,11 @@ mod tests {
         let budget = XmlParseWorkBudget::from_resources(&crate::policy::ResourcePolicy::default());
 
         let error = document
-            .replace_contents_with_budget(&replacements, maximum, 128, &budget)
+            .replace_contents_with_budget(
+                &replacements,
+                DocumentParseSettings::new(false, 128, maximum),
+                &budget,
+            )
             .expect_err("the active byte ceiling must reject the complete batch");
 
         assert!(matches!(
@@ -2545,12 +2717,7 @@ mod tests {
         let budget = XmlParseWorkBudget::with_limit(maximum);
 
         document
-            .replace_contents_with_budget(
-                &replacements,
-                crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
-                crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
-                &budget,
-            )
+            .replace_contents_with_budget(&replacements, DocumentParseSettings::default(), &budget)
             .expect("the batch must fit its two combined parser passes exactly");
 
         assert_eq!(budget.consumed(), maximum);
@@ -2616,8 +2783,7 @@ mod tests {
         document
             .replace_contents_with_budget(
                 &[(first, "a".into())],
-                crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
-                crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
+                DocumentParseSettings::default(),
                 &budget,
             )
             .expect("the first mutation must consume the exact allowance");
@@ -2635,8 +2801,7 @@ mod tests {
         let error = document
             .replace_contents_with_budget(
                 &[(second, "b".into())],
-                crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
-                crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
+                DocumentParseSettings::default(),
                 &budget,
             )
             .expect_err("the second mutation must not receive a fresh allowance");
@@ -2673,7 +2838,12 @@ mod tests {
         let budget = XmlParseWorkBudget::from_resources(&crate::policy::ResourcePolicy::default());
 
         assert!(matches!(
-            document.replace_content_with_budget(target, "value", maximum, &budget),
+            document.replace_content_with_budget(
+                target,
+                "value",
+                DocumentParseSettings::new(false, maximum as u32, 1_024),
+                &budget,
+            ),
             Err(XmlDocumentError::ProjectedNodeLimit { maximum: rejected })
                 if rejected == maximum
         ));
@@ -2695,7 +2865,12 @@ mod tests {
         let budget = XmlParseWorkBudget::from_resources(&crate::policy::ResourcePolicy::default());
 
         document
-            .append_child_with_budget(root, "more", 3, &budget)
+            .append_child_with_budget(
+                root,
+                "more",
+                DocumentParseSettings::new(false, 3, 1_024),
+                &budget,
+            )
             .expect("merged text must not consume another committed node");
 
         assert_eq!(document.as_xml(), "<root>textmore</root>");
@@ -2720,7 +2895,12 @@ mod tests {
         let budget = XmlParseWorkBudget::from_resources(&crate::policy::ResourcePolicy::default());
 
         document
-            .replace_node_with_fragment_with_budget(target, "middle", 3, &budget)
+            .replace_node_with_fragment_with_budget(
+                target,
+                "middle",
+                DocumentParseSettings::new(false, 3, 1_024),
+                &budget,
+            )
             .expect("both boundary text pairs must merge in the committed document");
 
         assert_eq!(document.as_xml(), "<root>leftmiddleright</root>");

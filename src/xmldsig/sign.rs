@@ -898,13 +898,16 @@ impl<'a> SignContext<'a> {
         self.validate_owned_document_input(document)?;
         let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
         let mut staged = document
-            .staged_copy_with_budget(budgets.transforms.xml_parse_work())
+            .staged_copy_with_budget(
+                DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
+                budgets.transforms.xml_parse_work(),
+            )
             .map_err(map_owned_document_mutation_error)?;
         self.sign_document_in_place(&mut staged, &mut budgets)?;
         document
-            .replace_serialized_with_node_limit(
+            .replace_serialized_with_settings(
                 staged.into_xml(),
-                self.policy.resources.effective_xml_nodes() as usize,
+                DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
                 Some(budgets.transforms.xml_parse_work()),
             )
             .map_err(map_owned_document_mutation_error)
@@ -977,9 +980,9 @@ impl<'a> SignContext<'a> {
         };
         if let Some(populated) = with_key_info {
             document
-                .replace_serialized_with_node_limit(
+                .replace_serialized_with_settings(
                     populated,
-                    self.policy.resources.effective_xml_nodes() as usize,
+                    DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
                     Some(budgets.transforms.xml_parse_work()),
                 )
                 .map_err(map_owned_document_mutation_error)?;
@@ -1054,7 +1057,7 @@ impl<'a> SignContext<'a> {
             .replace_content_with_budget(
                 signature_value_node,
                 &signature_b64,
-                self.policy.resources.effective_xml_nodes() as usize,
+                DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
                 budgets.transforms.xml_parse_work(),
             )
             .map_err(map_owned_document_mutation_error)?;
@@ -1100,13 +1103,16 @@ impl<'a> SignContext<'a> {
         self.validate_owned_document_input(document)?;
         let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
         let mut staged = document
-            .staged_copy_with_budget(budgets.transforms.xml_parse_work())
+            .staged_copy_with_budget(
+                DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
+                budgets.transforms.xml_parse_work(),
+            )
             .map_err(map_owned_document_mutation_error)?;
         self.sign_document_with_builder_in_place(&mut staged, builder, &mut budgets)?;
         document
-            .replace_serialized_with_node_limit(
+            .replace_serialized_with_settings(
                 staged.into_xml(),
-                self.policy.resources.effective_xml_nodes() as usize,
+                DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
                 Some(budgets.transforms.xml_parse_work()),
             )
             .map_err(map_owned_document_mutation_error)
@@ -1147,7 +1153,7 @@ impl<'a> SignContext<'a> {
             .append_child_with_budget(
                 signature_parent,
                 &template,
-                self.policy.resources.effective_xml_nodes() as usize,
+                DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
                 budgets.transforms.xml_parse_work(),
             )
             .map_err(map_owned_document_mutation_error)?;
@@ -1506,8 +1512,7 @@ fn fill_reference_digest_values_in_dependency_order(
         document
             .replace_contents_with_budget(
                 &replacements,
-                policy.resources.max_xml_document_bytes,
-                policy.resources.effective_xml_nodes() as usize,
+                DocumentParseSettings::from_policy(&policy.xml, &policy.resources),
                 budgets.transforms.xml_parse_work(),
             )
             .map_err(map_owned_document_digest_mutation_error)?;
@@ -1827,10 +1832,16 @@ fn parse_signing_document<'a>(
     policy: Option<&crate::policy::SigningPolicy>,
     budget: &XmlParseWorkBudget,
 ) -> Result<Document<'a>, SigningDigestError> {
-    budget
-        .charge(xml.len())
-        .map_err(map_owned_document_digest_mutation_error)?;
-    super::mutation::parse_with_options(xml, policy).map_err(SigningDigestError::XmlParse)
+    let settings = policy
+        .map(|policy| DocumentParseSettings::from_policy(&policy.xml, &policy.resources))
+        .unwrap_or_default();
+    super::mutation::parse_with_options_and_budget(xml, policy, Some(budget)).map_err(|error| {
+        match error.into_policy_violation(settings) {
+            Ok(error) => SigningDigestError::Policy(error),
+            Err(XmlDocumentError::Parse(error)) => SigningDigestError::XmlParse(error),
+            Err(error) => SigningDigestError::Document(error),
+        }
+    })
 }
 
 fn parse_private_key_pem(private_key_pem: &str) -> Result<Vec<u8>, SigningKeyError> {
@@ -2402,7 +2413,7 @@ mod error_conversion_tests {
         parsing_policy.resources.max_xml_parse_work_bytes = xml.len();
         let budget = XmlParseWorkBudget::from_resources(&parsing_policy.resources);
         assert!(matches!(
-            document.staged_copy_with_budget(&budget),
+            document.staged_copy_with_budget(DocumentParseSettings::default(), &budget),
             Err(XmlDocumentError::Policy(PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
                 maximum,
