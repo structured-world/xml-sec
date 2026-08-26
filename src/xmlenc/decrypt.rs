@@ -609,11 +609,7 @@ fn decrypt_document_with_context(
     let parse_budget = XmlParseWorkBudget::from_resources(&context.policy.resources);
     let mut document = XmlDocument::parse_with_settings_and_budget(
         xml.to_owned(),
-        DocumentParseSettings::new(
-            context.policy.xml.allow_internal_dtd,
-            context.policy.resources.effective_xml_nodes(),
-            context.policy.resources.max_xml_document_bytes,
-        ),
+        DocumentParseSettings::from_policy(&context.policy.xml, &context.policy.resources),
         &parse_budget,
     )
     .map_err(|error| match error {
@@ -632,17 +628,7 @@ fn decrypt_owned_document_with_context(
     parse_budget: &XmlParseWorkBudget,
 ) -> Result<(), XmlEncError> {
     context.policy.resources.validate()?;
-    document.validate_xml_input_policy(context.policy.xml.allow_internal_dtd)?;
-    validate_encryption_document_len(document.as_xml().len(), &context.policy)?;
-    let document_nodes = document.with_view(|view| view.node_count());
-    if document_nodes > context.policy.resources.effective_xml_nodes() as usize {
-        return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: crate::policy::resource_name::XML_NODES,
-            maximum: context.policy.resources.effective_xml_nodes() as usize,
-            actual: document_nodes,
-        }
-        .into());
-    }
+    document.validate_operation_policy(&context.policy.xml, &context.policy.resources)?;
     let (target, target_len, encrypted) = document.with_view(|view| {
         let start = match selector {
             DocumentEncryptedDataSelector::UniqueBelowStartNode(Some(id))
@@ -3787,6 +3773,46 @@ mod tests {
                 .policy(node_policy)
                 .decrypt_document(&document, None),
             Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
+        ));
+    }
+
+    #[test]
+    fn decryption_entry_points_enforce_policy_depth() {
+        // Depth validation precedes EncryptedData selection for both borrowed
+        // and retained documents, including inputs parsed under wider defaults.
+        let xml = "<root><child><leaf/></child></root>";
+        let policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_depth: 2,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        let resolver = SymmetricKeyDecryptor::new([0_u8; 16]);
+        let mut document = XmlDocument::parse(xml).expect("wide retained fixture must parse");
+
+        assert!(matches!(
+            DecryptContext::new(&resolver)
+                .policy(policy.clone())
+                .decrypt_document(xml, None),
+            Err(XmlEncError::Document(
+                crate::document::XmlDocumentError::DocumentTooDeep {
+                    maximum: 2,
+                    actual: 3,
+                }
+            ))
+        ));
+        assert!(matches!(
+            DecryptContext::new(&resolver)
+                .policy(policy)
+                .decrypt_owned_document(&mut document, None),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
+                    maximum: 2,
+                    actual: 3,
+                }
+            ))
         ));
     }
 

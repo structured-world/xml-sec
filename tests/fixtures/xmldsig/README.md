@@ -86,10 +86,12 @@ through `VerifyContext`; additions and removals cannot become implicit skips.
 
 Supported RSA, DSA, HMAC-SHA1, Base64, XPath, Manifest, detached-resource, and
 X.509 selection paths verify to their exact public result. Invalid vectors
-assert the first stable typed failure. XSLT, HMAC-MD5, and MD5-signed
-certificate paths remain explicit fail-closed classifications until those
-capabilities are implemented; corpus accounting therefore does not imply
-blanket algorithm support.
+assert the first stable typed failure. The XSLT Manifest fixture has a valid
+top-level signature and an independently invalid Manifest reference, so callers
+must inspect `VerifyResult::manifest_references` before accepting Manifest-backed
+data. HMAC-MD5 and MD5-signed certificate paths remain explicit fail-closed
+classifications until those capabilities are implemented; corpus accounting
+therefore does not imply blanket algorithm support.
 
 The historical `-40-` filenames contain 80-bit HMAC values. Executable donor
 artifacts are kept byte-for-byte rather than renamed, and the case configuration

@@ -97,7 +97,8 @@ fn public_owned_parser_enforces_cumulative_parse_work() {
             allow_internal_dtd: true,
         },
         resources: ResourcePolicy {
-            max_xml_parse_work_bytes: xml.len(),
+            max_xml_parse_work_bytes: xml.len()
+                * (1 + usize::from(cfg!(feature = "xml-backend-xmloxide"))),
             ..ResourcePolicy::default()
         },
         ..SigningPolicy::default()
@@ -110,7 +111,9 @@ fn public_owned_parser_enforces_cumulative_parse_work() {
                 maximum,
                 actual,
             }
-        )) if maximum == xml.len() && actual == xml.len() * 2
+        )) if maximum
+            == xml.len() * (1 + usize::from(cfg!(feature = "xml-backend-xmloxide")))
+            && actual == maximum + xml.len()
     ));
 }
 

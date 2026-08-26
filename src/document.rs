@@ -16,7 +16,11 @@ use self_cell::self_cell;
 use crate::IdAttributeRegistration;
 
 trait XmlParserBackend {
-    fn validate(xml: &str, settings: DocumentParseSettings) -> Result<(), XmlDocumentError>;
+    fn validate(
+        xml: &str,
+        settings: DocumentParseSettings,
+        budget: Option<&XmlParseWorkBudget>,
+    ) -> Result<(), XmlDocumentError>;
 }
 
 #[cfg(any(not(feature = "xml-backend-xmloxide"), test))]
@@ -24,7 +28,11 @@ struct RoxmltreeParser;
 
 #[cfg(any(not(feature = "xml-backend-xmloxide"), test))]
 impl XmlParserBackend for RoxmltreeParser {
-    fn validate(_xml: &str, _settings: DocumentParseSettings) -> Result<(), XmlDocumentError> {
+    fn validate(
+        _xml: &str,
+        _settings: DocumentParseSettings,
+        _budget: Option<&XmlParseWorkBudget>,
+    ) -> Result<(), XmlDocumentError> {
         // The retained semantic projection below is itself the roxmltree
         // validation pass, so this adapter must not parse the document twice.
         Ok(())
@@ -36,7 +44,12 @@ struct XmloxideParser;
 
 #[cfg(feature = "xml-backend-xmloxide")]
 impl XmlParserBackend for XmloxideParser {
-    fn validate(xml: &str, settings: DocumentParseSettings) -> Result<(), XmlDocumentError> {
+    fn validate(
+        xml: &str,
+        settings: DocumentParseSettings,
+        budget: Option<&XmlParseWorkBudget>,
+    ) -> Result<(), XmlDocumentError> {
+        charge_parse_work(budget, xml.len())?;
         let maximum_depth = u32::try_from(settings.depth_limit).unwrap_or(u32::MAX);
         let options = xmloxide::parser::ParseOptions::default()
             .max_depth(maximum_depth)
@@ -57,6 +70,7 @@ impl XmlParserBackend for XmloxideParser {
                 // Public failure precedence belongs to the backend-neutral
                 // document contract. An exhausted node budget wins over a
                 // later syntax error on the same input.
+                charge_parse_work(budget, xml.len())?;
                 if let Err(contract_error) = Document::parse_with_options(
                     xml,
                     ParsingOptions {
@@ -92,6 +106,11 @@ const VALIDATION_WRAPPER_CLOSE: &str = "</xmlsec_owned_document:wrapper>";
 // Validation adds one wrapper element and can prevent text-node merging at
 // both replacement boundaries. The committed candidate uses the real ceiling.
 const VALIDATION_WRAPPER_NODE_OVERHEAD: u32 = 3;
+
+#[cfg(test)]
+fn selected_parser_passes() -> usize {
+    1 + usize::from(cfg!(feature = "xml-backend-xmloxide"))
+}
 
 /// Process-local provenance of one owned XML document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -190,6 +209,7 @@ impl Default for DocumentParseSettings {
 
 #[cfg(any(feature = "xmldsig", feature = "xmlenc", test))]
 impl DocumentParseSettings {
+    #[cfg(test)]
     pub(crate) const fn new(allow_dtd: bool, nodes_limit: u32, max_bytes: usize) -> Self {
         Self::new_with_depth(
             allow_dtd,
@@ -211,6 +231,18 @@ impl DocumentParseSettings {
             depth_limit,
             max_bytes,
         }
+    }
+
+    pub(crate) fn from_policy(
+        xml: &crate::policy::XmlInputPolicy,
+        resources: &crate::policy::ResourcePolicy,
+    ) -> Self {
+        Self::new_with_depth(
+            xml.allow_internal_dtd,
+            resources.effective_xml_nodes(),
+            resources.max_xml_depth,
+            resources.max_xml_document_bytes,
+        )
     }
 }
 
@@ -402,6 +434,8 @@ impl_document_policy!(crate::policy::DecryptionPolicy);
 struct ParsedDocument<'input> {
     document: Document<'input>,
     indexes: DocumentIndexes,
+    node_count: usize,
+    max_depth: usize,
 }
 
 self_cell!(
@@ -523,12 +557,7 @@ impl XmlDocument {
         let xml = own_bounded_xml(xml, resources.max_xml_document_bytes)?;
         Self::parse_with_settings_and_optional_budget(
             xml,
-            DocumentParseSettings::new_with_depth(
-                policy.xml_input_policy().allow_internal_dtd,
-                resources.effective_xml_nodes(),
-                resources.max_xml_depth,
-                resources.max_xml_document_bytes,
-            ),
+            DocumentParseSettings::from_policy(policy.xml_input_policy(), resources),
             Some(&budget),
         )
     }
@@ -553,8 +582,7 @@ impl XmlDocument {
         }
         #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
         let requires_internal_dtd = document_requires_internal_dtd(&xml, settings, budget)?;
-        charge_parse_work(budget, xml.len())?;
-        let cell = build_cell(xml, settings)?;
+        let cell = build_cell(xml, settings, budget)?;
         let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
         Ok(Self {
             identity,
@@ -598,6 +626,36 @@ impl XmlDocument {
             });
         }
         Ok(())
+    }
+
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    pub(crate) fn validate_operation_policy(
+        &self,
+        xml: &crate::policy::XmlInputPolicy,
+        resources: &crate::policy::ResourcePolicy,
+    ) -> Result<(), crate::policy::PolicyViolation> {
+        resources.validate()?;
+        self.validate_xml_input_policy(xml.allow_internal_dtd)?;
+        resources.validate_xml_document_len(self.as_xml().len())?;
+        self.with_view(|view| {
+            let node_count = view.node_count();
+            if node_count > resources.effective_xml_nodes() as usize {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_NODES,
+                    maximum: resources.effective_xml_nodes() as usize,
+                    actual: node_count,
+                });
+            }
+            let max_depth = view.max_depth();
+            if max_depth > resources.max_xml_depth {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
+                    maximum: resources.max_xml_depth,
+                    actual: max_depth,
+                });
+            }
+            Ok(())
+        })
     }
 
     /// Return the deterministic serialized representation of this generation.
@@ -916,7 +974,6 @@ impl XmlDocument {
                     XmlDocumentError::InvalidReplacement("validation length overflow".into())
                 })
         })?;
-        charge_parse_work(budget, projected)?;
         let mut candidate = String::with_capacity(projected);
         let mut wrapper_ranges = Vec::with_capacity(edits.len());
         let mut cursor = 0;
@@ -940,14 +997,22 @@ impl XmlDocument {
             candidate,
             DocumentParseSettings {
                 nodes_limit: validation_nodes_limit,
+                depth_limit: self.settings.depth_limit.saturating_add(1),
                 max_bytes: projected,
                 ..self.settings
             },
+            budget,
         )
         .map_err(|error| match (maximum_nodes, error) {
             (Some(_), XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached)) => {
                 XmlDocumentError::ProjectedNodeLimit {
                     maximum: active_nodes_limit,
+                }
+            }
+            (_, XmlDocumentError::DocumentTooDeep { actual, .. }) => {
+                XmlDocumentError::DocumentTooDeep {
+                    maximum: self.settings.depth_limit,
+                    actual: actual.saturating_sub(1),
                 }
             }
             (_, error) => error,
@@ -1027,8 +1092,7 @@ impl XmlDocument {
         xml: String,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
-        charge_parse_work(budget, xml.len())?;
-        let next = build_cell(xml, self.settings)?;
+        let next = build_cell(xml, self.settings, budget)?;
         self.commit_cell(next)
     }
 
@@ -1040,13 +1104,13 @@ impl XmlDocument {
     ) -> Result<(), XmlDocumentError> {
         let effective_maximum = maximum.min(self.settings.nodes_limit as usize);
         let nodes_limit = u32::try_from(effective_maximum).unwrap_or(u32::MAX);
-        charge_parse_work(budget, xml.len())?;
         let next = build_cell(
             xml,
             DocumentParseSettings {
                 nodes_limit,
                 ..self.settings
             },
+            budget,
         )
         .map_err(|error| match error {
             XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached) => {
@@ -1341,7 +1405,6 @@ impl XmlDocument {
             .ok_or_else(|| {
                 XmlDocumentError::InvalidReplacement("validation length overflow".into())
             })?;
-        charge_parse_work(budget, projected)?;
         let mut candidate = String::with_capacity(projected);
         candidate.push_str(&self.as_xml()[..range.start]);
         candidate.push_str(replacement);
@@ -1356,14 +1419,22 @@ impl XmlDocument {
                 nodes_limit: active_nodes_limit.saturating_add(VALIDATION_WRAPPER_NODE_OVERHEAD),
                 // Wrapper markup is validation scaffolding, not document input.
                 // The committed candidate is checked against the real ceiling.
+                depth_limit: self.settings.depth_limit.saturating_add(1),
                 max_bytes: projected,
                 ..self.settings
             },
+            budget,
         )
         .map_err(|error| match (maximum, error) {
             (Some(_), XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached)) => {
                 XmlDocumentError::ProjectedNodeLimit {
                     maximum: active_nodes_limit as usize,
+                }
+            }
+            (_, XmlDocumentError::DocumentTooDeep { actual, .. }) => {
+                XmlDocumentError::DocumentTooDeep {
+                    maximum: self.settings.depth_limit,
+                    actual: actual.saturating_sub(1),
                 }
             }
             (_, error) => error,
@@ -1409,7 +1480,11 @@ impl<'a> DocumentView<'a> {
     /// Return the number of parser nodes in this generation.
     #[must_use]
     pub fn node_count(self) -> usize {
-        self.parsed.document.descendants().count()
+        self.parsed.node_count
+    }
+
+    pub(crate) fn max_depth(self) -> usize {
+        self.parsed.max_depth
     }
 
     /// Resolve an ID using standard spellings plus caller registrations.
@@ -1654,6 +1729,7 @@ impl<'a> DocumentView<'a> {
 fn build_cell(
     xml: String,
     settings: DocumentParseSettings,
+    budget: Option<&XmlParseWorkBudget>,
 ) -> Result<DocumentCell, XmlDocumentError> {
     if xml.len() > settings.max_bytes {
         return Err(XmlDocumentError::DocumentTooLarge {
@@ -1663,7 +1739,8 @@ fn build_cell(
     }
     // Backends only validate borrowed input. The type contract prevents a
     // parser serializer from rewriting bytes consumed by XMLDSig or mutation.
-    SelectedXmlParser::validate(&xml, settings)?;
+    SelectedXmlParser::validate(&xml, settings, budget)?;
+    charge_parse_work(budget, xml.len())?;
     build_roxmltree_cell(xml, settings)
 }
 
@@ -1681,21 +1758,34 @@ fn build_roxmltree_cell(
             },
         )
         .map_err(XmlDocumentError::Parse)?;
-        validate_document_depth(&document, settings.depth_limit)?;
+        let metrics = validate_document_metrics(&document, settings.depth_limit)?;
         let indexes = DocumentIndexes::build(&document);
-        Ok::<_, XmlDocumentError>(ParsedDocument { document, indexes })
+        Ok::<_, XmlDocumentError>(ParsedDocument {
+            document,
+            indexes,
+            node_count: metrics.node_count,
+            max_depth: metrics.max_depth,
+        })
     })
 }
 
-fn validate_document_depth(
+struct DocumentMetrics {
+    node_count: usize,
+    max_depth: usize,
+}
+
+fn validate_document_metrics(
     document: &Document<'_>,
     maximum: usize,
-) -> Result<(), XmlDocumentError> {
+) -> Result<DocumentMetrics, XmlDocumentError> {
     // Node IDs follow document order, so each parent's depth has already been
     // recorded. This keeps the compatibility path linear instead of walking
     // every ancestor chain independently.
     let mut depths = Vec::new();
+    let mut node_count = 0;
+    let mut max_depth = 0;
     for node in document.descendants() {
+        node_count += 1;
         let parent_depth = node
             .parent()
             .and_then(|parent| depths.get(parent.id().get_usize()))
@@ -1707,6 +1797,7 @@ fn validate_document_depth(
             depths.resize(node_index + 1, 0);
         }
         depths[node_index] = depth;
+        max_depth = max_depth.max(depth);
         if depth > maximum {
             return Err(XmlDocumentError::DocumentTooDeep {
                 maximum,
@@ -1714,7 +1805,10 @@ fn validate_document_depth(
             });
         }
     }
-    Ok(())
+    Ok(DocumentMetrics {
+        node_count,
+        max_depth,
+    })
 }
 
 fn own_bounded_xml(
@@ -1903,8 +1997,8 @@ mod tests {
         let settings = DocumentParseSettings::default();
         let xml =
             r#"<root xmlns:p="urn:test"><p:item ID="target"><![CDATA[value]]></p:item></root>"#;
-        RoxmltreeParser::validate(xml, settings).expect("roxmltree must accept the fixture");
-        XmloxideParser::validate(xml, settings).expect("xmloxide must accept the fixture");
+        RoxmltreeParser::validate(xml, settings, None).expect("roxmltree must accept the fixture");
+        XmloxideParser::validate(xml, settings, None).expect("xmloxide must accept the fixture");
         let roxmltree = build_roxmltree_cell(xml.to_owned(), settings)
             .expect("roxmltree semantic projection must parse");
         let xmloxide = build_roxmltree_cell(xml.to_owned(), settings)
@@ -1932,12 +2026,12 @@ mod tests {
         // policy as the default parser rather than relying on backend defaults.
         let settings = DocumentParseSettings::new_with_depth(false, 128, 2, 4_096);
         let accepted = nested_document(2);
-        RoxmltreeParser::validate(&accepted, settings)
+        RoxmltreeParser::validate(&accepted, settings, None)
             .expect("adapter must accept the exact boundary");
         build_roxmltree_cell(accepted, settings).expect("exact depth must parse");
 
         let rejected = nested_document(3);
-        RoxmltreeParser::validate(&rejected, settings)
+        RoxmltreeParser::validate(&rejected, settings, None)
             .expect("adapter defers retained-view validation");
         assert!(matches!(
             build_roxmltree_cell(rejected, settings),
@@ -1955,12 +2049,12 @@ mod tests {
         // while exposing the same backend-neutral document error.
         let settings = DocumentParseSettings::new_with_depth(false, 128, 2, 4_096);
         let accepted = nested_document(2);
-        XmloxideParser::validate(&accepted, settings).expect("exact depth must be accepted");
+        XmloxideParser::validate(&accepted, settings, None).expect("exact depth must be accepted");
         build_roxmltree_cell(accepted, settings).expect("exact depth must parse");
 
         let rejected = nested_document(3);
         assert!(matches!(
-            XmloxideParser::validate(&rejected, settings),
+            XmloxideParser::validate(&rejected, settings, None),
             Err(XmlDocumentError::DocumentTooDeep {
                 maximum: 2,
                 actual: 3,
@@ -2108,6 +2202,95 @@ mod tests {
         assert_eq!(
             document.as_xml(),
             "<p:root xmlns:p=\"urn:test\"><p:new/></p:root>"
+        );
+    }
+
+    #[test]
+    fn validation_wrapper_does_not_consume_document_depth() {
+        // The synthetic wrapper exists only while validating the replacement;
+        // a result at the real document depth ceiling must remain accepted.
+        let mut document = XmlDocument::parse_with_settings(
+            "<root><target/></root>".into(),
+            DocumentParseSettings::new_with_depth(false, 128, 2, 4_096),
+        )
+        .expect("fixture must fit the exact depth ceiling");
+        let target = document.with_view(|view| {
+            view.node_identity(
+                view.document()
+                    .descendants()
+                    .find(|node| node.has_tag_name("target"))
+                    .expect("target must exist"),
+            )
+        });
+
+        document
+            .replace_content(target, "text")
+            .expect("validation-only wrapper must not consume caller depth");
+        assert_eq!(document.as_xml(), "<root><target>text</target></root>");
+    }
+
+    #[test]
+    fn validation_wrapper_preserves_real_depth_rejection() {
+        // Exempting validation scaffolding must not exempt an inserted element
+        // that makes the committed document exceed the configured depth.
+        let mut document = XmlDocument::parse_with_settings(
+            "<root><target/></root>".into(),
+            DocumentParseSettings::new_with_depth(false, 128, 2, 4_096),
+        )
+        .expect("fixture must fit the exact depth ceiling");
+        let target = document.with_view(|view| {
+            view.node_identity(
+                view.document()
+                    .descendants()
+                    .find(|node| node.has_tag_name("target"))
+                    .expect("target must exist"),
+            )
+        });
+        let before = document.as_xml().to_owned();
+
+        let error = document
+            .replace_content(target, "<child/>")
+            .expect_err("real replacement depth must remain bounded");
+        assert!(
+            matches!(
+                error,
+                XmlDocumentError::DocumentTooDeep {
+                    maximum: 2,
+                    actual: 3,
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(document.as_xml(), before);
+        assert_eq!(document.generation(), 0);
+    }
+
+    #[test]
+    fn batched_validation_wrappers_do_not_consume_document_depth() {
+        // The combined validator inserts one wrapper per target, but sibling
+        // scaffolding must not reduce the active depth available to either edit.
+        let mut document = XmlDocument::parse_with_settings(
+            "<root><first/><second/></root>".into(),
+            DocumentParseSettings::new_with_depth(false, 128, 2, 4_096),
+        )
+        .expect("fixture must fit the exact depth ceiling");
+        let (first, second) = document.with_view(|view| {
+            let mut targets = view
+                .document()
+                .descendants()
+                .filter(|node| matches!(node.tag_name().name(), "first" | "second"));
+            (
+                view.node_identity(targets.next().expect("first target")),
+                view.node_identity(targets.next().expect("second target")),
+            )
+        });
+
+        document
+            .replace_contents(&[(first, "a".into()), (second, "b".into())])
+            .expect("validation-only wrappers must not consume caller depth");
+        assert_eq!(
+            document.as_xml(),
+            "<root><first>a</first><second>b</second></root>"
         );
     }
 
@@ -2357,7 +2540,8 @@ mod tests {
         let committed_len = source.len() - TARGETS * "old".len() + TARGETS;
         let validation_len =
             source.len() - TARGETS * "old".len() + TARGETS * wrapped_fragment("x").len();
-        let maximum = validation_len + committed_len;
+        let parser_passes = selected_parser_passes();
+        let maximum = (validation_len + committed_len) * parser_passes;
         let budget = XmlParseWorkBudget::with_limit(maximum);
 
         document
@@ -2425,7 +2609,8 @@ mod tests {
             .checked_add(VALIDATION_WRAPPER_OPEN.len())
             .and_then(|length| length.checked_add(VALIDATION_WRAPPER_CLOSE.len()))
             .expect("fixture length must fit");
-        let maximum = first_validation_len + first_output.len();
+        let parser_passes = selected_parser_passes();
+        let maximum = (first_validation_len + first_output.len()) * parser_passes;
         let budget = XmlParseWorkBudget::with_limit(maximum);
 
         document

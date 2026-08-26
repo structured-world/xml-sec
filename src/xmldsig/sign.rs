@@ -875,11 +875,7 @@ impl<'a> SignContext<'a> {
         let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
         let mut document = XmlDocument::parse_with_settings_and_budget(
             xml.to_owned(),
-            DocumentParseSettings::new(
-                self.policy.xml.allow_internal_dtd,
-                self.policy.resources.effective_xml_nodes(),
-                self.policy.resources.max_xml_document_bytes,
-            ),
+            DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
             budgets.transforms.xml_parse_work(),
         )
         .map_err(|error| match error {
@@ -934,19 +930,7 @@ impl<'a> SignContext<'a> {
 
     fn validate_owned_document_input(&self, document: &XmlDocument) -> Result<(), SigningError> {
         self.policy.validate()?;
-        document.validate_xml_input_policy(self.policy.xml.allow_internal_dtd)?;
-        self.policy
-            .resources
-            .validate_xml_document_len(document.as_xml().len())?;
-        let node_count = document.with_view(|view| view.node_count());
-        if node_count > self.policy.resources.effective_xml_nodes() as usize {
-            return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::XML_NODES,
-                maximum: self.policy.resources.effective_xml_nodes() as usize,
-                actual: node_count,
-            }
-            .into());
-        }
+        document.validate_operation_policy(&self.policy.xml, &self.policy.resources)?;
         Ok(())
     }
 
@@ -1092,11 +1076,7 @@ impl<'a> SignContext<'a> {
         let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
         let mut document = XmlDocument::parse_with_settings_and_budget(
             xml.to_owned(),
-            DocumentParseSettings::new(
-                self.policy.xml.allow_internal_dtd,
-                self.policy.resources.effective_xml_nodes(),
-                self.policy.resources.max_xml_document_bytes,
-            ),
+            DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
             budgets.transforms.xml_parse_work(),
         )
         .map_err(|error| match error {
@@ -2342,6 +2322,25 @@ mod error_conversion_tests {
                 maximum: 0,
                 actual,
             }) if actual == xml.len()
+        ));
+    }
+
+    #[test]
+    fn signing_string_entry_point_enforces_policy_depth() {
+        // Operation parsing must use the compiled policy depth rather than the
+        // process-wide hard ceiling, before template discovery or key use.
+        let mut policy = crate::policy::SigningPolicy::default();
+        policy.resources.max_xml_depth = 2;
+        let xml = "<root><child><leaf/></child></root>";
+
+        assert!(matches!(
+            SignContext::new(&RejectingSigningKey)
+                .policy(policy)
+                .sign_template(xml),
+            Err(SigningError::Document(XmlDocumentError::DocumentTooDeep {
+                maximum: 2,
+                actual: 3,
+            }))
         ));
     }
 
