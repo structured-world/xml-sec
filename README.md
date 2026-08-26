@@ -23,14 +23,16 @@ XML Security in pure Rust, built to replace libxmlsec1.
 - **Native CLI** — `xmlsec1` command surface backed by the same Rust policy and provider pipelines
 - **Provider-neutral crypto** — typed capabilities and opaque key handles with RustCrypto as the pure-Rust default
 - **Reusable XML documents** — policy-aware retained parsing, stable semantic identities, shared indexes, and generation-safe mutation across C14N, XMLDSig, and XMLEnc
+- **Selectable XML parser frontend** — bounded `xmloxide` validation is the default, with an explicitly testable `roxmltree`-only compatibility path
 
 ## Why?
 
 libxmlsec1 is the established XML Security implementation, but its native dependency stack adds
 libxml2, a crypto backend, platform packages, and cross-compilation work to every deployment.
 
-`xml-sec` rebuilds that functionality on memory-safe Rust foundations: `roxmltree` for parsing,
-`quick-xml` for writing, RustCrypto for cryptography, and `x509-parser` for certificates. One
+`xml-sec` rebuilds that functionality on memory-safe Rust foundations: feature-selected XML
+validation, a source-preserving `roxmltree` semantic view for C14N/XPath/mutation, `quick-xml` for
+writing, RustCrypto for cryptography, and `x509-parser` for certificates. One
 Cargo dependency, no system XML or crypto libraries.
 
 ## Install
@@ -45,8 +47,13 @@ Default features provide C14N, XMLDSig, and XMLEnc. Applications that need a
 smaller dependency graph can select only the required library capabilities:
 
 ```toml
-xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c14n"] }
+xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c14n", "xml-backend-xmloxide"] }
 ```
+
+Select `xml-backend-roxmltree` instead to omit the xmloxide validation pass and use the retained
+roxmltree parser directly. Backend selection is compile-time only: document content and runtime
+policy cannot switch it. Both paths retain the original source bytes and use the same semantic
+view, policy snapshot, C14N, XPath, signature, encryption, and mutation pipelines.
 
 Install the `xmlsec1` command from the same package:
 

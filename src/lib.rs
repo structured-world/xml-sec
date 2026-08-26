@@ -30,6 +30,9 @@
 #![deny(clippy::unwrap_used)]
 #![warn(missing_docs)]
 
+#[cfg(not(any(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree")))]
+compile_error!("select one XML backend feature: `xml-backend-xmloxide` or `xml-backend-roxmltree`");
+
 pub mod c14n;
 pub mod document;
 pub mod encoding;

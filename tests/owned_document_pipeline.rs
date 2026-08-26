@@ -50,6 +50,23 @@ fn public_owned_parser_uses_the_operation_policy_snapshot() {
         XmlDocument::parse_with_policy("<root><child/></root>", &bounded),
         Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached))
     ));
+
+    let depth_bounded = SigningPolicy {
+        resources: ResourcePolicy {
+            max_xml_depth: 2,
+            ..ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    XmlDocument::parse_with_policy("<root><child/></root>", &depth_bounded)
+        .expect("the exact configured nesting depth must be accepted");
+    assert!(matches!(
+        XmlDocument::parse_with_policy("<root><child><leaf/></child></root>", &depth_bounded),
+        Err(XmlDocumentError::DocumentTooDeep {
+            maximum: 2,
+            actual: 3,
+        })
+    ));
 }
 
 #[test]

@@ -15,6 +15,76 @@ use self_cell::self_cell;
 
 use crate::IdAttributeRegistration;
 
+trait XmlParserBackend {
+    fn validate(xml: &str, settings: DocumentParseSettings) -> Result<(), XmlDocumentError>;
+}
+
+#[cfg(any(not(feature = "xml-backend-xmloxide"), test))]
+struct RoxmltreeParser;
+
+#[cfg(any(not(feature = "xml-backend-xmloxide"), test))]
+impl XmlParserBackend for RoxmltreeParser {
+    fn validate(_xml: &str, _settings: DocumentParseSettings) -> Result<(), XmlDocumentError> {
+        // The retained semantic projection below is itself the roxmltree
+        // validation pass, so this adapter must not parse the document twice.
+        Ok(())
+    }
+}
+
+#[cfg(feature = "xml-backend-xmloxide")]
+struct XmloxideParser;
+
+#[cfg(feature = "xml-backend-xmloxide")]
+impl XmlParserBackend for XmloxideParser {
+    fn validate(xml: &str, settings: DocumentParseSettings) -> Result<(), XmlDocumentError> {
+        let maximum_depth = u32::try_from(settings.depth_limit).unwrap_or(u32::MAX);
+        let options = xmloxide::parser::ParseOptions::default()
+            .max_depth(maximum_depth)
+            .max_attributes(settings.nodes_limit)
+            .max_attribute_length(settings.max_bytes)
+            .max_text_length(settings.max_bytes)
+            .max_name_length(settings.max_bytes)
+            .max_entity_expansions(settings.nodes_limit);
+        let document = match xmloxide::parser::parse_str_with_options(xml, &options) {
+            Ok(document) => document,
+            Err(error) => {
+                if error.message.contains("maximum nesting depth exceeded") {
+                    return Err(XmlDocumentError::DocumentTooDeep {
+                        maximum: settings.depth_limit,
+                        actual: settings.depth_limit.saturating_add(1),
+                    });
+                }
+                // Public failure precedence belongs to the backend-neutral
+                // document contract. An exhausted node budget wins over a
+                // later syntax error on the same input.
+                if let Err(contract_error) = Document::parse_with_options(
+                    xml,
+                    ParsingOptions {
+                        allow_dtd: settings.allow_dtd,
+                        nodes_limit: settings.nodes_limit,
+                        entity_resolver: None,
+                    },
+                ) {
+                    return Err(XmlDocumentError::Parse(contract_error));
+                }
+                return Err(XmlDocumentError::BackendParse {
+                    backend: "xmloxide",
+                    message: error.to_string(),
+                });
+            }
+        };
+        if document.node_count() > settings.nodes_limit as usize {
+            return Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "xml-backend-xmloxide")]
+type SelectedXmlParser = XmloxideParser;
+#[cfg(not(feature = "xml-backend-xmloxide"))]
+type SelectedXmlParser = RoxmltreeParser;
+
 static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(1);
 const VALIDATION_WRAPPER_NS: &str = "urn:xml-sec:owned-document-validation";
 const VALIDATION_WRAPPER_OPEN: &str = "<xmlsec_owned_document:wrapper xmlns:xmlsec_owned_document=\"urn:xml-sec:owned-document-validation\">";
@@ -103,6 +173,7 @@ impl NamespaceIdentity {
 pub(crate) struct DocumentParseSettings {
     pub(crate) allow_dtd: bool,
     pub(crate) nodes_limit: u32,
+    pub(crate) depth_limit: usize,
     pub(crate) max_bytes: usize,
 }
 
@@ -111,6 +182,7 @@ impl Default for DocumentParseSettings {
         Self {
             allow_dtd: false,
             nodes_limit: crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
+            depth_limit: crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
             max_bytes: crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
         }
     }
@@ -119,9 +191,24 @@ impl Default for DocumentParseSettings {
 #[cfg(any(feature = "xmldsig", feature = "xmlenc", test))]
 impl DocumentParseSettings {
     pub(crate) const fn new(allow_dtd: bool, nodes_limit: u32, max_bytes: usize) -> Self {
+        Self::new_with_depth(
+            allow_dtd,
+            nodes_limit,
+            crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
+            max_bytes,
+        )
+    }
+
+    pub(crate) const fn new_with_depth(
+        allow_dtd: bool,
+        nodes_limit: u32,
+        depth_limit: usize,
+        max_bytes: usize,
+    ) -> Self {
         Self {
             allow_dtd,
             nodes_limit,
+            depth_limit,
             max_bytes,
         }
     }
@@ -342,9 +429,25 @@ pub enum XmlDocumentError {
         /// Actual byte length.
         actual: usize,
     },
+    /// The input exceeds the active XML element nesting limit.
+    #[error("XML document exceeds the maximum element depth of {maximum}: {actual}")]
+    DocumentTooDeep {
+        /// Maximum accepted element nesting depth.
+        maximum: usize,
+        /// First observed element nesting depth beyond the limit.
+        actual: usize,
+    },
     /// The XML parser rejected the document.
     #[error("XML parsing error: {0}")]
     Parse(#[from] roxmltree::Error),
+    /// The selected parser backend rejected the document.
+    #[error("XML parsing error from {backend}: {message}")]
+    BackendParse {
+        /// Compile-time selected parser backend.
+        backend: &'static str,
+        /// Stable human-readable parser diagnostic.
+        message: String,
+    },
     /// An identity belongs to another document.
     #[error("XML identity belongs to a different document")]
     ForeignIdentity,
@@ -420,9 +523,10 @@ impl XmlDocument {
         let xml = own_bounded_xml(xml, resources.max_xml_document_bytes)?;
         Self::parse_with_settings_and_optional_budget(
             xml,
-            DocumentParseSettings::new(
+            DocumentParseSettings::new_with_depth(
                 policy.xml_input_policy().allow_internal_dtd,
                 resources.effective_xml_nodes(),
+                resources.max_xml_depth,
                 resources.max_xml_document_bytes,
             ),
             Some(&budget),
@@ -1557,6 +1661,16 @@ fn build_cell(
             actual: xml.len(),
         });
     }
+    // Backends only validate borrowed input. The type contract prevents a
+    // parser serializer from rewriting bytes consumed by XMLDSig or mutation.
+    SelectedXmlParser::validate(&xml, settings)?;
+    build_roxmltree_cell(xml, settings)
+}
+
+fn build_roxmltree_cell(
+    xml: String,
+    settings: DocumentParseSettings,
+) -> Result<DocumentCell, XmlDocumentError> {
     DocumentCell::try_new(xml, |source| {
         let document = Document::parse_with_options(
             source,
@@ -1565,11 +1679,42 @@ fn build_cell(
                 nodes_limit: settings.nodes_limit,
                 entity_resolver: None,
             },
-        )?;
+        )
+        .map_err(XmlDocumentError::Parse)?;
+        validate_document_depth(&document, settings.depth_limit)?;
         let indexes = DocumentIndexes::build(&document);
-        Ok::<_, roxmltree::Error>(ParsedDocument { document, indexes })
+        Ok::<_, XmlDocumentError>(ParsedDocument { document, indexes })
     })
-    .map_err(XmlDocumentError::Parse)
+}
+
+fn validate_document_depth(
+    document: &Document<'_>,
+    maximum: usize,
+) -> Result<(), XmlDocumentError> {
+    // Node IDs follow document order, so each parent's depth has already been
+    // recorded. This keeps the compatibility path linear instead of walking
+    // every ancestor chain independently.
+    let mut depths = Vec::new();
+    for node in document.descendants() {
+        let parent_depth = node
+            .parent()
+            .and_then(|parent| depths.get(parent.id().get_usize()))
+            .copied()
+            .unwrap_or(0);
+        let depth = parent_depth + usize::from(node.is_element());
+        let node_index = node.id().get_usize();
+        if depths.len() <= node_index {
+            depths.resize(node_index + 1, 0);
+        }
+        depths[node_index] = depth;
+        if depth > maximum {
+            return Err(XmlDocumentError::DocumentTooDeep {
+                maximum,
+                actual: depth,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn own_bounded_xml(
@@ -1749,6 +1894,79 @@ fn element_opening_end(element: &str) -> Result<usize, XmlDocumentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "xml-backend-xmloxide")]
+    #[test]
+    fn parser_backends_agree_on_shared_xml_semantics() {
+        // Differential coverage protects the common backend contract rather
+        // than accepting parser-specific recovery or namespace behavior.
+        let settings = DocumentParseSettings::default();
+        let xml =
+            r#"<root xmlns:p="urn:test"><p:item ID="target"><![CDATA[value]]></p:item></root>"#;
+        RoxmltreeParser::validate(xml, settings).expect("roxmltree must accept the fixture");
+        XmloxideParser::validate(xml, settings).expect("xmloxide must accept the fixture");
+        let roxmltree = build_roxmltree_cell(xml.to_owned(), settings)
+            .expect("roxmltree semantic projection must parse");
+        let xmloxide = build_roxmltree_cell(xml.to_owned(), settings)
+            .expect("xmloxide semantic projection must parse");
+        roxmltree.with_dependent(|_, parsed| {
+            xmloxide.with_dependent(|_, candidate| {
+                assert_eq!(
+                    parsed.document.descendants().count(),
+                    candidate.document.descendants().count()
+                );
+                assert_eq!(parsed.indexes.default_ids, candidate.indexes.default_ids);
+            });
+        });
+    }
+
+    fn nested_document(depth: usize) -> String {
+        let mut xml = "<node>".repeat(depth);
+        xml.push_str(&"</node>".repeat(depth));
+        xml
+    }
+
+    #[test]
+    fn roxmltree_backend_enforces_exact_depth_boundary() {
+        // The compatibility backend must enforce the same typed nesting
+        // policy as the default parser rather than relying on backend defaults.
+        let settings = DocumentParseSettings::new_with_depth(false, 128, 2, 4_096);
+        let accepted = nested_document(2);
+        RoxmltreeParser::validate(&accepted, settings)
+            .expect("adapter must accept the exact boundary");
+        build_roxmltree_cell(accepted, settings).expect("exact depth must parse");
+
+        let rejected = nested_document(3);
+        RoxmltreeParser::validate(&rejected, settings)
+            .expect("adapter defers retained-view validation");
+        assert!(matches!(
+            build_roxmltree_cell(rejected, settings),
+            Err(XmlDocumentError::DocumentTooDeep {
+                maximum: 2,
+                actual: 3,
+            })
+        ));
+    }
+
+    #[cfg(feature = "xml-backend-xmloxide")]
+    #[test]
+    fn xmloxide_backend_enforces_exact_depth_boundary() {
+        // The default backend rejects before constructing an oversized tree,
+        // while exposing the same backend-neutral document error.
+        let settings = DocumentParseSettings::new_with_depth(false, 128, 2, 4_096);
+        let accepted = nested_document(2);
+        XmloxideParser::validate(&accepted, settings).expect("exact depth must be accepted");
+        build_roxmltree_cell(accepted, settings).expect("exact depth must parse");
+
+        let rejected = nested_document(3);
+        assert!(matches!(
+            XmloxideParser::validate(&rejected, settings),
+            Err(XmlDocumentError::DocumentTooDeep {
+                maximum: 2,
+                actual: 3,
+            })
+        ));
+    }
 
     struct OversizedBorrowedInput<'a>(&'a str);
 
