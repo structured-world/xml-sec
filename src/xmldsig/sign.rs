@@ -905,11 +905,7 @@ impl<'a> SignContext<'a> {
             .map_err(map_owned_document_mutation_error)?;
         self.sign_document_in_place(&mut staged, &mut budgets)?;
         document
-            .replace_serialized_with_settings(
-                staged.into_xml(),
-                DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
-                Some(budgets.transforms.xml_parse_work()),
-            )
+            .commit_staged(staged)
             .map_err(map_owned_document_mutation_error)
     }
 
@@ -1110,11 +1106,7 @@ impl<'a> SignContext<'a> {
             .map_err(map_owned_document_mutation_error)?;
         self.sign_document_with_builder_in_place(&mut staged, builder, &mut budgets)?;
         document
-            .replace_serialized_with_settings(
-                staged.into_xml(),
-                DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
-                Some(budgets.transforms.xml_parse_work()),
-            )
+            .commit_staged(staged)
             .map_err(map_owned_document_mutation_error)
     }
 
@@ -2147,6 +2139,26 @@ mod error_conversion_tests {
         }
     }
 
+    struct FixedRsaSigningKey;
+
+    impl SigningKey for FixedRsaSigningKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            Ok(vec![0x5a; 256])
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Ok(SigningPublicKeyInfo::Rsa {
+                spki_der: Vec::new(),
+                modulus: vec![0x80; 256],
+                exponent: vec![1, 0, 1],
+            })
+        }
+    }
+
     #[test]
     fn signing_error_promotes_every_policy_failure() {
         // All policy refusals use one public pipeline variant regardless of
@@ -2398,6 +2410,40 @@ mod error_conversion_tests {
         ));
         assert_eq!(builder_document.as_xml(), builder_before);
         assert_eq!(builder_document.generation(), 0);
+    }
+
+    #[test]
+    fn owned_signing_commits_the_validated_stage_without_reparsing() {
+        // Atomic commit must adopt the already validated staged cell. Charging
+        // another complete backend parse makes valid maximum-size inputs exceed
+        // the operation ceiling only because they use the owned entry point.
+        let xml = r##"<root><payload Id="payload">content</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
+        let policy = crate::policy::SigningPolicy::default();
+        let context = SignContext::new(&FixedRsaSigningKey).policy(policy.clone());
+        let source = XmlDocument::parse(xml).expect("fixture must parse");
+        let mut measured = SigningOperationBudgets::from_resources(&policy.resources);
+        let mut staged = source
+            .staged_copy_with_budget(
+                DocumentParseSettings::from_policy(&policy.xml, &policy.resources),
+                measured.transforms.xml_parse_work(),
+            )
+            .expect("staging must parse");
+        context
+            .sign_document_in_place(&mut staged, &mut measured)
+            .expect("staged signing must succeed");
+        let exact_stage_work = measured.transforms.xml_parse_work().consumed();
+
+        let mut constrained_policy = policy;
+        constrained_policy.resources.max_xml_parse_work_bytes = exact_stage_work;
+        let mut document = XmlDocument::parse(xml).expect("fixture must parse");
+        SignContext::new(&FixedRsaSigningKey)
+            .policy(constrained_policy)
+            .sign_document(&mut document)
+            .expect("commit must not parse the validated stage again");
+
+        assert_eq!(document.generation(), 1);
+        assert!(!document.as_xml().contains("<ds:DigestValue/>"));
+        assert!(!document.as_xml().contains("<ds:SignatureValue/>"));
     }
 
     #[test]

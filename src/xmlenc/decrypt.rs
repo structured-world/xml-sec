@@ -685,10 +685,10 @@ fn decrypt_owned_document_with_context(
         match encrypted.encrypted_type.as_ref() {
             Some(EncryptedDataType::Element) => document
                 .replace_element_with_budget(target, &plaintext, settings, parse_budget)
-                .map_err(map_document_mutation_error)?,
+                .map_err(|error| map_document_mutation_error(error, settings))?,
             Some(EncryptedDataType::Content) => document
                 .replace_node_with_fragment_with_budget(target, &plaintext, settings, parse_budget)
-                .map_err(map_document_mutation_error)?,
+                .map_err(|error| map_document_mutation_error(error, settings))?,
             Some(EncryptedDataType::Other(_)) | None => {
                 return Err(XmlEncError::ReplacementRequiresXml);
             }
@@ -697,11 +697,14 @@ fn decrypt_owned_document_with_context(
     })
 }
 
-fn map_document_mutation_error(error: crate::document::XmlDocumentError) -> XmlEncError {
-    match error {
-        crate::document::XmlDocumentError::Policy(error) => XmlEncError::Policy(error),
-        crate::document::XmlDocumentError::Parse(error) => XmlEncError::XmlParse(error),
-        crate::document::XmlDocumentError::ProjectedNodeLimit { maximum } => {
+fn map_document_mutation_error(
+    error: crate::document::XmlDocumentError,
+    settings: DocumentParseSettings,
+) -> XmlEncError {
+    match error.into_policy_violation(settings) {
+        Ok(error) => XmlEncError::Policy(error),
+        Err(crate::document::XmlDocumentError::Parse(error)) => XmlEncError::XmlParse(error),
+        Err(crate::document::XmlDocumentError::ProjectedNodeLimit { maximum }) => {
             crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_NODES,
                 maximum,
@@ -709,7 +712,7 @@ fn map_document_mutation_error(error: crate::document::XmlDocumentError) -> XmlE
             }
             .into()
         }
-        error => XmlEncError::Document(error),
+        Err(error) => XmlEncError::Document(error),
     }
 }
 
@@ -3889,6 +3892,51 @@ mod tests {
                 maximum,
                 ..
             }) if maximum == input_nodes
+        ));
+        assert_eq!(document.as_xml(), before);
+        assert_eq!(document.generation(), 0);
+    }
+
+    #[test]
+    fn owned_decryption_reports_decrypted_depth_as_policy() {
+        // The encrypted envelope can satisfy the active depth policy while its
+        // plaintext replacement exceeds it. That rejection must retain the
+        // typed policy contract and leave the owned document untouched.
+        let key = [0x3b_u8; 16];
+        let plaintext = format!("{}value{}", "<nested>".repeat(32), "</nested>".repeat(32));
+        let encrypted = encrypted_gcm_element(
+            "http://www.w3.org/2001/04/xmlenc#Element",
+            &plaintext,
+            None,
+            false,
+            &key,
+        );
+        let mut document = XmlDocument::parse(format!(
+            "<root xmlns:xenc=\"{XMLENC_NS}\">{encrypted}</root>"
+        ))
+        .expect("encrypted fixture must parse");
+        let input_depth = document.with_view(|view| view.max_depth());
+        let before = document.as_xml().to_owned();
+        let policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_depth: input_depth,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+
+        let error = DecryptContext::new(&SymmetricKeyDecryptor::new(key))
+            .policy(policy)
+            .decrypt_owned_document(&mut document, None)
+            .expect_err("deep plaintext must exceed the active depth policy");
+
+        assert!(matches!(
+            error,
+            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DEPTH,
+                maximum,
+                actual,
+            }) if maximum == input_depth && actual > maximum
         ));
         assert_eq!(document.as_xml(), before);
         assert_eq!(document.generation(), 0);

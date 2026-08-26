@@ -71,25 +71,23 @@ impl XmlParserBackend for XmloxideParser {
             .max_text_length(settings.max_bytes)
             .max_name_length(settings.max_bytes)
             .max_entity_expansions(settings.nodes_limit);
-        let document =
-            xmloxide::parser::parse_str_with_options(xml, &options).map_err(|error| {
-                if error.message.contains("maximum nesting depth exceeded") {
-                    XmlDocumentError::DocumentTooDeep {
-                        maximum: settings.depth_limit,
-                        actual: settings.depth_limit.saturating_add(1),
-                    }
-                } else {
-                    XmlDocumentError::BackendParse {
-                        backend: "xmloxide",
-                        message: error.to_string(),
-                    }
+        xmloxide::parser::parse_str_with_options(xml, &options).map_err(|error| {
+            if error.message.contains("maximum nesting depth exceeded") {
+                XmlDocumentError::DocumentTooDeep {
+                    maximum: settings.depth_limit,
+                    actual: settings.depth_limit.saturating_add(1),
                 }
-            })?;
-        debug_assert!(document.node_count() <= settings.nodes_limit as usize);
-        Ok(DocumentMetrics {
-            node_count: document.node_count(),
-            max_depth: bounded.max_depth,
-        })
+            } else {
+                XmlDocumentError::BackendParse {
+                    backend: "xmloxide",
+                    message: error.to_string(),
+                }
+            }
+        })?;
+        // Aggregate node policy is defined over the shared retained semantic
+        // projection. xmloxide can expose a different lexical node count for
+        // contiguous entity/CDATA text, so it must not replace those metrics.
+        Ok(bounded)
     }
 }
 
@@ -722,6 +720,14 @@ impl XmlDocument {
         Self::parse_with_settings_and_budget(self.as_xml().to_owned(), settings, budget)
     }
 
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn commit_staged(&mut self, staged: Self) -> Result<(), XmlDocumentError> {
+        // Signing mutates and validates every staged generation under the active
+        // policy. Moving that retained cell preserves atomicity without parsing
+        // the complete signed document once more merely to commit it.
+        self.commit_cell(staged.cell)
+    }
+
     /// Borrow the retained parsed view without reparsing.
     pub fn with_view<R>(&self, operation: impl for<'a> FnOnce(DocumentView<'a>) -> R) -> R {
         self.cell.with_dependent(|_, parsed| {
@@ -1178,10 +1184,11 @@ impl XmlDocument {
     }
 
     fn commit_cell(&mut self, next: DocumentCell) -> Result<(), XmlDocumentError> {
-        self.cell = next;
-        self.generation = self.generation.checked_add(1).ok_or_else(|| {
+        let next_generation = self.generation.checked_add(1).ok_or_else(|| {
             XmlDocumentError::InvalidReplacement("document generation overflow".into())
         })?;
+        self.cell = next;
+        self.generation = next_generation;
         Ok(())
     }
 
@@ -1861,18 +1868,28 @@ fn preflight_document_limits(
     let mut depth = 0_usize;
     // roxmltree exposes its document root as the first semantic node.
     let mut nodes = 1_u32;
+    let mut in_character_data = false;
     // Syntax diagnostics and exact parser precedence belong to the selected
     // DOM pipeline; this pass stops at malformed syntax after bounding its prefix.
     while let Ok(event) = reader.read_event() {
-        let adds_node = matches!(
-            event,
-            QuickXmlEvent::Start(_)
-                | QuickXmlEvent::Empty(_)
-                | QuickXmlEvent::Text(_)
-                | QuickXmlEvent::CData(_)
-                | QuickXmlEvent::Comment(_)
-                | QuickXmlEvent::PI(_)
+        let is_character_data = matches!(
+            &event,
+            QuickXmlEvent::Text(_) | QuickXmlEvent::CData(_) | QuickXmlEvent::GeneralRef(_)
         );
+        let adds_node = if is_character_data {
+            let starts_semantic_node = !in_character_data;
+            in_character_data = true;
+            starts_semantic_node
+        } else {
+            in_character_data = false;
+            matches!(
+                &event,
+                QuickXmlEvent::Start(_)
+                    | QuickXmlEvent::Empty(_)
+                    | QuickXmlEvent::Comment(_)
+                    | QuickXmlEvent::PI(_)
+            )
+        };
         if adds_node {
             nodes = nodes.saturating_add(1);
             if nodes > settings.nodes_limit {
@@ -2183,6 +2200,25 @@ mod tests {
 
         assert!(matches!(
             build_cell(xml.to_owned(), settings, Some(&budget)),
+            Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached))
+        ));
+    }
+
+    #[test]
+    fn node_preflight_counts_contiguous_character_data_once() {
+        // Entity references and CDATA split the lexical event stream, but
+        // roxmltree retains the contiguous character data as one text node.
+        let xml = "<root>a&amp;<![CDATA[b]]>&#99;</root>";
+        let exact_settings = DocumentParseSettings::new(false, 3, xml.len());
+
+        build_cell(xml.to_owned(), exact_settings, None)
+            .expect("the exact retained semantic node count must be accepted");
+        assert!(matches!(
+            build_cell(
+                xml.to_owned(),
+                DocumentParseSettings::new(false, 2, xml.len()),
+                None,
+            ),
             Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached))
         ));
     }
