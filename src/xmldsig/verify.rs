@@ -1135,15 +1135,16 @@ fn verify_signature_with_context(
     ctx.policy.validate()?;
     ctx.policy.resources.validate_xml_document_len(xml.len())?;
     let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
+    let settings = DocumentParseSettings::from_policy(&ctx.policy.xml, &ctx.policy.resources);
     let document = XmlDocument::parse_with_settings_and_budget(
         xml.to_owned(),
-        DocumentParseSettings::from_policy(&ctx.policy.xml, &ctx.policy.resources),
+        settings,
         execution_budget.xml_parse_work(),
     )
-    .map_err(|error| match error {
-        crate::document::XmlDocumentError::Policy(error) => DsigError::Policy(error),
-        crate::document::XmlDocumentError::Parse(error) => DsigError::XmlParse(error),
-        error => DsigError::Document(error),
+    .map_err(|error| match error.into_policy_violation(settings) {
+        Ok(error) => DsigError::Policy(error),
+        Err(crate::document::XmlDocumentError::Parse(error)) => DsigError::XmlParse(error),
+        Err(error) => DsigError::Document(error),
     })?;
     verify_signature_document_with_context_and_budget(&document, ctx, &execution_budget)
 }
@@ -2741,8 +2742,9 @@ mod tests {
 
         assert!(matches!(
             VerifyContext::new().policy(policy.clone()).verify(xml),
-            Err(DsigError::Document(
-                crate::document::XmlDocumentError::DocumentTooDeep {
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
                     maximum: 2,
                     actual: 3,
                 }

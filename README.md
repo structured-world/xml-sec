@@ -58,6 +58,10 @@ before building either DOM; recursive internal-entity traversal consumes the sam
 work budget. Both retain the original source bytes and use the same semantic view, policy snapshot,
 C14N, XPath, signature, encryption, and mutation pipelines.
 
+```toml
+xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c14n", "xml-backend-roxmltree"] }
+```
+
 Install the `xmlsec1` command from the same package:
 
 ```sh

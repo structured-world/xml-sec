@@ -1914,76 +1914,156 @@ fn preflight_xml_fragment(
     budget: Option<&XmlParseWorkBudget>,
     collect_doctype: bool,
 ) -> Result<(), XmlDocumentError> {
-    let mut reader = QuickXmlReader::from_str(xml);
+    enum FragmentSource {
+        Document,
+        Entity(String),
+    }
+
+    struct FragmentFrame {
+        source: FragmentSource,
+        offset: usize,
+        collect_doctype: bool,
+    }
+
+    enum PreflightEvent {
+        DocType(Option<String>),
+        GeneralRef {
+            name: Option<String>,
+            is_character_reference: bool,
+        },
+        CharacterData,
+        Start,
+        Empty,
+        End,
+        Node,
+        Other,
+        Done,
+    }
+
     if state.nodes == 0 {
         // roxmltree exposes its document root as the first semantic node.
         state.nodes = 1;
     }
+    let mut fragments = vec![FragmentFrame {
+        source: FragmentSource::Document,
+        offset: 0,
+        collect_doctype,
+    }];
     // Syntax diagnostics and exact parser precedence belong to the selected
     // DOM pipeline; this pass stops at malformed syntax after bounding its prefix.
-    while let Ok(event) = reader.read_event() {
-        if let QuickXmlEvent::DocType(doctype) = &event {
-            if collect_doctype
-                && settings.allow_dtd
-                && let Ok(doctype) = doctype.decode()
-            {
-                collect_internal_general_entities(&doctype, entities);
-            }
-            state.in_character_data = false;
-            continue;
-        }
-
-        if let QuickXmlEvent::GeneralRef(reference) = &event {
-            let Ok(name) = reference.decode() else {
-                continue;
+    while !fragments.is_empty() {
+        let (event, collect_doctype) = {
+            let frame = fragments.last_mut().expect("fragment stack is not empty");
+            let source = match &frame.source {
+                FragmentSource::Document => xml,
+                FragmentSource::Entity(name) => entities
+                    .get(name)
+                    .expect("active entity replacement remains registered"),
             };
-            if reference.resolve_char_ref().ok().flatten().is_some()
-                || matches!(name.as_ref(), "amp" | "apos" | "gt" | "lt" | "quot")
-            {
-                observe_preflight_node(state, settings, true)?;
-                continue;
-            }
-            let name = name.into_owned();
-            if expansion_stack.insert(name.clone()) {
-                if let Some(replacement) = entities.remove(&name) {
-                    charge_entity_expansion_work(state, budget, replacement.len())?;
-                    let result = preflight_xml_fragment(
-                        &replacement,
-                        settings,
-                        entities,
-                        expansion_stack,
-                        state,
-                        budget,
-                        false,
-                    );
-                    entities.insert(name.clone(), replacement);
-                    result?;
+            let remaining = &source[frame.offset..];
+            let mut reader = QuickXmlReader::from_str(remaining);
+            // This pass observes lexical events one at a time and deliberately
+            // leaves structural diagnostics to the selected DOM parser.
+            reader.config_mut().check_end_names = false;
+            let event = match reader.read_event() {
+                Ok(QuickXmlEvent::DocType(doctype)) => {
+                    PreflightEvent::DocType(doctype.decode().ok().map(|value| value.into_owned()))
                 }
-                expansion_stack.remove(&name);
+                Ok(QuickXmlEvent::GeneralRef(reference)) => {
+                    let name = reference.decode().ok().map(|value| value.into_owned());
+                    let is_character_reference =
+                        reference.resolve_char_ref().ok().flatten().is_some()
+                            || name.as_deref().is_some_and(|name| {
+                                matches!(name, "amp" | "apos" | "gt" | "lt" | "quot")
+                            });
+                    PreflightEvent::GeneralRef {
+                        name,
+                        is_character_reference,
+                    }
+                }
+                Ok(QuickXmlEvent::Text(_) | QuickXmlEvent::CData(_)) => {
+                    PreflightEvent::CharacterData
+                }
+                Ok(QuickXmlEvent::Start(_)) => PreflightEvent::Start,
+                Ok(QuickXmlEvent::Empty(_)) => PreflightEvent::Empty,
+                Ok(QuickXmlEvent::End(_)) => PreflightEvent::End,
+                Ok(QuickXmlEvent::Comment(_) | QuickXmlEvent::PI(_)) => PreflightEvent::Node,
+                Ok(QuickXmlEvent::Eof) | Err(_) => PreflightEvent::Done,
+                Ok(_) => PreflightEvent::Other,
+            };
+            frame.offset = frame.offset.saturating_add(
+                usize::try_from(reader.buffer_position()).unwrap_or(remaining.len()),
+            );
+            (event, frame.collect_doctype)
+        };
+
+        match event {
+            PreflightEvent::DocType(doctype) => {
+                if collect_doctype
+                    && settings.allow_dtd
+                    && let Some(doctype) = doctype
+                {
+                    collect_internal_general_entities(&doctype, entities);
+                }
+                state.in_character_data = false;
                 continue;
             }
+            PreflightEvent::GeneralRef {
+                name,
+                is_character_reference,
+            } => {
+                let Some(name) = name else {
+                    continue;
+                };
+                if is_character_reference {
+                    observe_preflight_node(state, settings, true)?;
+                    continue;
+                }
+                if expansion_stack.insert(name.clone()) {
+                    if let Some(replacement) = entities.get(&name) {
+                        charge_entity_expansion_work(state, budget, replacement.len())?;
+                        fragments.push(FragmentFrame {
+                            source: FragmentSource::Entity(name),
+                            offset: 0,
+                            collect_doctype: false,
+                        });
+                    } else {
+                        expansion_stack.remove(&name);
+                    }
+                }
+                continue;
+            }
+            PreflightEvent::Done => {
+                let frame = fragments.pop().expect("fragment stack is not empty");
+                if let FragmentSource::Entity(name) = frame.source {
+                    expansion_stack.remove(&name);
+                }
+                continue;
+            }
+            PreflightEvent::CharacterData => {
+                let starts_semantic_node = !state.in_character_data;
+                state.in_character_data = true;
+                if starts_semantic_node {
+                    observe_preflight_node(state, settings, false)?;
+                }
+                continue;
+            }
+            PreflightEvent::Node => {
+                state.in_character_data = false;
+                observe_preflight_node(state, settings, false)?;
+                continue;
+            }
+            PreflightEvent::Other => {
+                state.in_character_data = false;
+                continue;
+            }
+            PreflightEvent::Start | PreflightEvent::Empty | PreflightEvent::End => {}
         }
 
-        let is_character_data = matches!(&event, QuickXmlEvent::Text(_) | QuickXmlEvent::CData(_));
-        let adds_node = if is_character_data {
-            let starts_semantic_node = !state.in_character_data;
-            state.in_character_data = true;
-            starts_semantic_node
-        } else {
-            state.in_character_data = false;
-            matches!(
-                &event,
-                QuickXmlEvent::Start(_)
-                    | QuickXmlEvent::Empty(_)
-                    | QuickXmlEvent::Comment(_)
-                    | QuickXmlEvent::PI(_)
-            )
-        };
-        if adds_node {
-            observe_preflight_node(state, settings, false)?;
-        }
+        state.in_character_data = false;
         match event {
-            QuickXmlEvent::Start(_) => {
+            PreflightEvent::Start => {
+                observe_preflight_node(state, settings, false)?;
                 state.depth = state.depth.saturating_add(1);
                 if state.depth > settings.depth_limit {
                     return Err(XmlDocumentError::DocumentTooDeep {
@@ -1992,7 +2072,8 @@ fn preflight_xml_fragment(
                     });
                 }
             }
-            QuickXmlEvent::Empty(_) => {
+            PreflightEvent::Empty => {
+                observe_preflight_node(state, settings, false)?;
                 let actual = state.depth.saturating_add(1);
                 if actual > settings.depth_limit {
                     return Err(XmlDocumentError::DocumentTooDeep {
@@ -2001,9 +2082,8 @@ fn preflight_xml_fragment(
                     });
                 }
             }
-            QuickXmlEvent::End(_) => state.depth = state.depth.saturating_sub(1),
-            QuickXmlEvent::Eof => break,
-            _ => {}
+            PreflightEvent::End => state.depth = state.depth.saturating_sub(1),
+            _ => unreachable!("non-structural events continue above"),
         }
     }
     Ok(())
@@ -2514,6 +2594,25 @@ mod tests {
             })) if observed_maximum == maximum
                 && actual == xml.len() + first_replacement + nested_replacement
         ));
+    }
+
+    #[test]
+    fn entity_preflight_uses_bounded_heap_for_long_acyclic_chains() {
+        // Entity indirection is independent of element depth. A legal acyclic
+        // chain must not consume one native stack frame per replacement.
+        const ENTITY_COUNT: usize = 4_096;
+        let mut xml = String::from("<!DOCTYPE root [\n<!ENTITY e0 \"value\">\n");
+        for index in 1..ENTITY_COUNT {
+            use std::fmt::Write as _;
+            writeln!(xml, "<!ENTITY e{index} \"&e{};\">", index - 1)
+                .expect("write entity declaration");
+        }
+        use std::fmt::Write as _;
+        write!(xml, "]><root>&e{};</root>", ENTITY_COUNT - 1).expect("write root reference");
+        let settings = DocumentParseSettings::new_with_depth(true, 16, 1, xml.len());
+
+        preflight_document_limits(&xml, settings, None)
+            .expect("long acyclic entity traversal must use bounded native stack");
     }
 
     #[test]
