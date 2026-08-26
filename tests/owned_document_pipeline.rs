@@ -52,6 +52,51 @@ fn public_owned_parser_uses_the_operation_policy_snapshot() {
     ));
 }
 
+#[test]
+fn public_owned_parser_enforces_cumulative_parse_work() {
+    // Policy-aware construction is an operation boundary, so it must not drop
+    // the parser-work allowance while preserving the other resource limits.
+    let xml = "<root/>";
+    let denied = SigningPolicy {
+        resources: ResourcePolicy {
+            max_xml_parse_work_bytes: 0,
+            ..ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    assert!(matches!(
+        XmlDocument::parse_with_policy(xml, &denied),
+        Err(XmlDocumentError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "cumulative XML parse-work bytes",
+                maximum: 0,
+                actual,
+            }
+        )) if actual == xml.len()
+    ));
+
+    let dtd_capable = SigningPolicy {
+        xml: xml_sec::policy::XmlInputPolicy {
+            allow_internal_dtd: true,
+        },
+        resources: ResourcePolicy {
+            max_xml_parse_work_bytes: xml.len(),
+            ..ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    assert!(matches!(
+        XmlDocument::parse_with_policy(xml, &dtd_capable),
+        Err(XmlDocumentError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "cumulative XML parse-work bytes",
+                maximum,
+                actual,
+            }
+        )) if maximum == xml.len() && actual == xml.len() * 2
+    ));
+}
+
 fn signature_builder() -> SignatureBuilder {
     let canonicalization = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
     SignatureBuilder::new(canonicalization.clone(), SignatureAlgorithm::RsaSha256)

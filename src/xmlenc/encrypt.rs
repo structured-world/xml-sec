@@ -420,7 +420,11 @@ impl EncryptedDataBuilder {
             &ciphertext,
         )?;
         self.validate_document_len(encrypted_data_xml.len())?;
-        let xml_nodes = count_generated_encrypted_data_nodes(&encrypted_data_xml, parse_budget)?;
+        let xml_nodes = count_generated_encrypted_data_nodes(
+            &encrypted_data_xml,
+            self.policy.resources.effective_xml_nodes(),
+            parse_budget,
+        )?;
         let replacement = match encrypted_type {
             Some(EncryptedDataType::Content) => ReplacementMode::ReplaceContent,
             Some(EncryptedDataType::Element | EncryptedDataType::Other(_)) | None => {
@@ -712,17 +716,32 @@ fn validate_replacement_node_counts(
 
 fn count_generated_encrypted_data_nodes(
     encrypted_data_xml: &str,
+    maximum_nodes: u32,
     parse_budget: &XmlParseWorkBudget,
 ) -> Result<usize, XmlEncError> {
     parse_budget.charge_policy(encrypted_data_xml.len())?;
+    // The standalone parser adds one document node that is not inserted into
+    // the caller's tree. Bound the generated subtree by the active policy while
+    // admitting that transient root so exact-fit content replacement remains valid.
+    let parser_node_limit = maximum_nodes.saturating_add(1);
     let generated = Document::parse_with_options(
         encrypted_data_xml,
         ParsingOptions {
             allow_dtd: false,
-            nodes_limit: crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
+            nodes_limit: parser_node_limit,
             entity_resolver: None,
         },
-    )?;
+    )
+    .map_err(|error| match error {
+        roxmltree::Error::NodesLimitReached => {
+            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum: maximum_nodes as usize,
+                actual: maximum_nodes as usize + 1,
+            })
+        }
+        error => XmlEncError::XmlParse(error),
+    })?;
     Ok(generated.root_element().descendants().count())
 }
 
@@ -1783,6 +1802,36 @@ mod tests {
                 &budget_two,
             ),
             Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
+        ));
+    }
+
+    #[test]
+    fn generated_encrypted_data_parse_uses_the_active_node_limit() {
+        // Generated XML is still operation work: reject it in the parser under
+        // the active policy rather than allocating up to the absolute ceiling.
+        let xml = "<EncryptedData><CipherData><CipherValue>AA==</CipherValue></CipherData></EncryptedData>";
+        let policy = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_nodes: 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let budget = XmlParseWorkBudget::from_resources(&policy.resources);
+
+        assert!(matches!(
+            count_generated_encrypted_data_nodes(
+                xml,
+                policy.resources.effective_xml_nodes(),
+                &budget,
+            ),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_NODES,
+                    maximum: 1,
+                    actual: 2,
+                }
+            ))
         ));
     }
 

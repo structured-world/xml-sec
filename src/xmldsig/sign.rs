@@ -901,7 +901,9 @@ impl<'a> SignContext<'a> {
     pub fn sign_document(&self, document: &mut XmlDocument) -> Result<(), SigningError> {
         self.validate_owned_document_input(document)?;
         let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
-        let mut staged = document.staged_copy_with_budget(budgets.transforms.xml_parse_work())?;
+        let mut staged = document
+            .staged_copy_with_budget(budgets.transforms.xml_parse_work())
+            .map_err(map_owned_document_mutation_error)?;
         self.sign_document_in_place(&mut staged, &mut budgets)?;
         document
             .replace_serialized_with_node_limit(
@@ -1117,7 +1119,9 @@ impl<'a> SignContext<'a> {
     ) -> Result<(), SigningError> {
         self.validate_owned_document_input(document)?;
         let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
-        let mut staged = document.staged_copy_with_budget(budgets.transforms.xml_parse_work())?;
+        let mut staged = document
+            .staged_copy_with_budget(budgets.transforms.xml_parse_work())
+            .map_err(map_owned_document_mutation_error)?;
         self.sign_document_with_builder_in_place(&mut staged, builder, &mut budgets)?;
         document
             .replace_serialized_with_node_limit(
@@ -2338,6 +2342,51 @@ mod error_conversion_tests {
                 actual,
             }) if actual == xml.len()
         ));
+    }
+
+    #[test]
+    fn owned_signing_staged_copies_preserve_policy_errors() {
+        // Both retained-document entry points must expose operation policy
+        // exhaustion directly and leave the caller's generation untouched.
+        let mut policy = crate::policy::SigningPolicy::default();
+        policy.resources.max_xml_parse_work_bytes = 0;
+        let context = SignContext::new(&RejectingSigningKey).policy(policy);
+
+        let mut template_document = XmlDocument::parse("<root/>").expect("fixture must parse");
+        let template_before = template_document.as_xml().to_owned();
+        let error = context
+            .sign_document(&mut template_document)
+            .expect_err("the staged template copy must exhaust the operation budget");
+        assert!(matches!(
+            error,
+            SigningError::Policy(PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum: 0,
+                actual,
+            }) if actual == template_before.len()
+        ));
+        assert_eq!(template_document.as_xml(), template_before);
+        assert_eq!(template_document.generation(), 0);
+
+        let mut builder_document = XmlDocument::parse("<root/>").expect("fixture must parse");
+        let builder_before = builder_document.as_xml().to_owned();
+        let builder = SignatureBuilder::new(
+            crate::c14n::C14nAlgorithm::new(crate::c14n::C14nMode::Exclusive1_0, false),
+            SignatureAlgorithm::RsaSha256,
+        );
+        let error = context
+            .sign_document_with_builder(&mut builder_document, &builder)
+            .expect_err("the staged builder copy must exhaust the operation budget");
+        assert!(matches!(
+            error,
+            SigningError::Policy(PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum: 0,
+                actual,
+            }) if actual == builder_before.len()
+        ));
+        assert_eq!(builder_document.as_xml(), builder_before);
+        assert_eq!(builder_document.generation(), 0);
     }
 
     #[test]

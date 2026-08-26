@@ -409,19 +409,29 @@ impl XmlDocument {
     ) -> Result<Self, XmlDocumentError> {
         let resources = policy.resource_policy();
         resources.validate()?;
-        Self::parse_with_settings(
+        let budget = XmlParseWorkBudget::from_resources(resources);
+        Self::parse_with_settings_and_optional_budget(
             xml.into(),
             DocumentParseSettings::new(
                 policy.xml_input_policy().allow_internal_dtd,
                 resources.effective_xml_nodes(),
                 resources.max_xml_document_bytes,
             ),
+            Some(&budget),
         )
     }
 
     pub(crate) fn parse_with_settings(
         xml: String,
         settings: DocumentParseSettings,
+    ) -> Result<Self, XmlDocumentError> {
+        Self::parse_with_settings_and_optional_budget(xml, settings, None)
+    }
+
+    fn parse_with_settings_and_optional_budget(
+        xml: String,
+        settings: DocumentParseSettings,
+        budget: Option<&XmlParseWorkBudget>,
     ) -> Result<Self, XmlDocumentError> {
         if xml.len() > settings.max_bytes {
             return Err(XmlDocumentError::DocumentTooLarge {
@@ -430,7 +440,8 @@ impl XmlDocument {
             });
         }
         #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-        let requires_internal_dtd = document_requires_internal_dtd(&xml, settings);
+        let requires_internal_dtd = document_requires_internal_dtd(&xml, settings, budget)?;
+        charge_parse_work(budget, xml.len())?;
         let cell = build_cell(xml, settings)?;
         let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
         Ok(Self {
@@ -449,14 +460,7 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<Self, XmlDocumentError> {
-        if xml.len() > settings.max_bytes {
-            return Err(XmlDocumentError::DocumentTooLarge {
-                maximum: settings.max_bytes,
-                actual: xml.len(),
-            });
-        }
-        budget.charge(xml.len())?;
-        Self::parse_with_settings(xml, settings)
+        Self::parse_with_settings_and_optional_budget(xml, settings, Some(budget))
     }
 
     /// Return this document's stable provenance identity.
@@ -1566,20 +1570,27 @@ fn allocate_document_identity(counter: &AtomicU64) -> Result<DocumentIdentity, X
 }
 
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-fn document_requires_internal_dtd(xml: &str, settings: DocumentParseSettings) -> bool {
+fn document_requires_internal_dtd(
+    xml: &str,
+    settings: DocumentParseSettings,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<bool, XmlDocumentError> {
     // Parse provenance records what the source actually requires, not merely
     // whether its creator used a permissive policy. This lets a later strict
     // operation accept ordinary XML while rejecting DTD-dependent documents.
-    settings.allow_dtd
-        && Document::parse_with_options(
-            xml,
-            ParsingOptions {
-                allow_dtd: false,
-                nodes_limit: settings.nodes_limit,
-                entity_resolver: None,
-            },
-        )
-        .is_err()
+    if !settings.allow_dtd {
+        return Ok(false);
+    }
+    charge_parse_work(budget, xml.len())?;
+    Ok(Document::parse_with_options(
+        xml,
+        ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: settings.nodes_limit,
+            entity_resolver: None,
+        },
+    )
+    .is_err())
 }
 
 fn wrapped_fragment(replacement: &str) -> String {
