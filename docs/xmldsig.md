@@ -74,7 +74,9 @@ Custom `KeyInfoWriter` output is treated as a separate untrusted XML input: its
 byte ceiling is enforced before namespace wrapping or parsing, and its merged nodes remain under
 the same operation ceiling as the rest of the signature.
 Built-in writers emit `RSAKeyValue`/`ECKeyValue`, `DEREncodedKeyValue`, embedded
-X.509 certificate chains, or `X509Digest` selectors. DSA signing accepts plain
+X.509 certificate chains, or `X509Digest` selectors. Cryptographic writer work,
+including the certificate digest used by `X509Digest`, runs through the same
+operation provider as reference digests and signature generation. DSA signing accepts plain
 or password-encrypted PKCS#8 DER and emits XMLDSig's fixed-width `r || s` value;
 DSA-SHA1 requires a 160-bit `q`, while DSA-SHA256 requires a 256-bit `q`, so a
 key whose component width cannot be represented by the selected wire format is
@@ -85,6 +87,9 @@ Recursive `KeyInfoReference` materialization shares one candidate-work budget
 across the complete reference graph. Each dereference and terminal source is
 charged before expansion, so a shallow fan-out DAG cannot allocate an
 exponential flattened source list while remaining below the depth limit.
+Cycle identities include the owning document or stable external-resource URI:
+equal fragment names in distinct documents remain independent, while reparsing
+an external resource cannot hide a cycle that returns to that resource.
 `IdAttributeRegistration` supplies immutable request context for non-standard ID attributes.
 `SignContext::id_attributes` and `VerifyContext::id_attributes` apply the same global or
 element-scoped registrations to operation start-node selection and every same-document Reference.

@@ -320,11 +320,14 @@ A direct `--aes-key` cannot satisfy an `EncryptedKey` recipient embedded in the
 template, so that inconsistent combination is rejected rather than preserving
 a stale wrapped key.
 
-For HMAC templates, `--hmac-key[:name] path` reads the file as raw secret bytes;
-certificate companions are not applicable. The compatibility CLI accepts the
-legacy 40-bit minimum used by the donor suite, while library callers retain the
-typed policy default of 128 bits. Named HMAC and asymmetric options participate
-in the same `KeyName` selection and candidate-budget rules.
+For HMAC templates, both `sign` and `verify` accept `--hmac-key[:name] path` and
+read the file as raw secret bytes; certificate companions are not applicable.
+The compatibility CLI accepts the legacy 40-bit minimum used by the donor
+suite, while library callers retain the typed policy default of 128 bits.
+Named HMAC and asymmetric options participate in the same `KeyName` selection
+and candidate-budget rules. The compatibility boundary likewise admits legacy
+DSA 1024/160 keys for DSA-SHA1; the core signing and verification policies keep
+their 2048-bit default unless callers explicitly choose otherwise.
 
 Generate an AES key store using the upstream command shape:
 

@@ -24,9 +24,9 @@ use xml_sec::{
     provider::{CryptoProvider, default_provider},
     xmldsig::{
         DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus, FailureReason, HmacSigningKey,
-        KeyInfo, KeyInfoSource, KeyInfoWriter, KeyResolver, KeyResolverConfig, KeyValueInfo,
-        ReferenceResult, SignContext, SignatureAlgorithm, SignatureTemplateSelection, SigningKey,
-        SigningPublicKeyInfo, UriTypeSet, VerificationKey, VerifyContext, VerifyResult,
+        HmacVerificationKey, KeyInfo, KeyInfoSource, KeyInfoWriter, KeyResolver, KeyResolverConfig,
+        KeyValueInfo, ReferenceResult, SignContext, SignatureAlgorithm, SignatureTemplateSelection,
+        SigningKey, SigningPublicKeyInfo, UriTypeSet, VerificationKey, VerifyContext, VerifyResult,
         VerifyingKey, X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
         uri::UriReferenceResolver, validate_signing_key, x509_certificate_matches_selectors,
     },
@@ -82,6 +82,7 @@ const VERIFY_OPTIONS: &[&str] = &[
     "pubkey-der",
     "pubkey-cert-pem",
     "pubkey-cert-der",
+    "hmac-key",
     "trusted-pem",
     "trusted-der",
     "untrusted-pem",
@@ -701,7 +702,7 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
     // The native CLI is an explicit compatibility boundary. These complete
     // allowlists opt its sign command into every implemented libxmlsec1 method,
     // including legacy SHA-1, without weakening the core library defaults.
-    SigningPolicy {
+    let mut policy = SigningPolicy {
         signature_algorithms: Some(HashSet::from([
             SignatureAlgorithm::DsaSha1,
             SignatureAlgorithm::DsaSha256,
@@ -744,7 +745,9 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
         },
         ecdsa_signature_value_encoding: ecdsa_signature_value_encoding(invocation),
         ..SigningPolicy::default()
-    }
+    };
+    policy.dsa_keys.minimum_modulus_bits = 1024;
+    policy
 }
 
 fn write_signing_diagnostics(
@@ -1065,6 +1068,11 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         SignatureAlgorithm::HmacSha1,
         SignatureAlgorithm::EcdsaSha1,
     ]);
+    policy.key_trust.dsa_keys.minimum_modulus_bits = 1024;
+    policy.hmac = HmacPolicy {
+        minimum_key_bits: 40,
+        minimum_output_bits: 40,
+    };
     // X509Data is controlled by the signed document and therefore cannot
     // establish its own trust. Only an explicit insecure opt-out disables
     // path validation for resolver-selected certificates. libxmlsec1 makes
@@ -1109,6 +1117,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             "pubkey-der",
             "pubkey-cert-pem",
             "pubkey-cert-der",
+            "hmac-key",
         ])
         .map(|option| {
             let certificate = matches!(option.name.as_str(), "pubkey-cert-pem" | "pubkey-cert-der");
@@ -1156,7 +1165,16 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         let mut candidates = Vec::with_capacity(selected_keys.len());
         let mut last_load_error = None;
         for (option, certificate) in selected_keys {
-            let candidate = if certificate {
+            let candidate = if option.name == "hmac-key" {
+                (|| {
+                    let path = Path::new(option.value.as_deref().unwrap_or_default());
+                    let bytes = key_material::read(path)?;
+                    certificate_budget.charge(bytes.len())?;
+                    HmacVerificationKey::new(bytes)
+                        .map(ExplicitVerificationCandidate::Hmac)
+                        .map_err(|error| CommandError::Signature(error.to_string()))
+                })()
+            } else if certificate {
                 load_explicit_certificate_key_info(option, &mut certificate_budget)
                     .map(ExplicitVerificationCandidate::Certificate)
             } else {
@@ -1419,6 +1437,7 @@ fn verification_context<'a>(
 
 enum ExplicitVerificationCandidate {
     Direct(VerificationKey),
+    Hmac(HmacVerificationKey),
     Certificate(KeyInfo),
 }
 
@@ -1509,6 +1528,9 @@ impl KeyResolver for CandidateVerificationResolver {
         for candidate in &self.candidates {
             let key = match candidate {
                 ExplicitVerificationCandidate::Direct(key) => {
+                    Some(Box::new(key.clone()) as Box<dyn VerifyingKey>)
+                }
+                ExplicitVerificationCandidate::Hmac(key) => {
                     Some(Box::new(key.clone()) as Box<dyn VerifyingKey>)
                 }
                 ExplicitVerificationCandidate::Certificate(info) => {
@@ -3460,6 +3482,7 @@ mod tests {
                 DigestAlgorithm::Sha512,
             ]))
         );
+        assert_eq!(policy.dsa_keys.minimum_modulus_bits, 1024);
     }
 
     fn testdata(name: &str) -> PathBuf {
@@ -3725,6 +3748,8 @@ mod tests {
             policy.transforms.xpath_here_semantics,
             xml_sec::xmldsig::XPathHereSemantics::XmlSecLegacy
         );
+        assert_eq!(policy.key_trust.dsa_keys.minimum_modulus_bits, 1024);
+        assert_eq!(policy.hmac.minimum_key_bits, 40);
     }
 
     #[test]

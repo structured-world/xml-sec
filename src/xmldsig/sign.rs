@@ -468,12 +468,29 @@ pub trait SigningKey {
 pub trait KeyInfoWriter {
     /// Return XML child content for the direct `<Signature>/<KeyInfo>` element.
     fn write_key_info(&self, signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError>;
+
+    /// Write key metadata through the cryptographic provider selected for the operation.
+    ///
+    /// Writers that do not perform cryptographic operations can rely on this
+    /// default. Digest- or signature-producing writers must override it.
+    fn write_key_info_with_provider(
+        &self,
+        signing_key: &dyn SigningKey,
+        provider: &dyn crate::provider::CryptoProvider,
+    ) -> Result<String, KeyInfoWriteError> {
+        let _ = provider;
+        self.write_key_info(signing_key)
+    }
 }
 
 /// Errors while preparing XMLDSig signing `<KeyInfo>` output.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum KeyInfoWriteError {
+    /// The selected provider could not produce cryptographic key metadata.
+    #[error("cryptographic provider error: {0}")]
+    Provider(#[from] crate::provider::ProviderError),
+
     /// PEM input could not be parsed.
     #[error("invalid PEM certificate")]
     InvalidCertificatePem,
@@ -691,13 +708,25 @@ impl X509DigestKeyInfoWriter {
 
 impl KeyInfoWriter for X509DigestKeyInfoWriter {
     fn write_key_info(&self, signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
+        self.write_key_info_with_provider(signing_key, crate::provider::default_provider())
+    }
+
+    fn write_key_info_with_provider(
+        &self,
+        signing_key: &dyn SigningKey,
+        provider: &dyn crate::provider::CryptoProvider,
+    ) -> Result<String, KeyInfoWriteError> {
         let (_, certificate) =
             x509_parser::certificate::X509Certificate::from_der(&self.certificate_der)
                 .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
         if signing_key.public_key_info()?.spki_der() != Some(certificate.public_key().raw) {
             return Err(KeyInfoWriteError::CertificateKeyMismatch);
         }
-        let digest = super::compute_digest(self.digest_algorithm, &self.certificate_der);
+        let digest = super::compute_digest_with_provider(
+            provider,
+            self.digest_algorithm,
+            &self.certificate_der,
+        )?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(digest);
         Ok(format!(
             "<ds:X509Data xmlns:ds=\"{XMLDSIG_NS}\"><dsig11:X509Digest xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\" Algorithm=\"{}\">{encoded}</dsig11:X509Digest></ds:X509Data>",
@@ -916,12 +945,12 @@ impl SigningKey for DsaSigningKey {
             .map_err(|_| SigningKeyError::SigningFailed)?;
         let mut output = Vec::with_capacity(component_len.saturating_mul(2));
         for component in [signature.r(), signature.s()] {
-            let bytes = component.to_be_bytes();
+            let bytes = component.to_be_bytes_trimmed_vartime();
             if bytes.len() > component_len {
                 return Err(SigningKeyError::SigningFailed);
             }
             output.resize(output.len() + component_len - bytes.len(), 0);
-            output.extend_from_slice(&bytes);
+            output.extend_from_slice(bytes.as_ref());
         }
         Ok(output)
     }
@@ -1374,7 +1403,8 @@ impl<'a> SignContext<'a> {
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics);
         let with_key_info = if let Some(writer) = self.key_info_writer {
-            let key_info_content = writer.write_key_info(self.signing_key)?;
+            let key_info_content =
+                writer.write_key_info_with_provider(self.signing_key, self.provider)?;
             // Writer output is a separate untrusted XML input. Bound it before
             // namespace wrapping or parsing, then bound the merged document below.
             self.policy

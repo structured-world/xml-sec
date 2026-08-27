@@ -916,9 +916,7 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
     match algorithm {
         X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1)
         | X509SignatureAlgorithm::RsaPkcs1v15(_)
-        | X509SignatureAlgorithm::Ecdsa(
-            DigestAlgorithm::Sha224 | DigestAlgorithm::Sha256 | DigestAlgorithm::Sha384,
-        )
+        | X509SignatureAlgorithm::Ecdsa(_)
         | X509SignatureAlgorithm::Ed25519 => true,
         X509SignatureAlgorithm::RsaPss {
             digest, mgf_digest, ..
@@ -928,8 +926,7 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
                 DigestAlgorithm::Sha256 | DigestAlgorithm::Sha384 | DigestAlgorithm::Sha512
             ) && digest == mgf_digest
         }
-        X509SignatureAlgorithm::Dsa(_)
-        | X509SignatureAlgorithm::Ecdsa(DigestAlgorithm::Sha1 | DigestAlgorithm::Sha512) => false,
+        X509SignatureAlgorithm::Dsa(_) => false,
     }
 }
 
@@ -1727,6 +1724,51 @@ mod tests {
         assert!(RUST_CRYPTO_PROVIDER.supports(ProviderCapability::Verify(
             crate::xmldsig::SignatureAlgorithm::RsaSha1
         )));
+        for digest in [DigestAlgorithm::Sha1, DigestAlgorithm::Sha512] {
+            assert!(
+                RUST_CRYPTO_PROVIDER.supports(ProviderCapability::VerifyCertificate(
+                    X509SignatureAlgorithm::Ecdsa(digest)
+                ))
+            );
+        }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn x509_digest_key_info_uses_the_selected_provider() {
+        use crate::xmldsig::{
+            DigestAlgorithm, KeyInfoWriteError, KeyInfoWriter, RsaSigningKey,
+            X509DigestKeyInfoWriter,
+        };
+
+        // KeyInfo generation is part of the signing operation's provider
+        // boundary; a writer must not silently fall back to RustCrypto.
+        let key = RsaSigningKey::from_pkcs8_pem(include_str!(
+            "../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("RSA fixture must parse");
+        let writer = X509DigestKeyInfoWriter::from_pem(
+            include_str!("../tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+            DigestAlgorithm::Sha224,
+        )
+        .expect("certificate fixture must parse");
+        let provider = CountingRandomProvider {
+            random_calls: AtomicUsize::new(0),
+            reject_digest: Some(DigestAlgorithm::Sha224),
+            extra_digest_byte: false,
+            accept_signatures: false,
+        };
+
+        let error = writer
+            .write_key_info_with_provider(&key, &provider)
+            .expect_err("the selected provider must control X509Digest");
+        assert!(matches!(
+            error,
+            KeyInfoWriteError::Provider(ProviderError::Unsupported {
+                operation: ProviderOperation::Digest,
+                ..
+            })
+        ));
     }
 
     #[cfg(all(feature = "xmldsig", feature = "xmlenc"))]

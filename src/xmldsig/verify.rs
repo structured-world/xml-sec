@@ -1599,7 +1599,7 @@ struct RetrievalMaterializationBudgets<'a> {
 
 #[derive(Default)]
 struct KeyInfoReferenceTraversal {
-    active: HashSet<String>,
+    active: HashSet<(super::uri::TraversalDocumentIdentity, String)>,
     candidate_materialization_work: usize,
 }
 
@@ -1666,7 +1666,8 @@ fn materialize_key_info_references(
                 }
                 .into());
             }
-            if !traversal.active.insert(uri.clone()) {
+            let cycle_key = (resolver.traversal_document_identity(), uri.clone());
+            if !traversal.active.insert(cycle_key.clone()) {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "KeyInfoReference cycle detected",
                 });
@@ -1733,7 +1734,7 @@ fn materialize_key_info_references(
                 )
                 .map_err(|error| map_document_parse_error(error, settings))?;
                 document.with_view(|view| {
-                    let external_resolver = resolver.for_document_view(view);
+                    let external_resolver = resolver.for_external_document_view(view, resource_uri);
                     let target = match fragment {
                         Some(fragment) => external_resolver
                             .node_for_same_document_reference(&format!("#{fragment}"))
@@ -1793,7 +1794,7 @@ fn materialize_key_info_references(
                 )?);
             }
             outcome.merge(nested_outcome);
-            traversal.active.remove(&uri);
+            traversal.active.remove(&cycle_key);
             materialized.extend(referenced.sources);
         }
         key_info.sources = materialized;
@@ -5305,6 +5306,85 @@ mod tests {
             error,
             SignatureVerificationPipelineError::InvalidStructure {
                 reason: "KeyInfo contains too many RetrievalMethod elements"
+            }
+        ));
+    }
+
+    fn materialize_external_key_info_chain(
+        terminal_reference: &str,
+    ) -> Result<KeyInfo, SignatureVerificationPipelineError> {
+        let a = format!(
+            r##"<doc xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+                <ds:KeyInfo ID="root"><dsig11:KeyInfoReference URI="#next"/></ds:KeyInfo>
+                <ds:KeyInfo ID="next"><dsig11:KeyInfoReference URI="b.xml#root"/></ds:KeyInfo>
+            </doc>"##
+        );
+        let b = format!(
+            r##"<doc xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+                <ds:KeyInfo ID="root"><dsig11:KeyInfoReference URI="#next"/></ds:KeyInfo>
+                <ds:KeyInfo ID="next">{terminal_reference}</ds:KeyInfo>
+            </doc>"##
+        );
+        let resources = HashMap::from([
+            ("a.xml".to_owned(), a.into_bytes()),
+            ("b.xml".to_owned(), b.into_bytes()),
+        ]);
+        let document = XmlDocument::parse("<root/>").unwrap();
+        let mut key_info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                uri: "a.xml#root".into(),
+            }],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_sources.key_info_reference = true;
+        policy.uris.key_info_references = UriTypeSet::ALL;
+        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
+        let mut budgets = RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse_budget,
+            execution: &execution_budget,
+            resources: &policy.resources,
+        };
+
+        document.with_view(|view| {
+            let resolver = UriReferenceResolver::with_document_view(view, &[])
+                .with_external_resources(&resources);
+            materialize_key_info_references(
+                &mut key_info,
+                &resolver,
+                &policy,
+                crate::provider::default_provider(),
+                None,
+                &mut budgets,
+            )?;
+            Ok::<_, SignatureVerificationPipelineError>(())
+        })?;
+        Ok(key_info)
+    }
+
+    #[test]
+    fn key_info_reference_cycle_identity_includes_the_owning_resource() {
+        // Equal fragment spellings in separate external documents are distinct
+        // references and must not be rejected as a recursive cycle.
+        let key_info = materialize_external_key_info_chain("<ds:KeyName>terminal</ds:KeyName>")
+            .expect("cross-document duplicate fragments must materialize");
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [super::super::parse::KeyInfoSource::KeyName(name)] if name == "terminal"
+        ));
+    }
+
+    #[test]
+    fn key_info_reference_cycle_identity_survives_external_reparse() {
+        // Returning to the same external resource must remain a cycle even
+        // though each dereference creates a fresh owned XML document.
+        let error =
+            materialize_external_key_info_chain("<dsig11:KeyInfoReference URI=\"a.xml#root\"/>")
+                .expect_err("a resource cycle must fail before exhausting depth");
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "KeyInfoReference cycle detected"
             }
         ));
     }

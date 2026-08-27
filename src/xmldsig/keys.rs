@@ -2632,7 +2632,7 @@ mod tests {
             "certificate must repeat its signature OID"
         );
         for offset in offsets {
-            unsupported_intermediate[offset + ecdsa_sha256_oid.len() - 1] = 0x04;
+            unsupported_intermediate[offset + ecdsa_sha256_oid.len() - 1] = 0x05;
         }
 
         let anchored = x509_info(
@@ -2675,7 +2675,7 @@ mod tests {
                 crate::provider::default_provider(),
             ),
             Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { ref oid })
-                if oid == "1.2.840.10045.4.3.4"
+                if oid == "1.2.840.10045.4.3.5"
         ));
     }
 

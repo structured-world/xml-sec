@@ -122,6 +122,7 @@ impl ExternalResourceBudget {
 pub struct UriReferenceResolver<'a> {
     doc: &'a Document<'a>,
     view: Option<crate::DocumentView<'a>>,
+    resource_identity: Option<String>,
     id_index: ResolverIdIndex<'a>,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
     external_resource_budget: Rc<ExternalResourceBudget>,
@@ -131,6 +132,13 @@ pub struct UriReferenceResolver<'a> {
 enum ResolverIdIndex<'a> {
     Borrowed(XmlIdIndex<'a>),
     Retained(HashMap<String, NodeId>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TraversalDocumentIdentity {
+    Owned(crate::DocumentIdentity),
+    External(String),
+    Borrowed(usize),
 }
 
 impl<'a> ResolverIdIndex<'a> {
@@ -183,6 +191,7 @@ impl<'a> UriReferenceResolver<'a> {
         Self {
             doc,
             view: None,
+            resource_identity: None,
             id_index: ResolverIdIndex::Borrowed(XmlIdIndex::with_extra_attrs(doc, extra_attrs)),
             external_resources: None,
             external_resource_budget: Rc::new(ExternalResourceBudget::default()),
@@ -198,6 +207,7 @@ impl<'a> UriReferenceResolver<'a> {
         Self {
             doc,
             view: None,
+            resource_identity: None,
             id_index: ResolverIdIndex::Borrowed(XmlIdIndex::with_registrations(doc, registrations)),
             external_resources: None,
             external_resource_budget: Rc::new(ExternalResourceBudget::default()),
@@ -212,6 +222,7 @@ impl<'a> UriReferenceResolver<'a> {
         Self {
             doc: view.document(),
             view: Some(view),
+            resource_identity: None,
             id_index: ResolverIdIndex::Retained(view.id_index(registrations)),
             external_resources: None,
             external_resource_budget: Rc::new(ExternalResourceBudget::default()),
@@ -239,10 +250,39 @@ impl<'a> UriReferenceResolver<'a> {
         UriReferenceResolver {
             doc: view.document(),
             view: Some(view),
+            resource_identity: None,
             id_index: ResolverIdIndex::Retained(view.id_index(&[])),
             external_resources: self.external_resources,
             external_resource_budget: Rc::clone(&self.external_resource_budget),
             same_document_id_semantics: self.same_document_id_semantics,
+        }
+    }
+
+    /// Rebind document-local URI resolution to a stable external resource.
+    ///
+    /// The identity survives reparsing, so recursive reference traversal can
+    /// distinguish equal fragments in different resources without overlooking
+    /// a cycle that returns to the same resource.
+    pub(crate) fn for_external_document_view<'b>(
+        &self,
+        view: crate::DocumentView<'b>,
+        resource_identity: &str,
+    ) -> UriReferenceResolver<'b>
+    where
+        'a: 'b,
+    {
+        let mut resolver = self.for_document_view(view);
+        resolver.resource_identity = Some(resource_identity.to_owned());
+        resolver
+    }
+
+    pub(crate) fn traversal_document_identity(&self) -> TraversalDocumentIdentity {
+        if let Some(identity) = &self.resource_identity {
+            TraversalDocumentIdentity::External(identity.clone())
+        } else if let Some(view) = self.view {
+            TraversalDocumentIdentity::Owned(view.identity())
+        } else {
+            TraversalDocumentIdentity::Borrowed(self.doc as *const Document<'_> as usize)
         }
     }
 

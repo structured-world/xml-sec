@@ -144,6 +144,28 @@ fn compatibility_cli_signs_hmac_templates_with_named_raw_keys() {
         .expect("CLI-generated HMAC signature must verify");
     assert_eq!(verified.status, xml_sec::xmldsig::DsigStatus::Valid);
 
+    let cli_verified = Command::new(binary())
+        .args(["verify", "--hmac-key:TeskKeyName-Hmac"])
+        .arg(&key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        cli_verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli_verified.stderr)
+    );
+
+    let wrong_key = temp.path().join("wrong-hmac.bin");
+    fs::write(&wrong_key, b"wrong-secret").unwrap();
+    let rejected_wrong_key = Command::new(binary())
+        .args(["verify", "--hmac-key:TeskKeyName-Hmac"])
+        .arg(&wrong_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(!rejected_wrong_key.status.success());
+
     let short_key = temp.path().join("short-hmac.bin");
     fs::write(&short_key, [0_u8; 4]).unwrap();
     let rejected = Command::new(binary())
@@ -154,9 +176,22 @@ fn compatibility_cli_signs_hmac_templates_with_named_raw_keys() {
         .unwrap();
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("configured minimum"));
+
+    let rejected_verify = Command::new(binary())
+        .args(["verify", "--hmac-key:TeskKeyName-Hmac"])
+        .arg(&short_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(!rejected_verify.status.success());
+    assert!(String::from_utf8_lossy(&rejected_verify.stderr).contains("configured minimum"));
 }
 
 #[test]
+#[expect(
+    deprecated,
+    reason = "the compatibility CLI must retain coverage for legacy DSA 1024/160 keys"
+)]
 fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
     // The CLI decoder must cover every asymmetric family admitted by its
     // compatibility policy, not just the historically implemented subset.
@@ -204,6 +239,67 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         dsa_verify.status.success(),
         "{}",
         String::from_utf8_lossy(&dsa_verify.stderr)
+    );
+
+    let mut legacy_rng = ChaCha8Rng::seed_from_u64(0xD5A1_1024);
+    let legacy_components = dsa::Components::try_generate_from_rng_with_key_size(
+        &mut legacy_rng,
+        dsa::KeySize::DSA_1024_160,
+    )
+    .expect("legacy DSA parameters must generate");
+    let legacy_dsa =
+        dsa::SigningKey::try_generate_from_rng_with_components(&mut legacy_rng, legacy_components)
+            .expect("legacy DSA key must generate");
+    let legacy_private = temp.path().join("dsa-1024-private.der");
+    let legacy_public = temp.path().join("dsa-1024-public.der");
+    fs::write(
+        &legacy_private,
+        legacy_dsa.to_pkcs8_der().unwrap().as_bytes(),
+    )
+    .unwrap();
+    fs::write(
+        &legacy_public,
+        legacy_dsa
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let donor_legacy_template = project_root()
+        .join("tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-dsa.tmpl");
+    let legacy_template = temp.path().join("dsa-1024-template.xml");
+    fs::write(
+        &legacy_template,
+        fs::read_to_string(donor_legacy_template)
+            .unwrap()
+            .replace("    <KeyValue>\n    </KeyValue>\n", ""),
+    )
+    .unwrap();
+    let legacy_signed = temp.path().join("dsa-1024-signed.xml");
+    let legacy_sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-dsa-1024"])
+        .arg(&legacy_private)
+        .arg("--output")
+        .arg(&legacy_signed)
+        .arg(&legacy_template)
+        .output()
+        .unwrap();
+    assert!(
+        legacy_sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&legacy_sign.stderr)
+    );
+    let legacy_verify = Command::new(binary())
+        .args(["verify", "--pubkey-der:TestKeyName-dsa-1024"])
+        .arg(&legacy_public)
+        .arg(&legacy_signed)
+        .output()
+        .unwrap();
+    assert!(
+        legacy_verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&legacy_verify.stderr)
     );
 
     let p521_template = temp.path().join("p521-template.xml");

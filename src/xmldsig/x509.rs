@@ -817,6 +817,7 @@ fn x509_signature_algorithm(
     let oid = identifier.algorithm.to_id_string();
     let algorithm = match oid.as_str() {
         "1.2.840.10040.4.3" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha1),
+        "2.16.840.1.101.3.4.3.1" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha224),
         "2.16.840.1.101.3.4.3.2" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha256),
         "2.16.840.1.101.3.4.3.3" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha384),
         "2.16.840.1.101.3.4.3.4" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha512),
@@ -2090,6 +2091,10 @@ mod tests {
         // implement it even when RustCrypto does not.
         for (oid, expected) in [
             (
+                "2.16.840.1.101.3.4.3.1",
+                X509SignatureAlgorithm::Dsa(super::super::DigestAlgorithm::Sha224),
+            ),
+            (
                 "2.16.840.1.101.3.4.3.2",
                 X509SignatureAlgorithm::Dsa(super::super::DigestAlgorithm::Sha256),
             ),
@@ -2134,6 +2139,7 @@ mod tests {
         // parameters. A NULL is not equivalent for these algorithm profiles.
         for oid in [
             "1.2.840.10040.4.3",
+            "2.16.840.1.101.3.4.3.1",
             "2.16.840.1.101.3.4.3.2",
             "1.2.840.10045.4.1",
             "1.2.840.10045.4.3.1",
