@@ -2646,7 +2646,7 @@ mod tests {
         // operation meter rather than receiving a parser-local allowance.
         let signature_document = Document::parse("<Signature/>").unwrap();
         let xml = b"<root/>";
-        let parser_passes = 3;
+        let parser_passes = crate::document::selected_parser_passes();
         let resources = crate::policy::ResourcePolicy {
             max_xml_parse_work_bytes: xml.len() * parser_passes,
             ..crate::policy::ResourcePolicy::default()

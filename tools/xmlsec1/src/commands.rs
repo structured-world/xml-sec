@@ -922,6 +922,19 @@ fn validate_signing_key_info(
                 SigningPublicKeyInfo::Rsa { modulus: expected_modulus, exponent: expected_exponent, .. }
                     if expected_modulus == modulus && expected_exponent == exponent
             ),
+            KeyInfoSource::KeyValue(KeyValueInfo::Dsa { p, q, g, y }) => matches!(
+                &public,
+                SigningPublicKeyInfo::Dsa {
+                    p: expected_p,
+                    q: expected_q,
+                    g: expected_g,
+                    y: expected_y,
+                    ..
+                } if p.as_deref().is_none_or(|value| value == expected_p)
+                    && q.as_deref().is_none_or(|value| value == expected_q)
+                    && g.as_deref().is_none_or(|value| value == expected_g)
+                    && y == expected_y
+            ),
             KeyInfoSource::KeyValue(KeyValueInfo::Ec {
                 curve_oid,
                 public_key,

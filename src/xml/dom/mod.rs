@@ -57,6 +57,27 @@ pub enum ParseError {
     DtdDetected,
     /// The retained semantic node ceiling was exceeded.
     NodesLimitReached,
+    /// The absolute general-entity substitution ceiling was exceeded.
+    EntityExpansionLimitReached {
+        /// Maximum substitutions accepted for one document.
+        maximum: u32,
+        /// First substitution beyond the ceiling.
+        actual: u32,
+    },
+    /// The absolute entity replacement-work ceiling was exceeded.
+    EntityExpansionWorkLimitReached {
+        /// Maximum replacement bytes traversed for one document.
+        maximum: usize,
+        /// First cumulative replacement size beyond the ceiling.
+        actual: usize,
+    },
+    /// The source-position sidecar reached its absolute allocation ceiling.
+    SourcePositionLimitReached {
+        /// Maximum lexical positions retained for one document.
+        maximum: usize,
+        /// First lexical position beyond the ceiling.
+        actual: usize,
+    },
     /// The absolute XML element nesting ceiling was exceeded.
     DepthLimitReached {
         /// Maximum accepted element depth.
@@ -83,6 +104,18 @@ impl fmt::Display for ParseError {
         match self {
             Self::DtdDetected => formatter.write_str("DTD detected"),
             Self::NodesLimitReached => formatter.write_str("nodes limit reached"),
+            Self::EntityExpansionLimitReached { maximum, actual } => write!(
+                formatter,
+                "XML entity expansion limit {maximum} exceeded at expansion {actual}"
+            ),
+            Self::EntityExpansionWorkLimitReached { maximum, actual } => write!(
+                formatter,
+                "XML entity expansion-work limit {maximum} bytes exceeded at {actual} bytes"
+            ),
+            Self::SourcePositionLimitReached { maximum, actual } => write!(
+                formatter,
+                "XML source-position limit {maximum} exceeded at position {actual}"
+            ),
             Self::DepthLimitReached { maximum, actual } => {
                 write!(
                     formatter,

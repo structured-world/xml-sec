@@ -39,8 +39,9 @@ impl XmlBackend for XmloxideBackend {
 }
 
 fn backend_options() -> xmloxide::parser::ParseOptions {
-    // The common streaming preflight owns deployment limits. Backend-local
-    // defaults must not make the selected parser expose a narrower contract.
+    // The shared preflight owns the backend-neutral contract. These absolute
+    // limits are defense in depth against a backend regression allocating
+    // expanded entity data before returning control to the projector.
     xmloxide::parser::ParseOptions::default()
         .max_depth(
             u32::try_from(crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING)
@@ -48,9 +49,9 @@ fn backend_options() -> xmloxide::parser::ParseOptions {
         )
         .max_attributes(u32::MAX)
         .max_attribute_length(usize::MAX)
-        .max_text_length(usize::MAX)
+        .max_text_length(crate::hard_limits::XML_ENTITY_EXPANSION_WORK_BYTE_CEILING)
         .max_name_length(usize::MAX)
-        .max_entity_expansions(u32::MAX)
+        .max_entity_expansions(crate::hard_limits::XML_ENTITY_EXPANSION_CEILING)
 }
 
 struct Projector<'source, 'input, 'positions> {

@@ -278,6 +278,14 @@ pub enum SigningPublicKeyInfo {
     Dsa {
         /// DER-encoded SubjectPublicKeyInfo bytes.
         spki_der: Vec<u8>,
+        /// Prime modulus P, normalized as unsigned big-endian bytes.
+        p: Vec<u8>,
+        /// Prime divisor Q, normalized as unsigned big-endian bytes.
+        q: Vec<u8>,
+        /// Generator G, normalized as unsigned big-endian bytes.
+        g: Vec<u8>,
+        /// Public value Y, normalized as unsigned big-endian bytes.
+        y: Vec<u8>,
         /// Prime modulus width used for signing policy.
         modulus_bits: usize,
         /// Fixed XMLDSig width of each `r` and `s` component.
@@ -544,7 +552,7 @@ impl KeyInfoWriter for DerEncodedKeyValueInfoWriter {
     }
 }
 
-/// Writes RSA or XMLDSig 1.1 EC public parameters as `KeyValue`.
+/// Writes RSA, DSA, or XMLDSig 1.1 EC public parameters as `KeyValue`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KeyValueInfoWriter;
 
@@ -567,9 +575,14 @@ impl KeyInfoWriter for KeyValueInfoWriter {
                 "<ds:KeyValue xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><dsig11:ECKeyValue xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\"><dsig11:NamedCurve URI=\"urn:oid:{curve_oid}\"/><dsig11:PublicKey>{}</dsig11:PublicKey></dsig11:ECKeyValue></ds:KeyValue>",
                 encode(&public_key)
             )),
-            SigningPublicKeyInfo::Dsa { .. } | SigningPublicKeyInfo::Hmac { .. } => {
-                Err(KeyInfoWriteError::UnsupportedKeyValue)
-            }
+            SigningPublicKeyInfo::Dsa { p, q, g, y, .. } => Ok(format!(
+                "<ds:KeyValue xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:DSAKeyValue><ds:P>{}</ds:P><ds:Q>{}</ds:Q><ds:G>{}</ds:G><ds:Y>{}</ds:Y></ds:DSAKeyValue></ds:KeyValue>",
+                encode(&p),
+                encode(&q),
+                encode(&g),
+                encode(&y)
+            )),
+            SigningPublicKeyInfo::Hmac { .. } => Err(KeyInfoWriteError::UnsupportedKeyValue),
         }
     }
 }
@@ -966,8 +979,13 @@ impl SigningKey for DsaSigningKey {
         let component_len = usize::try_from(verifying_key.components().q().bits_vartime())
             .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?
             .div_ceil(8);
+        let components = verifying_key.components();
         Ok(SigningPublicKeyInfo::Dsa {
             spki_der,
+            p: components.p().to_be_bytes_trimmed_vartime().to_vec(),
+            q: components.q().to_be_bytes_trimmed_vartime().to_vec(),
+            g: components.g().to_be_bytes_trimmed_vartime().to_vec(),
+            y: verifying_key.y().to_be_bytes_trimmed_vartime().to_vec(),
             modulus_bits,
             component_len,
         })
@@ -2937,9 +2955,10 @@ mod error_conversion_tests {
     #[test]
     fn builder_signing_fits_the_document_to_parse_work_ratio() {
         // A builder operation at the configured document ceiling must fit the
-        // implementation's sixteen-pass hard allowance. Generated base64 text
-        // and the appended generated template need one committed candidate
-        // parse each, not an untrusted-fragment validation parse plus commit.
+        // implementation's hard allowance. Generated base64 text and the
+        // appended generated template need one committed candidate parse each,
+        // not an untrusted-fragment validation parse plus commit. Differential
+        // builds meter their comparison backend without reducing this envelope.
         let padding = "x".repeat(64 * 1024);
         let xml = format!("<root><payload Id=\"payload\"/><padding>{padding}</padding></root>");
         let builder = SignatureBuilder::new(
@@ -2952,7 +2971,8 @@ mod error_conversion_tests {
         let maximum_document_bytes = xml.len() + 4 * 1024;
         let mut policy = crate::policy::SigningPolicy::default();
         policy.resources.max_xml_document_bytes = maximum_document_bytes;
-        policy.resources.max_xml_parse_work_bytes = maximum_document_bytes * 16;
+        policy.resources.max_xml_parse_work_bytes =
+            maximum_document_bytes * crate::hard_limits::XML_PARSE_WORK_PASS_CEILING;
 
         let mut measurement_policy = policy.clone();
         measurement_policy.resources.max_xml_parse_work_bytes =
@@ -2979,7 +2999,7 @@ mod error_conversion_tests {
             .expect("measurement signing must succeed");
         let consumed = measurement_budgets.transforms.xml_parse_work().consumed();
         assert!(
-            consumed <= maximum_document_bytes * 16,
+            consumed <= maximum_document_bytes * crate::hard_limits::XML_PARSE_WORK_PASS_CEILING,
             "builder signing consumed {consumed} bytes for a {maximum_document_bytes}-byte ceiling"
         );
 

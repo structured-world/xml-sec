@@ -556,6 +556,31 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
     })
 }
 
+#[derive(Clone, Copy)]
+struct ByteAlignedHmacOutputLength(usize);
+
+impl ByteAlignedHmacOutputLength {
+    fn parse(text: &str, maximum_bits: usize) -> Result<Self, ParseError> {
+        let bits = text
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| ParseError::InvalidStructure("invalid HMACOutputLength".into()))?;
+        // XMLDSig 1.1 section 6.3.1 normatively REQUIRES truncation
+        // lengths to be multiples of eight because Base64 carries octets.
+        // https://www.w3.org/TR/xmldsig-core1/#sec-HMAC
+        if bits == 0 || bits > maximum_bits || !bits.is_multiple_of(8) {
+            return Err(ParseError::InvalidStructure(format!(
+                "HMACOutputLength must be a positive byte-aligned value no greater than {maximum_bits}"
+            )));
+        }
+        Ok(Self(bits))
+    }
+
+    const fn bits(self) -> usize {
+        self.0
+    }
+}
+
 fn parse_hmac_output_length(
     node: Node<'_, '_>,
     algorithm: SignatureAlgorithm,
@@ -581,19 +606,9 @@ fn parse_hmac_output_length(
     ensure_no_element_children(child, "HMACOutputLength")?;
     let text =
         collect_text_content_bounded(child, MAX_HMAC_OUTPUT_LENGTH_TEXT_LEN, "HMACOutputLength")?;
-    let bits = text
-        .trim()
-        .parse::<usize>()
-        .map_err(|_| ParseError::InvalidStructure("invalid HMACOutputLength".into()))?;
-    // XMLDSig 1.1 section 6.3.1 requires HMAC truncation to end on a
-    // byte boundary because SignatureValue is encoded as complete octets:
-    // https://www.w3.org/TR/xmldsig-core1/#sec-HMAC
-    if bits == 0 || bits > maximum_bits || !bits.is_multiple_of(8) {
-        return Err(ParseError::InvalidStructure(format!(
-            "HMACOutputLength must be a positive byte-aligned value no greater than {maximum_bits}"
-        )));
-    }
-    Ok(Some(bits))
+    Ok(Some(
+        ByteAlignedHmacOutputLength::parse(&text, maximum_bits)?.bits(),
+    ))
 }
 
 /// Parse a single `<ds:Reference>` element.
@@ -4604,18 +4619,18 @@ BA== </Modulus>
     }
 
     #[test]
-    fn parse_hmac_output_length_rejects_non_octet_truncation() {
+    fn xmldsig_1_1_rejects_non_octet_hmac_output_length() {
         // XMLDSig 1.1 section 6.3.1 requires a byte boundary even though the
         // HMACOutputLength schema represents the value as a bit count.
         let xml = r#"<SignatureMethod xmlns="http://www.w3.org/2000/09/xmldsig#">
-            <HMACOutputLength>81</HMACOutputLength>
+            <HMACOutputLength>129</HMACOutputLength>
         </SignatureMethod>"#;
         let document = Document::parse(xml).unwrap();
 
         assert!(matches!(
-            parse_hmac_output_length(document.root_element(), SignatureAlgorithm::HmacSha1),
+            parse_hmac_output_length(document.root_element(), SignatureAlgorithm::HmacSha256),
             Err(ParseError::InvalidStructure(reason))
-                if reason == "HMACOutputLength must be a positive byte-aligned value no greater than 160"
+                if reason == "HMACOutputLength must be a positive byte-aligned value no greater than 256"
         ));
     }
 

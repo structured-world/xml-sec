@@ -1646,7 +1646,7 @@ mod tests {
         )
         .expect("streaming mutation must succeed");
 
-        let dom_passes = 3;
+        let dom_passes = crate::document::selected_parser_passes();
         assert_eq!(
             budget.consumed(),
             xml.len() * (dom_passes + 1) + output.len() * dom_passes

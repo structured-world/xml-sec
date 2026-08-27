@@ -212,6 +212,14 @@ impl<'input> Document<'input> {
         input: &'input str,
         options: ParsingOptions,
     ) -> Result<Self, ParseError> {
+        let options = crate::document::preflight_dom_limits(input, options)?;
+        Self::parse_after_limit_preflight(input, options)
+    }
+
+    pub(crate) fn parse_after_limit_preflight(
+        input: &'input str,
+        options: ParsingOptions,
+    ) -> Result<Self, ParseError> {
         let preflight = super::LexicalPreflight::scan(input, options.allow_dtd)?;
         SelectedBackend::parse(input, options, &preflight)
     }
@@ -1030,6 +1038,71 @@ mod tests {
         )
         .expect_err("the semantic node limit must reject the fourth node");
         assert_eq!(error, ParseError::NodesLimitReached);
+    }
+
+    #[test]
+    fn selected_backend_enforces_the_absolute_node_ceiling_before_dom_allocation() {
+        // Direct DOM callers may request an unbounded parser, but the crate's
+        // process-safety ceiling must still stop a compact wide document before
+        // either backend allocates its complete native tree.
+        let count = crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize;
+        let xml = format!("<r>{}</r>", "<n/>".repeat(count));
+
+        assert_eq!(
+            Document::parse_with_options(
+                &xml,
+                ParsingOptions {
+                    allow_dtd: false,
+                    nodes_limit: u32::MAX,
+                },
+            )
+            .expect_err("the absolute retained-node ceiling must remain effective"),
+            ParseError::NodesLimitReached,
+        );
+    }
+
+    #[test]
+    fn selected_backend_bounds_direct_entity_expansion_count() {
+        // A shallow sequence of references bypasses roxmltree's nested-entity
+        // loop detector. Direct DOM parsing still needs a finite aggregate cap.
+        let references =
+            "&value;".repeat(crate::hard_limits::XML_ENTITY_EXPANSION_CEILING as usize + 1);
+        let xml = format!("<!DOCTYPE r [<!ENTITY value 'x'>]><r>{references}</r>");
+
+        assert!(matches!(
+            Document::parse_with_options(
+                &xml,
+                ParsingOptions {
+                    allow_dtd: true,
+                    nodes_limit: u32::MAX,
+                },
+            ),
+            Err(ParseError::EntityExpansionLimitReached { maximum, actual })
+                if maximum == crate::hard_limits::XML_ENTITY_EXPANSION_CEILING
+                    && actual == maximum + 1
+        ));
+    }
+
+    #[test]
+    fn selected_backend_bounds_source_positions_after_semantic_text_folding() {
+        // Many adjacent CDATA tokens retain one semantic text node, but the
+        // xmloxide range adapter still needs one source position per token.
+        // Bound that sidecar independently before constructing a backend DOM.
+        let segments = crate::hard_limits::XML_SOURCE_POSITION_CEILING + 1;
+        let xml = format!("<r>{}</r>", "<![CDATA[x]]>".repeat(segments));
+
+        assert!(matches!(
+            Document::parse_with_options(
+                &xml,
+                ParsingOptions {
+                    allow_dtd: false,
+                    nodes_limit: 3,
+                },
+            ),
+            Err(ParseError::SourcePositionLimitReached { maximum, actual })
+                if maximum == crate::hard_limits::XML_SOURCE_POSITION_CEILING
+                    && actual == maximum + 1
+        ));
     }
 
     #[test]

@@ -1718,9 +1718,9 @@ fn materialize_key_info_references(
                     .ok_or(SignatureVerificationPipelineError::InvalidStructure {
                         reason: "KeyInfoReference external resource is unavailable",
                     })?;
-                let xml = std::str::from_utf8(bytes).map_err(|_| {
+                let xml = crate::encoding::decode_xml_octets(bytes).map_err(|_| {
                     SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "KeyInfoReference external resource is not UTF-8 XML",
+                        reason: "KeyInfoReference external resource has an invalid XML encoding",
                     }
                 })?;
                 let settings = DocumentParseSettings::from_policy(
@@ -1728,7 +1728,7 @@ fn materialize_key_info_references(
                     &context.policy.resources,
                 );
                 let document = XmlDocument::parse_with_settings_and_budget(
-                    xml.to_owned(),
+                    xml.into_owned(),
                     settings,
                     context.budgets.execution.xml_parse_work(),
                 )
@@ -5360,6 +5360,75 @@ mod tests {
             Ok::<_, SignatureVerificationPipelineError>(())
         })?;
         Ok(key_info)
+    }
+
+    fn materialize_external_key_info_bytes(
+        encoded: Vec<u8>,
+    ) -> Result<KeyInfo, SignatureVerificationPipelineError> {
+        let resources = HashMap::from([("key.xml".to_owned(), encoded)]);
+        let document = XmlDocument::parse("<root/>").unwrap();
+        let mut key_info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                uri: "key.xml".into(),
+            }],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_sources.key_info_reference = true;
+        policy.uris.key_info_references = UriTypeSet::ALL;
+        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
+        let mut budgets = RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse_budget,
+            execution: &execution_budget,
+            resources: &policy.resources,
+        };
+
+        document.with_view(|view| {
+            let resolver = UriReferenceResolver::with_document_view(view, &[])
+                .with_external_resources(&resources);
+            materialize_key_info_references(
+                &mut key_info,
+                &resolver,
+                &policy,
+                crate::provider::default_provider(),
+                None,
+                &mut budgets,
+            )?;
+            Ok::<_, SignatureVerificationPipelineError>(())
+        })?;
+        Ok(key_info)
+    }
+
+    #[test]
+    fn external_key_info_reference_decodes_utf16_xml_octets() {
+        // External XML follows the XML encoding declaration/BOM contract, not
+        // the UTF-8-only contract of Rust strings passed by direct callers.
+        let xml = format!(
+            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>utf16-key</ds:KeyName></ds:KeyInfo>"#
+        );
+        let mut encoded = vec![0xff, 0xfe];
+        encoded.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+        let key_info = materialize_external_key_info_bytes(encoded)
+            .expect("UTF-16 external KeyInfo must materialize");
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [super::super::parse::KeyInfoSource::KeyName(name)] if name == "utf16-key"
+        ));
+    }
+
+    #[test]
+    fn external_key_info_reference_rejects_malformed_xml_encoding() {
+        // A BOM selecting UTF-16 must not permit a truncated code unit to reach
+        // the XML parser under a misleading structural diagnostic.
+        let error = materialize_external_key_info_bytes(vec![0xff, 0xfe, b'<'])
+            .expect_err("truncated UTF-16 must be rejected during octet decoding");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "KeyInfoReference external resource has an invalid XML encoding"
+            }
+        ));
     }
 
     #[test]

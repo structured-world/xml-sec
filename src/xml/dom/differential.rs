@@ -35,6 +35,18 @@ fn equivalent_rejection(left: &ParseError, right: &ParseError) -> bool {
         (ParseError::DtdDetected, ParseError::DtdDetected)
             | (ParseError::NodesLimitReached, ParseError::NodesLimitReached)
             | (
+                ParseError::EntityExpansionLimitReached { .. },
+                ParseError::EntityExpansionLimitReached { .. }
+            )
+            | (
+                ParseError::EntityExpansionWorkLimitReached { .. },
+                ParseError::EntityExpansionWorkLimitReached { .. }
+            )
+            | (
+                ParseError::SourcePositionLimitReached { .. },
+                ParseError::SourcePositionLimitReached { .. }
+            )
+            | (
                 ParseError::DepthLimitReached { .. },
                 ParseError::DepthLimitReached { .. }
             )
@@ -50,6 +62,11 @@ fn acceptance_summary(
         Ok(_) => "accepted",
         Err(ParseError::DtdDetected) => "rejected as DTD-disabled",
         Err(ParseError::NodesLimitReached) => "rejected by node limit",
+        Err(ParseError::EntityExpansionLimitReached { .. }) => "rejected by entity expansion limit",
+        Err(ParseError::EntityExpansionWorkLimitReached { .. }) => {
+            "rejected by entity expansion-work limit"
+        }
+        Err(ParseError::SourcePositionLimitReached { .. }) => "rejected by source-position limit",
         Err(ParseError::DepthLimitReached { .. }) => "rejected by depth limit",
         Err(ParseError::Backend { .. }) => "rejected as malformed",
         Err(ParseError::BackendDivergence { .. }) => "reported nested divergence",

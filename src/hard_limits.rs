@@ -5,6 +5,12 @@
 
 /// Maximum XML nodes allocated while parsing one verification or transform document.
 pub(crate) const XML_DOCUMENT_NODE_CEILING: u32 = 100_000;
+/// Maximum general-entity substitutions performed while parsing one document.
+pub(crate) const XML_ENTITY_EXPANSION_CEILING: u32 = 10_000;
+/// Maximum lexical source positions retained for backend-neutral ranges.
+pub(crate) const XML_SOURCE_POSITION_CEILING: usize = 2 * XML_DOCUMENT_NODE_CEILING as usize;
+/// Maximum replacement bytes traversed while expanding one XML document.
+pub(crate) const XML_ENTITY_EXPANSION_WORK_BYTE_CEILING: usize = 16 * XML_DOCUMENT_BYTE_CEILING;
 /// Maximum element nesting accepted by every XML parser backend.
 pub(crate) const XML_DOCUMENT_DEPTH_CEILING: usize = 256;
 
@@ -32,8 +38,15 @@ pub(crate) const XML_DOCUMENT_BYTE_CEILING: usize = 16 * 1024 * 1024;
 ///
 /// Sixteen full-size passes cover the ordinary staged sign/encrypt/decrypt
 /// pipelines while bounding adversarial dependency or key-candidate retries.
+/// Differential builds receive four additional passes because every semantic
+/// parse also runs the comparison backend; this preserves the same document
+/// size envelope while still metering the diagnostic work.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-pub(crate) const XML_PARSE_WORK_BYTE_CEILING: usize = 16 * XML_DOCUMENT_BYTE_CEILING;
+pub(crate) const XML_PARSE_WORK_PASS_CEILING: usize =
+    16 + 4 * cfg!(feature = "xml-backend-differential") as usize;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XML_PARSE_WORK_BYTE_CEILING: usize =
+    XML_PARSE_WORK_PASS_CEILING * XML_DOCUMENT_BYTE_CEILING;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const ENCRYPTION_RECIPIENT_CEILING: usize = 64;
 /// Maximum symmetric keys attempted by one prepared decryption operation.

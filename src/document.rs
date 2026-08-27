@@ -35,8 +35,8 @@ const VALIDATION_WRAPPER_CLOSE: &str = "</xmlsec_owned_document:wrapper>";
 const VALIDATION_WRAPPER_NODE_OVERHEAD: u32 = 3;
 
 #[cfg(test)]
-fn selected_parser_passes() -> usize {
-    3
+pub(crate) fn selected_parser_passes() -> usize {
+    3 + usize::from(cfg!(feature = "xml-backend-differential"))
 }
 
 /// Process-local provenance of one owned XML document.
@@ -247,6 +247,8 @@ fn charge_semantic_parser_work(
     bytes: usize,
 ) -> Result<(), XmlDocumentError> {
     charge_parse_work(budget, bytes)?;
+    charge_parse_work(budget, bytes)?;
+    #[cfg(feature = "xml-backend-differential")]
     charge_parse_work(budget, bytes)?;
     Ok(())
 }
@@ -1918,7 +1920,7 @@ struct DocumentPreflightState {
     depth: usize,
     nodes: u32,
     in_character_data: bool,
-    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    entity_expansions: u32,
     entity_expansion_work: usize,
 }
 
@@ -2109,6 +2111,16 @@ fn preflight_xml_fragment(
                 }
                 if expansion_stack.insert(name.clone()) {
                     if let Some(replacement) = dtd.entities.get(&name) {
+                        state.entity_expansions = state.entity_expansions.saturating_add(1);
+                        let maximum = crate::hard_limits::XML_ENTITY_EXPANSION_CEILING;
+                        if state.entity_expansions > maximum {
+                            return Err(XmlDocumentError::Parse(
+                                ParseError::EntityExpansionLimitReached {
+                                    maximum,
+                                    actual: state.entity_expansions,
+                                },
+                            ));
+                        }
                         charge_entity_expansion_work(state, budget, replacement.len())?;
                         fragments.push(FragmentFrame {
                             source: FragmentSource::Entity(name),
@@ -2288,23 +2300,46 @@ fn charge_entity_expansion_work(
     bytes: usize,
 ) -> Result<(), XmlDocumentError> {
     charge_parse_work(budget, bytes)?;
-    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     if budget.is_none() {
         let actual = state.entity_expansion_work.saturating_add(bytes);
-        let maximum = crate::hard_limits::XML_PARSE_WORK_BYTE_CEILING;
+        let maximum = crate::hard_limits::XML_ENTITY_EXPANSION_WORK_BYTE_CEILING;
         if actual > maximum {
-            return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
-                maximum,
-                actual,
-            }
-            .into());
+            return Err(XmlDocumentError::Parse(
+                ParseError::EntityExpansionWorkLimitReached { maximum, actual },
+            ));
         }
         state.entity_expansion_work = actual;
     }
-    #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
-    let _ = state;
     Ok(())
+}
+
+pub(crate) fn preflight_dom_limits(
+    xml: &str,
+    options: ParsingOptions,
+) -> Result<ParsingOptions, ParseError> {
+    let effective = ParsingOptions {
+        allow_dtd: options.allow_dtd,
+        nodes_limit: options
+            .nodes_limit
+            .min(crate::hard_limits::XML_DOCUMENT_NODE_CEILING),
+    };
+    let settings = DocumentParseSettings {
+        allow_dtd: effective.allow_dtd,
+        nodes_limit: effective.nodes_limit,
+        depth_limit: crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
+        max_bytes: usize::MAX,
+    };
+    match preflight_document_limits(xml, settings, None) {
+        Ok(()) => Ok(effective),
+        Err(XmlDocumentError::Parse(error)) => Err(error),
+        Err(XmlDocumentError::DocumentTooDeep { maximum, actual }) => {
+            Err(ParseError::DepthLimitReached { maximum, actual })
+        }
+        Err(error) => Err(ParseError::Backend {
+            backend: "xml-limit-preflight",
+            message: error.to_string(),
+        }),
+    }
 }
 
 fn observe_preflight_node(
@@ -2565,7 +2600,7 @@ fn parse_semantic_document<'a>(
     source: &'a str,
     settings: DocumentParseSettings,
 ) -> Result<(Document<'a>, DocumentMetrics), XmlDocumentError> {
-    let document = Document::parse_with_options(
+    let document = Document::parse_after_limit_preflight(
         source,
         ParsingOptions {
             allow_dtd: settings.allow_dtd,
@@ -2651,7 +2686,7 @@ fn document_requires_internal_dtd(
         return Ok(false);
     }
     charge_semantic_parser_work(budget, xml.len())?;
-    Ok(Document::parse_with_options(
+    Ok(Document::parse_after_limit_preflight(
         xml,
         ParsingOptions {
             allow_dtd: false,

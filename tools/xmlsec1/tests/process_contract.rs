@@ -269,11 +269,21 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
     let donor_legacy_template = project_root()
         .join("tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-dsa.tmpl");
     let legacy_template = temp.path().join("dsa-1024-template.xml");
+    let verifying_key = legacy_dsa.verifying_key();
+    let components = verifying_key.components();
+    let encode_component = |value: &[u8]| base64::engine::general_purpose::STANDARD.encode(value);
+    let dsa_key_value = format!(
+        "    <KeyValue><DSAKeyValue><P>{}</P><Q>{}</Q><G>{}</G><Y>{}</Y></DSAKeyValue></KeyValue>",
+        encode_component(components.p().to_be_bytes_trimmed_vartime().as_ref()),
+        encode_component(components.q().to_be_bytes_trimmed_vartime().as_ref()),
+        encode_component(components.g().to_be_bytes_trimmed_vartime().as_ref()),
+        encode_component(verifying_key.y().to_be_bytes_trimmed_vartime().as_ref()),
+    );
     fs::write(
         &legacy_template,
         fs::read_to_string(donor_legacy_template)
             .unwrap()
-            .replace("    <KeyValue>\n    </KeyValue>\n", ""),
+            .replace("    <KeyValue>\n    </KeyValue>", &dsa_key_value),
     )
     .unwrap();
     let legacy_signed = temp.path().join("dsa-1024-signed.xml");
@@ -300,6 +310,56 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         legacy_verify.status.success(),
         "{}",
         String::from_utf8_lossy(&legacy_verify.stderr)
+    );
+
+    let y_only_template = temp.path().join("dsa-1024-y-only-template.xml");
+    let y_only_key_value = format!(
+        "    <KeyValue><DSAKeyValue><Y>{}</Y></DSAKeyValue></KeyValue>",
+        encode_component(verifying_key.y().to_be_bytes_trimmed_vartime().as_ref()),
+    );
+    fs::write(
+        &y_only_template,
+        fs::read_to_string(&legacy_template)
+            .unwrap()
+            .replace(&dsa_key_value, &y_only_key_value),
+    )
+    .unwrap();
+    let y_only_sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-dsa-1024"])
+        .arg(&legacy_private)
+        .arg(&y_only_template)
+        .output()
+        .unwrap();
+    assert!(
+        y_only_sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&y_only_sign.stderr)
+    );
+
+    let mismatched_template = temp.path().join("dsa-1024-mismatched-template.xml");
+    let mut mismatched_y = verifying_key.y().to_be_bytes_trimmed_vartime().to_vec();
+    mismatched_y[0] ^= 1;
+    let mismatched_key_value = dsa_key_value.replace(
+        &encode_component(verifying_key.y().to_be_bytes_trimmed_vartime().as_ref()),
+        &encode_component(&mismatched_y),
+    );
+    fs::write(
+        &mismatched_template,
+        fs::read_to_string(&legacy_template)
+            .unwrap()
+            .replace(&dsa_key_value, &mismatched_key_value),
+    )
+    .unwrap();
+    let mismatched_sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-dsa-1024"])
+        .arg(&legacy_private)
+        .arg(&mismatched_template)
+        .output()
+        .unwrap();
+    assert!(!mismatched_sign.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatched_sign.stderr)
+            .contains("preserved KeyInfo does not match the selected signing key")
     );
 
     let p521_template = temp.path().join("p521-template.xml");

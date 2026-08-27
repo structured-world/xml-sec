@@ -91,6 +91,11 @@ impl LexicalPreflight {
                 Event::Eof => break,
                 _ => {}
             }
+            let actual = nodes.len();
+            let maximum = crate::hard_limits::XML_SOURCE_POSITION_CEILING;
+            if actual > maximum {
+                return Err(ParseError::SourcePositionLimitReached { maximum, actual });
+            }
         }
         Ok(Self { nodes })
     }
