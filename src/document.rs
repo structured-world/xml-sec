@@ -3309,6 +3309,30 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
+    #[test]
+    fn folded_character_data_replacement_splices_its_complete_source_range() {
+        // Adjacent text and CDATA tokens form one semantic text node. Mutation
+        // must replace every lexical token represented by that node.
+        let mut document = XmlDocument::parse("<r>one<![CDATA[+]]>two</r>")
+            .expect("mixed character data fixture must parse");
+        let target = document.with_view(|view| {
+            let text = view
+                .document()
+                .root_element()
+                .first_child()
+                .expect("fixture must contain a text node");
+            assert_eq!(text.text(), Some("one+two"));
+            view.node_identity(text)
+        });
+
+        document
+            .replace_node_with_fragment(target, "replacement")
+            .expect("the complete folded text node must be replaceable");
+
+        assert_eq!(document.as_xml(), "<r>replacement</r>");
+    }
+
     #[test]
     fn validation_wrapper_does_not_consume_document_depth() {
         // The synthetic wrapper exists only while validating the replacement;

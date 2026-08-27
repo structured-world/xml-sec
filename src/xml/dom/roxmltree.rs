@@ -28,7 +28,12 @@ impl XmlBackend for RoxmltreeBackend {
             input,
             parsed.descendants().count().max(preflight.node_count()),
         );
-        project_document(&mut target, parsed.root(), doctype_range(input).as_ref())?;
+        project_document(
+            &mut target,
+            parsed.root(),
+            doctype_range(input).as_ref(),
+            preflight,
+        )?;
         Ok(target.finish())
     }
 }
@@ -57,6 +62,7 @@ fn project_document<'document, 'input>(
     target: &mut TreeBuilder<'_>,
     root: ::roxmltree::Node<'document, 'input>,
     doctype: Option<&std::ops::Range<usize>>,
+    preflight: &LexicalPreflight,
 ) -> Result<(), ParseError> {
     let mut stack = vec![ProjectionFrame::Enter {
         source: root,
@@ -71,9 +77,10 @@ fn project_document<'document, 'input>(
                 parent,
                 depth,
             } => {
-                let source_range = source.range();
+                let mut source_range = source.range();
                 let inside_doctype =
                     doctype.is_some_and(|range| range_contains(range, &source_range));
+                let mut range_actionable = !inside_doctype;
                 if source.parent().is_some_and(|node| node.is_root()) && inside_doctype {
                     continue;
                 }
@@ -112,6 +119,12 @@ fn project_document<'document, 'input>(
                             .collect(),
                     },
                     ::roxmltree::NodeType::Text => {
+                        if let Some((range, actionable)) =
+                            preflight.folded_character_data_range(source_range.start)
+                        {
+                            source_range = range;
+                            range_actionable &= actionable;
+                        }
                         NodeKind::Text(source.text().unwrap_or_default().to_owned())
                     }
                     ::roxmltree::NodeType::Comment => {
@@ -126,7 +139,7 @@ fn project_document<'document, 'input>(
                     }
                 };
                 let id =
-                    target.push_with_actionability(parent, kind, source_range, !inside_doctype);
+                    target.push_with_actionability(parent, kind, source_range, range_actionable);
                 stack.push(ProjectionFrame::Exit(id));
                 for child in source.children().rev() {
                     stack.push(ProjectionFrame::Enter {

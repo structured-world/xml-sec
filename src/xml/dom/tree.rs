@@ -1,5 +1,7 @@
 //! Parser-independent retained XML tree consumed by XML Security algorithms.
 
+#[cfg(feature = "xml-backend-differential")]
+use std::collections::HashMap;
 use std::{
     hash::{Hash, Hasher},
     ops::Range,
@@ -80,7 +82,7 @@ pub(super) struct AttributeData {
     pub(super) value: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct NamespaceData {
     pub(super) prefix: Option<String>,
     pub(super) uri: String,
@@ -148,10 +150,16 @@ impl<'input> TreeBuilder<'input> {
         range_actionable: bool,
     ) {
         if let Some(last) = self.nodes[parent.index()].children.last().copied()
-            && let NodeKind::Text(existing) = &mut self.nodes[last.index()].kind
+            && let node = &mut self.nodes[last.index()]
+            && let NodeKind::Text(existing) = &mut node.kind
         {
             existing.push_str(value);
-            self.nodes[last.index()].range_actionable &= range_actionable;
+            // One semantic text node can fold several adjacent lexical tokens
+            // (plain text, CDATA, and references). Its source range must cover
+            // every token so mutation never splices only a semantic prefix.
+            node.range.start = node.range.start.min(range.start);
+            node.range.end = node.range.end.max(range.end);
+            node.range_actionable &= range_actionable;
             return;
         }
         self.push_with_actionability(
@@ -351,12 +359,9 @@ fn node_difference(left: &NodeData, right: &NodeData, doctype: Option<&Range<usi
 
 #[cfg(feature = "xml-backend-differential")]
 fn range_actionability_equivalent(left: &NodeData, right: &NodeData) -> bool {
-    // Only elements are accepted by owned-document mutation APIs. Parsers can
-    // legitimately report different lexical spans for coalesced character data
-    // after CDATA and entity expansion, but expanded elements must never become
-    // actionable through either backend.
-    !matches!(left.kind, NodeKind::Element { .. })
-        || left.range_actionable == right.range_actionable
+    // Mutation accepts any semantic node with a unique source span, so backend
+    // disagreement about actionability is always security-relevant.
+    left.range_actionable == right.range_actionable
 }
 
 #[cfg(feature = "xml-backend-differential")]
@@ -461,7 +466,22 @@ fn node_kinds_semantically_equivalent(left: &NodeKind, right: &NodeKind) -> bool
 
 #[cfg(feature = "xml-backend-differential")]
 fn namespace_axes_equivalent(left: &[NamespaceData], right: &[NamespaceData]) -> bool {
-    left.len() == right.len() && left.iter().all(|item| right.contains(item))
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut remaining = HashMap::with_capacity(left.len());
+    for item in left {
+        *remaining.entry(item).or_insert(0_usize) += 1;
+    }
+    right.iter().all(|item| {
+        remaining.get_mut(item).is_some_and(|count| {
+            if *count == 0 {
+                return false;
+            }
+            *count -= 1;
+            true
+        })
+    })
 }
 
 #[cfg(feature = "xml-backend-differential")]
@@ -946,7 +966,31 @@ mod tests {
         feature = "xml-backend-differential"
     ))]
     use super::doctype_range;
+    #[cfg(feature = "xml-backend-differential")]
+    use super::{NamespaceData, namespace_axes_equivalent};
     use crate::xml::dom::{ParseError, ParsingOptions};
+
+    #[cfg(feature = "xml-backend-differential")]
+    #[test]
+    fn differential_namespace_axis_comparison_preserves_multiplicity() {
+        // The fail-closed gate must reject unequal axes even if a malformed
+        // backend projection repeats one binding and hides another.
+        let binding = |prefix: &str, uri: &str| NamespaceData {
+            prefix: Some(prefix.to_owned()),
+            uri: uri.to_owned(),
+        };
+        let a = binding("a", "urn:a");
+        let b = binding("b", "urn:b");
+
+        assert!(!namespace_axes_equivalent(
+            &[a.clone(), a.clone()],
+            &[a.clone(), b]
+        ));
+        assert!(namespace_axes_equivalent(
+            &[a.clone(), a.clone()],
+            &[a.clone(), a]
+        ));
+    }
 
     #[test]
     fn selected_backend_preserves_element_source_ranges() {

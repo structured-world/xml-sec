@@ -108,12 +108,45 @@ impl LexicalPreflight {
         self.nodes.len()
     }
 
+    #[cfg(any(
+        feature = "xml-backend-roxmltree",
+        feature = "xml-backend-differential"
+    ))]
+    pub(super) fn folded_character_data_range(&self, start: usize) -> Option<(Range<usize>, bool)> {
+        let first = self.nodes.partition_point(|node| node.range.start < start);
+        let node = self.nodes.get(first)?;
+        if node.range.start != start || !node.kind.is_character_data() {
+            return None;
+        }
+
+        let mut range = node.range.clone();
+        let mut actionable = node.kind != SourceKind::EntityRef;
+        for node in &self.nodes[first + 1..] {
+            if !node.kind.is_character_data() || node.range.start != range.end {
+                break;
+            }
+            range.end = range.end.max(node.range.end);
+            actionable &= node.kind != SourceKind::EntityRef;
+        }
+        Some((range, actionable))
+    }
+
     #[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
     pub(super) fn positions(&self) -> PositionCursor<'_> {
         PositionCursor {
             positions: &self.nodes,
             next: 0,
         }
+    }
+}
+
+#[cfg(any(
+    feature = "xml-backend-roxmltree",
+    feature = "xml-backend-differential"
+))]
+impl SourceKind {
+    fn is_character_data(self) -> bool {
+        matches!(self, Self::Text | Self::CData | Self::EntityRef)
     }
 }
 
