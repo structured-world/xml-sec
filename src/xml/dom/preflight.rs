@@ -23,6 +23,11 @@ struct SourceNode {
 
 pub(super) struct LexicalPreflight {
     nodes: Vec<SourceNode>,
+    #[cfg(any(
+        feature = "xml-backend-roxmltree",
+        feature = "xml-backend-differential"
+    ))]
+    doctype: Option<Range<usize>>,
 }
 
 impl LexicalPreflight {
@@ -30,6 +35,11 @@ impl LexicalPreflight {
         let mut reader = Reader::from_str(input);
         let mut nodes: Vec<SourceNode> = Vec::new();
         let mut elements = Vec::new();
+        #[cfg(any(
+            feature = "xml-backend-roxmltree",
+            feature = "xml-backend-differential"
+        ))]
+        let mut doctype = None;
         loop {
             let start = source_offset(reader.buffer_position())?;
             let event = reader.read_event().map_err(|error| ParseError::Backend {
@@ -88,6 +98,11 @@ impl LexicalPreflight {
                     range: start..end,
                 }),
                 Event::DocType(_) if !allow_dtd => return Err(ParseError::DtdDetected),
+                #[cfg(any(
+                    feature = "xml-backend-roxmltree",
+                    feature = "xml-backend-differential"
+                ))]
+                Event::DocType(_) => doctype = Some(start..end),
                 Event::Eof => break,
                 _ => {}
             }
@@ -97,7 +112,22 @@ impl LexicalPreflight {
                 return Err(ParseError::SourcePositionLimitReached { maximum, actual });
             }
         }
-        Ok(Self { nodes })
+        Ok(Self {
+            nodes,
+            #[cfg(any(
+                feature = "xml-backend-roxmltree",
+                feature = "xml-backend-differential"
+            ))]
+            doctype,
+        })
+    }
+
+    #[cfg(any(
+        feature = "xml-backend-roxmltree",
+        feature = "xml-backend-differential"
+    ))]
+    pub(super) fn doctype_range(&self) -> Option<&Range<usize>> {
+        self.doctype.as_ref()
     }
 
     #[cfg(any(

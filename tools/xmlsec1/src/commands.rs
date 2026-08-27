@@ -662,7 +662,7 @@ fn named_candidate_search<'a, T: Copy>(
 fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, SIGN_OPTIONS)?;
     validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
-    let password = option_text(invocation, "pwd")?;
+    let password = invocation.password_bytes();
     // This binary is an explicit libxmlsec1 compatibility boundary. Its sign
     // and verify commands must bind XPath here() identically for round trips.
     let policy = xmlsec_compatibility_signing_policy(invocation);
@@ -677,7 +677,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         signature.algorithm,
         signature.key_info.as_ref(),
         &policy,
-        password.map(str::as_bytes),
+        password,
     )?;
     let mut context = SignContext::new(selected.key.as_ref())
         .policy(policy)
@@ -2743,7 +2743,7 @@ fn direct_encrypted_keys<'a, 'input>(key_info: Node<'a, 'input>) -> Vec<Node<'a,
 fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, DECRYPT_OPTIONS)?;
     validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
-    if invocation.last_value("pwd").is_some() {
+    if invocation.flag("pwd") {
         return Err(CommandError::UnsupportedOption("pwd".into()));
     }
     let policy = DecryptionPolicy::default();

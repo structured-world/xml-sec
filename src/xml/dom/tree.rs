@@ -264,8 +264,11 @@ impl<'input> Document<'input> {
     }
 
     #[cfg(feature = "xml-backend-differential")]
-    pub(super) fn ensure_semantically_equivalent(&self, other: &Self) -> Result<(), ParseError> {
-        let doctype = doctype_range(self.input);
+    pub(super) fn ensure_semantically_equivalent(
+        &self,
+        other: &Self,
+        doctype: Option<&Range<usize>>,
+    ) -> Result<(), ParseError> {
         if self.nodes.len() != other.nodes.len() {
             let detail = self
                 .nodes
@@ -292,19 +295,17 @@ impl<'input> Document<'input> {
                 ),
             });
         }
-        if let Some((index, (left, right))) =
-            self.nodes
-                .iter()
-                .zip(&other.nodes)
-                .enumerate()
-                .find(|(_, (left, right))| {
-                    !nodes_semantically_equivalent(left, right, doctype.as_ref())
-                })
+        if let Some((index, (left, right))) = self
+            .nodes
+            .iter()
+            .zip(&other.nodes)
+            .enumerate()
+            .find(|(_, (left, right))| !nodes_semantically_equivalent(left, right, doctype))
         {
             return Err(ParseError::BackendDivergence {
                 reason: format!(
                     "retained semantic node {index} differs in {}",
-                    node_difference(left, right, doctype.as_ref())
+                    node_difference(left, right, doctype)
                 ),
             });
         }
@@ -380,51 +381,6 @@ fn source_ranges_equivalent(
     // roxmltree reports declaration bytes while xmloxide reports reference
     // bytes. Both positions encode the same synthetic entity provenance.
     range_contains(doctype, left) != range_contains(doctype, right)
-}
-
-#[cfg(any(
-    feature = "xml-backend-roxmltree",
-    feature = "xml-backend-differential"
-))]
-pub(super) fn doctype_range(input: &str) -> Option<Range<usize>> {
-    let start = input.find("<!DOCTYPE")?;
-    let bytes = input.as_bytes();
-    let mut quote = None;
-    let mut subset_depth = 0_u32;
-    let mut offset = start + "<!DOCTYPE".len();
-    while let Some(&byte) = bytes.get(offset) {
-        if let Some(active) = quote {
-            if byte == active {
-                quote = None;
-            }
-        } else {
-            // Brackets and closing delimiters inside DTD comments or processing
-            // instructions are data, not internal-subset structure.
-            if bytes[offset..].starts_with(b"<!--") {
-                let end = bytes[offset + 4..]
-                    .windows(3)
-                    .position(|window| window == b"-->")?;
-                offset += 4 + end + 3;
-                continue;
-            }
-            if bytes[offset..].starts_with(b"<?") {
-                let end = bytes[offset + 2..]
-                    .windows(2)
-                    .position(|window| window == b"?>")?;
-                offset += 2 + end + 2;
-                continue;
-            }
-            match byte {
-                b'\'' | b'"' => quote = Some(byte),
-                b'[' => subset_depth = subset_depth.saturating_add(1),
-                b']' => subset_depth = subset_depth.saturating_sub(1),
-                b'>' if subset_depth == 0 => return Some(start..offset + 1),
-                _ => {}
-            }
-        }
-        offset += 1;
-    }
-    None
 }
 
 #[cfg(any(
@@ -750,8 +706,8 @@ impl<'a, 'input> Node<'a, 'input> {
     /// Finds an in-scope prefix for a namespace URI.
     pub fn lookup_prefix(self, uri: &str) -> Option<&'a str> {
         self.namespaces()
-            .find(|ns| ns.uri() == uri)
-            .and_then(Namespace::name)
+            .filter(|namespace| namespace.uri() == uri)
+            .find_map(Namespace::name)
     }
     /// Returns direct character data, or the first direct text child of an element.
     pub fn text(self) -> Option<&'a str> {
@@ -961,11 +917,6 @@ impl<'a, 'input> Iterator for Ancestors<'a, 'input> {
 #[cfg(test)]
 mod tests {
     use super::Document;
-    #[cfg(any(
-        feature = "xml-backend-roxmltree",
-        feature = "xml-backend-differential"
-    ))]
-    use super::doctype_range;
     #[cfg(feature = "xml-backend-differential")]
     use super::{NamespaceData, namespace_axes_equivalent};
     use crate::xml::dom::{ParseError, ParsingOptions};
@@ -1216,7 +1167,7 @@ mod tests {
         right.nodes[2].range.end -= 1;
 
         assert!(matches!(
-            left.ensure_semantically_equivalent(&right),
+            left.ensure_semantically_equivalent(&right, None),
             Err(ParseError::BackendDivergence { .. })
         ));
     }
@@ -1249,6 +1200,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dtd_range_ignores_doctype_text_in_prolog_nodes() {
+        // DOCTYPE-like text in ordinary prolog nodes must not redirect DTD
+        // filtering away from the actual declaration and leak subset nodes.
+        let document = Document::parse_with_options(
+            "<!-- <!DOCTYPE fake> --><?probe <!DOCTYPE fake> ?><!DOCTYPE r [<!--hidden-->]><r/>",
+            ParsingOptions {
+                allow_dtd: true,
+                ..ParsingOptions::default()
+            },
+        )
+        .expect("DTD fixture must parse");
+        let root = document.root();
+        let comments = root
+            .children()
+            .filter(|node| node.is_comment())
+            .filter_map(|node| node.text())
+            .collect::<Vec<_>>();
+        let processing_instructions = root
+            .children()
+            .filter(|node| node.is_pi())
+            .filter_map(|node| node.pi())
+            .collect::<Vec<_>>();
+
+        assert_eq!(comments, [" <!DOCTYPE fake> "]);
+        assert_eq!(processing_instructions.len(), 1);
+        assert_eq!(processing_instructions[0].target, "probe");
+    }
+
     #[cfg(any(
         feature = "xml-backend-roxmltree",
         feature = "xml-backend-differential"
@@ -1260,6 +1240,8 @@ mod tests {
         let input = "<!DOCTYPE r [<!ENTITY café 'ok'>]><r/>";
         let end = input.find("><r/>").expect("fixture has document root") + 1;
 
-        assert_eq!(doctype_range(input), Some(0..end));
+        let preflight = super::super::LexicalPreflight::scan(input, true)
+            .expect("Unicode DTD fixture must pass lexical preflight");
+        assert_eq!(preflight.doctype_range(), Some(&(0..end)));
     }
 }

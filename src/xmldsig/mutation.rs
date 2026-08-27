@@ -1918,6 +1918,27 @@ mod tests {
     }
 
     #[test]
+    fn key_info_source_merge_uses_named_binding_for_namespaced_attributes() {
+        // A default binding cannot qualify an attribute. Prefix lookup must
+        // continue to the named binding when both map to the same URI.
+        let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo><ds:X509Data/></ds:KeyInfo></ds:Signature>"#;
+        let generated = r#"<ds:X509Data xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns="urn:example:metadata" xmlns:ext="urn:example:metadata" ext:role="signer"><ds:X509Certificate>Y2VydA==</ds:X509Certificate></ds:X509Data>"#;
+
+        let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect("a named namespace binding must qualify the generated attribute");
+        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let x509_data = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
+            .expect("X509Data");
+
+        assert_eq!(
+            x509_data.attribute(("urn:example:metadata", "role")),
+            Some("signer")
+        );
+    }
+
+    #[test]
     fn key_info_source_merge_preserves_comment_and_processing_instruction() {
         // Comments and processing instructions are caller-owned content, not an
         // empty placeholder that the generated identity may silently replace.

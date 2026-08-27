@@ -18,7 +18,7 @@ impl XmlBackend for DifferentialBackend {
 
         match (roxmltree, xmloxide) {
             (Ok(roxmltree), Ok(xmloxide)) => {
-                roxmltree.ensure_semantically_equivalent(&xmloxide)?;
+                roxmltree.ensure_semantically_equivalent(&xmloxide, preflight.doctype_range())?;
                 Ok(xmloxide)
             }
             (Err(left), Err(right)) if equivalent_rejection(&left, &right) => Err(right),

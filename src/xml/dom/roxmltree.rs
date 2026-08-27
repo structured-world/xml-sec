@@ -2,9 +2,7 @@
 
 use super::{
     Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackend,
-    tree::{
-        AttributeData, NamespaceData, NodeId, NodeKind, TreeBuilder, doctype_range, range_contains,
-    },
+    tree::{AttributeData, NamespaceData, NodeId, NodeKind, TreeBuilder, range_contains},
 };
 
 pub(super) struct RoxmltreeBackend;
@@ -31,7 +29,7 @@ impl XmlBackend for RoxmltreeBackend {
         project_document(
             &mut target,
             parsed.root(),
-            doctype_range(input).as_ref(),
+            preflight.doctype_range(),
             preflight,
         )?;
         Ok(target.finish())

@@ -6,7 +6,8 @@ pub mod dom;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 #[cfg(any(feature = "xmldsig", test))]
-use crate::xml::dom::{Document, Node};
+use crate::xml::dom::Document;
+use crate::xml::dom::Node;
 
 #[cfg(feature = "xmldsig")]
 use crate::xml::dom::NodeId;
