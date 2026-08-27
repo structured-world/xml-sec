@@ -54,7 +54,7 @@
     {
       "id": "native-supported-uri",
       "kinds": ["algorithm-uri"],
-      "name_regex": "^xmlSecHref(?:Aes128Cbc|Aes256Cbc|Aes128Gcm|Aes256Gcm|KWAes128|KWAes256|Base64|C14N|C14NWithComments|C14N11|C14N11WithComments|ExcC14N|ExcC14NWithComments|DEREncodedKeyValue|DSAKeyValue|ECKeyValue|Enveloped|RSAKeyValue|RsaSha256|RsaSha384|RsaSha512|EcdsaSha256|EcdsaSha384|Sha256|Sha384|Sha512|RsaOaep|RsaOaepEnc11|Mgf1Sha1|Mgf1Sha256|Mgf1Sha384|Mgf1Sha512|X509Data|RawX509Cert|EncryptedKey)$",
+      "name_regex": "^xmlSecHref(?:Aes128Cbc|Aes256Cbc|Aes128Gcm|Aes256Gcm|KWAes128|KWAes256|Base64|C14N|C14NWithComments|C14N11|C14N11WithComments|ExcC14N|ExcC14NWithComments|DEREncodedKeyValue|DSAKeyValue|ECKeyValue|Enveloped|RSAKeyValue|DsaSha256|HmacSha224|HmacSha256|HmacSha384|HmacSha512|RsaSha224|RsaSha256|RsaSha384|RsaSha512|EcdsaSha224|EcdsaSha256|EcdsaSha384|EcdsaSha512|Sha224|Sha256|Sha384|Sha512|RsaOaep|RsaOaepEnc11|Mgf1Sha1|Mgf1Sha256|Mgf1Sha384|Mgf1Sha512|X509Data|RawX509Cert|EncryptedKey)$",
       "outcome": "behavior-compatible",
       "rationale": "The native Rust API parses and executes this standard URI, with unit or interoperability coverage in the repository.",
       "evidence": "native-algorithm-tests"
@@ -64,13 +64,13 @@
       "kinds": ["algorithm-uri"],
       "name_regex": "^xmlSecHrefSha1$",
       "outcome": "behavior-compatible",
-      "rationale": "The native Rust API provides verification-only SHA-1 reference digest compatibility; signing rejects SHA-1 independently of policy.",
+      "rationale": "The native Rust API implements SHA-1 reference digests; secure signing defaults reject SHA-1 while an explicit compatibility policy can opt in.",
       "evidence": "sha1-verification-tests"
     },
     {
       "id": "policy-gated-legacy-uri",
       "kinds": ["algorithm-uri"],
-      "name_regex": "^xmlSecHref(?:DsaSha1|HmacSha1|RsaSha1)$",
+      "name_regex": "^xmlSecHref(?:DsaSha1|EcdsaSha1|HmacSha1|RsaSha1)$",
       "outcome": "compatibility-profile-only",
       "rationale": "The implementation retains this legacy algorithm for interoperability, but the compiled policy must explicitly permit it.",
       "evidence": "legacy-policy-tests"

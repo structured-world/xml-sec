@@ -87,7 +87,7 @@
     },
     "native-sha1-verification-uri": {
       "outcome": "behavior-compatible",
-      "rationale": "The native Rust API provides verification-only SHA-1 reference digest compatibility; signing rejects SHA-1 independently of policy.",
+      "rationale": "The native Rust API implements SHA-1 reference digests; secure signing defaults reject SHA-1 while an explicit compatibility policy can opt in.",
       "evidence": "sha1-verification-tests"
     },
     "native-supported-uri": {
@@ -4408,7 +4408,7 @@
       "source": "src/strings.c",
       "line": 335,
       "detail": "http://www.w3.org/2009/xmldsig11#dsa-sha256",
-      "classification": "remaining-uri-surface"
+      "classification": "native-supported-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4440,7 +4440,7 @@
       "source": "src/strings.c",
       "line": 393,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha1",
-      "classification": "remaining-uri-surface"
+      "classification": "policy-gated-legacy-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4448,7 +4448,7 @@
       "source": "src/strings.c",
       "line": 396,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha224",
-      "classification": "remaining-uri-surface"
+      "classification": "native-supported-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4504,7 +4504,7 @@
       "source": "src/strings.c",
       "line": 405,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512",
-      "classification": "remaining-uri-surface"
+      "classification": "native-supported-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4712,7 +4712,7 @@
       "source": "src/strings.c",
       "line": 609,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#hmac-sha224",
-      "classification": "remaining-uri-surface"
+      "classification": "native-supported-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4720,7 +4720,7 @@
       "source": "src/strings.c",
       "line": 612,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256",
-      "classification": "remaining-uri-surface"
+      "classification": "native-supported-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4728,7 +4728,7 @@
       "source": "src/strings.c",
       "line": 615,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#hmac-sha384",
-      "classification": "remaining-uri-surface"
+      "classification": "native-supported-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -4736,7 +4736,7 @@
       "source": "src/strings.c",
       "line": 618,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#hmac-sha512",
-      "classification": "remaining-uri-surface"
+      "classification": "native-supported-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -5080,7 +5080,7 @@
       "source": "src/strings.c",
       "line": 734,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#rsa-sha224",
-      "classification": "remaining-uri-surface"
+      "classification": "native-supported-uri"
     },
     {
       "kind": "algorithm-uri",
@@ -5184,7 +5184,7 @@
       "source": "src/strings.c",
       "line": 828,
       "detail": "http://www.w3.org/2001/04/xmldsig-more#sha224",
-      "classification": "remaining-uri-surface"
+      "classification": "native-supported-uri"
     },
     {
       "kind": "algorithm-uri",

@@ -287,9 +287,9 @@ fn rsa_signing_key_exposes_structured_public_key_info() {
 }
 
 #[test]
-fn signing_key_preflight_rejects_verify_only_algorithms() {
-    // Candidate search must not classify RSA-SHA1 as usable and then fail only
-    // after choosing that key; the shared preflight owns signing capability.
+fn signing_key_preflight_enforces_legacy_algorithm_policy() {
+    // Candidate search must reject RSA-SHA1 under secure defaults, while an
+    // explicit compatibility allowlist can opt into the implemented primitive.
     let key =
         RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
             .expect("RSA private key fixture must parse");
@@ -297,10 +297,24 @@ fn signing_key_preflight_rejects_verify_only_algorithms() {
 
     assert!(matches!(
         validate_signing_key(&key, SignatureAlgorithm::RsaSha1, &policy),
-        Err(SigningError::Key(
-            SigningKeyError::UnsupportedAlgorithm { .. }
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::Algorithm { .. }
         ))
     ));
+    let ecdsa_key = EcdsaP256SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime256v1-key.pem",
+    ))
+    .expect("P-256 private key fixture must parse");
+    assert!(matches!(
+        validate_signing_key(&ecdsa_key, SignatureAlgorithm::EcdsaSha1, &policy),
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::Algorithm { .. }
+        ))
+    ));
+    let mut compatibility_policy = policy.clone();
+    compatibility_policy.signature_algorithms = Some([SignatureAlgorithm::RsaSha1].into());
+    validate_signing_key(&key, SignatureAlgorithm::RsaSha1, &compatibility_policy)
+        .expect("an explicit compatibility policy may enable implemented RSA-SHA1 signing");
     validate_signing_key(&key, SignatureAlgorithm::RsaSha256, &policy)
         .expect("secure signing algorithm must remain usable");
 }
@@ -1983,8 +1997,8 @@ fn signing_template_bounds_xpath_expressions_across_references() {
 
 #[test]
 fn rejects_sha1_digest_for_signing_template() {
-    // SHA-1 remains verify-only. This manually crafted template bypasses the
-    // builder, so the digest pass must enforce the same policy before signing.
+    // SHA-1 remains disabled by default. This manually crafted template bypasses
+    // the builder, so the digest pass must enforce the same policy before signing.
     let xml = r##"<root><payload ID="payload">hello</payload><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#payload"><DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><DigestValue/></Reference></SignedInfo><SignatureValue/></Signature></root>"##;
 
     let err = compute_reference_digest_values(xml).expect_err("SHA-1 signing digest must fail");

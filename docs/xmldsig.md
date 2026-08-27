@@ -4,21 +4,21 @@
 
 `SignatureAlgorithm::EcdsaP256Sha256` and `EcdsaP384Sha384` are now
 `EcdsaSha256` and `EcdsaSha384`, because the signature URI selects a digest while
-the key selects P-256, P-384, or P-521. The enum also includes `DsaSha1` and
-`HmacSha1`. `SignedInfo` now reports optional HMAC truncation through
+the key selects P-256, P-384, or P-521. The enum also covers DSA, HMAC, RSA,
+and ECDSA SHA-1/SHA-224/SHA-256/SHA-384/SHA-512 methods implemented by the
+XMLDSig 1.1 interop pipeline. `SignedInfo` reports optional HMAC truncation through
 `hmac_output_length_bits`. Both public types are non-exhaustive; consumers should
 use wildcard match arms and obtain `SignedInfo` through the parser.
 
 The `xmldsig` feature provides signing and verification pipelines for same-document XML
 signatures and detached references whose payloads the caller supplies. It supports inclusive and
 exclusive canonicalization, enveloped signatures,
-Base64, XPath 1.0, and XPath Filter 2.0 transforms, RSA PKCS#1 v1.5, ECDSA SHA-256/SHA-384
-with P-256/P-384/P-521 verification keys,
-DSA-SHA1 and HMAC-SHA1 verification, embedded X.509 certificates, and configured key
-resolution.
+Base64, XPath 1.0, and XPath Filter 2.0 transforms, RSA PKCS#1 v1.5, DSA,
+ECDSA with P-256/P-384/P-521 keys, HMAC truncation, embedded X.509 certificates,
+and configured key resolution.
 
-The complete Phaos XMLDSig 3 corpus is checked in for deterministic offline
-interoperability testing. Every signature document is executed through the
+The complete Phaos XMLDSig 3 and 2012 XMLDSig 1.1 corpora are checked in for
+deterministic offline interoperability testing. Every signature document is executed through the
 public verification API and must be classified exactly once. Supported vectors
 must verify, invalid vectors must return their exact failure class, and vectors
 that depend on an unavailable capability such as XSLT or HMAC-MD5 must fail at
@@ -73,6 +73,11 @@ unchanged. Every staged mutation checks the active projected node count before c
 Custom `KeyInfoWriter` output is treated as a separate untrusted XML input: its
 byte ceiling is enforced before namespace wrapping or parsing, and its merged nodes remain under
 the same operation ceiling as the rest of the signature.
+Built-in writers emit `RSAKeyValue`/`ECKeyValue`, `DEREncodedKeyValue`, embedded
+X.509 certificate chains, or `X509Digest` selectors. DSA signing accepts plain
+or password-encrypted PKCS#8 DER and emits XMLDSig's fixed-width `r || s` value;
+P-521 signing and verification use the same key-selected ECDSA framing contract
+as P-256 and P-384.
 `IdAttributeRegistration` supplies immutable request context for non-standard ID attributes.
 `SignContext::id_attributes` and `VerifyContext::id_attributes` apply the same global or
 element-scoped registrations to operation start-node selection and every same-document Reference.
@@ -227,6 +232,13 @@ bounds both inherited `xml:base` components and cumulative URI-resolution bytes 
 References, `RetrievalMethod`, Reference transforms, and SignedInfo C14N 1.1 fixup; implementation
 ceilings are 64 components and 1 MiB per operation. Other retrieval transform chains fail closed
 instead of being ignored.
+XMLDSig 1.1 `KeyInfoReference` has separate source and URI policy gates plus a
+bounded recursion depth. Same-document and caller-owned external targets must
+resolve to exactly one `KeyInfo`; missing targets, non-`KeyInfo` targets, and
+cycles fail closed. Fragment lookup and nested references inside an external XML
+document use that document's ID namespace. All nested external dereferences
+consume the operation's shared aggregate external-resource budget and never
+trigger implicit I/O.
 `VerifyContext::allowed_transforms` applies to Reference transforms and implicit C14N,
 the declared SignedInfo canonicalization method, and supported RetrievalMethod transforms.
 Allowing XPath for signed payload processing therefore also explicitly permits the bounded
@@ -262,15 +274,20 @@ reported as an invalid per-reference result without changing core `SignedInfo` v
 
 ## Current Scope
 
-Implemented algorithms include RSA PKCS#1 v1.5 with SHA-1/SHA-256/SHA-384/SHA-512 for
-verification, SHA-256/SHA-384/SHA-512 for signing, and ECDSA with SHA-256 or SHA-384. ECDSA
-verification selects P-256, P-384, or P-521 from the SPKI independently of the hash identifier;
-the built-in P-256 and P-384 signing keys support either ECDSA hash identifier.
-RSA-SHA1, DSA-SHA1, and HMAC-SHA1 (including XMLDSig's byte-aligned 80-160-bit truncation range)
-are verify-only legacy algorithms. Every one is independently default-deny: `None` in the general
+Implemented signature methods include DSA-SHA1/SHA256; HMAC-SHA1/SHA224/SHA256/SHA384/SHA512;
+RSA PKCS#1 v1.5 with SHA-1/SHA224/SHA256/SHA384/SHA512; and ECDSA
+SHA-1/SHA224/SHA256/SHA384/SHA512. ECDSA selects P-256, P-384, or P-521 from the key independently
+of the hash identifier. Digest methods include SHA-1/SHA224/SHA256/SHA384/SHA512.
+HMAC output can be omitted for full width or explicitly truncated on an octet boundary, subject to
+`HmacPolicy` key and output minima.
+
+RSA-SHA1, DSA-SHA1, HMAC-SHA1, and ECDSA-SHA1 are legacy algorithms disabled by default.
+Verification requires an independent opt-in: `None` in the general
 `VerificationPolicy::signature_algorithms` allowlist does not bypass
 `VerificationPolicy::key_trust.allowed_legacy_signature_algorithms`, where callers must explicitly
-opt in to each legacy method needed by that operation. `KeyTrustPolicy::rsa_keys` and
+opt in to each legacy method needed by that operation. Signing requires the method in an explicit
+`SigningPolicy::signature_algorithms` allowlist; selecting a SHA-1 method in document content never
+enables it. `KeyTrustPolicy::rsa_keys` and
 `KeyTrustPolicy::dsa_keys` separately enforce key-strength minima on resolved verification keys and
 on issuer keys used to authenticate certificate paths and applicable CRLs; their secure defaults
 are 2048 bits. Compatibility operations may lower the DSA minimum to 1024 bits, but the
@@ -281,13 +298,11 @@ the configured minimum. Custom opaque `VerifyingKey` implementations remain resp
 metadata that the core cannot inspect.
 Selecting the algorithm in untrusted XML does not opt the operation into legacy cryptography, and
 this gate runs before key resolution.
-RSA-SHA1 signing remains unsupported.
 X.509 path and CRL authentication additionally supports standard RSA-PSS with SHA-256/SHA-384/
 SHA-512 parameters, including RFC 4055 issuer-key restrictions, and Ed25519. Signature
 `AlgorithmIdentifier` parameters are validated before provider dispatch: DSA, ECDSA, and Ed25519
 require absent parameters; RSA PKCS#1 accepts NULL or absent; RSA-PSS requires valid typed
 parameters. An `id-RSASSA-PSS` issuer key with absent parameters imposes no parameter restrictions,
 as required by RFC 4055 section 3.3; present key parameters constrain the signature hash, MGF,
-minimum salt length, and trailer field. DSA-SHA256, broader HMAC verification/signing, XMLDSig
-`SignatureMethod` RSA-PSS, and
-implicit external resource loading are not currently supported.
+minimum salt length, and trailer field. XMLDSig `SignatureMethod` RSA-PSS and implicit external
+resource loading are not currently supported.

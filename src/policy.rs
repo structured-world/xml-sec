@@ -39,6 +39,7 @@ pub(crate) mod resource_name {
     pub const ENCRYPTION_RECIPIENTS: &str = "encryption recipients";
     pub const ENCRYPTION_METADATA_BYTES: &str = "encryption metadata bytes";
     pub const KEY_CANDIDATES: &str = "key candidates";
+    pub const KEY_INFO_REFERENCE_DEPTH: &str = "KeyInfoReference depth";
     pub const BASE64_TRANSFORM_INPUT_BYTES: &str = "Base64 transform input bytes";
     pub const BASE64_TRANSFORM_OUTPUT_BYTES: &str = "Base64 transform output bytes";
     pub const XPATH_EXPRESSIONS: &str = "XPath expressions";
@@ -69,6 +70,17 @@ pub enum PolicyViolation {
         operation: &'static str,
         /// Stable algorithm URI or diagnostic name.
         algorithm: String,
+    },
+    /// An HMAC output length is outside the operation's configured bounds.
+    #[cfg(feature = "xmldsig")]
+    #[error("HMAC output length must be between {minimum} and {maximum} bits: got {actual}")]
+    HmacOutputLength {
+        /// Minimum output length selected by policy.
+        minimum: usize,
+        /// Full output width of the selected HMAC algorithm.
+        maximum: usize,
+        /// Parsed output length.
+        actual: usize,
     },
     /// An input exceeds a configured resource ceiling.
     #[error("{resource} exceeds policy maximum {maximum}: got {actual}")]
@@ -136,6 +148,70 @@ pub enum PolicyViolation {
         /// Non-secret structural rejection reason.
         reason: &'static str,
     },
+}
+
+/// HMAC key-strength and truncation requirements shared by signing and verification.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HmacPolicy {
+    /// Minimum caller-owned secret length in bits.
+    pub minimum_key_bits: usize,
+    /// Minimum emitted or accepted MAC length in bits.
+    pub minimum_output_bits: usize,
+}
+
+#[cfg(feature = "xmldsig")]
+impl Default for HmacPolicy {
+    fn default() -> Self {
+        Self {
+            minimum_key_bits: 128,
+            minimum_output_bits: 128,
+        }
+    }
+}
+
+#[cfg(feature = "xmldsig")]
+impl HmacPolicy {
+    pub(crate) fn validate(self) -> Result<(), PolicyViolation> {
+        if self.minimum_key_bits == 0 || self.minimum_output_bits == 0 {
+            return Err(PolicyViolation::KeyTrust {
+                reason: "HMAC minimum key and output lengths must be nonzero",
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_key(self, key_bytes: usize) -> Result<(), PolicyViolation> {
+        if key_bytes.saturating_mul(8) < self.minimum_key_bits {
+            return Err(PolicyViolation::InvalidKeyMaterial {
+                operation: "HMAC",
+                key_type: "symmetric",
+                reason: "secret is shorter than the configured minimum",
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_output(
+        self,
+        algorithm: SignatureAlgorithm,
+        selected_bits: usize,
+    ) -> Result<(), PolicyViolation> {
+        let maximum = algorithm
+            .hmac_output_bits()
+            .ok_or_else(|| PolicyViolation::Algorithm {
+                operation: "HMAC",
+                algorithm: algorithm.uri().to_owned(),
+            })?;
+        if selected_bits < self.minimum_output_bits || selected_bits > maximum {
+            return Err(PolicyViolation::HmacOutputLength {
+                minimum: self.minimum_output_bits,
+                maximum,
+                actual: selected_bits,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// RSA strength and structural requirements for outbound cryptographic operations.
@@ -315,6 +391,8 @@ pub struct ResourcePolicy {
     pub max_encryption_metadata_bytes: usize,
     /// Maximum key and certificate candidates inspected by one operation.
     pub max_key_candidates: usize,
+    /// Maximum nested `KeyInfoReference` dereference depth.
+    pub max_key_info_reference_depth: usize,
     /// Maximum bytes accepted by Base64 transforms before decoding.
     pub max_base64_transform_input_bytes: usize,
     /// Maximum cumulative bytes emitted by Base64 transforms in one operation.
@@ -368,6 +446,7 @@ impl Default for ResourcePolicy {
             max_encryption_recipients: crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
             max_encryption_metadata_bytes: crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
             max_key_candidates: crate::hard_limits::KEY_CANDIDATE_CEILING,
+            max_key_info_reference_depth: crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
             max_base64_transform_input_bytes:
                 crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
             max_base64_transform_output_bytes:
@@ -470,6 +549,11 @@ impl ResourcePolicy {
                 resource_name::KEY_CANDIDATES,
                 self.max_key_candidates,
                 crate::hard_limits::KEY_CANDIDATE_CEILING,
+            ),
+            (
+                resource_name::KEY_INFO_REFERENCE_DEPTH,
+                self.max_key_info_reference_depth,
+                crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
             ),
             (
                 resource_name::BASE64_TRANSFORM_INPUT_BYTES,
@@ -693,6 +777,8 @@ pub struct UriPolicy {
     pub references: UriTypeSet,
     /// URI classes accepted by RetrievalMethod processing.
     pub retrieval_methods: UriTypeSet,
+    /// URI classes accepted by XMLDSig 1.1 `KeyInfoReference` processing.
+    pub key_info_references: UriTypeSet,
 }
 
 #[cfg(feature = "xmldsig")]
@@ -701,6 +787,7 @@ impl Default for UriPolicy {
         Self {
             references: UriTypeSet::SAME_DOCUMENT,
             retrieval_methods: UriTypeSet::SAME_DOCUMENT,
+            key_info_references: UriTypeSet::SAME_DOCUMENT,
         }
     }
 }
@@ -719,6 +806,8 @@ pub struct KeySourcePolicy {
     pub der_encoded_key_value: bool,
     /// Permit certificates and selectors embedded in `X509Data`.
     pub x509_data: bool,
+    /// Permit `KeyInfoReference` indirection to another bounded `KeyInfo`.
+    pub key_info_reference: bool,
 }
 
 #[cfg(feature = "xmldsig")]
@@ -730,6 +819,7 @@ impl Default for KeySourcePolicy {
             key_value: true,
             der_encoded_key_value: true,
             x509_data: true,
+            key_info_reference: true,
         }
     }
 }
@@ -858,6 +948,8 @@ pub struct VerificationPolicy {
     pub signature_algorithms: Option<HashSet<SignatureAlgorithm>>,
     /// Allowed reference digest methods; `None` accepts every implemented method.
     pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
+    /// HMAC secret and output-length requirements.
+    pub hmac: HmacPolicy,
     /// Required ECDSA `SignatureValue` wire representation.
     pub ecdsa_signature_value_encoding: EcdsaSignatureValueEncoding,
     /// Key and certificate trust rules.
@@ -881,7 +973,8 @@ impl VerificationPolicy {
     /// Validate the complete snapshot against implementation hard ceilings.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         self.resources.validate()?;
-        self.key_trust.validate()
+        self.key_trust.validate()?;
+        self.hmac.validate()
     }
 
     /// Enforce the signature algorithm after key resolution.
@@ -894,6 +987,7 @@ impl VerificationPolicy {
             SignatureAlgorithm::RsaSha1
                 | SignatureAlgorithm::DsaSha1
                 | SignatureAlgorithm::HmacSha1
+                | SignatureAlgorithm::EcdsaSha1
         ) && !self
             .key_trust
             .allowed_legacy_signature_algorithms
@@ -926,10 +1020,14 @@ pub struct SigningPolicy {
     pub signature_algorithms: Option<HashSet<SignatureAlgorithm>>,
     /// Allowed reference digest methods; `None` uses the implemented secure defaults.
     pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
+    /// HMAC secret and output-length requirements.
+    pub hmac: HmacPolicy,
     /// ECDSA `SignatureValue` wire representation emitted by signing.
     pub ecdsa_signature_value_encoding: EcdsaSignatureValueEncoding,
     /// RSA requirements enforced before producing a signature.
     pub rsa_keys: RsaKeyPolicy,
+    /// DSA requirements enforced before producing a signature.
+    pub dsa_keys: DsaKeyPolicy,
     /// Reference URI permissions. External URIs remain unsupported until the
     /// caller supplies request-scoped external bytes through the signing API.
     pub uris: UriPolicy,
@@ -948,7 +1046,53 @@ impl SigningPolicy {
     /// Validate the complete snapshot before signing work begins.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         self.resources.validate()?;
-        self.rsa_keys.validate()
+        self.rsa_keys.validate()?;
+        self.dsa_keys.validate()?;
+        self.hmac.validate()
+    }
+
+    pub(crate) fn check_signature_algorithm(
+        &self,
+        algorithm: SignatureAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        let explicitly_allowed = self
+            .signature_algorithms
+            .as_ref()
+            .is_some_and(|allowed| allowed.contains(&algorithm));
+        if (!algorithm.signing_allowed() && !explicitly_allowed)
+            || self
+                .signature_algorithms
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&algorithm))
+        {
+            return Err(PolicyViolation::Algorithm {
+                operation: "signing",
+                algorithm: algorithm.uri().to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_digest_algorithm(
+        &self,
+        algorithm: DigestAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        let explicitly_allowed = self
+            .digest_algorithms
+            .as_ref()
+            .is_some_and(|allowed| allowed.contains(&algorithm));
+        if (!algorithm.signing_allowed() && !explicitly_allowed)
+            || self
+                .digest_algorithms
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&algorithm))
+        {
+            return Err(PolicyViolation::Algorithm {
+                operation: "signing",
+                algorithm: algorithm.uri().to_owned(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1245,6 +1389,7 @@ mod tests {
             max_encryption_recipients: 0,
             max_encryption_metadata_bytes: 0,
             max_key_candidates: 0,
+            max_key_info_reference_depth: 0,
             max_base64_transform_input_bytes: 0,
             max_base64_transform_output_bytes: 0,
             max_xpath_expressions: 0,

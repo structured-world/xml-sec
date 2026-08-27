@@ -93,8 +93,12 @@ if (( ${#fixture_paths[@]} == 0 )); then
   fixture_paths=(
     "xmldsig/aleksey-xmldsig-01/enveloping-rsa-x509chain.xml"
     "xmldsig/aleksey-xmldsig-01/enveloped-x509-digest-sha256.xml"
+    "xmldsig/aleksey-xmldsig-01/enveloping-sha256-dsa2048-sha256.tmpl"
+    "xmldsig/aleksey-xmldsig-01/enveloping-sha256-dsa2048-sha256.xml"
+    "xmldsig/keys/dsa/dsa-2048-key.p8-der"
     "xmldsig/merlin-xmldsig-twenty-three"
     "xmldsig/phaos-xmldsig-three"
+    "xmldsig/xmldsig11-interop-2012"
     "xmldsig/external-data/xml-stylesheet-2005"
     "xmldsig/external-data/xml-stylesheet-2005.b64"
     "xmldsig/external-data/rfc3161.txt"

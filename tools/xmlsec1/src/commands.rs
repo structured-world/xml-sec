@@ -860,7 +860,7 @@ fn validate_signing_key_info(
                 SigningPublicKeyInfo::Ec { curve_oid: expected_curve, public_key: expected_key, .. }
                     if *expected_curve == curve_oid && expected_key == public_key
             ),
-            KeyInfoSource::DerEncodedKeyValue(der) => public.spki_der() == der,
+            KeyInfoSource::DerEncodedKeyValue(der) => public.spki_der() == Some(der),
             KeyInfoSource::X509Data(data) => {
                 let has_identity = !data.certificates.is_empty()
                     || !data.subject_names.is_empty()
@@ -882,7 +882,7 @@ fn validate_signing_key_info(
                     let (_, certificate) =
                         x509_parser::certificate::X509Certificate::from_der(certificate)
                             .map_err(|_| signing_key_info_error("X509Certificate is invalid"))?;
-                    certificate.public_key().raw == public.spki_der()
+                    Some(certificate.public_key().raw) == public.spki_der()
                 } else {
                     let certificate =
                         selected.leaf_certificate_der.as_deref().ok_or_else(|| {
@@ -984,6 +984,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         uris: UriPolicy {
             references: UriTypeSet::ALL,
             retrieval_methods: UriTypeSet::ALL,
+            key_info_references: UriTypeSet::ALL,
         },
         transforms: TransformPolicy {
             xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
@@ -997,6 +998,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         SignatureAlgorithm::RsaSha1,
         SignatureAlgorithm::DsaSha1,
         SignatureAlgorithm::HmacSha1,
+        SignatureAlgorithm::EcdsaSha1,
     ]);
     // X509Data is controlled by the signed document and therefore cannot
     // establish its own trust. Only an explicit insecure opt-out disables

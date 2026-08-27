@@ -54,7 +54,8 @@ sha2 = { version = "0.11", features = ["oid"], optional = true }
 p256 = { version = "0.14", features = ["ecdsa"], optional = true }
 p384 = { version = "0.14", features = ["ecdsa"], optional = true }
 p521 = { version = "0.14", features = ["ecdsa"], optional = true }
-dsa = { version = "0.7", optional = true }
+dsa = { version = "0.7", features = ["hazmat"], optional = true }
+pkcs8 = { version = "0.11", features = ["encryption"], optional = true }
 ed25519-dalek = { version = "3", features = ["pkcs8"], optional = true }
 hmac = { version = "0.13", optional = true }
 signature = { version = "3", optional = true }
@@ -102,6 +103,7 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:p256",
     "dep:p384",
     "dep:p521",
+    "dep:pkcs8",
     "dep:rsa",
     "dep:sha1",
     "dep:sha2",

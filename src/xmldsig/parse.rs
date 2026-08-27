@@ -60,7 +60,8 @@ const MAX_RSA_MODULUS_LEN: usize = 1024;
 const MAX_RSA_EXPONENT_LEN: usize = 8;
 pub(crate) const EC_P256_OID: &str = "1.2.840.10045.3.1.7";
 pub(crate) const EC_P384_OID: &str = "1.3.132.0.34";
-const MAX_EC_PUBLIC_KEY_LEN: usize = 97;
+pub(crate) const EC_P521_OID: &str = "1.3.132.0.35";
+const MAX_EC_PUBLIC_KEY_LEN: usize = 133;
 const MAX_X509_BASE64_TEXT_LEN: usize = 262_144;
 const MAX_X509_BASE64_NORMALIZED_LEN: usize = MAX_X509_BASE64_TEXT_LEN;
 pub(crate) const MAX_X509_DECODED_BINARY_LEN: usize =
@@ -80,37 +81,77 @@ pub(crate) const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SignatureAlgorithm {
-    /// DSA with SHA-1. Verify-only legacy XMLDSig algorithm.
+    /// DSA with SHA-1. Legacy algorithm disabled for signing by default.
     DsaSha1,
-    /// HMAC with SHA-1. Verify-only legacy XMLDSig algorithm.
+    /// DSA with SHA-256 as defined by XMLDSig 1.1.
+    DsaSha256,
+    /// HMAC with SHA-1. Legacy algorithm disabled for signing by default.
     HmacSha1,
-    /// RSA with SHA-1. **Verify-only** — signing disabled.
+    /// HMAC with SHA-224.
+    HmacSha224,
+    /// HMAC with SHA-256.
+    HmacSha256,
+    /// HMAC with SHA-384.
+    HmacSha384,
+    /// HMAC with SHA-512.
+    HmacSha512,
+    /// RSA with SHA-1. Legacy algorithm disabled for signing by default.
     RsaSha1,
+    /// RSA with SHA-224.
+    RsaSha224,
     /// RSA with SHA-256 (most common in SAML).
     RsaSha256,
     /// RSA with SHA-384.
     RsaSha384,
     /// RSA with SHA-512.
     RsaSha512,
+    /// ECDSA with SHA-1; the key selects the elliptic curve.
+    EcdsaSha1,
+    /// ECDSA with SHA-224; the key selects the elliptic curve.
+    EcdsaSha224,
     /// ECDSA with SHA-256; the key selects the elliptic curve.
     EcdsaSha256,
     /// ECDSA with SHA-384; the key selects the elliptic curve.
     EcdsaSha384,
+    /// ECDSA with SHA-512; the key selects the elliptic curve.
+    EcdsaSha512,
 }
 
 impl SignatureAlgorithm {
+    /// Return the full HMAC output width for HMAC algorithms.
+    #[must_use]
+    pub const fn hmac_output_bits(self) -> Option<usize> {
+        match self {
+            Self::HmacSha1 => Some(160),
+            Self::HmacSha224 => Some(224),
+            Self::HmacSha256 => Some(256),
+            Self::HmacSha384 => Some(384),
+            Self::HmacSha512 => Some(512),
+            _ => None,
+        }
+    }
+
     /// Parse from an XML algorithm URI.
     #[must_use]
     pub fn from_uri(uri: &str) -> Option<Self> {
         match uri {
             "http://www.w3.org/2000/09/xmldsig#dsa-sha1" => Some(Self::DsaSha1),
+            "http://www.w3.org/2009/xmldsig11#dsa-sha256" => Some(Self::DsaSha256),
             "http://www.w3.org/2000/09/xmldsig#hmac-sha1" => Some(Self::HmacSha1),
+            "http://www.w3.org/2001/04/xmldsig-more#hmac-sha224" => Some(Self::HmacSha224),
+            "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256" => Some(Self::HmacSha256),
+            "http://www.w3.org/2001/04/xmldsig-more#hmac-sha384" => Some(Self::HmacSha384),
+            "http://www.w3.org/2001/04/xmldsig-more#hmac-sha512" => Some(Self::HmacSha512),
             "http://www.w3.org/2000/09/xmldsig#rsa-sha1" => Some(Self::RsaSha1),
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha224" => Some(Self::RsaSha224),
             "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256" => Some(Self::RsaSha256),
             "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384" => Some(Self::RsaSha384),
             "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512" => Some(Self::RsaSha512),
+            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha1" => Some(Self::EcdsaSha1),
+            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha224" => Some(Self::EcdsaSha224),
             "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256" => Some(Self::EcdsaSha256),
             "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384" => Some(Self::EcdsaSha384),
+            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512" => Some(Self::EcdsaSha512),
             _ => None,
         }
     }
@@ -120,20 +161,32 @@ impl SignatureAlgorithm {
     pub fn uri(self) -> &'static str {
         match self {
             Self::DsaSha1 => "http://www.w3.org/2000/09/xmldsig#dsa-sha1",
+            Self::DsaSha256 => "http://www.w3.org/2009/xmldsig11#dsa-sha256",
             Self::HmacSha1 => "http://www.w3.org/2000/09/xmldsig#hmac-sha1",
+            Self::HmacSha224 => "http://www.w3.org/2001/04/xmldsig-more#hmac-sha224",
+            Self::HmacSha256 => "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256",
+            Self::HmacSha384 => "http://www.w3.org/2001/04/xmldsig-more#hmac-sha384",
+            Self::HmacSha512 => "http://www.w3.org/2001/04/xmldsig-more#hmac-sha512",
             Self::RsaSha1 => "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
+            Self::RsaSha224 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha224",
             Self::RsaSha256 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
             Self::RsaSha384 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384",
             Self::RsaSha512 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512",
+            Self::EcdsaSha1 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha1",
+            Self::EcdsaSha224 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha224",
             Self::EcdsaSha256 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
             Self::EcdsaSha384 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
+            Self::EcdsaSha512 => "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512",
         }
     }
 
     /// Whether this algorithm is allowed for signing (not just verification).
     #[must_use]
     pub fn signing_allowed(self) -> bool {
-        !matches!(self, Self::RsaSha1 | Self::DsaSha1 | Self::HmacSha1)
+        !matches!(
+            self,
+            Self::RsaSha1 | Self::DsaSha1 | Self::HmacSha1 | Self::EcdsaSha1
+        )
     }
 }
 
@@ -187,7 +240,9 @@ impl KeyInfo {
             count.saturating_add(match source {
                 KeyInfoSource::KeyValue(_) | KeyInfoSource::DerEncodedKeyValue(_) => 1,
                 KeyInfoSource::X509Data(info) => info.certificates.len(),
-                KeyInfoSource::KeyName(_) | KeyInfoSource::RetrievalMethod { .. } => 0,
+                KeyInfoSource::KeyName(_)
+                | KeyInfoSource::RetrievalMethod { .. }
+                | KeyInfoSource::KeyInfoReference { .. } => 0,
             })
         })
     }
@@ -213,6 +268,11 @@ pub enum KeyInfoSource {
         resource_type: Option<String>,
         /// Supported transform shape declared by the retrieval method.
         transforms: RetrievalMethodTransforms,
+    },
+    /// XMLDSig 1.1 reference to another `KeyInfo` element.
+    KeyInfoReference {
+        /// RFC 3986-resolved resource identity.
+        uri: String,
     },
 }
 
@@ -494,8 +554,12 @@ fn parse_hmac_output_length(
     let Some(child) = children.next() else {
         return Ok(None);
     };
-    if algorithm != SignatureAlgorithm::HmacSha1
-        || child.tag_name().namespace() != Some(XMLDSIG_NS)
+    let Some(maximum_bits) = algorithm.hmac_output_bits() else {
+        return Err(ParseError::InvalidStructure(
+            "SignatureMethod parameters do not match the selected algorithm".into(),
+        ));
+    };
+    if child.tag_name().namespace() != Some(XMLDSIG_NS)
         || child.tag_name().name() != "HMACOutputLength"
         || children.next().is_some()
     {
@@ -513,10 +577,10 @@ fn parse_hmac_output_length(
     // XMLDSig 1.1 section 6.3.1 requires HMAC truncation to end on a
     // byte boundary because SignatureValue is encoded as complete octets:
     // https://www.w3.org/TR/xmldsig-core1/#sec-HMAC
-    if !(80..=160).contains(&bits) || !bits.is_multiple_of(8) {
-        return Err(ParseError::InvalidStructure(
-            "HMACOutputLength must be a byte-aligned value from 80 through 160".into(),
-        ));
+    if bits == 0 || bits > maximum_bits || !bits.is_multiple_of(8) {
+        return Err(ParseError::InvalidStructure(format!(
+            "HMACOutputLength must be a positive byte-aligned value no greater than {maximum_bits}"
+        )));
     }
     Ok(Some(bits))
 }
@@ -742,6 +806,25 @@ pub(crate) fn parse_key_info_with_policy_budgets(
                 ensure_no_element_children(child, "DEREncodedKeyValue")?;
                 let der = decode_der_encoded_key_value_base64(child)?;
                 sources.push(KeyInfoSource::DerEncodedKeyValue(der));
+            }
+            (Some(XMLDSIG11_NS), "KeyInfoReference") => {
+                ensure_no_element_children(child, "KeyInfoReference")?;
+                ensure_no_non_whitespace_text(child, "KeyInfoReference")?;
+                let lexical_uri = child.attribute("URI").ok_or_else(|| {
+                    ParseError::InvalidStructure("KeyInfoReference requires URI".into())
+                })?;
+                if lexical_uri.is_empty() || lexical_uri.len() > MAX_KEY_NAME_TEXT_LEN {
+                    return Err(ParseError::InvalidStructure(
+                        "KeyInfoReference URI must be non-empty and bounded".into(),
+                    ));
+                }
+                let uri = if lexical_uri.starts_with('#') {
+                    lexical_uri.to_owned()
+                } else {
+                    resolve_uri_from_node_with_budget(child, lexical_uri, xml_base_budget)
+                        .map_err(|error| ParseError::InvalidStructure(error.to_string()))?
+                };
+                sources.push(KeyInfoSource::KeyInfoReference { uri });
             }
             _ => {}
         }
@@ -1074,6 +1157,7 @@ fn ec_public_key_len(curve_oid: &str) -> Option<usize> {
     match curve_oid {
         EC_P256_OID => Some(65),
         EC_P384_OID => Some(97),
+        EC_P521_OID => Some(133),
         _ => None,
     }
 }
@@ -3884,7 +3968,7 @@ BA== </Modulus>
                               xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
             <KeyValue>
                 <dsig11:ECKeyValue>
-                    <dsig11:NamedCurve URI="urn:oid:1.3.132.0.35"/>
+                    <dsig11:NamedCurve URI="urn:oid:1.3.132.0.36"/>
                     <dsig11:PublicKey>BA==</dsig11:PublicKey>
                 </dsig11:ECKeyValue>
             </KeyValue>
@@ -4452,6 +4536,22 @@ BA== </Modulus>
     }
 
     #[test]
+    fn hmac_sha256_accepts_byte_aligned_output_length() {
+        let document = Document::parse(
+            r#"<ds:SignatureMethod xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"><ds:HMACOutputLength>128</ds:HMACOutputLength></ds:SignatureMethod>"#,
+        )
+        .unwrap();
+        let algorithm =
+            SignatureAlgorithm::from_uri("http://www.w3.org/2001/04/xmldsig-more#hmac-sha256")
+                .expect("HMAC-SHA256 must be recognized");
+
+        assert_eq!(
+            parse_hmac_output_length(document.root_element(), algorithm).unwrap(),
+            Some(128)
+        );
+    }
+
+    #[test]
     fn parse_hmac_output_length_rejects_hidden_suffix_text() {
         // Reading only the first text node would misinterpret 800 bits as 80.
         let xml = r#"<SignatureMethod xmlns="http://www.w3.org/2000/09/xmldsig#">
@@ -4462,7 +4562,7 @@ BA== </Modulus>
         assert!(matches!(
             parse_hmac_output_length(document.root_element(), SignatureAlgorithm::HmacSha1),
             Err(ParseError::InvalidStructure(reason))
-                if reason == "HMACOutputLength must be a byte-aligned value from 80 through 160"
+                if reason == "HMACOutputLength must be a positive byte-aligned value no greater than 160"
         ));
     }
 
@@ -4478,7 +4578,7 @@ BA== </Modulus>
         assert!(matches!(
             parse_hmac_output_length(document.root_element(), SignatureAlgorithm::HmacSha1),
             Err(ParseError::InvalidStructure(reason))
-                if reason == "HMACOutputLength must be a byte-aligned value from 80 through 160"
+                if reason == "HMACOutputLength must be a positive byte-aligned value no greater than 160"
         ));
     }
 

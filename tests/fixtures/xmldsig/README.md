@@ -42,24 +42,15 @@ DSA and HMAC variants remain fail-closed.
 ### `xmldsig11-interop-2012`
 
 XMLDSig 1.1 interoperability corpus. The test suite verifies the implemented
-ECKeyValue cases and records every other vector as fail-closed until its
-required algorithm, key source, or transform is implemented.
+algorithms and key sources through both verification documents and signing
+templates; unsupported RFC 4050 coordinate-form EC keys remain fail-closed.
 
-Currently verified as valid:
-
-- P-256 with SHA-256 and raw XMLDSig `r || s` encoding.
-- P-384 with SHA-384 and raw XMLDSig `r || s` encoding.
-- The DER-encoded ECDSA interoperability document, accepted as an explicit
-  parser compatibility path.
-
-Currently fail-closed:
-
-- HMAC algorithms other than HMAC-SHA1.
-- SHA-224 digest or signature algorithms.
-- P-521 KeyValue resolution.
-- `KeyInfoReference` dereference.
-- X.509 digest lookup without configured certificate policy.
-- RSA documents lacking an allowed verification-key source.
+Coverage includes SHA-224 digests, DSA-SHA256, RSA-SHA224, HMAC-SHA1/224/256/384/512,
+ECDSA SHA-1/224/256/384/512 over P-256/P-384/P-521, `ECKeyValue`,
+`DEREncodedKeyValue`, `X509Digest`, and bounded recursive `KeyInfoReference`.
+Legacy SHA-1 vectors use explicit compatibility policies; secure defaults stay
+deny-by-default. The checked-in encrypted DSA PKCS#8 key and all 19 templates
+exercise signing as well as verification.
 
 ### `xmldsig2ed-tests`
 

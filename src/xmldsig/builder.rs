@@ -60,7 +60,7 @@ pub enum SignatureBuilderError {
     /// An XPath parameter cannot be parsed or exceeds its resource bounds.
     #[error("invalid XPath expression: {0}")]
     InvalidXPath(String),
-    /// SHA-1 algorithms are available for verification but not new signatures.
+    /// The selected algorithm is disabled by the immutable signing policy.
     #[error("algorithm is not allowed for signing: {0}")]
     SigningAlgorithmDisabled(&'static str),
     /// The XML writer failed.

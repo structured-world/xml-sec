@@ -9,12 +9,14 @@ use subtle::ConstantTimeEq;
 
 /// Digest algorithms supported by XMLDSig.
 ///
-/// SHA-1 is supported for verification only (legacy interop with older IdPs).
+/// SHA-1 is disabled for signing by default and requires explicit policy opt-in.
 /// SHA-256 is the recommended default for new signatures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DigestAlgorithm {
-    /// SHA-1 (160-bit). **Verify-only** — signing with SHA-1 is deprecated.
+    /// SHA-1 (160-bit). Disabled for signing by default.
     Sha1,
+    /// SHA-224 (224-bit), required by XMLDSig 1.1 interoperability profiles.
+    Sha224,
     /// SHA-256 (256-bit). Default for SAML.
     Sha256,
     /// SHA-384 (384-bit).
@@ -33,12 +35,14 @@ impl DigestAlgorithm {
     /// | Algorithm | URI |
     /// |-----------|-----|
     /// | SHA-1 | `http://www.w3.org/2000/09/xmldsig#sha1` |
+    /// | SHA-224 | `http://www.w3.org/2001/04/xmldsig-more#sha224` |
     /// | SHA-256 | `http://www.w3.org/2001/04/xmlenc#sha256` |
     /// | SHA-384 | `http://www.w3.org/2001/04/xmldsig-more#sha384` |
     /// | SHA-512 | `http://www.w3.org/2001/04/xmlenc#sha512` |
     pub fn from_uri(uri: &str) -> Option<Self> {
         match uri {
             "http://www.w3.org/2000/09/xmldsig#sha1" => Some(Self::Sha1),
+            "http://www.w3.org/2001/04/xmldsig-more#sha224" => Some(Self::Sha224),
             "http://www.w3.org/2001/04/xmlenc#sha256" => Some(Self::Sha256),
             "http://www.w3.org/2001/04/xmldsig-more#sha384" => Some(Self::Sha384),
             "http://www.w3.org/2001/04/xmlenc#sha512" => Some(Self::Sha512),
@@ -50,6 +54,7 @@ impl DigestAlgorithm {
     pub fn uri(self) -> &'static str {
         match self {
             Self::Sha1 => "http://www.w3.org/2000/09/xmldsig#sha1",
+            Self::Sha224 => "http://www.w3.org/2001/04/xmldsig-more#sha224",
             Self::Sha256 => "http://www.w3.org/2001/04/xmlenc#sha256",
             Self::Sha384 => "http://www.w3.org/2001/04/xmldsig-more#sha384",
             Self::Sha512 => "http://www.w3.org/2001/04/xmlenc#sha512",
@@ -58,8 +63,8 @@ impl DigestAlgorithm {
 
     /// Whether this algorithm is allowed for signing (not just verification).
     ///
-    /// SHA-1 is deprecated and restricted to verify-only for interop with
-    /// legacy IdPs.
+    /// SHA-1 is deprecated and disabled by secure signing defaults. An explicit
+    /// signing policy allowlist can enable it for a trusted compatibility boundary.
     pub fn signing_allowed(self) -> bool {
         !matches!(self, Self::Sha1)
     }
@@ -68,6 +73,7 @@ impl DigestAlgorithm {
     pub fn output_len(self) -> usize {
         match self {
             Self::Sha1 => 20,
+            Self::Sha224 => 28,
             Self::Sha256 => 32,
             Self::Sha384 => 48,
             Self::Sha512 => 64,
@@ -368,6 +374,19 @@ mod tests {
         assert_eq!(DigestAlgorithm::Sha512.output_len(), 64);
     }
 
+    #[test]
+    fn sha224_uri_round_trips_and_has_standard_width() {
+        let algorithm = DigestAlgorithm::from_uri("http://www.w3.org/2001/04/xmldsig-more#sha224")
+            .expect("XMLDSig 1.1 SHA-224 must be recognized");
+
+        assert_eq!(
+            algorithm.uri(),
+            "http://www.w3.org/2001/04/xmldsig-more#sha224"
+        );
+        assert_eq!(algorithm.output_len(), 28);
+        assert!(algorithm.signing_allowed());
+    }
+
     // ── Known-answer tests (KAT) ────────────────────────────────────
     // Reference values computed with `echo -n "..." | openssl dgst -sha*`
 
@@ -387,6 +406,19 @@ mod tests {
         assert_eq!(
             hex(&digest),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn sha224_empty() {
+        let digest = compute_digest(
+            DigestAlgorithm::from_uri("http://www.w3.org/2001/04/xmldsig-more#sha224")
+                .expect("SHA-224 URI must be recognized"),
+            b"",
+        );
+        assert_eq!(
+            hex(&digest),
+            "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"
         );
     }
 

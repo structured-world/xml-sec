@@ -207,15 +207,18 @@ impl X509SignatureAlgorithm {
     pub const fn oid(self) -> &'static str {
         match self {
             Self::Dsa(DigestAlgorithm::Sha1) => "1.2.840.10040.4.3",
+            Self::Dsa(DigestAlgorithm::Sha224) => "2.16.840.1.101.3.4.3.1",
             Self::Dsa(DigestAlgorithm::Sha256) => "2.16.840.1.101.3.4.3.2",
             Self::Dsa(DigestAlgorithm::Sha384) => "2.16.840.1.101.3.4.3.3",
             Self::Dsa(DigestAlgorithm::Sha512) => "2.16.840.1.101.3.4.3.4",
             Self::RsaPkcs1v15(DigestAlgorithm::Sha1) => "1.2.840.113549.1.1.5",
+            Self::RsaPkcs1v15(DigestAlgorithm::Sha224) => "1.2.840.113549.1.1.14",
             Self::RsaPkcs1v15(DigestAlgorithm::Sha256) => "1.2.840.113549.1.1.11",
             Self::RsaPkcs1v15(DigestAlgorithm::Sha384) => "1.2.840.113549.1.1.12",
             Self::RsaPkcs1v15(DigestAlgorithm::Sha512) => "1.2.840.113549.1.1.13",
             Self::RsaPss { .. } => "1.2.840.113549.1.1.10",
             Self::Ecdsa(DigestAlgorithm::Sha1) => "1.2.840.10045.4.1",
+            Self::Ecdsa(DigestAlgorithm::Sha224) => "1.2.840.10045.4.3.1",
             Self::Ecdsa(DigestAlgorithm::Sha256) => "1.2.840.10045.4.3.2",
             Self::Ecdsa(DigestAlgorithm::Sha384) => "1.2.840.10045.4.3.3",
             Self::Ecdsa(DigestAlgorithm::Sha512) => "1.2.840.10045.4.3.4",
@@ -734,9 +737,10 @@ impl CryptoProvider for RustCryptoProvider {
     #[cfg(feature = "xmldsig")]
     fn digest(&self, algorithm: DigestAlgorithm, data: &[u8]) -> Result<Vec<u8>, ProviderError> {
         use sha1::Sha1;
-        use sha2::{Digest, Sha256, Sha384, Sha512};
+        use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
         Ok(match algorithm {
             DigestAlgorithm::Sha1 => Sha1::digest(data).to_vec(),
+            DigestAlgorithm::Sha224 => Sha224::digest(data).to_vec(),
             DigestAlgorithm::Sha256 => Sha256::digest(data).to_vec(),
             DigestAlgorithm::Sha384 => Sha384::digest(data).to_vec(),
             DigestAlgorithm::Sha512 => Sha512::digest(data).to_vec(),
@@ -864,13 +868,22 @@ fn is_supported_signature_uri(algorithm: &str) -> bool {
     matches!(
         algorithm,
         "http://www.w3.org/2000/09/xmldsig#dsa-sha1"
+            | "http://www.w3.org/2009/xmldsig11#dsa-sha256"
             | "http://www.w3.org/2000/09/xmldsig#hmac-sha1"
+            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha224"
+            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"
+            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha384"
+            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha512"
             | "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
+            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha224"
             | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
             | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384"
             | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512"
+            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha1"
+            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha224"
             | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"
             | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384"
+            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512"
     )
 }
 
@@ -878,11 +891,23 @@ fn is_supported_signature_uri(algorithm: &str) -> bool {
 fn is_supported_signing_uri(algorithm: &str) -> bool {
     matches!(
         algorithm,
-        "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
+        "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
+            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
+            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha224"
             | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384"
             | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512"
+            | "http://www.w3.org/2009/xmldsig11#dsa-sha256"
+            | "http://www.w3.org/2000/09/xmldsig#dsa-sha1"
+            | "http://www.w3.org/2000/09/xmldsig#hmac-sha1"
+            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha224"
+            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"
+            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha384"
+            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha512"
+            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha1"
+            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha224"
             | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"
             | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384"
+            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512"
     )
 }
 
@@ -891,7 +916,9 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
     match algorithm {
         X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1)
         | X509SignatureAlgorithm::RsaPkcs1v15(_)
-        | X509SignatureAlgorithm::Ecdsa(DigestAlgorithm::Sha256 | DigestAlgorithm::Sha384)
+        | X509SignatureAlgorithm::Ecdsa(
+            DigestAlgorithm::Sha224 | DigestAlgorithm::Sha256 | DigestAlgorithm::Sha384,
+        )
         | X509SignatureAlgorithm::Ed25519 => true,
         X509SignatureAlgorithm::RsaPss {
             digest, mgf_digest, ..
@@ -1045,7 +1072,7 @@ mod rustcrypto_x509 {
                 RsaPssVerifyingKey::<Sha512>::new_with_salt_len(key, salt_len)
                     .verify(signed_data, &signature)
             }
-            DigestAlgorithm::Sha1 => {
+            DigestAlgorithm::Sha1 | DigestAlgorithm::Sha224 => {
                 return unsupported(X509SignatureAlgorithm::RsaPss {
                     digest,
                     mgf_digest: digest,
@@ -1130,6 +1157,7 @@ mod rustcrypto_x509 {
     fn x509_digest_from_oid(oid: &str) -> Option<DigestAlgorithm> {
         match oid {
             "1.3.14.3.2.26" => Some(DigestAlgorithm::Sha1),
+            "2.16.840.1.101.3.4.2.4" => Some(DigestAlgorithm::Sha224),
             "2.16.840.1.101.3.4.2.1" => Some(DigestAlgorithm::Sha256),
             "2.16.840.1.101.3.4.2.2" => Some(DigestAlgorithm::Sha384),
             "2.16.840.1.101.3.4.2.3" => Some(DigestAlgorithm::Sha512),
@@ -1140,6 +1168,7 @@ mod rustcrypto_x509 {
     const fn rsa_pkcs1_algorithm(digest: DigestAlgorithm) -> Option<SignatureAlgorithm> {
         match digest {
             DigestAlgorithm::Sha1 => Some(SignatureAlgorithm::RsaSha1),
+            DigestAlgorithm::Sha224 => Some(SignatureAlgorithm::RsaSha224),
             DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::RsaSha256),
             DigestAlgorithm::Sha384 => Some(SignatureAlgorithm::RsaSha384),
             DigestAlgorithm::Sha512 => Some(SignatureAlgorithm::RsaSha512),
@@ -1148,9 +1177,11 @@ mod rustcrypto_x509 {
 
     const fn ecdsa_algorithm(digest: DigestAlgorithm) -> Option<SignatureAlgorithm> {
         match digest {
+            DigestAlgorithm::Sha1 => Some(SignatureAlgorithm::EcdsaSha1),
+            DigestAlgorithm::Sha224 => Some(SignatureAlgorithm::EcdsaSha224),
             DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::EcdsaSha256),
             DigestAlgorithm::Sha384 => Some(SignatureAlgorithm::EcdsaSha384),
-            DigestAlgorithm::Sha1 | DigestAlgorithm::Sha512 => None,
+            DigestAlgorithm::Sha512 => Some(SignatureAlgorithm::EcdsaSha512),
         }
     }
 
@@ -1690,7 +1721,7 @@ mod tests {
             peer_public_key: &[],
         };
         assert!(!RUST_CRYPTO_PROVIDER.supports(ProviderCapability::KeyAgreement(&agreement)));
-        assert!(!RUST_CRYPTO_PROVIDER.supports(ProviderCapability::Sign(
+        assert!(RUST_CRYPTO_PROVIDER.supports(ProviderCapability::Sign(
             crate::xmldsig::SignatureAlgorithm::RsaSha1
         )));
         assert!(RUST_CRYPTO_PROVIDER.supports(ProviderCapability::Verify(

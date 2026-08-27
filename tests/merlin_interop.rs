@@ -36,6 +36,10 @@ fn legacy_policy(algorithm: SignatureAlgorithm) -> xml_sec::policy::Verification
     if algorithm == SignatureAlgorithm::DsaSha1 {
         policy.key_trust.dsa_keys.minimum_modulus_bits = 1024;
     }
+    if algorithm == SignatureAlgorithm::HmacSha1 {
+        policy.hmac.minimum_key_bits = 40;
+        policy.hmac.minimum_output_bits = 40;
+    }
     policy
 }
 
@@ -162,10 +166,7 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
             .key(&hmac)
             .verify(&xml("signature-enveloping-hmac-sha1")),
     );
-    let truncated_hmac = HmacSha1VerificationKey::new(b"secret".to_vec())
-        .expect("valid HMAC key")
-        .with_output_length_bits(80)
-        .expect("valid XMLDSig truncation");
+    let truncated_hmac = HmacSha1VerificationKey::new(b"secret".to_vec()).expect("valid HMAC key");
     assert_valid(
         "signature-enveloping-hmac-sha1-80",
         VerifyContext::new()
@@ -446,17 +447,17 @@ fn rejects_wrong_hmac_key_and_invalid_output_length() {
 
     let malformed = xml("signature-enveloping-hmac-sha1-80").replacen(
         "<HMACOutputLength>80</HMACOutputLength>",
-        "<HMACOutputLength>72</HMACOutputLength>",
+        "<HMACOutputLength>73</HMACOutputLength>",
         1,
     );
-    assert!(malformed.contains("<HMACOutputLength>72</HMACOutputLength>"));
+    assert!(malformed.contains("<HMACOutputLength>73</HMACOutputLength>"));
     assert!(matches!(
         VerifyContext::new()
             .policy(legacy_policy(SignatureAlgorithm::HmacSha1))
             .key(&wrong)
             .verify(&malformed),
         Err(DsigError::ParseSignedInfo(ParseError::InvalidStructure(reason)))
-            if reason == "HMACOutputLength must be a byte-aligned value from 80 through 160"
+            if reason == "HMACOutputLength must be a positive byte-aligned value no greater than 160"
     ));
 
     let implicit_full_length = xml("signature-enveloping-hmac-sha1-80").replacen(

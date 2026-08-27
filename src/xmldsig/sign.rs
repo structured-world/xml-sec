@@ -6,17 +6,19 @@
 //! must continue to reject empty or malformed stored digest values.
 
 use base64::Engine;
+use hmac::{KeyInit, Mac};
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey};
+use p521::ecdsa::{Signature as P521Signature, SigningKey as P521SigningKey};
 use roxmltree::{Document, Node, NodeId};
 use rsa::RsaPrivateKey;
 use rsa::pkcs1v15::Signature as RsaPkcs1v15Signature;
 use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use rsa::traits::PublicKeyParts;
-use sha2::{Sha256, Sha384, Sha512};
-use signature::hazmat::PrehashSigner;
+use sha2::{Sha224, Sha256, Sha384, Sha512};
+use signature::hazmat::{PrehashSigner, RandomizedPrehashSigner};
 use std::{collections::HashSet, ops::Range};
 use x509_parser::prelude::FromDer;
 
@@ -271,14 +273,31 @@ pub enum SigningPublicKeyInfo {
         /// Uncompressed SEC1 point (`0x04 || x || y`).
         public_key: Vec<u8>,
     },
+    /// DSA public key and signature component width.
+    Dsa {
+        /// DER-encoded SubjectPublicKeyInfo bytes.
+        spki_der: Vec<u8>,
+        /// Prime modulus width used for signing policy.
+        modulus_bits: usize,
+        /// Fixed XMLDSig width of each `r` and `s` component.
+        component_len: usize,
+    },
+    /// Symmetric HMAC key metadata without exposing secret bytes.
+    Hmac {
+        /// Secret length used for signing policy.
+        key_bits: usize,
+    },
 }
 
 impl SigningPublicKeyInfo {
     /// Return DER-encoded SubjectPublicKeyInfo bytes for this public key.
     #[must_use]
-    pub fn spki_der(&self) -> &[u8] {
+    pub fn spki_der(&self) -> Option<&[u8]> {
         match self {
-            Self::Rsa { spki_der, .. } | Self::Ec { spki_der, .. } => spki_der,
+            Self::Rsa { spki_der, .. } | Self::Ec { spki_der, .. } | Self::Dsa { spki_der, .. } => {
+                Some(spki_der)
+            }
+            Self::Hmac { .. } => None,
         }
     }
 }
@@ -293,24 +312,21 @@ pub fn validate_signing_key(
     policy: &crate::policy::SigningPolicy,
 ) -> Result<(), SigningError> {
     policy.resources.validate_key_candidates(1)?;
-    if !algorithm.signing_allowed() {
-        return Err(SigningKeyError::UnsupportedAlgorithm {
-            uri: algorithm.uri().to_owned(),
-        }
-        .into());
-    }
-    expected_signature_output_len(key, algorithm, policy).map(|_| ())
+    policy.check_signature_algorithm(algorithm)?;
+    expected_signature_output_len(key, algorithm, policy, None).map(|_| ())
 }
 
 fn expected_signature_output_len(
     key: &dyn SigningKey,
     algorithm: SignatureAlgorithm,
     policy: &crate::policy::SigningPolicy,
+    hmac_output_length_bits: Option<usize>,
 ) -> Result<usize, SigningError> {
     let public_key = key.public_key_info()?;
     let expected = match (algorithm, public_key) {
         (
             SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
             | SignatureAlgorithm::RsaSha512,
@@ -321,7 +337,11 @@ fn expected_signature_output_len(
             .rsa_keys
             .validate_components("signing", &modulus, &exponent)?,
         (
-            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384,
+            SignatureAlgorithm::EcdsaSha1
+            | SignatureAlgorithm::EcdsaSha224
+            | SignatureAlgorithm::EcdsaSha256
+            | SignatureAlgorithm::EcdsaSha384
+            | SignatureAlgorithm::EcdsaSha512,
             SigningPublicKeyInfo::Ec { public_key, .. },
         ) if public_key.first() == Some(&0x04)
             && public_key.len() > 1
@@ -332,15 +352,52 @@ fn expected_signature_output_len(
             public_key.len() - 1
         }
         (
+            SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256,
+            SigningPublicKeyInfo::Dsa {
+                modulus_bits,
+                component_len,
+                ..
+            },
+        ) => {
+            policy.dsa_keys.validate_modulus_bits(modulus_bits)?;
+            component_len.saturating_mul(2)
+        }
+        (
+            SignatureAlgorithm::HmacSha1
+            | SignatureAlgorithm::HmacSha224
+            | SignatureAlgorithm::HmacSha256
+            | SignatureAlgorithm::HmacSha384
+            | SignatureAlgorithm::HmacSha512,
+            SigningPublicKeyInfo::Hmac { key_bits },
+        ) => {
+            policy.hmac.validate_key(key_bits.div_ceil(8))?;
+            let output_bits = hmac_output_length_bits.unwrap_or(
+                algorithm
+                    .hmac_output_bits()
+                    .ok_or(SigningKeyError::InvalidPublicKeyInfo)?,
+            );
+            policy.hmac.validate_output(algorithm, output_bits)?;
+            output_bits / 8
+        }
+        (
             SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
             | SignatureAlgorithm::RsaSha512,
-            SigningPublicKeyInfo::Ec { .. },
+            SigningPublicKeyInfo::Ec { .. }
+            | SigningPublicKeyInfo::Dsa { .. }
+            | SigningPublicKeyInfo::Hmac { .. },
         )
         | (
-            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384,
-            SigningPublicKeyInfo::Rsa { .. },
+            SignatureAlgorithm::EcdsaSha1
+            | SignatureAlgorithm::EcdsaSha224
+            | SignatureAlgorithm::EcdsaSha256
+            | SignatureAlgorithm::EcdsaSha384
+            | SignatureAlgorithm::EcdsaSha512,
+            SigningPublicKeyInfo::Rsa { .. }
+            | SigningPublicKeyInfo::Dsa { .. }
+            | SigningPublicKeyInfo::Hmac { .. },
         ) => {
             return Err(SigningKeyError::UnsupportedAlgorithm {
                 uri: algorithm.uri().to_owned(),
@@ -422,9 +479,64 @@ pub enum KeyInfoWriteError {
     #[error("signing key public-key extraction failed: {0}")]
     SigningKey(#[from] SigningKeyError),
 
+    /// Symmetric signing keys cannot expose an asymmetric public key value.
+    #[error("signing key has no DER-encodable public key")]
+    MissingPublicKey,
+
+    /// The selected writer cannot represent this public-key family.
+    #[error("signing key cannot be represented as XMLDSig KeyValue")]
+    UnsupportedKeyValue,
+
     /// The configured certificate does not contain the signing key's public key.
     #[error("X.509 certificate public key does not match signing key")]
     CertificateKeyMismatch,
+}
+
+/// Writes the signing key's SPKI as XMLDSig 1.1 `DEREncodedKeyValue`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DerEncodedKeyValueInfoWriter;
+
+impl KeyInfoWriter for DerEncodedKeyValueInfoWriter {
+    fn write_key_info(&self, signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
+        let public_key = signing_key.public_key_info()?;
+        let spki_der = public_key
+            .spki_der()
+            .ok_or(KeyInfoWriteError::MissingPublicKey)?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(spki_der);
+        Ok(format!(
+            "<dsig11:DEREncodedKeyValue xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\">{encoded}</dsig11:DEREncodedKeyValue>"
+        ))
+    }
+}
+
+/// Writes RSA or XMLDSig 1.1 EC public parameters as `KeyValue`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeyValueInfoWriter;
+
+impl KeyInfoWriter for KeyValueInfoWriter {
+    fn write_key_info(&self, signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        match signing_key.public_key_info()? {
+            SigningPublicKeyInfo::Rsa {
+                modulus, exponent, ..
+            } => Ok(format!(
+                "<ds:KeyValue xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:RSAKeyValue><ds:Modulus>{}</ds:Modulus><ds:Exponent>{}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue>",
+                encode(&modulus),
+                encode(&exponent)
+            )),
+            SigningPublicKeyInfo::Ec {
+                curve_oid,
+                public_key,
+                ..
+            } => Ok(format!(
+                "<ds:KeyValue xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><dsig11:ECKeyValue xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\"><dsig11:NamedCurve URI=\"urn:oid:{curve_oid}\"/><dsig11:PublicKey>{}</dsig11:PublicKey></dsig11:ECKeyValue></ds:KeyValue>",
+                encode(&public_key)
+            )),
+            SigningPublicKeyInfo::Dsa { .. } | SigningPublicKeyInfo::Hmac { .. } => {
+                Err(KeyInfoWriteError::UnsupportedKeyValue)
+            }
+        }
+    }
 }
 
 /// `<KeyInfo>` writer that embeds an ordered DER X.509 certificate chain.
@@ -511,7 +623,7 @@ impl KeyInfoWriter for X509CertificateKeyInfoWriter {
             return Err(KeyInfoWriteError::InvalidCertificateDer);
         }
         let signing_public_key = signing_key.public_key_info()?;
-        if certificate.public_key().raw != signing_public_key.spki_der() {
+        if signing_public_key.spki_der() != Some(certificate.public_key().raw) {
             return Err(KeyInfoWriteError::CertificateKeyMismatch);
         }
 
@@ -524,6 +636,55 @@ impl KeyInfoWriter for X509CertificateKeyInfoWriter {
         }
         xml.push_str("</X509Data>");
         Ok(xml)
+    }
+}
+
+/// Writes an XMLDSig 1.1 `X509Digest` selector for the signing certificate.
+pub struct X509DigestKeyInfoWriter {
+    certificate_der: Vec<u8>,
+    digest_algorithm: DigestAlgorithm,
+}
+
+impl X509DigestKeyInfoWriter {
+    /// Validate and retain a DER certificate and selector digest algorithm.
+    pub fn from_der(
+        certificate_der: &[u8],
+        digest_algorithm: DigestAlgorithm,
+    ) -> Result<Self, KeyInfoWriteError> {
+        let (rest, _) = x509_parser::certificate::X509Certificate::from_der(certificate_der)
+            .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
+        if !rest.is_empty() {
+            return Err(KeyInfoWriteError::InvalidCertificateDer);
+        }
+        Ok(Self {
+            certificate_der: certificate_der.to_vec(),
+            digest_algorithm,
+        })
+    }
+
+    /// Parse a PEM certificate and retain its selector digest algorithm.
+    pub fn from_pem(
+        certificate_pem: &str,
+        digest_algorithm: DigestAlgorithm,
+    ) -> Result<Self, KeyInfoWriteError> {
+        Self::from_der(&parse_certificate_pem(certificate_pem)?, digest_algorithm)
+    }
+}
+
+impl KeyInfoWriter for X509DigestKeyInfoWriter {
+    fn write_key_info(&self, signing_key: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
+        let (_, certificate) =
+            x509_parser::certificate::X509Certificate::from_der(&self.certificate_der)
+                .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
+        if signing_key.public_key_info()?.spki_der() != Some(certificate.public_key().raw) {
+            return Err(KeyInfoWriteError::CertificateKeyMismatch);
+        }
+        let digest = super::compute_digest(self.digest_algorithm, &self.certificate_der);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(digest);
+        Ok(format!(
+            "<ds:X509Data xmlns:ds=\"{XMLDSIG_NS}\"><dsig11:X509Digest xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\" Algorithm=\"{}\">{encoded}</dsig11:X509Digest></ds:X509Data>",
+            self.digest_algorithm.uri()
+        ))
     }
 }
 
@@ -567,6 +728,11 @@ impl SigningKey for RsaSigningKey {
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
         match algorithm {
+            SignatureAlgorithm::RsaSha224 => sign_rsa_pkcs1v15_with_rng(
+                provider,
+                RsaPkcs1v15SigningKey::<Sha224>::new(self.key.clone()),
+                canonical_signed_info,
+            ),
             SignatureAlgorithm::RsaSha256 => sign_rsa_pkcs1v15_with_rng(
                 provider,
                 RsaPkcs1v15SigningKey::<Sha256>::new(self.key.clone()),
@@ -598,6 +764,163 @@ impl SigningKey for RsaSigningKey {
             spki_der,
             modulus: public_key.n().to_be_bytes_trimmed_vartime().into_vec(),
             exponent: public_key.e().to_be_bytes_trimmed_vartime().into_vec(),
+        })
+    }
+}
+
+/// Symmetric key for XMLDSig HMAC signing.
+pub struct HmacSigningKey {
+    secret: Vec<u8>,
+}
+
+impl HmacSigningKey {
+    /// Construct a signing key from non-empty caller-owned secret bytes.
+    pub fn new(secret: impl Into<Vec<u8>>) -> Result<Self, SigningKeyError> {
+        let secret = secret.into();
+        if secret.is_empty() {
+            return Err(SigningKeyError::InvalidKeyDer);
+        }
+        Ok(Self { secret })
+    }
+}
+
+impl SigningKey for HmacSigningKey {
+    fn sign(
+        &self,
+        algorithm: SignatureAlgorithm,
+        canonical_signed_info: &[u8],
+    ) -> Result<Vec<u8>, SigningKeyError> {
+        macro_rules! sign_hmac {
+            ($digest:ty) => {{
+                let mut mac = hmac::Hmac::<$digest>::new_from_slice(&self.secret)
+                    .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+                mac.update(canonical_signed_info);
+                mac.finalize().into_bytes().to_vec()
+            }};
+        }
+        Ok(match algorithm {
+            SignatureAlgorithm::HmacSha1 => sign_hmac!(sha1::Sha1),
+            SignatureAlgorithm::HmacSha224 => sign_hmac!(sha2::Sha224),
+            SignatureAlgorithm::HmacSha256 => sign_hmac!(sha2::Sha256),
+            SignatureAlgorithm::HmacSha384 => sign_hmac!(sha2::Sha384),
+            SignatureAlgorithm::HmacSha512 => sign_hmac!(sha2::Sha512),
+            _ => {
+                return Err(SigningKeyError::UnsupportedAlgorithm {
+                    uri: algorithm.uri().to_owned(),
+                });
+            }
+        })
+    }
+
+    fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+        Ok(SigningPublicKeyInfo::Hmac {
+            key_bits: self.secret.len().saturating_mul(8),
+        })
+    }
+}
+
+/// DSA private key for XMLDSig 1.1 signing.
+pub struct DsaSigningKey {
+    key: dsa::SigningKey,
+}
+
+impl DsaSigningKey {
+    /// Parse an unencrypted PKCS#8 `PRIVATE KEY` PEM block.
+    pub fn from_pkcs8_pem(private_key_pem: &str) -> Result<Self, SigningKeyError> {
+        let private_key_der = parse_private_key_pem(private_key_pem)?;
+        Self::from_pkcs8_der(&private_key_der)
+    }
+
+    /// Parse unencrypted PKCS#8 private key DER.
+    pub fn from_pkcs8_der(private_key_der: &[u8]) -> Result<Self, SigningKeyError> {
+        let key = dsa::SigningKey::from_pkcs8_der(private_key_der)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+
+    /// Decrypt and parse password-protected PKCS#8 DER.
+    pub fn from_pkcs8_encrypted_der(
+        private_key_der: &[u8],
+        password: impl AsRef<[u8]>,
+    ) -> Result<Self, SigningKeyError> {
+        let key = dsa::SigningKey::from_pkcs8_encrypted_der(private_key_der, password)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+}
+
+impl SigningKey for DsaSigningKey {
+    fn sign(
+        &self,
+        algorithm: SignatureAlgorithm,
+        canonical_signed_info: &[u8],
+    ) -> Result<Vec<u8>, SigningKeyError> {
+        self.sign_with_provider(
+            crate::provider::default_provider(),
+            algorithm,
+            canonical_signed_info,
+        )
+    }
+
+    fn sign_with_provider(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: SignatureAlgorithm,
+        canonical_signed_info: &[u8],
+    ) -> Result<Vec<u8>, SigningKeyError> {
+        let digest = match algorithm {
+            SignatureAlgorithm::DsaSha1 => super::compute_digest_with_provider(
+                provider,
+                DigestAlgorithm::Sha1,
+                canonical_signed_info,
+            )?,
+            SignatureAlgorithm::DsaSha256 => super::compute_digest_with_provider(
+                provider,
+                DigestAlgorithm::Sha256,
+                canonical_signed_info,
+            )?,
+            _ => {
+                return Err(SigningKeyError::UnsupportedAlgorithm {
+                    uri: algorithm.uri().to_owned(),
+                });
+            }
+        };
+        let mut rng = crate::provider::ProviderRng(provider);
+        let signature: dsa::Signature = self
+            .key
+            .sign_prehash_with_rng(&mut rng, &digest)
+            .map_err(|_| SigningKeyError::SigningFailed)?;
+        let component_len =
+            usize::try_from(self.key.verifying_key().components().q().bits_vartime())
+                .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?
+                .div_ceil(8);
+        let mut output = Vec::with_capacity(component_len.saturating_mul(2));
+        for component in [signature.r(), signature.s()] {
+            let bytes = component.to_be_bytes();
+            if bytes.len() > component_len {
+                return Err(SigningKeyError::SigningFailed);
+            }
+            output.resize(output.len() + component_len - bytes.len(), 0);
+            output.extend_from_slice(&bytes);
+        }
+        Ok(output)
+    }
+
+    fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+        let verifying_key = self.key.verifying_key();
+        let spki_der = verifying_key
+            .to_public_key_der()
+            .map(|doc| doc.as_bytes().to_vec())
+            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)?;
+        let modulus_bits = usize::try_from(verifying_key.components().p().bits_vartime())
+            .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?;
+        let component_len = usize::try_from(verifying_key.components().q().bits_vartime())
+            .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?
+            .div_ceil(8);
+        Ok(SigningPublicKeyInfo::Dsa {
+            spki_der,
+            modulus_bits,
+            component_len,
         })
     }
 }
@@ -654,8 +977,11 @@ impl SigningKey for EcdsaP256SigningKey {
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
         let digest_algorithm = match algorithm {
+            SignatureAlgorithm::EcdsaSha1 => DigestAlgorithm::Sha1,
+            SignatureAlgorithm::EcdsaSha224 => DigestAlgorithm::Sha224,
             SignatureAlgorithm::EcdsaSha256 => DigestAlgorithm::Sha256,
             SignatureAlgorithm::EcdsaSha384 => DigestAlgorithm::Sha384,
+            SignatureAlgorithm::EcdsaSha512 => DigestAlgorithm::Sha512,
             _ => {
                 return Err(SigningKeyError::UnsupportedAlgorithm {
                     uri: algorithm.uri().to_string(),
@@ -725,8 +1051,11 @@ impl SigningKey for EcdsaP384SigningKey {
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
         let digest_algorithm = match algorithm {
+            SignatureAlgorithm::EcdsaSha1 => DigestAlgorithm::Sha1,
+            SignatureAlgorithm::EcdsaSha224 => DigestAlgorithm::Sha224,
             SignatureAlgorithm::EcdsaSha256 => DigestAlgorithm::Sha256,
             SignatureAlgorithm::EcdsaSha384 => DigestAlgorithm::Sha384,
+            SignatureAlgorithm::EcdsaSha512 => DigestAlgorithm::Sha512,
             _ => {
                 return Err(SigningKeyError::UnsupportedAlgorithm {
                     uri: algorithm.uri().to_string(),
@@ -751,6 +1080,80 @@ impl SigningKey for EcdsaP384SigningKey {
         Ok(SigningPublicKeyInfo::Ec {
             spki_der,
             curve_oid: "1.3.132.0.34",
+            public_key: verifying_key.to_sec1_point(false).as_bytes().to_vec(),
+        })
+    }
+}
+
+/// ECDSA P-521 private key for XMLDSig signing.
+pub struct EcdsaP521SigningKey {
+    key: P521SigningKey,
+}
+
+impl EcdsaP521SigningKey {
+    /// Parse an unencrypted PKCS#8 `PRIVATE KEY` PEM block.
+    pub fn from_pkcs8_pem(private_key_pem: &str) -> Result<Self, SigningKeyError> {
+        let private_key_der = parse_private_key_pem(private_key_pem)?;
+        Self::from_pkcs8_der(&private_key_der)
+    }
+
+    /// Parse unencrypted PKCS#8 private key DER.
+    pub fn from_pkcs8_der(private_key_der: &[u8]) -> Result<Self, SigningKeyError> {
+        let key = P521SigningKey::from_pkcs8_der(private_key_der)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+}
+
+impl SigningKey for EcdsaP521SigningKey {
+    fn sign(
+        &self,
+        algorithm: SignatureAlgorithm,
+        canonical_signed_info: &[u8],
+    ) -> Result<Vec<u8>, SigningKeyError> {
+        self.sign_with_provider(
+            crate::provider::default_provider(),
+            algorithm,
+            canonical_signed_info,
+        )
+    }
+
+    fn sign_with_provider(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: SignatureAlgorithm,
+        canonical_signed_info: &[u8],
+    ) -> Result<Vec<u8>, SigningKeyError> {
+        let digest_algorithm = match algorithm {
+            SignatureAlgorithm::EcdsaSha1 => DigestAlgorithm::Sha1,
+            SignatureAlgorithm::EcdsaSha224 => DigestAlgorithm::Sha224,
+            SignatureAlgorithm::EcdsaSha256 => DigestAlgorithm::Sha256,
+            SignatureAlgorithm::EcdsaSha384 => DigestAlgorithm::Sha384,
+            SignatureAlgorithm::EcdsaSha512 => DigestAlgorithm::Sha512,
+            _ => {
+                return Err(SigningKeyError::UnsupportedAlgorithm {
+                    uri: algorithm.uri().to_owned(),
+                });
+            }
+        };
+        let prehash =
+            super::compute_digest_with_provider(provider, digest_algorithm, canonical_signed_info)?;
+        let signature: P521Signature = self
+            .key
+            .sign_prehash(&prehash)
+            .map_err(|_| SigningKeyError::SigningFailed)?;
+        Ok(signature.to_bytes().to_vec())
+    }
+
+    fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+        let verifying_key = self.key.verifying_key();
+        let spki_der = verifying_key
+            .to_public_key_der()
+            .map(|doc| doc.as_bytes().to_vec())
+            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)?;
+        Ok(SigningPublicKeyInfo::Ec {
+            spki_der,
+            curve_oid: "1.3.132.0.35",
             public_key: verifying_key.to_sec1_point(false).as_bytes().to_vec(),
         })
     }
@@ -994,27 +1397,19 @@ impl<'a> SignContext<'a> {
         self.policy
             .resources
             .validate_xml_document_len(document.as_xml().len())?;
-        let (algorithm, canonical_signed_info) =
+        let (algorithm, hmac_output_length_bits, canonical_signed_info) =
             canonicalize_signed_info(document, &self.policy, budgets, target_signature)?;
         budgets
             .transforms
             .charge_c14n_output(canonical_signed_info.len())
             .map_err(SigningDigestError::Transform)?;
-        if !algorithm.signing_allowed()
-            || self
-                .policy
-                .signature_algorithms
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&algorithm))
-        {
-            return Err(crate::policy::PolicyViolation::Algorithm {
-                operation: "signing",
-                algorithm: algorithm.uri().to_string(),
-            }
-            .into());
-        }
-        let expected_signature_len =
-            expected_signature_output_len(self.signing_key, algorithm, &self.policy)?;
+        self.policy.check_signature_algorithm(algorithm)?;
+        let expected_signature_len = expected_signature_output_len(
+            self.signing_key,
+            algorithm,
+            &self.policy,
+            hmac_output_length_bits,
+        )?;
         let projected_signature_len = projected_signature_output_len(
             algorithm,
             expected_signature_len,
@@ -1038,9 +1433,12 @@ impl<'a> SignContext<'a> {
         self.provider
             .require_capability(crate::provider::ProviderCapability::Sign(algorithm))
             .map_err(SigningKeyError::from)?;
-        let signature_value =
+        let mut signature_value =
             self.provider
                 .sign(self.signing_key, algorithm, &canonical_signed_info)?;
+        if algorithm.hmac_output_bits().is_some() {
+            signature_value.truncate(expected_signature_len);
+        }
         validate_signature_output(expected_signature_len, &signature_value)?;
         let signature_value = encode_signature_output(
             algorithm,
@@ -1119,6 +1517,7 @@ impl<'a> SignContext<'a> {
             self.signing_key,
             builder.signature_method(),
             &self.policy,
+            None,
         )?;
         let template = builder.build_template_with_policy_for_signature_output(
             &self.policy,
@@ -1177,7 +1576,11 @@ fn projected_signature_output_len(
     if matches!(
         (algorithm, encoding),
         (
-            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384,
+            SignatureAlgorithm::EcdsaSha1
+                | SignatureAlgorithm::EcdsaSha224
+                | SignatureAlgorithm::EcdsaSha256
+                | SignatureAlgorithm::EcdsaSha384
+                | SignatureAlgorithm::EcdsaSha512,
             crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der
         )
     ) {
@@ -1239,7 +1642,11 @@ fn encode_signature_output(
     if matches!(
         (algorithm, encoding),
         (
-            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384,
+            SignatureAlgorithm::EcdsaSha1
+                | SignatureAlgorithm::EcdsaSha224
+                | SignatureAlgorithm::EcdsaSha256
+                | SignatureAlgorithm::EcdsaSha384
+                | SignatureAlgorithm::EcdsaSha512,
             crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der
         )
     ) {
@@ -1616,10 +2023,9 @@ fn validate_signing_references(
     total_references: usize,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<(), SigningDigestError> {
-    let Some(policy) = policy else {
-        return Ok(());
-    };
-    if total_references > policy.resources.max_references {
+    if let Some(policy) = policy
+        && total_references > policy.resources.max_references
+    {
         return Err(crate::policy::PolicyViolation::ResourceLimit {
             resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
             maximum: policy.resources.max_references,
@@ -1628,8 +2034,12 @@ fn validate_signing_references(
         .into());
     }
     for reference in references {
-        validate_signing_reference_uri(&reference.uri, policy)?;
-        if reference.transforms.len() > policy.resources.max_transforms_per_reference {
+        if let Some(policy) = policy {
+            validate_signing_reference_uri(&reference.uri, policy)?;
+        }
+        if let Some(policy) = policy
+            && reference.transforms.len() > policy.resources.max_transforms_per_reference
+        {
             return Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
                 maximum: policy.resources.max_transforms_per_reference,
@@ -1637,22 +2047,18 @@ fn validate_signing_references(
             }
             .into());
         }
-        if policy
-            .digest_algorithms
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
-        {
-            return Err(crate::policy::PolicyViolation::Algorithm {
-                operation: "signing",
-                algorithm: reference.digest_method.uri().to_string(),
-            }
-            .into());
+        if let Some(policy) = policy {
+            policy.check_digest_algorithm(reference.digest_method)?;
+        } else if !reference.digest_method.signing_allowed() {
+            return Err(SigningDigestError::SigningAlgorithmDisabled {
+                uri: reference.digest_method.uri(),
+            });
         }
         let initial_binary = !reference.uri.is_empty() && !reference.uri.starts_with('#');
         validate_signing_transform_policy(
             initial_binary,
             &reference.transforms,
-            policy.transforms.allowed_algorithms.as_ref(),
+            policy.and_then(|policy| policy.transforms.allowed_algorithms.as_ref()),
         )?;
     }
     Ok(())
@@ -1774,7 +2180,7 @@ fn canonicalize_signed_info(
     policy: &crate::policy::SigningPolicy,
     budgets: &mut SigningOperationBudgets,
     target_signature: usize,
-) -> Result<(SignatureAlgorithm, Vec<u8>), SigningError> {
+) -> Result<(SignatureAlgorithm, Option<usize>, Vec<u8>), SigningError> {
     document.with_view(|view| {
         let doc = view.document();
         let signature =
@@ -1820,7 +2226,11 @@ fn canonicalize_signed_info(
                 SigningError::Canonicalization(error)
             }
         })?;
-        Ok((signed_info.signature_method, canonical_signed_info))
+        Ok((
+            signed_info.signature_method,
+            signed_info.hmac_output_length_bits,
+            canonical_signed_info,
+        ))
     })
 }
 
@@ -2046,12 +2456,6 @@ fn parse_signing_reference(
             uri: digest_uri.to_string(),
         }
     })?;
-    if !digest_method.signing_allowed() {
-        return Err(SigningDigestError::SigningAlgorithmDisabled {
-            uri: digest_method.uri(),
-        });
-    }
-
     let digest_value_node = children.next().ok_or(SigningDigestError::MissingElement {
         element: "DigestValue",
     })?;

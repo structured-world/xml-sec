@@ -1346,6 +1346,13 @@ fn verify_signature_view<'a>(
         }
     }
     let retrieval_materialization = if let Some(info) = key_info.as_mut() {
+        materialize_key_info_references(
+            info,
+            &resolver,
+            &ctx.policy,
+            ctx.provider,
+            execution_budget,
+        )?;
         let mut retrieval_budgets = RetrievalMaterializationBudgets {
             xpath_parse: &mut xpath_parse_budget,
             execution: execution_budget,
@@ -1421,8 +1428,13 @@ fn verify_signature_view<'a>(
     canonicalized_data_budget.charge(canonical_signed_info.len())?;
 
     let signature_value = decode_signature_value(signature_children.signature_value_node)?;
-    if signed_info.signature_method == SignatureAlgorithm::HmacSha1 {
-        let expected_bits = signed_info.hmac_output_length_bits.unwrap_or(160);
+    if let Some(full_output_bits) = signed_info.signature_method.hmac_output_bits() {
+        let expected_bits = signed_info
+            .hmac_output_length_bits
+            .unwrap_or(full_output_bits);
+        ctx.policy
+            .hmac
+            .validate_output(signed_info.signature_method, expected_bits)?;
         if signature_value.len() != expected_bits / 8 {
             return Err(SignatureVerificationPipelineError::InvalidStructure {
                 reason: "SignatureValue length does not match HMACOutputLength",
@@ -1569,6 +1581,171 @@ struct RetrievalMaterializationBudgets<'a> {
     xpath_parse: &'a mut XPathSignatureParseBudget,
     execution: &'a TransformExecutionBudget,
     resources: &'a crate::policy::ResourcePolicy,
+}
+
+fn materialize_key_info_references(
+    key_info: &mut KeyInfo,
+    resolver: &UriReferenceResolver<'_>,
+    policy: &crate::policy::VerificationPolicy,
+    provider: &dyn crate::provider::CryptoProvider,
+    execution: &TransformExecutionBudget,
+) -> Result<(), SignatureVerificationPipelineError> {
+    fn visit(
+        key_info: &mut KeyInfo,
+        resolver: &UriReferenceResolver<'_>,
+        policy: &crate::policy::VerificationPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+        execution: &TransformExecutionBudget,
+        active: &mut HashSet<String>,
+        depth: usize,
+    ) -> Result<(), SignatureVerificationPipelineError> {
+        let mut materialized = Vec::new();
+        for source in std::mem::take(&mut key_info.sources) {
+            let super::parse::KeyInfoSource::KeyInfoReference { uri } = source else {
+                materialized.push(source);
+                continue;
+            };
+            if !policy.key_sources.key_info_reference {
+                return Err(crate::policy::PolicyViolation::KeyTrust {
+                    reason: "KeyInfoReference key sources are disabled",
+                }
+                .into());
+            }
+            if !policy.uris.key_info_references.allows(&uri) {
+                return Err(crate::policy::PolicyViolation::Uri {
+                    operation: "KeyInfoReference",
+                    reason: "URI class is disabled",
+                }
+                .into());
+            }
+            let next_depth = depth.saturating_add(1);
+            if next_depth > policy.resources.max_key_info_reference_depth {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::KEY_INFO_REFERENCE_DEPTH,
+                    maximum: policy.resources.max_key_info_reference_depth,
+                    actual: next_depth,
+                }
+                .into());
+            }
+            if !active.insert(uri.clone()) {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "KeyInfoReference cycle detected",
+                });
+            }
+
+            let mut referenced = if uri.starts_with('#') {
+                let node = resolver
+                    .node_for_same_document_reference(&uri)
+                    .map_err(|error| {
+                        SignatureVerificationPipelineError::from(
+                            ReferenceProcessingError::UriDereference(error),
+                        )
+                    })?
+                    .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "KeyInfoReference target is missing or ambiguous",
+                    })?;
+                if !node.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "KeyInfoReference target must be KeyInfo",
+                    });
+                }
+                parse_key_info_with_policy_budgets(
+                    node,
+                    provider,
+                    execution.xml_base_resolution(),
+                    &policy.resources,
+                )
+                .map_err(map_key_info_parse_error)?
+            } else {
+                let bytes = resolver
+                    .external_resource(&uri)
+                    .map_err(|error| {
+                        SignatureVerificationPipelineError::from(
+                            ReferenceProcessingError::UriDereference(error),
+                        )
+                    })?
+                    .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "KeyInfoReference external resource is unavailable",
+                    })?;
+                let xml = std::str::from_utf8(bytes).map_err(|_| {
+                    SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "KeyInfoReference external resource is not UTF-8 XML",
+                    }
+                })?;
+                let document = XmlDocument::parse_with_settings_and_budget(
+                    xml.to_owned(),
+                    DocumentParseSettings::from_policy(&policy.xml, &policy.resources),
+                    execution.xml_parse_work(),
+                )?;
+                document.with_view(|view| {
+                    let external_resolver = resolver.for_document_view(view);
+                    let target = match uri.rsplit_once('#') {
+                        Some((_, fragment)) if !fragment.is_empty() => external_resolver
+                            .node_for_same_document_reference(&format!("#{fragment}"))
+                            .map_err(|error| {
+                                SignatureVerificationPipelineError::from(
+                                    ReferenceProcessingError::UriDereference(error),
+                                )
+                            })?
+                            .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+                                reason: "KeyInfoReference external target is missing or ambiguous",
+                            })?,
+                        _ => view.document().root_element(),
+                    };
+                    if !target.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
+                        return Err(SignatureVerificationPipelineError::InvalidStructure {
+                            reason: "KeyInfoReference external target must be KeyInfo",
+                        });
+                    }
+                    let mut referenced = parse_key_info_with_policy_budgets(
+                        target,
+                        provider,
+                        execution.xml_base_resolution(),
+                        &policy.resources,
+                    )
+                    .map_err(map_key_info_parse_error)?;
+                    visit(
+                        &mut referenced,
+                        &external_resolver,
+                        policy,
+                        provider,
+                        execution,
+                        active,
+                        next_depth,
+                    )?;
+                    Ok(referenced)
+                })?
+            };
+            if uri.starts_with('#') {
+                visit(
+                    &mut referenced,
+                    resolver,
+                    policy,
+                    provider,
+                    execution,
+                    active,
+                    next_depth,
+                )?;
+            }
+            active.remove(&uri);
+            materialized.extend(referenced.sources);
+        }
+        key_info.sources = materialized;
+        policy
+            .resources
+            .validate_key_candidates(key_info.embedded_candidate_count())?;
+        Ok(())
+    }
+
+    visit(
+        key_info,
+        resolver,
+        policy,
+        provider,
+        execution,
+        &mut HashSet::new(),
+        0,
+    )
 }
 
 fn materialize_retrieval_methods_with_budgets(
@@ -2428,7 +2605,7 @@ fn verify_with_algorithm(
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationPipelineError> {
     match algorithm {
-        SignatureAlgorithm::DsaSha1 => {
+        SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
             let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
                 .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
             if !rest.iter().all(|byte| byte.is_ascii_whitespace()) || pem.label != "PUBLIC KEY" {
@@ -2441,11 +2618,16 @@ fn verify_with_algorithm(
                 signature_value,
             )?)
         }
-        SignatureAlgorithm::HmacSha1 => Err(SignatureVerificationError::UnsupportedAlgorithm {
+        SignatureAlgorithm::HmacSha1
+        | SignatureAlgorithm::HmacSha224
+        | SignatureAlgorithm::HmacSha256
+        | SignatureAlgorithm::HmacSha384
+        | SignatureAlgorithm::HmacSha512 => Err(SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_string(),
         }
         .into()),
         SignatureAlgorithm::RsaSha1
+        | SignatureAlgorithm::RsaSha224
         | SignatureAlgorithm::RsaSha256
         | SignatureAlgorithm::RsaSha384
         | SignatureAlgorithm::RsaSha512 => Ok(verify_rsa_signature_pem(
@@ -2454,7 +2636,11 @@ fn verify_with_algorithm(
             signed_data,
             signature_value,
         )?),
-        SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384 => {
+        SignatureAlgorithm::EcdsaSha1
+        | SignatureAlgorithm::EcdsaSha224
+        | SignatureAlgorithm::EcdsaSha256
+        | SignatureAlgorithm::EcdsaSha384
+        | SignatureAlgorithm::EcdsaSha512 => {
             // Malformed ECDSA signature bytes are treated as a verification miss
             // (Ok(false)) instead of a pipeline error; only key/algorithm and
             // crypto-operation failures propagate as Err.

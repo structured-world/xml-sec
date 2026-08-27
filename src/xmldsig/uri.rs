@@ -14,6 +14,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use roxmltree::{Document, Node, NodeId};
 
@@ -123,7 +124,7 @@ pub struct UriReferenceResolver<'a> {
     view: Option<crate::DocumentView<'a>>,
     id_index: ResolverIdIndex<'a>,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
-    external_resource_budget: ExternalResourceBudget,
+    external_resource_budget: Rc<ExternalResourceBudget>,
     same_document_id_semantics: SameDocumentIdSemantics,
 }
 
@@ -184,7 +185,7 @@ impl<'a> UriReferenceResolver<'a> {
             view: None,
             id_index: ResolverIdIndex::Borrowed(XmlIdIndex::with_extra_attrs(doc, extra_attrs)),
             external_resources: None,
-            external_resource_budget: ExternalResourceBudget::default(),
+            external_resource_budget: Rc::new(ExternalResourceBudget::default()),
             same_document_id_semantics: SameDocumentIdSemantics::Specification,
         }
     }
@@ -199,7 +200,7 @@ impl<'a> UriReferenceResolver<'a> {
             view: None,
             id_index: ResolverIdIndex::Borrowed(XmlIdIndex::with_registrations(doc, registrations)),
             external_resources: None,
-            external_resource_budget: ExternalResourceBudget::default(),
+            external_resource_budget: Rc::new(ExternalResourceBudget::default()),
             same_document_id_semantics: SameDocumentIdSemantics::Specification,
         }
     }
@@ -213,7 +214,7 @@ impl<'a> UriReferenceResolver<'a> {
             view: Some(view),
             id_index: ResolverIdIndex::Retained(view.id_index(registrations)),
             external_resources: None,
-            external_resource_budget: ExternalResourceBudget::default(),
+            external_resource_budget: Rc::new(ExternalResourceBudget::default()),
             same_document_id_semantics: SameDocumentIdSemantics::Specification,
         }
     }
@@ -224,6 +225,25 @@ impl<'a> UriReferenceResolver<'a> {
     ) -> Self {
         self.same_document_id_semantics = semantics;
         self
+    }
+
+    /// Rebind document-local URI resolution while retaining caller-owned
+    /// external resources and their aggregate byte budget.
+    pub(crate) fn for_document_view<'b>(
+        &self,
+        view: crate::DocumentView<'b>,
+    ) -> UriReferenceResolver<'b>
+    where
+        'a: 'b,
+    {
+        UriReferenceResolver {
+            doc: view.document(),
+            view: Some(view),
+            id_index: ResolverIdIndex::Retained(view.id_index(&[])),
+            external_resources: self.external_resources,
+            external_resource_budget: Rc::clone(&self.external_resource_budget),
+            same_document_id_semantics: self.same_document_id_semantics,
+        }
     }
 
     /// Attach an explicit caller-owned external-resource map.
@@ -241,8 +261,10 @@ impl<'a> UriReferenceResolver<'a> {
         max_resource_bytes: usize,
         max_total_bytes: usize,
     ) -> Self {
-        self.external_resource_budget =
-            ExternalResourceBudget::with_limits(max_resource_bytes, max_total_bytes);
+        self.external_resource_budget = Rc::new(ExternalResourceBudget::with_limits(
+            max_resource_bytes,
+            max_total_bytes,
+        ));
         self
     }
 

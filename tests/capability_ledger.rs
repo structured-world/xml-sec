@@ -349,7 +349,7 @@ fn native_algorithm_claims_match_the_rust_api() {
                 )
         })
         .collect();
-    assert_eq!(claims.len(), 41);
+    assert_eq!(claims.len(), 51);
     for item in claims {
         assert_native_uri_support(item);
     }
@@ -380,16 +380,26 @@ fn assert_native_uri_support(item: &Item) {
             assert!(C14nAlgorithm::from_uri(uri).is_some(), "{}", item_id(item));
         }
         "xmlSecHrefDsaSha1"
+        | "xmlSecHrefDsaSha256"
+        | "xmlSecHrefEcdsaSha1"
+        | "xmlSecHrefEcdsaSha224"
         | "xmlSecHrefEcdsaSha256"
         | "xmlSecHrefEcdsaSha384"
+        | "xmlSecHrefEcdsaSha512"
         | "xmlSecHrefHmacSha1"
+        | "xmlSecHrefHmacSha224"
+        | "xmlSecHrefHmacSha256"
+        | "xmlSecHrefHmacSha384"
+        | "xmlSecHrefHmacSha512"
         | "xmlSecHrefRsaSha1"
+        | "xmlSecHrefRsaSha224"
         | "xmlSecHrefRsaSha256"
         | "xmlSecHrefRsaSha384"
         | "xmlSecHrefRsaSha512" => {
             assert_eq!(SignatureAlgorithm::from_uri(uri).unwrap().uri(), uri);
         }
-        "xmlSecHrefSha1" | "xmlSecHrefSha256" | "xmlSecHrefSha384" | "xmlSecHrefSha512" => {
+        "xmlSecHrefSha1" | "xmlSecHrefSha224" | "xmlSecHrefSha256" | "xmlSecHrefSha384"
+        | "xmlSecHrefSha512" => {
             assert_eq!(DigestAlgorithm::from_uri(uri).unwrap().uri(), uri);
         }
         "xmlSecHrefKWAes128" | "xmlSecHrefKWAes256" => {
@@ -530,6 +540,7 @@ fn legacy_algorithm_claims_are_policy_gated() {
         actual,
         BTreeSet::from([
             "xmlSecHrefDsaSha1",
+            "xmlSecHrefEcdsaSha1",
             "xmlSecHrefHmacSha1",
             "xmlSecHrefRsaSha1",
         ])
@@ -542,7 +553,11 @@ fn legacy_algorithm_claims_are_policy_gated() {
         .expect("SHA-1 digest URI must remain inventoried");
     let sha1_classification = classification(&ledger, sha1);
     assert_eq!(sha1_classification.outcome, "behavior-compatible");
-    assert!(sha1_classification.rationale.contains("verification-only"));
+    assert!(
+        sha1_classification
+            .rationale
+            .contains("secure signing defaults")
+    );
     assert!(
         xml_sec::policy::VerificationPolicy::default()
             .digest_algorithms
