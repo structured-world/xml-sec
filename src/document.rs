@@ -335,6 +335,28 @@ struct SelfClosingContentEdit {
     qualified_name: String,
 }
 
+#[cfg(feature = "xmldsig")]
+fn is_unescaped_base64_text(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+}
+
+#[cfg(feature = "xmldsig")]
+fn validate_base64_replacements(
+    replacements: &[(NodeIdentity, String)],
+) -> Result<(), XmlDocumentError> {
+    if replacements
+        .iter()
+        .any(|(_, value)| !is_unescaped_base64_text(value))
+    {
+        return Err(XmlDocumentError::InvalidReplacement(
+            "generated base64 replacement contains XML markup".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl ContentReplacementEdit<'_> {
     fn output_len(&self) -> Option<usize> {
         let Some(expansion) = &self.self_closing else {
@@ -918,24 +940,50 @@ impl XmlDocument {
 
     /// Replace the children of several non-overlapping elements atomically.
     ///
-    /// All identities must belong to the current generation. The candidate is
-    /// parsed once and either every replacement commits in one new generation
-    /// or the document remains unchanged.
+    /// All identities must belong to the current generation. Every boundary is
+    /// checked in one validation candidate, then the final candidate is parsed
+    /// and either commits as one new generation or leaves the document unchanged.
     pub fn replace_contents(
         &mut self,
         replacements: &[(NodeIdentity, String)],
     ) -> Result<(), XmlDocumentError> {
-        self.replace_contents_inner(replacements, self.settings, false, None)
+        self.replace_contents_inner(replacements, self.settings, false, true, None)
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(all(feature = "xmldsig", test))]
     pub(crate) fn replace_contents_with_budget(
         &mut self,
         replacements: &[(NodeIdentity, String)],
         settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
-        self.replace_contents_inner(replacements, settings, true, Some(budget))
+        self.replace_contents_inner(replacements, settings, true, true, Some(budget))
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn replace_base64_contents_with_budget(
+        &mut self,
+        replacements: &[(NodeIdentity, String)],
+        settings: DocumentParseSettings,
+        budget: &XmlParseWorkBudget,
+    ) -> Result<(), XmlDocumentError> {
+        validate_base64_replacements(replacements)?;
+        // Base64 cannot alter XML structure, so the committed candidate parse
+        // is also the boundary validation. Generic caller fragments retain the
+        // separate contextual validation path above.
+        self.replace_contents_inner(replacements, settings, true, false, Some(budget))
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn project_base64_contents(
+        &self,
+        replacements: &[(NodeIdentity, String)],
+        maximum_bytes: usize,
+    ) -> Result<String, XmlDocumentError> {
+        validate_base64_replacements(replacements)?;
+        let (edits, projected) =
+            self.prepare_content_replacement_edits(replacements, maximum_bytes)?;
+        Ok(self.render_content_replacement_edits(&edits, projected))
     }
 
     fn replace_contents_inner(
@@ -943,11 +991,32 @@ impl XmlDocument {
         replacements: &[(NodeIdentity, String)],
         settings: DocumentParseSettings,
         policy_bounded: bool,
+        validate_fragments: bool,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
         if replacements.is_empty() {
             return Ok(());
         }
+        let (edits, projected) =
+            self.prepare_content_replacement_edits(replacements, settings.max_bytes)?;
+
+        if validate_fragments {
+            self.validate_content_edits(&edits, settings, policy_bounded, budget)?;
+        }
+
+        let output = self.render_content_replacement_edits(&edits, projected);
+        if policy_bounded {
+            self.replace_serialized_with_settings(output, settings, budget)
+        } else {
+            self.replace_serialized(output, budget)
+        }
+    }
+
+    fn prepare_content_replacement_edits<'a>(
+        &self,
+        replacements: &'a [(NodeIdentity, String)],
+        maximum_bytes: usize,
+    ) -> Result<(Vec<ContentReplacementEdit<'a>>, usize), XmlDocumentError> {
         let mut targets = HashSet::with_capacity(replacements.len());
         if replacements
             .iter()
@@ -1001,39 +1070,39 @@ impl XmlDocument {
                 "replacement targets overlap".into(),
             ));
         }
-        let active_maximum_bytes = settings.max_bytes;
         let projected = edits.iter().try_fold(self.as_xml().len(), |length, edit| {
             length
                 .checked_sub(edit.range.len())
                 .and_then(|length| length.checked_add(edit.output_len()?))
                 .ok_or(XmlDocumentError::DocumentTooLarge {
-                    maximum: active_maximum_bytes,
+                    maximum: maximum_bytes,
                     actual: usize::MAX,
                 })
         })?;
-        if projected > active_maximum_bytes {
+        if projected > maximum_bytes {
             return Err(XmlDocumentError::DocumentTooLarge {
-                maximum: active_maximum_bytes,
+                maximum: maximum_bytes,
                 actual: projected,
             });
         }
+        Ok((edits, projected))
+    }
 
-        self.validate_content_edits(&edits, settings, policy_bounded, budget)?;
-
+    fn render_content_replacement_edits(
+        &self,
+        edits: &[ContentReplacementEdit<'_>],
+        projected: usize,
+    ) -> String {
         let mut output = String::with_capacity(projected);
         let mut cursor = 0;
-        for edit in &edits {
+        for edit in edits {
             output.push_str(&self.as_xml()[cursor..edit.range.start]);
             edit.write_output(self.as_xml(), &mut output);
             cursor = edit.range.end;
         }
         output.push_str(&self.as_xml()[cursor..]);
         debug_assert_eq!(output.len(), projected);
-        if policy_bounded {
-            self.replace_serialized_with_settings(output, settings, budget)
-        } else {
-            self.replace_serialized(output, budget)
-        }
+        output
     }
 
     fn validate_content_edits(
@@ -1101,10 +1170,10 @@ impl XmlDocument {
         target: NodeIdentity,
         child: &str,
     ) -> Result<(), XmlDocumentError> {
-        self.append_child_inner(target, child, None, self.settings, None)
+        self.append_child_inner(target, child, None, self.settings, true, None)
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(all(feature = "xmldsig", test))]
     pub(crate) fn append_child_with_budget(
         &mut self,
         target: NodeIdentity,
@@ -1117,6 +1186,28 @@ impl XmlDocument {
             child,
             Some(settings.nodes_limit as usize),
             settings,
+            true,
+            Some(budget),
+        )
+    }
+
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn append_generated_child_with_budget(
+        &mut self,
+        target: NodeIdentity,
+        child: &str,
+        settings: DocumentParseSettings,
+        budget: &XmlParseWorkBudget,
+    ) -> Result<(), XmlDocumentError> {
+        // SignatureBuilder serializes this fragment with quick-xml. Parsing the
+        // final candidate once validates both the generated child and its
+        // document context without a redundant wrapper-document pass.
+        self.append_child_inner(
+            target,
+            child,
+            Some(settings.nodes_limit as usize),
+            settings,
+            false,
             Some(budget),
         )
     }
@@ -1127,6 +1218,7 @@ impl XmlDocument {
         child: &str,
         maximum: Option<usize>,
         settings: DocumentParseSettings,
+        validate_context: bool,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
         let projected = self.projected_child_append_len(target, child.len())?;
@@ -1161,7 +1253,9 @@ impl XmlDocument {
             ))
         })?;
         self.ensure_replacement_fits(&range, replacement.len(), settings.max_bytes)?;
-        self.validate_content_in_element_context(target, child, maximum, settings, budget)?;
+        if validate_context {
+            self.validate_content_in_element_context(target, child, maximum, settings, budget)?;
+        }
         if let Some(maximum) = maximum {
             debug_assert_eq!(maximum, settings.nodes_limit as usize);
             self.replace_range_with_settings(range, &replacement, settings, budget)
@@ -1916,7 +2010,7 @@ struct InternalDtd {
 
 struct InternalAttributeDefault {
     attribute_name: String,
-    references: Vec<String>,
+    value: String,
 }
 
 fn preflight_xml_fragment(
@@ -1944,7 +2038,8 @@ fn preflight_xml_fragment(
         offset: usize,
         collect_doctype: bool,
         context: FragmentContext,
-        pending_attribute_references: Vec<String>,
+        pending_attribute_source: Vec<u8>,
+        pending_attribute_offset: usize,
     }
 
     enum PreflightEvent {
@@ -1956,8 +2051,8 @@ fn preflight_xml_fragment(
         CharacterData {
             xml_whitespace: bool,
         },
-        Start(Vec<String>),
-        Empty(Vec<String>),
+        Start(Vec<u8>),
+        Empty(Vec<u8>),
         End,
         Node,
         Other,
@@ -1973,23 +2068,32 @@ fn preflight_xml_fragment(
         offset: 0,
         collect_doctype,
         context: FragmentContext::Content,
-        pending_attribute_references: Vec::new(),
+        pending_attribute_source: Vec::new(),
+        pending_attribute_offset: 0,
     }];
     // Syntax diagnostics and exact parser precedence belong to the selected
     // DOM pipeline; this pass stops at malformed syntax after bounding its prefix.
     while !fragments.is_empty() {
         let (event, collect_doctype, context) = {
             let frame = fragments.last_mut().expect("fragment stack is not empty");
-            if let Some(name) = frame.pending_attribute_references.pop() {
+            let mut pending = general_references(
+                &frame.pending_attribute_source[frame.pending_attribute_offset..],
+            );
+            if let Some(name) = pending.next() {
+                frame.pending_attribute_offset = frame
+                    .pending_attribute_offset
+                    .saturating_add(pending.consumed());
                 (
                     PreflightEvent::GeneralRef {
-                        name: Some(name),
+                        name: Some(name.to_owned()),
                         is_character_reference: false,
                     },
                     false,
                     FragmentContext::Attribute,
                 )
             } else {
+                frame.pending_attribute_source.clear();
+                frame.pending_attribute_offset = 0;
                 let source = match &frame.source {
                     FragmentSource::Document => xml,
                     FragmentSource::Entity(name) => dtd
@@ -2032,20 +2136,20 @@ fn preflight_xml_fragment(
                         xml_whitespace: false,
                     },
                     Ok(QuickXmlEvent::Start(element)) => {
-                        let references = if frame.context == FragmentContext::Content {
-                            element_attribute_references(&element, dtd)
+                        let source = if frame.context == FragmentContext::Content {
+                            element_attribute_reference_source(&element, dtd)
                         } else {
                             Vec::new()
                         };
-                        PreflightEvent::Start(references)
+                        PreflightEvent::Start(source)
                     }
                     Ok(QuickXmlEvent::Empty(element)) => {
-                        let references = if frame.context == FragmentContext::Content {
-                            element_attribute_references(&element, dtd)
+                        let source = if frame.context == FragmentContext::Content {
+                            element_attribute_reference_source(&element, dtd)
                         } else {
                             Vec::new()
                         };
-                        PreflightEvent::Empty(references)
+                        PreflightEvent::Empty(source)
                     }
                     Ok(QuickXmlEvent::End(_)) => PreflightEvent::End,
                     Ok(QuickXmlEvent::Comment(_) | QuickXmlEvent::PI(_)) => PreflightEvent::Node,
@@ -2091,7 +2195,8 @@ fn preflight_xml_fragment(
                             offset: 0,
                             collect_doctype: false,
                             context,
-                            pending_attribute_references: Vec::new(),
+                            pending_attribute_source: Vec::new(),
+                            pending_attribute_offset: 0,
                         });
                     } else {
                         expansion_stack.remove(&name);
@@ -2138,13 +2243,12 @@ fn preflight_xml_fragment(
         }
         state.in_character_data = false;
         match event {
-            PreflightEvent::Start(mut attribute_references) => {
-                attribute_references.reverse();
-                fragments
+            PreflightEvent::Start(attribute_source) => {
+                let frame = fragments
                     .last_mut()
-                    .expect("active element frame remains registered")
-                    .pending_attribute_references
-                    .extend(attribute_references);
+                    .expect("active element frame remains registered");
+                frame.pending_attribute_source = attribute_source;
+                frame.pending_attribute_offset = 0;
                 observe_preflight_node(state, settings, false)?;
                 state.depth = state.depth.saturating_add(1);
                 if state.depth > settings.depth_limit {
@@ -2154,13 +2258,12 @@ fn preflight_xml_fragment(
                     });
                 }
             }
-            PreflightEvent::Empty(mut attribute_references) => {
-                attribute_references.reverse();
-                fragments
+            PreflightEvent::Empty(attribute_source) => {
+                let frame = fragments
                     .last_mut()
-                    .expect("active element frame remains registered")
-                    .pending_attribute_references
-                    .extend(attribute_references);
+                    .expect("active element frame remains registered");
+                frame.pending_attribute_source = attribute_source;
+                frame.pending_attribute_offset = 0;
                 observe_preflight_node(state, settings, false)?;
                 let actual = state.depth.saturating_add(1);
                 if actual > settings.depth_limit {
@@ -2177,52 +2280,86 @@ fn preflight_xml_fragment(
     Ok(())
 }
 
-fn element_attribute_references(
+fn element_attribute_reference_source(
     element: &QuickXmlBytesStart<'_>,
     dtd: &InternalDtd,
-) -> Vec<String> {
-    let mut references = Vec::new();
-    let mut present_attributes = HashSet::new();
-    for attribute in element.attributes().flatten() {
-        if let Ok(name) = std::str::from_utf8(attribute.key.as_ref()) {
-            present_attributes.insert(name.to_owned());
-        }
-        references.extend(general_references(attribute.value.as_ref()));
+) -> Vec<u8> {
+    let lexical = element.as_ref();
+    let mut source = if lexical.contains(&b'&') {
+        lexical.to_vec()
+    } else {
+        Vec::new()
+    };
+    if dtd.attribute_defaults.is_empty() {
+        return source;
     }
 
     let element_name = element.name();
     let Ok(element_name) = std::str::from_utf8(element_name.as_ref()) else {
-        return references;
+        return source;
     };
     if let Some(defaults) = dtd.attribute_defaults.get(element_name) {
+        let mut present_attributes: HashSet<_> = element
+            .attributes()
+            .flatten()
+            .filter_map(|attribute| {
+                std::str::from_utf8(attribute.key.as_ref())
+                    .ok()
+                    .map(ToOwned::to_owned)
+            })
+            .collect();
         for default in defaults {
-            if present_attributes.insert(default.attribute_name.clone()) {
-                references.extend(default.references.iter().cloned());
+            if present_attributes.insert(default.attribute_name.clone())
+                && default.value.contains('&')
+            {
+                source.push(b' ');
+                source.extend_from_slice(default.value.as_bytes());
             }
         }
     }
-    references
+    source
 }
 
-fn general_references(value: &[u8]) -> Vec<String> {
-    let mut references = Vec::new();
-    let mut offset = 0;
-    while let Some(relative_start) = value[offset..].iter().position(|byte| *byte == b'&') {
-        let start = offset + relative_start + 1;
-        let Some(relative_end) = value[start..].iter().position(|byte| *byte == b';') else {
-            break;
-        };
-        let end = start + relative_end;
-        let name = &value[start..end];
-        if !name.starts_with(b"#")
-            && !matches!(name, b"amp" | b"apos" | b"gt" | b"lt" | b"quot")
-            && let Ok(name) = std::str::from_utf8(name)
-        {
-            references.push(name.to_owned());
-        }
-        offset = end + 1;
+struct GeneralReferences<'a> {
+    value: &'a [u8],
+    offset: usize,
+}
+
+impl GeneralReferences<'_> {
+    fn consumed(&self) -> usize {
+        self.offset
     }
-    references
+}
+
+impl<'a> Iterator for GeneralReferences<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let relative_start = self.value[self.offset..]
+                .iter()
+                .position(|byte| *byte == b'&')?;
+            let start = self.offset + relative_start + 1;
+            let Some(relative_end) = self.value[start..].iter().position(|byte| *byte == b';')
+            else {
+                self.offset = self.value.len();
+                return None;
+            };
+            let end = start + relative_end;
+            self.offset = end + 1;
+            let name = &self.value[start..end];
+            if !name.starts_with(b"#")
+                && !matches!(name, b"amp" | b"apos" | b"gt" | b"lt" | b"quot")
+                && let Ok(name) = std::str::from_utf8(name)
+            {
+                return Some(name);
+            }
+        }
+    }
+}
+
+fn general_references(value: &[u8]) -> GeneralReferences<'_> {
+    GeneralReferences { value, offset: 0 }
 }
 
 fn charge_entity_expansion_work(
@@ -2363,7 +2500,7 @@ fn collect_internal_attribute_defaults(
         };
         declarations.push(InternalAttributeDefault {
             attribute_name: attribute_name.to_owned(),
-            references: general_references(value.as_bytes()),
+            value: value.to_owned(),
         });
     }
 
@@ -2933,6 +3070,34 @@ mod tests {
                 actual,
             })) if observed_maximum == maximum
                 && actual == expected_work
+        ));
+    }
+
+    #[test]
+    fn entity_preflight_streams_dense_attribute_references_in_source_order() {
+        // A dense attribute must fail on the first expansion that exhausts the
+        // budget. Buffering every reference and popping in reverse both delays
+        // enforcement and exposes the transient allocation amplification.
+        let repeated = "&first;".repeat(4_096);
+        let xml = format!(
+            "<!DOCTYPE root [<!ENTITY first \"0123456789\"><!ENTITY last \"01234567890123456789\">]><root value=\"{repeated}&last;\"/>"
+        );
+        let maximum = xml.len() + 9;
+        let budget = XmlParseWorkBudget::with_limit(maximum);
+        let settings = DocumentParseSettings::new_with_depth(true, 8, 1, xml.len());
+
+        let mut scanner = general_references(b"&first;&last;");
+        assert_eq!(scanner.next(), Some("first"));
+        assert_eq!(scanner.next(), Some("last"));
+        assert_eq!(scanner.next(), None);
+
+        assert!(matches!(
+            preflight_document_limits(&xml, settings, Some(&budget)),
+            Err(XmlDocumentError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum: observed_maximum,
+                actual,
+            })) if observed_maximum == maximum && actual == xml.len() + 10
         ));
     }
 

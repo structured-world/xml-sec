@@ -984,17 +984,29 @@ fn validate_xml_plaintext(
             Ok(())
         }
         EncryptedDataType::Content => {
-            let wrapped = format!("<xmlsec-content>{xml}</xmlsec-content>");
+            const WRAPPER_START: &str = "<xmlsec-content>";
+            const WRAPPER_END: &str = "</xmlsec-content>";
+
+            policy.resources.validate_xml_document_len(xml.len())?;
+            let wrapped = format!("{WRAPPER_START}{xml}{WRAPPER_END}");
+            let wrapper_bytes = WRAPPER_START.len() + WRAPPER_END.len();
             // The wrapper exists only to parse an XML fragment. Its node must
-            // not consume the caller-owned node or depth allowance.
+            // not consume the caller-owned byte, node, or depth allowance.
             let wrapped_settings = DocumentParseSettings {
                 nodes_limit: settings.nodes_limit.saturating_add(1),
                 depth_limit: settings.depth_limit.saturating_add(1),
-                max_bytes: wrapped.len(),
+                max_bytes: settings.max_bytes.saturating_add(wrapper_bytes),
                 ..settings
             };
             parse_borrowed_with_settings_and_budget(&wrapped, wrapped_settings, Some(parse_budget))
                 .map_err(|error| match error {
+                    XmlDocumentError::DocumentTooLarge { actual, .. } => {
+                        XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                            resource: crate::policy::resource_name::XML_DOCUMENT,
+                            maximum: settings.max_bytes,
+                            actual: actual.saturating_sub(wrapper_bytes),
+                        })
+                    }
                     XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached) => {
                         XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                             resource: crate::policy::resource_name::XML_NODES,
@@ -1914,6 +1926,40 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn content_plaintext_byte_limit_excludes_only_the_internal_wrapper() {
+        // The parser-only wrapper must not replace the caller's byte ceiling.
+        // Encryption plaintext may be larger than the XML input policy, but an
+        // XML Content fragment still has to satisfy both limits before parsing.
+        let xml = "<first/><second/>";
+        let maximum = xml.len() - 1;
+        let policy = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_document_bytes: maximum,
+                max_encryption_plaintext_bytes: xml.len(),
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let budget = XmlParseWorkBudget::from_resources(&policy.resources);
+
+        assert!(matches!(
+            validate_xml_plaintext(xml, &EncryptedDataType::Content, &policy, &budget),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DOCUMENT,
+                    maximum: observed_maximum,
+                    actual,
+                }
+            )) if observed_maximum == maximum && actual == xml.len()
+        ));
+        assert_eq!(
+            budget.consumed(),
+            0,
+            "oversized XML must fail before parsing"
+        );
     }
 
     #[test]

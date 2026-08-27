@@ -25,8 +25,7 @@ use crate::c14n::canonicalize_bounded_with_xml_base_budget;
 use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::DigestAlgorithm;
 use super::mutation::{
-    XmlMutationError, fill_selected_manifest_digest_values_at_index_with_budget,
-    fill_signature_value_at_index_with_budget, fill_signed_info_digest_values_at_index_with_budget,
+    XmlMutationError, fill_signed_info_digest_values_at_index_with_budget,
     fill_signed_info_digest_values_with_budget, merge_key_info_source_at_index_with_budget,
     padded_base64_len_for_xml,
 };
@@ -1050,9 +1049,8 @@ impl<'a> SignContext<'a> {
         )?;
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature_value);
         document
-            .replace_content_with_budget(
-                signature_value_node,
-                &signature_b64,
+            .replace_base64_contents_with_budget(
+                &[(signature_value_node, signature_b64)],
                 DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
                 budgets.transforms.xml_parse_work(),
             )
@@ -1142,7 +1140,7 @@ impl<'a> SignContext<'a> {
             .resources
             .validate_xml_document_len(projected_document_len)?;
         document
-            .append_child_with_budget(
+            .append_generated_child_with_budget(
                 signature_parent,
                 &template,
                 DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
@@ -1381,34 +1379,34 @@ fn fill_reference_digest_values_in_dependency_order(
         .ok_or_else(|| SigningDigestError::InvalidStructure("reference count overflow".into()))?;
     validate_signing_references(&manifest_references, total_references, Some(policy))?;
     let placeholder = "AA==";
-    let analysis_xml = fill_signed_info_digest_values_at_index_with_budget(
-        document.as_xml(),
-        std::iter::repeat_n(placeholder, signed_info_references.len()),
-        target_signature,
-        Some(policy),
-        Some(budgets.transforms.xml_parse_work()),
-    )?;
-    let analysis_xml = if manifest_references.is_empty() {
-        analysis_xml
-    } else {
-        fill_selected_manifest_digest_values_at_index_with_budget(
-            &analysis_xml,
-            (0..manifest_references.len()).map(|index| (index, placeholder)),
-            target_signature,
-            Some(policy),
-            Some(budgets.transforms.xml_parse_work()),
-        )?
-    };
     // SignatureValue is the final mutable value in the signing pipeline. Give
     // it concrete character data during analysis so references that retain the
     // existing or future text cannot be mistaken for stable inputs.
-    let analysis_xml = fill_signature_value_at_index_with_budget(
-        &analysis_xml,
-        placeholder,
-        target_signature,
-        Some(policy),
-        Some(budgets.transforms.xml_parse_work()),
-    )?;
+    let analysis_replacements = document.with_view(|view| {
+        let signature = find_signing_signature_node(
+            view.document(),
+            SigningSignatureTarget::Index(target_signature),
+        )?;
+        let signature_value = find_required_child(signature, "SignatureValue")?;
+        let mut replacements = signed_info_references
+            .iter()
+            .chain(&manifest_references)
+            .map(|reference| {
+                (
+                    view.node_identity_by_id(reference.digest_value_node_id),
+                    placeholder.to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        replacements.push((view.node_identity(signature_value), placeholder.to_owned()));
+        Ok::<_, SigningDigestError>(replacements)
+    })?;
+    let analysis_xml = document
+        .project_base64_contents(
+            &analysis_replacements,
+            policy.resources.max_xml_document_bytes,
+        )
+        .map_err(map_owned_document_digest_mutation_error)?;
     let analysis_doc = parse_signing_document(
         &analysis_xml,
         Some(policy),
@@ -1509,7 +1507,7 @@ fn fill_reference_digest_values_in_dependency_order(
             )
         })?;
         document
-            .replace_contents_with_budget(
+            .replace_base64_contents_with_budget(
                 &replacements,
                 DocumentParseSettings::from_policy(&policy.xml, &policy.resources),
                 budgets.transforms.xml_parse_work(),
@@ -2480,6 +2478,71 @@ mod error_conversion_tests {
         assert_eq!(document.generation(), 1);
         assert!(!document.as_xml().contains("<ds:DigestValue/>"));
         assert!(!document.as_xml().contains("<ds:SignatureValue/>"));
+    }
+
+    #[test]
+    fn builder_signing_fits_the_document_to_parse_work_ratio() {
+        // A builder operation at the configured document ceiling must fit the
+        // implementation's sixteen-pass hard allowance. Generated base64 text
+        // and the appended generated template need one committed candidate
+        // parse each, not an untrusted-fragment validation parse plus commit.
+        let padding = "x".repeat(64 * 1024);
+        let xml = format!("<root><payload Id=\"payload\"/><padding>{padding}</padding></root>");
+        let builder = SignatureBuilder::new(
+            crate::c14n::C14nAlgorithm::new(crate::c14n::C14nMode::Exclusive1_0, false),
+            SignatureAlgorithm::RsaSha256,
+        )
+        .add_reference(
+            crate::xmldsig::ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"),
+        );
+        let maximum_document_bytes = xml.len() + 4 * 1024;
+        let mut policy = crate::policy::SigningPolicy::default();
+        policy.resources.max_xml_document_bytes = maximum_document_bytes;
+        policy.resources.max_xml_parse_work_bytes = maximum_document_bytes * 16;
+
+        let mut measurement_policy = policy.clone();
+        measurement_policy.resources.max_xml_parse_work_bytes =
+            crate::hard_limits::XML_PARSE_WORK_BYTE_CEILING;
+        let measurement_context =
+            SignContext::new(&FixedRsaSigningKey).policy(measurement_policy.clone());
+        let mut measurement_budgets =
+            SigningOperationBudgets::from_resources(&measurement_policy.resources);
+        let mut measurement_document = XmlDocument::parse_with_settings_and_budget(
+            xml.clone(),
+            DocumentParseSettings::from_policy(
+                &measurement_policy.xml,
+                &measurement_policy.resources,
+            ),
+            measurement_budgets.transforms.xml_parse_work(),
+        )
+        .expect("measurement input must parse");
+        measurement_context
+            .sign_document_with_builder_in_place(
+                &mut measurement_document,
+                &builder,
+                &mut measurement_budgets,
+            )
+            .expect("measurement signing must succeed");
+        let consumed = measurement_budgets.transforms.xml_parse_work().consumed();
+        assert!(
+            consumed <= maximum_document_bytes * 16,
+            "builder signing consumed {consumed} bytes for a {maximum_document_bytes}-byte ceiling"
+        );
+
+        let signed = SignContext::new(&FixedRsaSigningKey)
+            .policy(policy.clone())
+            .sign_with_builder(&xml, &builder)
+            .expect("string builder signing must fit the advertised parse-work ratio");
+        assert!(signed.contains("DigestValue>"));
+        assert!(signed.contains("SignatureValue>"));
+
+        let mut owned = XmlDocument::parse(&xml).expect("fixture must parse");
+        SignContext::new(&FixedRsaSigningKey)
+            .policy(policy)
+            .sign_document_with_builder(&mut owned, &builder)
+            .expect("owned builder signing must fit the advertised parse-work ratio");
+        assert!(owned.as_xml().contains("DigestValue>"));
+        assert!(owned.as_xml().contains("SignatureValue>"));
     }
 
     #[test]

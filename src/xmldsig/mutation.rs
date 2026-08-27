@@ -280,87 +280,6 @@ where
     )
 }
 
-pub(super) fn fill_selected_manifest_digest_values_at_index_with_budget<I, S>(
-    xml: &str,
-    replacements: I,
-    target_signature: usize,
-    policy: Option<&crate::policy::SigningPolicy>,
-    budget: Option<&XmlParseWorkBudget>,
-) -> Result<String, XmlMutationError>
-where
-    I: IntoIterator<Item = (usize, S)>,
-    S: AsRef<str>,
-{
-    let replacements = replacements
-        .into_iter()
-        .map(|(index, value)| (index, value.as_ref().to_owned()))
-        .collect::<Vec<_>>();
-    let expected = count_manifest_digest_values(xml, target_signature, policy, budget)?;
-    fill_selected_digest_values(
-        xml,
-        replacements,
-        expected,
-        policy,
-        budget,
-        |stack, namespace| is_manifest_reference_context(stack, namespace, target_signature),
-    )
-}
-
-fn fill_selected_digest_values(
-    xml: &str,
-    replacements: Vec<(usize, String)>,
-    expected: usize,
-    policy: Option<&crate::policy::SigningPolicy>,
-    budget: Option<&XmlParseWorkBudget>,
-    mut in_context: impl FnMut(&[(bool, Vec<u8>, Option<usize>)], &ResolveResult<'_>) -> bool,
-) -> Result<String, XmlMutationError> {
-    if replacements
-        .iter()
-        .enumerate()
-        .any(|(position, (index, _))| {
-            *index >= expected
-                || position
-                    .checked_sub(1)
-                    .is_some_and(|previous| replacements[previous].0 >= *index)
-        })
-    {
-        return Err(XmlMutationError::ValueCountMismatch {
-            element: "DigestValue",
-            expected,
-            actual: replacements.len(),
-        });
-    }
-
-    let replacement_indices = replacements
-        .iter()
-        .map(|(index, _)| *index)
-        .collect::<Vec<_>>();
-    let values = replacements
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect::<Vec<_>>();
-    let mut context_index = 0usize;
-    let mut replacement_index = 0usize;
-    fill_dsig_values_matching(
-        xml,
-        "DigestValue",
-        values,
-        policy,
-        budget,
-        |stack, namespace| {
-            if !in_context(stack, namespace) {
-                return false;
-            }
-            let selected = replacement_indices.get(replacement_index) == Some(&context_index);
-            context_index += 1;
-            if selected {
-                replacement_index += 1;
-            }
-            selected
-        },
-    )
-}
-
 /// Fill XMLDSig `<SignatureValue>` elements in document order.
 pub fn fill_signature_values<I, S>(xml: &str, values: I) -> Result<String, XmlMutationError>
 where
@@ -1534,37 +1453,6 @@ fn count_direct_key_infos(
         .count())
 }
 
-fn count_manifest_digest_values(
-    xml: &str,
-    target_signature: usize,
-    policy: Option<&crate::policy::SigningPolicy>,
-    budget: Option<&XmlParseWorkBudget>,
-) -> Result<usize, XmlMutationError> {
-    let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
-    let Some(signature) = signature_node(&document, target_signature) else {
-        return Ok(0);
-    };
-    Ok(signature
-        .children()
-        .filter(|node| is_dsig_node(*node, "Object"))
-        .flat_map(|object| {
-            object
-                .children()
-                .filter(|node| is_dsig_node(*node, "Manifest"))
-        })
-        .flat_map(|manifest| {
-            manifest
-                .children()
-                .filter(|node| is_dsig_node(*node, "Reference"))
-        })
-        .flat_map(|reference| {
-            reference
-                .children()
-                .filter(|node| is_dsig_node(*node, "DigestValue"))
-        })
-        .count())
-}
-
 fn signature_node<'a>(
     document: &'a roxmltree::Document<'a>,
     target_signature: usize,
@@ -1647,27 +1535,6 @@ fn is_direct_signature_context(
             element_stack,
             [.., (true, signature, Some(index))]
                 if signature.as_slice() == b"Signature" && *index == target_signature
-        )
-}
-
-fn is_manifest_reference_context(
-    element_stack: &[(bool, Vec<u8>, Option<usize>)],
-    namespace: &ResolveResult<'_>,
-    target_signature: usize,
-) -> bool {
-    is_dsig_namespace(namespace)
-        && matches!(
-            element_stack,
-            [..,
-                (true, signature, Some(index)),
-                (true, object, _),
-                (true, manifest, _),
-                (true, reference, _)
-            ] if *index == target_signature
-                && signature.as_slice() == b"Signature"
-                && object.as_slice() == b"Object"
-                && manifest.as_slice() == b"Manifest"
-                && reference.as_slice() == b"Reference"
         )
 }
 
