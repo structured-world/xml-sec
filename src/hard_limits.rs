@@ -5,6 +5,8 @@
 
 /// Maximum XML nodes allocated while parsing one verification or transform document.
 pub(crate) const XML_DOCUMENT_NODE_CEILING: u32 = 100_000;
+/// Maximum element nesting accepted by every XML parser backend.
+pub(crate) const XML_DOCUMENT_DEPTH_CEILING: usize = 256;
 
 /// Maximum inherited `xml:base` attributes considered for one URI resolution.
 pub(crate) const XML_BASE_COMPONENT_CEILING: usize = 64;

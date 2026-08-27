@@ -32,7 +32,7 @@ pub(crate) mod xml_base;
 
 use std::collections::HashSet;
 
-use roxmltree::{Document, Node, NodeId, ParsingOptions};
+use roxmltree::{Document, Node, NodeId};
 
 use ns_exclusive::ExclusiveNsRenderer;
 use ns_inclusive::InclusiveNsRenderer;
@@ -499,7 +499,7 @@ fn serialize_canonical_visible_with_position_dispatch(
 ///
 /// Input must be valid UTF-8 (XML 1.0 documents are UTF-8 or declare their
 /// encoding; roxmltree only accepts UTF-8). DTDs and external entity resolution
-/// are disabled, and the library's absolute XML byte and node ceilings apply.
+/// are disabled, and the library's absolute XML byte, node, and depth ceilings apply.
 /// Returns `C14nError::Parse` for invalid UTF-8, malformed XML, or exceeded
 /// input ceilings.
 pub fn canonicalize_xml(xml: &[u8], algo: &C14nAlgorithm) -> Result<Vec<u8>, C14nError> {
@@ -512,13 +512,10 @@ pub fn canonicalize_xml(xml: &[u8], algo: &C14nAlgorithm) -> Result<Vec<u8>, C14
     }
     let xml_str =
         std::str::from_utf8(xml).map_err(|e| C14nError::Parse(format!("invalid UTF-8: {e}")))?;
-    let document = Document::parse_with_options(
+    let document = crate::document::parse_borrowed_with_settings_and_budget(
         xml_str,
-        ParsingOptions {
-            allow_dtd: false,
-            nodes_limit: crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
-            entity_resolver: None,
-        },
+        crate::document::DocumentParseSettings::default(),
+        None,
     )
     .map_err(|error| C14nError::Parse(error.to_string()))?;
     let mut output = Vec::new();
@@ -617,6 +614,25 @@ mod tests {
         assert!(matches!(
             error,
             C14nError::Parse(message) if message.contains("nodes limit reached")
+        ));
+    }
+
+    #[test]
+    fn canonicalize_xml_rejects_input_above_the_document_depth_ceiling() {
+        // The convenience parser is a public untrusted-input boundary, so the
+        // absolute depth ceiling must apply before recursive C14N traversal.
+        let depth = crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING + 1;
+        let xml = format!("{}{}", "<n>".repeat(depth), "</n>".repeat(depth));
+
+        let error = canonicalize_xml(
+            xml.as_bytes(),
+            &C14nAlgorithm::new(C14nMode::Inclusive1_0, false),
+        )
+        .expect_err("over-depth canonicalization input must be rejected");
+
+        assert!(matches!(
+            error,
+            C14nError::Parse(message) if message.contains("maximum element depth")
         ));
     }
 

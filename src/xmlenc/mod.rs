@@ -38,6 +38,25 @@ pub use types::{
     ReplacementMode, RsaOaepParameters, XmlEncError,
 };
 
+fn map_document_error(
+    error: crate::document::XmlDocumentError,
+    settings: crate::document::DocumentParseSettings,
+) -> XmlEncError {
+    match error.into_policy_violation(settings) {
+        Ok(error) => XmlEncError::Policy(error),
+        Err(crate::document::XmlDocumentError::Parse(error)) => XmlEncError::XmlParse(error),
+        Err(crate::document::XmlDocumentError::ProjectedNodeLimit { maximum }) => {
+            crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum,
+                actual: maximum.saturating_add(1),
+            }
+            .into()
+        }
+        Err(error) => XmlEncError::Document(error),
+    }
+}
+
 fn has_single_element_with_boundary_trivia(parent: Node<'_, '_>) -> bool {
     let mut element_count = 0;
     for node in parent.children() {
@@ -62,4 +81,42 @@ fn has_single_element_with_boundary_trivia(parent: Node<'_, '_>) -> bool {
         }
     }
     element_count == 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::{DocumentParseSettings, XmlDocumentError};
+
+    #[test]
+    fn document_errors_have_one_xmlenc_policy_mapping() {
+        // Borrowed parsing and owned mutation must expose identical typed
+        // resource failures rather than depending on their entry-point mapper.
+        let settings = DocumentParseSettings::new_with_depth(false, 8, 3, 128);
+        assert!(matches!(
+            map_document_error(
+                XmlDocumentError::DocumentTooDeep {
+                    maximum: 3,
+                    actual: 4,
+                },
+                settings,
+            ),
+            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DEPTH,
+                maximum: 3,
+                actual: 4,
+            })
+        ));
+        assert!(matches!(
+            map_document_error(
+                XmlDocumentError::ProjectedNodeLimit { maximum: 8 },
+                settings,
+            ),
+            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_NODES,
+                maximum: 8,
+                actual: 9,
+            })
+        ));
+    }
 }

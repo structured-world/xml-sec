@@ -17,6 +17,7 @@ use super::types::{MAX_CIPHER_VALUE_BASE64_LEN, XMLENC_NS, validate_ciphertext_f
 use super::{
     DataEncryptionAlgorithm, DecryptedContent, EncryptedData, EncryptedDataType, EncryptedKey,
     KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm, RsaOaepParameters, XmlEncError,
+    map_document_error,
 };
 
 #[cfg(test)]
@@ -607,20 +608,11 @@ fn decrypt_document_with_context(
     context.policy.resources.validate()?;
     validate_encryption_document_len(xml.len(), &context.policy)?;
     let parse_budget = XmlParseWorkBudget::from_resources(&context.policy.resources);
-    let mut document = XmlDocument::parse_with_settings_and_budget(
-        xml.to_owned(),
-        DocumentParseSettings::new(
-            context.policy.xml.allow_internal_dtd,
-            context.policy.resources.effective_xml_nodes(),
-            context.policy.resources.max_xml_document_bytes,
-        ),
-        &parse_budget,
-    )
-    .map_err(|error| match error {
-        crate::document::XmlDocumentError::Policy(error) => XmlEncError::Policy(error),
-        crate::document::XmlDocumentError::Parse(error) => XmlEncError::XmlParse(error),
-        error => XmlEncError::Document(error),
-    })?;
+    let settings =
+        DocumentParseSettings::from_policy(&context.policy.xml, &context.policy.resources);
+    let mut document =
+        XmlDocument::parse_with_settings_and_budget(xml.to_owned(), settings, &parse_budget)
+            .map_err(|error| map_document_error(error, settings))?;
     decrypt_owned_document_with_context(&mut document, selector, context, &parse_budget)?;
     Ok(document.into_xml())
 }
@@ -632,17 +624,7 @@ fn decrypt_owned_document_with_context(
     parse_budget: &XmlParseWorkBudget,
 ) -> Result<(), XmlEncError> {
     context.policy.resources.validate()?;
-    document.validate_xml_input_policy(context.policy.xml.allow_internal_dtd)?;
-    validate_encryption_document_len(document.as_xml().len(), &context.policy)?;
-    let document_nodes = document.with_view(|view| view.node_count());
-    if document_nodes > context.policy.resources.effective_xml_nodes() as usize {
-        return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: crate::policy::resource_name::XML_NODES,
-            maximum: context.policy.resources.effective_xml_nodes() as usize,
-            actual: document_nodes,
-        }
-        .into());
-    }
+    document.validate_operation_policy(&context.policy.xml, &context.policy.resources)?;
     let (target, target_len, encrypted) = document.with_view(|view| {
         let start = match selector {
             DocumentEncryptedDataSelector::UniqueBelowStartNode(Some(id))
@@ -694,41 +676,21 @@ fn decrypt_owned_document_with_context(
                 .saturating_add(plaintext.len()),
             &context.policy,
         )?;
-        let node_limit = context.policy.resources.effective_xml_nodes() as usize;
+        let settings =
+            DocumentParseSettings::from_policy(&context.policy.xml, &context.policy.resources);
         match encrypted.encrypted_type.as_ref() {
             Some(EncryptedDataType::Element) => document
-                .replace_element_with_budget(target, &plaintext, node_limit, parse_budget)
-                .map_err(map_document_mutation_error)?,
+                .replace_element_with_budget(target, &plaintext, settings, parse_budget)
+                .map_err(|error| map_document_error(error, settings))?,
             Some(EncryptedDataType::Content) => document
-                .replace_node_with_fragment_with_budget(
-                    target,
-                    &plaintext,
-                    node_limit,
-                    parse_budget,
-                )
-                .map_err(map_document_mutation_error)?,
+                .replace_node_with_fragment_with_budget(target, &plaintext, settings, parse_budget)
+                .map_err(|error| map_document_error(error, settings))?,
             Some(EncryptedDataType::Other(_)) | None => {
                 return Err(XmlEncError::ReplacementRequiresXml);
             }
         }
         Ok(())
     })
-}
-
-fn map_document_mutation_error(error: crate::document::XmlDocumentError) -> XmlEncError {
-    match error {
-        crate::document::XmlDocumentError::Policy(error) => XmlEncError::Policy(error),
-        crate::document::XmlDocumentError::Parse(error) => XmlEncError::XmlParse(error),
-        crate::document::XmlDocumentError::ProjectedNodeLimit { maximum } => {
-            crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::XML_NODES,
-                maximum,
-                actual: maximum.saturating_add(1),
-            }
-            .into()
-        }
-        error => XmlEncError::Document(error),
-    }
 }
 
 fn validate_encryption_document_len(
@@ -3786,7 +3748,54 @@ mod tests {
             DecryptContext::new(&SymmetricKeyDecryptor::new(key))
                 .policy(node_policy)
                 .decrypt_document(&document, None),
-            Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_NODES,
+                    maximum: 3,
+                    actual: 4,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn decryption_entry_points_enforce_policy_depth() {
+        // Depth validation precedes EncryptedData selection for both borrowed
+        // and retained documents, including inputs parsed under wider defaults.
+        let xml = "<root><child><leaf/></child></root>";
+        let policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_depth: 2,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        let resolver = SymmetricKeyDecryptor::new([0_u8; 16]);
+        let mut document = XmlDocument::parse(xml).expect("wide retained fixture must parse");
+
+        assert!(matches!(
+            DecryptContext::new(&resolver)
+                .policy(policy.clone())
+                .decrypt_document(xml, None),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
+                    maximum: 2,
+                    actual: 3,
+                }
+            ))
+        ));
+        assert!(matches!(
+            DecryptContext::new(&resolver)
+                .policy(policy)
+                .decrypt_owned_document(&mut document, None),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
+                    maximum: 2,
+                    actual: 3,
+                }
+            ))
         ));
     }
 
@@ -3867,6 +3876,51 @@ mod tests {
                 maximum,
                 ..
             }) if maximum == input_nodes
+        ));
+        assert_eq!(document.as_xml(), before);
+        assert_eq!(document.generation(), 0);
+    }
+
+    #[test]
+    fn owned_decryption_reports_decrypted_depth_as_policy() {
+        // The encrypted envelope can satisfy the active depth policy while its
+        // plaintext replacement exceeds it. That rejection must retain the
+        // typed policy contract and leave the owned document untouched.
+        let key = [0x3b_u8; 16];
+        let plaintext = format!("{}value{}", "<nested>".repeat(32), "</nested>".repeat(32));
+        let encrypted = encrypted_gcm_element(
+            "http://www.w3.org/2001/04/xmlenc#Element",
+            &plaintext,
+            None,
+            false,
+            &key,
+        );
+        let mut document = XmlDocument::parse(format!(
+            "<root xmlns:xenc=\"{XMLENC_NS}\">{encrypted}</root>"
+        ))
+        .expect("encrypted fixture must parse");
+        let input_depth = document.with_view(|view| view.max_depth());
+        let before = document.as_xml().to_owned();
+        let policy = crate::policy::DecryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_depth: input_depth,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::DecryptionPolicy::default()
+        };
+
+        let error = DecryptContext::new(&SymmetricKeyDecryptor::new(key))
+            .policy(policy)
+            .decrypt_owned_document(&mut document, None)
+            .expect_err("deep plaintext must exceed the active depth policy");
+
+        assert!(matches!(
+            error,
+            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_DEPTH,
+                maximum,
+                actual,
+            }) if maximum == input_depth && actual > maximum
         ));
         assert_eq!(document.as_xml(), before);
         assert_eq!(document.generation(), 0);

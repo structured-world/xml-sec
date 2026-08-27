@@ -7,36 +7,23 @@ use quick_xml::{
     Writer,
     events::{BytesEnd, BytesStart, BytesText, Event},
 };
-use roxmltree::{Document, Node, ParsingOptions};
+use roxmltree::{Document, Node};
 use rsa::RsaPublicKey;
 
-use crate::document::{DocumentParseSettings, XmlDocument, XmlParseWorkBudget};
+use crate::document::{
+    DocumentParseSettings, XmlDocument, XmlDocumentError, XmlParseWorkBudget,
+    parse_borrowed_with_settings_and_budget,
+};
 use crate::xml::{is_xml_1_0_character, is_xml_ncname};
 
 use super::types::{XMLDSIG_NS, XMLENC_NS, XMLENC11_NS};
 use super::{
     DataEncryptionAlgorithm, DocumentEncryptionOptions, EncryptedDataType, EncryptionRecipient,
     EncryptionResult, KeyWrapAlgorithm, ReplacementMode, RsaOaepParameters, XmlEncError,
-    has_single_element_with_boundary_trivia,
+    has_single_element_with_boundary_trivia, map_document_error,
 };
 
 const XML_WHITESPACE: &[char] = &[' ', '\t', '\n', '\r'];
-
-fn map_document_mutation_error(error: crate::document::XmlDocumentError) -> XmlEncError {
-    match error {
-        crate::document::XmlDocumentError::Policy(error) => XmlEncError::Policy(error),
-        crate::document::XmlDocumentError::Parse(error) => XmlEncError::XmlParse(error),
-        crate::document::XmlDocumentError::ProjectedNodeLimit { maximum } => {
-            crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::XML_NODES,
-                maximum,
-                actual: maximum.saturating_add(1),
-            }
-            .into()
-        }
-        error => XmlEncError::Document(error),
-    }
-}
 
 /// Validate an RSA recipient key against the compiled encryption policy.
 ///
@@ -224,20 +211,10 @@ impl EncryptedDataBuilder {
         self.policy.validate()?;
         self.validate_document_len(xml.len())?;
         let parse_budget = XmlParseWorkBudget::from_resources(&self.policy.resources);
-        let mut document = XmlDocument::parse_with_settings_and_budget(
-            xml.to_owned(),
-            DocumentParseSettings::new(
-                self.policy.xml.allow_internal_dtd,
-                self.policy.resources.effective_xml_nodes(),
-                self.policy.resources.max_xml_document_bytes,
-            ),
-            &parse_budget,
-        )
-        .map_err(|error| match error {
-            crate::document::XmlDocumentError::Policy(error) => XmlEncError::Policy(error),
-            crate::document::XmlDocumentError::Parse(error) => XmlEncError::XmlParse(error),
-            error => XmlEncError::Document(error),
-        })?;
+        let settings = DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources);
+        let mut document =
+            XmlDocument::parse_with_settings_and_budget(xml.to_owned(), settings, &parse_budget)
+                .map_err(|error| map_document_error(error, settings))?;
         self.encrypt_owned_document_with_budget(&mut document, options, &parse_budget)?;
         Ok(document.into_xml())
     }
@@ -262,17 +239,8 @@ impl EncryptedDataBuilder {
         parse_budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlEncError> {
         self.policy.validate()?;
-        document.validate_xml_input_policy(self.policy.xml.allow_internal_dtd)?;
-        self.validate_document_len(document.as_xml().len())?;
+        document.validate_operation_policy(&self.policy.xml, &self.policy.resources)?;
         let document_nodes = document.with_view(|view| view.node_count());
-        if document_nodes > self.policy.resources.effective_xml_nodes() as usize {
-            return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::XML_NODES,
-                maximum: self.policy.resources.effective_xml_nodes() as usize,
-                actual: document_nodes,
-            }
-            .into());
-        }
         let (target, source, content_boundaries, selected_nodes) = document.with_view(|view| {
             let selected = select_encryption_target(view.document(), options.element_id)?;
             let source = &view.xml()[selected.range()];
@@ -317,14 +285,16 @@ impl EncryptedDataBuilder {
                     ReplacementMode::ReplaceElement,
                     self.policy.resources.effective_xml_nodes() as usize,
                 )?;
+                let settings =
+                    DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources);
                 document
                     .replace_element_with_budget(
                         target,
                         &result.encrypted_data_xml,
-                        self.policy.resources.effective_xml_nodes() as usize,
+                        settings,
                         parse_budget,
                     )
-                    .map_err(map_document_mutation_error)?;
+                    .map_err(|error| map_document_error(error, settings))?;
                 Ok(())
             }
             EncryptedDataType::Content => {
@@ -369,14 +339,16 @@ impl EncryptedDataBuilder {
                     ReplacementMode::ReplaceContent,
                     self.policy.resources.effective_xml_nodes() as usize,
                 )?;
+                let settings =
+                    DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources);
                 document
                     .replace_content_with_budget(
                         target,
                         &result.encrypted_data_xml,
-                        self.policy.resources.effective_xml_nodes() as usize,
+                        settings,
                         parse_budget,
                     )
-                    .map_err(map_document_mutation_error)?;
+                    .map_err(|error| map_document_error(error, settings))?;
                 Ok(())
             }
             EncryptedDataType::Other(_) => Err(XmlEncError::InvalidEncryptionConfig(
@@ -420,11 +392,8 @@ impl EncryptedDataBuilder {
             &ciphertext,
         )?;
         self.validate_document_len(encrypted_data_xml.len())?;
-        let xml_nodes = count_generated_encrypted_data_nodes(
-            &encrypted_data_xml,
-            self.policy.resources.effective_xml_nodes(),
-            parse_budget,
-        )?;
+        let xml_nodes =
+            count_generated_encrypted_data_nodes(&encrypted_data_xml, &self.policy, parse_budget)?;
         let replacement = match encrypted_type {
             Some(EncryptedDataType::Content) => ReplacementMode::ReplaceContent,
             Some(EncryptedDataType::Element | EncryptedDataType::Other(_)) | None => {
@@ -716,32 +685,29 @@ fn validate_replacement_node_counts(
 
 fn count_generated_encrypted_data_nodes(
     encrypted_data_xml: &str,
-    maximum_nodes: u32,
+    policy: &crate::policy::EncryptionPolicy,
     parse_budget: &XmlParseWorkBudget,
 ) -> Result<usize, XmlEncError> {
-    parse_budget.charge_policy(encrypted_data_xml.len())?;
+    let maximum_nodes = policy.resources.effective_xml_nodes();
     // The standalone parser adds one document node that is not inserted into
     // the caller's tree. Bound the generated subtree by the active policy while
     // admitting that transient root so exact-fit content replacement remains valid.
-    let parser_node_limit = maximum_nodes.saturating_add(1);
-    let generated = Document::parse_with_options(
-        encrypted_data_xml,
-        ParsingOptions {
-            allow_dtd: false,
-            nodes_limit: parser_node_limit,
-            entity_resolver: None,
-        },
-    )
-    .map_err(|error| match error {
-        roxmltree::Error::NodesLimitReached => {
-            XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::XML_NODES,
-                maximum: maximum_nodes as usize,
-                actual: maximum_nodes as usize + 1,
-            })
-        }
-        error => XmlEncError::XmlParse(error),
-    })?;
+    let settings = DocumentParseSettings {
+        nodes_limit: maximum_nodes.saturating_add(1),
+        ..DocumentParseSettings::from_policy(&policy.xml, &policy.resources)
+    };
+    let generated =
+        parse_borrowed_with_settings_and_budget(encrypted_data_xml, settings, Some(parse_budget))
+            .map_err(|error| match error {
+            XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached) => {
+                XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_NODES,
+                    maximum: maximum_nodes as usize,
+                    actual: maximum_nodes as usize + 1,
+                })
+            }
+            error => map_document_error(error, settings),
+        })?;
     Ok(generated.root_element().descendants().count())
 }
 
@@ -1004,11 +970,12 @@ fn validate_xml_plaintext(
     policy: &crate::policy::EncryptionPolicy,
     parse_budget: &XmlParseWorkBudget,
 ) -> Result<(), XmlEncError> {
-    let parsing_options = || encryption_parsing_options(policy);
+    let settings = DocumentParseSettings::from_policy(&policy.xml, &policy.resources);
     match encrypted_type {
         EncryptedDataType::Element => {
-            parse_budget.charge_policy(xml.len())?;
-            let document = Document::parse_with_options(xml, parsing_options())?;
+            let document =
+                parse_borrowed_with_settings_and_budget(xml, settings, Some(parse_budget))
+                    .map_err(|error| map_document_error(error, settings))?;
             if !has_single_element_with_boundary_trivia(document.root()) {
                 return Err(XmlEncError::InvalidStructure(
                     "Element plaintext must contain exactly one element".into(),
@@ -1017,26 +984,50 @@ fn validate_xml_plaintext(
             Ok(())
         }
         EncryptedDataType::Content => {
-            let wrapped = format!("<xmlsec-content>{xml}</xmlsec-content>");
-            let mut options = parsing_options();
+            const WRAPPER_START: &str = "<xmlsec-content>";
+            const WRAPPER_END: &str = "</xmlsec-content>";
+
+            policy.resources.validate_xml_document_len(xml.len())?;
+            let wrapped = format!("{WRAPPER_START}{xml}{WRAPPER_END}");
+            let wrapper_bytes = WRAPPER_START.len() + WRAPPER_END.len();
             // The wrapper exists only to parse an XML fragment. Its node must
-            // not consume the caller-owned plaintext node allowance.
-            options.nodes_limit = options.nodes_limit.saturating_add(1);
-            parse_budget.charge_policy(wrapped.len())?;
-            let _ = Document::parse_with_options(&wrapped, options)?;
+            // not consume the caller-owned byte, node, or depth allowance.
+            let wrapped_settings = DocumentParseSettings {
+                nodes_limit: settings.nodes_limit.saturating_add(1),
+                depth_limit: settings.depth_limit.saturating_add(1),
+                max_bytes: settings.max_bytes.saturating_add(wrapper_bytes),
+                ..settings
+            };
+            parse_borrowed_with_settings_and_budget(&wrapped, wrapped_settings, Some(parse_budget))
+                .map_err(|error| match error {
+                    XmlDocumentError::DocumentTooLarge { actual, .. } => {
+                        XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                            resource: crate::policy::resource_name::XML_DOCUMENT,
+                            maximum: settings.max_bytes,
+                            actual: actual.saturating_sub(wrapper_bytes),
+                        })
+                    }
+                    XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached) => {
+                        XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                            resource: crate::policy::resource_name::XML_NODES,
+                            maximum: settings.nodes_limit as usize,
+                            actual: settings.nodes_limit as usize + 1,
+                        })
+                    }
+                    XmlDocumentError::DocumentTooDeep { actual, .. } => {
+                        XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                            resource: crate::policy::resource_name::XML_DEPTH,
+                            maximum: settings.depth_limit,
+                            actual: actual.saturating_sub(1),
+                        })
+                    }
+                    error => map_document_error(error, wrapped_settings),
+                })?;
             Ok(())
         }
         EncryptedDataType::Other(_) => Err(XmlEncError::InvalidEncryptionConfig(
             "encrypt_xml requires Element or Content Type".into(),
         )),
-    }
-}
-
-fn encryption_parsing_options<'a>(policy: &crate::policy::EncryptionPolicy) -> ParsingOptions<'a> {
-    ParsingOptions {
-        allow_dtd: policy.xml.allow_internal_dtd,
-        nodes_limit: policy.resources.effective_xml_nodes(),
-        entity_resolver: None,
     }
 }
 
@@ -1698,12 +1689,138 @@ mod tests {
 
         assert!(matches!(
             builder().encrypt_xml(xml),
-            Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_NODES,
+                    maximum: 4,
+                    actual: 5,
+                }
+            ))
         ));
         assert!(matches!(
             builder().encrypt_document(xml, DocumentEncryptionOptions::default()),
-            Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_NODES,
+                    maximum: 4,
+                    actual: 5,
+                }
+            ))
         ));
+    }
+
+    #[test]
+    fn encryption_entry_points_enforce_policy_depth() {
+        // Whole-document encryption must apply the same depth policy to string
+        // and retained inputs before target selection or encryption work.
+        let xml = "<root><child><leaf/></child></root>";
+        let policy = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_depth: 2,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let builder = || {
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy.clone())
+        };
+        let mut document = XmlDocument::parse(xml).expect("wide retained fixture must parse");
+
+        assert!(matches!(
+            builder().encrypt_document(xml, DocumentEncryptionOptions::default()),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
+                    maximum: 2,
+                    actual: 3,
+                }
+            ))
+        ));
+        assert!(matches!(
+            builder().encrypt_owned_document(&mut document, DocumentEncryptionOptions::default()),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
+                    maximum: 2,
+                    actual: 3,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn encryption_plaintext_and_owned_mutations_use_the_active_depth() {
+        // A document parsed under broad defaults must not retain those defaults
+        // when a stricter encryption operation parses or commits replacement XML.
+        let policy = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_depth: 1,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let builder = || {
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .policy(policy.clone())
+        };
+
+        assert!(matches!(
+            builder().encrypt_xml("<root><child/></root>"),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
+                    maximum: 1,
+                    actual: 2,
+                }
+            ))
+        ));
+
+        let generated = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .direct_key([0_u8; 16])
+            .encryption_type(EncryptedDataType::Content)
+            .encrypt_xml("")
+            .expect("generated content replacement must parse");
+        let generated_document = Document::parse(&generated.encrypted_data_xml)
+            .expect("generated replacement must be XML");
+        let generated_depth = generated_document
+            .descendants()
+            .filter(|node| node.is_element())
+            .map(|node| {
+                node.ancestors()
+                    .filter(|ancestor| ancestor.is_element())
+                    .count()
+            })
+            .max()
+            .expect("generated replacement has elements");
+        let mutation_policy = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_depth: generated_depth,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let mut document = XmlDocument::parse("<root/>").expect("shallow fixture must parse");
+        let original = document.as_xml().to_owned();
+        let generation = document.generation();
+        assert!(matches!(
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+                .direct_key([0_u8; 16])
+                .encryption_type(EncryptedDataType::Content)
+                .policy(mutation_policy)
+                .encrypt_owned_document(&mut document, DocumentEncryptionOptions::default()),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
+                    maximum,
+                    actual,
+                }
+            )) if maximum == generated_depth && actual == generated_depth + 1
+        ));
+        assert_eq!(document.as_xml(), original);
+        assert_eq!(document.generation(), generation);
     }
 
     #[test]
@@ -1801,8 +1918,48 @@ mod tests {
                 &policy_two,
                 &budget_two,
             ),
-            Err(XmlEncError::XmlParse(roxmltree::Error::NodesLimitReached))
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_NODES,
+                    maximum: 2,
+                    actual: 3,
+                }
+            ))
         ));
+    }
+
+    #[test]
+    fn content_plaintext_byte_limit_excludes_only_the_internal_wrapper() {
+        // The parser-only wrapper must not replace the caller's byte ceiling.
+        // Encryption plaintext may be larger than the XML input policy, but an
+        // XML Content fragment still has to satisfy both limits before parsing.
+        let xml = "<first/><second/>";
+        let maximum = xml.len() - 1;
+        let policy = crate::policy::EncryptionPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_document_bytes: maximum,
+                max_encryption_plaintext_bytes: xml.len(),
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let budget = XmlParseWorkBudget::from_resources(&policy.resources);
+
+        assert!(matches!(
+            validate_xml_plaintext(xml, &EncryptedDataType::Content, &policy, &budget),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DOCUMENT,
+                    maximum: observed_maximum,
+                    actual,
+                }
+            )) if observed_maximum == maximum && actual == xml.len()
+        ));
+        assert_eq!(
+            budget.consumed(),
+            0,
+            "oversized XML must fail before parsing"
+        );
     }
 
     #[test]
@@ -1820,11 +1977,7 @@ mod tests {
         let budget = XmlParseWorkBudget::from_resources(&policy.resources);
 
         assert!(matches!(
-            count_generated_encrypted_data_nodes(
-                xml,
-                policy.resources.effective_xml_nodes(),
-                &budget,
-            ),
+            count_generated_encrypted_data_nodes(xml, &policy, &budget),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::XML_NODES,

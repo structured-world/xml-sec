@@ -17,6 +17,13 @@ with P-256/P-384/P-521 verification keys,
 DSA-SHA1 and HMAC-SHA1 verification, embedded X.509 certificates, and configured key
 resolution.
 
+The complete Phaos XMLDSig 3 corpus is checked in for deterministic offline
+interoperability testing. Every signature document is executed through the
+public verification API and must be classified exactly once. Supported vectors
+must verify, invalid vectors must return their exact failure class, and vectors
+that depend on an unavailable capability such as XSLT or HMAC-MD5 must fail at
+an explicit typed boundary rather than being skipped.
+
 ## Examples
 
 `examples/sign.rs` builds an enveloped RSA-SHA256 signature with an embedded X.509
@@ -137,10 +144,13 @@ certificates provide key material and do not become trusted merely because they 
 certificate is present in both pools, its explicit trusted classification is retained.
 `ResourcePolicy::max_xml_document_bytes` rejects verification and signing inputs before DOM
 parsing; the same immutable ceiling is rechecked after signing mutations that enlarge the XML.
+The selected node and depth ceilings are enforced by a streaming preflight before either parser
+backend allocates a DOM, then rechecked on every staged copy, adapter parse, and committed generation.
 `ResourcePolicy::max_xml_parse_work_bytes` separately bounds cumulative parser work across the
 whole operation. Initial parsing, generated-template validation, binary-to-node-set adapters,
 staged copies, digest dependency levels, Manifest recursion, and committed generations all charge
-the same monotonic allowance; failed parses do not restore it.
+the same monotonic allowance. Recursive internal-entity replacement traversal is charged before a
+DOM parser runs; failed parses do not restore the allowance.
 Configured chain depth and candidate-path limits are validated after resolver defaults compose with
 the operation policy. Candidate-path accounting includes every generated partial path, and
 self-issued rollover certificates continue toward a distinct same-name issuer when its signature

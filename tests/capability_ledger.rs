@@ -165,7 +165,7 @@ fn complete_surface_categories_are_stable() {
         "https://github.com/lsh123/xmlsec"
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
-    assert_eq!(ledger.classifications.len(), 18);
+    assert_eq!(ledger.classifications.len(), 19);
     assert_eq!(ledger.availability.len(), 427);
 
     let counts = ledger
@@ -769,6 +769,32 @@ fn planned_surface_is_never_reported_as_supported() {
     assert!(planned.iter().any(|item| item.kind == "algorithm-uri"));
     assert!(planned.iter().any(|item| item.kind == "test-family"));
     assert!(planned.iter().any(|item| item.kind == "registry"));
+}
+
+#[test]
+fn phaos_xmldsig_family_is_exhaustively_classified() {
+    // The family claim remains honest while the dedicated integration suite
+    // accounts for every vector and exposes unsupported dependencies exactly.
+    let ledger = ledger();
+    let families: Vec<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "test-family" && item.name == "phaos-xmldsig-three")
+        .collect();
+    assert_eq!(
+        families.len(),
+        1,
+        "Phaos XMLDSig family must appear exactly once in the upstream inventory"
+    );
+    let family = families[0];
+    let classification = classification(&ledger, family);
+    assert_eq!(family.classification, "phaos-xmldsig-exhaustive");
+    assert_eq!(classification.outcome, "planned");
+    assert_eq!(classification.evidence, "phaos-xmldsig-tests");
+
+    let suite = include_str!("phaos_interop.rs");
+    assert!(suite.contains("every_phaos_signature_is_classified_once"));
+    assert!(suite.contains("executes_every_phaos_signature_through_the_public_pipeline"));
 }
 
 #[test]

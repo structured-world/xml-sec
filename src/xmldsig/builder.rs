@@ -321,20 +321,22 @@ impl SignatureBuilder {
         policy
             .resources
             .validate_xml_document_len(validation_template.len())?;
-        budget
-            .xml_parse_work()
-            .charge_policy(validation_template.len())?;
-        let document = super::mutation::parse_with_options(&validation_template, Some(policy))
-            .map_err(|error| match error {
-                roxmltree::Error::NodesLimitReached => {
-                    SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
-                        resource: crate::policy::resource_name::XML_NODES,
-                        maximum: policy.resources.max_xml_nodes,
-                        actual: policy.resources.max_xml_nodes.saturating_add(1),
-                    })
-                }
-                other => SignatureBuilderError::GeneratedXml(other),
-            })?;
+        let settings =
+            crate::document::DocumentParseSettings::from_policy(&policy.xml, &policy.resources);
+        let document = super::mutation::parse_with_options_and_budget(
+            &validation_template,
+            settings,
+            Some(budget.xml_parse_work()),
+        )
+        .map_err(|error| match error.into_policy_violation(settings) {
+            Ok(error) => SignatureBuilderError::Policy(error),
+            Err(crate::document::XmlDocumentError::Parse(error)) => {
+                SignatureBuilderError::GeneratedXml(error)
+            }
+            Err(error) => SignatureBuilderError::GeneratedMutation(
+                super::mutation::XmlMutationError::Document(error),
+            ),
+        })?;
         let signed_info = document
             .root_element()
             .children()

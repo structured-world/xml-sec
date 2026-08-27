@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Deterministic libxmlsec1 1.3.13 behavioral compatibility ledger with executable policy and CLI evidence
+
+### Changed
+
+- Ship the native `xmlsec1` CLI from the same `xml-sec` crate as the Rust library
+
 ## [0.1.13](https://github.com/structured-world/xml-sec/compare/v0.1.12...v0.1.13) - 2026-08-24
 
 ### Fixed

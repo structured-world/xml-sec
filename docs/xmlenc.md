@@ -157,8 +157,10 @@ AES-GCM.
 Use `decrypt_document` to replace one typed `EncryptedData` in a complete XML string. Pass its
 `Id` when the document contains multiple encrypted regions. The compiled decryption policy checks
 the shared `ResourcePolicy::max_xml_document_bytes` ceiling before DOM allocation and applies its
-XML node ceiling to
-the initial document and every replacement generation. `encrypt_owned_document` and
+XML node and depth ceilings to the initial document and every replacement generation. A bounded
+streaming preflight enforces these limits before either parser backend allocates a DOM and charges
+recursive internal-entity replacement traversal to cumulative XML parse work.
+`encrypt_owned_document` and
 `decrypt_owned_document` reuse the retained parsed view, validate replacement XML in the parent
 namespace context, and invalidate prior node identities after a successful mutation. String APIs
 remain adapters over this boundary. `ResourcePolicy::max_xml_parse_work_bytes` is cumulative across
@@ -168,7 +170,7 @@ key-candidate retries, so nested helpers cannot reset parser work. Use
 document with non-default XML rules; this derives parsing directly from the operation's immutable
 policy snapshot. The projected output byte length is checked before constructing
 the replacement, and expanded decryption plaintext is parsed against the operation's projected
-node ceiling before any generation is committed. Owned entry points also revalidate parse
+node and depth ceilings before any generation is committed. Owned entry points also revalidate parse
 provenance, preventing a document that required internal DTD support from crossing into a stricter
 operation context. DTD parsing remains disabled by
 default; legacy documents that need an internal DTD can opt in only through

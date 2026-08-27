@@ -1135,19 +1135,16 @@ fn verify_signature_with_context(
     ctx.policy.validate()?;
     ctx.policy.resources.validate_xml_document_len(xml.len())?;
     let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
+    let settings = DocumentParseSettings::from_policy(&ctx.policy.xml, &ctx.policy.resources);
     let document = XmlDocument::parse_with_settings_and_budget(
         xml.to_owned(),
-        DocumentParseSettings::new(
-            ctx.policy.xml.allow_internal_dtd,
-            ctx.policy.resources.effective_xml_nodes(),
-            ctx.policy.resources.max_xml_document_bytes,
-        ),
+        settings,
         execution_budget.xml_parse_work(),
     )
-    .map_err(|error| match error {
-        crate::document::XmlDocumentError::Policy(error) => DsigError::Policy(error),
-        crate::document::XmlDocumentError::Parse(error) => DsigError::XmlParse(error),
-        error => DsigError::Document(error),
+    .map_err(|error| match error.into_policy_violation(settings) {
+        Ok(error) => DsigError::Policy(error),
+        Err(crate::document::XmlDocumentError::Parse(error)) => DsigError::XmlParse(error),
+        Err(error) => DsigError::Document(error),
     })?;
     verify_signature_document_with_context_and_budget(&document, ctx, &execution_budget)
 }
@@ -1193,7 +1190,7 @@ fn verify_signature_document_with_context_and_budget(
     ctx: &VerifyContext<'_>,
     execution_budget: &TransformExecutionBudget,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
-    document.validate_xml_input_policy(ctx.policy.xml.allow_internal_dtd)?;
+    document.validate_operation_policy(&ctx.policy.xml, &ctx.policy.resources)?;
     document.with_view(|view| verify_signature_view(view, ctx, execution_budget))
 }
 
@@ -1203,17 +1200,6 @@ fn verify_signature_view<'a>(
     execution_budget: &TransformExecutionBudget,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
     ctx.policy.validate()?;
-    let xml = view.xml();
-    ctx.policy.resources.validate_xml_document_len(xml.len())?;
-    let node_count = view.node_count();
-    if node_count > ctx.policy.resources.effective_xml_nodes() as usize {
-        return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: crate::policy::resource_name::XML_NODES,
-            maximum: ctx.policy.resources.effective_xml_nodes() as usize,
-            actual: node_count,
-        }
-        .into());
-    }
     let doc = view.document();
     let resolver = UriReferenceResolver::with_document_view(view, ctx.id_attributes)
         .with_same_document_id_semantics(ctx.policy.transforms.same_document_id_semantics)
@@ -2737,6 +2723,44 @@ mod tests {
                     actual,
                 }
             )) if maximum == xml.len() - 1 && actual == xml.len()
+        ));
+    }
+
+    #[test]
+    fn verification_entry_points_enforce_policy_depth() {
+        // Both borrowed XML and a retained document parsed under wider defaults
+        // must be rejected before signature selection traverses the tree.
+        let xml = "<root><child><leaf/></child></root>";
+        let policy = crate::policy::VerificationPolicy {
+            resources: crate::policy::ResourcePolicy {
+                max_xml_depth: 2,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+        let document = XmlDocument::parse(xml).expect("wide retained fixture must parse");
+
+        assert!(matches!(
+            VerifyContext::new().policy(policy.clone()).verify(xml),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
+                    maximum: 2,
+                    actual: 3,
+                }
+            ))
+        ));
+        assert!(matches!(
+            VerifyContext::new()
+                .policy(policy)
+                .verify_document(&document),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::XML_DEPTH,
+                    maximum: 2,
+                    actual: 3,
+                }
+            ))
         ));
     }
 

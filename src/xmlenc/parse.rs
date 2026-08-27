@@ -1,10 +1,15 @@
 //! Strict parsing for the subset of XMLEnc needed by the decryption API.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use roxmltree::{Document, Node, ParsingOptions};
+use roxmltree::Node;
+#[cfg(test)]
+use roxmltree::{Document, ParsingOptions};
 
-use crate::document::XmlParseWorkBudget;
+use crate::document::{
+    DocumentParseSettings, XmlParseWorkBudget, parse_borrowed_with_settings_and_budget,
+};
 
+use super::map_document_error;
 use super::types::{
     CipherData, EncryptedData, EncryptedDataType, EncryptedKey, EncryptionMethod,
     MAX_CIPHER_VALUE_BASE64_LEN, ReferenceList, XMLDSIG_NS, XMLENC_NS, XMLENC11_NS, XmlEncError,
@@ -51,15 +56,7 @@ pub(super) fn parse_encrypted_data_with_policy(
     policy.validate()?;
     policy.resources.validate_xml_document_len(xml.len())?;
     let parse_budget = XmlParseWorkBudget::from_resources(&policy.resources);
-    parse_budget.charge_policy(xml.len())?;
-    let document = Document::parse_with_options(
-        xml,
-        ParsingOptions {
-            allow_dtd: policy.xml.allow_internal_dtd,
-            nodes_limit: policy.resources.effective_xml_nodes(),
-            entity_resolver: None,
-        },
-    )?;
+    let document = parse_policy_document(xml, policy.into(), &parse_budget)?;
     parse_encrypted_data_node(document.root_element(), policy.into(), false)
 }
 
@@ -111,29 +108,18 @@ fn validate_node_document_policy(
     policy: ParsingPolicy<'_>,
     parse_budget: &XmlParseWorkBudget,
 ) -> Result<(), XmlEncError> {
-    let resources = &policy.resources;
-    resources
-        .validate_xml_document_len(node.document().input_text().len())
-        .map_err(XmlEncError::from)?;
-    let actual = node.document().root().descendants().count();
-    if actual > resources.max_xml_nodes {
-        return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: crate::policy::resource_name::XML_NODES,
-            maximum: resources.max_xml_nodes,
-            actual,
-        }
-        .into());
-    }
-    parse_budget.charge_policy(node.document().input_text().len())?;
-    Document::parse_with_options(
-        node.document().input_text(),
-        ParsingOptions {
-            allow_dtd: policy.xml.allow_internal_dtd,
-            nodes_limit: resources.effective_xml_nodes(),
-            entity_resolver: None,
-        },
-    )?;
+    parse_policy_document(node.document().input_text(), policy, parse_budget)?;
     Ok(())
+}
+
+fn parse_policy_document<'a>(
+    xml: &'a str,
+    policy: ParsingPolicy<'_>,
+    parse_budget: &XmlParseWorkBudget,
+) -> Result<roxmltree::Document<'a>, XmlEncError> {
+    let settings = DocumentParseSettings::from_policy(policy.xml, policy.resources);
+    parse_borrowed_with_settings_and_budget(xml, settings, Some(parse_budget))
+        .map_err(|error| map_document_error(error, settings))
 }
 
 fn parse_encrypted_data_node(
@@ -873,6 +859,57 @@ mod tests {
         };
         parse_encrypted_data_node_with_policy(encrypted_data, &exact_policy)
             .expect("a document exactly at the node ceiling must parse");
+    }
+
+    #[test]
+    fn policy_parsers_enforce_the_complete_document_depth() {
+        // Both borrowed-node entry points revalidate the containing document;
+        // selecting a shallow EncryptedData subtree must not hide deep ancestors.
+        let containing = format!("<outer><inner>{DATA}</inner></outer>");
+        let document = Document::parse(&containing).expect("containing document must parse");
+        let encrypted_data = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLENC_NS, "EncryptedData")))
+            .expect("selected EncryptedData");
+        let actual_depth = encrypted_data
+            .document()
+            .descendants()
+            .filter(|node| node.is_element())
+            .map(|node| {
+                node.ancestors()
+                    .filter(|ancestor| ancestor.is_element())
+                    .count()
+            })
+            .max()
+            .expect("fixture has elements");
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_depth: actual_depth - 1,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let decryption = crate::policy::DecryptionPolicy {
+            resources: resources.clone(),
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        let encryption = crate::policy::EncryptionPolicy {
+            resources,
+            ..crate::policy::EncryptionPolicy::default()
+        };
+
+        for result in [
+            parse_encrypted_data_node_with_policy(encrypted_data, &decryption),
+            parse_encrypted_data_template_node_with_policy(encrypted_data, &encryption),
+        ] {
+            assert!(matches!(
+                result,
+                Err(XmlEncError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: crate::policy::resource_name::XML_DEPTH,
+                        maximum,
+                        actual,
+                    }
+                )) if maximum == actual_depth - 1 && actual == actual_depth
+            ));
+        }
     }
 
     #[test]

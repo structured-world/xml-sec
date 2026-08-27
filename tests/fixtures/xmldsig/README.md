@@ -78,21 +78,27 @@ tests separately cover signing and verification interoperability.
 
 ### `phaos-xmldsig-three`
 
-Third-party negative vectors. The regression suite currently imports the
-historical RSA enveloped baseline, its bad-digest and bad-signature variants,
-and the matching leaf/CA certificates. The artifacts intentionally exercise
-different boundaries:
+Complete Phaos XMLDSig 3 interoperability corpus: all 28 signed documents plus
+their keys, certificates, CRL, detached payloads, stylesheet inputs, and the
+offline RFC 3161 resource. `tests/phaos_interop.rs` requires exact set equality
+between the fixture directory and its case manifest, then executes every case
+through `VerifyContext`; additions and removals cannot become implicit skips.
 
-- The bad-digest vector returns an exact Reference digest mismatch when a
-  caller-owned key bypasses advisory document KeyInfo.
-- The file named `bad-sig` contains a second malformed MD5 Reference and is
-  rejected as an unsupported algorithm before SignatureValue verification.
-- The baseline certificate uses a 1024-bit RSA key and expired in 2012; key
-  strength and certificate validity policy reject it independently.
+Supported RSA, DSA, HMAC-SHA1, Base64, XPath, Manifest, detached-resource, and
+X.509 selection paths verify to their exact public result. Invalid vectors
+assert the first stable typed failure. The XSLT Manifest fixture has a valid
+top-level signature and an independently invalid Manifest reference, so callers
+must inspect `VerifyResult::manifest_references` before accepting Manifest-backed
+data. HMAC-MD5 and MD5-signed certificate paths remain explicit fail-closed
+classifications until those capabilities are implemented; corpus accounting
+therefore does not imply blanket algorithm support.
 
-The upstream corpus does not contain a separately named expired-certificate
-signature. Expiry coverage therefore uses the original Phaos leaf and CA at a
-fixed modern verification time without modifying the donor artifacts.
+The historical `-40-` filenames contain 80-bit HMAC values. Executable donor
+artifacts are kept byte-for-byte rather than renamed, and the case configuration
+follows the encoded `HMACOutputLength`; the importer corrects only the matching
+unit error in the upstream README. The upstream corpus also lacks a separately
+named expired-certificate signature, so expiry coverage uses the original Phaos
+leaf and CA at a fixed modern verification time without modifying donor data.
 
 ## Test Contract
 

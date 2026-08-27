@@ -61,6 +61,11 @@ for thousands of items:
 | `intentionally-unsupported` | The item is deliberately excluded, currently limited to deprecated C aliases. |
 | `planned` | The item is a visible parity target and is not implemented yet. |
 
+A planned donor test family may reference executable corpus evidence. This
+means every vector is imported, run, and assigned an exact current outcome; it
+does not promote the family to behavior-compatible while any vector still
+depends on a planned algorithm or transform.
+
 The classification source is
 [`compatibility/libxmlsec1-1.3.13-rules.json`](../compatibility/libxmlsec1-1.3.13-rules.json).
 Rules are evaluated in order, so precise supported and policy-gated URI and
