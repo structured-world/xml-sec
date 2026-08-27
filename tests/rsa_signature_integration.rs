@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use base64::Engine;
+use xml_sec::XmlDomDocument as Document;
 use xml_sec::c14n::canonicalize;
 use xml_sec::policy::PolicyViolation;
 use xml_sec::xmldsig::parse::{SignatureAlgorithm, find_signature_node, parse_signed_info};
@@ -20,7 +21,7 @@ fn read_fixture(path: &Path) -> String {
 }
 
 fn canonicalized_signed_info_and_signature(xml: &str) -> (SignatureAlgorithm, Vec<u8>, Vec<u8>) {
-    let doc = roxmltree::Document::parse(xml).expect("fixture XML should parse");
+    let doc = Document::parse(xml).expect("fixture XML should parse");
     let signature_node = find_signature_node(&doc).expect("fixture XML should contain Signature");
     let signed_info_node = signature_node
         .children()

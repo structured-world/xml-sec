@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
 
-use roxmltree::{Document, Node, NodeId};
+use crate::xml::dom::{Document, Node, NodeId};
 
 const MAX_NODE_SET_ENTRIES: usize = crate::hard_limits::NODE_SET_ENTRY_CEILING;
 const MAX_NODE_SET_OWNED_STRING_BYTES: usize =

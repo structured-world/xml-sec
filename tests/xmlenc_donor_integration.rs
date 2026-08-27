@@ -13,13 +13,14 @@ use aes_gcm::{
 };
 use aes_kw::KwAes256;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use roxmltree::{Document, ParsingOptions};
 use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePrivateKey};
+use xml_sec as roxmltree;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize, canonicalize_xml};
 use xml_sec::xmlenc::{
     DecryptContext, DecryptedContent, KekDecryptor, PrivateKeyDecryptor, SymmetricKeyDecryptor,
     XmlEncError, decrypt, decrypt_data, decrypt_document, parse_encrypted_data,
 };
+use xml_sec::{Document, ParsingOptions};
 
 const VECTOR_DIR: &str = "tests/fixtures/xmlenc/aleksey-xmlenc-01";
 const NIST_DIR: &str = "tests/fixtures/xmlenc/nist-aesgcm";
@@ -154,7 +155,6 @@ fn canonicalize_dtd_document(xml: &str, algorithm: &C14nAlgorithm) -> Vec<u8> {
         xml,
         ParsingOptions {
             allow_dtd: true,
-            entity_resolver: None,
             ..ParsingOptions::default()
         },
     )

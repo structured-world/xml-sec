@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use roxmltree::Node;
+use crate::xml::dom::Node;
 
 use super::NodeVisibility;
 use super::prefix::has_in_scope_default_namespace;
@@ -111,7 +111,7 @@ pub(crate) fn collect_ns_declarations(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use roxmltree::Document;
+    use crate::xml::dom::Document;
 
     /// Helper: run the pipeline with an accept-all predicate (inclusive behavior).
     fn collect_all(xml: &str) -> Vec<(String, String)> {

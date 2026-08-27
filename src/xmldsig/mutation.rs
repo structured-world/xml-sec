@@ -21,7 +21,7 @@ pub(super) fn parse_with_options_and_budget<'a>(
     xml: &'a str,
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
-) -> Result<roxmltree::Document<'a>, XmlDocumentError> {
+) -> Result<crate::xml::dom::Document<'a>, XmlDocumentError> {
     parse_borrowed_with_settings_and_budget(xml, settings, budget)
 }
 
@@ -39,7 +39,7 @@ fn map_mutation_parse_error(
 fn parse_mutation_xml_with_options<'a>(
     xml: &'a str,
     policy: Option<&crate::policy::SigningPolicy>,
-) -> Result<roxmltree::Document<'a>, XmlMutationError> {
+) -> Result<crate::xml::dom::Document<'a>, XmlMutationError> {
     parse_mutation_xml_with_budget(xml, policy, None)
 }
 
@@ -47,7 +47,7 @@ fn parse_mutation_xml_with_budget<'a>(
     xml: &'a str,
     policy: Option<&crate::policy::SigningPolicy>,
     budget: Option<&XmlParseWorkBudget>,
-) -> Result<roxmltree::Document<'a>, XmlMutationError> {
+) -> Result<crate::xml::dom::Document<'a>, XmlMutationError> {
     let settings = policy
         .map(|policy| DocumentParseSettings::from_policy(&policy.xml, &policy.resources))
         .unwrap_or_default();
@@ -63,7 +63,7 @@ pub enum XmlMutationError {
     Policy(#[from] crate::policy::PolicyViolation),
     /// Input XML or generated template is not parseable XML.
     #[error("XML parsing error: {0}")]
-    XmlParse(#[from] roxmltree::Error),
+    XmlParse(#[from] crate::xml::dom::ParseError),
     /// The backend-neutral document boundary rejected generated XML.
     #[error("XML document error: {0}")]
     Document(#[from] XmlDocumentError),
@@ -801,7 +801,7 @@ fn merge_one_key_info_source_at_index_with_options(
 
 fn wrap_key_info_children(
     source: &str,
-    key_info: roxmltree::Node<'_, '_>,
+    key_info: crate::xml::dom::Node<'_, '_>,
     policy: Option<&crate::policy::SigningPolicy>,
 ) -> Result<String, XmlMutationError> {
     const OPEN: &str = "<KeyInfoFragment";
@@ -851,7 +851,7 @@ fn wrap_key_info_children(
 
 fn standalone_element(
     source: &str,
-    node: roxmltree::Node<'_, '_>,
+    node: crate::xml::dom::Node<'_, '_>,
 ) -> Result<String, XmlMutationError> {
     let fragment = &source[node.range()];
     let opening_end = element_opening_end(fragment).ok_or(XmlMutationError::InvalidAppendTarget)?;
@@ -899,7 +899,7 @@ fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, XmlMut
 }
 
 fn is_matching_empty_placeholder(
-    node: roxmltree::Node<'_, '_>,
+    node: crate::xml::dom::Node<'_, '_>,
     generated_sources: &[(Option<&str>, &str)],
 ) -> bool {
     generated_sources.iter().any(|(namespace, name)| {
@@ -909,12 +909,12 @@ fn is_matching_empty_placeholder(
     })
 }
 
-fn is_reusable_placeholder(node: roxmltree::Node<'_, '_>) -> bool {
+fn is_reusable_placeholder(node: crate::xml::dom::Node<'_, '_>) -> bool {
     node.children()
         .all(|child| child.is_text() && child.text().is_some_and(is_xml_whitespace_only))
 }
 
-fn has_cryptographic_identity_content(node: roxmltree::Node<'_, '_>) -> bool {
+fn has_cryptographic_identity_content(node: crate::xml::dom::Node<'_, '_>) -> bool {
     if is_dsig_x509_data(node.tag_name().namespace(), node.tag_name().name()) {
         return node
             .children()
@@ -941,7 +941,7 @@ fn is_dsig_x509_data(namespace: Option<&str>, name: &str) -> bool {
     namespace == Some(XMLDSIG_NS) && name == "X509Data"
 }
 
-fn is_x509_identity_child(node: roxmltree::Node<'_, '_>) -> bool {
+fn is_x509_identity_child(node: crate::xml::dom::Node<'_, '_>) -> bool {
     matches!(
         (node.tag_name().namespace(), node.tag_name().name()),
         (
@@ -951,7 +951,7 @@ fn is_x509_identity_child(node: roxmltree::Node<'_, '_>) -> bool {
     )
 }
 
-fn has_x509_mergeable_metadata(node: roxmltree::Node<'_, '_>) -> bool {
+fn has_x509_mergeable_metadata(node: crate::xml::dom::Node<'_, '_>) -> bool {
     node.children().any(|child| child.is_element()) && !has_cryptographic_identity_content(node)
 }
 
@@ -1454,9 +1454,9 @@ fn count_direct_key_infos(
 }
 
 fn signature_node<'a>(
-    document: &'a roxmltree::Document<'a>,
+    document: &'a crate::xml::dom::Document<'a>,
     target_signature: usize,
-) -> Option<roxmltree::Node<'a, 'a>> {
+) -> Option<crate::xml::dom::Node<'a, 'a>> {
     document
         .descendants()
         .filter(|node| is_dsig_node(*node, "Signature"))
@@ -1483,8 +1483,8 @@ fn last_signature_index(
 }
 
 fn is_direct_signed_info_reference_digest(
-    node: roxmltree::Node<'_, '_>,
-    signature: roxmltree::Node<'_, '_>,
+    node: crate::xml::dom::Node<'_, '_>,
+    signature: crate::xml::dom::Node<'_, '_>,
 ) -> bool {
     node.is_element()
         && node.tag_name().namespace() == Some(XMLDSIG_NS)
@@ -1503,7 +1503,7 @@ fn is_direct_signed_info_reference_digest(
             .is_some_and(|parent| parent == signature)
 }
 
-fn is_dsig_node(node: roxmltree::Node<'_, '_>, expected_local: &str) -> bool {
+fn is_dsig_node(node: crate::xml::dom::Node<'_, '_>, expected_local: &str) -> bool {
     node.is_element()
         && node.tag_name().namespace() == Some(XMLDSIG_NS)
         && node.tag_name().name() == expected_local
@@ -1574,6 +1574,7 @@ fn signature_stack_index(
 #[cfg(test)]
 mod tests {
     use crate::c14n::{C14nAlgorithm, C14nMode};
+    use crate::xml::dom as roxmltree;
     use crate::xmldsig::{
         DigestAlgorithm, ReferenceBuilder, SignatureAlgorithm, SignatureBuilder, Transform,
     };
@@ -1629,8 +1630,8 @@ mod tests {
 
     #[test]
     fn streaming_mutation_scan_consumes_the_shared_parse_budget() {
-        // The quick-xml rewrite and every bounded backend pass before and after
-        // it consume one operation-wide allowance.
+        // The quick-xml rewrite plus one bounded preflight and one selected
+        // semantic backend parse consume one operation-wide allowance.
         let xml = format!(
             "<root><ds:Signature xmlns:ds=\"{XMLDSIG_NS}\"><ds:SignatureValue/></ds:Signature></root>"
         );
@@ -1645,7 +1646,7 @@ mod tests {
         )
         .expect("streaming mutation must succeed");
 
-        let dom_passes = 2 + usize::from(cfg!(feature = "xml-backend-xmloxide"));
+        let dom_passes = 2;
         assert_eq!(
             budget.consumed(),
             xml.len() * (dom_passes + 1) + output.len() * dom_passes

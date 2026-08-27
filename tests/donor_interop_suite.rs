@@ -7,6 +7,7 @@ use std::{
 };
 
 use base64::Engine as _;
+use xml_sec::IdAttributeRegistration;
 use xml_sec::policy::{
     HmacPolicy, PolicyViolation, RsaKeyPolicy, SigningPolicy, VerificationPolicy,
 };
@@ -367,9 +368,9 @@ fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
         .map(|offset| marker_offset + offset + "</dsig:KeyInfo>".len())
         .unwrap();
     let key_info = &xml[start..end];
-    let inner_key_info = key_info.replacen("Id=\"KeyInfoID\"", "Id=\"inner\"", 1);
+    let inner_key_info = key_info.replacen("Id=\"KeyInfoID\"", "ExternalId=\"inner\"", 1);
     let fragment_document = format!(
-        r##"<keys xmlns:dsig="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><dsig:KeyInfo Id="outer"><dsig11:KeyInfoReference URI="#inner"/></dsig:KeyInfo>{inner_key_info}</keys>"##
+        r##"<keys xmlns:dsig="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><dsig:KeyInfo ExternalId="outer"><dsig11:KeyInfoReference URI="#inner"/></dsig:KeyInfo>{inner_key_info}</keys>"##
     );
     let fragment_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"key-info.xml#outer\"", 1);
     let fragment_resources =
@@ -377,8 +378,10 @@ fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
     let resolver = DefaultKeyResolver::default();
     let mut policy = compatibility_verification_policy();
     policy.uris.key_info_references = UriTypeSet::ALL;
+    let id_attributes = [IdAttributeRegistration::global("ExternalId")];
     let result = VerifyContext::new()
         .key_resolver(&resolver)
+        .id_attributes(&id_attributes)
         .external_resources(&fragment_resources)
         .policy(policy.clone())
         .verify(&fragment_signature)

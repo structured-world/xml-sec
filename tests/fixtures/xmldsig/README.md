@@ -116,7 +116,7 @@ single generic success condition.
 1. Identify the upstream file and the XMLDSig feature it covers.
 2. Import it with `scripts/import-donor-fixtures.sh`.
 3. Add a positive assertion or an explicit fail-closed classification.
-4. Run the focused `cargo nextest run` target and the full all-features suite.
+4. Run the focused `cargo nextest run` target and the full suite against both XML backends.
 5. Update this document when the supported set changes.
 
 Do not weaken an expected failure merely because a donor document uses a

@@ -1,9 +1,9 @@
 //! Strict parsing for the subset of XMLEnc needed by the decryption API.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use roxmltree::Node;
 #[cfg(test)]
-use roxmltree::{Document, ParsingOptions};
+use crate::xml::dom::ParsingOptions;
+use crate::xml::dom::{Document, Node};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use crate::document::{
     DocumentParseSettings, XmlParseWorkBudget, parse_borrowed_with_settings_and_budget,
@@ -116,7 +116,7 @@ fn parse_policy_document<'a>(
     xml: &'a str,
     policy: ParsingPolicy<'_>,
     parse_budget: &XmlParseWorkBudget,
-) -> Result<roxmltree::Document<'a>, XmlEncError> {
+) -> Result<Document<'a>, XmlEncError> {
     let settings = DocumentParseSettings::from_policy(policy.xml, policy.resources);
     parse_borrowed_with_settings_and_budget(xml, settings, Some(parse_budget))
         .map_err(|error| map_document_error(error, settings))

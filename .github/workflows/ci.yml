@@ -60,13 +60,13 @@ jobs:
         include:
           - rust: stable
             xml-backend: xmloxide
-            cargo-args: --all-features
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide
           - rust: stable
             xml-backend: roxmltree
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-roxmltree
           - rust: "1.92.0"
             xml-backend: xmloxide
-            cargo-args: --all-features
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide
           - rust: "1.92.0"
             xml-backend: roxmltree
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-roxmltree
@@ -96,13 +96,13 @@ jobs:
         include:
           - rust: stable
             xml-backend: xmloxide
-            cargo-args: --all-features
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide
           - rust: stable
             xml-backend: roxmltree
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-roxmltree
           - rust: "1.92.0"
             xml-backend: xmloxide
-            cargo-args: --all-features
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide
           - rust: "1.92.0"
             xml-backend: roxmltree
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-roxmltree
@@ -154,7 +154,7 @@ jobs:
       matrix:
         include:
           - xml-backend: xmloxide
-            cargo-args: --all-features
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide
           - xml-backend: roxmltree
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-roxmltree
     steps:

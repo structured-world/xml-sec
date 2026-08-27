@@ -30,8 +30,8 @@ an explicit typed boundary rather than being skipped.
 certificate. `examples/verify.rs` verifies that document through `DefaultKeyResolver`:
 
 ```sh
-cargo run --example sign --all-features > signed.xml
-cargo run --example verify --all-features -- signed.xml
+cargo run --example sign > signed.xml
+cargo run --example verify -- signed.xml
 ```
 
 The signing and verification contexts share the same reference-transform implementation.

@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::rc::Rc;
 
-use roxmltree::{Document, NodeId};
+use crate::xml::dom::{Document, NodeId};
 use sxd_document_no_unsafe::{Package, QName, dom};
 use sxd_xpath_no_unsafe::{Context, Factory, Value, function, nodeset};
 
@@ -1219,7 +1219,7 @@ impl<'d> Mirror<'d> {
         &self,
         source: &'a Document<'a>,
         id: Option<&NodeId>,
-    ) -> Option<roxmltree::Node<'a, 'a>> {
+    ) -> Option<crate::xml::dom::Node<'a, 'a>> {
         id.and_then(|id| source.get_node(*id))
     }
 
@@ -1785,8 +1785,8 @@ pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a>(
 mod tests {
     use super::*;
     use crate::c14n::{C14nAlgorithm, C14nMode, canonicalize_with_visibility};
+    use crate::xml::dom::Document;
     use crate::xmldsig::TransformData;
-    use roxmltree::Document;
 
     fn canonicalize(nodes: &NodeSet<'_>) -> String {
         let mut output = Vec::new();

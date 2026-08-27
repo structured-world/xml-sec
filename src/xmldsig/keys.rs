@@ -1262,6 +1262,7 @@ fn validate_spki_algorithm(
 
 #[cfg(test)]
 mod tests {
+    use crate::xml::dom as roxmltree;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::{Engine, engine::general_purpose::STANDARD};

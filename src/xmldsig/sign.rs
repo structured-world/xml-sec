@@ -5,13 +5,13 @@
 //! instead of [`crate::xmldsig::parse::parse_signed_info`], because verification
 //! must continue to reject empty or malformed stored digest values.
 
+use crate::xml::dom::{Document, Node, NodeId};
 use base64::Engine;
 use hmac::{KeyInit, Mac};
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey};
 use p521::ecdsa::{Signature as P521Signature, SigningKey as P521SigningKey};
-use roxmltree::{Document, Node, NodeId};
 use rsa::RsaPrivateKey;
 use rsa::pkcs1v15::Signature as RsaPkcs1v15Signature;
 use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
@@ -78,7 +78,7 @@ pub enum SigningDigestError {
 
     /// The input XML document is not well-formed.
     #[error("XML parse error: {0}")]
-    XmlParse(#[from] roxmltree::Error),
+    XmlParse(#[from] crate::xml::dom::ParseError),
 
     /// The owned document boundary rejected a signing mutation.
     #[error("XML document error: {0}")]

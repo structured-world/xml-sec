@@ -33,6 +33,9 @@
 #[cfg(not(any(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree")))]
 compile_error!("select one XML backend feature: `xml-backend-xmloxide` or `xml-backend-roxmltree`");
 
+#[cfg(all(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree"))]
+compile_error!("XML backends are mutually exclusive; select exactly one backend feature");
+
 pub mod c14n;
 pub mod document;
 pub mod encoding;
@@ -45,6 +48,12 @@ pub mod provider;
 mod xml;
 
 pub use xml::IdAttributeRegistration;
+pub use xml::dom::{
+    Ancestors, Attribute, Attributes, Children, Descendants, Document, Document as XmlDomDocument,
+    ExpandedName, Namespace, Namespaces, Node, Node as XmlDomNode, NodeId, NodeId as XmlDomNodeId,
+    NodeType, PI, ParseError, ParseError as XmlDomParseError, ParsingOptions,
+    ParsingOptions as XmlDomParsingOptions,
+};
 
 #[cfg(feature = "xmldsig")]
 pub mod xmldsig;

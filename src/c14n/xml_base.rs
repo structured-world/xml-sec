@@ -11,7 +11,7 @@
 
 use std::cell::Cell;
 
-use roxmltree::Node;
+use crate::xml::dom::Node;
 
 use super::NodeVisibility;
 
@@ -537,7 +537,7 @@ fn remove_dot_segments_with_unmatched_parents(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use roxmltree::Document;
+    use crate::xml::dom::Document;
 
     // ── resolve_uri tests ────────────────────────────────────────────
 

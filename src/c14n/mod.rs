@@ -32,7 +32,7 @@ pub(crate) mod xml_base;
 
 use std::collections::HashSet;
 
-use roxmltree::{Document, Node, NodeId};
+use crate::xml::dom::{Document, Node, NodeId};
 
 use ns_exclusive::ExclusiveNsRenderer;
 use ns_inclusive::InclusiveNsRenderer;
@@ -699,7 +699,7 @@ mod tests {
     fn c14n_1_1_xml_id_is_not_inherited_in_subset() {
         // C14N 1.1 explicitly excludes xml:id from simple inheritable
         // attributes, so omitting its owner must also omit the attribute.
-        use roxmltree::Document;
+        use crate::xml::dom::Document;
         use std::collections::HashSet;
 
         let xml = r#"<root xml:id="r1"><child>text</child></root>"#;
@@ -715,7 +715,7 @@ mod tests {
                 stack.push(c);
             }
         }
-        let pred = move |n: roxmltree::Node| ids.contains(&n.id());
+        let pred = move |n: crate::xml::dom::Node| ids.contains(&n.id());
 
         let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
         let mut out = Vec::new();
@@ -732,7 +732,7 @@ mod tests {
     fn c14n_1_0_xml_id_is_inherited_in_subset() {
         // C14N 1.0 predates the C14N 1.1 xml:id exception, so xml:id follows
         // the general xml:* apex inheritance rule in a document subset.
-        use roxmltree::Document;
+        use crate::xml::dom::Document;
         use std::collections::HashSet;
 
         let xml = r#"<root xml:id="r1"><child>text</child></root>"#;
@@ -742,7 +742,7 @@ mod tests {
             .descendants()
             .map(|node| node.id())
             .collect::<HashSet<_>>();
-        let pred = move |node: roxmltree::Node| ids.contains(&node.id());
+        let pred = move |node: crate::xml::dom::Node| ids.contains(&node.id());
 
         let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
         let mut out = Vec::new();

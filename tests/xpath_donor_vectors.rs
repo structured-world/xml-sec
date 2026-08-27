@@ -42,3 +42,4 @@ fn merlin_filter2_sign_spec_produces_exact_canonical_octets() {
 
     assert_eq!(output, expected.as_bytes());
 }
+use xml_sec as roxmltree;

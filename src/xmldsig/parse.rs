@@ -16,11 +16,11 @@
 //! </Signature>
 //! ```
 
+use crate::xml::dom::{Document, Node};
 use der::{
     Decode,
     asn1::{Ia5StringRef, ObjectIdentifier},
 };
-use roxmltree::{Document, Node};
 use std::collections::BTreeMap;
 use x509_cert::ext::pkix::name::DirectoryString;
 use x509_cert::name::Name;

@@ -10,8 +10,8 @@
 //! - [`compute_digest`] + [`constant_time_eq`] for digest computation and comparison
 //! - [`verify_signature_with_pem_key`] for full pipeline validation (`SignedInfo` + `SignatureValue`)
 
+use crate::xml::dom::{Node, NodeId};
 use base64::Engine;
-use roxmltree::{Node, NodeId};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
@@ -971,7 +971,7 @@ pub enum DsigError {
 
     /// XML parsing failed.
     #[error("XML parse error: {0}")]
-    XmlParse(#[from] roxmltree::Error),
+    XmlParse(#[from] crate::xml::dom::ParseError),
 
     /// The owned XML document boundary rejected the document or identity.
     #[error("XML document error: {0}")]
@@ -2730,13 +2730,13 @@ fn verify_with_algorithm(
 mod tests {
     use super::*;
     use crate::c14n::C14nAlgorithm;
+    use crate::xml::dom::Document;
     use crate::xmldsig::TransformError;
     use crate::xmldsig::digest::DigestAlgorithm;
     use crate::xmldsig::parse::{Reference, parse_signed_info};
     use crate::xmldsig::transforms::Transform;
     use crate::xmldsig::uri::UriReferenceResolver;
     use base64::Engine;
-    use roxmltree::Document;
 
     // ── Helpers ──────────────────────────────────────────────────────
 

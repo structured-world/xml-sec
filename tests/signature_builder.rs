@@ -930,3 +930,4 @@ fn rejects_non_ncname_signature_and_reference_ids() {
             .expect_err("markup must not satisfy Reference Id validation");
     assert!(injected_reference_id.to_string().contains("Reference Id"));
 }
+use xml_sec as roxmltree;

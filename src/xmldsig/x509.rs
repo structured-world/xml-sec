@@ -1734,9 +1734,9 @@ mod tests {
     use std::str::FromStr as _;
 
     use super::*;
+    use crate::xml::dom::Document;
     use crate::xmldsig::{KeyInfoSource, parse::XMLDSIG_NS, parse_key_info};
     use p256::pkcs8::EncodePublicKey;
-    use roxmltree::Document;
     use sha2::{Digest, Sha256, Sha384};
     use signature::hazmat::PrehashSigner;
     use std::time::Duration;

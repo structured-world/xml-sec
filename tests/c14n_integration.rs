@@ -605,3 +605,4 @@ fn subset_no_spurious_xmlns_empty() {
         "xmlns=\"\" must NOT appear when no default ns in scope. Got: {result}"
     );
 }
+use xml_sec as roxmltree;

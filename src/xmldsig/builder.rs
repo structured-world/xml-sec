@@ -71,7 +71,7 @@ pub enum SignatureBuilderError {
     InvalidUtf8(#[from] std::string::FromUtf8Error),
     /// The generated template could not be parsed under the selected policy.
     #[error("generated XML template is invalid: {0}")]
-    GeneratedXml(#[from] roxmltree::Error),
+    GeneratedXml(#[from] crate::xml::dom::ParseError),
     /// The generated SignedInfo could not be canonicalized.
     #[error("generated SignedInfo canonicalization failed: {0}")]
     Canonicalization(#[from] crate::c14n::C14nError),

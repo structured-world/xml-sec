@@ -609,7 +609,7 @@ pub enum XmlEncError {
 
     /// XML document parsing failed.
     #[error("XML parsing error: {0}")]
-    XmlParse(#[from] roxmltree::Error),
+    XmlParse(#[from] crate::xml::dom::ParseError),
     /// The owned XML document boundary rejected an identity or mutation.
     #[error("XML document error: {0}")]
     Document(#[from] crate::document::XmlDocumentError),

@@ -1557,7 +1557,9 @@ fn signing_internal_dtd_policy_reaches_builder_and_mutation_reparses() {
     assert!(matches!(
         SignContext::new(&private_key).sign_with_builder(xml, &builder),
         Err(SigningError::XmlMutation(
-            xml_sec::xmldsig::mutation::XmlMutationError::XmlParse(roxmltree::Error::DtdDetected)
+            xml_sec::xmldsig::mutation::XmlMutationError::XmlParse(
+                xml_sec::ParseError::DtdDetected
+            )
         ))
     ));
 
@@ -2978,3 +2980,4 @@ fn signs_ecdsa_donor_templates_and_verifies_round_trip() {
         "tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem",
     );
 }
+use xml_sec as roxmltree;

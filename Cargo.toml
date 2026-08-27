@@ -42,7 +42,7 @@ required-features = ["xmlenc"]
 
 [dependencies]
 # XML parsing
-roxmltree = { version = "0.21", features = ["positions"] }
+roxmltree = { version = "0.21", features = ["positions"], optional = true }
 xmloxide = { version = "0.5", default-features = false, optional = true }
 quick-xml = "0.41"
 self_cell = "1.3"
@@ -82,6 +82,7 @@ base64 = "0.23"
 thiserror = "2"
 
 [dev-dependencies]
+roxmltree = { version = "0.21", features = ["positions"] }
 rcgen = "0.14.6"
 rand_chacha = "0.10"
 serde = { version = "1", features = ["derive"] }
@@ -92,7 +93,7 @@ tempfile = "3"
 [features]
 default = ["xmldsig", "xmlenc", "c14n", "xml-backend-xmloxide"]
 xml-backend-xmloxide = ["dep:xmloxide"]
-xml-backend-roxmltree = []
+xml-backend-roxmltree = ["dep:roxmltree"]
 xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:der",
     "dep:crypto-bigint",

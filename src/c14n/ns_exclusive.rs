@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use roxmltree::Node;
+use crate::xml::dom::Node;
 
 use super::NodeVisibility;
 use super::ns_common::collect_ns_declarations;
@@ -154,7 +154,7 @@ mod tests {
         C14nConfig, serialize_canonical, serialize_canonical_visible_with_position,
     };
     use super::*;
-    use roxmltree::Document;
+    use crate::xml::dom::Document;
     use std::collections::HashSet;
 
     struct NamespaceGapVisibility;

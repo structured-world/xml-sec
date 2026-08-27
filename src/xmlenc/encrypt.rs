@@ -2,12 +2,12 @@
 
 use std::{fmt, sync::Arc};
 
+use crate::xml::dom::{Document, Node};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use quick_xml::{
     Writer,
     events::{BytesEnd, BytesStart, BytesText, Event},
 };
-use roxmltree::{Document, Node};
 use rsa::RsaPublicKey;
 
 use crate::document::{
@@ -699,7 +699,7 @@ fn count_generated_encrypted_data_nodes(
     let generated =
         parse_borrowed_with_settings_and_budget(encrypted_data_xml, settings, Some(parse_budget))
             .map_err(|error| match error {
-            XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached) => {
+            XmlDocumentError::Parse(crate::xml::dom::ParseError::NodesLimitReached) => {
                 XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::XML_NODES,
                     maximum: maximum_nodes as usize,
@@ -1007,7 +1007,7 @@ fn validate_xml_plaintext(
                             actual: actual.saturating_sub(wrapper_bytes),
                         })
                     }
-                    XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached) => {
+                    XmlDocumentError::Parse(crate::xml::dom::ParseError::NodesLimitReached) => {
                         XmlEncError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                             resource: crate::policy::resource_name::XML_NODES,
                             maximum: settings.nodes_limit as usize,

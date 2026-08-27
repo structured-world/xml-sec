@@ -12,7 +12,7 @@
 //! unauthenticated legacy ciphers are intentionally outside this profile.
 #![doc = include_str!("../../docs/xmlenc.md")]
 
-use roxmltree::Node;
+use crate::xml::dom::Node;
 
 mod decrypt;
 mod encrypt;

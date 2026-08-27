@@ -462,3 +462,4 @@ fn spki_der_with_trailing_garbage_returns_typed_error() {
 
     assert!(matches!(err, SignatureVerificationError::InvalidKeyDer));
 }
+use xml_sec as roxmltree;

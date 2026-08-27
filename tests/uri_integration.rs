@@ -249,3 +249,4 @@ fn saml_enveloped_signature_exclusion() {
         "Assertion should remain: {result}"
     );
 }
+use xml_sec as roxmltree;

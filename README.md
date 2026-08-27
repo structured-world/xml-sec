@@ -23,7 +23,7 @@ XML Security in pure Rust, built to replace libxmlsec1.
 - **Native CLI** — `xmlsec1` command surface backed by the same Rust policy and provider pipelines
 - **Provider-neutral crypto** — typed capabilities and opaque key handles with RustCrypto as the pure-Rust default
 - **Reusable XML documents** — policy-aware retained parsing, stable semantic identities, shared indexes, and generation-safe mutation across C14N, XMLDSig, and XMLEnc
-- **Selectable XML parser frontend** — allocation-safe streaming preflight protects both the default `xmloxide` validation path and the explicitly testable `roxmltree`-only path
+- **Selectable XML backend** — `xmloxide` and `roxmltree` are interchangeable compile-time parsers behind one backend-neutral semantic DOM
 
 ## Why?
 
@@ -31,10 +31,9 @@ libxmlsec1 is the established XML Security implementation, but its native depend
 libxml2, a crypto backend, platform packages, and cross-compilation work to every deployment.
 
 `xml-sec` rebuilds that functionality on memory-safe Rust foundations: a bounded `quick-xml`
-preflight before DOM allocation, feature-selected XML validation, a source-preserving `roxmltree`
-semantic view for C14N/XPath/mutation, `quick-xml` for writing, RustCrypto for cryptography, and
-`x509-parser` for certificates. One
-Cargo dependency, no system XML or crypto libraries.
+preflight before DOM allocation, one feature-selected XML parser projected into a shared semantic
+arena for C14N/XPath/mutation, `quick-xml` for writing, RustCrypto for cryptography, and
+`x509-parser` for certificates. One Cargo dependency, no system XML or crypto libraries.
 
 ## Install
 
@@ -51,12 +50,14 @@ smaller dependency graph can select only the required library capabilities:
 xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c14n", "xml-backend-xmloxide"] }
 ```
 
-Select `xml-backend-roxmltree` instead to omit the xmloxide validation pass and use the retained
-roxmltree projection directly. Backend selection is compile-time only: document content and runtime
-policy cannot switch it. Both paths reject byte, node, and depth limits in the streaming preflight
-before building either DOM; stack-safe internal-entity traversal consumes the same cumulative parse
-work budget. Both retain the original source bytes and use the same semantic view, policy snapshot,
-C14N, XPath, signature, encryption, and mutation pipelines.
+Select `xml-backend-roxmltree` instead to use `roxmltree` as the parser. The backend features are
+mutually exclusive and selection is compile-time only: document content and runtime policy cannot
+switch it. Both adapters populate the same source-preserving semantic arena, and no C14N, XPath,
+signature, encryption, or mutation code branches on parser type. A bounded streaming preflight
+rejects byte, node, and depth limits before either backend allocates its DOM; stack-safe
+internal-entity traversal consumes the same cumulative parse-work budget. The `xmloxide` adapter
+adds a lexical position sidecar because its native tree does not retain the source ranges required
+for namespace-correct mutation.
 
 ```toml
 xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c14n", "xml-backend-roxmltree"] }
@@ -121,8 +122,8 @@ diagnostics, and interoperability boundaries.
 verifies it through the embedded X.509 certificate:
 
 ```sh
-cargo run --example sign --all-features > signed.xml
-cargo run --example verify --all-features -- signed.xml
+cargo run --example sign > signed.xml
+cargo run --example verify -- signed.xml
 ```
 
 See [XML Digital Signatures](docs/xmldsig.md) for supported algorithms, transform

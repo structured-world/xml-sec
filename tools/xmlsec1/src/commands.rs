@@ -7,7 +7,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use roxmltree::{Document, Node, ParsingOptions};
 use rsa::{
     RsaPublicKey,
     pkcs8::{DecodePublicKey as _, EncodePublicKey as _},
@@ -37,6 +36,9 @@ use xml_sec::{
         PrivateKeyDecryptor, RsaOaepParameters, XmlEncError,
         parse_encrypted_data_template_node_with_policy, validate_rsa_recipient_key,
     },
+};
+use xml_sec::{
+    XmlDomDocument as Document, XmlDomNode as Node, XmlDomParsingOptions as ParsingOptions,
 };
 
 use crate::{
@@ -1965,7 +1967,7 @@ fn xml_data_plaintext<'a>(
 fn append_serialized_xml_child(
     output: &mut String,
     source: &str,
-    node: roxmltree::Node<'_, '_>,
+    node: Node<'_, '_>,
     maximum: usize,
 ) -> Result<(), CommandError> {
     if node.is_element() {
@@ -2458,7 +2460,7 @@ fn apply_encryption_template(
 
 fn append_element_children_replacement(
     source: &str,
-    node: roxmltree::Node<'_, '_>,
+    node: Node<'_, '_>,
     children: &str,
 ) -> Result<(std::ops::Range<usize>, String), CommandError> {
     let fragment = &source[node.range()];
@@ -2562,7 +2564,7 @@ fn replace_element_text(
     ))
 }
 
-fn standalone_element(source: &str, node: roxmltree::Node<'_, '_>) -> Result<String, CommandError> {
+fn standalone_element(source: &str, node: Node<'_, '_>) -> Result<String, CommandError> {
     let mut output = String::new();
     append_standalone_element(&mut output, source, node, usize::MAX)?;
     Ok(output)
@@ -2571,7 +2573,7 @@ fn standalone_element(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Str
 fn append_standalone_element(
     output: &mut String,
     source: &str,
-    node: roxmltree::Node<'_, '_>,
+    node: Node<'_, '_>,
     maximum: usize,
 ) -> Result<(), CommandError> {
     let fragment = &source[node.range()];
@@ -2667,18 +2669,18 @@ fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, Comman
 }
 
 fn direct_child_element<'a, 'input>(
-    node: roxmltree::Node<'a, 'input>,
+    node: Node<'a, 'input>,
     namespace: &str,
     name: &str,
-) -> Option<roxmltree::Node<'a, 'input>> {
+) -> Option<Node<'a, 'input>> {
     node.children()
         .find(|child| child.has_tag_name((namespace, name)))
 }
 
 fn required_cipher_value<'a, 'input>(
-    parent: roxmltree::Node<'a, 'input>,
+    parent: Node<'a, 'input>,
     owner: &str,
-) -> Result<roxmltree::Node<'a, 'input>, CommandError> {
+) -> Result<Node<'a, 'input>, CommandError> {
     let cipher_data = singleton_direct_child(
         parent,
         XMLENC_NS,
@@ -2696,9 +2698,9 @@ fn required_cipher_value<'a, 'input>(
 }
 
 fn encrypted_key_cipher_values<'a, 'input>(
-    key_info: roxmltree::Node<'a, 'input>,
+    key_info: Node<'a, 'input>,
     owner: &str,
-) -> Result<Vec<roxmltree::Node<'a, 'input>>, CommandError> {
+) -> Result<Vec<Node<'a, 'input>>, CommandError> {
     direct_encrypted_keys(key_info)
         .into_iter()
         .enumerate()
@@ -2711,9 +2713,7 @@ fn encrypted_key_cipher_values<'a, 'input>(
         .collect()
 }
 
-fn direct_encrypted_keys<'a, 'input>(
-    key_info: roxmltree::Node<'a, 'input>,
-) -> Vec<roxmltree::Node<'a, 'input>> {
+fn direct_encrypted_keys<'a, 'input>(key_info: Node<'a, 'input>) -> Vec<Node<'a, 'input>> {
     key_info
         .children()
         .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
@@ -3289,7 +3289,6 @@ fn parse_encryption_document<'a>(
         ParsingOptions {
             allow_dtd: xml_policy.allow_internal_dtd,
             nodes_limit,
-            entity_resolver: None,
         },
     )
     .map_err(|error| CommandError::Encryption(error.to_string()))

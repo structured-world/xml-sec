@@ -4,7 +4,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use roxmltree::Document;
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
     pkcs1::{DecodeRsaPrivateKey as _, DecodeRsaPublicKey as _},
@@ -18,6 +17,9 @@ use xml_sec::xmldsig::{
     DsaSigningKey, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey, KeyInfo,
     RsaSigningKey, SignatureAlgorithm, SigningKey, VerificationKey, find_signature_node,
     parse_key_info, parse_signed_info, uri::UriReferenceResolver,
+};
+use xml_sec::{
+    XmlDomDocument as Document, XmlDomNode as Node, XmlDomParsingOptions as ParsingOptions,
 };
 
 // This is an absolute process-safety ceiling, not deployment policy. Parsed
@@ -186,7 +188,7 @@ fn select_signature<'a>(
     document: &'a Document<'a>,
     start_node_id: Option<&str>,
     id_attributes: &[xml_sec::IdAttributeRegistration],
-) -> Result<roxmltree::Node<'a, 'a>, KeyMaterialError> {
+) -> Result<Node<'a, 'a>, KeyMaterialError> {
     match start_node_id {
         Some(id) => UriReferenceResolver::with_id_registrations(document, id_attributes)
             .node_for_id(id)
@@ -208,16 +210,15 @@ fn parse_signature_document(
     })?;
     Document::parse_with_options(
         xml,
-        roxmltree::ParsingOptions {
+        ParsingOptions {
             allow_dtd: allow_internal_dtd,
             nodes_limit,
-            entity_resolver: None,
         },
     )
     .map_err(|error| KeyMaterialError::Signature(error.to_string()))
 }
 
-fn signature_key_names(signature: roxmltree::Node<'_, '_>) -> Vec<String> {
+fn signature_key_names(signature: Node<'_, '_>) -> Vec<String> {
     signature_key_info(signature)
         .into_iter()
         .flat_map(|key_info| key_info.children())
@@ -225,16 +226,14 @@ fn signature_key_names(signature: roxmltree::Node<'_, '_>) -> Vec<String> {
         .map(|key_name| {
             key_name
                 .children()
-                .filter(roxmltree::Node::is_text)
+                .filter(Node::is_text)
                 .filter_map(|child| child.text())
                 .collect()
         })
         .collect()
 }
 
-fn signature_key_info<'a, 'input>(
-    signature: roxmltree::Node<'a, 'input>,
-) -> Option<roxmltree::Node<'a, 'input>> {
+fn signature_key_info<'a, 'input>(signature: Node<'a, 'input>) -> Option<Node<'a, 'input>> {
     signature
         .children()
         .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))

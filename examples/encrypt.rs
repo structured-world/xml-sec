@@ -1,6 +1,6 @@
 //! Encrypt an XML element for an RSA-OAEP recipient.
 //!
-//! Run with `cargo run --example encrypt --all-features`. The example uses a
+//! Run with `cargo run --example encrypt`. The example uses a
 //! test public key solely to demonstrate the API; applications must resolve
 //! recipient keys from authenticated configuration or certificate metadata.
 

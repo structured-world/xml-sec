@@ -10,103 +10,21 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::xml::dom::{Document, Node, NodeId, ParseError, ParsingOptions};
 use quick_xml::{
     Reader as QuickXmlReader,
     events::{BytesStart as QuickXmlBytesStart, Event as QuickXmlEvent},
 };
-use roxmltree::{Document, Node, NodeId, ParsingOptions};
 use self_cell::self_cell;
 
 use crate::IdAttributeRegistration;
+use crate::xml::dom::{SemanticDocument, SemanticNodeId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DocumentMetrics {
     node_count: usize,
     max_depth: usize,
 }
-
-trait XmlParserBackend {
-    fn validate_after_bounded_projection(
-        xml: &str,
-        settings: DocumentParseSettings,
-        bounded: DocumentMetrics,
-        budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<DocumentMetrics, XmlDocumentError>;
-}
-
-#[cfg(not(feature = "xml-backend-xmloxide"))]
-struct RoxmltreeParser;
-
-#[cfg(not(feature = "xml-backend-xmloxide"))]
-impl XmlParserBackend for RoxmltreeParser {
-    fn validate_after_bounded_projection(
-        _xml: &str,
-        _settings: DocumentParseSettings,
-        bounded: DocumentMetrics,
-        _budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<DocumentMetrics, XmlDocumentError> {
-        // The retained semantic projection below is itself the roxmltree
-        // validation pass, so this adapter must not parse the document twice.
-        Ok(bounded)
-    }
-}
-
-#[cfg(feature = "xml-backend-xmloxide")]
-struct XmloxideParser;
-
-#[cfg(feature = "xml-backend-xmloxide")]
-impl XmlParserBackend for XmloxideParser {
-    fn validate_after_bounded_projection(
-        xml: &str,
-        settings: DocumentParseSettings,
-        bounded: DocumentMetrics,
-        budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<DocumentMetrics, XmlDocumentError> {
-        // xmloxide 0.5 has no aggregate node-count parser option. Requiring a
-        // bounded retained projection here ensures wide input is rejected
-        // before xmloxide can allocate its tree.
-        charge_parse_work(budget, xml.len())?;
-        let options = xmloxide_parse_options(settings);
-        xmloxide::parser::parse_str_with_options(xml, &options).map_err(|error| {
-            if error.message.contains("maximum nesting depth exceeded") {
-                XmlDocumentError::DocumentTooDeep {
-                    maximum: settings.depth_limit,
-                    actual: settings.depth_limit.saturating_add(1),
-                }
-            } else {
-                XmlDocumentError::BackendParse {
-                    backend: "xmloxide",
-                    message: error.to_string(),
-                }
-            }
-        })?;
-        // Aggregate node policy is defined over the shared retained semantic
-        // projection. xmloxide can expose a different lexical node count for
-        // contiguous entity/CDATA text, so it must not replace those metrics.
-        Ok(bounded)
-    }
-}
-
-#[cfg(feature = "xml-backend-xmloxide")]
-fn xmloxide_parse_options(settings: DocumentParseSettings) -> xmloxide::parser::ParseOptions {
-    let maximum_depth = u32::try_from(settings.depth_limit).unwrap_or(u32::MAX);
-    // Retained semantic nodes and source bytes are different resources from
-    // xmloxide's per-element and post-expansion lexical limits. Disable those
-    // backend-specific caps so selecting a parser cannot narrow the shared
-    // document contract; the bounded preflight remains authoritative.
-    xmloxide::parser::ParseOptions::default()
-        .max_depth(maximum_depth)
-        .max_attributes(u32::MAX)
-        .max_attribute_length(usize::MAX)
-        .max_text_length(usize::MAX)
-        .max_name_length(usize::MAX)
-        .max_entity_expansions(u32::MAX)
-}
-
-#[cfg(feature = "xml-backend-xmloxide")]
-type SelectedXmlParser = XmloxideParser;
-#[cfg(not(feature = "xml-backend-xmloxide"))]
-type SelectedXmlParser = RoxmltreeParser;
 
 static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(1);
 const VALIDATION_WRAPPER_NS: &str = "urn:xml-sec:owned-document-validation";
@@ -118,7 +36,7 @@ const VALIDATION_WRAPPER_NODE_OVERHEAD: u32 = 3;
 
 #[cfg(test)]
 fn selected_parser_passes() -> usize {
-    2 + usize::from(cfg!(feature = "xml-backend-xmloxide"))
+    2
 }
 
 /// Process-local provenance of one owned XML document.
@@ -130,7 +48,7 @@ pub struct DocumentIdentity(u64);
 pub struct NodeIdentity {
     document: DocumentIdentity,
     generation: u64,
-    backend: NodeId,
+    semantic_id: SemanticNodeId,
 }
 
 /// Identity of one XPath attribute node and its owning element.
@@ -469,15 +387,6 @@ struct ParsedDocument<'input> {
     max_depth: usize,
 }
 
-impl ParsedDocument<'_> {
-    const fn metrics(&self) -> DocumentMetrics {
-        DocumentMetrics {
-            node_count: self.node_count,
-            max_depth: self.max_depth,
-        }
-    }
-}
-
 self_cell!(
     struct DocumentCell {
         owner: String,
@@ -513,15 +422,7 @@ pub enum XmlDocumentError {
     },
     /// The XML parser rejected the document.
     #[error("XML parsing error: {0}")]
-    Parse(#[from] roxmltree::Error),
-    /// The selected parser backend rejected the document.
-    #[error("XML parsing error from {backend}: {message}")]
-    BackendParse {
-        /// Compile-time selected parser backend.
-        backend: &'static str,
-        /// Stable human-readable parser diagnostic.
-        message: String,
-    },
+    Parse(#[from] ParseError),
     /// An identity belongs to another document.
     #[error("XML identity belongs to a different document")]
     ForeignIdentity,
@@ -575,7 +476,7 @@ impl XmlDocumentError {
                     actual,
                 }
             }
-            Self::Parse(roxmltree::Error::NodesLimitReached) => {
+            Self::Parse(ParseError::NodesLimitReached) => {
                 crate::policy::PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::XML_NODES,
                     maximum: settings.nodes_limit as usize,
@@ -1148,7 +1049,7 @@ impl XmlDocument {
             budget,
         )
         .map_err(|error| match (policy_bounded, error) {
-            (true, XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached)) => {
+            (true, XmlDocumentError::Parse(ParseError::NodesLimitReached)) => {
                 XmlDocumentError::ProjectedNodeLimit {
                     maximum: active_nodes_limit,
                 }
@@ -1280,7 +1181,7 @@ impl XmlDocument {
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
         let next = build_cell(xml, settings, budget).map_err(|error| match error {
-            XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached) => {
+            XmlDocumentError::Parse(ParseError::NodesLimitReached) => {
                 XmlDocumentError::ProjectedNodeLimit {
                     maximum: settings.nodes_limit as usize,
                 }
@@ -1603,7 +1504,7 @@ impl XmlDocument {
             budget,
         )
         .map_err(|error| match (maximum, error) {
-            (Some(_), XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached)) => {
+            (Some(_), XmlDocumentError::Parse(ParseError::NodesLimitReached)) => {
                 XmlDocumentError::ProjectedNodeLimit {
                     maximum: active_nodes_limit as usize,
                 }
@@ -1751,7 +1652,7 @@ impl<'a> DocumentView<'a> {
         self.parsed
             .indexes
             .order
-            .get(&identity.backend)
+            .get(&self.resolve_node(identity)?.id())
             .copied()
             .ok_or(XmlDocumentError::MissingNode)
     }
@@ -1819,15 +1720,20 @@ impl<'a> DocumentView<'a> {
     }
 
     pub(crate) fn node_identity(self, node: Node<'_, '_>) -> NodeIdentity {
-        self.node_identity_by_id(node.id())
-    }
-
-    pub(crate) fn node_identity_by_id(self, backend: NodeId) -> NodeIdentity {
         NodeIdentity {
             document: self.identity,
             generation: self.generation,
-            backend,
+            semantic_id: SemanticDocument::node_id(&self.parsed.document, node),
         }
+    }
+
+    pub(crate) fn node_identity_by_id(self, backend: NodeId) -> NodeIdentity {
+        let node = self
+            .parsed
+            .document
+            .get_node(backend)
+            .expect("indexed backend node must remain in the retained document");
+        self.node_identity(node)
     }
 
     pub(crate) fn resolve_node(
@@ -1835,9 +1741,7 @@ impl<'a> DocumentView<'a> {
         identity: NodeIdentity,
     ) -> Result<Node<'a, 'a>, XmlDocumentError> {
         self.validate_identity(identity)?;
-        self.parsed
-            .document
-            .get_node(identity.backend)
+        SemanticDocument::node(&self.parsed.document, identity.semantic_id)
             .ok_or(XmlDocumentError::MissingNode)
     }
 
@@ -1924,25 +1828,15 @@ fn build_cell_after_preflight(
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<DocumentCell, XmlDocumentError> {
     charge_parse_work(budget, xml.len())?;
-    let cell = build_roxmltree_cell(xml, settings)?;
-    cell.with_dependent(|source, parsed| {
-        SelectedXmlParser::validate_after_bounded_projection(
-            source,
-            settings,
-            parsed.metrics(),
-            budget,
-        )
-        .map(|_| ())
-    })?;
-    Ok(cell)
+    build_semantic_cell(xml, settings)
 }
 
-fn build_roxmltree_cell(
+fn build_semantic_cell(
     xml: String,
     settings: DocumentParseSettings,
 ) -> Result<DocumentCell, XmlDocumentError> {
     DocumentCell::try_new(xml, |source| {
-        let (document, metrics) = parse_roxmltree_projection(source, settings)?;
+        let (document, metrics) = parse_semantic_document(source, settings)?;
         let indexes = DocumentIndexes::build(&document);
         Ok::<_, XmlDocumentError>(ParsedDocument {
             document,
@@ -1966,8 +1860,7 @@ pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
     }
     preflight_document_limits(xml, settings, budget)?;
     charge_parse_work(budget, xml.len())?;
-    let (document, metrics) = parse_roxmltree_projection(xml, settings)?;
-    SelectedXmlParser::validate_after_bounded_projection(xml, settings, metrics, budget)?;
+    let (document, _) = parse_semantic_document(xml, settings)?;
     Ok(document)
 }
 
@@ -2400,7 +2293,7 @@ fn observe_preflight_node(
     }
     state.nodes = state.nodes.saturating_add(1);
     if state.nodes > settings.nodes_limit {
-        return Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached));
+        return Err(XmlDocumentError::Parse(ParseError::NodesLimitReached));
     }
     Ok(())
 }
@@ -2641,7 +2534,7 @@ fn find_unquoted_byte(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
     None
 }
 
-fn parse_roxmltree_projection<'a>(
+fn parse_semantic_document<'a>(
     source: &'a str,
     settings: DocumentParseSettings,
 ) -> Result<(Document<'a>, DocumentMetrics), XmlDocumentError> {
@@ -2650,7 +2543,6 @@ fn parse_roxmltree_projection<'a>(
         ParsingOptions {
             allow_dtd: settings.allow_dtd,
             nodes_limit: settings.nodes_limit,
-            entity_resolver: None,
         },
     )
     .map_err(XmlDocumentError::Parse)?;
@@ -2737,7 +2629,6 @@ fn document_requires_internal_dtd(
         ParsingOptions {
             allow_dtd: false,
             nodes_limit: settings.nodes_limit,
-            entity_resolver: None,
         },
     )
     .is_err())
@@ -2873,26 +2764,24 @@ fn element_opening_end(element: &str) -> Result<usize, XmlDocumentError> {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "xml-backend-xmloxide")]
     #[test]
-    fn xmloxide_accepts_the_retained_semantic_projection() {
-        // The retained roxmltree projection owns shared metrics and indexes;
-        // the selected backend adds strict syntax validation without replacing
-        // those semantics with a backend-specific node model.
+    fn selected_backend_builds_the_retained_semantic_projection() {
         let settings = DocumentParseSettings::default();
         let xml =
             r#"<root xmlns:p="urn:test"><p:item ID="target"><![CDATA[value]]></p:item></root>"#;
-        let retained = build_roxmltree_cell(xml.to_owned(), settings)
-            .expect("roxmltree semantic projection must parse");
-        retained.with_dependent(|source, parsed| {
-            XmloxideParser::validate_after_bounded_projection(
-                source,
-                settings,
-                parsed.metrics(),
-                None,
-            )
-            .expect("xmloxide must accept the fixture");
+        let retained = build_semantic_cell(xml.to_owned(), settings)
+            .expect("selected backend semantic projection must parse");
+        retained.with_dependent(|_, parsed| {
             assert!(parsed.indexes.default_ids.contains_key("target"));
+            assert_eq!(
+                parsed
+                    .document
+                    .root_element()
+                    .first_element_child()
+                    .expect("fixture must contain the indexed child element")
+                    .text(),
+                Some("value")
+            );
         });
     }
 
@@ -2904,13 +2793,6 @@ mod tests {
         // otherwise bounded element that the semantic projection accepts.
         let xml = r#"<root a="1" b="2" c="3"/>"#;
         let settings = DocumentParseSettings::new(false, 2, xml.len());
-        let options = xmloxide_parse_options(settings);
-
-        assert_eq!(options.max_attributes, u32::MAX);
-        assert_eq!(options.max_attribute_length, usize::MAX);
-        assert_eq!(options.max_text_length, usize::MAX);
-        assert_eq!(options.max_name_length, usize::MAX);
-        assert_eq!(options.max_entity_expansions, u32::MAX);
         build_cell(xml.to_owned(), settings, None)
             .expect("attributes must not consume the retained node allowance");
     }
@@ -2929,7 +2811,7 @@ mod tests {
 
         assert!(matches!(
             build_cell(xml.to_owned(), settings, Some(&budget)),
-            Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached))
+            Err(XmlDocumentError::Parse(ParseError::NodesLimitReached))
         ));
     }
 
@@ -2948,7 +2830,7 @@ mod tests {
                 DocumentParseSettings::new(false, 2, xml.len()),
                 None,
             ),
-            Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached))
+            Err(XmlDocumentError::Parse(ParseError::NodesLimitReached))
         ));
     }
 
@@ -2972,7 +2854,7 @@ mod tests {
 
         assert!(matches!(
             preflight_document_limits(xml, settings, None),
-            Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached))
+            Err(XmlDocumentError::Parse(ParseError::NodesLimitReached))
         ));
     }
 
@@ -3188,16 +3070,14 @@ mod tests {
     }
 
     #[test]
-    fn roxmltree_backend_enforces_exact_depth_boundary() {
-        // The compatibility backend must enforce the same typed nesting
-        // policy as the default parser rather than relying on backend defaults.
+    fn selected_backend_enforces_exact_depth_boundary() {
         let settings = DocumentParseSettings::new_with_depth(false, 128, 2, 4_096);
         let accepted = nested_document(2);
-        build_roxmltree_cell(accepted, settings).expect("exact depth must parse");
+        build_semantic_cell(accepted, settings).expect("exact depth must parse");
 
         let rejected = nested_document(3);
         assert!(matches!(
-            build_roxmltree_cell(rejected, settings),
+            build_semantic_cell(rejected, settings),
             Err(XmlDocumentError::DocumentTooDeep {
                 maximum: 2,
                 actual: 3,

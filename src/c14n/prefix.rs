@@ -1,55 +1,21 @@
-//! Lexical prefix extraction from roxmltree nodes.
-//!
-//! roxmltree's DOM stores only `(namespace_uri, local_name)` — the lexical
-//! prefix is discarded during parsing. We recover it from the source XML
-//! using byte-range positions (`roxmltree` `positions` feature).
-//!
-//! This avoids ambiguity when multiple prefixes bind the same namespace URI
-//! (e.g., `xmlns:a="u" xmlns:b="u"`), where `lookup_prefix()` would return
-//! an arbitrary match.
+//! Lexical prefix access through the backend-neutral semantic tree.
 
-use roxmltree::{Attribute, Node};
+use crate::xml::dom::{Attribute, Node};
 
 /// Extract the lexical prefix of an element from the source XML.
 ///
 /// Returns `""` for unprefixed elements, or the prefix string (e.g., `"foo"`
 /// for `<foo:Bar>`).
 pub(crate) fn element_prefix<'a>(node: Node<'a, '_>) -> &'a str {
-    let input = node.document().input_text();
-    let range = node.range();
-
-    // range starts at '<', skip it to get to the QName
-    let tag_start = range.start + 1;
-    let tag_bytes = input.as_bytes();
-
-    // Find end of QName: first space, '>', or '/'
-    let mut qname_end = tag_start;
-    while qname_end < input.len() {
-        match tag_bytes[qname_end] {
-            b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/' => break,
-            _ => qname_end += 1,
-        }
-    }
-
-    let qname = &input[tag_start..qname_end];
-    match qname.find(':') {
-        Some(pos) => &qname[..pos],
-        None => "",
-    }
+    node.prefix().unwrap_or_default()
 }
 
 /// Extract the lexical prefix of an attribute from the source XML.
 ///
 /// Returns `""` for unprefixed attributes, or the prefix string (e.g., `"xml"`
 /// for `xml:lang="en"`).
-pub(crate) fn attribute_prefix<'a>(node: Node<'a, '_>, attr: &Attribute<'a, '_>) -> &'a str {
-    let input = node.document().input_text();
-    let qname_range = attr.range_qname();
-    let qname = &input[qname_range];
-    match qname.find(':') {
-        Some(pos) => &qname[..pos],
-        None => "",
-    }
+pub(crate) fn attribute_prefix<'a>(_node: Node<'a, '_>, attr: &Attribute<'a>) -> &'a str {
+    attr.prefix().unwrap_or_default()
 }
 
 /// Check whether `xmlns=""` on `node` would be meaningful — i.e., whether
@@ -86,7 +52,7 @@ pub(crate) fn has_in_scope_default_namespace(node: Node) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use roxmltree::Document;
+    use crate::xml::dom::Document;
 
     #[test]
     fn prefixed_element() {

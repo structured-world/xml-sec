@@ -2,9 +2,9 @@
 
 use std::{fmt, sync::Arc};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 #[cfg(test)]
-use roxmltree::Document;
+use crate::xml::dom::Document;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use crate::document::{DocumentParseSettings, XmlDocument, XmlParseWorkBudget};
 use rsa::RsaPrivateKey;
@@ -3672,7 +3672,9 @@ mod tests {
         );
         assert!(matches!(
             decrypt_document(&with_dtd, None, &SymmetricKeyDecryptor::new(key)),
-            Err(XmlEncError::XmlParse(roxmltree::Error::DtdDetected))
+            Err(XmlEncError::XmlParse(
+                crate::xml::dom::ParseError::DtdDetected
+            ))
         ));
         let mut policy = crate::policy::DecryptionPolicy::default();
         policy.xml.allow_internal_dtd = true;

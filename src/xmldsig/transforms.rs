@@ -22,8 +22,8 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 
+use crate::xml::dom::{Document, Node, NodeId, NodeType};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use roxmltree::{Document, Node, NodeId, NodeType};
 use sha2::{Digest as _, Sha256};
 
 use super::parse::XMLDSIG_NS;
@@ -217,8 +217,8 @@ impl C14nOutputBudget {
 mod c14n_budget_regression_tests {
     use super::*;
     use crate::c14n::C14nMode;
+    use crate::xml::dom::Document;
     use crate::xmldsig::types::NodeSet;
-    use roxmltree::Document;
 
     #[test]
     fn bounded_c14n_failure_exhausts_the_shared_budget() {
@@ -471,8 +471,8 @@ impl TransformOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct XPathHereNodes {
-    specification_xpath_element: roxmltree::NodeId,
-    xmlsec_legacy_transform_element: roxmltree::NodeId,
+    specification_xpath_element: NodeId,
+    xmlsec_legacy_transform_element: NodeId,
     document: XPathDocumentIdentity,
 }
 
@@ -565,10 +565,7 @@ impl XPathExpression {
         &self.namespaces
     }
 
-    pub(crate) fn here_context_node(
-        &self,
-        semantics: XPathHereSemantics,
-    ) -> Option<roxmltree::NodeId> {
+    pub(crate) fn here_context_node(&self, semantics: XPathHereSemantics) -> Option<NodeId> {
         self.here_nodes.map(|nodes| match semantics {
             XPathHereSemantics::Specification => nodes.specification_xpath_element,
             XPathHereSemantics::XmlSecLegacy => nodes.xmlsec_legacy_transform_element,
@@ -1760,7 +1757,7 @@ fn parse_xpath_filter2_transform(
 
 fn parse_xpath_expression(
     xpath_node: Node,
-    transform_node: roxmltree::NodeId,
+    transform_node: NodeId,
     xpath_state: &mut XPathParseState,
 ) -> Result<XPathExpression, TransformError> {
     let mut source = String::new();
@@ -2128,8 +2125,8 @@ fn parse_inclusive_prefixes(transform_node: Node) -> Result<Option<String>, Tran
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
     use super::*;
+    use crate::xml::dom::Document;
     use crate::xmldsig::NodeSet;
-    use roxmltree::Document;
 
     fn assert_resource_limit(error: &TransformError, expected_resource: &'static str) {
         assert!(
