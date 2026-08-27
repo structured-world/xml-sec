@@ -81,6 +81,10 @@ key whose component width cannot be represented by the selected wire format is
 rejected before signing.
 P-521 signing and verification use the same key-selected ECDSA framing contract
 as P-256 and P-384.
+Recursive `KeyInfoReference` materialization shares one candidate-work budget
+across the complete reference graph. Each dereference and terminal source is
+charged before expansion, so a shallow fan-out DAG cannot allocate an
+exponential flattened source list while remaining below the depth limit.
 `IdAttributeRegistration` supplies immutable request context for non-standard ID attributes.
 `SignContext::id_attributes` and `VerifyContext::id_attributes` apply the same global or
 element-scoped registrations to operation start-node selection and every same-document Reference.

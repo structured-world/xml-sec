@@ -389,7 +389,8 @@ pub struct ResourcePolicy {
     pub max_encryption_recipients: usize,
     /// Maximum caller-controlled XMLEnc metadata bytes per field.
     pub max_encryption_metadata_bytes: usize,
-    /// Maximum key and certificate candidates inspected by one operation.
+    /// Maximum key-source expansion work and concrete key or certificate
+    /// candidates inspected by one operation stage.
     pub max_key_candidates: usize,
     /// Maximum nested `KeyInfoReference` dereference depth.
     pub max_key_info_reference_depth: usize,

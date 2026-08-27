@@ -823,6 +823,9 @@ fn x509_signature_algorithm(
         "1.2.840.113549.1.1.5" | "1.3.14.3.2.29" => {
             X509SignatureAlgorithm::RsaPkcs1v15(super::DigestAlgorithm::Sha1)
         }
+        "1.2.840.113549.1.1.14" => {
+            X509SignatureAlgorithm::RsaPkcs1v15(super::DigestAlgorithm::Sha224)
+        }
         "1.2.840.113549.1.1.11" => {
             X509SignatureAlgorithm::RsaPkcs1v15(super::DigestAlgorithm::Sha256)
         }
@@ -834,6 +837,7 @@ fn x509_signature_algorithm(
         }
         "1.2.840.113549.1.1.10" => parse_rsa_pss_algorithm(identifier)?,
         "1.2.840.10045.4.1" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha1),
+        "1.2.840.10045.4.3.1" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha224),
         "1.2.840.10045.4.3.2" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha256),
         "1.2.840.10045.4.3.3" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha384),
         "1.2.840.10045.4.3.4" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha512),
@@ -2102,6 +2106,14 @@ mod tests {
                 X509SignatureAlgorithm::Ecdsa(super::super::DigestAlgorithm::Sha1),
             ),
             (
+                "1.2.840.113549.1.1.14",
+                X509SignatureAlgorithm::RsaPkcs1v15(super::super::DigestAlgorithm::Sha224),
+            ),
+            (
+                "1.2.840.10045.4.3.1",
+                X509SignatureAlgorithm::Ecdsa(super::super::DigestAlgorithm::Sha224),
+            ),
+            (
                 "1.2.840.10045.4.3.4",
                 X509SignatureAlgorithm::Ecdsa(super::super::DigestAlgorithm::Sha512),
             ),
@@ -2124,6 +2136,7 @@ mod tests {
             "1.2.840.10040.4.3",
             "2.16.840.1.101.3.4.3.2",
             "1.2.840.10045.4.1",
+            "1.2.840.10045.4.3.1",
             "1.2.840.10045.4.3.2",
             "1.3.101.112",
         ] {
@@ -2142,26 +2155,37 @@ mod tests {
 
         // RSA PKCS#1 signature identifiers accept absent and NULL parameters
         // for interoperability, but no other ASN.1 value.
-        let rsa_oid =
-            Oid::from_str("1.2.840.113549.1.1.11").expect("static RSA signature OID must parse");
-        for parameters in [None, Some(Any::from_tag_and_data(Tag::Null, &[]))] {
+        for (oid, digest) in [
+            (
+                "1.2.840.113549.1.1.14",
+                super::super::DigestAlgorithm::Sha224,
+            ),
+            (
+                "1.2.840.113549.1.1.11",
+                super::super::DigestAlgorithm::Sha256,
+            ),
+        ] {
+            let rsa_oid = Oid::from_str(oid).expect("static RSA signature OID must parse");
+            for parameters in [None, Some(Any::from_tag_and_data(Tag::Null, &[]))] {
+                assert_eq!(
+                    x509_signature_algorithm(&AlgorithmIdentifier::new(
+                        rsa_oid.clone(),
+                        parameters,
+                    )),
+                    Ok(X509SignatureAlgorithm::RsaPkcs1v15(digest)),
+                );
+            }
             assert!(matches!(
-                x509_signature_algorithm(&AlgorithmIdentifier::new(rsa_oid.clone(), parameters)),
-                Ok(X509SignatureAlgorithm::RsaPkcs1v15(
-                    super::super::DigestAlgorithm::Sha256
-                ))
+                x509_signature_algorithm(&AlgorithmIdentifier::new(
+                    rsa_oid,
+                    Some(Any::from_tag_and_data(Tag::OctetString, &[])),
+                )),
+                Err(X509ChainError::InvalidDer {
+                    kind: "X.509 signature AlgorithmIdentifier parameters",
+                    ..
+                })
             ));
         }
-        assert!(matches!(
-            x509_signature_algorithm(&AlgorithmIdentifier::new(
-                rsa_oid,
-                Some(Any::from_tag_and_data(Tag::OctetString, &[])),
-            )),
-            Err(X509ChainError::InvalidDer {
-                kind: "X.509 signature AlgorithmIdentifier parameters",
-                ..
-            })
-        ));
     }
 
     #[test]

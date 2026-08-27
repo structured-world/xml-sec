@@ -1583,6 +1583,12 @@ struct RetrievalMaterializationBudgets<'a> {
     resources: &'a crate::policy::ResourcePolicy,
 }
 
+#[derive(Default)]
+struct KeyInfoReferenceTraversal {
+    active: HashSet<String>,
+    candidate_materialization_work: usize,
+}
+
 fn materialize_key_info_references(
     key_info: &mut KeyInfo,
     resolver: &UriReferenceResolver<'_>,
@@ -1596,11 +1602,22 @@ fn materialize_key_info_references(
         policy: &crate::policy::VerificationPolicy,
         provider: &dyn crate::provider::CryptoProvider,
         execution: &TransformExecutionBudget,
-        active: &mut HashSet<String>,
+        traversal: &mut KeyInfoReferenceTraversal,
         depth: usize,
     ) -> Result<(), SignatureVerificationPipelineError> {
         let mut materialized = Vec::new();
         for source in std::mem::take(&mut key_info.sources) {
+            let source_work = match &source {
+                super::parse::KeyInfoSource::X509Data(info) => info.certificates.len().max(1),
+                _ => 1,
+            };
+            traversal.candidate_materialization_work = traversal
+                .candidate_materialization_work
+                .saturating_add(source_work);
+            policy
+                .resources
+                .validate_key_candidates(traversal.candidate_materialization_work)?;
+
             let super::parse::KeyInfoSource::KeyInfoReference { uri } = source else {
                 materialized.push(source);
                 continue;
@@ -1627,7 +1644,7 @@ fn materialize_key_info_references(
                 }
                 .into());
             }
-            if !active.insert(uri.clone()) {
+            if !traversal.active.insert(uri.clone()) {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "KeyInfoReference cycle detected",
                 });
@@ -1711,7 +1728,7 @@ fn materialize_key_info_references(
                         policy,
                         provider,
                         execution,
-                        active,
+                        traversal,
                         next_depth,
                     )?;
                     Ok(referenced)
@@ -1724,11 +1741,11 @@ fn materialize_key_info_references(
                     policy,
                     provider,
                     execution,
-                    active,
+                    traversal,
                     next_depth,
                 )?;
             }
-            active.remove(&uri);
+            traversal.active.remove(&uri);
             materialized.extend(referenced.sources);
         }
         key_info.sources = materialized;
@@ -1738,13 +1755,14 @@ fn materialize_key_info_references(
         Ok(())
     }
 
+    let mut traversal = KeyInfoReferenceTraversal::default();
     visit(
         key_info,
         resolver,
         policy,
         provider,
         execution,
-        &mut HashSet::new(),
+        &mut traversal,
         0,
     )
 }

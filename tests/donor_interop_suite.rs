@@ -279,6 +279,47 @@ fn key_info_reference_policy_and_structure_fail_closed() {
 }
 
 #[test]
+fn key_info_reference_dag_is_bounded_by_candidate_work() {
+    // Depth and active-path cycle checks do not bound a DAG whose siblings all
+    // reference the same next level. Candidate discovery must reject that
+    // repeated expansion before it can allocate an exponential source list.
+    let xml = fs::read_to_string(format!(
+        "{XMLDSIG11_DIR}/signature-enveloping-keyinforeference-rsa.xml"
+    ))
+    .expect("KeyInfoReference fixture must be readable");
+
+    let mut nested = "<dsig:KeyInfo xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\" Id=\"level-5\"><dsig:KeyName>terminal</dsig:KeyName></dsig:KeyInfo>".to_owned();
+    for level in (1..5).rev() {
+        let next = level + 1;
+        nested = format!(
+            "<dsig:KeyInfo xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\" Id=\"level-{level}\"><dsig11:KeyInfoReference URI=\"#level-{next}\"/><dsig11:KeyInfoReference URI=\"#level-{next}\"/>{nested}</dsig:KeyInfo>"
+        );
+    }
+    let replacement = format!(
+        "<dsig11:KeyInfoReference xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#level-1\"/><dsig11:KeyInfoReference xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\" URI=\"#level-1\"/>{nested}"
+    );
+    let dag = replace_referenced_key_info_contents(&xml, &replacement);
+    let mut policy = compatibility_verification_policy();
+    policy.resources.max_key_candidates = 8;
+
+    let result = VerifyContext::new()
+        .key_resolver(&DefaultKeyResolver::default())
+        .policy(policy)
+        .verify(&dag);
+    assert!(
+        matches!(
+            result,
+            Err(DsigError::Policy(PolicyViolation::ResourceLimit {
+                resource: "key candidates",
+                maximum: 8,
+                actual: 9,
+            }))
+        ),
+        "unexpected DAG budget result: {result:?}"
+    );
+}
+
+#[test]
 fn external_key_info_reference_uses_only_caller_owned_bytes() {
     // Enabling external key references never enables I/O; the complete XML
     // document is supplied by the caller and parsed under the operation budget.
