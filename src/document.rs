@@ -1882,16 +1882,16 @@ fn preflight_document_limits(
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<(), XmlDocumentError> {
-    // This allocation-free pass is the first parser stage for every entry
+    // This bounded lexical pass is the first parser stage for every entry
     // point, before either backend is allowed to construct a DOM.
     charge_parse_work(budget, xml.len())?;
-    let mut entities = HashMap::new();
+    let mut dtd = InternalDtd::default();
     let mut expansion_stack = HashSet::new();
     let mut state = DocumentPreflightState::default();
     preflight_xml_fragment(
         xml,
         settings,
-        &mut entities,
+        &mut dtd,
         &mut expansion_stack,
         &mut state,
         budget,
@@ -1908,10 +1908,21 @@ struct DocumentPreflightState {
     entity_expansion_work: usize,
 }
 
+#[derive(Default)]
+struct InternalDtd {
+    entities: HashMap<String, String>,
+    attribute_defaults: HashMap<String, Vec<InternalAttributeDefault>>,
+}
+
+struct InternalAttributeDefault {
+    attribute_name: String,
+    references: Vec<String>,
+}
+
 fn preflight_xml_fragment(
     xml: &str,
     settings: DocumentParseSettings,
-    entities: &mut HashMap<String, String>,
+    dtd: &mut InternalDtd,
     expansion_stack: &mut HashSet<String>,
     state: &mut DocumentPreflightState,
     budget: Option<&XmlParseWorkBudget>,
@@ -1981,7 +1992,8 @@ fn preflight_xml_fragment(
             } else {
                 let source = match &frame.source {
                     FragmentSource::Document => xml,
-                    FragmentSource::Entity(name) => entities
+                    FragmentSource::Entity(name) => dtd
+                        .entities
                         .get(name)
                         .expect("active entity replacement remains registered"),
                 };
@@ -1990,6 +2002,10 @@ fn preflight_xml_fragment(
                 // This pass observes lexical events one at a time and deliberately
                 // leaves structural diagnostics to the selected DOM parser.
                 reader.config_mut().check_end_names = false;
+                // A fresh reader has no opening-tag state for an End event at
+                // this slice boundary. Emit it so our manual depth state and all
+                // later events remain visible; the DOM still rejects bad pairs.
+                reader.config_mut().allow_unmatched_ends = true;
                 let event = match reader.read_event() {
                     Ok(QuickXmlEvent::DocType(doctype)) => PreflightEvent::DocType(
                         doctype.decode().ok().map(|value| value.into_owned()),
@@ -2017,7 +2033,7 @@ fn preflight_xml_fragment(
                     },
                     Ok(QuickXmlEvent::Start(element)) => {
                         let references = if frame.context == FragmentContext::Content {
-                            attribute_general_references(&element)
+                            element_attribute_references(&element, dtd)
                         } else {
                             Vec::new()
                         };
@@ -2025,7 +2041,7 @@ fn preflight_xml_fragment(
                     }
                     Ok(QuickXmlEvent::Empty(element)) => {
                         let references = if frame.context == FragmentContext::Content {
-                            attribute_general_references(&element)
+                            element_attribute_references(&element, dtd)
                         } else {
                             Vec::new()
                         };
@@ -2049,7 +2065,7 @@ fn preflight_xml_fragment(
                     && settings.allow_dtd
                     && let Some(doctype) = doctype
                 {
-                    collect_internal_general_entities(&doctype, entities);
+                    collect_internal_dtd(&doctype, dtd);
                 }
                 state.in_character_data = false;
                 continue;
@@ -2068,7 +2084,7 @@ fn preflight_xml_fragment(
                     continue;
                 }
                 if expansion_stack.insert(name.clone()) {
-                    if let Some(replacement) = entities.get(&name) {
+                    if let Some(replacement) = dtd.entities.get(&name) {
                         charge_entity_expansion_work(state, budget, replacement.len())?;
                         fragments.push(FragmentFrame {
                             source: FragmentSource::Entity(name),
@@ -2161,26 +2177,50 @@ fn preflight_xml_fragment(
     Ok(())
 }
 
-fn attribute_general_references(element: &QuickXmlBytesStart<'_>) -> Vec<String> {
+fn element_attribute_references(
+    element: &QuickXmlBytesStart<'_>,
+    dtd: &InternalDtd,
+) -> Vec<String> {
     let mut references = Vec::new();
+    let mut present_attributes = HashSet::new();
     for attribute in element.attributes().flatten() {
-        let value = attribute.value.as_ref();
-        let mut offset = 0;
-        while let Some(relative_start) = value[offset..].iter().position(|byte| *byte == b'&') {
-            let start = offset + relative_start + 1;
-            let Some(relative_end) = value[start..].iter().position(|byte| *byte == b';') else {
-                break;
-            };
-            let end = start + relative_end;
-            let name = &value[start..end];
-            if !name.starts_with(b"#")
-                && !matches!(name, b"amp" | b"apos" | b"gt" | b"lt" | b"quot")
-                && let Ok(name) = std::str::from_utf8(name)
-            {
-                references.push(name.to_owned());
-            }
-            offset = end + 1;
+        if let Ok(name) = std::str::from_utf8(attribute.key.as_ref()) {
+            present_attributes.insert(name.to_owned());
         }
+        references.extend(general_references(attribute.value.as_ref()));
+    }
+
+    let element_name = element.name();
+    let Ok(element_name) = std::str::from_utf8(element_name.as_ref()) else {
+        return references;
+    };
+    if let Some(defaults) = dtd.attribute_defaults.get(element_name) {
+        for default in defaults {
+            if present_attributes.insert(default.attribute_name.clone()) {
+                references.extend(default.references.iter().cloned());
+            }
+        }
+    }
+    references
+}
+
+fn general_references(value: &[u8]) -> Vec<String> {
+    let mut references = Vec::new();
+    let mut offset = 0;
+    while let Some(relative_start) = value[offset..].iter().position(|byte| *byte == b'&') {
+        let start = offset + relative_start + 1;
+        let Some(relative_end) = value[start..].iter().position(|byte| *byte == b';') else {
+            break;
+        };
+        let end = start + relative_end;
+        let name = &value[start..end];
+        if !name.starts_with(b"#")
+            && !matches!(name, b"amp" | b"apos" | b"gt" | b"lt" | b"quot")
+            && let Ok(name) = std::str::from_utf8(name)
+        {
+            references.push(name.to_owned());
+        }
+        offset = end + 1;
     }
     references
 }
@@ -2228,7 +2268,7 @@ fn observe_preflight_node(
     Ok(())
 }
 
-fn collect_internal_general_entities(doctype: &str, entities: &mut HashMap<String, String>) {
+fn collect_internal_dtd(doctype: &str, dtd: &mut InternalDtd) {
     let Some(subset_start) = find_unquoted_byte(doctype.as_bytes(), b'[', 0) else {
         return;
     };
@@ -2257,10 +2297,22 @@ fn collect_internal_general_entities(doctype: &str, entities: &mut HashMap<Strin
             let declaration = &subset[declaration_start..declaration_end];
             if let Some((name, value)) = parse_internal_general_entity(declaration) {
                 // roxmltree resolves the first declaration with a matching name.
-                entities
+                dtd.entities
                     .entry(name.to_owned())
                     .or_insert_with(|| value.to_owned());
             }
+            offset = declaration_end + 1;
+        } else if bytes[offset..].starts_with(b"<!ATTLIST") {
+            let declaration_start = offset + "<!ATTLIST".len();
+            let Some(declaration_end) = find_unquoted_byte(bytes, b'>', declaration_start) else {
+                break;
+            };
+            // Parser-created default values bypass lexical start-tag attributes,
+            // so retain their references for the same iterative work accounting.
+            collect_internal_attribute_defaults(
+                &subset[declaration_start..declaration_end],
+                &mut dtd.attribute_defaults,
+            );
             offset = declaration_end + 1;
         } else if bytes[offset..].starts_with(b"<!") {
             let Some(declaration_end) = find_unquoted_byte(bytes, b'>', offset + 2) else {
@@ -2271,6 +2323,142 @@ fn collect_internal_general_entities(doctype: &str, entities: &mut HashMap<Strin
             offset += 1;
         }
     }
+}
+
+fn collect_internal_attribute_defaults(
+    declaration: &str,
+    defaults: &mut HashMap<String, Vec<InternalAttributeDefault>>,
+) {
+    let bytes = declaration.as_bytes();
+    let mut offset = 0;
+    skip_dtd_whitespace(bytes, &mut offset);
+    let Some(element_name) = consume_dtd_token(declaration, &mut offset) else {
+        return;
+    };
+    let mut declarations = Vec::new();
+    loop {
+        skip_dtd_whitespace(bytes, &mut offset);
+        if offset == bytes.len() {
+            break;
+        }
+        let Some(attribute_name) = consume_dtd_token(declaration, &mut offset) else {
+            break;
+        };
+        skip_dtd_whitespace(bytes, &mut offset);
+        if !consume_attribute_type(declaration, &mut offset) {
+            break;
+        }
+        skip_dtd_whitespace(bytes, &mut offset);
+
+        if consume_dtd_keyword(declaration, &mut offset, "#REQUIRED")
+            || consume_dtd_keyword(declaration, &mut offset, "#IMPLIED")
+        {
+            continue;
+        }
+        if consume_dtd_keyword(declaration, &mut offset, "#FIXED") {
+            skip_dtd_whitespace(bytes, &mut offset);
+        }
+        let Some(value) = consume_dtd_quoted_value(declaration, &mut offset) else {
+            break;
+        };
+        declarations.push(InternalAttributeDefault {
+            attribute_name: attribute_name.to_owned(),
+            references: general_references(value.as_bytes()),
+        });
+    }
+
+    if !declarations.is_empty() {
+        defaults
+            .entry(element_name.to_owned())
+            .or_default()
+            .extend(declarations);
+    }
+}
+
+fn skip_dtd_whitespace(bytes: &[u8], offset: &mut usize) {
+    while bytes
+        .get(*offset)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        *offset += 1;
+    }
+}
+
+fn consume_dtd_token<'a>(input: &'a str, offset: &mut usize) -> Option<&'a str> {
+    let bytes = input.as_bytes();
+    let start = *offset;
+    while bytes.get(*offset).is_some_and(|byte| {
+        !matches!(
+            byte,
+            b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')' | b'\'' | b'"'
+        )
+    }) {
+        *offset += 1;
+    }
+    (start != *offset).then(|| &input[start..*offset])
+}
+
+fn consume_attribute_type(input: &str, offset: &mut usize) -> bool {
+    let bytes = input.as_bytes();
+    if consume_dtd_keyword(input, offset, "NOTATION") {
+        skip_dtd_whitespace(bytes, offset);
+        return consume_parenthesized_dtd_group(bytes, offset);
+    }
+    if bytes.get(*offset) == Some(&b'(') {
+        return consume_parenthesized_dtd_group(bytes, offset);
+    }
+    consume_dtd_token(input, offset).is_some()
+}
+
+fn consume_parenthesized_dtd_group(bytes: &[u8], offset: &mut usize) -> bool {
+    if bytes.get(*offset) != Some(&b'(') {
+        return false;
+    }
+    let mut depth = 0usize;
+    while let Some(byte) = bytes.get(*offset).copied() {
+        *offset += 1;
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn consume_dtd_keyword(input: &str, offset: &mut usize, keyword: &str) -> bool {
+    let remaining = &input[*offset..];
+    if !remaining.starts_with(keyword) {
+        return false;
+    }
+    let end = *offset + keyword.len();
+    if input
+        .as_bytes()
+        .get(end)
+        .is_some_and(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'(' | b'\'' | b'"'))
+    {
+        return false;
+    }
+    *offset = end;
+    true
+}
+
+fn consume_dtd_quoted_value<'a>(input: &'a str, offset: &mut usize) -> Option<&'a str> {
+    let bytes = input.as_bytes();
+    let quote = *bytes.get(*offset)?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+    let start = *offset + 1;
+    let relative_end = bytes[start..].iter().position(|byte| *byte == quote)?;
+    let end = start + relative_end;
+    *offset = end + 1;
+    Some(&input[start..end])
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2639,6 +2827,19 @@ mod tests {
     }
 
     #[test]
+    fn node_preflight_continues_after_explicit_end_tags() {
+        // The lexical reader is recreated at each event boundary. A closing tag
+        // must still be observed so later siblings cannot bypass node policy.
+        let xml = "<root><first></first><second/></root>";
+        let settings = DocumentParseSettings::new(false, 3, xml.len());
+
+        assert!(matches!(
+            preflight_document_limits(xml, settings, None),
+            Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached))
+        ));
+    }
+
+    #[test]
     fn depth_preflight_expands_nested_internal_entity_markup() {
         // Entity replacement markup contributes real retained element depth.
         // The streaming guard must reject it before either DOM parser allocates
@@ -2733,6 +2934,46 @@ mod tests {
             })) if observed_maximum == maximum
                 && actual == expected_work
         ));
+    }
+
+    #[test]
+    fn entity_preflight_charges_applicable_dtd_attribute_defaults() {
+        // Parser-created DTD defaults bypass lexical start-tag attributes when
+        // the source element omits that name. Their references must use the same
+        // budget as literal values without charging an overridden default.
+        let omitted = r#"<!DOCTYPE root [
+            <!ENTITY a "0123456789">
+            <!ENTITY b "&a;&a;&a;&a;">
+            <!ATTLIST root value CDATA "&b;">
+        ]><root/>"#;
+        let first_replacement = "&a;&a;&a;&a;".len();
+        let nested_replacement = "0123456789".len();
+        let expected_work = omitted.len() + first_replacement + 4 * nested_replacement;
+        let settings = DocumentParseSettings::new_with_depth(true, 8, 1, omitted.len());
+        let exact_budget = XmlParseWorkBudget::with_limit(expected_work);
+
+        preflight_document_limits(omitted, settings, Some(&exact_budget))
+            .expect("the exact default-attribute expansion budget must be accepted");
+        assert_eq!(exact_budget.consumed(), expected_work);
+
+        let maximum = expected_work - 1;
+        let short_budget = XmlParseWorkBudget::with_limit(maximum);
+        assert!(matches!(
+            preflight_document_limits(omitted, settings, Some(&short_budget)),
+            Err(XmlDocumentError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum: observed_maximum,
+                actual,
+            })) if observed_maximum == maximum && actual == expected_work
+        ));
+
+        let overridden = omitted.replace("<root/>", "<root value=\"literal\"/>");
+        let source_only_budget = XmlParseWorkBudget::with_limit(overridden.len());
+        let overridden_settings =
+            DocumentParseSettings::new_with_depth(true, 8, 1, overridden.len());
+        preflight_document_limits(&overridden, overridden_settings, Some(&source_only_budget))
+            .expect("an explicit source attribute must suppress its DTD default");
+        assert_eq!(source_only_budget.consumed(), overridden.len());
     }
 
     #[test]
