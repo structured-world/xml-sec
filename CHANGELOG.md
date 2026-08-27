@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14](https://github.com/structured-world/xml-sec/compare/v0.1.13...v0.1.14) - 2026-08-27
+
+### Added
+
+- *(xml)* add selectable parser backend
+
+### Fixed
+
+- *(xml)* bound preflight and signing work
+- *(xml)* complete lexical preflight
+- *(xml)* align preflight semantics
+- *(xml)* preserve parser policy boundaries
+- *(xml)* enforce parser policy boundaries
+- *(xml)* unify bounded parser behavior
+- *(xml)* align parser policy boundaries
+- *(xml)* enforce parser policy end to end
+- *(xml)* enforce parser policy budgets
+- *(tests)* tighten Phaos corpus checks
+- *(xml)* close resource accounting gaps
+- *(xml)* account for validation text merges
+- *(xml)* preserve staged parser limits
+- *(xml)* enforce parser policy boundaries
+- *(xml)* bound cumulative parser work
+- *(xml)* enforce retained operation limits
+- *(xmldsig)* preflight signing mutations
+- *(xml)* bound and streamline adapters
+- make document and release flows atomic
+- close document and release gaps
+- *(xml)* enforce owned document invariants
+- *(compat)* reject ambiguous evidence names
+- *(compat)* align behavioral evidence
+- *(compat)* validate evidence invariants
+- *(compat)* parse evidence as Rust items
+- *(compat)* harden behavior evidence
+- *(xmldsig)* unify same-document ID semantics
+- *(compat)* align donor behavior contracts
+
+### Refactored
+
+- *(xml)* add owned document boundary
+
 ### Added
 
 - Deterministic libxmlsec1 1.3.13 behavioral compatibility ledger with executable policy and CLI evidence
