@@ -48,6 +48,56 @@ fn signature_template_without_key_info() -> &'static str {
 </Signature>"##
 }
 
+fn rsa_sha1_signature_template() -> String {
+    signature_template_without_key_info()
+        .replace(
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
+        )
+        .replace(
+            "http://www.w3.org/2001/04/xmlenc#sha256",
+            "http://www.w3.org/2000/09/xmldsig#sha1",
+        )
+}
+
+#[test]
+fn compatibility_cli_signs_and_verifies_legacy_sha1_templates() {
+    // The xmlsec1-compatible binary is an explicit legacy boundary. It must
+    // accept donor SHA-1 templates without weakening the core library defaults.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("rsa-sha1-template.xml");
+    let signed = temp.path().join("rsa-sha1-signed.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(&template, rsa_sha1_signature_template()).unwrap();
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
 fn ecdsa_signature_template() -> &'static str {
     r##"<root><payload ID="payload">payload</payload><Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
 <SignedInfo>

@@ -23,11 +23,11 @@ use xml_sec::{
     },
     provider::{CryptoProvider, default_provider},
     xmldsig::{
-        DefaultKeyResolver, DsigError, DsigStatus, FailureReason, KeyInfo, KeyInfoSource,
-        KeyInfoWriter, KeyResolver, KeyResolverConfig, KeyValueInfo, ReferenceResult, SignContext,
-        SignatureAlgorithm, SignatureTemplateSelection, SigningKey, SigningPublicKeyInfo,
-        UriTypeSet, VerificationKey, VerifyContext, VerifyResult, VerifyingKey,
-        X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
+        DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus, FailureReason, KeyInfo,
+        KeyInfoSource, KeyInfoWriter, KeyResolver, KeyResolverConfig, KeyValueInfo,
+        ReferenceResult, SignContext, SignatureAlgorithm, SignatureTemplateSelection, SigningKey,
+        SigningPublicKeyInfo, UriTypeSet, VerificationKey, VerifyContext, VerifyResult,
+        VerifyingKey, X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
         uri::UriReferenceResolver, validate_signing_key, x509_certificate_matches_selectors,
     },
     xmlenc::{
@@ -663,20 +663,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     }
     // This binary is an explicit libxmlsec1 compatibility boundary. Its sign
     // and verify commands must bind XPath here() identically for round trips.
-    let policy = SigningPolicy {
-        manifest_processing: if invocation.flag("ignore-manifests") {
-            ManifestProcessing::Ignore
-        } else {
-            ManifestProcessing::Process
-        },
-        transforms: TransformPolicy {
-            xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
-            same_document_id_semantics: same_document_id_semantics(invocation),
-            ..TransformPolicy::default()
-        },
-        ecdsa_signature_value_encoding: ecdsa_signature_value_encoding(invocation),
-        ..SigningPolicy::default()
-    };
+    let policy = xmlsec_compatibility_signing_policy(invocation);
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
@@ -707,6 +694,52 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     write_result_then_stdout_diagnostics(invocation, signed.as_bytes(), stdout, |stdout| {
         write_signing_diagnostics(invocation, signature.algorithm, stdout)
     })
+}
+
+fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy {
+    // The native CLI is an explicit compatibility boundary. These complete
+    // allowlists opt its sign command into every implemented libxmlsec1 method,
+    // including legacy SHA-1, without weakening the core library defaults.
+    SigningPolicy {
+        signature_algorithms: Some(HashSet::from([
+            SignatureAlgorithm::DsaSha1,
+            SignatureAlgorithm::DsaSha256,
+            SignatureAlgorithm::HmacSha1,
+            SignatureAlgorithm::HmacSha224,
+            SignatureAlgorithm::HmacSha256,
+            SignatureAlgorithm::HmacSha384,
+            SignatureAlgorithm::HmacSha512,
+            SignatureAlgorithm::RsaSha1,
+            SignatureAlgorithm::RsaSha224,
+            SignatureAlgorithm::RsaSha256,
+            SignatureAlgorithm::RsaSha384,
+            SignatureAlgorithm::RsaSha512,
+            SignatureAlgorithm::EcdsaSha1,
+            SignatureAlgorithm::EcdsaSha224,
+            SignatureAlgorithm::EcdsaSha256,
+            SignatureAlgorithm::EcdsaSha384,
+            SignatureAlgorithm::EcdsaSha512,
+        ])),
+        digest_algorithms: Some(HashSet::from([
+            DigestAlgorithm::Sha1,
+            DigestAlgorithm::Sha224,
+            DigestAlgorithm::Sha256,
+            DigestAlgorithm::Sha384,
+            DigestAlgorithm::Sha512,
+        ])),
+        manifest_processing: if invocation.flag("ignore-manifests") {
+            ManifestProcessing::Ignore
+        } else {
+            ManifestProcessing::Process
+        },
+        transforms: TransformPolicy {
+            xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
+            same_document_id_semantics: same_document_id_semantics(invocation),
+            ..TransformPolicy::default()
+        },
+        ecdsa_signature_value_encoding: ecdsa_signature_value_encoding(invocation),
+        ..SigningPolicy::default()
+    }
 }
 
 fn write_signing_diagnostics(
@@ -3356,6 +3389,45 @@ mod tests {
 
     fn invocation(arguments: &[&str]) -> Invocation {
         Invocation::parse(arguments.iter().map(OsString::from)).unwrap()
+    }
+
+    #[test]
+    fn compatibility_signing_policy_includes_every_implemented_algorithm() {
+        // An explicit allowlist replaces, rather than extends, secure defaults.
+        // Keep the CLI compatibility boundary complete when algorithms evolve.
+        let policy = xmlsec_compatibility_signing_policy(&invocation(&["xmlsec1", "sign"]));
+        assert_eq!(
+            policy.signature_algorithms,
+            Some(HashSet::from([
+                SignatureAlgorithm::DsaSha1,
+                SignatureAlgorithm::DsaSha256,
+                SignatureAlgorithm::HmacSha1,
+                SignatureAlgorithm::HmacSha224,
+                SignatureAlgorithm::HmacSha256,
+                SignatureAlgorithm::HmacSha384,
+                SignatureAlgorithm::HmacSha512,
+                SignatureAlgorithm::RsaSha1,
+                SignatureAlgorithm::RsaSha224,
+                SignatureAlgorithm::RsaSha256,
+                SignatureAlgorithm::RsaSha384,
+                SignatureAlgorithm::RsaSha512,
+                SignatureAlgorithm::EcdsaSha1,
+                SignatureAlgorithm::EcdsaSha224,
+                SignatureAlgorithm::EcdsaSha256,
+                SignatureAlgorithm::EcdsaSha384,
+                SignatureAlgorithm::EcdsaSha512,
+            ]))
+        );
+        assert_eq!(
+            policy.digest_algorithms,
+            Some(HashSet::from([
+                DigestAlgorithm::Sha1,
+                DigestAlgorithm::Sha224,
+                DigestAlgorithm::Sha256,
+                DigestAlgorithm::Sha384,
+                DigestAlgorithm::Sha512,
+            ]))
+        );
     }
 
     fn testdata(name: &str) -> PathBuf {

@@ -130,6 +130,12 @@ xmlsec1 sign --privkey-pem signing-key.pem --output signed.xml template.xml
 xmlsec1 verify --pubkey-pem signing-key.pub.pem signed.xml
 ```
 
+The binary is an explicit libxmlsec1 compatibility boundary: `sign` and
+`verify` accept the implemented SHA-1 signature and digest methods used by
+legacy donor documents. This opt-in is local to the CLI. Library callers retain
+the secure defaults and must explicitly allow each legacy algorithm through
+their immutable signing or verification policy.
+
 Signing key options accept libxmlsec1's comma-separated certificate form,
 `key.pem,leaf.pem,intermediate.pem,...`. Every certificate is structurally
 validated, and the first certificate must contain the signing key. When the

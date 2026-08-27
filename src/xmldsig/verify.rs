@@ -1674,8 +1674,16 @@ fn materialize_key_info_references(
                 )
                 .map_err(map_key_info_parse_error)?
             } else {
+                // The fragment selects a node inside the retrieved document; it
+                // is not part of either the caller-owned resource identity or
+                // the base URI used by references nested in that document.
+                let (resource_uri, fragment) = uri
+                    .split_once('#')
+                    .map_or((uri.as_str(), None), |(resource, fragment)| {
+                        (resource, (!fragment.is_empty()).then_some(fragment))
+                    });
                 let bytes = resolver
-                    .external_resource(&uri)
+                    .external_resource(resource_uri)
                     .map_err(|error| {
                         SignatureVerificationPipelineError::from(
                             ReferenceProcessingError::UriDereference(error),
@@ -1696,8 +1704,8 @@ fn materialize_key_info_references(
                 )?;
                 document.with_view(|view| {
                     let external_resolver = resolver.for_document_view(view);
-                    let target = match uri.rsplit_once('#') {
-                        Some((_, fragment)) if !fragment.is_empty() => external_resolver
+                    let target = match fragment {
+                        Some(fragment) => external_resolver
                             .node_for_same_document_reference(&format!("#{fragment}"))
                             .map_err(|error| {
                                 SignatureVerificationPipelineError::from(
@@ -1719,7 +1727,7 @@ fn materialize_key_info_references(
                         provider,
                         execution.xml_base_resolution(),
                         &policy.resources,
-                        Some(&uri),
+                        Some(resource_uri),
                     )
                     .map_err(map_key_info_parse_error)?;
                     visit(

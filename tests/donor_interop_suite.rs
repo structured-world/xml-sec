@@ -371,10 +371,8 @@ fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
         r##"<keys xmlns:dsig="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><dsig:KeyInfo Id="outer"><dsig11:KeyInfoReference URI="#inner"/></dsig:KeyInfo>{inner_key_info}</keys>"##
     );
     let fragment_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"key-info.xml#outer\"", 1);
-    let fragment_resources = HashMap::from([(
-        "key-info.xml#outer".to_owned(),
-        fragment_document.into_bytes(),
-    )]);
+    let fragment_resources =
+        HashMap::from([("key-info.xml".to_owned(), fragment_document.into_bytes())]);
     let resolver = DefaultKeyResolver::default();
     let mut policy = compatibility_verification_policy();
     policy.uris.key_info_references = UriTypeSet::ALL;
@@ -389,9 +387,9 @@ fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
         Path::new("external KeyInfoReference fragment"),
     );
 
-    let outer = br#"<dsig:KeyInfo xmlns:dsig="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><dsig11:KeyInfoReference URI="inner.xml"/></dsig:KeyInfo>"#.to_vec();
+    let outer = br#"<keys xmlns:dsig="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><dsig:KeyInfo Id="outer"><dsig11:KeyInfoReference URI="inner.xml"/></dsig:KeyInfo></keys>"#.to_vec();
     let inner = key_info.as_bytes().to_vec();
-    let external_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"keys/outer.xml\"", 1);
+    let external_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"keys/outer.xml#outer\"", 1);
     let external_resources = HashMap::from([
         ("keys/outer.xml".to_owned(), outer.clone()),
         ("keys/inner.xml".to_owned(), inner.clone()),
