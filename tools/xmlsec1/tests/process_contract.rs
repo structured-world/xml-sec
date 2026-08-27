@@ -17,11 +17,12 @@ use rsa::{
 use x509_parser::{extensions::ParsedExtension, prelude::FromDer as _};
 use xml_sec::{
     c14n::{C14nAlgorithm, C14nMode},
-    policy::{EncryptionPolicy, VerificationPolicy},
+    policy::{EncryptionPolicy, HmacPolicy, VerificationPolicy},
     provider::default_provider,
     xmldsig::{
-        DigestAlgorithm, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
-        SignatureBuilder, Transform, XPathExpression, mutation::append_signature_to_root,
+        DigestAlgorithm, HmacVerificationKey, ReferenceBuilder, RsaSigningKey, SignContext,
+        SignatureAlgorithm, SignatureBuilder, Transform, VerifyContext, XPathExpression,
+        mutation::append_signature_to_root,
     },
     xmlenc::{
         DataEncryptionAlgorithm, EncryptedDataBuilder, EncryptionRecipient, KeyCandidateBudget,
@@ -95,6 +96,153 @@ fn compatibility_cli_signs_and_verifies_legacy_sha1_templates() {
         verify.status.success(),
         "{}",
         String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
+fn compatibility_cli_signs_hmac_templates_with_named_raw_keys() {
+    // The global hmac-key option is part of the xmlsec1 sign contract. The CLI
+    // consumes its file verbatim and applies the compatibility HMAC minima.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root().join(
+        "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-hmac-sha1.tmpl",
+    );
+    let key = project_root().join("tests/fixtures/keys/hmackey.bin");
+    let signed = temp.path().join("hmac-signed.xml");
+
+    let sign = Command::new(binary())
+        .args(["sign", "--hmac-key:TeskKeyName-Hmac"])
+        .arg(&key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let secret = fs::read(&key).unwrap();
+    let verification_key = HmacVerificationKey::new(secret).unwrap();
+    let mut policy = VerificationPolicy {
+        hmac: HmacPolicy {
+            minimum_key_bits: 40,
+            minimum_output_bits: 40,
+        },
+        ..VerificationPolicy::default()
+    };
+    policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(SignatureAlgorithm::HmacSha1);
+    let verified = VerifyContext::new()
+        .key(&verification_key)
+        .policy(policy)
+        .verify(&fs::read_to_string(&signed).unwrap())
+        .expect("CLI-generated HMAC signature must verify");
+    assert_eq!(verified.status, xml_sec::xmldsig::DsigStatus::Valid);
+
+    let short_key = temp.path().join("short-hmac.bin");
+    fs::write(&short_key, [0_u8; 4]).unwrap();
+    let rejected = Command::new(binary())
+        .args(["sign", "--hmac-key:TeskKeyName-Hmac"])
+        .arg(&short_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("configured minimum"));
+}
+
+#[test]
+fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
+    // The CLI decoder must cover every asymmetric family admitted by its
+    // compatibility policy, not just the historically implemented subset.
+    let temp = tempfile::tempdir().unwrap();
+
+    let encrypted_dsa =
+        fs::read(project_root().join("tests/fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der"))
+            .unwrap();
+    let dsa_key = dsa::SigningKey::from_pkcs8_encrypted_der(&encrypted_dsa, b"secret123").unwrap();
+    let dsa_private = temp.path().join("dsa-private.der");
+    let dsa_public = temp.path().join("dsa-public.der");
+    fs::write(&dsa_private, dsa_key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    fs::write(
+        &dsa_public,
+        dsa_key
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let dsa_template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-dsa2048-sha256.tmpl");
+    let dsa_signed = temp.path().join("dsa-signed.xml");
+    let dsa_sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-dsa-2048"])
+        .arg(&dsa_private)
+        .arg("--output")
+        .arg(&dsa_signed)
+        .arg(&dsa_template)
+        .output()
+        .unwrap();
+    assert!(
+        dsa_sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dsa_sign.stderr)
+    );
+    let dsa_verify = Command::new(binary())
+        .args(["verify", "--pubkey-der:TestKeyName-dsa-2048"])
+        .arg(&dsa_public)
+        .arg(&dsa_signed)
+        .output()
+        .unwrap();
+    assert!(
+        dsa_verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dsa_verify.stderr)
+    );
+
+    let p521_template = temp.path().join("p521-template.xml");
+    fs::write(
+        &p521_template,
+        ecdsa_signature_template().replace(
+            "<SignatureValue/>",
+            "<SignatureValue/><KeyInfo><KeyName>TestKeyName-ec-prime521v1</KeyName></KeyInfo>",
+        ),
+    )
+    .unwrap();
+    let p521_private =
+        project_root().join("tests/fixtures/xmldsig/xmldsig11-interop-2012/keys/p521-key-orig.der");
+    let p521_certificate =
+        project_root().join("tests/fixtures/xmldsig/xmldsig11-interop-2012/keys/p521-key.crt");
+    let p521_signed = temp.path().join("p521-signed.xml");
+    let p521_sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-ec-prime521v1"])
+        .arg(&p521_private)
+        .arg("--output")
+        .arg(&p521_signed)
+        .arg(&p521_template)
+        .output()
+        .unwrap();
+    assert!(
+        p521_sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&p521_sign.stderr)
+    );
+    let p521_verify = Command::new(binary())
+        .args(["verify", "--insecure", "--pubkey-cert-der"])
+        .arg(&p521_certificate)
+        .arg(&p521_signed)
+        .output()
+        .unwrap();
+    assert!(
+        p521_verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&p521_verify.stderr)
     );
 }
 

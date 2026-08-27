@@ -6,6 +6,7 @@ use std::{
     path::Path,
 };
 
+use base64::Engine as _;
 use xml_sec::policy::{
     HmacPolicy, PolicyViolation, RsaKeyPolicy, SigningPolicy, VerificationPolicy,
 };
@@ -387,6 +388,29 @@ fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
         Path::new("external KeyInfoReference fragment"),
     );
 
+    // RetrievalMethod fragments belong to the external KeyInfo document too;
+    // flattening parsed sources must not rebind them to the signature document.
+    let certificate = base64::engine::general_purpose::STANDARD.encode(
+        fs::read("tests/fixtures/xmldsig/phaos-xmldsig-three/certs/rsa-cert.der")
+            .expect("matching RSA certificate must be readable"),
+    );
+    let retrieval_document = format!(
+        r##"<keys xmlns:dsig="http://www.w3.org/2000/09/xmldsig#"><dsig:KeyInfo Id="outer"><dsig:RetrievalMethod URI="#certificate" Type="http://www.w3.org/2000/09/xmldsig#X509Data"/></dsig:KeyInfo><dsig:X509Data Id="certificate"><dsig:X509Certificate>{certificate}</dsig:X509Certificate></dsig:X509Data></keys>"##
+    );
+    let retrieval_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"retrieval.xml#outer\"", 1);
+    let retrieval_resources =
+        HashMap::from([("retrieval.xml".to_owned(), retrieval_document.into_bytes())]);
+    let result = VerifyContext::new()
+        .key_resolver(&resolver)
+        .external_resources(&retrieval_resources)
+        .policy(policy.clone())
+        .verify(&retrieval_signature)
+        .expect("external RetrievalMethod must use its owning document resolver");
+    assert_valid(
+        result.status,
+        Path::new("external KeyInfoReference RetrievalMethod"),
+    );
+
     let outer = br#"<keys xmlns:dsig="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><dsig:KeyInfo Id="outer"><dsig11:KeyInfoReference URI="inner.xml"/></dsig:KeyInfo></keys>"#.to_vec();
     let inner = key_info.as_bytes().to_vec();
     let external_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"keys/outer.xml#outer\"", 1);
@@ -420,6 +444,36 @@ fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
             })
         ),
         "unexpected aggregate budget error: {error:?}"
+    );
+
+    // Nested documents use the same typed XML resource policy as the initial
+    // signature parse, including the public Policy error classification.
+    let oversized_nodes = format!(
+        r##"<keys xmlns:dsig="http://www.w3.org/2000/09/xmldsig#"><dsig:KeyInfo Id="outer">{}</dsig:KeyInfo></keys>"##,
+        "<node/>".repeat(256)
+    );
+    let oversized_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"oversized.xml#outer\"", 1);
+    let oversized_resources =
+        HashMap::from([("oversized.xml".to_owned(), oversized_nodes.into_bytes())]);
+    let mut node_policy = compatibility_verification_policy();
+    node_policy.uris.key_info_references = UriTypeSet::ALL;
+    node_policy.resources.max_xml_nodes = 128;
+    let error = VerifyContext::new()
+        .key_resolver(&resolver)
+        .external_resources(&oversized_resources)
+        .policy(node_policy)
+        .verify(&oversized_signature)
+        .expect_err("external KeyInfo XML node limits must fail as policy errors");
+    assert!(
+        matches!(
+            error,
+            DsigError::Policy(PolicyViolation::ResourceLimit {
+                resource: "XML nodes",
+                maximum: 128,
+                ..
+            })
+        ),
+        "unexpected external XML policy error: {error:?}"
     );
 }
 

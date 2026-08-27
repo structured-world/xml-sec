@@ -17,14 +17,14 @@ use x509_parser::prelude::FromDer as _;
 use xml_sec::{
     IdAttributeRegistration,
     policy::{
-        DecryptionPolicy, EcdsaSignatureValueEncoding, EncryptionPolicy, ManifestProcessing,
-        ResourcePolicy, SameDocumentIdSemantics, SigningPolicy, TransformPolicy, UriPolicy,
-        VerificationPolicy, XmlInputPolicy,
+        DecryptionPolicy, EcdsaSignatureValueEncoding, EncryptionPolicy, HmacPolicy,
+        ManifestProcessing, ResourcePolicy, SameDocumentIdSemantics, SigningPolicy,
+        TransformPolicy, UriPolicy, VerificationPolicy, XmlInputPolicy,
     },
     provider::{CryptoProvider, default_provider},
     xmldsig::{
-        DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus, FailureReason, KeyInfo,
-        KeyInfoSource, KeyInfoWriter, KeyResolver, KeyResolverConfig, KeyValueInfo,
+        DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus, FailureReason, HmacSigningKey,
+        KeyInfo, KeyInfoSource, KeyInfoWriter, KeyResolver, KeyResolverConfig, KeyValueInfo,
         ReferenceResult, SignContext, SignatureAlgorithm, SignatureTemplateSelection, SigningKey,
         SigningPublicKeyInfo, UriTypeSet, VerificationKey, VerifyContext, VerifyResult,
         VerifyingKey, X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
@@ -64,6 +64,7 @@ const SIGN_OPTIONS: &[&str] = &[
     "privkey-der",
     "pkcs8-pem",
     "pkcs8-der",
+    "hmac-key",
     "pwd",
     "lax-key-search",
     "node-id",
@@ -737,6 +738,10 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
             same_document_id_semantics: same_document_id_semantics(invocation),
             ..TransformPolicy::default()
         },
+        hmac: HmacPolicy {
+            minimum_key_bits: 40,
+            minimum_output_bits: 40,
+        },
         ecdsa_signature_value_encoding: ecdsa_signature_value_encoding(invocation),
         ..SigningPolicy::default()
     }
@@ -777,21 +782,30 @@ fn select_signing_key(
     key_info: Option<&KeyInfo>,
     policy: &SigningPolicy,
 ) -> Result<SigningKeyCandidate, CommandError> {
+    let hmac = algorithm.hmac_output_bits().is_some();
+    let key_options: &[&str] = if hmac {
+        &["hmac-key"]
+    } else {
+        &["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"]
+    };
+    let key_kind = if hmac { "HMAC key" } else { "private key" };
     let keys = invocation
-        .ordered_values(&["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"])
+        .ordered_values(key_options)
         .map(|key| (key, ()))
         .collect::<Vec<_>>();
     if keys.is_empty() {
-        return Err(CommandError::Usage(
-            "sign requires --privkey-pem or --pkcs8-pem/der".into(),
-        ));
+        return Err(CommandError::Usage(if hmac {
+            "HMAC signing requires --hmac-key".into()
+        } else {
+            "sign requires --privkey-pem or --pkcs8-pem/der".into()
+        }));
     }
     let candidates = named_candidate_search(
         &keys,
         requested_names,
         invocation.flag("lax-key-search"),
         false,
-        "private key",
+        key_kind,
     )?;
     KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
         .consume(candidates.len())
@@ -819,7 +833,7 @@ fn select_signing_key(
         return Err(error);
     }
     Err(CommandError::Usage(format!(
-        "no private key input supports {}",
+        "no {key_kind} input supports {}",
         algorithm.uri()
     )))
 }
@@ -830,12 +844,30 @@ fn prepare_signing_key_candidate(
     policy: &SigningPolicy,
     material_budget: &mut ExternalMaterialBudget,
 ) -> Result<SigningKeyCandidate, CommandError> {
+    if algorithm.hmac_output_bits().is_some() {
+        let path = option.value.as_deref().unwrap_or_default();
+        let key_bytes = key_material::read(path)?;
+        material_budget.charge(key_bytes.len())?;
+        let key = HmacSigningKey::new(key_bytes)
+            .map_err(|error| CommandError::Signature(error.to_string()))?;
+        validate_signing_key(&key, algorithm, policy)
+            .map_err(|error| CommandError::Signature(error.to_string()))?;
+        return Ok(SigningKeyCandidate {
+            key: Box::new(key),
+            certificate_writer: None,
+            leaf_certificate_der: None,
+        });
+    }
     let (path, certificate_paths) =
         split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
     let key_bytes = key_material::read(path)?;
     material_budget.charge(key_bytes.len())?;
-    let key =
-        key_material::decode_signing_key(Path::new(path), &key_bytes, private_key_format(option))?;
+    let key = key_material::decode_signing_key(
+        Path::new(path),
+        &key_bytes,
+        private_key_format(option),
+        algorithm,
+    )?;
     validate_signing_key(key.as_ref(), algorithm, policy)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
     let (certificate_writer, leaf_certificate_der) = if certificate_paths.is_empty() {

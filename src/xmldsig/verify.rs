@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::c14n::canonicalize_bounded_with_xml_base_budget;
-use crate::document::{DocumentParseSettings, DocumentView, XmlDocument};
+use crate::document::{DocumentParseSettings, DocumentView, XmlDocument, XmlDocumentError};
 use crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING;
 
 #[cfg(test)]
@@ -1141,12 +1141,16 @@ fn verify_signature_with_context(
         settings,
         execution_budget.xml_parse_work(),
     )
-    .map_err(|error| match error.into_policy_violation(settings) {
-        Ok(error) => DsigError::Policy(error),
-        Err(crate::document::XmlDocumentError::Parse(error)) => DsigError::XmlParse(error),
-        Err(error) => DsigError::Document(error),
-    })?;
+    .map_err(|error| map_document_parse_error(error, settings))?;
     verify_signature_document_with_context_and_budget(&document, ctx, &execution_budget)
+}
+
+fn map_document_parse_error(error: XmlDocumentError, settings: DocumentParseSettings) -> DsigError {
+    match error.into_policy_violation(settings) {
+        Ok(error) => DsigError::Policy(error),
+        Err(XmlDocumentError::Parse(error)) => DsigError::XmlParse(error),
+        Err(error) => DsigError::Document(error),
+    }
 }
 
 #[cfg(test)]
@@ -1346,26 +1350,28 @@ fn verify_signature_view<'a>(
         }
     }
     let retrieval_materialization = if let Some(info) = key_info.as_mut() {
-        materialize_key_info_references(
-            info,
-            &resolver,
-            &ctx.policy,
-            ctx.provider,
-            execution_budget,
-        )?;
         let mut retrieval_budgets = RetrievalMaterializationBudgets {
             xpath_parse: &mut xpath_parse_budget,
             execution: execution_budget,
             resources: &ctx.policy.resources,
         };
-        materialize_retrieval_methods_with_budgets(
+        let mut outcome = materialize_key_info_references(
+            info,
+            &resolver,
+            &ctx.policy,
+            ctx.provider,
+            ctx.allowed_transform_uris(),
+            &mut retrieval_budgets,
+        )?;
+        outcome.merge(materialize_retrieval_methods_with_budgets(
             info,
             &resolver,
             ctx.policy.uris.retrieval_methods,
             ctx.allowed_transform_uris(),
             ctx.provider,
             &mut retrieval_budgets,
-        )?
+        )?);
+        outcome
     } else {
         RetrievalMaterialization::default()
     };
@@ -1577,6 +1583,14 @@ struct RetrievalMaterialization {
     deferred_error: Option<SignatureVerificationPipelineError>,
 }
 
+impl RetrievalMaterialization {
+    fn merge(&mut self, other: Self) {
+        if self.deferred_error.is_none() {
+            self.deferred_error = other.deferred_error;
+        }
+    }
+}
+
 struct RetrievalMaterializationBudgets<'a> {
     xpath_parse: &'a mut XPathSignatureParseBudget,
     execution: &'a TransformExecutionBudget,
@@ -1589,23 +1603,30 @@ struct KeyInfoReferenceTraversal {
     candidate_materialization_work: usize,
 }
 
+struct KeyInfoReferenceMaterializationContext<'a, 'budget> {
+    policy: &'a crate::policy::VerificationPolicy,
+    provider: &'a dyn crate::provider::CryptoProvider,
+    allowed_transforms: Option<&'a HashSet<String>>,
+    budgets: &'a mut RetrievalMaterializationBudgets<'budget>,
+}
+
 fn materialize_key_info_references(
     key_info: &mut KeyInfo,
     resolver: &UriReferenceResolver<'_>,
     policy: &crate::policy::VerificationPolicy,
     provider: &dyn crate::provider::CryptoProvider,
-    execution: &TransformExecutionBudget,
-) -> Result<(), SignatureVerificationPipelineError> {
+    allowed_transforms: Option<&HashSet<String>>,
+    budgets: &mut RetrievalMaterializationBudgets<'_>,
+) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
     fn visit(
         key_info: &mut KeyInfo,
         resolver: &UriReferenceResolver<'_>,
-        policy: &crate::policy::VerificationPolicy,
-        provider: &dyn crate::provider::CryptoProvider,
-        execution: &TransformExecutionBudget,
+        context: &mut KeyInfoReferenceMaterializationContext<'_, '_>,
         traversal: &mut KeyInfoReferenceTraversal,
         depth: usize,
-    ) -> Result<(), SignatureVerificationPipelineError> {
+    ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
         let mut materialized = Vec::new();
+        let mut outcome = RetrievalMaterialization::default();
         for source in std::mem::take(&mut key_info.sources) {
             let source_work = match &source {
                 super::parse::KeyInfoSource::X509Data(info) => info.certificates.len().max(1),
@@ -1614,7 +1635,8 @@ fn materialize_key_info_references(
             traversal.candidate_materialization_work = traversal
                 .candidate_materialization_work
                 .saturating_add(source_work);
-            policy
+            context
+                .policy
                 .resources
                 .validate_key_candidates(traversal.candidate_materialization_work)?;
 
@@ -1622,13 +1644,13 @@ fn materialize_key_info_references(
                 materialized.push(source);
                 continue;
             };
-            if !policy.key_sources.key_info_reference {
+            if !context.policy.key_sources.key_info_reference {
                 return Err(crate::policy::PolicyViolation::KeyTrust {
                     reason: "KeyInfoReference key sources are disabled",
                 }
                 .into());
             }
-            if !policy.uris.key_info_references.allows(&uri) {
+            if !context.policy.uris.key_info_references.allows(&uri) {
                 return Err(crate::policy::PolicyViolation::Uri {
                     operation: "KeyInfoReference",
                     reason: "URI class is disabled",
@@ -1636,10 +1658,10 @@ fn materialize_key_info_references(
                 .into());
             }
             let next_depth = depth.saturating_add(1);
-            if next_depth > policy.resources.max_key_info_reference_depth {
+            if next_depth > context.policy.resources.max_key_info_reference_depth {
                 return Err(crate::policy::PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::KEY_INFO_REFERENCE_DEPTH,
-                    maximum: policy.resources.max_key_info_reference_depth,
+                    maximum: context.policy.resources.max_key_info_reference_depth,
                     actual: next_depth,
                 }
                 .into());
@@ -1650,7 +1672,7 @@ fn materialize_key_info_references(
                 });
             }
 
-            let mut referenced = if uri.starts_with('#') {
+            let (mut referenced, mut nested_outcome) = if uri.starts_with('#') {
                 let node = resolver
                     .node_for_same_document_reference(&uri)
                     .map_err(|error| {
@@ -1666,13 +1688,16 @@ fn materialize_key_info_references(
                         reason: "KeyInfoReference target must be KeyInfo",
                     });
                 }
-                parse_key_info_with_policy_budgets(
-                    node,
-                    provider,
-                    execution.xml_base_resolution(),
-                    &policy.resources,
+                (
+                    parse_key_info_with_policy_budgets(
+                        node,
+                        context.provider,
+                        context.budgets.execution.xml_base_resolution(),
+                        &context.policy.resources,
+                    )
+                    .map_err(map_key_info_parse_error)?,
+                    RetrievalMaterialization::default(),
                 )
-                .map_err(map_key_info_parse_error)?
             } else {
                 // The fragment selects a node inside the retrieved document; it
                 // is not part of either the caller-owned resource identity or
@@ -1697,11 +1722,16 @@ fn materialize_key_info_references(
                         reason: "KeyInfoReference external resource is not UTF-8 XML",
                     }
                 })?;
+                let settings = DocumentParseSettings::from_policy(
+                    &context.policy.xml,
+                    &context.policy.resources,
+                );
                 let document = XmlDocument::parse_with_settings_and_budget(
                     xml.to_owned(),
-                    DocumentParseSettings::from_policy(&policy.xml, &policy.resources),
-                    execution.xml_parse_work(),
-                )?;
+                    settings,
+                    context.budgets.execution.xml_parse_work(),
+                )
+                .map_err(|error| map_document_parse_error(error, settings))?;
                 document.with_view(|view| {
                     let external_resolver = resolver.for_document_view(view);
                     let target = match fragment {
@@ -1724,55 +1754,64 @@ fn materialize_key_info_references(
                     }
                     let mut referenced = parse_key_info_with_policy_budgets_and_document_base(
                         target,
-                        provider,
-                        execution.xml_base_resolution(),
-                        &policy.resources,
+                        context.provider,
+                        context.budgets.execution.xml_base_resolution(),
+                        &context.policy.resources,
                         Some(resource_uri),
                     )
                     .map_err(map_key_info_parse_error)?;
-                    visit(
+                    let mut nested_outcome = visit(
                         &mut referenced,
                         &external_resolver,
-                        policy,
-                        provider,
-                        execution,
+                        context,
                         traversal,
                         next_depth,
                     )?;
-                    Ok(referenced)
+                    nested_outcome.merge(materialize_retrieval_methods_with_budgets(
+                        &mut referenced,
+                        &external_resolver,
+                        context.policy.uris.retrieval_methods,
+                        context.allowed_transforms,
+                        context.provider,
+                        context.budgets,
+                    )?);
+                    // RetrievalMethod nodes are meaningful only in the document
+                    // whose resolver owns their same-document URI context.
+                    referenced.sources.retain(|source| {
+                        !matches!(source, super::parse::KeyInfoSource::RetrievalMethod { .. })
+                    });
+                    Ok((referenced, nested_outcome))
                 })?
             };
             if uri.starts_with('#') {
-                visit(
+                nested_outcome.merge(visit(
                     &mut referenced,
                     resolver,
-                    policy,
-                    provider,
-                    execution,
+                    context,
                     traversal,
                     next_depth,
-                )?;
+                )?);
             }
+            outcome.merge(nested_outcome);
             traversal.active.remove(&uri);
             materialized.extend(referenced.sources);
         }
         key_info.sources = materialized;
-        policy
+        context
+            .policy
             .resources
             .validate_key_candidates(key_info.embedded_candidate_count())?;
-        Ok(())
+        Ok(outcome)
     }
 
     let mut traversal = KeyInfoReferenceTraversal::default();
-    visit(
-        key_info,
-        resolver,
+    let mut context = KeyInfoReferenceMaterializationContext {
         policy,
         provider,
-        execution,
-        &mut traversal,
-        0,
-    )
+        allowed_transforms,
+        budgets,
+    };
+    visit(key_info, resolver, &mut context, &mut traversal, 0)
 }
 
 fn materialize_retrieval_methods_with_budgets(

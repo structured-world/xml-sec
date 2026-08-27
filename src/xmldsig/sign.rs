@@ -388,7 +388,7 @@ fn expected_signature_output_len(
             | SignatureAlgorithm::HmacSha512,
             SigningPublicKeyInfo::Hmac { key_bits },
         ) => {
-            policy.hmac.validate_key(key_bits.div_ceil(8))?;
+            policy.hmac.validate_key_bits(key_bits)?;
             let output_bits = hmac_output_length_bits.unwrap_or(
                 algorithm
                     .hmac_output_bits()

@@ -181,8 +181,12 @@ impl HmacPolicy {
         Ok(())
     }
 
-    pub(crate) fn validate_key(self, key_bytes: usize) -> Result<(), PolicyViolation> {
-        if key_bytes.saturating_mul(8) < self.minimum_key_bits {
+    pub(crate) fn validate_key_bytes(self, key_bytes: usize) -> Result<(), PolicyViolation> {
+        self.validate_key_bits(key_bytes.saturating_mul(8))
+    }
+
+    pub(crate) fn validate_key_bits(self, key_bits: usize) -> Result<(), PolicyViolation> {
+        if key_bits < self.minimum_key_bits {
             return Err(PolicyViolation::InvalidKeyMaterial {
                 operation: "HMAC",
                 key_type: "symmetric",

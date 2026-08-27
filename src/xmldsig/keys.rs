@@ -68,7 +68,7 @@ impl HmacVerificationKey {
         if algorithm.hmac_output_bits().is_none() {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
-        policy.validate_key(self.secret.len())?;
+        policy.validate_key_bytes(self.secret.len())?;
         policy.validate_output(algorithm, signature_value.len().saturating_mul(8))?;
         Ok(())
     }
@@ -106,7 +106,7 @@ impl VerifyingKey for HmacVerificationKey {
     fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
         policy
             .hmac
-            .validate_key(self.secret.len())
+            .validate_key_bytes(self.secret.len())
             .map_err(Into::into)
     }
 

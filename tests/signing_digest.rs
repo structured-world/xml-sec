@@ -8,7 +8,7 @@ use base64::Engine as _;
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::policy::{
-    EcdsaSignatureValueEncoding, ManifestProcessing, SigningPolicy, VerificationPolicy,
+    EcdsaSignatureValueEncoding, HmacPolicy, ManifestProcessing, SigningPolicy, VerificationPolicy,
 };
 use xml_sec::xmldsig::mutation::append_signature_to_root;
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
@@ -317,6 +317,55 @@ fn signing_key_preflight_enforces_legacy_algorithm_policy() {
         .expect("an explicit compatibility policy may enable implemented RSA-SHA1 signing");
     validate_signing_key(&key, SignatureAlgorithm::RsaSha256, &policy)
         .expect("secure signing algorithm must remain usable");
+}
+
+#[test]
+fn signing_key_preflight_compares_custom_hmac_metadata_in_bits() {
+    struct HmacMetadataKey {
+        key_bits: usize,
+    }
+
+    impl SigningKey for HmacMetadataKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            Ok(vec![0; 32])
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Ok(SigningPublicKeyInfo::Hmac {
+                key_bits: self.key_bits,
+            })
+        }
+    }
+
+    // Metadata from HSM-backed implementations is already measured in bits;
+    // rounding 127 up to 16 bytes would overstate the key's actual strength.
+    let policy = SigningPolicy {
+        hmac: HmacPolicy {
+            minimum_key_bits: 128,
+            minimum_output_bits: 128,
+        },
+        ..SigningPolicy::default()
+    };
+    assert!(matches!(
+        validate_signing_key(
+            &HmacMetadataKey { key_bits: 127 },
+            SignatureAlgorithm::HmacSha256,
+            &policy,
+        ),
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::InvalidKeyMaterial { .. }
+        ))
+    ));
+    validate_signing_key(
+        &HmacMetadataKey { key_bits: 128 },
+        SignatureAlgorithm::HmacSha256,
+        &policy,
+    )
+    .expect("an exact 128-bit HMAC key must meet the configured minimum");
 }
 
 #[test]

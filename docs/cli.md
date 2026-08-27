@@ -320,6 +320,12 @@ A direct `--aes-key` cannot satisfy an `EncryptedKey` recipient embedded in the
 template, so that inconsistent combination is rejected rather than preserving
 a stale wrapped key.
 
+For HMAC templates, `--hmac-key[:name] path` reads the file as raw secret bytes;
+certificate companions are not applicable. The compatibility CLI accepts the
+legacy 40-bit minimum used by the donor suite, while library callers retain the
+typed policy default of 128 bits. Named HMAC and asymmetric options participate
+in the same `KeyName` selection and candidate-budget rules.
+
 Generate an AES key store using the upstream command shape:
 
 ```sh
@@ -333,9 +339,11 @@ The key name is optional. `--gen-key aes-128` writes an unnamed key without a
 
 The command and status surface is available now, while individual key formats,
 algorithms, selectors, and policy controls remain capability-limited. Current
-private-key loading accepts unencrypted PKCS#8 RSA, P-256, and P-384 plus
-PKCS#1 RSA in PEM or DER; `--privkey-p8-pem` and `--privkey-p8-der` are accepted
-as upstream PKCS#8 aliases. Public verification accepts SubjectPublicKeyInfo,
+private-key loading accepts unencrypted PKCS#8 RSA, DSA, P-256, P-384, and P-521
+plus PKCS#1 RSA in PEM or DER; `--privkey-p8-pem` and `--privkey-p8-der` are
+accepted as upstream PKCS#8 aliases. The template signature method selects the
+key family before decoding, while ECDSA keys select their curve from PKCS#8.
+Public verification accepts SubjectPublicKeyInfo,
 PKCS#1 RSA public keys, and X.509 certificates. Encryption accepts RSA public
 keys or RSA X.509 recipient certificates in PEM or DER. Explicit verification
 certificate options pin verification to that certificate's public key instead

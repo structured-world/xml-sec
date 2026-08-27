@@ -15,9 +15,9 @@ use rsa::{
 use x509_parser::prelude::FromDer as _;
 use xml_sec::policy::{PolicyViolation, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
-    EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfo, RsaSigningKey, SignatureAlgorithm,
-    SigningKey, VerificationKey, find_signature_node, parse_key_info, parse_signed_info,
-    uri::UriReferenceResolver,
+    DsaSigningKey, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey, KeyInfo,
+    RsaSigningKey, SignatureAlgorithm, SigningKey, VerificationKey, find_signature_node,
+    parse_key_info, parse_signed_info, uri::UriReferenceResolver,
 };
 
 // This is an absolute process-safety ceiling, not deployment policy. Parsed
@@ -246,42 +246,115 @@ pub fn decode_signing_key(
     path: &Path,
     bytes: &[u8],
     format: PrivateKeyFormat,
+    algorithm: SignatureAlgorithm,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
-    if matches!(format, PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem)
-        && let Ok(text) = std::str::from_utf8(bytes)
-    {
-        if let Ok(key) = RsaSigningKey::from_pkcs8_pem(text) {
-            return Ok(Box::new(key));
+    match algorithm {
+        SignatureAlgorithm::RsaSha1
+        | SignatureAlgorithm::RsaSha224
+        | SignatureAlgorithm::RsaSha256
+        | SignatureAlgorithm::RsaSha384
+        | SignatureAlgorithm::RsaSha512 => decode_rsa_signing_key(path, bytes, format),
+        SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
+            decode_pkcs8_signing_key::<DsaSigningKey>(path, bytes, format)
         }
-        if let Ok(key) = EcdsaP256SigningKey::from_pkcs8_pem(text) {
-            return Ok(Box::new(key));
+        SignatureAlgorithm::EcdsaSha1
+        | SignatureAlgorithm::EcdsaSha224
+        | SignatureAlgorithm::EcdsaSha256
+        | SignatureAlgorithm::EcdsaSha384
+        | SignatureAlgorithm::EcdsaSha512 => decode_ecdsa_signing_key(path, bytes, format),
+        SignatureAlgorithm::HmacSha1
+        | SignatureAlgorithm::HmacSha224
+        | SignatureAlgorithm::HmacSha256
+        | SignatureAlgorithm::HmacSha384
+        | SignatureAlgorithm::HmacSha512 => {
+            Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
         }
-        if let Ok(key) = EcdsaP384SigningKey::from_pkcs8_pem(text) {
-            return Ok(Box::new(key));
-        }
-        if format == PrivateKeyFormat::Pem
-            && let Ok(rsa) = RsaPrivateKey::from_pkcs1_pem(text)
-        {
-            return normalize_rsa_signing_key(rsa, path);
+        _ => Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
+    }
+}
+
+trait Pkcs8SigningKey: SigningKey + Sized + 'static {
+    fn decode_pkcs8_pem(text: &str) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
+    fn decode_pkcs8_der(bytes: &[u8]) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
+}
+
+macro_rules! impl_pkcs8_signing_key {
+    ($($key:ty),+ $(,)?) => {
+        $(
+            impl Pkcs8SigningKey for $key {
+                fn decode_pkcs8_pem(
+                    text: &str,
+                ) -> Result<Self, xml_sec::xmldsig::SigningKeyError> {
+                    Self::from_pkcs8_pem(text)
+                }
+
+                fn decode_pkcs8_der(
+                    bytes: &[u8],
+                ) -> Result<Self, xml_sec::xmldsig::SigningKeyError> {
+                    Self::from_pkcs8_der(bytes)
+                }
+            }
+        )+
+    };
+}
+
+impl_pkcs8_signing_key!(
+    RsaSigningKey,
+    DsaSigningKey,
+    EcdsaP256SigningKey,
+    EcdsaP384SigningKey,
+    EcdsaP521SigningKey,
+);
+
+fn decode_pkcs8_signing_key<K: Pkcs8SigningKey>(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+    let key = match format {
+        PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| K::decode_pkcs8_pem(text).ok()),
+        PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der => K::decode_pkcs8_der(bytes).ok(),
+    };
+    key.map(|key| Box::new(key) as Box<dyn SigningKey>)
+        .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+}
+
+fn decode_ecdsa_signing_key(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+    decode_pkcs8_signing_key::<EcdsaP256SigningKey>(path, bytes, format)
+        .or_else(|_| decode_pkcs8_signing_key::<EcdsaP384SigningKey>(path, bytes, format))
+        .or_else(|_| decode_pkcs8_signing_key::<EcdsaP521SigningKey>(path, bytes, format))
+}
+
+fn decode_rsa_signing_key(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+    if let Ok(key) = decode_pkcs8_signing_key::<RsaSigningKey>(path, bytes, format) {
+        return Ok(key);
+    }
+    match format {
+        PrivateKeyFormat::Pem => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| RsaPrivateKey::from_pkcs1_pem(text).ok())
+            .map_or_else(
+                || Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
+                |key| normalize_rsa_signing_key(key, path),
+            ),
+        PrivateKeyFormat::Der => RsaPrivateKey::from_pkcs1_der(bytes).map_or_else(
+            |_| Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
+            |key| normalize_rsa_signing_key(key, path),
+        ),
+        PrivateKeyFormat::Pkcs8Pem | PrivateKeyFormat::Pkcs8Der => {
+            Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
         }
     }
-    if matches!(format, PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der) {
-        if let Ok(key) = RsaSigningKey::from_pkcs8_der(bytes) {
-            return Ok(Box::new(key));
-        }
-        if let Ok(key) = EcdsaP256SigningKey::from_pkcs8_der(bytes) {
-            return Ok(Box::new(key));
-        }
-        if let Ok(key) = EcdsaP384SigningKey::from_pkcs8_der(bytes) {
-            return Ok(Box::new(key));
-        }
-        if format == PrivateKeyFormat::Der
-            && let Ok(rsa) = RsaPrivateKey::from_pkcs1_der(bytes)
-        {
-            return normalize_rsa_signing_key(rsa, path);
-        }
-    }
-    Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
 }
 
 fn normalize_rsa_signing_key(
@@ -535,7 +608,7 @@ mod tests {
     ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
         let path = path.as_ref();
         let bytes = read(path)?;
-        decode_signing_key(path, &bytes, format)
+        decode_signing_key(path, &bytes, format, SignatureAlgorithm::RsaSha256)
     }
 
     #[test]
