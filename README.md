@@ -63,6 +63,12 @@ for namespace-correct mutation.
 xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c14n", "xml-backend-roxmltree"] }
 ```
 
+CI and fuzzing use the separate `xml-backend-differential` mode. It parses each bounded input with
+both adapters and fails closed unless their complete semantic arenas agree, including topology,
+expanded names, attributes, namespace axes, character data, comments, processing instructions,
+semantic order, and source ranges. This intentionally pays for both DOM parses and is not a
+production fallback; production builds select exactly one parser backend.
+
 Install the `xmlsec1` command from the same package:
 
 ```sh

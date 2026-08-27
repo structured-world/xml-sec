@@ -587,11 +587,14 @@ fn rejects_dtd_and_unsupported_retrieval_defaults() {
         .external_resources(&resources)
         .verify(&unsupported)
         .expect_err("unsupported RetrievalMethod XPath must fail closed");
-    assert!(matches!(
-        unsupported_error,
-        DsigError::ParseKeyInfo(ParseError::InvalidStructure(reason))
-            if reason == "unsupported RetrievalMethod XPath selection"
-    ));
+    assert!(
+        matches!(
+            &unsupported_error,
+            DsigError::ParseKeyInfo(ParseError::InvalidStructure(reason))
+                if reason == "unsupported RetrievalMethod XPath selection"
+        ),
+        "unexpected RetrievalMethod error: {unsupported_error:?}"
+    );
 
     let retrieval = DefaultKeyResolver::new(KeyResolverConfig {
         lookup_certs: vec![cert("balor.pem")],

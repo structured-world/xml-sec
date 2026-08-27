@@ -4,14 +4,24 @@
 //! implemented above it, so selecting a backend cannot change C14N, XPath,
 //! XMLDSig, or XMLEnc behavior.
 
-#[cfg(feature = "xml-backend-roxmltree")]
+#[cfg(feature = "xml-backend-differential")]
+mod differential;
+mod preflight;
+#[cfg(any(
+    feature = "xml-backend-roxmltree",
+    feature = "xml-backend-differential"
+))]
 mod roxmltree;
 mod tree;
-#[cfg(feature = "xml-backend-xmloxide")]
+#[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
 mod xmloxide;
 
 use std::fmt;
 
+use self::preflight::LexicalPreflight;
+
+#[cfg(feature = "xml-backend-differential")]
+use self::differential::DifferentialBackend as SelectedBackend;
 #[cfg(feature = "xml-backend-roxmltree")]
 use self::roxmltree::RoxmltreeBackend as SelectedBackend;
 #[cfg(feature = "xml-backend-xmloxide")]
@@ -47,12 +57,24 @@ pub enum ParseError {
     DtdDetected,
     /// The retained semantic node ceiling was exceeded.
     NodesLimitReached,
+    /// The absolute XML element nesting ceiling was exceeded.
+    DepthLimitReached {
+        /// Maximum accepted element depth.
+        maximum: usize,
+        /// First observed depth beyond the ceiling.
+        actual: usize,
+    },
     /// The selected backend rejected malformed XML.
     Backend {
         /// Compile-time selected backend name.
         backend: &'static str,
         /// Backend diagnostic retained for troubleshooting.
         message: String,
+    },
+    /// The two parsers produced different retained XML semantics.
+    BackendDivergence {
+        /// Bounded diagnostic identifying the divergent semantic component.
+        reason: String,
     },
 }
 
@@ -61,8 +83,17 @@ impl fmt::Display for ParseError {
         match self {
             Self::DtdDetected => formatter.write_str("DTD detected"),
             Self::NodesLimitReached => formatter.write_str("nodes limit reached"),
+            Self::DepthLimitReached { maximum, actual } => {
+                write!(
+                    formatter,
+                    "XML depth limit {maximum} exceeded at depth {actual}"
+                )
+            }
             Self::Backend { backend, message } => {
                 write!(formatter, "{backend} rejected XML: {message}")
+            }
+            Self::BackendDivergence { reason } => {
+                write!(formatter, "XML backend semantic divergence: {reason}")
             }
         }
     }
@@ -74,6 +105,7 @@ trait XmlBackend {
     fn parse<'input>(
         input: &'input str,
         options: ParsingOptions,
+        preflight: &LexicalPreflight,
     ) -> Result<Document<'input>, ParseError>;
 }
 

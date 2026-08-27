@@ -5112,6 +5112,25 @@ BA== </Modulus>
     }
 
     #[test]
+    fn digest_value_ignores_processing_instruction_data() {
+        // PI payload is not XML character data and therefore cannot alter the
+        // base64 octets represented by DigestValue.
+        let xml = r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+            <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+            <SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/>
+            <Reference URI="">
+                <DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+                <DigestValue>AAAAAAAA<?ignored not-base64?>AAAAAAAAAAAAAAAAAAA=</DigestValue>
+            </Reference>
+        </SignedInfo>"#;
+        let document = Document::parse(xml).expect("fixture must parse");
+        let signed_info =
+            parse_signed_info(document.root_element()).expect("PI must not alter digest data");
+
+        assert_eq!(signed_info.references[0].digest_value, vec![0_u8; 20]);
+    }
+
+    #[test]
     fn base64_decode_digest_accepts_xml_whitespace_chars() {
         let digest =
             base64_decode_digest("AAAA\tAAAA\rAAAA\nAAAA AAAAAAAAAAA=", DigestAlgorithm::Sha1)

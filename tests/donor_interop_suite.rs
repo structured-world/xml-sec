@@ -151,6 +151,7 @@ fn complete_xmldsig11_verification_corpus_is_classified_and_executed() {
     let policy = compatibility_verification_policy();
     let mut verified = 0;
     let mut rejected_rfc4050 = 0;
+    let mut rejected_weak_hmac = 0;
 
     for path in paths {
         let xml = fs::read_to_string(&path)
@@ -173,7 +174,17 @@ fn complete_xmldsig11_verification_corpus_is_classified_and_executed() {
                 .verify(&xml)
         };
 
-        if name.contains("_4050") {
+        if name == "signature-enveloping-hmac-sha1-truncated40.xml" {
+            assert!(
+                matches!(
+                    result,
+                    Err(DsigError::Policy(PolicyViolation::HmacOutputLength { .. }))
+                ),
+                "{} must reject an HMAC output below the XMLDSig 80-bit floor",
+                path.display()
+            );
+            rejected_weak_hmac += 1;
+        } else if name.contains("_4050") {
             assert!(
                 matches!(
                     result,
@@ -191,8 +202,9 @@ fn complete_xmldsig11_verification_corpus_is_classified_and_executed() {
         }
     }
 
-    assert_eq!(verified, 33);
+    assert_eq!(verified, 32);
     assert_eq!(rejected_rfc4050, 12);
+    assert_eq!(rejected_weak_hmac, 1);
 }
 
 #[test]
@@ -513,8 +525,10 @@ fn hmac_donor_vectors_sign_and_verify_with_declared_output_lengths() {
     for path in sorted_files(XMLDSIG11_DIR, "xml")
         .into_iter()
         .filter(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().contains("hmac"))
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.contains("hmac") && name != "signature-enveloping-hmac-sha1-truncated40.xml"
+            })
         })
     {
         let signed = fs::read_to_string(&path).expect("HMAC vector must be readable");

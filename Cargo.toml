@@ -94,6 +94,7 @@ tempfile = "3"
 default = ["xmldsig", "xmlenc", "c14n", "xml-backend-xmloxide"]
 xml-backend-xmloxide = ["dep:xmloxide"]
 xml-backend-roxmltree = ["dep:roxmltree"]
+xml-backend-differential = ["dep:roxmltree", "dep:xmloxide"]
 xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:der",
     "dep:crypto-bigint",

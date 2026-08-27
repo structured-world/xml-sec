@@ -1630,8 +1630,8 @@ mod tests {
 
     #[test]
     fn streaming_mutation_scan_consumes_the_shared_parse_budget() {
-        // The quick-xml rewrite plus one bounded preflight and one selected
-        // semantic backend parse consume one operation-wide allowance.
+        // The quick-xml rewrite plus bounded preflight and every selected-mode
+        // semantic parser consume one operation-wide allowance.
         let xml = format!(
             "<root><ds:Signature xmlns:ds=\"{XMLDSIG_NS}\"><ds:SignatureValue/></ds:Signature></root>"
         );
@@ -1646,7 +1646,7 @@ mod tests {
         )
         .expect("streaming mutation must succeed");
 
-        let dom_passes = 2;
+        let dom_passes = 3;
         assert_eq!(
             budget.consumed(),
             xml.len() * (dom_passes + 1) + output.len() * dom_passes

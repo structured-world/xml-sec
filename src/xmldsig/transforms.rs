@@ -1821,7 +1821,7 @@ fn parse_xpath_expression(
             // bearing the expression, not as the text node itself.
             specification_xpath_element: xpath_node.id(),
             xmlsec_legacy_transform_element: transform_node,
-            // NodeId is only meaningful within one roxmltree Document. Keep an
+            // NodeId is only meaningful within one semantic DOM Document. Keep an
             // owned content identity so parsed transforms cannot outlive the
             // source and later alias unrelated nodes carrying the same indices.
             document: xpath_state.document_identity(xpath_node.document()),
@@ -2646,7 +2646,7 @@ mod tests {
         // operation meter rather than receiving a parser-local allowance.
         let signature_document = Document::parse("<Signature/>").unwrap();
         let xml = b"<root/>";
-        let parser_passes = 2 + usize::from(cfg!(feature = "xml-backend-xmloxide"));
+        let parser_passes = 3;
         let resources = crate::policy::ResourcePolicy {
             max_xml_parse_work_bytes: xml.len() * parser_passes,
             ..crate::policy::ResourcePolicy::default()
@@ -2685,7 +2685,7 @@ mod tests {
     #[test]
     fn binary_to_node_set_adapter_bounds_external_xml_nodes_during_parse() {
         // The parser must reject a dense external XML resource before allocating
-        // an unbounded roxmltree arena or beginning XPath materialization.
+        // an unbounded semantic DOM arena or beginning XPath materialization.
         let signature_document = Document::parse("<Signature/>").unwrap();
         let xml = format!(
             "<root>{}</root>",

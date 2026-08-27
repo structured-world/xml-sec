@@ -36,7 +36,7 @@ const VALIDATION_WRAPPER_NODE_OVERHEAD: u32 = 3;
 
 #[cfg(test)]
 fn selected_parser_passes() -> usize {
-    2
+    3
 }
 
 /// Process-local provenance of one owned XML document.
@@ -242,6 +242,15 @@ fn charge_parse_work(
     Ok(())
 }
 
+fn charge_semantic_parser_work(
+    budget: Option<&XmlParseWorkBudget>,
+    bytes: usize,
+) -> Result<(), XmlDocumentError> {
+    charge_parse_work(budget, bytes)?;
+    charge_parse_work(budget, bytes)?;
+    Ok(())
+}
+
 struct ContentReplacementEdit<'a> {
     range: std::ops::Range<usize>,
     replacement: &'a str,
@@ -440,6 +449,11 @@ pub enum XmlDocumentError {
     /// A mutation target is not an element.
     #[error("XML mutation target must be an element")]
     TargetNotElement,
+    /// A semantic node was synthesized from a shared entity-reference token.
+    #[error(
+        "XML mutation target originates from an entity expansion and has no unique source range"
+    )]
+    EntityExpandedMutationTarget,
     /// Replacement content does not satisfy the requested structural shape.
     #[error("invalid XML replacement: {0}")]
     InvalidReplacement(String),
@@ -682,7 +696,7 @@ impl XmlDocument {
         replacement: &str,
     ) -> Result<(), XmlDocumentError> {
         let range = self.with_view(|view| {
-            let node = view.resolve_node(target)?;
+            let node = view.resolve_mutation_node(target)?;
             if !node.is_element() {
                 return Err(XmlDocumentError::TargetNotElement);
             }
@@ -708,7 +722,7 @@ impl XmlDocument {
         budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
         let range = self.with_view(|view| {
-            let node = view.resolve_node(target)?;
+            let node = view.resolve_mutation_node(target)?;
             if !node.is_element() {
                 return Err(XmlDocumentError::TargetNotElement);
             }
@@ -734,8 +748,9 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
     ) -> Result<(), XmlDocumentError> {
-        let range =
-            self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
+        let range = self.with_view(|view| {
+            Ok::<_, XmlDocumentError>(view.resolve_mutation_node(target)?.range())
+        })?;
         self.ensure_replacement_fits(&range, replacement.len(), self.settings.max_bytes)?;
         self.validate_fragment_in_parent_context(target, replacement, None, self.settings, None)?;
         self.replace_range(range, replacement, None)
@@ -749,8 +764,9 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
-        let range =
-            self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
+        let range = self.with_view(|view| {
+            Ok::<_, XmlDocumentError>(view.resolve_mutation_node(target)?.range())
+        })?;
         self.ensure_replacement_fits(&range, replacement.len(), settings.max_bytes)?;
         self.validate_fragment_in_parent_context(
             target,
@@ -771,7 +787,7 @@ impl XmlDocument {
         self.replace_content_inner(target, replacement, None, self.settings, None)
     }
 
-    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    #[cfg(feature = "xmlenc")]
     pub(crate) fn replace_content_with_budget(
         &mut self,
         target: NodeIdentity,
@@ -797,7 +813,7 @@ impl XmlDocument {
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
         let (range, self_closing_expansion, serialized_len) = self.with_view(|view| {
-            let node = view.resolve_node(target)?;
+            let node = view.resolve_mutation_node(target)?;
             if !node.is_element() {
                 return Err(XmlDocumentError::TargetNotElement);
             }
@@ -931,7 +947,7 @@ impl XmlDocument {
             replacements
                 .iter()
                 .map(|(target, replacement)| {
-                    let node = view.resolve_node(*target)?;
+                    let node = view.resolve_mutation_node(*target)?;
                     if !node.is_element() {
                         return Err(XmlDocumentError::TargetNotElement);
                     }
@@ -1130,7 +1146,7 @@ impl XmlDocument {
             });
         }
         let (range, replacement) = self.with_view(|view| {
-            let node = view.resolve_node(target)?;
+            let node = view.resolve_mutation_node(target)?;
             if !node.is_element() {
                 return Err(XmlDocumentError::TargetNotElement);
             }
@@ -1207,7 +1223,7 @@ impl XmlDocument {
         replacement_len: usize,
     ) -> Result<usize, XmlDocumentError> {
         self.with_view(|view| {
-            let node = view.resolve_node(target)?;
+            let node = view.resolve_mutation_node(target)?;
             if !node.is_element() {
                 return Err(XmlDocumentError::TargetNotElement);
             }
@@ -1257,7 +1273,7 @@ impl XmlDocument {
         child_len: usize,
     ) -> Result<usize, XmlDocumentError> {
         self.with_view(|view| {
-            let node = view.resolve_node(target)?;
+            let node = view.resolve_mutation_node(target)?;
             if !node.is_element() {
                 return Err(XmlDocumentError::TargetNotElement);
             }
@@ -1745,6 +1761,17 @@ impl<'a> DocumentView<'a> {
             .ok_or(XmlDocumentError::MissingNode)
     }
 
+    fn resolve_mutation_node(
+        self,
+        identity: NodeIdentity,
+    ) -> Result<Node<'a, 'a>, XmlDocumentError> {
+        let node = self.resolve_node(identity)?;
+        if !node.has_actionable_range() {
+            return Err(XmlDocumentError::EntityExpandedMutationTarget);
+        }
+        Ok(node)
+    }
+
     /// Identify an attribute by expanded name on a current owner element.
     pub fn attribute_identity(
         self,
@@ -1827,7 +1854,7 @@ fn build_cell_after_preflight(
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<DocumentCell, XmlDocumentError> {
-    charge_parse_work(budget, xml.len())?;
+    charge_semantic_parser_work(budget, xml.len())?;
     build_semantic_cell(xml, settings)
 }
 
@@ -1859,7 +1886,7 @@ pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
         });
     }
     preflight_document_limits(xml, settings, budget)?;
-    charge_parse_work(budget, xml.len())?;
+    charge_semantic_parser_work(budget, xml.len())?;
     let (document, _) = parse_semantic_document(xml, settings)?;
     Ok(document)
 }
@@ -2623,7 +2650,7 @@ fn document_requires_internal_dtd(
     if !settings.allow_dtd {
         return Ok(false);
     }
-    charge_parse_work(budget, xml.len())?;
+    charge_semantic_parser_work(budget, xml.len())?;
     Ok(Document::parse_with_options(
         xml,
         ParsingOptions {
@@ -3692,7 +3719,7 @@ mod tests {
         assert_eq!(document.generation(), 1);
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmlenc")]
     #[test]
     fn bounded_content_replacement_rejects_new_text_node_atomically() {
         let mut document =
@@ -3721,6 +3748,28 @@ mod tests {
             Err(XmlDocumentError::ProjectedNodeLimit { maximum: rejected })
                 if rejected == maximum
         ));
+        assert_eq!(document.as_xml(), before);
+        assert_eq!(document.generation(), 0);
+    }
+
+    #[test]
+    fn entity_expanded_elements_are_not_mutation_targets() {
+        // One entity token may expand to several semantic siblings. Mutating
+        // one projected identity must not splice the shared lexical token.
+        let source = "<!DOCTYPE root [<!ENTITY pair '<a ID=\"target\"/><b/>'>]><root>&pair;</root>";
+        let settings = DocumentParseSettings::new(true, 64, 4_096);
+        let mut document = XmlDocument::parse_with_settings(source.into(), settings)
+            .expect("entity fixture must parse");
+        let target = document
+            .with_view(|view| view.node_for_id("target", &[]))
+            .expect("expanded element ID must resolve");
+        let before = document.as_xml().to_owned();
+
+        let error = document
+            .replace_element(target, "<replacement/>")
+            .expect_err("entity-expanded identity must not be mutable");
+
+        assert!(error.to_string().contains("entity expansion"), "{error}");
         assert_eq!(document.as_xml(), before);
         assert_eq!(document.generation(), 0);
     }

@@ -44,16 +44,17 @@ pub enum NodeType {
     PI,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct NodeData {
     pub(super) parent: Option<NodeId>,
     pub(super) children: Vec<NodeId>,
     pub(super) kind: NodeKind,
     pub(super) range: Range<usize>,
+    pub(super) range_actionable: bool,
     pub(super) subtree_end: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum NodeKind {
     Root,
     Element {
@@ -71,7 +72,7 @@ pub(super) enum NodeKind {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AttributeData {
     pub(super) name: String,
     pub(super) namespace: Option<String>,
@@ -79,7 +80,7 @@ pub(super) struct AttributeData {
     pub(super) value: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct NamespaceData {
     pub(super) prefix: Option<String>,
     pub(super) uri: String,
@@ -99,11 +100,22 @@ impl<'input> TreeBuilder<'input> {
         }
     }
 
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
     pub(super) fn push(
         &mut self,
         parent: Option<NodeId>,
         kind: NodeKind,
         range: Range<usize>,
+    ) -> NodeId {
+        self.push_with_actionability(parent, kind, range, true)
+    }
+
+    pub(super) fn push_with_actionability(
+        &mut self,
+        parent: Option<NodeId>,
+        kind: NodeKind,
+        range: Range<usize>,
+        range_actionable: bool,
     ) -> NodeId {
         let id = NodeId(
             u32::try_from(self.nodes.len()).expect("bounded XML node count must fit into u32"),
@@ -113,6 +125,7 @@ impl<'input> TreeBuilder<'input> {
             children: Vec::new(),
             kind,
             range,
+            range_actionable,
             subtree_end: id.0 + 1,
         });
         if let Some(parent) = parent {
@@ -126,24 +139,35 @@ impl<'input> TreeBuilder<'input> {
             u32::try_from(self.nodes.len()).expect("bounded XML node count must fit into u32");
     }
 
-    #[cfg(feature = "xml-backend-xmloxide")]
-    pub(super) fn append_text(&mut self, parent: NodeId, value: &str, range: Range<usize>) {
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
+    pub(super) fn append_text(
+        &mut self,
+        parent: NodeId,
+        value: &str,
+        range: Range<usize>,
+        range_actionable: bool,
+    ) {
         if let Some(last) = self.nodes[parent.index()].children.last().copied()
             && let NodeKind::Text(existing) = &mut self.nodes[last.index()].kind
         {
             existing.push_str(value);
-            self.nodes[last.index()].range.end = range.end;
+            self.nodes[last.index()].range_actionable &= range_actionable;
             return;
         }
-        self.push(Some(parent), NodeKind::Text(value.to_owned()), range);
+        self.push_with_actionability(
+            Some(parent),
+            NodeKind::Text(value.to_owned()),
+            range,
+            range_actionable,
+        );
     }
 
-    #[cfg(feature = "xml-backend-xmloxide")]
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
     pub(super) fn len(&self) -> usize {
         self.nodes.len()
     }
 
-    #[cfg(feature = "xml-backend-xmloxide")]
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
     pub(super) fn namespaces(&self, node: NodeId) -> Option<&[NamespaceData]> {
         match &self.nodes[node.index()].kind {
             NodeKind::Element { namespaces, .. } => Some(namespaces),
@@ -158,7 +182,10 @@ impl<'input> TreeBuilder<'input> {
         }
     }
 
-    #[cfg(feature = "xml-backend-roxmltree")]
+    #[cfg(any(
+        feature = "xml-backend-roxmltree",
+        feature = "xml-backend-differential"
+    ))]
     pub(super) fn input(&self) -> &'input str {
         self.input
     }
@@ -185,7 +212,8 @@ impl<'input> Document<'input> {
         input: &'input str,
         options: ParsingOptions,
     ) -> Result<Self, ParseError> {
-        SelectedBackend::parse(input, options)
+        let preflight = super::LexicalPreflight::scan(input, options.allow_dtd)?;
+        SelectedBackend::parse(input, options, &preflight)
     }
 
     /// Returns the original UTF-8 source.
@@ -217,6 +245,260 @@ impl<'input> Document<'input> {
         self.nodes
             .get(id.index())
             .map(|_| Node { document: self, id })
+    }
+
+    #[cfg(feature = "xml-backend-differential")]
+    pub(super) fn ensure_semantically_equivalent(&self, other: &Self) -> Result<(), ParseError> {
+        let doctype = doctype_range(self.input);
+        if self.nodes.len() != other.nodes.len() {
+            let detail = self
+                .nodes
+                .iter()
+                .zip(&other.nodes)
+                .position(|(left, right)| {
+                    node_kind_label(&left.kind) != node_kind_label(&right.kind)
+                })
+                .map_or_else(
+                    || "one adapter retained trailing nodes".to_owned(),
+                    |index| {
+                        format!(
+                            "node {index} is {} versus {}",
+                            node_kind_label(&self.nodes[index].kind),
+                            node_kind_label(&other.nodes[index].kind)
+                        )
+                    },
+                );
+            return Err(ParseError::BackendDivergence {
+                reason: format!(
+                    "retained semantic node counts differ ({} versus {}): {detail}",
+                    self.nodes.len(),
+                    other.nodes.len()
+                ),
+            });
+        }
+        if let Some((index, (left, right))) =
+            self.nodes
+                .iter()
+                .zip(&other.nodes)
+                .enumerate()
+                .find(|(_, (left, right))| {
+                    !nodes_semantically_equivalent(left, right, doctype.as_ref())
+                })
+        {
+            return Err(ParseError::BackendDivergence {
+                reason: format!(
+                    "retained semantic node {index} differs in {}",
+                    node_difference(left, right, doctype.as_ref())
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "xml-backend-differential")]
+fn node_kind_label(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Root => "root",
+        NodeKind::Element { .. } => "element",
+        NodeKind::Text(_) => "text",
+        NodeKind::Comment(_) => "comment",
+        NodeKind::PI { .. } => "processing instruction",
+    }
+}
+
+#[cfg(feature = "xml-backend-differential")]
+fn nodes_semantically_equivalent(
+    left: &NodeData,
+    right: &NodeData,
+    doctype: Option<&Range<usize>>,
+) -> bool {
+    left.parent == right.parent
+        && left.children == right.children
+        && node_kinds_semantically_equivalent(&left.kind, &right.kind)
+        && source_ranges_equivalent(&left.range, &right.range, doctype)
+        && range_actionability_equivalent(left, right)
+        && left.subtree_end == right.subtree_end
+}
+
+#[cfg(feature = "xml-backend-differential")]
+fn node_difference(left: &NodeData, right: &NodeData, doctype: Option<&Range<usize>>) -> String {
+    if left.parent != right.parent {
+        "parent identity".to_owned()
+    } else if left.children != right.children {
+        "child identities".to_owned()
+    } else if !node_kinds_semantically_equivalent(&left.kind, &right.kind) {
+        node_kind_difference(&left.kind, &right.kind).to_owned()
+    } else if !source_ranges_equivalent(&left.range, &right.range, doctype) {
+        format!(
+            "source range ({}..{} versus {}..{})",
+            left.range.start, left.range.end, right.range.start, right.range.end
+        )
+    } else if !range_actionability_equivalent(left, right) {
+        "source-range actionability".to_owned()
+    } else {
+        "subtree boundary".to_owned()
+    }
+}
+
+#[cfg(feature = "xml-backend-differential")]
+fn range_actionability_equivalent(left: &NodeData, right: &NodeData) -> bool {
+    // Only elements are accepted by owned-document mutation APIs. Parsers can
+    // legitimately report different lexical spans for coalesced character data
+    // after CDATA and entity expansion, but expanded elements must never become
+    // actionable through either backend.
+    !matches!(left.kind, NodeKind::Element { .. })
+        || left.range_actionable == right.range_actionable
+}
+
+#[cfg(feature = "xml-backend-differential")]
+fn source_ranges_equivalent(
+    left: &Range<usize>,
+    right: &Range<usize>,
+    doctype: Option<&Range<usize>>,
+) -> bool {
+    if left == right {
+        return true;
+    }
+    let Some(doctype) = doctype else {
+        return false;
+    };
+    // Entity-expanded nodes have no single lexical span in the instance:
+    // roxmltree reports declaration bytes while xmloxide reports reference
+    // bytes. Both positions encode the same synthetic entity provenance.
+    range_contains(doctype, left) != range_contains(doctype, right)
+}
+
+#[cfg(any(
+    feature = "xml-backend-roxmltree",
+    feature = "xml-backend-differential"
+))]
+pub(super) fn doctype_range(input: &str) -> Option<Range<usize>> {
+    let start = input.find("<!DOCTYPE")?;
+    let bytes = input.as_bytes();
+    let mut quote = None;
+    let mut subset_depth = 0_u32;
+    let mut offset = start + "<!DOCTYPE".len();
+    while let Some(&byte) = bytes.get(offset) {
+        if let Some(active) = quote {
+            if byte == active {
+                quote = None;
+            }
+        } else {
+            // Brackets and closing delimiters inside DTD comments or processing
+            // instructions are data, not internal-subset structure.
+            if bytes[offset..].starts_with(b"<!--") {
+                let end = bytes[offset + 4..]
+                    .windows(3)
+                    .position(|window| window == b"-->")?;
+                offset += 4 + end + 3;
+                continue;
+            }
+            if bytes[offset..].starts_with(b"<?") {
+                let end = bytes[offset + 2..]
+                    .windows(2)
+                    .position(|window| window == b"?>")?;
+                offset += 2 + end + 2;
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'[' => subset_depth = subset_depth.saturating_add(1),
+                b']' => subset_depth = subset_depth.saturating_sub(1),
+                b'>' if subset_depth == 0 => return Some(start..offset + 1),
+                _ => {}
+            }
+        }
+        offset += 1;
+    }
+    None
+}
+
+#[cfg(any(
+    feature = "xml-backend-roxmltree",
+    feature = "xml-backend-differential"
+))]
+pub(super) fn range_contains(container: &Range<usize>, candidate: &Range<usize>) -> bool {
+    candidate.start >= container.start && candidate.end <= container.end
+}
+
+#[cfg(feature = "xml-backend-differential")]
+fn node_kinds_semantically_equivalent(left: &NodeKind, right: &NodeKind) -> bool {
+    match (left, right) {
+        (
+            NodeKind::Element {
+                name: left_name,
+                namespace: left_namespace,
+                prefix: left_prefix,
+                attributes: left_attributes,
+                namespaces: left_namespaces,
+            },
+            NodeKind::Element {
+                name: right_name,
+                namespace: right_namespace,
+                prefix: right_prefix,
+                attributes: right_attributes,
+                namespaces: right_namespaces,
+            },
+        ) => {
+            left_name == right_name
+                && left_namespace == right_namespace
+                && left_prefix == right_prefix
+                && left_attributes == right_attributes
+                && namespace_axes_equivalent(left_namespaces, right_namespaces)
+        }
+        _ => left == right,
+    }
+}
+
+#[cfg(feature = "xml-backend-differential")]
+fn namespace_axes_equivalent(left: &[NamespaceData], right: &[NamespaceData]) -> bool {
+    left.len() == right.len() && left.iter().all(|item| right.contains(item))
+}
+
+#[cfg(feature = "xml-backend-differential")]
+fn node_kind_difference(left: &NodeKind, right: &NodeKind) -> &'static str {
+    match (left, right) {
+        (
+            NodeKind::Element {
+                name: left_name,
+                namespace: left_namespace,
+                prefix: left_prefix,
+                attributes: left_attributes,
+                namespaces: left_namespaces,
+            },
+            NodeKind::Element {
+                name: right_name,
+                namespace: right_namespace,
+                prefix: right_prefix,
+                attributes: right_attributes,
+                namespaces: right_namespaces,
+            },
+        ) => {
+            if left_name != right_name {
+                "element local name"
+            } else if left_namespace != right_namespace {
+                match (left_namespace.as_deref(), right_namespace.as_deref()) {
+                    (None, Some("")) => "element namespace URI (absent versus empty)",
+                    (Some(""), None) => "element namespace URI (empty versus absent)",
+                    (None, Some(_)) => "element namespace URI (absent versus non-empty)",
+                    (Some(_), None) => "element namespace URI (non-empty versus absent)",
+                    _ => "element namespace URI (different non-empty values)",
+                }
+            } else if left_prefix != right_prefix {
+                "element prefix"
+            } else if left_attributes != right_attributes {
+                "attribute axis"
+            } else if !namespace_axes_equivalent(left_namespaces, right_namespaces) {
+                "namespace axis"
+            } else {
+                "element semantics"
+            }
+        }
+        (NodeKind::Text(left), NodeKind::Text(right)) if left != right => "character data",
+        (NodeKind::Comment(left), NodeKind::Comment(right)) if left != right => "comment data",
+        (NodeKind::PI { .. }, NodeKind::PI { .. }) => "processing instruction data",
+        _ => "node kind",
     }
 }
 
@@ -285,6 +567,9 @@ impl<'a, 'input> Node<'a, 'input> {
     /// Returns the source byte range represented by this node.
     pub fn range(self) -> Range<usize> {
         self.data().range.clone()
+    }
+    pub(crate) fn has_actionable_range(self) -> bool {
+        self.data().range_actionable
     }
     /// Returns the parent node.
     pub fn parent(self) -> Option<Self> {
@@ -415,12 +700,7 @@ impl<'a, 'input> Node<'a, 'input> {
     {
         let name = name.into();
         self.attributes()
-            .find(|attr| {
-                attr.name() == name.name()
-                    && name
-                        .namespace()
-                        .is_none_or(|namespace| attr.namespace() == Some(namespace))
-            })
+            .find(|attr| attr.name() == name.name() && attr.namespace() == name.namespace())
             .map(Attribute::value)
     }
     /// Iterates in-scope namespace bindings.
@@ -449,8 +729,14 @@ impl<'a, 'input> Node<'a, 'input> {
     pub fn text(self) -> Option<&'a str> {
         match &self.data().kind {
             NodeKind::Text(value) | NodeKind::Comment(value) => Some(value),
-            NodeKind::Element { .. } => self.children().find_map(Node::text),
-            NodeKind::PI { value, .. } => value.as_deref(),
+            NodeKind::Element { .. } => {
+                self.first_child()
+                    .and_then(|child| match &child.data().kind {
+                        NodeKind::Text(value) => Some(value.as_str()),
+                        _ => None,
+                    })
+            }
+            NodeKind::PI { .. } => None,
             NodeKind::Root => None,
         }
     }
@@ -647,6 +933,11 @@ impl<'a, 'input> Iterator for Ancestors<'a, 'input> {
 #[cfg(test)]
 mod tests {
     use super::Document;
+    #[cfg(any(
+        feature = "xml-backend-roxmltree",
+        feature = "xml-backend-differential"
+    ))]
+    use super::doctype_range;
     use crate::xml::dom::{ParseError, ParsingOptions};
 
     #[test]
@@ -739,5 +1030,119 @@ mod tests {
         )
         .expect_err("the semantic node limit must reject the fourth node");
         assert_eq!(error, ParseError::NodesLimitReached);
+    }
+
+    #[test]
+    fn unqualified_attribute_lookup_requires_no_namespace() {
+        // Schema attributes such as Algorithm and URI are unqualified. A
+        // same-local-name extension attribute must never satisfy that lookup.
+        let document = Document::parse(
+            r#"<r xmlns:evil="urn:evil" evil:Algorithm="extension" Algorithm="schema"/>"#,
+        )
+        .expect("fixture must parse");
+        let root = document.root_element();
+
+        assert_eq!(root.attribute("Algorithm"), Some("schema"));
+        assert_eq!(root.attribute(("urn:evil", "Algorithm")), Some("extension"));
+
+        let extension_only =
+            Document::parse(r#"<r xmlns:evil="urn:evil" evil:Algorithm="extension"/>"#)
+                .expect("fixture must parse");
+        assert_eq!(extension_only.root_element().attribute("Algorithm"), None);
+    }
+
+    #[test]
+    fn node_text_preserves_character_data_contract() {
+        // PI data is not character data, and element text follows the first
+        // direct child contract rather than searching later descendants.
+        let document = Document::parse("<r><?p hidden?>visible</r>").expect("fixture must parse");
+        let root = document.root_element();
+        let pi = root.first_child().expect("PI must exist");
+
+        assert_eq!(pi.text(), None);
+        assert_eq!(pi.pi().and_then(|value| value.value), Some("hidden"));
+        assert_eq!(root.text(), None);
+        assert_eq!(
+            pi.next_sibling().and_then(|node| node.text()),
+            Some("visible")
+        );
+
+        let nested =
+            Document::parse("<r><child>nested</child>later</r>").expect("fixture must parse");
+        assert_eq!(nested.root_element().text(), None);
+    }
+
+    #[test]
+    fn selected_backend_rejects_deep_documents_before_dom_parsing() {
+        // Direct DOM callers do not run operation-policy preflight. The common
+        // lexical pass must enforce the absolute ceiling before either DOM.
+        const DEPTH: usize = 20_000;
+        let mut xml = String::with_capacity(DEPTH * 7);
+        xml.push_str(&"<n>".repeat(DEPTH));
+        xml.push_str(&"</n>".repeat(DEPTH));
+
+        assert!(matches!(
+            Document::parse(&xml),
+            Err(ParseError::DepthLimitReached { maximum, actual })
+                if maximum == crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING
+                    && actual == maximum + 1
+        ));
+    }
+
+    #[cfg(feature = "xml-backend-differential")]
+    #[test]
+    fn differential_comparison_fails_closed_on_semantic_divergence() {
+        // Differential mode must reject adapter disagreement rather than
+        // silently selecting one parser's interpretation of attacker input.
+        let left = Document::parse("<r><a/></r>").expect("fixture must parse");
+        let mut right = Document::parse("<r><a/></r>").expect("fixture must parse");
+        right.nodes[2].range.end -= 1;
+
+        assert!(matches!(
+            left.ensure_semantically_equivalent(&right),
+            Err(ParseError::BackendDivergence { .. })
+        ));
+    }
+
+    #[test]
+    fn dtd_internal_comments_are_not_document_nodes() {
+        // A `]` or `>` in an internal-subset comment must not terminate DTD
+        // range detection and leak that comment into the semantic document.
+        let document = Document::parse_with_options(
+            "<!--before--><!DOCTYPE r [<!-- ] > --><!ENTITY value 'ok'>]><r>&value;</r><!--after-->",
+            ParsingOptions {
+                allow_dtd: true,
+                ..ParsingOptions::default()
+            },
+        )
+        .expect("DTD fixture must parse");
+        let root = document.root();
+        let comments = root
+            .descendants()
+            .filter(|node| node.is_comment())
+            .filter_map(|node| node.text())
+            .collect::<Vec<_>>();
+
+        assert_eq!(comments, ["before", "after"]);
+        assert_eq!(
+            root.descendants()
+                .find(|node| node.is_text())
+                .and_then(|node| node.text()),
+            Some("ok")
+        );
+    }
+
+    #[cfg(any(
+        feature = "xml-backend-roxmltree",
+        feature = "xml-backend-differential"
+    ))]
+    #[test]
+    fn dtd_range_scanning_accepts_unicode_names() {
+        // Scanner offsets are bytes; a multibyte XML name must not become an
+        // invalid UTF-8 slicing boundary while locating the DTD terminator.
+        let input = "<!DOCTYPE r [<!ENTITY café 'ok'>]><r/>";
+        let end = input.find("><r/>").expect("fixture has document root") + 1;
+
+        assert_eq!(doctype_range(input), Some(0..end));
     }
 }

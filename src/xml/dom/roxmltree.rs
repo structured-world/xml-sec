@@ -1,8 +1,10 @@
 //! `roxmltree` parser adapter for the shared semantic arena.
 
 use super::{
-    Document, ParseError, ParsingOptions, XmlBackend,
-    tree::{AttributeData, NamespaceData, NodeId, NodeKind, TreeBuilder},
+    Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackend,
+    tree::{
+        AttributeData, NamespaceData, NodeId, NodeKind, TreeBuilder, doctype_range, range_contains,
+    },
 };
 
 pub(super) struct RoxmltreeBackend;
@@ -11,6 +13,7 @@ impl XmlBackend for RoxmltreeBackend {
     fn parse<'input>(
         input: &'input str,
         options: ParsingOptions,
+        preflight: &LexicalPreflight,
     ) -> Result<Document<'input>, ParseError> {
         let parsed = ::roxmltree::Document::parse_with_options(
             input,
@@ -21,8 +24,11 @@ impl XmlBackend for RoxmltreeBackend {
             },
         )
         .map_err(map_error)?;
-        let mut target = TreeBuilder::new(input, parsed.descendants().count());
-        project_node(&mut target, parsed.root(), None);
+        let mut target = TreeBuilder::new(
+            input,
+            parsed.descendants().count().max(preflight.node_count()),
+        );
+        project_document(&mut target, parsed.root(), doctype_range(input).as_ref())?;
         Ok(target.finish())
     }
 }
@@ -38,52 +44,101 @@ fn map_error(error: ::roxmltree::Error) -> ParseError {
     }
 }
 
-fn project_node(
+enum ProjectionFrame<'document, 'input> {
+    Enter {
+        source: ::roxmltree::Node<'document, 'input>,
+        parent: Option<NodeId>,
+        depth: usize,
+    },
+    Exit(NodeId),
+}
+
+fn project_document<'document, 'input>(
     target: &mut TreeBuilder<'_>,
-    source: ::roxmltree::Node<'_, '_>,
-    parent: Option<NodeId>,
-) -> NodeId {
-    let kind = match source.node_type() {
-        ::roxmltree::NodeType::Root => NodeKind::Root,
-        ::roxmltree::NodeType::Element => NodeKind::Element {
-            name: source.tag_name().name().to_owned(),
-            namespace: source.tag_name().namespace().map(str::to_owned),
-            prefix: element_prefix(source).map(str::to_owned),
-            attributes: source
-                .attributes()
-                .map(|attribute| AttributeData {
-                    name: attribute.name().to_owned(),
-                    namespace: attribute.namespace().map(str::to_owned),
-                    prefix: attribute_prefix(target.input(), &attribute).map(str::to_owned),
-                    value: attribute.value().to_owned(),
-                })
-                .collect(),
-            namespaces: source
-                .namespaces()
-                .map(|namespace| NamespaceData {
-                    prefix: namespace.name().map(str::to_owned),
-                    uri: namespace.uri().to_owned(),
-                })
-                .collect(),
-        },
-        ::roxmltree::NodeType::Text => NodeKind::Text(source.text().unwrap_or_default().to_owned()),
-        ::roxmltree::NodeType::Comment => {
-            NodeKind::Comment(source.text().unwrap_or_default().to_owned())
-        }
-        ::roxmltree::NodeType::PI => {
-            let pi = source.pi().expect("PI node exposes PI data");
-            NodeKind::PI {
-                target: pi.target.to_owned(),
-                value: pi.value.map(str::to_owned),
+    root: ::roxmltree::Node<'document, 'input>,
+    doctype: Option<&std::ops::Range<usize>>,
+) -> Result<(), ParseError> {
+    let mut stack = vec![ProjectionFrame::Enter {
+        source: root,
+        parent: None,
+        depth: 0,
+    }];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            ProjectionFrame::Exit(node) => target.finish_subtree(node),
+            ProjectionFrame::Enter {
+                source,
+                parent,
+                depth,
+            } => {
+                let source_range = source.range();
+                let inside_doctype =
+                    doctype.is_some_and(|range| range_contains(range, &source_range));
+                if source.parent().is_some_and(|node| node.is_root()) && inside_doctype {
+                    continue;
+                }
+                if source.is_element() && depth > crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING {
+                    return Err(ParseError::DepthLimitReached {
+                        maximum: crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
+                        actual: depth,
+                    });
+                }
+                let kind = match source.node_type() {
+                    ::roxmltree::NodeType::Root => NodeKind::Root,
+                    ::roxmltree::NodeType::Element => NodeKind::Element {
+                        name: source.tag_name().name().to_owned(),
+                        namespace: source
+                            .tag_name()
+                            .namespace()
+                            .filter(|uri| !uri.is_empty())
+                            .map(str::to_owned),
+                        prefix: element_prefix(source).map(str::to_owned),
+                        attributes: source
+                            .attributes()
+                            .map(|attribute| AttributeData {
+                                name: attribute.name().to_owned(),
+                                namespace: attribute.namespace().map(str::to_owned),
+                                prefix: attribute_prefix(target.input(), &attribute)
+                                    .map(str::to_owned),
+                                value: attribute.value().to_owned(),
+                            })
+                            .collect(),
+                        namespaces: source
+                            .namespaces()
+                            .map(|namespace| NamespaceData {
+                                prefix: namespace.name().map(str::to_owned),
+                                uri: namespace.uri().to_owned(),
+                            })
+                            .collect(),
+                    },
+                    ::roxmltree::NodeType::Text => {
+                        NodeKind::Text(source.text().unwrap_or_default().to_owned())
+                    }
+                    ::roxmltree::NodeType::Comment => {
+                        NodeKind::Comment(source.text().unwrap_or_default().to_owned())
+                    }
+                    ::roxmltree::NodeType::PI => {
+                        let pi = source.pi().expect("PI node exposes PI data");
+                        NodeKind::PI {
+                            target: pi.target.to_owned(),
+                            value: pi.value.map(str::to_owned),
+                        }
+                    }
+                };
+                let id =
+                    target.push_with_actionability(parent, kind, source_range, !inside_doctype);
+                stack.push(ProjectionFrame::Exit(id));
+                for child in source.children().rev() {
+                    stack.push(ProjectionFrame::Enter {
+                        source: child,
+                        parent: Some(id),
+                        depth: depth + usize::from(child.is_element()),
+                    });
+                }
             }
         }
-    };
-    let id = target.push(parent, kind, source.range());
-    for child in source.children() {
-        project_node(target, child, Some(id));
     }
-    target.finish_subtree(id);
-    id
+    Ok(())
 }
 
 fn element_prefix<'a>(node: ::roxmltree::Node<'a, 'a>) -> Option<&'a str> {
