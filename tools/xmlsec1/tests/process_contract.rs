@@ -250,9 +250,7 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         fs::read(project_root().join("tests/fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der"))
             .unwrap();
     let dsa_key = dsa::SigningKey::from_pkcs8_encrypted_der(&encrypted_dsa, b"secret123").unwrap();
-    let dsa_private = temp.path().join("dsa-private.der");
     let dsa_public = temp.path().join("dsa-public.der");
-    fs::write(&dsa_private, dsa_key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
     fs::write(
         &dsa_public,
         dsa_key
@@ -267,7 +265,8 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
     let dsa_signed = temp.path().join("dsa-signed.xml");
     let dsa_sign = Command::new(binary())
         .args(["sign", "--pkcs8-der:TestKeyName-dsa-2048"])
-        .arg(&dsa_private)
+        .arg(project_root().join("tests/fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der"))
+        .args(["--pwd", "secret123"])
         .arg("--output")
         .arg(&dsa_signed)
         .arg(&dsa_template)
@@ -278,6 +277,19 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         "{}",
         String::from_utf8_lossy(&dsa_sign.stderr)
     );
+    let wrong_password_output = temp.path().join("dsa-wrong-password.xml");
+    let wrong_password = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-dsa-2048"])
+        .arg(project_root().join("tests/fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der"))
+        .args(["--pwd", "wrong"])
+        .arg("--output")
+        .arg(&wrong_password_output)
+        .arg(&dsa_template)
+        .output()
+        .unwrap();
+    assert!(!wrong_password.status.success());
+    assert!(!wrong_password_output.exists());
+    assert!(!String::from_utf8_lossy(&wrong_password.stderr).contains("wrong"));
     let dsa_verify = Command::new(binary())
         .args(["verify", "--pubkey-der:TestKeyName-dsa-2048"])
         .arg(&dsa_public)

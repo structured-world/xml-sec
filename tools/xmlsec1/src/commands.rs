@@ -662,9 +662,7 @@ fn named_candidate_search<'a, T: Copy>(
 fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, SIGN_OPTIONS)?;
     validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
-    if invocation.last_value("pwd").is_some() {
-        return Err(CommandError::UnsupportedOption("pwd".into()));
-    }
+    let password = option_text(invocation, "pwd")?;
     // This binary is an explicit libxmlsec1 compatibility boundary. Its sign
     // and verify commands must bind XPath here() identically for round trips.
     let policy = xmlsec_compatibility_signing_policy(invocation);
@@ -679,6 +677,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
         signature.algorithm,
         signature.key_info.as_ref(),
         &policy,
+        password.map(str::as_bytes),
     )?;
     let mut context = SignContext::new(selected.key.as_ref())
         .policy(policy)
@@ -786,6 +785,7 @@ fn select_signing_key(
     algorithm: SignatureAlgorithm,
     key_info: Option<&KeyInfo>,
     policy: &SigningPolicy,
+    password: Option<&[u8]>,
 ) -> Result<SigningKeyCandidate, CommandError> {
     let hmac = algorithm.hmac_output_bits().is_some();
     let key_options: &[&str] = if hmac {
@@ -820,12 +820,17 @@ fn select_signing_key(
     let mut material_budget =
         ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
     for (option, ()) in candidates {
-        let attempt =
-            prepare_signing_key_candidate(option, algorithm, policy, &mut material_budget)
-                .and_then(|candidate| {
-                    validate_signing_key_info(key_info, &candidate)?;
-                    Ok(candidate)
-                });
+        let attempt = prepare_signing_key_candidate(
+            option,
+            algorithm,
+            policy,
+            password,
+            &mut material_budget,
+        )
+        .and_then(|candidate| {
+            validate_signing_key_info(key_info, &candidate)?;
+            Ok(candidate)
+        });
         match attempt {
             Ok(candidate) => return Ok(candidate),
             Err(error) if lax_key_search && lax_candidate_error_is_recoverable(&error) => {
@@ -847,6 +852,7 @@ fn prepare_signing_key_candidate(
     option: &crate::OptionValue,
     algorithm: SignatureAlgorithm,
     policy: &SigningPolicy,
+    password: Option<&[u8]>,
     material_budget: &mut ExternalMaterialBudget,
 ) -> Result<SigningKeyCandidate, CommandError> {
     if algorithm.hmac_output_bits().is_some() {
@@ -872,6 +878,7 @@ fn prepare_signing_key_candidate(
         &key_bytes,
         private_key_format(option),
         algorithm,
+        password,
     )?;
     validate_signing_key(key.as_ref(), algorithm, policy)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
@@ -4152,6 +4159,7 @@ mod tests {
                 option,
                 SignatureAlgorithm::RsaSha256,
                 &SigningPolicy::default(),
+                None,
                 &mut budget,
             ),
             Err(CommandError::ExternalMaterialTooLarge { maximum: 1 })
@@ -4195,6 +4203,7 @@ mod tests {
                 SignatureAlgorithm::RsaSha256,
                 None,
                 &policy,
+                None,
             ),
             Err(CommandError::ExternalMaterialTooLarge { maximum })
                 if maximum == valid_len as usize + 1

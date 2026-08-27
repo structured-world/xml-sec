@@ -13,11 +13,11 @@ use rsa::{
     },
 };
 use x509_parser::prelude::FromDer as _;
-use xml_sec::policy::{PolicyViolation, SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{PolicyViolation, ResourcePolicy, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
     DsaSigningKey, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey, KeyInfo,
-    RsaSigningKey, SignatureAlgorithm, SigningKey, VerificationKey, find_signature_node,
-    parse_key_info, parse_signed_info, uri::UriReferenceResolver,
+    RsaSigningKey, SignatureAlgorithm, SigningKey, UriTypeSet, VerificationKey,
+    find_signature_node, parse_key_info, parse_signed_info, uri::UriReferenceResolver,
 };
 use xml_sec::{
     XmlDomDocument as Document, XmlDomNode as Node, XmlDomParsingOptions as ParsingOptions,
@@ -142,9 +142,17 @@ pub fn verification_signature_metadata(
     let algorithm = parse_signed_info(signed_info)
         .map(|info| info.signature_method)
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
+    let mut key_info = signature_key_info(signature)
+        .map(parse_key_info)
+        .transpose()
+        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
+    if let Some(key_info) = &mut key_info {
+        let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
+        materialize_key_info_references(key_info, &resolver, policy)?;
+    }
     Ok(SignatureMetadata {
         algorithm,
-        key_names: signature_key_names(signature),
+        key_names: key_names(&key_info),
     })
 }
 
@@ -180,31 +188,58 @@ pub fn signing_signature_metadata(
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
     if let Some(key_info) = &mut key_info {
         let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
-        materialize_signing_key_info_references(key_info, &resolver, policy)?;
+        materialize_key_info_references(key_info, &resolver, policy)?;
     }
     Ok(SigningTemplateMetadata {
         algorithm,
-        key_names: key_info
-            .iter()
-            .flat_map(|key_info| &key_info.sources)
-            .filter_map(|source| match source {
-                xml_sec::xmldsig::KeyInfoSource::KeyName(name) => Some(name.clone()),
-                _ => None,
-            })
-            .collect(),
+        key_names: key_names(&key_info),
         key_info,
     })
 }
 
-fn materialize_signing_key_info_references(
+trait MetadataKeyInfoPolicy {
+    fn resources(&self) -> &ResourcePolicy;
+    fn key_info_reference_uris(&self) -> UriTypeSet;
+    fn allows_key_info_reference(&self) -> bool;
+}
+
+impl MetadataKeyInfoPolicy for SigningPolicy {
+    fn resources(&self) -> &ResourcePolicy {
+        &self.resources
+    }
+
+    fn key_info_reference_uris(&self) -> UriTypeSet {
+        self.uris.key_info_references
+    }
+
+    fn allows_key_info_reference(&self) -> bool {
+        true
+    }
+}
+
+impl MetadataKeyInfoPolicy for VerificationPolicy {
+    fn resources(&self) -> &ResourcePolicy {
+        &self.resources
+    }
+
+    fn key_info_reference_uris(&self) -> UriTypeSet {
+        self.uris.key_info_references
+    }
+
+    fn allows_key_info_reference(&self) -> bool {
+        self.key_sources.key_info_reference
+    }
+}
+
+fn materialize_key_info_references<P: MetadataKeyInfoPolicy>(
     key_info: &mut KeyInfo,
     resolver: &UriReferenceResolver<'_>,
-    policy: &SigningPolicy,
+    policy: &P,
 ) -> Result<(), KeyMaterialError> {
-    fn visit(
+    fn visit<P: MetadataKeyInfoPolicy>(
         key_info: &mut KeyInfo,
         resolver: &UriReferenceResolver<'_>,
-        policy: &SigningPolicy,
+        policy: &P,
         active: &mut HashSet<String>,
         candidate_work: &mut usize,
         depth: usize,
@@ -216,26 +251,34 @@ fn materialize_signing_key_info_references(
                 _ => 1,
             };
             *candidate_work = candidate_work.saturating_add(source_work);
-            policy.resources.validate_key_candidates(*candidate_work)?;
+            policy
+                .resources()
+                .validate_key_candidates(*candidate_work)?;
 
             let xml_sec::xmldsig::KeyInfoSource::KeyInfoReference { uri } = source else {
                 materialized.push(source);
                 continue;
             };
-            if !policy.uris.key_info_references.allows(&uri) {
+            if !policy.allows_key_info_reference() {
+                return Err(KeyMaterialError::Policy(PolicyViolation::KeyTrust {
+                    reason: "KeyInfoReference key sources are disabled",
+                }));
+            }
+            if !policy.key_info_reference_uris().allows(&uri) {
                 return Err(KeyMaterialError::Policy(PolicyViolation::Uri {
                     operation: "KeyInfoReference",
                     reason: "URI class is disabled",
                 }));
             }
-            if !uri.starts_with('#') {
+            if !uri.is_empty() && !uri.starts_with('#') {
                 return Err(KeyMaterialError::Signature(
-                    "signing KeyInfoReference must be a same-document reference".into(),
+                    "CLI KeyInfoReference metadata selection requires a same-document reference"
+                        .into(),
                 ));
             }
             let next_depth = depth.saturating_add(1);
             policy
-                .resources
+                .resources()
                 .validate_key_info_reference_depth(next_depth)?;
             if !active.insert(uri.clone()) {
                 return Err(KeyMaterialError::Signature(
@@ -318,17 +361,13 @@ fn parse_signature_document(
     .map_err(|error| KeyMaterialError::Signature(error.to_string()))
 }
 
-fn signature_key_names(signature: Node<'_, '_>) -> Vec<String> {
-    signature_key_info(signature)
-        .into_iter()
-        .flat_map(|key_info| key_info.children())
-        .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
-        .map(|key_name| {
-            key_name
-                .children()
-                .filter(Node::is_text)
-                .filter_map(|child| child.text())
-                .collect()
+fn key_names(key_info: &Option<KeyInfo>) -> Vec<String> {
+    key_info
+        .iter()
+        .flat_map(|key_info| &key_info.sources)
+        .filter_map(|source| match source {
+            xml_sec::xmldsig::KeyInfoSource::KeyName(name) => Some(name.clone()),
+            _ => None,
         })
         .collect()
 }
@@ -346,6 +385,7 @@ pub fn decode_signing_key(
     bytes: &[u8],
     format: PrivateKeyFormat,
     algorithm: SignatureAlgorithm,
+    password: Option<&[u8]>,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
     match algorithm {
         SignatureAlgorithm::RsaSha1
@@ -354,7 +394,16 @@ pub fn decode_signing_key(
         | SignatureAlgorithm::RsaSha384
         | SignatureAlgorithm::RsaSha512 => decode_rsa_signing_key(path, bytes, format),
         SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
-            decode_pkcs8_signing_key::<DsaSigningKey>(path, bytes, format)
+            if let Some(password) = password {
+                if format != PrivateKeyFormat::Pkcs8Der {
+                    return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+                }
+                DsaSigningKey::from_pkcs8_encrypted_der(bytes, password)
+                    .map(|key| Box::new(key) as Box<dyn SigningKey>)
+                    .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+            } else {
+                decode_pkcs8_signing_key::<DsaSigningKey>(path, bytes, format)
+            }
         }
         SignatureAlgorithm::EcdsaSha1
         | SignatureAlgorithm::EcdsaSha224
@@ -707,7 +756,7 @@ mod tests {
     ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
         let path = path.as_ref();
         let bytes = read(path)?;
-        decode_signing_key(path, &bytes, format, SignatureAlgorithm::RsaSha256)
+        decode_signing_key(path, &bytes, format, SignatureAlgorithm::RsaSha256, None)
     }
 
     fn signing_template_with_key_info(key_info: &str, targets: &str) -> String {
@@ -1045,6 +1094,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(metadata.key_names, ["old", "wanted"]);
+    }
+
+    #[test]
+    fn verification_metadata_resolves_referenced_key_names() {
+        // CLI candidate selection precedes core verification, so it must see
+        // the same bounded KeyInfoReference graph as the verifier.
+        let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
+        let xml = format!(
+            r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue><ds:KeyInfo><dsig11:KeyInfoReference URI="#target"/></ds:KeyInfo></ds:Signature><ds:KeyInfo Id="target"><ds:KeyName>wanted</ds:KeyName></ds:KeyInfo></root>"##
+        );
+
+        let metadata =
+            verification_signature_metadata(&xml, None, &[], &VerificationPolicy::default())
+                .expect("same-document KeyInfoReference must resolve before candidate selection");
+
+        assert_eq!(metadata.key_names, ["wanted"]);
+
+        let mut disabled = VerificationPolicy::default();
+        disabled.key_sources.key_info_reference = false;
+        let error = verification_signature_metadata(&xml, None, &[], &disabled)
+            .expect_err("metadata selection must honor the verification key-source policy");
+        assert!(error.to_string().contains("key sources are disabled"));
     }
 
     #[test]

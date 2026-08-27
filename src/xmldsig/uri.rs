@@ -512,10 +512,14 @@ impl<'a> UriReferenceResolver<'a> {
     }
 
     /// Resolve a same-document URI to an element under the configured grammar.
+    /// An empty URI selects the document element for element-valued consumers.
     pub fn node_for_same_document_reference(
         &self,
         uri: &str,
     ) -> Result<Option<Node<'a, 'a>>, TransformError> {
+        if uri.is_empty() {
+            return Ok(Some(self.doc.root_element()));
+        }
         Ok(self
             .node_id_for_same_document_reference(uri)?
             .and_then(|id| self.doc.get_node(id)))
@@ -583,6 +587,22 @@ pub(crate) fn parse_xpointer_id_fragment(fragment: &str) -> Option<&str> {
 mod tests {
     use super::super::types::NodeSet;
     use super::*;
+
+    #[test]
+    fn empty_same_document_node_reference_selects_the_document_element() {
+        // Element-valued consumers of the Reference URI contract interpret an
+        // empty URI as the root element of the current XML document.
+        let document = Document::parse("<root><child/></root>").unwrap();
+        let resolver = UriReferenceResolver::new(&document);
+
+        assert_eq!(
+            resolver
+                .node_for_same_document_reference("")
+                .unwrap()
+                .unwrap(),
+            document.root_element()
+        );
+    }
 
     #[test]
     fn empty_uri_returns_whole_document() {

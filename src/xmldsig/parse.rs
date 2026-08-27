@@ -860,12 +860,12 @@ pub(crate) fn parse_key_info_with_policy_budgets_and_document_base(
                 let lexical_uri = child.attribute("URI").ok_or_else(|| {
                     ParseError::InvalidStructure("KeyInfoReference requires URI".into())
                 })?;
-                if lexical_uri.is_empty() || lexical_uri.len() > MAX_KEY_NAME_TEXT_LEN {
+                if lexical_uri.len() > MAX_KEY_NAME_TEXT_LEN {
                     return Err(ParseError::InvalidStructure(
-                        "KeyInfoReference URI must be non-empty and bounded".into(),
+                        "KeyInfoReference URI exceeds maximum length".into(),
                     ));
                 }
-                let uri = if lexical_uri.starts_with('#') {
+                let uri = if lexical_uri.is_empty() || lexical_uri.starts_with('#') {
                     lexical_uri.to_owned()
                 } else {
                     resolve_uri_from_node_with_document_base_with_budget(
@@ -4461,6 +4461,25 @@ BA== </Modulus>
                 KeyInfoSource::RetrievalMethod { resource_type: Some(resource_type), .. },
                 KeyInfoSource::KeyName(name),
             ] if resource_type == "urn:vendor:key" && name == "fallback"
+        ));
+    }
+
+    #[test]
+    fn parse_key_info_preserves_empty_same_document_reference_uri() {
+        // KeyInfoReference inherits Reference URI semantics: the attribute is
+        // mandatory, but an empty value is a valid same-document URI class.
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"
+            xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+            <dsig11:KeyInfoReference URI=""/>
+        </KeyInfo>"#;
+        let document = Document::parse(xml).unwrap();
+
+        assert!(matches!(
+            parse_key_info(document.root_element())
+                .unwrap()
+                .sources
+                .as_slice(),
+            [KeyInfoSource::KeyInfoReference { uri }] if uri.is_empty()
         ));
     }
 

@@ -250,7 +250,11 @@ resolve to exactly one `KeyInfo`; missing targets, non-`KeyInfo` targets, and
 cycles fail closed. Fragment lookup and nested references inside an external XML
 document use that document's ID namespace. Its fetched resource identity is the
 RFC 3986 base for relative nested references, with inherited `xml:base` applied
-on top. All nested external dereferences
+on top before lookup. The mandatory `URI` attribute may be empty: under
+`Reference` URI semantics it selects the current document, and element-valued
+key lookup requires that document's root element to be `KeyInfo`. Empty
+self-references still fail through the ordinary cycle detector. All nested
+external dereferences
 consume the operation's shared aggregate external-resource budget and never
 trigger implicit I/O.
 

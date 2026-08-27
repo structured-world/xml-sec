@@ -1670,7 +1670,7 @@ fn materialize_key_info_references(
                 });
             }
 
-            let (mut referenced, mut nested_outcome) = if uri.starts_with('#') {
+            let (mut referenced, mut nested_outcome) = if uri.is_empty() || uri.starts_with('#') {
                 let node = resolver
                     .node_for_same_document_reference(&uri)
                     .map_err(|error| {
@@ -5304,6 +5304,50 @@ mod tests {
             SignatureVerificationPipelineError::InvalidStructure {
                 reason: "KeyInfo contains too many RetrievalMethod elements"
             }
+        ));
+    }
+
+    #[test]
+    fn key_info_reference_materializes_an_allowed_empty_uri() {
+        // Empty URI is a same-document Reference URI. Element-valued
+        // KeyInfoReference dereferencing therefore selects a KeyInfo document
+        // element rather than consulting the external-resource map.
+        let document = XmlDocument::parse(format!(
+            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>root-key</ds:KeyName></ds:KeyInfo>"#
+        ))
+        .unwrap();
+        let mut key_info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                uri: String::new(),
+            }],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_sources.key_info_reference = true;
+        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
+        let mut budgets = RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse_budget,
+            execution: &execution_budget,
+            resources: &policy.resources,
+        };
+
+        document
+            .with_view(|view| {
+                materialize_key_info_references(
+                    &mut key_info,
+                    &UriReferenceResolver::with_document_view(view, &[]),
+                    &policy,
+                    crate::provider::default_provider(),
+                    None,
+                    &mut budgets,
+                )?;
+                Ok::<_, SignatureVerificationPipelineError>(())
+            })
+            .unwrap();
+
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [super::super::parse::KeyInfoSource::KeyName(name)] if name == "root-key"
         ));
     }
 
