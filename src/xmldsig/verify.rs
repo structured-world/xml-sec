@@ -31,8 +31,8 @@ use super::parse::{
     RetrievalMethodTransforms, SignatureAlgorithm, XMLDSIG_NS,
 };
 use super::parse::{
-    parse_key_info_with_policy_budgets, parse_reference_with_xpath_budget,
-    parse_signed_info_with_xpath_budget, parse_x509_certificate,
+    parse_key_info_with_policy_budgets, parse_key_info_with_policy_budgets_and_document_base,
+    parse_reference_with_xpath_budget, parse_signed_info_with_xpath_budget, parse_x509_certificate,
     parse_x509_data_dispatch_with_budget_and_provider, reference_digest_method,
 };
 use super::signature::{
@@ -1697,11 +1697,12 @@ fn materialize_key_info_references(
                             reason: "KeyInfoReference external target must be KeyInfo",
                         });
                     }
-                    let mut referenced = parse_key_info_with_policy_budgets(
+                    let mut referenced = parse_key_info_with_policy_budgets_and_document_base(
                         target,
                         provider,
                         execution.xml_base_resolution(),
                         &policy.resources,
+                        Some(&uri),
                     )
                     .map_err(map_key_info_parse_error)?;
                     visit(

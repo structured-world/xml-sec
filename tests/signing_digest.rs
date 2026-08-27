@@ -16,12 +16,12 @@ use xml_sec::xmldsig::uri::UriReferenceResolver;
 use xml_sec::xmldsig::verify::process_all_references;
 use xml_sec::xmldsig::{
     DEFAULT_IMPLICIT_C14N_URI, DefaultKeyResolver, DigestAlgorithm, DsigStatus,
-    EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriter, ReferenceBuilder, RsaSigningKey,
-    SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError,
-    SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, TransformError, VerificationKey,
-    VerifyContext, X509CertificateKeyInfoWriter, XPathExpression, compute_reference_digest_values,
-    fill_reference_digest_values, parse_key_info, validate_signing_key,
-    verify_signature_with_pem_key,
+    EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriter, KeyValueInfoWriter, ReferenceBuilder,
+    RsaSigningKey, SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError,
+    SigningError, SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, TransformError,
+    VerificationKey, VerifyContext, X509CertificateKeyInfoWriter, XPathExpression,
+    compute_reference_digest_values, fill_reference_digest_values, parse_key_info,
+    validate_signing_key, verify_signature_with_pem_key,
 };
 
 fn exclusive_c14n() -> C14nAlgorithm {
@@ -2847,6 +2847,53 @@ fn signs_rsa_donor_templates_and_verifies_round_trip() {
 
         assert_signed_template_verifies(&signed, public_key_path);
     }
+}
+
+#[test]
+fn explicit_legacy_sha1_policy_builds_signs_and_verifies() {
+    // A compatibility opt-in must reach builder validation, digest filling,
+    // built-in RSA signing, and verification without weakening secure defaults.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha1)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha1)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        )
+        .key_info(true);
+    assert!(
+        builder.build_template().is_err(),
+        "secure defaults must continue to reject SHA-1 signing"
+    );
+
+    let signing_policy = SigningPolicy {
+        signature_algorithms: Some(HashSet::from([SignatureAlgorithm::RsaSha1])),
+        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+        ..SigningPolicy::default()
+    };
+    let signed = SignContext::new(&private_key)
+        .policy(signing_policy)
+        .key_info_writer(&KeyValueInfoWriter)
+        .sign_with_builder(
+            "<root><payload ID=\"payload\">legacy interop</payload></root>",
+            &builder,
+        )
+        .expect("explicit compatibility policy must enable RSA-SHA1 signing");
+
+    let mut verification_policy = VerificationPolicy::default();
+    verification_policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(SignatureAlgorithm::RsaSha1);
+    let resolver = DefaultKeyResolver::default();
+    let result = VerifyContext::new()
+        .key_resolver(&resolver)
+        .policy(verification_policy)
+        .verify(&signed)
+        .expect("explicit compatibility policy must verify generated RSA-SHA1");
+    assert_eq!(result.status, DsigStatus::Valid);
 }
 
 #[test]

@@ -32,6 +32,10 @@ use super::{
 };
 
 /// Caller-owned HMAC verification key.
+///
+/// Policy-free [`VerifyingKey`] calls enforce [`crate::policy::HmacPolicy::default`].
+/// [`super::VerifyContext`] supplies its immutable operation policy through the
+/// policy-aware hooks, so legacy truncation always requires an explicit opt-in.
 #[derive(Clone)]
 pub struct HmacVerificationKey {
     secret: Vec<u8>,
@@ -54,39 +58,29 @@ impl HmacVerificationKey {
         }
         Ok(Self { secret })
     }
-}
 
-impl VerifyingKey for HmacVerificationKey {
-    fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
-        policy
-            .hmac
-            .validate_key(self.secret.len())
-            .map_err(Into::into)
-    }
-
-    fn validate_signature_value(
+    fn validate_output(
         &self,
+        policy: crate::policy::HmacPolicy,
         algorithm: SignatureAlgorithm,
         signature_value: &[u8],
-    ) -> Result<bool, DsigError> {
-        let Some(output_bits) = algorithm.hmac_output_bits() else {
+    ) -> Result<(), DsigError> {
+        if algorithm.hmac_output_bits().is_none() {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
-        };
-        Ok(!signature_value.is_empty() && signature_value.len() <= output_bits / 8)
+        }
+        policy.validate_key(self.secret.len())?;
+        policy.validate_output(algorithm, signature_value.len().saturating_mul(8))?;
+        Ok(())
     }
 
-    fn verify(
+    fn verify_with_hmac_policy(
         &self,
+        policy: crate::policy::HmacPolicy,
         algorithm: SignatureAlgorithm,
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        let Some(output_bits) = algorithm.hmac_output_bits() else {
-            return Err(KeyResolutionError::AlgorithmMismatch.into());
-        };
-        if signature_value.is_empty() || signature_value.len() > output_bits / 8 {
-            return Ok(false);
-        }
+        self.validate_output(policy, algorithm, signature_value)?;
         macro_rules! verify_hmac {
             ($digest:ty) => {{
                 let mut mac = hmac::Hmac::<$digest>::new_from_slice(&self.secret)
@@ -103,8 +97,64 @@ impl VerifyingKey for HmacVerificationKey {
             SignatureAlgorithm::HmacSha256 => verify_hmac!(sha2::Sha256),
             SignatureAlgorithm::HmacSha384 => verify_hmac!(sha2::Sha384),
             SignatureAlgorithm::HmacSha512 => verify_hmac!(sha2::Sha512),
-            _ => unreachable!("HMAC algorithm checked above"),
+            _ => return Err(KeyResolutionError::AlgorithmMismatch.into()),
         })
+    }
+}
+
+impl VerifyingKey for HmacVerificationKey {
+    fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
+        policy
+            .hmac
+            .validate_key(self.secret.len())
+            .map_err(Into::into)
+    }
+
+    fn validate_signature_value(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.validate_output(
+            crate::policy::HmacPolicy::default(),
+            algorithm,
+            signature_value,
+        )?;
+        Ok(true)
+    }
+
+    fn validate_signature_value_with_policy(
+        &self,
+        policy: &crate::policy::VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.validate_output(policy.hmac, algorithm, signature_value)?;
+        Ok(true)
+    }
+
+    fn verify(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.verify_with_hmac_policy(
+            crate::policy::HmacPolicy::default(),
+            algorithm,
+            signed_data,
+            signature_value,
+        )
+    }
+
+    fn verify_with_policy(
+        &self,
+        policy: &crate::policy::VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.verify_with_hmac_policy(policy.hmac, algorithm, signed_data, signature_value)
     }
 }
 
@@ -1682,9 +1732,10 @@ mod tests {
     }
 
     #[test]
-    fn hmac_key_uses_the_signature_value_length_for_truncation() {
+    fn hmac_key_uses_the_operation_policy_for_truncation() {
         // Output length belongs to SignatureMethod and operation policy, not
-        // reusable secret key material.
+        // reusable secret key material. Legacy truncation therefore requires
+        // an explicit compatibility policy even on the policy-aware key hook.
         let key = HmacVerificationKey::new(b"secret".to_vec())
             .expect("the fixture HMAC secret is non-empty");
         let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(b"secret")
@@ -1692,14 +1743,48 @@ mod tests {
         mac.update(b"data");
         let expected = mac.finalize().into_bytes();
 
+        let policy = crate::policy::VerificationPolicy {
+            hmac: crate::policy::HmacPolicy {
+                minimum_key_bits: 40,
+                minimum_output_bits: 80,
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
         assert!(
-            key.verify(SignatureAlgorithm::HmacSha1, b"data", &expected[..10])
-                .expect("the key and algorithm match")
+            key.verify_with_policy(
+                &policy,
+                SignatureAlgorithm::HmacSha1,
+                b"data",
+                &expected[..10],
+            )
+            .expect("the compatibility policy and algorithm match")
         );
         assert!(
-            !key.verify(SignatureAlgorithm::HmacSha1, b"data", &[0_u8; 9])
+            !key.verify_with_policy(&policy, SignatureAlgorithm::HmacSha1, b"data", &[0_u8; 10],)
                 .expect("a mismatched truncated MAC must be rejected")
         );
+    }
+
+    #[test]
+    fn hmac_key_direct_api_rejects_attacker_selected_short_output() {
+        // The policy-free trait method applies secure defaults; signature bytes
+        // cannot act as their own one-byte truncation declaration.
+        let key = HmacVerificationKey::new([0x42; 16]).expect("fixed HMAC key must parse");
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&[0x42; 16])
+            .expect("HMAC accepts the fixed secret");
+        mac.update(b"data");
+        let expected = mac.finalize().into_bytes();
+
+        assert!(matches!(
+            key.verify(SignatureAlgorithm::HmacSha256, b"data", &expected[..1]),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::HmacOutputLength {
+                    minimum: 128,
+                    maximum: 256,
+                    actual: 8,
+                }
+            ))
+        ));
     }
 
     #[test]

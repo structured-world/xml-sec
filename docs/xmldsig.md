@@ -76,6 +76,9 @@ the same operation ceiling as the rest of the signature.
 Built-in writers emit `RSAKeyValue`/`ECKeyValue`, `DEREncodedKeyValue`, embedded
 X.509 certificate chains, or `X509Digest` selectors. DSA signing accepts plain
 or password-encrypted PKCS#8 DER and emits XMLDSig's fixed-width `r || s` value;
+DSA-SHA1 requires a 160-bit `q`, while DSA-SHA256 requires a 256-bit `q`, so a
+key whose component width cannot be represented by the selected wire format is
+rejected before signing.
 P-521 signing and verification use the same key-selected ECDSA framing contract
 as P-256 and P-384.
 `IdAttributeRegistration` supplies immutable request context for non-standard ID attributes.
@@ -236,9 +239,15 @@ XMLDSig 1.1 `KeyInfoReference` has separate source and URI policy gates plus a
 bounded recursion depth. Same-document and caller-owned external targets must
 resolve to exactly one `KeyInfo`; missing targets, non-`KeyInfo` targets, and
 cycles fail closed. Fragment lookup and nested references inside an external XML
-document use that document's ID namespace. All nested external dereferences
+document use that document's ID namespace. Its fetched resource identity is the
+RFC 3986 base for relative nested references, with inherited `xml:base` applied
+on top. All nested external dereferences
 consume the operation's shared aggregate external-resource budget and never
 trigger implicit I/O.
+
+Direct policy-free calls on `HmacVerificationKey` enforce the secure default
+HMAC key and output minima. Compatibility truncation is available only through
+the policy-aware hooks used by `VerifyContext` with an explicit `HmacPolicy`.
 `VerifyContext::allowed_transforms` applies to Reference transforms and implicit C14N,
 the declared SignedInfo canonicalization method, and supported RetrievalMethod transforms.
 Allowing XPath for signed payload processing therefore also explicitly permits the bounded

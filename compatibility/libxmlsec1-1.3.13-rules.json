@@ -19,7 +19,7 @@
     },
     "sha1-verification-tests": {
       "test": "capability_ledger::legacy_algorithm_claims_are_policy_gated",
-      "description": "SHA-1 reference digests remain available for verification interoperability while every signing path rejects them."
+      "description": "SHA-1 interoperability verification executes through the public pipeline; secure signing defaults reject SHA-1 while an explicit compatibility policy enables builder construction and signing."
     },
     "provider-contract": {
       "test": "capability_ledger::backend_surface_distinguishes_provider_capabilities_from_unimplemented_apis",

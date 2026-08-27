@@ -17,6 +17,7 @@ use rsa::pkcs1v15::Signature as RsaPkcs1v15Signature;
 use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
 use rsa::signature::{RandomizedSigner, SignatureEncoding};
 use rsa::traits::PublicKeyParts;
+use sha1::Sha1;
 use sha2::{Sha224, Sha256, Sha384, Sha512};
 use signature::hazmat::{PrehashSigner, RandomizedPrehashSigner};
 use std::{collections::HashSet, ops::Range};
@@ -352,7 +353,7 @@ fn expected_signature_output_len(
             public_key.len() - 1
         }
         (
-            SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256,
+            algorithm @ (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256),
             SigningPublicKeyInfo::Dsa {
                 modulus_bits,
                 component_len,
@@ -360,6 +361,23 @@ fn expected_signature_output_len(
             },
         ) => {
             policy.dsa_keys.validate_modulus_bits(modulus_bits)?;
+            let required_component_len = algorithm
+                .dsa_component_len()
+                .expect("DSA algorithm matched above");
+            if component_len != required_component_len {
+                return Err(crate::policy::PolicyViolation::InvalidKeyMaterial {
+                    operation: "signing",
+                    key_type: "DSA",
+                    reason: match algorithm {
+                        SignatureAlgorithm::DsaSha1 => "DSA-SHA1 requires a 160-bit q parameter",
+                        SignatureAlgorithm::DsaSha256 => {
+                            "DSA-SHA256 requires a 256-bit q parameter"
+                        }
+                        _ => unreachable!("DSA algorithm matched above"),
+                    },
+                }
+                .into());
+            }
             component_len.saturating_mul(2)
         }
         (
@@ -728,6 +746,11 @@ impl SigningKey for RsaSigningKey {
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
         match algorithm {
+            SignatureAlgorithm::RsaSha1 => sign_rsa_pkcs1v15_with_rng(
+                provider,
+                RsaPkcs1v15SigningKey::<Sha1>::new(self.key.clone()),
+                canonical_signed_info,
+            ),
             SignatureAlgorithm::RsaSha224 => sign_rsa_pkcs1v15_with_rng(
                 provider,
                 RsaPkcs1v15SigningKey::<Sha224>::new(self.key.clone()),
@@ -868,32 +891,29 @@ impl SigningKey for DsaSigningKey {
         algorithm: SignatureAlgorithm,
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
-        let digest = match algorithm {
-            SignatureAlgorithm::DsaSha1 => super::compute_digest_with_provider(
-                provider,
-                DigestAlgorithm::Sha1,
-                canonical_signed_info,
-            )?,
-            SignatureAlgorithm::DsaSha256 => super::compute_digest_with_provider(
-                provider,
-                DigestAlgorithm::Sha256,
-                canonical_signed_info,
-            )?,
+        let digest_algorithm = match algorithm {
+            SignatureAlgorithm::DsaSha1 => DigestAlgorithm::Sha1,
+            SignatureAlgorithm::DsaSha256 => DigestAlgorithm::Sha256,
             _ => {
                 return Err(SigningKeyError::UnsupportedAlgorithm {
                     uri: algorithm.uri().to_owned(),
                 });
             }
         };
+        let component_len =
+            usize::try_from(self.key.verifying_key().components().q().bits_vartime())
+                .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?
+                .div_ceil(8);
+        if algorithm.dsa_component_len() != Some(component_len) {
+            return Err(SigningKeyError::InvalidPublicKeyInfo);
+        }
+        let digest =
+            super::compute_digest_with_provider(provider, digest_algorithm, canonical_signed_info)?;
         let mut rng = crate::provider::ProviderRng(provider);
         let signature: dsa::Signature = self
             .key
             .sign_prehash_with_rng(&mut rng, &digest)
             .map_err(|_| SigningKeyError::SigningFailed)?;
-        let component_len =
-            usize::try_from(self.key.verifying_key().components().q().bits_vartime())
-                .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?
-                .div_ceil(8);
         let mut output = Vec::with_capacity(component_len.saturating_mul(2));
         for component in [signature.r(), signature.s()] {
             let bytes = component.to_be_bytes();

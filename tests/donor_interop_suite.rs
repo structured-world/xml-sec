@@ -13,8 +13,8 @@ use xml_sec::xmldsig::{
     DefaultKeyResolver, DerEncodedKeyValueInfoWriter, DigestAlgorithm, DsaSigningKey, DsigError,
     DsigStatus, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey, FailureReason,
     HmacSigningKey, HmacVerificationKey, KeyResolverConfig, KeyValueInfoWriter, RsaSigningKey,
-    SignContext, SignatureAlgorithm, SigningKey, SigningPublicKeyInfo, UriTypeSet, VerificationKey,
-    VerifyContext, X509DigestKeyInfoWriter,
+    SignContext, SignatureAlgorithm, SigningKey, SigningKeyError, SigningPublicKeyInfo, UriTypeSet,
+    VerificationKey, VerifyContext, X509DigestKeyInfoWriter, validate_signing_key,
 };
 
 const XMLDSIG11_DIR: &str = "tests/fixtures/xmldsig/xmldsig11-interop-2012";
@@ -350,10 +350,10 @@ fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
 
     let outer = br#"<dsig:KeyInfo xmlns:dsig="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><dsig11:KeyInfoReference URI="inner.xml"/></dsig:KeyInfo>"#.to_vec();
     let inner = key_info.as_bytes().to_vec();
-    let external_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"outer.xml\"", 1);
+    let external_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"keys/outer.xml\"", 1);
     let external_resources = HashMap::from([
-        ("outer.xml".to_owned(), outer.clone()),
-        ("inner.xml".to_owned(), inner.clone()),
+        ("keys/outer.xml".to_owned(), outer.clone()),
+        ("keys/inner.xml".to_owned(), inner.clone()),
     ]);
     policy.resources.max_external_resource_bytes = outer.len().max(inner.len());
     policy.resources.max_external_resource_total_bytes = outer.len() + inner.len();
@@ -644,4 +644,34 @@ fn dsa_sha256_upstream_vector_verifies_and_signs() {
         .verify(&signed)
         .expect("generated DSA-SHA256 signature must verify");
     assert_valid(result.status, Path::new("generated DSA-SHA256"));
+}
+
+#[test]
+fn dsa_sha1_rejects_a_key_with_a_256_bit_q() {
+    // XMLDSig DSA-SHA1 fixes SignatureValue at two 160-bit components; a
+    // 2048/256 key cannot be represented by that wire format.
+    let key = DsaSigningKey::from_pkcs8_encrypted_der(
+        include_bytes!("fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der"),
+        b"secret123",
+    )
+    .expect("upstream encrypted DSA PKCS#8 key must parse");
+    let policy = SigningPolicy {
+        signature_algorithms: Some(HashSet::from([SignatureAlgorithm::DsaSha1])),
+        ..SigningPolicy::default()
+    };
+
+    assert!(matches!(
+        validate_signing_key(&key, SignatureAlgorithm::DsaSha1, &policy),
+        Err(xml_sec::xmldsig::SigningError::Policy(
+            PolicyViolation::InvalidKeyMaterial {
+                operation: "signing",
+                key_type: "DSA",
+                reason: "DSA-SHA1 requires a 160-bit q parameter",
+            }
+        ))
+    ));
+    assert!(matches!(
+        key.sign(SignatureAlgorithm::DsaSha1, b"signed info"),
+        Err(SigningKeyError::InvalidPublicKeyInfo)
+    ));
 }

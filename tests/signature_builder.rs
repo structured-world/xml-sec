@@ -142,7 +142,10 @@ fn rejects_incomplete_or_unsafe_signing_templates() {
         .expect_err("SHA-1 signatures are disabled by the default policy");
     assert!(matches!(
         sha1_signature,
-        SignatureBuilderError::SigningAlgorithmDisabled(_)
+        SignatureBuilderError::Policy(PolicyViolation::Algorithm {
+            operation: "signing",
+            ..
+        })
     ));
 
     let sha1_digest = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
@@ -151,7 +154,10 @@ fn rejects_incomplete_or_unsafe_signing_templates() {
         .expect_err("SHA-1 digests are disabled by the default policy");
     assert!(matches!(
         sha1_digest,
-        SignatureBuilderError::SigningAlgorithmDisabled(_)
+        SignatureBuilderError::Policy(PolicyViolation::Algorithm {
+            operation: "signing",
+            ..
+        })
     ));
 }
 

@@ -564,6 +564,44 @@ fn legacy_algorithm_claims_are_policy_gated() {
             .is_none()
     );
     assert!(!xml_sec::xmldsig::DigestAlgorithm::Sha1.signing_allowed());
+
+    let fixture = std::fs::read_to_string(
+        "tests/fixtures/xmldsig/xmldsig11-interop-2012/signature-enveloping-p256_sha1.xml",
+    )
+    .expect("SHA-1 interoperability fixture must be readable");
+    let mut verification_policy = xml_sec::policy::VerificationPolicy::default();
+    verification_policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(xml_sec::xmldsig::SignatureAlgorithm::EcdsaSha1);
+    let resolver = xml_sec::xmldsig::DefaultKeyResolver::default();
+    let result = xml_sec::xmldsig::VerifyContext::new()
+        .key_resolver(&resolver)
+        .policy(verification_policy)
+        .verify(&fixture)
+        .expect("explicit compatibility policy must execute SHA-1 verification");
+    assert_eq!(result.status, xml_sec::xmldsig::DsigStatus::Valid);
+
+    let builder = xml_sec::xmldsig::SignatureBuilder::new(
+        xml_sec::c14n::C14nAlgorithm::new(xml_sec::c14n::C14nMode::Exclusive1_0, false),
+        xml_sec::xmldsig::SignatureAlgorithm::RsaSha1,
+    )
+    .add_reference(
+        xml_sec::xmldsig::ReferenceBuilder::new(xml_sec::xmldsig::DigestAlgorithm::Sha1).uri(""),
+    );
+    assert!(builder.build_template().is_err());
+    let signing_policy = xml_sec::policy::SigningPolicy {
+        signature_algorithms: Some(std::collections::HashSet::from([
+            xml_sec::xmldsig::SignatureAlgorithm::RsaSha1,
+        ])),
+        digest_algorithms: Some(std::collections::HashSet::from([
+            xml_sec::xmldsig::DigestAlgorithm::Sha1,
+        ])),
+        ..xml_sec::policy::SigningPolicy::default()
+    };
+    builder
+        .build_template_with_policy(&signing_policy)
+        .expect("explicit compatibility policy must enable SHA-1 template construction");
 }
 
 #[cfg(feature = "xmldsig")]

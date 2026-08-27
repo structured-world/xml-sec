@@ -46,8 +46,9 @@ pub(crate) fn signature_value_matches_algorithm_with_encoding(
     encoding: EcdsaSignatureValueEncoding,
 ) -> bool {
     match algorithm {
-        SignatureAlgorithm::DsaSha1 => signature_value.len() == 40,
-        SignatureAlgorithm::DsaSha256 => signature_value.len() == 64,
+        SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => algorithm
+            .dsa_component_len()
+            .is_some_and(|component_len| signature_value.len() == component_len * 2),
         SignatureAlgorithm::HmacSha1
         | SignatureAlgorithm::HmacSha224
         | SignatureAlgorithm::HmacSha256
@@ -114,8 +115,18 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
 
     match (algorithm, public_key) {
-        (SignatureAlgorithm::DsaSha1, PublicKey::DSA(_)) => Ok(signature_value.len() == 40),
-        (SignatureAlgorithm::DsaSha256, PublicKey::DSA(_)) => Ok(signature_value.len() == 64),
+        (
+            algorithm @ (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256),
+            PublicKey::DSA(_),
+        ) => {
+            let key = dsa::VerifyingKey::from_public_key_der(public_key_spki_der)
+                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+            let component_len = usize::try_from(key.components().q().bits_vartime())
+                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
+                .div_ceil(8);
+            Ok(algorithm.dsa_component_len() == Some(component_len)
+                && signature_value.len() == component_len * 2)
+        }
         (
             SignatureAlgorithm::RsaSha1
             | SignatureAlgorithm::RsaSha224
@@ -443,6 +454,9 @@ pub(crate) fn verify_dsa_signature_spki_primitive(
     let component_len = usize::try_from(key.components().q().bits_vartime())
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
         .div_ceil(8);
+    if algorithm.dsa_component_len() != Some(component_len) {
+        return Ok(false);
+    }
     if signature_value.len() != component_len.saturating_mul(2) {
         return Ok(false);
     }

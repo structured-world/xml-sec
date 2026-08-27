@@ -39,7 +39,9 @@ use super::whitespace::{
 };
 use super::x509::certificate_signature_matches_with_provider;
 use crate::c14n::C14nAlgorithm;
-use crate::c14n::xml_base::{XmlBaseResolutionBudget, resolve_uri_from_node_with_budget};
+use crate::c14n::xml_base::{
+    XmlBaseResolutionBudget, resolve_uri_from_node_with_document_base_with_budget,
+};
 
 pub(crate) use crate::hard_limits::SIGNATURE_REFERENCE_CEILING as MAX_REFERENCES_PER_SIGNATURE;
 #[cfg(test)]
@@ -118,6 +120,15 @@ pub enum SignatureAlgorithm {
 }
 
 impl SignatureAlgorithm {
+    /// Fixed XMLDSig component width for DSA's `r || s` representation.
+    pub(crate) const fn dsa_component_len(self) -> Option<usize> {
+        match self {
+            Self::DsaSha1 => Some(20),
+            Self::DsaSha256 => Some(32),
+            _ => None,
+        }
+    }
+
     /// Return the full HMAC output width for HMAC algorithms.
     #[must_use]
     pub const fn hmac_output_bits(self) -> Option<usize> {
@@ -724,6 +735,22 @@ pub(crate) fn parse_key_info_with_policy_budgets(
     xml_base_budget: &XmlBaseResolutionBudget,
     resources: &crate::policy::ResourcePolicy,
 ) -> Result<KeyInfo, ParseError> {
+    parse_key_info_with_policy_budgets_and_document_base(
+        key_info_node,
+        provider,
+        xml_base_budget,
+        resources,
+        None,
+    )
+}
+
+pub(crate) fn parse_key_info_with_policy_budgets_and_document_base(
+    key_info_node: Node,
+    provider: &dyn crate::provider::CryptoProvider,
+    xml_base_budget: &XmlBaseResolutionBudget,
+    resources: &crate::policy::ResourcePolicy,
+    document_base: Option<&str>,
+) -> Result<KeyInfo, ParseError> {
     verify_ds_element(key_info_node, "KeyInfo")?;
     ensure_no_non_whitespace_text(key_info_node, "KeyInfo")?;
 
@@ -776,8 +803,13 @@ pub(crate) fn parse_key_info_with_policy_budgets(
                 } else {
                     // RetrievalMethod is parsed independently from later key
                     // materialization, so retain its resolved resource identity.
-                    resolve_uri_from_node_with_budget(child, lexical_uri, xml_base_budget)
-                        .map_err(|error| ParseError::InvalidStructure(error.to_string()))?
+                    resolve_uri_from_node_with_document_base_with_budget(
+                        child,
+                        lexical_uri,
+                        document_base,
+                        xml_base_budget,
+                    )
+                    .map_err(|error| ParseError::InvalidStructure(error.to_string()))?
                 };
                 let resource_type = child.attribute("Type");
                 if resource_type.is_some_and(|value| value.len() > MAX_KEY_NAME_TEXT_LEN) {
@@ -821,8 +853,13 @@ pub(crate) fn parse_key_info_with_policy_budgets(
                 let uri = if lexical_uri.starts_with('#') {
                     lexical_uri.to_owned()
                 } else {
-                    resolve_uri_from_node_with_budget(child, lexical_uri, xml_base_budget)
-                        .map_err(|error| ParseError::InvalidStructure(error.to_string()))?
+                    resolve_uri_from_node_with_document_base_with_budget(
+                        child,
+                        lexical_uri,
+                        document_base,
+                        xml_base_budget,
+                    )
+                    .map_err(|error| ParseError::InvalidStructure(error.to_string()))?
                 };
                 sources.push(KeyInfoSource::KeyInfoReference { uri });
             }

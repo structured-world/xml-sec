@@ -510,22 +510,7 @@ impl SignatureBuilder {
                 ));
             }
         }
-        if !self.sign_method.signing_allowed() {
-            return Err(SignatureBuilderError::SigningAlgorithmDisabled(
-                self.sign_method.uri(),
-            ));
-        }
-        if policy
-            .signature_algorithms
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&self.sign_method))
-        {
-            return Err(PolicyViolation::Algorithm {
-                operation: "signing",
-                algorithm: self.sign_method.uri().to_owned(),
-            }
-            .into());
-        }
+        policy.check_signature_algorithm(self.sign_method)?;
         if policy
             .transforms
             .allowed_algorithms
@@ -547,22 +532,7 @@ impl SignatureBuilder {
                     value: id.clone(),
                 });
             }
-            if !reference.digest_method.signing_allowed() {
-                return Err(SignatureBuilderError::SigningAlgorithmDisabled(
-                    reference.digest_method.uri(),
-                ));
-            }
-            if policy
-                .digest_algorithms
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
-            {
-                return Err(PolicyViolation::Algorithm {
-                    operation: "signing",
-                    algorithm: reference.digest_method.uri().to_owned(),
-                }
-                .into());
-            }
+            policy.check_digest_algorithm(reference.digest_method)?;
         }
         Ok(())
     }
