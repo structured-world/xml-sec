@@ -512,7 +512,7 @@ impl<'a> UriReferenceResolver<'a> {
     }
 
     /// Resolve a same-document URI to an element under the configured grammar.
-    pub(crate) fn node_for_same_document_reference(
+    pub fn node_for_same_document_reference(
         &self,
         uri: &str,
     ) -> Result<Option<Node<'a, 'a>>, TransformError> {

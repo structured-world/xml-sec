@@ -22,6 +22,7 @@ use sha2::{Sha224, Sha256, Sha384, Sha512};
 use signature::hazmat::{PrehashSigner, RandomizedPrehashSigner};
 use std::{collections::HashSet, ops::Range};
 use x509_parser::prelude::FromDer;
+use zeroize::Zeroizing;
 
 use crate::c14n::canonicalize_bounded_with_xml_base_budget;
 
@@ -834,8 +835,10 @@ impl SigningKey for RsaSigningKey {
 }
 
 /// Symmetric key for XMLDSig HMAC signing.
+///
+/// Owned secret bytes are zeroized when the key is dropped.
 pub struct HmacSigningKey {
-    secret: Vec<u8>,
+    secret: Zeroizing<Vec<u8>>,
 }
 
 impl HmacSigningKey {
@@ -845,7 +848,9 @@ impl HmacSigningKey {
         if secret.is_empty() {
             return Err(SigningKeyError::InvalidKeyDer);
         }
-        Ok(Self { secret })
+        Ok(Self {
+            secret: Zeroizing::new(secret),
+        })
     }
 }
 

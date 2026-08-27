@@ -61,6 +61,7 @@ hmac = { version = "0.13", optional = true }
 signature = { version = "3", optional = true }
 subtle = { version = "2", optional = true }
 getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
+zeroize = { version = "1", optional = true }
 sxd-document-no-unsafe = { version = "0.4.1", default-features = false, features = ["no-unsafe"], optional = true }
 sxd-xpath-no-unsafe = { version = "0.5.1", default-features = false, features = ["no-unsafe"], optional = true }
 aes = { version = "0.9.2", optional = true }
@@ -116,6 +117,7 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:x509-parser",
     "dep:x509-cert",
     "dep:x520-stringprep",
+    "dep:zeroize",
 ]
 xmlenc = [             # XML Encryption (encrypt + decrypt)
     "dep:aes",

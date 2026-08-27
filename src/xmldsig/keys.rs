@@ -10,6 +10,7 @@ use x509_parser::{
     public_key::PublicKey,
     x509::SubjectPublicKeyInfo,
 };
+use zeroize::Zeroizing;
 
 use super::signature::{
     signature_value_matches_spki, signature_value_matches_spki_with_encoding,
@@ -36,9 +37,10 @@ use super::{
 /// Policy-free [`VerifyingKey`] calls enforce [`crate::policy::HmacPolicy::default`].
 /// [`super::VerifyContext`] supplies its immutable operation policy through the
 /// policy-aware hooks, so legacy truncation always requires an explicit opt-in.
+/// Owned secret bytes are zeroized when the key is dropped.
 #[derive(Clone)]
 pub struct HmacVerificationKey {
-    secret: Vec<u8>,
+    secret: Zeroizing<Vec<u8>>,
 }
 
 impl fmt::Debug for HmacVerificationKey {
@@ -56,7 +58,9 @@ impl HmacVerificationKey {
         if secret.is_empty() {
             return Err(KeyResolutionError::InvalidPublicKey);
         }
-        Ok(Self { secret })
+        Ok(Self {
+            secret: Zeroizing::new(secret),
+        })
     }
 
     fn validate_output(

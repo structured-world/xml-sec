@@ -257,6 +257,9 @@ trigger implicit I/O.
 Direct policy-free calls on `HmacVerificationKey` enforce the secure default
 HMAC key and output minima. Compatibility truncation is available only through
 the policy-aware hooks used by `VerifyContext` with an explicit `HmacPolicy`.
+Both `HmacVerificationKey` and `HmacSigningKey` own their secret bytes in
+zeroizing storage, so dropping either key overwrites the retained secret before
+releasing its allocation.
 `VerifyContext::allowed_transforms` applies to Reference transforms and implicit C14N,
 the declared SignedInfo canonicalization method, and supported RetrievalMethod transforms.
 Allowing XPath for signed payload processing therefore also explicitly permits the bounded

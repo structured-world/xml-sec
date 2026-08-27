@@ -662,11 +662,25 @@ impl ResourcePolicy {
     }
 
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-    pub(crate) fn validate_key_candidates(&self, actual: usize) -> Result<(), PolicyViolation> {
+    /// Reject aggregate key-candidate work beyond this policy snapshot.
+    pub fn validate_key_candidates(&self, actual: usize) -> Result<(), PolicyViolation> {
         if actual > self.max_key_candidates {
             return Err(PolicyViolation::ResourceLimit {
                 resource: resource_name::KEY_CANDIDATES,
                 maximum: self.max_key_candidates,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    /// Reject `KeyInfoReference` traversal beyond this policy snapshot.
+    #[cfg(feature = "xmldsig")]
+    pub fn validate_key_info_reference_depth(&self, actual: usize) -> Result<(), PolicyViolation> {
+        if actual > self.max_key_info_reference_depth {
+            return Err(PolicyViolation::ResourceLimit {
+                resource: resource_name::KEY_INFO_REFERENCE_DEPTH,
+                maximum: self.max_key_info_reference_depth,
                 actual,
             });
         }

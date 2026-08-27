@@ -166,6 +166,12 @@ are checked during each attempt rather than only after selecting a key. The CLI
 rejects an oversized candidate ring before opening any private-key source, and
 every successfully read private-key source and certificate companion is also
 charged to one invocation-wide external-material byte budget before decoding.
+Before signing-key selection, the CLI recursively materializes same-document
+`KeyInfoReference` sources under the signing policy's shared depth and
+key-candidate limits. Referenced `KeyName` and public identity sources therefore
+participate in the same selection and validation as direct children. Missing,
+ambiguous, non-`KeyInfo`, cyclic, over-budget, and external references fail
+closed; the CLI never reads external key metadata implicitly.
 
 Verification accepts `-` as the conventional stdin marker. Verification starts
 at the document root and uses the first descendant `Signature` in document order.

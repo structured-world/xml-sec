@@ -190,7 +190,7 @@ pub trait KeyResolver {
     }
 }
 
-/// Allowed URI classes for `<Reference URI="...">`.
+/// Allowed structural URI classes for XMLDSig reference and key-source policy.
 ///
 /// External URIs resolve only from bytes supplied through
 /// [`VerifyContext::external_resources`]; allowing them never enables I/O.
@@ -245,7 +245,8 @@ impl UriTypeSet {
         allow_external: true,
     };
 
-    pub(crate) fn allows(self, uri: &str) -> bool {
+    /// Return whether this set permits the URI's structural class.
+    pub fn allows(self, uri: &str) -> bool {
         match classify_uri(uri) {
             UriClass::Empty => self.allow_empty,
             UriClass::SameDocument => self.allow_same_document,
@@ -1658,14 +1659,10 @@ fn materialize_key_info_references(
                 .into());
             }
             let next_depth = depth.saturating_add(1);
-            if next_depth > context.policy.resources.max_key_info_reference_depth {
-                return Err(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::KEY_INFO_REFERENCE_DEPTH,
-                    maximum: context.policy.resources.max_key_info_reference_depth,
-                    actual: next_depth,
-                }
-                .into());
-            }
+            context
+                .policy
+                .resources
+                .validate_key_info_reference_depth(next_depth)?;
             let cycle_key = (resolver.traversal_document_identity(), uri.clone());
             if !traversal.active.insert(cycle_key.clone()) {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {

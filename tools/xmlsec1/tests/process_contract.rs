@@ -100,6 +100,55 @@ fn compatibility_cli_signs_and_verifies_legacy_sha1_templates() {
 }
 
 #[test]
+fn compatibility_cli_resolves_key_info_reference_before_signing_key_selection() {
+    // The donor template puts its KeyName behind a same-document
+    // KeyInfoReference. Compatibility key selection must resolve that identity
+    // before matching a named private-key option.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root().join(
+        "tests/fixtures/xmldsig/xmldsig11-interop-2012/signature-enveloping-keyinforeference-rsa.tmpl",
+    );
+    let private_key = temp.path().join("rsa-4096-private.der");
+    let fixture_key = RsaPrivateKey::from_pkcs8_pem(
+        &fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem"))
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(&private_key, fixture_key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let signed = temp.path().join("key-info-reference-signed.xml");
+
+    let sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-rsa-4096"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let unnamed_signed = temp.path().join("key-info-reference-unnamed-signed.xml");
+    let unnamed_sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&unnamed_signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        unnamed_sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unnamed_sign.stderr)
+    );
+}
+
+#[test]
 fn compatibility_cli_signs_hmac_templates_with_named_raw_keys() {
     // The global hmac-key option is part of the xmlsec1 sign contract. The CLI
     // consumes its file verbatim and applies the compatibility HMAC minima.

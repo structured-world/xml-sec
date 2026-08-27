@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::File,
     io::Read as _,
     path::{Path, PathBuf},
@@ -173,15 +174,114 @@ pub fn signing_signature_metadata(
     let algorithm = SignatureAlgorithm::from_uri(algorithm_uri).ok_or_else(|| {
         KeyMaterialError::Signature(format!("unsupported signature algorithm: {algorithm_uri}"))
     })?;
-    let key_info = signature_key_info(signature)
+    let mut key_info = signature_key_info(signature)
         .map(parse_key_info)
         .transpose()
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
+    if let Some(key_info) = &mut key_info {
+        let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
+        materialize_signing_key_info_references(key_info, &resolver, policy)?;
+    }
     Ok(SigningTemplateMetadata {
         algorithm,
-        key_names: signature_key_names(signature),
+        key_names: key_info
+            .iter()
+            .flat_map(|key_info| &key_info.sources)
+            .filter_map(|source| match source {
+                xml_sec::xmldsig::KeyInfoSource::KeyName(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect(),
         key_info,
     })
+}
+
+fn materialize_signing_key_info_references(
+    key_info: &mut KeyInfo,
+    resolver: &UriReferenceResolver<'_>,
+    policy: &SigningPolicy,
+) -> Result<(), KeyMaterialError> {
+    fn visit(
+        key_info: &mut KeyInfo,
+        resolver: &UriReferenceResolver<'_>,
+        policy: &SigningPolicy,
+        active: &mut HashSet<String>,
+        candidate_work: &mut usize,
+        depth: usize,
+    ) -> Result<(), KeyMaterialError> {
+        let mut materialized = Vec::new();
+        for source in std::mem::take(&mut key_info.sources) {
+            let source_work = match &source {
+                xml_sec::xmldsig::KeyInfoSource::X509Data(info) => info.certificates.len().max(1),
+                _ => 1,
+            };
+            *candidate_work = candidate_work.saturating_add(source_work);
+            policy.resources.validate_key_candidates(*candidate_work)?;
+
+            let xml_sec::xmldsig::KeyInfoSource::KeyInfoReference { uri } = source else {
+                materialized.push(source);
+                continue;
+            };
+            if !policy.uris.key_info_references.allows(&uri) {
+                return Err(KeyMaterialError::Policy(PolicyViolation::Uri {
+                    operation: "KeyInfoReference",
+                    reason: "URI class is disabled",
+                }));
+            }
+            if !uri.starts_with('#') {
+                return Err(KeyMaterialError::Signature(
+                    "signing KeyInfoReference must be a same-document reference".into(),
+                ));
+            }
+            let next_depth = depth.saturating_add(1);
+            policy
+                .resources
+                .validate_key_info_reference_depth(next_depth)?;
+            if !active.insert(uri.clone()) {
+                return Err(KeyMaterialError::Signature(
+                    "KeyInfoReference cycle detected".into(),
+                ));
+            }
+            let node = resolver
+                .node_for_same_document_reference(&uri)
+                .map_err(|error| KeyMaterialError::Signature(error.to_string()))?
+                .ok_or_else(|| {
+                    KeyMaterialError::Signature(
+                        "KeyInfoReference target is missing or ambiguous".into(),
+                    )
+                })?;
+            if !node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")) {
+                return Err(KeyMaterialError::Signature(
+                    "KeyInfoReference target must be KeyInfo".into(),
+                ));
+            }
+            let mut referenced = parse_key_info(node)
+                .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
+            visit(
+                &mut referenced,
+                resolver,
+                policy,
+                active,
+                candidate_work,
+                next_depth,
+            )?;
+            active.remove(&uri);
+            materialized.extend(referenced.sources);
+        }
+        key_info.sources = materialized;
+        Ok(())
+    }
+
+    let mut active = HashSet::new();
+    let mut candidate_work = 0;
+    visit(
+        key_info,
+        resolver,
+        policy,
+        &mut active,
+        &mut candidate_work,
+        0,
+    )
 }
 
 fn select_signature<'a>(
@@ -608,6 +708,134 @@ mod tests {
         let path = path.as_ref();
         let bytes = read(path)?;
         decode_signing_key(path, &bytes, format, SignatureAlgorithm::RsaSha256)
+    }
+
+    fn signing_template_with_key_info(key_info: &str, targets: &str) -> String {
+        format!(
+            r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:SignedInfo><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/></ds:SignedInfo><ds:SignatureValue/>{key_info}{targets}</ds:Signature>"##
+        )
+    }
+
+    #[test]
+    fn signing_metadata_rejects_invalid_key_info_reference_graphs() {
+        // Signing key selection must fail closed on the same malformed graph
+        // shapes rejected by verification rather than silently discarding the
+        // reference and selecting an unconstrained key.
+        let cases = [
+            (
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#missing\"/></ds:KeyInfo>",
+                "",
+                "KeyInfoReference target is missing or ambiguous",
+            ),
+            (
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
+                "<ds:Object Id=\"target\"/>",
+                "KeyInfoReference target must be KeyInfo",
+            ),
+            (
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
+                "<ds:KeyInfo Id=\"target\"><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
+                "KeyInfoReference cycle detected",
+            ),
+            (
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"keys.xml#target\"/></ds:KeyInfo>",
+                "",
+                "KeyInfoReference URI policy rejected the operation",
+            ),
+        ];
+        for (key_info, targets, expected) in cases {
+            let error = signing_signature_metadata(
+                &signing_template_with_key_info(key_info, targets),
+                None,
+                &[],
+                &SigningPolicy::default(),
+            )
+            .expect_err("invalid KeyInfoReference graph must be rejected");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn signing_metadata_bounds_key_info_reference_depth() {
+        // Acyclic chains remain attacker-controlled, so traversal depth must
+        // consume the operation policy limit before parsing the next target.
+        let maximum = SigningPolicy::default()
+            .resources
+            .max_key_info_reference_depth;
+        let targets = (0..=maximum)
+            .map(|index| {
+                if index == maximum {
+                    format!("<ds:KeyInfo Id=\"level-{index}\"><ds:KeyName>key</ds:KeyName></ds:KeyInfo>")
+                } else {
+                    format!("<ds:KeyInfo Id=\"level-{index}\"><dsig11:KeyInfoReference URI=\"#level-{}\"/></ds:KeyInfo>", index + 1)
+                }
+            })
+            .collect::<String>();
+        let error = signing_signature_metadata(
+            &signing_template_with_key_info(
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#level-0\"/></ds:KeyInfo>",
+                &targets,
+            ),
+            None,
+            &[],
+            &SigningPolicy::default(),
+        )
+        .expect_err("over-deep KeyInfoReference chain must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("policy maximum {maximum}")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn signing_metadata_bounds_key_info_reference_candidate_work() {
+        // Referenced sources share one aggregate candidate budget with the
+        // reference nodes themselves; each nested KeyInfo cannot reset it.
+        let mut policy = SigningPolicy::default();
+        policy.resources.max_key_candidates = 2;
+        let error = signing_signature_metadata(
+            &signing_template_with_key_info(
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
+                "<ds:KeyInfo Id=\"target\"><ds:KeyName>one</ds:KeyName><ds:KeyName>two</ds:KeyName></ds:KeyInfo>",
+            ),
+            None,
+            &[],
+            &policy,
+        )
+        .expect_err("aggregate candidate work must respect operation policy");
+        assert!(
+            error
+                .to_string()
+                .contains("key candidates exceeds policy maximum 2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn signing_metadata_enforces_key_info_reference_uri_policy() {
+        // The signing policy can disable KeyInfoReference independently of
+        // ordinary signed-payload references; metadata selection must honor it
+        // before dereferencing even a valid same-document target.
+        let mut policy = SigningPolicy::default();
+        policy.uris.key_info_references = xml_sec::xmldsig::UriTypeSet::new(false, false, false);
+        let error = signing_signature_metadata(
+            &signing_template_with_key_info(
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
+                "<ds:KeyInfo Id=\"target\"><ds:KeyName>key</ds:KeyName></ds:KeyInfo>",
+            ),
+            None,
+            &[],
+            &policy,
+        )
+        .expect_err("disabled KeyInfoReference URI class must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("KeyInfoReference URI policy rejected the operation"),
+            "{error}"
+        );
     }
 
     #[test]
