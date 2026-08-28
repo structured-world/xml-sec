@@ -902,6 +902,7 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
         "crypto",
         "crypto-config",
         "gen-key",
+        "hmac-key",
         "pkcs8-der",
         "pkcs8-pem",
         "print-crypto-library-errors",

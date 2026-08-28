@@ -22043,7 +22043,7 @@
       "source": "apps/xmlsec.c",
       "line": 478,
       "detail": "static xmlSecAppCmdLineParam hmacKeyParam = { xmlSecAppCmdLineTopicKeysMngr, \"--hmac-key\", \"--hmackey\", \"--hmac-key[:<name>] <file>\" \"\\n\\tload HMAC key from binary file <file>\", xmlSecAppCmdLineParamTypeString, xmlSecAppCmdLineParamFlagParamNameValue | xmlSecAppCmdLineParamFlagMultipleValues, NULL };",
-      "classification": "planned-cli-surface"
+      "classification": "native-cli-provider-options"
     },
     {
       "kind": "cli-option",
