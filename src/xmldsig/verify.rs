@@ -1882,7 +1882,7 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
         policy.resources().max_external_resource_bytes,
         policy.resources().max_external_resource_total_bytes,
     );
-    let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+    let mut xpath_parse_budget = XPathSignatureParseBudget::from_resources(policy.resources());
     let execution_budget = TransformExecutionBudget::from_resources(policy.resources());
     let mut budgets = RetrievalMaterializationBudgets {
         xpath_parse: &mut xpath_parse_budget,
@@ -5635,6 +5635,72 @@ mod tests {
                 actual,
             }) if actual == resources["key.xml"].len()
         ));
+    }
+
+    #[test]
+    fn public_key_info_materialization_binds_xpath_policy() {
+        // Both public helpers must carry the caller's XPath parse limits into
+        // RetrievalMethod transforms nested in an external KeyInfo document.
+        let external = format!(
+            r##"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}">
+                <ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data">
+                    <ds:Transforms><ds:Transform Algorithm="{XPATH_TRANSFORM_URI}">
+                        <ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath>
+                    </ds:Transform></ds:Transforms>
+                </ds:RetrievalMethod>
+                <ds:X509Data Id="target"><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data>
+            </ds:KeyInfo>"##
+        );
+        let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
+        let document = Document::parse("<root/>").unwrap();
+
+        for operation in ["signing", "verification"] {
+            let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+            let mut key_info = KeyInfo {
+                sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                    uri: "key.xml".into(),
+                }],
+            };
+            let error = match operation {
+                "signing" => {
+                    let mut policy = crate::policy::SigningPolicy::default();
+                    policy.uris.key_info_references = UriTypeSet::ALL;
+                    policy.resources.max_xpath_expressions = 0;
+                    materialize_signing_key_info_references(
+                        &mut key_info,
+                        resolver,
+                        &policy,
+                        crate::provider::default_provider(),
+                    )
+                }
+                "verification" => {
+                    let mut policy = crate::policy::VerificationPolicy::default();
+                    policy.key_sources.key_info_reference = true;
+                    policy.uris.key_info_references = UriTypeSet::ALL;
+                    policy.resources.max_xpath_expressions = 0;
+                    materialize_verification_key_info_references(
+                        &mut key_info,
+                        resolver,
+                        &policy,
+                        crate::provider::default_provider(),
+                    )
+                }
+                _ => unreachable!(),
+            }
+            .expect_err("the public helper must enforce the supplied XPath expression limit");
+
+            assert!(
+                matches!(
+                    error,
+                    DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                        resource: crate::policy::resource_name::XPATH_EXPRESSIONS,
+                        maximum: 0,
+                        actual: 1,
+                    })
+                ),
+                "unexpected {operation} error: {error:?}"
+            );
+        }
     }
 
     fn materialize_external_key_info_chain(

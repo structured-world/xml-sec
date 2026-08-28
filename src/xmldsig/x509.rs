@@ -944,6 +944,7 @@ fn parse_rsa_pss_algorithm(
 fn x509_digest_algorithm(oid: &str) -> Result<super::DigestAlgorithm, X509ChainError> {
     match oid {
         "1.3.14.3.2.26" => Ok(super::DigestAlgorithm::Sha1),
+        "2.16.840.1.101.3.4.2.4" => Ok(super::DigestAlgorithm::Sha224),
         "2.16.840.1.101.3.4.2.1" => Ok(super::DigestAlgorithm::Sha256),
         "2.16.840.1.101.3.4.2.2" => Ok(super::DigestAlgorithm::Sha384),
         "2.16.840.1.101.3.4.2.3" => Ok(super::DigestAlgorithm::Sha512),
@@ -2229,6 +2230,31 @@ mod tests {
                 digest: super::super::DigestAlgorithm::Sha256,
                 mgf_digest: super::super::DigestAlgorithm::Sha256,
                 salt_len: 32,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_sha224_rsa_pss_certificate_parameters() {
+        // RFC 4055 permits SHA-224 independently for the message digest and
+        // MGF1. The provider-neutral parser must preserve that capability.
+        let der = [
+            0x30, 0x41, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a, 0x30,
+            0x34, 0xa0, 0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04,
+            0x02, 0x04, 0x05, 0x00, 0xa1, 0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+            0xf7, 0x0d, 0x01, 0x01, 0x08, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
+            0x03, 0x04, 0x02, 0x04, 0x05, 0x00, 0xa2, 0x03, 0x02, 0x01, 0x1c,
+        ];
+        let (rest, identifier) = AlgorithmIdentifier::from_der(&der)
+            .expect("standard SHA-224 RSA-PSS AlgorithmIdentifier must parse");
+        assert!(rest.is_empty());
+
+        assert_eq!(
+            x509_signature_algorithm(&identifier),
+            Ok(X509SignatureAlgorithm::RsaPss {
+                digest: super::super::DigestAlgorithm::Sha224,
+                mgf_digest: super::super::DigestAlgorithm::Sha224,
+                salt_len: 28,
             })
         );
     }
