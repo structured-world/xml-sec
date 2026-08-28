@@ -993,7 +993,7 @@ fn compatibility_cli_signs_with_traditional_encrypted_sec1_pem() {
         String::from_utf8_lossy(&verify.stderr)
     );
 
-    for password in [None, Some("wrong-legacy-password")] {
+    for password in [None, Some("wrong-legacy-password-sentinel")] {
         let rejected_output = temp.path().join(format!(
             "ec-traditional-rejected-{}.xml",
             password.unwrap_or("missing")
@@ -1011,6 +1011,9 @@ fn compatibility_cli_signs_with_traditional_encrypted_sec1_pem() {
             .unwrap();
         assert!(!rejected.status.success());
         assert!(!rejected_output.exists());
+        if let Some(password) = password {
+            assert!(!String::from_utf8_lossy(&rejected.stderr).contains(password));
+        }
     }
 }
 

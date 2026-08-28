@@ -59,10 +59,16 @@ pub enum ProviderCapability<'a> {
     /// Message digest computation for an XMLDSig digest method.
     #[cfg(feature = "xmldsig")]
     Digest(DigestAlgorithm),
-    /// Signature generation for an XMLDSig signature method.
+    /// Provider dispatch for an XMLDSig signing method.
+    ///
+    /// The opaque signing key remains responsible for accepting the method and
+    /// implementing its primitive.
     #[cfg(feature = "xmldsig")]
     Sign(crate::xmldsig::SignatureAlgorithm),
-    /// Signature verification for an XMLDSig signature method.
+    /// Provider dispatch for an XMLDSig verification method.
+    ///
+    /// The opaque verification key remains responsible for accepting the
+    /// method and implementing its primitive.
     #[cfg(feature = "xmldsig")]
     Verify(crate::xmldsig::SignatureAlgorithm),
     /// X.509 signature verification with complete algorithm parameters.
@@ -366,7 +372,11 @@ pub trait CryptoProvider: Send + Sync {
     /// Stable provider name for diagnostics and capability reporting.
     fn name(&self) -> &'static str;
 
-    /// Return whether this build supports the requested operation and parameters.
+    /// Return whether this build can dispatch the requested capability.
+    ///
+    /// [`ProviderCapability::Sign`] and [`ProviderCapability::Verify`] describe
+    /// provider dispatch only: the supplied opaque key performs the executable
+    /// algorithm-support check when the operation runs.
     fn supports(&self, capability: ProviderCapability<'_>) -> bool;
 
     /// Fill caller-owned output with cryptographically secure random bytes.
@@ -697,9 +707,9 @@ impl CryptoProvider for RustCryptoProvider {
             #[cfg(feature = "xmldsig")]
             ProviderCapability::Digest(_) => true,
             #[cfg(feature = "xmldsig")]
-            ProviderCapability::Sign(_) => true,
-            #[cfg(feature = "xmldsig")]
-            ProviderCapability::Verify(_) => true,
+            // Opaque keys own these primitives and reject unsupported methods
+            // during dispatch; the provider advertises its dispatch surface.
+            ProviderCapability::Sign(_) | ProviderCapability::Verify(_) => true,
             #[cfg(feature = "xmldsig")]
             ProviderCapability::VerifyCertificate(algorithm) => {
                 is_supported_x509_signature(algorithm)
