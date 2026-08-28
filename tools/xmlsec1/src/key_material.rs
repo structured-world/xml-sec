@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fs::File,
     io::Read as _,
     path::{Path, PathBuf},
@@ -13,11 +12,13 @@ use rsa::{
     },
 };
 use x509_parser::prelude::FromDer as _;
-use xml_sec::policy::{PolicyViolation, ResourcePolicy, SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{PolicyViolation, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
-    DsaSigningKey, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey, KeyInfo,
-    RsaSigningKey, SignatureAlgorithm, SigningKey, UriTypeSet, VerificationKey,
-    find_signature_node, parse_key_info, parse_signed_info, uri::UriReferenceResolver,
+    DsaSigningKey, DsigError, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey,
+    KeyInfo, ReferenceProcessingError, RsaSigningKey, SignatureAlgorithm, SigningKey,
+    VerificationKey, find_signature_node, materialize_signing_key_info_references,
+    materialize_verification_key_info_references, parse_key_info, parse_signed_info,
+    uri::UriReferenceResolver,
 };
 use xml_sec::{
     XmlDomDocument as Document, XmlDomNode as Node, XmlDomParsingOptions as ParsingOptions,
@@ -148,7 +149,13 @@ pub fn verification_signature_metadata(
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
     if let Some(key_info) = &mut key_info {
         let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
-        materialize_key_info_references(key_info, &resolver, policy)?;
+        materialize_verification_key_info_references(
+            key_info,
+            &resolver,
+            policy,
+            xml_sec::provider::default_provider(),
+        )
+        .map_err(map_key_info_reference_error)?;
     }
     Ok(SignatureMetadata {
         algorithm,
@@ -188,7 +195,13 @@ pub fn signing_signature_metadata(
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
     if let Some(key_info) = &mut key_info {
         let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
-        materialize_key_info_references(key_info, &resolver, policy)?;
+        materialize_signing_key_info_references(
+            key_info,
+            &resolver,
+            policy,
+            xml_sec::provider::default_provider(),
+        )
+        .map_err(map_key_info_reference_error)?;
     }
     Ok(SigningTemplateMetadata {
         algorithm,
@@ -197,136 +210,16 @@ pub fn signing_signature_metadata(
     })
 }
 
-trait MetadataKeyInfoPolicy {
-    fn resources(&self) -> &ResourcePolicy;
-    fn key_info_reference_uris(&self) -> UriTypeSet;
-    fn key_info_reference_source_enabled(&self) -> bool;
-}
-
-impl MetadataKeyInfoPolicy for SigningPolicy {
-    fn resources(&self) -> &ResourcePolicy {
-        &self.resources
-    }
-
-    fn key_info_reference_uris(&self) -> UriTypeSet {
-        self.uris.key_info_references
-    }
-
-    fn key_info_reference_source_enabled(&self) -> bool {
-        // Signing selects caller-supplied key material; unlike verification,
-        // it has no document-source trust decision beyond the URI policy.
-        true
-    }
-}
-
-impl MetadataKeyInfoPolicy for VerificationPolicy {
-    fn resources(&self) -> &ResourcePolicy {
-        &self.resources
-    }
-
-    fn key_info_reference_uris(&self) -> UriTypeSet {
-        self.uris.key_info_references
-    }
-
-    fn key_info_reference_source_enabled(&self) -> bool {
-        self.key_sources.key_info_reference
-    }
-}
-
-fn materialize_key_info_references<P: MetadataKeyInfoPolicy>(
-    key_info: &mut KeyInfo,
-    resolver: &UriReferenceResolver<'_>,
-    policy: &P,
-) -> Result<(), KeyMaterialError> {
-    fn visit<P: MetadataKeyInfoPolicy>(
-        key_info: &mut KeyInfo,
-        resolver: &UriReferenceResolver<'_>,
-        policy: &P,
-        active: &mut HashSet<String>,
-        candidate_work: &mut usize,
-        depth: usize,
-    ) -> Result<(), KeyMaterialError> {
-        let mut materialized = Vec::new();
-        for source in std::mem::take(&mut key_info.sources) {
-            let source_work = match &source {
-                xml_sec::xmldsig::KeyInfoSource::X509Data(info) => info.certificates.len().max(1),
-                _ => 1,
-            };
-            *candidate_work = candidate_work.saturating_add(source_work);
-            policy
-                .resources()
-                .validate_key_candidates(*candidate_work)?;
-
-            let xml_sec::xmldsig::KeyInfoSource::KeyInfoReference { uri } = source else {
-                materialized.push(source);
-                continue;
-            };
-            if !policy.key_info_reference_source_enabled() {
-                return Err(KeyMaterialError::Policy(PolicyViolation::KeyTrust {
-                    reason: "KeyInfoReference key sources are disabled",
-                }));
-            }
-            if !policy.key_info_reference_uris().allows(&uri) {
-                return Err(KeyMaterialError::Policy(PolicyViolation::Uri {
-                    operation: "KeyInfoReference",
-                    reason: "URI class is disabled",
-                }));
-            }
-            if !uri.is_empty() && !uri.starts_with('#') {
-                return Err(KeyMaterialError::Signature(
-                    "CLI KeyInfoReference metadata selection requires a same-document reference"
-                        .into(),
-                ));
-            }
-            let next_depth = depth.saturating_add(1);
-            policy
-                .resources()
-                .validate_key_info_reference_depth(next_depth)?;
-            if !active.insert(uri.clone()) {
-                return Err(KeyMaterialError::Signature(
-                    "KeyInfoReference cycle detected".into(),
-                ));
-            }
-            let node = resolver
-                .node_for_same_document_reference(&uri)
-                .map_err(|error| KeyMaterialError::Signature(error.to_string()))?
-                .ok_or_else(|| {
-                    KeyMaterialError::Signature(
-                        "KeyInfoReference target is missing or ambiguous".into(),
-                    )
-                })?;
-            if !node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")) {
-                return Err(KeyMaterialError::Signature(
-                    "KeyInfoReference target must be KeyInfo".into(),
-                ));
-            }
-            let mut referenced = parse_key_info(node)
-                .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-            visit(
-                &mut referenced,
-                resolver,
-                policy,
-                active,
-                candidate_work,
-                next_depth,
-            )?;
-            active.remove(&uri);
-            materialized.extend(referenced.sources);
+fn map_key_info_reference_error(error: DsigError) -> KeyMaterialError {
+    match error {
+        DsigError::Policy(error) => KeyMaterialError::Policy(error),
+        DsigError::InvalidStructure { reason } => KeyMaterialError::Signature(reason.to_owned()),
+        DsigError::Reference(ReferenceProcessingError::UriDereference(error)) => {
+            KeyMaterialError::Signature(error.to_string())
         }
-        key_info.sources = materialized;
-        Ok(())
+        DsigError::ParseKeyInfo(error) => KeyMaterialError::Signature(error.to_string()),
+        error => KeyMaterialError::Signature(error.to_string()),
     }
-
-    let mut active = HashSet::new();
-    let mut candidate_work = 0;
-    visit(
-        key_info,
-        resolver,
-        policy,
-        &mut active,
-        &mut candidate_work,
-        0,
-    )
 }
 
 fn select_signature<'a>(

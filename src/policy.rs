@@ -1295,6 +1295,11 @@ mod tests {
                 |p| &mut p.max_key_candidates,
             ),
             (
+                resource_name::KEY_INFO_REFERENCE_DEPTH,
+                crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
+                |p| &mut p.max_key_info_reference_depth,
+            ),
+            (
                 resource_name::BASE64_TRANSFORM_INPUT_BYTES,
                 crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
                 |p| &mut p.max_base64_transform_input_bytes,

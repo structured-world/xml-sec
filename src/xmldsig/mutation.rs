@@ -1,7 +1,7 @@
 //! Streaming XML mutation helpers for the XMLDSig signing pipeline.
 //!
-//! Signing cannot mutate `roxmltree`'s read-only DOM. These helpers validate
-//! structure with `roxmltree`, then rewrite the document with `quick-xml`.
+//! The selected semantic DOM is immutable. These helpers validate structure
+//! through the backend-neutral DOM contract, then rewrite with `quick-xml`.
 
 use std::{collections::HashSet, io::Write, ops::Range};
 
@@ -10,7 +10,7 @@ use quick_xml::name::{Namespace, ResolveResult};
 use quick_xml::reader::NsReader;
 use quick_xml::{Reader, Writer};
 
-use super::parse::XMLDSIG_NS;
+use super::parse::{XMLDSIG_NS, XMLDSIG11_NS};
 use super::whitespace::is_xml_whitespace_only;
 use crate::document::{
     DocumentParseSettings, XmlDocumentError, XmlParseWorkBudget,
@@ -929,10 +929,11 @@ fn has_cryptographic_identity_content(node: crate::xml::dom::Node<'_, '_>) -> bo
             .filter_map(|child| child.text())
             .any(|text| !is_xml_whitespace_only(text)),
         (Some(XMLDSIG_NS), "RetrievalMethod") => node.attribute("URI").is_some(),
-        (Some("http://www.w3.org/2009/xmldsig11#"), "DEREncodedKeyValue") => node
+        (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => node
             .children()
             .filter_map(|child| child.text())
             .any(|text| !is_xml_whitespace_only(text)),
+        (Some(XMLDSIG11_NS), "KeyInfoReference") => node.attribute("URI").is_some(),
         _ => false,
     }
 }
@@ -962,7 +963,7 @@ fn is_cryptographic_key_info_source(namespace: Option<&str>, name: &str) -> bool
             Some(XMLDSIG_NS),
             "KeyValue" | "RetrievalMethod" | "X509Data" | "PGPData" | "SPKIData"
         ) | (
-            Some("http://www.w3.org/2009/xmldsig11#"),
+            Some(XMLDSIG11_NS),
             "DEREncodedKeyValue" | "KeyInfoReference"
         )
     )
@@ -1961,6 +1962,27 @@ mod tests {
                 .children()
                 .any(|node| node.has_tag_name((XMLDSIG_NS, "X509Certificate")))
         }));
+    }
+
+    #[test]
+    fn key_info_source_merge_replaces_uri_reference_with_non_element_children() {
+        // KeyInfoReference identity is carried by URI. Comments and processing
+        // instructions make the element non-placeholder content, but must not
+        // cause stale and generated references to coexist.
+        let source = r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:KeyInfo><dsig11:KeyInfoReference URI="#stale"><!--audit--><?trace keep?></dsig11:KeyInfoReference></ds:KeyInfo></ds:Signature>"##;
+        let generated = r##"<dsig11:KeyInfoReference xmlns:dsig11="http://www.w3.org/2009/xmldsig11#" URI="#generated"/>"##;
+
+        let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect("generated reference must replace stale identity");
+        let document = dom::Document::parse(&merged).expect("merged XML must parse");
+        let references = document
+            .descendants()
+            .filter(|node| node.has_tag_name((XMLDSIG11_NS, "KeyInfoReference")))
+            .collect::<Vec<_>>();
+
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].attribute("URI"), Some("#generated"));
+        assert!(!merged.contains("#stale"));
     }
 
     #[test]

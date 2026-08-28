@@ -257,6 +257,12 @@ self-references still fail through the ordinary cycle detector. All nested
 external dereferences
 consume the operation's shared aggregate external-resource budget and never
 trigger implicit I/O.
+Callers that inspect template or signature metadata before running a complete
+operation can use `materialize_signing_key_info_references` or
+`materialize_verification_key_info_references`. Both entry points execute the
+same core traversal as `VerifyContext`, including candidate-work, depth, cycle,
+target, parser, transform, and external-resource bounds; they differ only in
+the typed signing or verification policy applied at the boundary.
 
 Direct policy-free calls on `HmacVerificationKey` enforce the secure default
 HMAC key and output minima. Compatibility truncation is available only through
