@@ -562,10 +562,14 @@ fn decode_dsa_signing_key(
         PrivateKeyFormat::Pem => {
             let text = std::str::from_utf8(bytes)
                 .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
-            Some(Zeroizing::new(
-                parse_pem(text, "DSA PRIVATE KEY", path)
-                    .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?,
-            ))
+            // Generic PEM uses the same password-aware OpenSSL envelope
+            // contract for DSA as for traditional RSA and SEC1 keys.
+            Some(decode_openssl_traditional_pem(
+                text,
+                "DSA PRIVATE KEY",
+                password,
+                path,
+            )?)
         }
         PrivateKeyFormat::Der => None,
         PrivateKeyFormat::Pkcs8Pem | PrivateKeyFormat::Pkcs8Der => {
@@ -1098,6 +1102,43 @@ mod tests {
             None,
         )
         .expect("valid traditional DSA DER must decode");
+
+        let password = b"legacy-dsa-password";
+        let encrypted = encrypted_traditional_pem("DSA PRIVATE KEY", &valid, password);
+        let encrypted_path = Path::new("traditional-encrypted-dsa.pem");
+        decode_signing_key(
+            encrypted_path,
+            encrypted.as_bytes(),
+            PrivateKeyFormat::Pem,
+            SignatureAlgorithm::DsaSha256,
+            Some(password),
+        )
+        .expect("the correct password must decrypt traditional DSA PEM");
+        for rejected_password in [None, Some(b"wrong-password".as_slice())] {
+            assert!(
+                decode_signing_key(
+                    encrypted_path,
+                    encrypted.as_bytes(),
+                    PrivateKeyFormat::Pem,
+                    SignatureAlgorithm::DsaSha256,
+                    rejected_password,
+                )
+                .is_err(),
+                "missing or incorrect passwords must fail closed"
+            );
+        }
+        let trailing = format!("{encrypted}not-pem-trailing-input");
+        assert!(
+            decode_signing_key(
+                encrypted_path,
+                trailing.as_bytes(),
+                PrivateKeyFormat::Pem,
+                SignatureAlgorithm::DsaSha256,
+                Some(password),
+            )
+            .is_err(),
+            "encrypted DSA PEM must occupy the complete input"
+        );
 
         let mut trailing = valid.clone();
         trailing.push(0);

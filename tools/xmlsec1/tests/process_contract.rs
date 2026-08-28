@@ -857,6 +857,71 @@ fn compatibility_cli_signs_with_traditional_encrypted_rsa_pem() {
 }
 
 #[test]
+fn compatibility_cli_signs_with_traditional_encrypted_dsa_pem() {
+    // Generic PEM loading applies the password before DSA ASN.1 validation;
+    // encrypted input must never fall back to password-blind plain decoding.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-dsa2048-sha256.tmpl");
+    let signed = temp.path().join("dsa-traditional-signed.xml");
+    let private_key =
+        project_root().join("tests/fixtures/keys/dsa/dsa-2048-key-traditional-encrypted.pem");
+    let public_key = project_root().join("tests/fixtures/keys/dsa/dsa-2048-public.pem");
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem:TestKeyName-dsa-2048"])
+        .arg(&private_key)
+        .args(["--pwd", "legacy-dsa-password"])
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem:TestKeyName-dsa-2048"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    for password in [None, Some("wrong-legacy-password-sentinel")] {
+        let rejected_output = temp.path().join(format!(
+            "dsa-traditional-rejected-{}.xml",
+            password.unwrap_or("missing")
+        ));
+        let mut rejected = Command::new(binary());
+        rejected
+            .args(["sign", "--privkey-pem:TestKeyName-dsa-2048"])
+            .arg(&private_key);
+        if let Some(password) = password {
+            rejected.args(["--pwd", password]);
+        }
+        let rejected = rejected
+            .arg("--output")
+            .arg(&rejected_output)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(!rejected_output.exists());
+        if let Some(password) = password {
+            assert!(!String::from_utf8_lossy(&rejected.stderr).contains(password));
+        }
+    }
+}
+
+#[test]
 fn compatibility_cli_accepts_generic_sec1_ecdsa_keys() {
     // Generic private-key options accept the traditional ECPrivateKey container,
     // while the explicitly named PKCS#8 options remain container-strict.

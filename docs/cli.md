@@ -180,7 +180,7 @@ closed; the CLI never reads external key metadata implicitly.
 For RSA, DSA, P-256, P-384, and P-521 signing, `--pwd` decrypts
 password-protected PKCS#8 PEM or DER supplied through the matching private-key
 option. The generic `--privkey-pem` option also accepts OpenSSL traditional
-encrypted PKCS#1 RSA and SEC1 P-256/P-384/P-521 PEM. The container label,
+encrypted PKCS#1 RSA, DSA, and SEC1 P-256/P-384/P-521 PEM. The container label,
 headers, or DER structure select encrypted versus plain decoding first: a
 supplied password is ignored for a plain key, while a missing or wrong password
 for an encrypted key fails without a plaintext fallback, before output is
@@ -363,8 +363,8 @@ The command and status surface is available now, while individual key formats,
 algorithms, selectors, and policy controls remain capability-limited. Current
 private-key loading accepts plain and password-encrypted PKCS#8 RSA, DSA, P-256,
 P-384, and P-521 in PEM or DER. The generic PEM or DER options additionally
-accept plain or OpenSSL traditional encrypted PKCS#1 RSA, plain traditional DSA,
-and plain or OpenSSL traditional encrypted SEC1 P-256/P-384/P-521 keys;
+accept plain or OpenSSL traditional encrypted PKCS#1 RSA, traditional DSA, and
+SEC1 P-256/P-384/P-521 keys;
 `--privkey-p8-pem` and `--privkey-p8-der` are accepted as upstream PKCS#8
 aliases. The template signature method selects the key family before decoding,
 while ECDSA keys select their curve from PKCS#8 or SEC1 parameters. Explicit
