@@ -38,15 +38,11 @@ pub(crate) const XML_DOCUMENT_BYTE_CEILING: usize = 16 * 1024 * 1024;
 ///
 /// Sixteen full-size passes cover the ordinary staged sign/encrypt/decrypt
 /// pipelines while bounding adversarial dependency or key-candidate retries.
-/// Fat builds reserve four additional passes so an operation may explicitly
-/// select differential parsing without reducing the document-size envelope.
-/// Runtime accounting charges those passes only for differential operations.
+/// Differential parsing checks each implementation against the same per-backend
+/// allowance, so compiling or selecting a diagnostic backend cannot change the
+/// caller-visible work envelope.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-pub(crate) const XML_PARSE_WORK_PASS_CEILING: usize = 16
-    + 4 * cfg!(all(
-        feature = "xml-backend-xmloxide",
-        feature = "xml-backend-roxmltree"
-    )) as usize;
+pub(crate) const XML_PARSE_WORK_PASS_CEILING: usize = 16;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const XML_PARSE_WORK_BYTE_CEILING: usize =
     XML_PARSE_WORK_PASS_CEILING * XML_DOCUMENT_BYTE_CEILING;

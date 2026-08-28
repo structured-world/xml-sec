@@ -676,6 +676,7 @@ fn decrypt_owned_document_with_context(
                 selected,
                 &context.policy,
                 parse_budget,
+                context.xml_backend,
             )?,
         ))
     })?;

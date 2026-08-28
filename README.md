@@ -85,8 +85,8 @@ let result = VerifyContext::new()
 adapters and selects `Differential` by default. Differential parsing fails closed unless the full
 semantic arenas agree, including topology, expanded names, attributes, namespace axes, character
 data, comments, processing instructions, semantic order, and source ranges. It is an explicit
-diagnostic mode, not a production fallback, and parser-work accounting charges the second native
-parse only when this runtime mode is selected.
+diagnostic mode, not a production fallback. Both implementations are checked against the same
+per-backend parser-work allowance, so differential validation does not halve the operation budget.
 
 Cryptographic implementation and runtime selection follow the same separation through the
 `CryptoProvider` contract: operation contexts receive one provider explicitly. The current package

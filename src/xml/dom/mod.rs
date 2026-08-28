@@ -86,13 +86,6 @@ impl XmlBackend {
             .filter(|backend| backend.is_available())
     }
 
-    pub(crate) const fn semantic_parse_passes(self) -> usize {
-        match self {
-            Self::Differential => 2,
-            Self::Xmloxide | Self::Roxmltree => 1,
-        }
-    }
-
     fn parse<'input>(
         self,
         input: &'input str,

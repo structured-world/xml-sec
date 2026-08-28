@@ -29,7 +29,9 @@ pub use encrypt::{
 };
 pub use parse::{
     parse_encrypted_data, parse_encrypted_data_node_with_policy,
+    parse_encrypted_data_node_with_policy_and_backend,
     parse_encrypted_data_template_node_with_policy,
+    parse_encrypted_data_template_node_with_policy_and_backend,
 };
 pub use types::{
     CipherData, DataEncryptionAlgorithm, DecryptedContent, DocumentEncryptionOptions,

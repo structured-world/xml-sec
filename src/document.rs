@@ -36,7 +36,7 @@ const VALIDATION_WRAPPER_NODE_OVERHEAD: u32 = 3;
 
 #[cfg(test)]
 pub(crate) fn selected_parser_passes() -> usize {
-    2 + XmlBackend::default().semantic_parse_passes()
+    3
 }
 
 /// Process-local provenance of one owned XML document.
@@ -253,11 +253,11 @@ fn charge_parse_work(
 fn charge_semantic_parser_work(
     budget: Option<&XmlParseWorkBudget>,
     bytes: usize,
-    backend: XmlBackend,
 ) -> Result<(), XmlDocumentError> {
-    // The shared lexical sidecar is one pass; each selected parser contributes
-    // one additional pass. Differential work is paid only when selected.
-    for _ in 0..1 + backend.semantic_parse_passes() {
+    // The lexical sidecar and one semantic parser allowance are caller work.
+    // Differential mode checks each implementation against that same allowance
+    // instead of charging its diagnostic duplicate to the caller twice.
+    for _ in 0..2 {
         charge_parse_work(budget, bytes)?;
     }
     Ok(())
@@ -1895,7 +1895,7 @@ fn build_cell_after_preflight(
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<DocumentCell, XmlDocumentError> {
-    charge_semantic_parser_work(budget, xml.len(), settings.backend)?;
+    charge_semantic_parser_work(budget, xml.len())?;
     build_semantic_cell(xml, settings)
 }
 
@@ -1921,7 +1921,7 @@ pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<Document<'a>, XmlDocumentError> {
     preflight_document_limits(xml, settings, budget)?;
-    charge_semantic_parser_work(budget, xml.len(), settings.backend)?;
+    charge_semantic_parser_work(budget, xml.len())?;
     let (document, _) = parse_semantic_document(xml, settings)?;
     Ok(document)
 }
@@ -2769,7 +2769,7 @@ fn document_requires_internal_dtd(
     if !settings.allow_dtd {
         return Ok(false);
     }
-    charge_semantic_parser_work(budget, xml.len(), settings.backend)?;
+    charge_semantic_parser_work(budget, xml.len())?;
     Ok(Document::parse_after_limit_preflight_with_backend(
         xml,
         ParsingOptions {
@@ -3815,8 +3815,8 @@ mod tests {
 
     #[test]
     fn parser_work_accounting_follows_the_runtime_backend() {
-        // Fat builds must not charge two native parsers unless differential
-        // execution was explicitly selected for this parse.
+        // Differential mode validates both implementations against the same
+        // per-backend allowance; its diagnostic duplicate is not caller work.
         let xml = "<root><value/></root>";
         for backend in [
             XmlBackend::Xmloxide,
@@ -3826,7 +3826,7 @@ mod tests {
         .into_iter()
         .filter(|backend| backend.is_available())
         {
-            let expected = xml.len() * (2 + backend.semantic_parse_passes());
+            let expected = xml.len() * 3;
             let budget = XmlParseWorkBudget::with_limit(expected);
             parse_borrowed_with_settings_and_budget(
                 xml,
