@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15](https://github.com/structured-world/xml-sec/compare/v0.1.14...v0.1.15) - 2026-08-28
+
+### Added
+
+- *(cli)* select XML backend at runtime
+- *(xml)* select compiled backends at runtime
+- *(xml)* complete backend semantic parity
+- *(xmldsig)* complete 1.1 interoperability
+
+### Documentation
+
+- *(crypto)* clarify key handling contracts
+
+### Fixed
+
+- *(cli)* decrypt traditional DSA PEM
+- *(cli)* decrypt encrypted SEC1 PEM
+- *(xmldsig)* harden key material handling
+- *(cli)* decrypt traditional RSA PEM
+- *(xml)* preserve backend semantic contracts
+- *(xml)* preserve runtime backend semantics
+- *(cli)* classify HMAC key support
+- *(xml)* close parser and key boundary gaps
+- *(xmldsig)* harden key fallback handling
+- *(cli)* align key material handling
+- *(xmldsig)* honor policy and SHA-224
+- *(cli)* skip unused key info resolution
+- *(xmldsig)* enforce materialization budgets
+- *(xmldsig)* harden key info traversal
+- *(xml)* harden metadata processing
+- *(xmldsig)* complete key source handling
+- *(xml)* preserve folded source ranges
+- *(xmldsig)* secure key metadata handling
+- *(xmldsig)* close interoperability gaps
+- *(xmldsig)* complete reviewed interop paths
+- *(xmldsig)* complete reviewed key paths
+- *(xmldsig)* honor compatibility boundaries
+- *(xmldsig)* bound key reference expansion
+- *(xmldsig)* enforce compatibility contracts
+
+### Refactored
+
+- *(xmldsig)* unify key info traversal
+- *(xml)* add selectable backends
+
 ## [0.1.14](https://github.com/structured-world/xml-sec/compare/v0.1.13...v0.1.14) - 2026-08-27
 
 ### Added
