@@ -355,10 +355,13 @@ The key name is optional. `--gen-key aes-128` writes an unnamed key without a
 The command and status surface is available now, while individual key formats,
 algorithms, selectors, and policy controls remain capability-limited. Current
 private-key loading accepts plain and password-encrypted PKCS#8 RSA, DSA, P-256,
-P-384, and P-521 in PEM or DER, plus PKCS#1 RSA in PEM or DER;
+P-384, and P-521 in PEM or DER, plus PKCS#1 RSA, traditional DSA, and SEC1
+P-256/P-384/P-521 keys through the generic PEM or DER options;
 `--privkey-p8-pem` and `--privkey-p8-der` are accepted as upstream PKCS#8
 aliases. The template signature method selects the key family before decoding,
-while ECDSA keys select their curve from PKCS#8.
+while ECDSA keys select their curve from PKCS#8 or SEC1 parameters. Explicit
+PKCS#8 options reject traditional containers rather than silently broadening
+their documented format contract.
 Public verification accepts SubjectPublicKeyInfo,
 PKCS#1 RSA public keys, and X.509 certificates. Encryption accepts RSA public
 keys or RSA X.509 recipient certificates in PEM or DER. Explicit verification

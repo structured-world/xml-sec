@@ -95,7 +95,10 @@ tempfile = "3"
 default = ["xmldsig", "xmlenc", "c14n", "xml-backend-xmloxide"]
 xml-backend-xmloxide = ["dep:xmloxide"]
 xml-backend-roxmltree = ["dep:roxmltree"]
-xml-backend-differential = ["dep:roxmltree", "dep:xmloxide"]
+xml-backends-all = ["xml-backend-xmloxide", "xml-backend-roxmltree"]
+# Compatibility alias for existing CI/fuzz builds. Unlike `xml-backends-all`,
+# this also selects differential parsing as the default runtime mode.
+xml-backend-differential = ["xml-backends-all"]
 xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:der",
     "dep:crypto-bigint",

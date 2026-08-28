@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::xml::dom::{Document, Node, NodeId, ParseError, ParsingOptions};
+use crate::xml::dom::{Document, Node, NodeId, ParseError, ParsingOptions, XmlBackend};
 use quick_xml::{
     Reader as QuickXmlReader,
     events::{BytesStart as QuickXmlBytesStart, Event as QuickXmlEvent},
@@ -36,7 +36,7 @@ const VALIDATION_WRAPPER_NODE_OVERHEAD: u32 = 3;
 
 #[cfg(test)]
 pub(crate) fn selected_parser_passes() -> usize {
-    3 + usize::from(cfg!(feature = "xml-backend-differential"))
+    2 + XmlBackend::default().semantic_parse_passes()
 }
 
 /// Process-local provenance of one owned XML document.
@@ -117,6 +117,7 @@ impl NamespaceIdentity {
 
 #[derive(Clone, Copy)]
 pub(crate) struct DocumentParseSettings {
+    pub(crate) backend: XmlBackend,
     pub(crate) allow_dtd: bool,
     pub(crate) nodes_limit: u32,
     pub(crate) depth_limit: usize,
@@ -126,6 +127,7 @@ pub(crate) struct DocumentParseSettings {
 impl Default for DocumentParseSettings {
     fn default() -> Self {
         Self {
+            backend: XmlBackend::build_default(),
             allow_dtd: false,
             nodes_limit: crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
             depth_limit: crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
@@ -153,6 +155,7 @@ impl DocumentParseSettings {
         max_bytes: usize,
     ) -> Self {
         Self {
+            backend: XmlBackend::build_default(),
             allow_dtd,
             nodes_limit,
             depth_limit,
@@ -170,6 +173,11 @@ impl DocumentParseSettings {
             resources.max_xml_depth,
             resources.max_xml_document_bytes,
         )
+    }
+
+    pub(crate) const fn with_backend(mut self, backend: XmlBackend) -> Self {
+        self.backend = backend;
+        self
     }
 }
 
@@ -245,11 +253,13 @@ fn charge_parse_work(
 fn charge_semantic_parser_work(
     budget: Option<&XmlParseWorkBudget>,
     bytes: usize,
+    backend: XmlBackend,
 ) -> Result<(), XmlDocumentError> {
-    charge_parse_work(budget, bytes)?;
-    charge_parse_work(budget, bytes)?;
-    #[cfg(feature = "xml-backend-differential")]
-    charge_parse_work(budget, bytes)?;
+    // The shared lexical sidecar is one pass; each selected parser contributes
+    // one additional pass. Differential work is paid only when selected.
+    for _ in 0..1 + backend.semantic_parse_passes() {
+        charge_parse_work(budget, bytes)?;
+    }
     Ok(())
 }
 
@@ -528,10 +538,26 @@ pub struct DocumentView<'a> {
 }
 
 impl XmlDocument {
+    /// Return the parser backend retained for reparsing and mutation.
+    #[must_use]
+    pub fn xml_backend(&self) -> XmlBackend {
+        self.settings.backend
+    }
+
     /// Parse and own an XML document using conservative XML input defaults.
     /// Borrowed input is size-checked before it is copied into owned storage.
     pub fn parse(xml: impl AsRef<str> + Into<String>) -> Result<Self, XmlDocumentError> {
         let settings = DocumentParseSettings::default();
+        let xml = own_bounded_xml(xml, settings.max_bytes)?;
+        Self::parse_with_settings(xml, settings)
+    }
+
+    /// Parse and own XML with an explicitly selected compiled parser backend.
+    pub fn parse_with_backend(
+        xml: impl AsRef<str> + Into<String>,
+        backend: XmlBackend,
+    ) -> Result<Self, XmlDocumentError> {
+        let settings = DocumentParseSettings::default().with_backend(backend);
         let xml = own_bounded_xml(xml, settings.max_bytes)?;
         Self::parse_with_settings(xml, settings)
     }
@@ -550,6 +576,25 @@ impl XmlDocument {
         Self::parse_with_settings_and_optional_budget(
             xml,
             DocumentParseSettings::from_policy(policy.xml_input_policy(), resources),
+            Some(&budget),
+        )
+    }
+
+    /// Parse and own XML under an operation policy and explicit parser backend.
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    pub fn parse_with_policy_and_backend(
+        xml: impl AsRef<str> + Into<String>,
+        policy: &impl XmlDocumentPolicy,
+        backend: XmlBackend,
+    ) -> Result<Self, XmlDocumentError> {
+        let resources = policy.resource_policy();
+        resources.validate()?;
+        let budget = XmlParseWorkBudget::from_resources(resources);
+        let xml = own_bounded_xml(xml, resources.max_xml_document_bytes)?;
+        Self::parse_with_settings_and_optional_budget(
+            xml,
+            DocumentParseSettings::from_policy(policy.xml_input_policy(), resources)
+                .with_backend(backend),
             Some(&budget),
         )
     }
@@ -1850,7 +1895,7 @@ fn build_cell_after_preflight(
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<DocumentCell, XmlDocumentError> {
-    charge_semantic_parser_work(budget, xml.len())?;
+    charge_semantic_parser_work(budget, xml.len(), settings.backend)?;
     build_semantic_cell(xml, settings)
 }
 
@@ -1876,7 +1921,7 @@ pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<Document<'a>, XmlDocumentError> {
     preflight_document_limits(xml, settings, budget)?;
-    charge_semantic_parser_work(budget, xml.len())?;
+    charge_semantic_parser_work(budget, xml.len(), settings.backend)?;
     let (document, _) = parse_semantic_document(xml, settings)?;
     Ok(document)
 }
@@ -2318,6 +2363,7 @@ pub(crate) fn preflight_dom_limits(
             .min(crate::hard_limits::XML_DOCUMENT_NODE_CEILING),
     };
     let settings = DocumentParseSettings {
+        backend: XmlBackend::default(),
         allow_dtd: effective.allow_dtd,
         nodes_limit: effective.nodes_limit,
         depth_limit: crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
@@ -2637,12 +2683,13 @@ fn parse_semantic_document<'a>(
     source: &'a str,
     settings: DocumentParseSettings,
 ) -> Result<(Document<'a>, DocumentMetrics), XmlDocumentError> {
-    let document = Document::parse_after_limit_preflight(
+    let document = Document::parse_after_limit_preflight_with_backend(
         source,
         ParsingOptions {
             allow_dtd: settings.allow_dtd,
             nodes_limit: settings.nodes_limit,
         },
+        settings.backend,
     )
     .map_err(XmlDocumentError::Parse)?;
     let metrics = validate_document_metrics(&document, settings.depth_limit)?;
@@ -2722,13 +2769,14 @@ fn document_requires_internal_dtd(
     if !settings.allow_dtd {
         return Ok(false);
     }
-    charge_semantic_parser_work(budget, xml.len())?;
-    Ok(Document::parse_after_limit_preflight(
+    charge_semantic_parser_work(budget, xml.len(), settings.backend)?;
+    Ok(Document::parse_after_limit_preflight_with_backend(
         xml,
         ParsingOptions {
             allow_dtd: false,
             nodes_limit: settings.nodes_limit,
         },
+        settings.backend,
     )
     .is_err())
 }
@@ -3389,7 +3437,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
+    #[cfg(feature = "xml-backend-xmloxide")]
     #[test]
     fn folded_character_data_replacement_splices_its_complete_source_range() {
         // Adjacent text and CDATA tokens form one semantic text node. Mutation
@@ -3763,6 +3811,31 @@ mod tests {
         assert_eq!(budget.consumed(), maximum);
         assert_eq!(document.as_xml().matches("<item>x</item>").count(), TARGETS);
         assert_eq!(document.generation(), 1);
+    }
+
+    #[test]
+    fn parser_work_accounting_follows_the_runtime_backend() {
+        // Fat builds must not charge two native parsers unless differential
+        // execution was explicitly selected for this parse.
+        let xml = "<root><value/></root>";
+        for backend in [
+            XmlBackend::Xmloxide,
+            XmlBackend::Roxmltree,
+            XmlBackend::Differential,
+        ]
+        .into_iter()
+        .filter(|backend| backend.is_available())
+        {
+            let expected = xml.len() * (2 + backend.semantic_parse_passes());
+            let budget = XmlParseWorkBudget::with_limit(expected);
+            parse_borrowed_with_settings_and_budget(
+                xml,
+                DocumentParseSettings::default().with_backend(backend),
+                Some(&budget),
+            )
+            .expect("the exact runtime parser-work allowance must fit");
+            assert_eq!(budget.consumed(), expected, "{backend:?}");
+        }
     }
 
     #[test]

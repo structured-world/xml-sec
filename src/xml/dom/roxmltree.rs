@@ -1,13 +1,13 @@
 //! `roxmltree` parser adapter for the shared semantic arena.
 
 use super::{
-    Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackend,
+    Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackendImplementation,
     tree::{AttributeData, NamespaceData, NodeId, NodeKind, TreeBuilder, range_contains},
 };
 
 pub(super) struct RoxmltreeBackend;
 
-impl XmlBackend for RoxmltreeBackend {
+impl XmlBackendImplementation for RoxmltreeBackend {
     fn parse<'input>(
         input: &'input str,
         options: ParsingOptions,

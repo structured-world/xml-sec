@@ -23,10 +23,7 @@ struct SourceNode {
 
 pub(super) struct LexicalPreflight {
     nodes: Vec<SourceNode>,
-    #[cfg(any(
-        feature = "xml-backend-roxmltree",
-        feature = "xml-backend-differential"
-    ))]
+    #[cfg(feature = "xml-backend-roxmltree")]
     doctype: Option<Range<usize>>,
 }
 
@@ -35,10 +32,7 @@ impl LexicalPreflight {
         let mut reader = Reader::from_str(input);
         let mut nodes: Vec<SourceNode> = Vec::new();
         let mut elements = Vec::new();
-        #[cfg(any(
-            feature = "xml-backend-roxmltree",
-            feature = "xml-backend-differential"
-        ))]
+        #[cfg(feature = "xml-backend-roxmltree")]
         let mut doctype = None;
         loop {
             let start = source_offset(reader.buffer_position())?;
@@ -98,10 +92,7 @@ impl LexicalPreflight {
                     range: start..end,
                 }),
                 Event::DocType(_) if !allow_dtd => return Err(ParseError::DtdDetected),
-                #[cfg(any(
-                    feature = "xml-backend-roxmltree",
-                    feature = "xml-backend-differential"
-                ))]
+                #[cfg(feature = "xml-backend-roxmltree")]
                 Event::DocType(_) => doctype = Some(start..end),
                 Event::Eof => break,
                 _ => {}
@@ -114,34 +105,22 @@ impl LexicalPreflight {
         }
         Ok(Self {
             nodes,
-            #[cfg(any(
-                feature = "xml-backend-roxmltree",
-                feature = "xml-backend-differential"
-            ))]
+            #[cfg(feature = "xml-backend-roxmltree")]
             doctype,
         })
     }
 
-    #[cfg(any(
-        feature = "xml-backend-roxmltree",
-        feature = "xml-backend-differential"
-    ))]
+    #[cfg(feature = "xml-backend-roxmltree")]
     pub(super) fn doctype_range(&self) -> Option<&Range<usize>> {
         self.doctype.as_ref()
     }
 
-    #[cfg(any(
-        feature = "xml-backend-roxmltree",
-        feature = "xml-backend-differential"
-    ))]
+    #[cfg(feature = "xml-backend-roxmltree")]
     pub(super) fn node_count(&self) -> usize {
         self.nodes.len()
     }
 
-    #[cfg(any(
-        feature = "xml-backend-roxmltree",
-        feature = "xml-backend-differential"
-    ))]
+    #[cfg(feature = "xml-backend-roxmltree")]
     pub(super) fn folded_character_data_range(&self, start: usize) -> Option<(Range<usize>, bool)> {
         let first = self.nodes.partition_point(|node| node.range.start < start);
         let node = self.nodes.get(first)?;
@@ -161,7 +140,7 @@ impl LexicalPreflight {
         Some((range, actionable))
     }
 
-    #[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
+    #[cfg(feature = "xml-backend-xmloxide")]
     pub(super) fn positions(&self) -> PositionCursor<'_> {
         PositionCursor {
             positions: &self.nodes,
@@ -170,10 +149,7 @@ impl LexicalPreflight {
     }
 }
 
-#[cfg(any(
-    feature = "xml-backend-roxmltree",
-    feature = "xml-backend-differential"
-))]
+#[cfg(feature = "xml-backend-roxmltree")]
 impl SourceKind {
     fn is_character_data(self) -> bool {
         matches!(self, Self::Text | Self::CData | Self::EntityRef)
@@ -214,13 +190,13 @@ fn source_offset(offset: u64) -> Result<usize, ParseError> {
     })
 }
 
-#[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
+#[cfg(feature = "xml-backend-xmloxide")]
 pub(super) struct PositionCursor<'a> {
     positions: &'a [SourceNode],
     next: usize,
 }
 
-#[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
+#[cfg(feature = "xml-backend-xmloxide")]
 impl PositionCursor<'_> {
     pub(super) fn take(&mut self, expected: SourceKind) -> Result<Range<usize>, ParseError> {
         let Some(node) = self.positions.get(self.next) else {
@@ -250,7 +226,7 @@ impl PositionCursor<'_> {
     }
 }
 
-#[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
+#[cfg(feature = "xml-backend-xmloxide")]
 fn source_map_mismatch(message: String) -> ParseError {
     ParseError::Backend {
         backend: "xmloxide-source-map",

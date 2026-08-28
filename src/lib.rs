@@ -30,24 +30,10 @@
 #![deny(clippy::unwrap_used)]
 #![warn(missing_docs)]
 
-#[cfg(not(any(
-    feature = "xml-backend-xmloxide",
-    feature = "xml-backend-roxmltree",
-    feature = "xml-backend-differential"
-)))]
+#[cfg(not(any(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree")))]
 compile_error!(
-    "select one XML backend mode: `xml-backend-xmloxide`, `xml-backend-roxmltree`, or `xml-backend-differential`"
+    "compile at least one XML backend: `xml-backend-xmloxide` or `xml-backend-roxmltree`"
 );
-
-#[cfg(any(
-    all(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree"),
-    all(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"),
-    all(
-        feature = "xml-backend-roxmltree",
-        feature = "xml-backend-differential"
-    )
-))]
-compile_error!("XML backend modes are mutually exclusive; select exactly one mode");
 
 pub mod c14n;
 pub mod document;
@@ -65,7 +51,7 @@ pub use xml::dom::{
     Ancestors, Attribute, Attributes, Children, Descendants, Document, Document as XmlDomDocument,
     ExpandedName, Namespace, Namespaces, Node, Node as XmlDomNode, NodeId, NodeId as XmlDomNodeId,
     NodeType, PI, ParseError, ParseError as XmlDomParseError, ParsingOptions,
-    ParsingOptions as XmlDomParsingOptions,
+    ParsingOptions as XmlDomParsingOptions, XmlBackend,
 };
 
 #[cfg(feature = "xmldsig")]

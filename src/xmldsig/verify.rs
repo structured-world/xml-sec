@@ -280,6 +280,7 @@ pub struct VerifyContext<'a> {
     key_resolver: Option<&'a dyn KeyResolver>,
     policy: crate::policy::VerificationPolicy,
     provider: &'a dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
     store_pre_digest: bool,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
     signature_selection: SignatureSelection<'a>,
@@ -301,6 +302,7 @@ impl<'a> VerifyContext<'a> {
             key_resolver: None,
             policy: crate::policy::VerificationPolicy::default(),
             provider: crate::provider::default_provider(),
+            xml_backend: crate::XmlBackend::default(),
             store_pre_digest: false,
             external_resources: None,
             signature_selection: SignatureSelection::UniqueDocumentSignature,
@@ -334,6 +336,12 @@ impl<'a> VerifyContext<'a> {
     /// Select the cryptographic provider for this verification operation.
     pub fn provider(mut self, provider: &'a dyn crate::provider::CryptoProvider) -> Self {
         self.provider = provider;
+        self
+    }
+
+    /// Select the compiled XML parser backend for this verification operation.
+    pub fn xml_backend(mut self, backend: crate::XmlBackend) -> Self {
+        self.xml_backend = backend;
         self
     }
 
@@ -1135,8 +1143,10 @@ fn verify_signature_with_context(
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
     ctx.policy.validate()?;
     ctx.policy.resources.validate_xml_document_len(xml.len())?;
-    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
-    let settings = DocumentParseSettings::from_policy(&ctx.policy.xml, &ctx.policy.resources);
+    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources)
+        .with_xml_backend(ctx.xml_backend);
+    let settings = DocumentParseSettings::from_policy(&ctx.policy.xml, &ctx.policy.resources)
+        .with_backend(ctx.xml_backend);
     let document = XmlDocument::parse_with_settings_and_budget(
         xml.to_owned(),
         settings,
@@ -1186,7 +1196,8 @@ fn verify_signature_document_with_context(
     document: &XmlDocument,
     ctx: &VerifyContext<'_>,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
-    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
+    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources)
+        .with_xml_backend(ctx.xml_backend);
     verify_signature_document_with_context_and_budget(document, ctx, &execution_budget)
 }
 
@@ -1355,6 +1366,7 @@ fn verify_signature_view<'a>(
             xpath_parse: &mut xpath_parse_budget,
             execution: execution_budget,
             resources: &ctx.policy.resources,
+            xml_backend: ctx.xml_backend,
         };
         let mut materialization = KeyInfoMaterializationState::default();
         let mut outcome = materialize_key_info_references_with_budgets(
@@ -1598,6 +1610,7 @@ struct RetrievalMaterializationBudgets<'a> {
     xpath_parse: &'a mut XPathSignatureParseBudget,
     execution: &'a TransformExecutionBudget,
     resources: &'a crate::policy::ResourcePolicy,
+    xml_backend: crate::XmlBackend,
 }
 
 #[derive(Default)]
@@ -1784,7 +1797,8 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                 let settings = DocumentParseSettings::from_policy(
                     context.policy.xml(),
                     context.policy.resources(),
-                );
+                )
+                .with_backend(context.budgets.xml_backend);
                 let document = XmlDocument::parse_with_settings_and_budget(
                     xml.into_owned(),
                     settings,
@@ -1888,6 +1902,7 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
         xpath_parse: &mut xpath_parse_budget,
         execution: &execution_budget,
         resources: policy.resources(),
+        xml_backend: crate::XmlBackend::default(),
     };
     let mut materialization = KeyInfoMaterializationState::default();
     let outcome = materialize_key_info_references_with_budgets(
@@ -2191,6 +2206,7 @@ fn materialize_retrieval_methods(
         xpath_parse: &mut xpath_parse_budget,
         execution: &execution_budget,
         resources: &resources,
+        xml_backend: crate::XmlBackend::default(),
     };
     let mut candidate_work = key_info.embedded_candidate_count();
     materialize_retrieval_methods_with_budgets(
@@ -5473,6 +5489,7 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
 
@@ -5518,6 +5535,7 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
 
@@ -5571,6 +5589,7 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
 
@@ -5747,6 +5766,7 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
 
@@ -5785,6 +5805,7 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &policy.resources,
+            xml_backend: crate::XmlBackend::default(),
         };
         let mut materialization = KeyInfoMaterializationState::default();
 
@@ -5933,6 +5954,7 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &resource_policy,
+            xml_backend: crate::XmlBackend::default(),
         };
         let mut candidate_work = key_info.embedded_candidate_count();
 

@@ -50,10 +50,12 @@ smaller dependency graph can select only the required library capabilities:
 xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c14n", "xml-backend-xmloxide"] }
 ```
 
-Select `xml-backend-roxmltree` instead to use `roxmltree` as the parser. The backend features are
-mutually exclusive and selection is compile-time only: document content and runtime policy cannot
-switch it. Both adapters populate the same source-preserving semantic arena, and no C14N, XPath,
-signature, encryption, or mutation code branches on parser type. A bounded streaming preflight
+Select `xml-backend-roxmltree` instead for a thin build containing only `roxmltree`, or compile
+`xml-backends-all` when the application must select `Xmloxide`, `Roxmltree`, or fail-closed
+`Differential` parsing at runtime. Compiled implementations and runtime selection are separate:
+selecting an implementation absent from a thin build returns a typed error and never falls back.
+Both adapters populate the same source-preserving semantic arena, and no C14N, XPath, signature,
+encryption, or mutation code branches on parser type. A bounded streaming preflight
 rejects byte, node, and depth limits before either backend allocates its DOM; stack-safe
 internal-entity traversal consumes the same cumulative parse-work budget. The `xmloxide` adapter
 adds a lexical position sidecar because its native tree does not retain the source ranges required
@@ -63,11 +65,34 @@ for namespace-correct mutation.
 xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c14n", "xml-backend-roxmltree"] }
 ```
 
-CI and fuzzing use the separate `xml-backend-differential` mode. It parses each bounded input with
-both adapters and fails closed unless their complete semantic arenas agree, including topology,
-expanded names, attributes, namespace axes, character data, comments, processing instructions,
-semantic order, and source ranges. This intentionally pays for both DOM parses and is not a
-production fallback; production builds select exactly one parser backend.
+```toml
+# Fat build: xmloxide remains the default; applications select per operation.
+xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "xmlenc", "c14n", "xml-backends-all"] }
+```
+
+```rust
+use xml_sec::XmlBackend;
+use xml_sec::xmldsig::VerifyContext;
+
+# let xml = "<root/>";
+let result = VerifyContext::new()
+    .xml_backend(XmlBackend::Roxmltree)
+    .verify(xml);
+# let _ = result;
+```
+
+`xml-backend-differential` remains a compatibility feature for CI and fuzzing: it compiles both
+adapters and selects `Differential` by default. Differential parsing fails closed unless the full
+semantic arenas agree, including topology, expanded names, attributes, namespace axes, character
+data, comments, processing instructions, semantic order, and source ranges. It is an explicit
+diagnostic mode, not a production fallback, and parser-work accounting charges the second native
+parse only when this runtime mode is selected.
+
+Cryptographic implementation and runtime selection follow the same separation through the
+`CryptoProvider` contract: operation contexts receive one provider explicitly. The current package
+ships the RustCrypto provider; a future AWS-LC feature can add another compiled implementation
+without changing signing, verification, encryption, or decryption policy semantics. Crypto has no
+differential mode: a fat crypto build selects exactly one provider for each operation.
 
 Install the `xmlsec1` command from the same package:
 

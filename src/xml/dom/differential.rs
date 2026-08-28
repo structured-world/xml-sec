@@ -1,13 +1,13 @@
 //! Fail-closed semantic comparison of both XML parser adapters.
 
 use super::{
-    Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackend,
+    Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackendImplementation,
     roxmltree::RoxmltreeBackend, xmloxide::XmloxideBackend,
 };
 
 pub(super) struct DifferentialBackend;
 
-impl XmlBackend for DifferentialBackend {
+impl XmlBackendImplementation for DifferentialBackend {
     fn parse<'input>(
         input: &'input str,
         options: ParsingOptions,
@@ -72,6 +72,7 @@ fn acceptance_summary(
         }
         Err(ParseError::SourcePositionLimitReached { .. }) => "rejected by source-position limit",
         Err(ParseError::DepthLimitReached { .. }) => "rejected by depth limit",
+        Err(ParseError::BackendUnavailable { .. }) => "rejected as unavailable",
         Err(ParseError::Backend { .. }) => "rejected as malformed",
         Err(ParseError::BackendDivergence { .. }) => "reported nested divergence",
     };

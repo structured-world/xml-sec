@@ -1,13 +1,13 @@
 //! Parser-independent retained XML tree consumed by XML Security algorithms.
 
-#[cfg(feature = "xml-backend-differential")]
+#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 use std::collections::HashMap;
 use std::{
     hash::{Hash, Hasher},
     ops::Range,
 };
 
-use super::{ParseError, ParsingOptions, SelectedBackend, XmlBackend};
+use super::{ParseError, ParsingOptions, XmlBackend};
 
 /// Stable arena index for a node in one parsed document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -102,7 +102,7 @@ impl<'input> TreeBuilder<'input> {
         }
     }
 
-    #[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
+    #[cfg(feature = "xml-backend-xmloxide")]
     pub(super) fn push(
         &mut self,
         parent: Option<NodeId>,
@@ -141,7 +141,7 @@ impl<'input> TreeBuilder<'input> {
             u32::try_from(self.nodes.len()).expect("bounded XML node count must fit into u32");
     }
 
-    #[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
+    #[cfg(feature = "xml-backend-xmloxide")]
     pub(super) fn append_text(
         &mut self,
         parent: NodeId,
@@ -170,12 +170,12 @@ impl<'input> TreeBuilder<'input> {
         );
     }
 
-    #[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
+    #[cfg(feature = "xml-backend-xmloxide")]
     pub(super) fn len(&self) -> usize {
         self.nodes.len()
     }
 
-    #[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
+    #[cfg(feature = "xml-backend-xmloxide")]
     pub(super) fn namespaces(&self, node: NodeId) -> Option<&[NamespaceData]> {
         match &self.nodes[node.index()].kind {
             NodeKind::Element { namespaces, .. } => Some(namespaces),
@@ -190,10 +190,7 @@ impl<'input> TreeBuilder<'input> {
         }
     }
 
-    #[cfg(any(
-        feature = "xml-backend-roxmltree",
-        feature = "xml-backend-differential"
-    ))]
+    #[cfg(feature = "xml-backend-roxmltree")]
     pub(super) fn input(&self) -> &'input str {
         self.input
     }
@@ -215,21 +212,36 @@ impl<'input> Document<'input> {
         Self::parse_with_options(input, ParsingOptions::default())
     }
 
-    /// Parses XML with the compile-time selected backend.
+    /// Parses XML with the build's default backend.
     pub fn parse_with_options(
         input: &'input str,
         options: ParsingOptions,
     ) -> Result<Self, ParseError> {
-        let options = crate::document::preflight_dom_limits(input, options)?;
-        Self::parse_after_limit_preflight(input, options)
+        Self::parse_with_options_and_backend(input, options, XmlBackend::default())
     }
 
-    pub(crate) fn parse_after_limit_preflight(
+    /// Parses XML with an explicitly selected compiled backend.
+    pub fn parse_with_backend(input: &'input str, backend: XmlBackend) -> Result<Self, ParseError> {
+        Self::parse_with_options_and_backend(input, ParsingOptions::default(), backend)
+    }
+
+    /// Parses XML with explicit parser options and backend selection.
+    pub fn parse_with_options_and_backend(
         input: &'input str,
         options: ParsingOptions,
+        backend: XmlBackend,
+    ) -> Result<Self, ParseError> {
+        let options = crate::document::preflight_dom_limits(input, options)?;
+        Self::parse_after_limit_preflight_with_backend(input, options, backend)
+    }
+
+    pub(crate) fn parse_after_limit_preflight_with_backend(
+        input: &'input str,
+        options: ParsingOptions,
+        backend: XmlBackend,
     ) -> Result<Self, ParseError> {
         let preflight = super::LexicalPreflight::scan(input, options.allow_dtd)?;
-        SelectedBackend::parse(input, options, &preflight)
+        backend.parse(input, options, &preflight)
     }
 
     /// Returns the original UTF-8 source.
@@ -263,7 +275,7 @@ impl<'input> Document<'input> {
             .map(|_| Node { document: self, id })
     }
 
-    #[cfg(feature = "xml-backend-differential")]
+    #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
     pub(super) fn ensure_semantically_equivalent(
         &self,
         other: &Self,
@@ -313,7 +325,7 @@ impl<'input> Document<'input> {
     }
 }
 
-#[cfg(feature = "xml-backend-differential")]
+#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 fn node_kind_label(kind: &NodeKind) -> &'static str {
     match kind {
         NodeKind::Root => "root",
@@ -324,7 +336,7 @@ fn node_kind_label(kind: &NodeKind) -> &'static str {
     }
 }
 
-#[cfg(feature = "xml-backend-differential")]
+#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 fn nodes_semantically_equivalent(
     left: &NodeData,
     right: &NodeData,
@@ -338,7 +350,7 @@ fn nodes_semantically_equivalent(
         && left.subtree_end == right.subtree_end
 }
 
-#[cfg(feature = "xml-backend-differential")]
+#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 fn node_difference(left: &NodeData, right: &NodeData, doctype: Option<&Range<usize>>) -> String {
     if left.parent != right.parent {
         "parent identity".to_owned()
@@ -358,14 +370,14 @@ fn node_difference(left: &NodeData, right: &NodeData, doctype: Option<&Range<usi
     }
 }
 
-#[cfg(feature = "xml-backend-differential")]
+#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 fn range_actionability_equivalent(left: &NodeData, right: &NodeData) -> bool {
     // Mutation accepts any semantic node with a unique source span, so backend
     // disagreement about actionability is always security-relevant.
     left.range_actionable == right.range_actionable
 }
 
-#[cfg(feature = "xml-backend-differential")]
+#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 fn source_ranges_equivalent(
     left: &Range<usize>,
     right: &Range<usize>,
@@ -383,15 +395,12 @@ fn source_ranges_equivalent(
     range_contains(doctype, left) != range_contains(doctype, right)
 }
 
-#[cfg(any(
-    feature = "xml-backend-roxmltree",
-    feature = "xml-backend-differential"
-))]
+#[cfg(feature = "xml-backend-roxmltree")]
 pub(super) fn range_contains(container: &Range<usize>, candidate: &Range<usize>) -> bool {
     candidate.start >= container.start && candidate.end <= container.end
 }
 
-#[cfg(feature = "xml-backend-differential")]
+#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 fn node_kinds_semantically_equivalent(left: &NodeKind, right: &NodeKind) -> bool {
     match (left, right) {
         (
@@ -420,7 +429,7 @@ fn node_kinds_semantically_equivalent(left: &NodeKind, right: &NodeKind) -> bool
     }
 }
 
-#[cfg(feature = "xml-backend-differential")]
+#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 fn namespace_axes_equivalent(left: &[NamespaceData], right: &[NamespaceData]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -440,7 +449,7 @@ fn namespace_axes_equivalent(left: &[NamespaceData], right: &[NamespaceData]) ->
     })
 }
 
-#[cfg(feature = "xml-backend-differential")]
+#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 fn node_kind_difference(left: &NodeKind, right: &NodeKind) -> &'static str {
     match (left, right) {
         (
@@ -917,11 +926,74 @@ impl<'a, 'input> Iterator for Ancestors<'a, 'input> {
 #[cfg(test)]
 mod tests {
     use super::Document;
-    #[cfg(feature = "xml-backend-differential")]
+    #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
     use super::{NamespaceData, namespace_axes_equivalent};
-    use crate::xml::dom::{ParseError, ParsingOptions};
+    use crate::xml::dom::{ParseError, ParsingOptions, XmlBackend};
+
+    #[test]
+    fn runtime_selection_never_falls_back_to_a_compiled_backend() {
+        // A stable selector can be supplied by application configuration even
+        // in a thin build. Missing implementations must fail explicitly.
+        for backend in [
+            XmlBackend::Xmloxide,
+            XmlBackend::Roxmltree,
+            XmlBackend::Differential,
+        ] {
+            let result = Document::parse_with_backend("<r/>", backend);
+            if backend.is_available() {
+                assert!(result.is_ok(), "{backend:?} should be available");
+            } else {
+                assert_eq!(
+                    result.expect_err("an unavailable backend must not fall back"),
+                    ParseError::BackendUnavailable { backend }
+                );
+            }
+        }
+    }
 
     #[cfg(feature = "xml-backend-differential")]
+    #[test]
+    fn compatibility_feature_selects_differential_by_default() {
+        assert_eq!(XmlBackend::default(), XmlBackend::Differential);
+    }
+
+    #[cfg(all(
+        feature = "xml-backend-xmloxide",
+        feature = "xml-backend-roxmltree",
+        not(feature = "xml-backend-differential")
+    ))]
+    #[test]
+    fn fat_build_defaults_to_xmloxide_without_implicit_double_parsing() {
+        assert_eq!(XmlBackend::default(), XmlBackend::Xmloxide);
+    }
+
+    #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
+    #[test]
+    fn fat_build_selects_each_semantically_equivalent_runtime_mode() {
+        // Runtime selection changes only arena construction; downstream XML
+        // Security semantics and stable source ranges remain identical.
+        let xml = r#"<r xmlns:p="urn:p"><p:a x="1">value</p:a></r>"#;
+        let snapshot = |backend| {
+            let document = Document::parse_with_backend(xml, backend)
+                .expect("every compiled runtime mode must parse the fixture");
+            document
+                .descendants()
+                .map(|node| {
+                    (
+                        node.node_type(),
+                        node.range(),
+                        node.text().map(str::to_owned),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let xmloxide = snapshot(XmlBackend::Xmloxide);
+        assert_eq!(snapshot(XmlBackend::Roxmltree), xmloxide);
+        assert_eq!(snapshot(XmlBackend::Differential), xmloxide);
+    }
+
+    #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
     #[test]
     fn differential_namespace_axis_comparison_preserves_multiplicity() {
         // The fail-closed gate must reject unequal axes even if a malformed
@@ -1190,7 +1262,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "xml-backend-differential")]
+    #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
     #[test]
     fn differential_comparison_fails_closed_on_semantic_divergence() {
         // Differential mode must reject adapter disagreement rather than
@@ -1262,10 +1334,7 @@ mod tests {
         assert_eq!(processing_instructions[0].target, "probe");
     }
 
-    #[cfg(any(
-        feature = "xml-backend-roxmltree",
-        feature = "xml-backend-differential"
-    ))]
+    #[cfg(feature = "xml-backend-roxmltree")]
     #[test]
     fn dtd_range_scanning_accepts_unicode_names() {
         // Scanner offsets are bytes; a multibyte XML name must not become an

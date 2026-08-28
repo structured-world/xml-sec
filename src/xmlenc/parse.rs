@@ -53,10 +53,21 @@ pub(super) fn parse_encrypted_data_with_policy(
     xml: &str,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
+    parse_encrypted_data_with_policy_and_backend(xml, policy, crate::XmlBackend::default())
+}
+
+pub(super) fn parse_encrypted_data_with_policy_and_backend(
+    xml: &str,
+    policy: &crate::policy::DecryptionPolicy,
+    backend: crate::XmlBackend,
+) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
     policy.resources.validate_xml_document_len(xml.len())?;
     let parse_budget = XmlParseWorkBudget::from_resources(&policy.resources);
-    let document = parse_policy_document(xml, policy.into(), &parse_budget)?;
+    let settings =
+        DocumentParseSettings::from_policy(&policy.xml, &policy.resources).with_backend(backend);
+    let document = parse_borrowed_with_settings_and_budget(xml, settings, Some(&parse_budget))
+        .map_err(|error| map_document_error(error, settings))?;
     parse_encrypted_data_node(document.root_element(), policy.into(), false)
 }
 

@@ -1045,6 +1045,22 @@ pub struct EcdsaP256SigningKey {
 }
 
 impl EcdsaP256SigningKey {
+    /// Parse an unencrypted SEC1 `EC PRIVATE KEY` PEM block.
+    pub fn from_sec1_pem(private_key_pem: &str) -> Result<Self, SigningKeyError> {
+        let key = p256::SecretKey::from_sec1_pem(private_key_pem)
+            .map(P256SigningKey::from)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+
+    /// Parse unencrypted SEC1 `ECPrivateKey` DER.
+    pub fn from_sec1_der(private_key_der: &[u8]) -> Result<Self, SigningKeyError> {
+        let key = p256::SecretKey::from_sec1_der(private_key_der)
+            .map(P256SigningKey::from)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+
     /// Parse an unencrypted PKCS#8 `PRIVATE KEY` PEM block.
     pub fn from_pkcs8_pem(private_key_pem: &str) -> Result<Self, SigningKeyError> {
         let private_key_der = parse_private_key_pem(private_key_pem)?;
@@ -1139,6 +1155,22 @@ pub struct EcdsaP384SigningKey {
 }
 
 impl EcdsaP384SigningKey {
+    /// Parse an unencrypted SEC1 `EC PRIVATE KEY` PEM block.
+    pub fn from_sec1_pem(private_key_pem: &str) -> Result<Self, SigningKeyError> {
+        let key = p384::SecretKey::from_sec1_pem(private_key_pem)
+            .map(P384SigningKey::from)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+
+    /// Parse unencrypted SEC1 `ECPrivateKey` DER.
+    pub fn from_sec1_der(private_key_der: &[u8]) -> Result<Self, SigningKeyError> {
+        let key = p384::SecretKey::from_sec1_der(private_key_der)
+            .map(P384SigningKey::from)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+
     /// Parse an unencrypted PKCS#8 `PRIVATE KEY` PEM block.
     pub fn from_pkcs8_pem(private_key_pem: &str) -> Result<Self, SigningKeyError> {
         let private_key_der = parse_private_key_pem(private_key_pem)?;
@@ -1233,6 +1265,22 @@ pub struct EcdsaP521SigningKey {
 }
 
 impl EcdsaP521SigningKey {
+    /// Parse an unencrypted SEC1 `EC PRIVATE KEY` PEM block.
+    pub fn from_sec1_pem(private_key_pem: &str) -> Result<Self, SigningKeyError> {
+        let key = p521::SecretKey::from_sec1_pem(private_key_pem)
+            .map(P521SigningKey::from)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+
+    /// Parse unencrypted SEC1 `ECPrivateKey` DER.
+    pub fn from_sec1_der(private_key_der: &[u8]) -> Result<Self, SigningKeyError> {
+        let key = p521::SecretKey::from_sec1_der(private_key_der)
+            .map(P521SigningKey::from)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+
     /// Parse an unencrypted PKCS#8 `PRIVATE KEY` PEM block.
     pub fn from_pkcs8_pem(private_key_pem: &str) -> Result<Self, SigningKeyError> {
         let private_key_der = parse_private_key_pem(private_key_pem)?;
@@ -1349,6 +1397,7 @@ pub struct SignContext<'a> {
     template_selection: SignatureTemplateSelection,
     policy: crate::policy::SigningPolicy,
     provider: &'a dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
 }
 
 impl<'a> SignContext<'a> {
@@ -1362,6 +1411,7 @@ impl<'a> SignContext<'a> {
             template_selection: SignatureTemplateSelection::default(),
             policy: crate::policy::SigningPolicy::default(),
             provider: crate::provider::default_provider(),
+            xml_backend: crate::XmlBackend::default(),
         }
     }
 
@@ -1377,6 +1427,18 @@ impl<'a> SignContext<'a> {
     pub fn provider(mut self, provider: &'a dyn crate::provider::CryptoProvider) -> Self {
         self.provider = provider;
         self
+    }
+
+    /// Select the compiled XML parser backend for this signing operation.
+    #[must_use]
+    pub fn xml_backend(mut self, backend: crate::XmlBackend) -> Self {
+        self.xml_backend = backend;
+        self
+    }
+
+    fn document_parse_settings(&self) -> DocumentParseSettings {
+        DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources)
+            .with_backend(self.xml_backend)
     }
 
     /// Configure signing to populate the direct `<Signature>/<KeyInfo>` placeholder.
@@ -1436,10 +1498,13 @@ impl<'a> SignContext<'a> {
     pub fn sign_template(&self, xml: &str) -> Result<String, SigningError> {
         self.policy.validate()?;
         self.policy.resources.validate_xml_document_len(xml.len())?;
-        let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
+        let mut budgets = SigningOperationBudgets::from_resources_with_backend(
+            &self.policy.resources,
+            self.xml_backend,
+        );
         let mut document = XmlDocument::parse_with_settings_and_budget(
             xml.to_owned(),
-            DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
+            self.document_parse_settings(),
             budgets.transforms.xml_parse_work(),
         )
         .map_err(|error| match owned_document_policy_violation(error) {
@@ -1460,10 +1525,13 @@ impl<'a> SignContext<'a> {
     /// unchanged. Success commits the complete signature as one generation.
     pub fn sign_document(&self, document: &mut XmlDocument) -> Result<(), SigningError> {
         self.validate_owned_document_input(document)?;
-        let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
+        let mut budgets = SigningOperationBudgets::from_resources_with_backend(
+            &self.policy.resources,
+            self.xml_backend,
+        );
         let mut staged = document
             .staged_copy_with_budget(
-                DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
+                self.document_parse_settings(),
                 budgets.transforms.xml_parse_work(),
             )
             .map_err(map_owned_document_mutation_error)?;
@@ -1543,7 +1611,7 @@ impl<'a> SignContext<'a> {
             document
                 .replace_serialized_with_settings(
                     populated,
-                    DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
+                    self.document_parse_settings(),
                     Some(budgets.transforms.xml_parse_work()),
                 )
                 .map_err(map_owned_document_mutation_error)?;
@@ -1612,7 +1680,7 @@ impl<'a> SignContext<'a> {
         document
             .replace_base64_contents_with_budget(
                 &[(signature_value_node, signature_b64)],
-                DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
+                self.document_parse_settings(),
                 budgets.transforms.xml_parse_work(),
             )
             .map_err(map_owned_document_mutation_error)?;
@@ -1631,10 +1699,13 @@ impl<'a> SignContext<'a> {
     ) -> Result<String, SigningError> {
         self.policy.validate()?;
         self.policy.resources.validate_xml_document_len(xml.len())?;
-        let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
+        let mut budgets = SigningOperationBudgets::from_resources_with_backend(
+            &self.policy.resources,
+            self.xml_backend,
+        );
         let mut document = XmlDocument::parse_with_settings_and_budget(
             xml.to_owned(),
-            DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
+            self.document_parse_settings(),
             budgets.transforms.xml_parse_work(),
         )
         .map_err(|error| match owned_document_policy_violation(error) {
@@ -1656,10 +1727,13 @@ impl<'a> SignContext<'a> {
         builder: &SignatureBuilder,
     ) -> Result<(), SigningError> {
         self.validate_owned_document_input(document)?;
-        let mut budgets = SigningOperationBudgets::from_resources(&self.policy.resources);
+        let mut budgets = SigningOperationBudgets::from_resources_with_backend(
+            &self.policy.resources,
+            self.xml_backend,
+        );
         let mut staged = document
             .staged_copy_with_budget(
-                DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
+                self.document_parse_settings(),
                 budgets.transforms.xml_parse_work(),
             )
             .map_err(map_owned_document_mutation_error)?;
@@ -1705,7 +1779,7 @@ impl<'a> SignContext<'a> {
             .append_generated_child_with_budget(
                 signature_parent,
                 &template,
-                DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources),
+                self.document_parse_settings(),
                 budgets.transforms.xml_parse_work(),
             )
             .map_err(map_owned_document_mutation_error)?;
@@ -1840,6 +1914,17 @@ impl SigningOperationBudgets {
             xpath_parse: XPathSignatureParseBudget::from_resources(resources),
         }
     }
+
+    fn from_resources_with_backend(
+        resources: &crate::policy::ResourcePolicy,
+        backend: crate::XmlBackend,
+    ) -> Self {
+        Self {
+            transforms: TransformExecutionBudget::from_resources(resources)
+                .with_xml_backend(backend),
+            xpath_parse: XPathSignatureParseBudget::from_resources(resources),
+        }
+    }
 }
 
 impl Default for SigningOperationBudgets {
@@ -1878,7 +1963,12 @@ fn compute_reference_digest_values_with_options(
     target_signature: Option<usize>,
     id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
-    let doc = parse_signing_document(xml, policy, execution_budget.xml_parse_work())?;
+    let doc = parse_signing_document(
+        xml,
+        policy,
+        execution_budget.xml_parse_work(),
+        crate::XmlBackend::default(),
+    )?;
     let signature = find_signing_signature_node(
         &doc,
         target_signature.map_or(SigningSignatureTarget::Last, SigningSignatureTarget::Index),
@@ -1981,6 +2071,7 @@ fn fill_reference_digest_values_in_dependency_order(
         &analysis_xml,
         Some(policy),
         budgets.transforms.xml_parse_work(),
+        document.xml_backend(),
     )?;
     let analysis_signature = find_signing_signature_node(
         &analysis_doc,
@@ -2079,7 +2170,8 @@ fn fill_reference_digest_values_in_dependency_order(
         document
             .replace_base64_contents_with_budget(
                 &replacements,
-                DocumentParseSettings::from_policy(&policy.xml, &policy.resources),
+                DocumentParseSettings::from_policy(&policy.xml, &policy.resources)
+                    .with_backend(document.xml_backend()),
                 budgets.transforms.xml_parse_work(),
             )
             .map_err(map_owned_document_digest_mutation_error)?;
@@ -2401,10 +2493,12 @@ fn parse_signing_document<'a>(
     xml: &'a str,
     policy: Option<&crate::policy::SigningPolicy>,
     budget: &XmlParseWorkBudget,
+    backend: crate::XmlBackend,
 ) -> Result<Document<'a>, SigningDigestError> {
     let settings = policy
         .map(|policy| DocumentParseSettings::from_policy(&policy.xml, &policy.resources))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .with_backend(backend);
     super::mutation::parse_with_options_and_budget(xml, settings, Some(budget)).map_err(|error| {
         match error.into_policy_violation(settings) {
             Ok(error) => SigningDigestError::Policy(error),

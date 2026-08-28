@@ -353,6 +353,11 @@ trait Pkcs8SigningKey: SigningKey + Sized + 'static {
     ) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
 }
 
+trait Sec1SigningKey: SigningKey + Sized + 'static {
+    fn decode_sec1_pem(text: &str) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
+    fn decode_sec1_der(bytes: &[u8]) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Pkcs8ContainerKind {
     Plain,
@@ -432,6 +437,32 @@ impl_pkcs8_signing_key!(
     EcdsaP521SigningKey,
 );
 
+macro_rules! impl_sec1_signing_key {
+    ($($key:ty),+ $(,)?) => {
+        $(
+            impl Sec1SigningKey for $key {
+                fn decode_sec1_pem(
+                    text: &str,
+                ) -> Result<Self, xml_sec::xmldsig::SigningKeyError> {
+                    Self::from_sec1_pem(text)
+                }
+
+                fn decode_sec1_der(
+                    bytes: &[u8],
+                ) -> Result<Self, xml_sec::xmldsig::SigningKeyError> {
+                    Self::from_sec1_der(bytes)
+                }
+            }
+        )+
+    };
+}
+
+impl_sec1_signing_key!(
+    EcdsaP256SigningKey,
+    EcdsaP384SigningKey,
+    EcdsaP521SigningKey,
+);
+
 fn decode_pkcs8_signing_key<K: Pkcs8SigningKey>(
     path: &Path,
     bytes: &[u8],
@@ -475,9 +506,30 @@ fn decode_ecdsa_signing_key(
     format: PrivateKeyFormat,
     password: Option<&[u8]>,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
-    decode_pkcs8_signing_key::<EcdsaP256SigningKey>(path, bytes, format, password)
-        .or_else(|_| decode_pkcs8_signing_key::<EcdsaP384SigningKey>(path, bytes, format, password))
-        .or_else(|_| decode_pkcs8_signing_key::<EcdsaP521SigningKey>(path, bytes, format, password))
+    decode_ecdsa_curve::<EcdsaP256SigningKey>(path, bytes, format, password)
+        .or_else(|_| decode_ecdsa_curve::<EcdsaP384SigningKey>(path, bytes, format, password))
+        .or_else(|_| decode_ecdsa_curve::<EcdsaP521SigningKey>(path, bytes, format, password))
+}
+
+fn decode_ecdsa_curve<K: Pkcs8SigningKey + Sec1SigningKey>(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+    password: Option<&[u8]>,
+) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+    if pkcs8_container_kind(bytes, format).is_some() {
+        return decode_pkcs8_signing_key::<K>(path, bytes, format, password);
+    }
+
+    let key = match format {
+        PrivateKeyFormat::Pem => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| K::decode_sec1_pem(text).ok()),
+        PrivateKeyFormat::Der => K::decode_sec1_der(bytes).ok(),
+        PrivateKeyFormat::Pkcs8Pem | PrivateKeyFormat::Pkcs8Der => None,
+    };
+    key.map(|key| Box::new(key) as Box<dyn SigningKey>)
+        .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
 }
 
 fn decode_dsa_signing_key(

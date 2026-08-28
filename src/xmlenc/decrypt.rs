@@ -10,8 +10,7 @@ use crate::document::{DocumentParseSettings, XmlDocument, XmlParseWorkBudget};
 use rsa::RsaPrivateKey;
 
 use super::parse::{
-    parse_encrypted_data_node_with_policy_and_budget, parse_encrypted_data_with_policy,
-    validate_encrypted_data_metadata,
+    parse_encrypted_data_node_with_policy_and_budget, validate_encrypted_data_metadata,
 };
 use super::types::{MAX_CIPHER_VALUE_BASE64_LEN, XMLENC_NS, validate_ciphertext_framing};
 use super::{
@@ -125,6 +124,7 @@ pub struct DecryptContext<'a> {
     resolver: &'a dyn DecryptionKeyResolver,
     policy: crate::policy::DecryptionPolicy,
     provider: &'a dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
     id_attributes: &'a [crate::IdAttributeRegistration],
 }
 
@@ -135,6 +135,7 @@ impl<'a> DecryptContext<'a> {
             resolver,
             policy: crate::policy::DecryptionPolicy::default(),
             provider: crate::provider::default_provider(),
+            xml_backend: crate::XmlBackend::default(),
             id_attributes: &[],
         }
     }
@@ -151,6 +152,17 @@ impl<'a> DecryptContext<'a> {
         self
     }
 
+    /// Select the compiled XML parser backend for this decryption operation.
+    pub fn xml_backend(mut self, backend: crate::XmlBackend) -> Self {
+        self.xml_backend = backend;
+        self
+    }
+
+    fn document_parse_settings(&self) -> DocumentParseSettings {
+        DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources)
+            .with_backend(self.xml_backend)
+    }
+
     /// Add caller-declared ID attributes for operation start-node lookup.
     pub fn id_attributes(mut self, registrations: &'a [crate::IdAttributeRegistration]) -> Self {
         self.id_attributes = registrations;
@@ -159,7 +171,11 @@ impl<'a> DecryptContext<'a> {
 
     /// Parse and decrypt a standalone `EncryptedData` XML fragment.
     pub fn decrypt(&self, xml: &str) -> Result<DecryptedContent, XmlEncError> {
-        let encrypted = parse_encrypted_data_with_policy(xml, &self.policy)?;
+        let encrypted = super::parse::parse_encrypted_data_with_policy_and_backend(
+            xml,
+            &self.policy,
+            self.xml_backend,
+        )?;
         self.decrypt_data(&encrypted)
     }
 
@@ -608,8 +624,7 @@ fn decrypt_document_with_context(
     context.policy.resources.validate()?;
     validate_encryption_document_len(xml.len(), &context.policy)?;
     let parse_budget = XmlParseWorkBudget::from_resources(&context.policy.resources);
-    let settings =
-        DocumentParseSettings::from_policy(&context.policy.xml, &context.policy.resources);
+    let settings = context.document_parse_settings();
     let mut document =
         XmlDocument::parse_with_settings_and_budget(xml.to_owned(), settings, &parse_budget)
             .map_err(|error| map_document_error(error, settings))?;
@@ -676,8 +691,7 @@ fn decrypt_owned_document_with_context(
                 .saturating_add(plaintext.len()),
             &context.policy,
         )?;
-        let settings =
-            DocumentParseSettings::from_policy(&context.policy.xml, &context.policy.resources);
+        let settings = context.document_parse_settings();
         match encrypted.encrypted_type.as_ref() {
             Some(EncryptedDataType::Element) => document
                 .replace_element_with_budget(target, &plaintext, settings, parse_budget)

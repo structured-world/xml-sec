@@ -1,31 +1,21 @@
 //! Backend-neutral XML semantic tree contract.
 //!
-//! Exactly one parser backend builds this tree. All XML Security semantics are
+//! One explicitly selected parser backend builds this tree. All XML Security semantics are
 //! implemented above it, so selecting a backend cannot change C14N, XPath,
 //! XMLDSig, or XMLEnc behavior.
 
-#[cfg(feature = "xml-backend-differential")]
+#[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 mod differential;
 mod preflight;
-#[cfg(any(
-    feature = "xml-backend-roxmltree",
-    feature = "xml-backend-differential"
-))]
+#[cfg(feature = "xml-backend-roxmltree")]
 mod roxmltree;
 mod tree;
-#[cfg(any(feature = "xml-backend-xmloxide", feature = "xml-backend-differential"))]
+#[cfg(feature = "xml-backend-xmloxide")]
 mod xmloxide;
 
 use std::fmt;
 
 use self::preflight::LexicalPreflight;
-
-#[cfg(feature = "xml-backend-differential")]
-use self::differential::DifferentialBackend as SelectedBackend;
-#[cfg(feature = "xml-backend-roxmltree")]
-use self::roxmltree::RoxmltreeBackend as SelectedBackend;
-#[cfg(feature = "xml-backend-xmloxide")]
-use self::xmloxide::XmloxideBackend as SelectedBackend;
 
 pub use tree::{
     Ancestors, Attribute, Attributes, Children, Descendants, Document, ExpandedName, Namespace,
@@ -50,9 +40,135 @@ impl Default for ParsingOptions {
     }
 }
 
+/// XML parser implementation selected for one document or operation.
+///
+/// Cargo features control which implementations are compiled. Selecting an
+/// implementation absent from a thin build fails explicitly; no parser
+/// fallback is performed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum XmlBackend {
+    /// Parse with the xmloxide adapter.
+    Xmloxide,
+    /// Parse with the roxmltree adapter.
+    Roxmltree,
+    /// Parse with both adapters and fail closed unless their semantic arenas agree.
+    Differential,
+}
+
+impl XmlBackend {
+    pub(crate) const fn build_default() -> Self {
+        if cfg!(feature = "xml-backend-differential") {
+            Self::Differential
+        } else if cfg!(feature = "xml-backend-xmloxide") {
+            Self::Xmloxide
+        } else {
+            Self::Roxmltree
+        }
+    }
+
+    /// Returns whether this backend can run in the current build.
+    #[must_use]
+    pub const fn is_available(self) -> bool {
+        match self {
+            Self::Xmloxide => cfg!(feature = "xml-backend-xmloxide"),
+            Self::Roxmltree => cfg!(feature = "xml-backend-roxmltree"),
+            Self::Differential => cfg!(all(
+                feature = "xml-backend-xmloxide",
+                feature = "xml-backend-roxmltree"
+            )),
+        }
+    }
+
+    /// Iterate over every runtime mode available in this build.
+    pub fn available() -> impl Iterator<Item = Self> {
+        [Self::Xmloxide, Self::Roxmltree, Self::Differential]
+            .into_iter()
+            .filter(|backend| backend.is_available())
+    }
+
+    pub(crate) const fn semantic_parse_passes(self) -> usize {
+        match self {
+            Self::Differential => 2,
+            Self::Xmloxide | Self::Roxmltree => 1,
+        }
+    }
+
+    fn parse<'input>(
+        self,
+        input: &'input str,
+        options: ParsingOptions,
+        preflight: &LexicalPreflight,
+    ) -> Result<Document<'input>, ParseError> {
+        match self {
+            Self::Xmloxide => parse_with_xmloxide(input, options, preflight),
+            Self::Roxmltree => parse_with_roxmltree(input, options, preflight),
+            Self::Differential => parse_differentially(input, options, preflight),
+        }
+    }
+}
+
+fn parse_with_xmloxide<'input>(
+    input: &'input str,
+    options: ParsingOptions,
+    preflight: &LexicalPreflight,
+) -> Result<Document<'input>, ParseError> {
+    #[cfg(feature = "xml-backend-xmloxide")]
+    return xmloxide::XmloxideBackend::parse(input, options, preflight);
+    #[cfg(not(feature = "xml-backend-xmloxide"))]
+    {
+        let _ = (input, options, preflight);
+        Err(ParseError::BackendUnavailable {
+            backend: XmlBackend::Xmloxide,
+        })
+    }
+}
+
+fn parse_with_roxmltree<'input>(
+    input: &'input str,
+    options: ParsingOptions,
+    preflight: &LexicalPreflight,
+) -> Result<Document<'input>, ParseError> {
+    #[cfg(feature = "xml-backend-roxmltree")]
+    return roxmltree::RoxmltreeBackend::parse(input, options, preflight);
+    #[cfg(not(feature = "xml-backend-roxmltree"))]
+    {
+        let _ = (input, options, preflight);
+        Err(ParseError::BackendUnavailable {
+            backend: XmlBackend::Roxmltree,
+        })
+    }
+}
+
+fn parse_differentially<'input>(
+    input: &'input str,
+    options: ParsingOptions,
+    preflight: &LexicalPreflight,
+) -> Result<Document<'input>, ParseError> {
+    #[cfg(all(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree"))]
+    return differential::DifferentialBackend::parse(input, options, preflight);
+    #[cfg(not(all(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree")))]
+    {
+        let _ = (input, options, preflight);
+        Err(ParseError::BackendUnavailable {
+            backend: XmlBackend::Differential,
+        })
+    }
+}
+
+impl Default for XmlBackend {
+    fn default() -> Self {
+        Self::build_default()
+    }
+}
+
 /// Stable parser-neutral XML parse error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParseError {
+    /// The requested parser implementation was not compiled into this build.
+    BackendUnavailable {
+        /// Runtime selection that cannot be satisfied.
+        backend: XmlBackend,
+    },
     /// The absolute source-document byte ceiling was exceeded.
     ByteLimitReached {
         /// Maximum accepted UTF-8 source length.
@@ -109,6 +225,12 @@ pub enum ParseError {
 impl fmt::Display for ParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BackendUnavailable { backend } => {
+                write!(
+                    formatter,
+                    "XML backend {backend:?} is not compiled into this build"
+                )
+            }
             Self::ByteLimitReached { maximum, actual } => {
                 write!(
                     formatter,
@@ -147,7 +269,7 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-trait XmlBackend {
+trait XmlBackendImplementation {
     fn parse<'input>(
         input: &'input str,
         options: ParsingOptions,

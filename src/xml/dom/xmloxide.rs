@@ -5,14 +5,14 @@ use std::ops::Range;
 use xmloxide::tree::{NodeId as XmloxNodeId, NodeKind as XmloxNodeKind};
 
 use super::{
-    Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackend,
+    Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackendImplementation,
     preflight::{PositionCursor, SourceKind},
     tree::{AttributeData, NamespaceData, NodeId, NodeKind, TreeBuilder},
 };
 
 pub(super) struct XmloxideBackend;
 
-impl XmlBackend for XmloxideBackend {
+impl XmlBackendImplementation for XmloxideBackend {
     fn parse<'input>(
         input: &'input str,
         options: ParsingOptions,

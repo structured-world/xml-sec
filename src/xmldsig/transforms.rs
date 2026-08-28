@@ -397,6 +397,11 @@ impl TransformExecutionBudget {
         }
     }
 
+    pub(crate) fn with_xml_backend(mut self, backend: crate::XmlBackend) -> Self {
+        self.xml_parse_settings = self.xml_parse_settings.with_backend(backend);
+        self
+    }
+
     pub(crate) fn charge_c14n_output(&self, bytes: usize) -> Result<(), TransformError> {
         self.c14n.charge(bytes).map_err(TransformError::from)
     }

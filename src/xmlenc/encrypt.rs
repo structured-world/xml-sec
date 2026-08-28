@@ -64,6 +64,7 @@ pub struct EncryptedDataBuilder {
     recipients: Vec<EncryptionRecipient>,
     policy: crate::policy::EncryptionPolicy,
     provider: Arc<dyn crate::provider::CryptoProvider>,
+    xml_backend: crate::XmlBackend,
 }
 
 struct GeneratedEncryption {
@@ -102,6 +103,7 @@ impl EncryptedDataBuilder {
             recipients: Vec::new(),
             policy: crate::policy::EncryptionPolicy::default(),
             provider: Arc::new(crate::provider::RustCryptoProvider),
+            xml_backend: crate::XmlBackend::default(),
         }
     }
 
@@ -115,6 +117,17 @@ impl EncryptedDataBuilder {
     pub fn provider(mut self, provider: Arc<dyn crate::provider::CryptoProvider>) -> Self {
         self.provider = provider;
         self
+    }
+
+    /// Select the compiled XML parser backend for encryption document work.
+    pub fn xml_backend(mut self, backend: crate::XmlBackend) -> Self {
+        self.xml_backend = backend;
+        self
+    }
+
+    fn document_parse_settings(&self) -> DocumentParseSettings {
+        DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources)
+            .with_backend(self.xml_backend)
     }
 
     /// Set whether XML encryption covers one element or its child content.
@@ -170,7 +183,13 @@ impl EncryptedDataBuilder {
         self.policy.validate()?;
         self.validate_plaintext_len(xml.len())?;
         let parse_budget = XmlParseWorkBudget::from_resources(&self.policy.resources);
-        validate_xml_plaintext(xml, &self.encrypted_type, &self.policy, &parse_budget)?;
+        validate_xml_plaintext(
+            xml,
+            &self.encrypted_type,
+            &self.policy,
+            &parse_budget,
+            self.xml_backend,
+        )?;
         let generated = self.encrypt_payload(
             xml.as_bytes(),
             Some(self.encrypted_type.clone()),
@@ -211,7 +230,7 @@ impl EncryptedDataBuilder {
         self.policy.validate()?;
         self.validate_document_len(xml.len())?;
         let parse_budget = XmlParseWorkBudget::from_resources(&self.policy.resources);
-        let settings = DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources);
+        let settings = self.document_parse_settings();
         let mut document =
             XmlDocument::parse_with_settings_and_budget(xml.to_owned(), settings, &parse_budget)
                 .map_err(|error| map_document_error(error, settings))?;
@@ -285,8 +304,7 @@ impl EncryptedDataBuilder {
                     ReplacementMode::ReplaceElement,
                     self.policy.resources.effective_xml_nodes() as usize,
                 )?;
-                let settings =
-                    DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources);
+                let settings = self.document_parse_settings();
                 document
                     .replace_element_with_budget(
                         target,
@@ -339,8 +357,7 @@ impl EncryptedDataBuilder {
                     ReplacementMode::ReplaceContent,
                     self.policy.resources.effective_xml_nodes() as usize,
                 )?;
-                let settings =
-                    DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources);
+                let settings = self.document_parse_settings();
                 document
                     .replace_content_with_budget(
                         target,
@@ -392,8 +409,12 @@ impl EncryptedDataBuilder {
             &ciphertext,
         )?;
         self.validate_document_len(encrypted_data_xml.len())?;
-        let xml_nodes =
-            count_generated_encrypted_data_nodes(&encrypted_data_xml, &self.policy, parse_budget)?;
+        let xml_nodes = count_generated_encrypted_data_nodes(
+            &encrypted_data_xml,
+            &self.policy,
+            parse_budget,
+            self.xml_backend,
+        )?;
         let replacement = match encrypted_type {
             Some(EncryptedDataType::Content) => ReplacementMode::ReplaceContent,
             Some(EncryptedDataType::Element | EncryptedDataType::Other(_)) | None => {
@@ -687,6 +708,7 @@ fn count_generated_encrypted_data_nodes(
     encrypted_data_xml: &str,
     policy: &crate::policy::EncryptionPolicy,
     parse_budget: &XmlParseWorkBudget,
+    backend: crate::XmlBackend,
 ) -> Result<usize, XmlEncError> {
     let maximum_nodes = policy.resources.effective_xml_nodes();
     // The standalone parser adds one document node that is not inserted into
@@ -694,7 +716,7 @@ fn count_generated_encrypted_data_nodes(
     // admitting that transient root so exact-fit content replacement remains valid.
     let settings = DocumentParseSettings {
         nodes_limit: maximum_nodes.saturating_add(1),
-        ..DocumentParseSettings::from_policy(&policy.xml, &policy.resources)
+        ..DocumentParseSettings::from_policy(&policy.xml, &policy.resources).with_backend(backend)
     };
     let generated =
         parse_borrowed_with_settings_and_budget(encrypted_data_xml, settings, Some(parse_budget))
@@ -969,8 +991,10 @@ fn validate_xml_plaintext(
     encrypted_type: &EncryptedDataType,
     policy: &crate::policy::EncryptionPolicy,
     parse_budget: &XmlParseWorkBudget,
+    backend: crate::XmlBackend,
 ) -> Result<(), XmlEncError> {
-    let settings = DocumentParseSettings::from_policy(&policy.xml, &policy.resources);
+    let settings =
+        DocumentParseSettings::from_policy(&policy.xml, &policy.resources).with_backend(backend);
     match encrypted_type {
         EncryptedDataType::Element => {
             let document =
@@ -1907,6 +1931,7 @@ mod tests {
             &EncryptedDataType::Content,
             &policy_three,
             &budget_three,
+            crate::XmlBackend::default(),
         )
         .expect("the caller root and two elements must fit a three-node policy");
         let policy_two = policy(2);
@@ -1917,6 +1942,7 @@ mod tests {
                 &EncryptedDataType::Content,
                 &policy_two,
                 &budget_two,
+                crate::XmlBackend::default(),
             ),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
@@ -1946,7 +1972,13 @@ mod tests {
         let budget = XmlParseWorkBudget::from_resources(&policy.resources);
 
         assert!(matches!(
-            validate_xml_plaintext(xml, &EncryptedDataType::Content, &policy, &budget),
+            validate_xml_plaintext(
+                xml,
+                &EncryptedDataType::Content,
+                &policy,
+                &budget,
+                crate::XmlBackend::default(),
+            ),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::XML_DOCUMENT,
@@ -1977,7 +2009,12 @@ mod tests {
         let budget = XmlParseWorkBudget::from_resources(&policy.resources);
 
         assert!(matches!(
-            count_generated_encrypted_data_nodes(xml, &policy, &budget),
+            count_generated_encrypted_data_nodes(
+                xml,
+                &policy,
+                &budget,
+                crate::XmlBackend::default(),
+            ),
             Err(XmlEncError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::XML_NODES,

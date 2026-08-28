@@ -8,6 +8,8 @@ use std::{
 use base64::Engine as _;
 use der::{Encode as _, asn1::UintRef};
 use p256::SecretKey as P256SecretKey;
+use p384::SecretKey as P384SecretKey;
+use p521::SecretKey as P521SecretKey;
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
@@ -715,6 +717,93 @@ fn compatibility_cli_decrypts_rsa_and_ecdsa_pkcs8_signing_keys() {
         password,
         true,
     );
+}
+
+#[test]
+fn compatibility_cli_accepts_generic_sec1_ecdsa_keys() {
+    // Generic private-key options accept the traditional ECPrivateKey container,
+    // while the explicitly named PKCS#8 options remain container-strict.
+    let temp = tempfile::tempdir().unwrap();
+    let p256 = P256SecretKey::from_slice(&[0x11; 32]).unwrap();
+    let p384 = P384SecretKey::from_slice(&[0x22; 48]).unwrap();
+    let p521 = P521SecretKey::from_slice(&[0x01; 66]).unwrap();
+
+    assert_sec1_cli_round_trip(
+        temp.path(),
+        "p256",
+        p256.to_sec1_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
+        p256.to_sec1_der().unwrap().as_ref(),
+        p256.public_key().to_public_key_der().unwrap().as_bytes(),
+    );
+    assert_sec1_cli_round_trip(
+        temp.path(),
+        "p384",
+        p384.to_sec1_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
+        p384.to_sec1_der().unwrap().as_ref(),
+        p384.public_key().to_public_key_der().unwrap().as_bytes(),
+    );
+    assert_sec1_cli_round_trip(
+        temp.path(),
+        "p521",
+        p521.to_sec1_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
+        p521.to_sec1_der().unwrap().as_ref(),
+        p521.public_key().to_public_key_der().unwrap().as_bytes(),
+    );
+}
+
+fn assert_sec1_cli_round_trip(
+    directory: &Path,
+    name: &str,
+    private_pem: &[u8],
+    private_der: &[u8],
+    public_der: &[u8],
+) {
+    let template = directory.join(format!("{name}-template.xml"));
+    let public_key = directory.join(format!("{name}-public.der"));
+    fs::write(&template, ecdsa_signature_template()).unwrap();
+    fs::write(&public_key, public_der).unwrap();
+
+    for (encoding, bytes) in [("pem", private_pem), ("der", private_der)] {
+        let private_key = directory.join(format!("{name}-private.{encoding}"));
+        let signed = directory.join(format!("{name}-{encoding}-signed.xml"));
+        fs::write(&private_key, bytes).unwrap();
+
+        let sign = Command::new(binary())
+            .arg("sign")
+            .arg(format!("--privkey-{encoding}"))
+            .arg(&private_key)
+            .arg("--output")
+            .arg(&signed)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            sign.status.success(),
+            "{name} SEC1 {encoding}: {}",
+            String::from_utf8_lossy(&sign.stderr)
+        );
+
+        let verify = Command::new(binary())
+            .args(["verify", "--pubkey-der"])
+            .arg(&public_key)
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "{name} SEC1 {encoding}: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+
+        let rejected = Command::new(binary())
+            .arg("sign")
+            .arg(format!("--pkcs8-{encoding}"))
+            .arg(&private_key)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+    }
 }
 
 fn assert_pkcs8_cli_round_trip(
