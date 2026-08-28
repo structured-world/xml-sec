@@ -3,6 +3,15 @@
 Enable the `xmlenc` feature for AES-CBC/GCM content encryption and decryption, RSA-OAEP key
 transport, AES Key Wrap, multiple recipients, and Element/Content document replacement.
 
+Encryption and decryption compile explicit operation plans that order document parsing,
+key resolution, provider dispatch, evidence finalization, and optional mutation. The
+operation context owns the immutable policy, stable document identity/generation, XML
+parse-work and key-candidate budgets, and deterministic decision state. All recipient
+retries consume that single context; a successful provider call is not reported as an
+accepted operation until output validation succeeds, and document replacement remains
+the terminal graph node. Failed candidates or replacement validation leave an owned
+document and its generation unchanged.
+
 ## Direct-Key Encryption
 
 `EncryptedDataBuilder` can encrypt opaque bytes, one XML element, an XML content fragment, or a

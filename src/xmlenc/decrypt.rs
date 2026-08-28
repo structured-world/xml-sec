@@ -7,10 +7,15 @@ use crate::xml::dom::Document;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use crate::document::{DocumentParseSettings, XmlDocument, XmlParseWorkBudget};
+use crate::operation::{
+    OperationExecutionContext, OperationNodeId, OperationNodeKind, OperationPlanError,
+    OperationResourceIdentity, OperationStage,
+};
 use rsa::RsaPrivateKey;
 
 use super::parse::{
-    parse_encrypted_data_node_with_policy_and_budget, validate_encrypted_data_metadata,
+    parse_encrypted_data_node_with_policy_and_budget,
+    parse_encrypted_data_with_policy_backend_and_budget, validate_encrypted_data_metadata,
 };
 use super::types::{MAX_CIPHER_VALUE_BASE64_LEN, XMLENC_NS, validate_ciphertext_framing};
 use super::{
@@ -128,6 +133,84 @@ pub struct DecryptContext<'a> {
     id_attributes: &'a [crate::IdAttributeRegistration],
 }
 
+struct DecryptionPlanNodes {
+    key: OperationNodeId,
+    crypto: OperationNodeId,
+    evidence: OperationNodeId,
+    mutation: Option<OperationNodeId>,
+}
+
+struct DecryptionOperationBudgets {
+    key_candidates: std::cell::RefCell<KeyCandidateBudget>,
+    xml_parse: XmlParseWorkBudget,
+}
+
+impl DecryptionOperationBudgets {
+    fn from_policy(policy: &crate::policy::DecryptionPolicy) -> Self {
+        Self {
+            key_candidates: std::cell::RefCell::new(KeyCandidateBudget::with_limit(
+                policy.resources.max_key_candidates,
+            )),
+            xml_parse: XmlParseWorkBudget::from_resources(&policy.resources),
+        }
+    }
+}
+
+fn compile_decryption_plan(
+    operation: &mut OperationExecutionContext<
+        crate::policy::DecryptionPolicy,
+        DecryptionOperationBudgets,
+    >,
+    encrypted: &EncryptedData,
+    mutation: bool,
+) -> Result<DecryptionPlanNodes, XmlEncError> {
+    let document = operation.add_node(
+        OperationNodeKind::Document,
+        OperationStage::Parse,
+        encrypted
+            .id
+            .as_ref()
+            .map(|id| OperationResourceIdentity::External(format!("EncryptedData#{id}"))),
+    );
+    let key = operation.add_node(
+        OperationNodeKind::Key { index: 0 },
+        OperationStage::Resolve,
+        None,
+    );
+    operation
+        .add_dependency(key, document)
+        .map_err(map_decryption_plan_error)?;
+    let crypto = operation.add_node(OperationNodeKind::Crypto, OperationStage::Crypto, None);
+    operation
+        .add_dependency(crypto, key)
+        .map_err(map_decryption_plan_error)?;
+    let evidence = operation.add_node(OperationNodeKind::Evidence, OperationStage::Evidence, None);
+    operation
+        .add_dependency(evidence, crypto)
+        .map_err(map_decryption_plan_error)?;
+    let mutation = mutation.then(|| {
+        let node = operation.add_node(OperationNodeKind::Mutation, OperationStage::Mutation, None);
+        operation
+            .add_dependency(node, evidence)
+            .expect("evidence-to-mutation stage order is fixed");
+        node
+    });
+    operation.compile().map_err(map_decryption_plan_error)?;
+    operation
+        .execute(document)
+        .map_err(map_decryption_plan_error)?;
+    Ok(DecryptionPlanNodes {
+        key,
+        crypto,
+        evidence,
+        mutation,
+    })
+}
+
+fn map_decryption_plan_error(error: OperationPlanError) -> XmlEncError {
+    XmlEncError::InvalidStructure(format!("invalid decryption operation plan: {error}"))
+}
+
 impl<'a> DecryptContext<'a> {
     /// Create a context with the default decryption policy and RustCrypto provider.
     pub fn new(resolver: &'a dyn DecryptionKeyResolver) -> Self {
@@ -171,24 +254,40 @@ impl<'a> DecryptContext<'a> {
 
     /// Parse and decrypt a standalone `EncryptedData` XML fragment.
     pub fn decrypt(&self, xml: &str) -> Result<DecryptedContent, XmlEncError> {
-        let encrypted = super::parse::parse_encrypted_data_with_policy_and_backend(
+        let budgets = DecryptionOperationBudgets::from_policy(&self.policy);
+        let encrypted = parse_encrypted_data_with_policy_backend_and_budget(
             xml,
             &self.policy,
             self.xml_backend,
+            &budgets.xml_parse,
         )?;
-        self.decrypt_data(&encrypted)
+        self.process_decryption_candidates(&encrypted, None, false, budgets, |content, _| {
+            Ok(content)
+        })
     }
 
     /// Decrypt an already parsed `EncryptedData` value.
     pub fn decrypt_data(&self, encrypted: &EncryptedData) -> Result<DecryptedContent, XmlEncError> {
-        self.process_decryption_candidates(encrypted, Ok)
+        self.process_decryption_candidates(
+            encrypted,
+            None,
+            false,
+            DecryptionOperationBudgets::from_policy(&self.policy),
+            |content, _| Ok(content),
+        )
     }
 
     fn process_decryption_candidates<T>(
         &self,
         encrypted: &EncryptedData,
-        mut accept: impl FnMut(DecryptedContent) -> Result<T, XmlEncError>,
+        document_binding: Option<(crate::DocumentIdentity, u64)>,
+        mutates_document: bool,
+        budgets: DecryptionOperationBudgets,
+        mut accept: impl FnMut(DecryptedContent, &XmlParseWorkBudget) -> Result<T, XmlEncError>,
     ) -> Result<T, XmlEncError> {
+        let mut operation =
+            OperationExecutionContext::new(self.policy.clone(), budgets, document_binding);
+        let plan_nodes = compile_decryption_plan(&mut operation, encrypted, mutates_document)?;
         self.policy.resources.validate()?;
         validate_encrypted_data_metadata(encrypted, &self.policy)?;
         encrypted.encryption_method.validate_structure()?;
@@ -237,7 +336,12 @@ impl<'a> DecryptContext<'a> {
             encrypted,
             self.resolver,
             &self.policy,
+            &mut operation.budgets().key_candidates.borrow_mut(),
         )?;
+        operation
+            .execute(plan_nodes.key)
+            .map_err(map_decryption_plan_error)?;
+        operation.record(plan_nodes.key, true, "decryption key candidates resolved");
         let keys = compatible_decryption_key_candidates(algorithm, keys)?;
         validate_decryption_key_candidates(algorithm, keys.len())?;
         let mut last_error = None;
@@ -265,13 +369,34 @@ impl<'a> DecryptContext<'a> {
                 }
             })();
             match attempt {
-                Ok(content) => match accept(content) {
-                    Ok(result) => return Ok(result),
+                Ok(content) => match accept(content, &operation.budgets().xml_parse) {
+                    Ok(result) => {
+                        operation
+                            .execute(plan_nodes.crypto)
+                            .map_err(map_decryption_plan_error)?;
+                        operation.record(plan_nodes.crypto, true, "ciphertext decrypted");
+                        operation
+                            .execute(plan_nodes.evidence)
+                            .map_err(map_decryption_plan_error)?;
+                        operation.record(plan_nodes.evidence, true, "decryption accepted");
+                        if let Some(mutation) = plan_nodes.mutation {
+                            operation
+                                .execute(mutation)
+                                .map_err(map_decryption_plan_error)?;
+                            operation.record(mutation, true, "document mutation committed");
+                        }
+                        return Ok(result);
+                    }
                     Err(error) => last_error = Some(error),
                 },
                 Err(error) => last_error = Some(error),
             }
         }
+        operation.record(
+            plan_nodes.crypto,
+            false,
+            "all decryption candidates rejected",
+        );
         Err(last_error.unwrap_or(XmlEncError::KeyNotFound))
     }
 
@@ -294,12 +419,12 @@ impl<'a> DecryptContext<'a> {
         document: &mut XmlDocument,
         encrypted_data_id: Option<&str>,
     ) -> Result<(), XmlEncError> {
-        let parse_budget = XmlParseWorkBudget::from_resources(&self.policy.resources);
+        let budgets = DecryptionOperationBudgets::from_policy(&self.policy);
         decrypt_owned_document_with_context(
             document,
             DocumentEncryptedDataSelector::EncryptedDataId(encrypted_data_id),
             self,
-            &parse_budget,
+            budgets,
         )
     }
 
@@ -623,12 +748,12 @@ fn decrypt_document_with_context(
 ) -> Result<String, XmlEncError> {
     context.policy.resources.validate()?;
     validate_encryption_document_len(xml.len(), &context.policy)?;
-    let parse_budget = XmlParseWorkBudget::from_resources(&context.policy.resources);
+    let budgets = DecryptionOperationBudgets::from_policy(&context.policy);
     let settings = context.document_parse_settings();
     let mut document =
-        XmlDocument::parse_with_settings_and_budget(xml.to_owned(), settings, &parse_budget)
+        XmlDocument::parse_with_settings_and_budget(xml.to_owned(), settings, &budgets.xml_parse)
             .map_err(|error| map_document_error(error, settings))?;
-    decrypt_owned_document_with_context(&mut document, selector, context, &parse_budget)?;
+    decrypt_owned_document_with_context(&mut document, selector, context, budgets)?;
     Ok(document.into_xml())
 }
 
@@ -636,7 +761,7 @@ fn decrypt_owned_document_with_context(
     document: &mut XmlDocument,
     selector: DocumentEncryptedDataSelector<'_>,
     context: &DecryptContext<'_>,
-    parse_budget: &XmlParseWorkBudget,
+    budgets: DecryptionOperationBudgets,
 ) -> Result<(), XmlEncError> {
     context.policy.resources.validate()?;
     document.validate_operation_policy(&context.policy.xml, &context.policy.resources)?;
@@ -675,37 +800,54 @@ fn decrypt_owned_document_with_context(
             parse_encrypted_data_node_with_policy_and_budget(
                 selected,
                 &context.policy,
-                parse_budget,
+                &budgets.xml_parse,
                 context.xml_backend,
             )?,
         ))
     })?;
-    context.process_decryption_candidates(&encrypted, |candidate| {
-        let DecryptedContent::Xml(plaintext) = candidate else {
-            return Err(XmlEncError::ReplacementRequiresXml);
-        };
-        validate_encryption_document_len(
-            document
-                .as_xml()
-                .len()
-                .saturating_sub(target_len)
-                .saturating_add(plaintext.len()),
-            &context.policy,
-        )?;
-        let settings = context.document_parse_settings();
-        match encrypted.encrypted_type.as_ref() {
-            Some(EncryptedDataType::Element) => document
-                .replace_element_with_budget(target, &plaintext, settings, parse_budget)
-                .map_err(|error| map_document_error(error, settings))?,
-            Some(EncryptedDataType::Content) => document
-                .replace_node_with_fragment_with_budget(target, &plaintext, settings, parse_budget)
-                .map_err(|error| map_document_error(error, settings))?,
-            Some(EncryptedDataType::Other(_)) | None => {
+    let document_binding = Some((document.identity(), document.generation()));
+    context.process_decryption_candidates(
+        &encrypted,
+        document_binding,
+        true,
+        budgets,
+        |candidate, operation_parse_budget| {
+            let DecryptedContent::Xml(plaintext) = candidate else {
                 return Err(XmlEncError::ReplacementRequiresXml);
+            };
+            validate_encryption_document_len(
+                document
+                    .as_xml()
+                    .len()
+                    .saturating_sub(target_len)
+                    .saturating_add(plaintext.len()),
+                &context.policy,
+            )?;
+            let settings = context.document_parse_settings();
+            match encrypted.encrypted_type.as_ref() {
+                Some(EncryptedDataType::Element) => document
+                    .replace_element_with_budget(
+                        target,
+                        &plaintext,
+                        settings,
+                        operation_parse_budget,
+                    )
+                    .map_err(|error| map_document_error(error, settings))?,
+                Some(EncryptedDataType::Content) => document
+                    .replace_node_with_fragment_with_budget(
+                        target,
+                        &plaintext,
+                        settings,
+                        operation_parse_budget,
+                    )
+                    .map_err(|error| map_document_error(error, settings))?,
+                Some(EncryptedDataType::Other(_)) | None => {
+                    return Err(XmlEncError::ReplacementRequiresXml);
+                }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 fn validate_encryption_document_len(
@@ -742,11 +884,11 @@ fn resolve_content_key_candidates(
     encrypted: &EncryptedData,
     resolver: &dyn DecryptionKeyResolver,
     policy: &crate::policy::DecryptionPolicy,
+    budget: &mut KeyCandidateBudget,
 ) -> Result<Vec<Vec<u8>>, XmlEncError> {
-    let mut budget = KeyCandidateBudget::with_limit(policy.resources.max_key_candidates);
     let mut last_error = None;
     let mut candidates =
-        match resolve_candidates_with_budget(resolver, provider, algorithm, None, &mut budget) {
+        match resolve_candidates_with_budget(resolver, provider, algorithm, None, budget) {
             Ok(keys) => keys,
             Err(error) => {
                 record_candidate_source_error_or_fail_operation(error, &mut last_error)?;
@@ -766,7 +908,7 @@ fn resolve_content_key_candidates(
             provider,
             algorithm,
             Some(encrypted_key),
-            &mut budget,
+            budget,
         ) {
             Ok(keys) => candidates.extend(keys),
             Err(error) => record_candidate_source_error_or_fail_operation(error, &mut last_error)?,

@@ -35,6 +35,19 @@ cargo run --example verify -- signed.xml
 ```
 
 The signing and verification contexts share the same reference-transform implementation.
+Both pipelines compile a deterministic operation graph before provider success or
+document mutation can be reported. The graph orders parsing, key and URI resolution,
+mutable-reference dependencies, transforms, digests, signature crypto, evidence, and
+the final mutation gate. One operation context owns the immutable policy snapshot,
+stable document generation, resolver and transform-cache state, cumulative budgets,
+authenticated node identities, and first-failure evidence. Nested helpers and reparses
+therefore cannot reset accounting or use identities captured from another generation.
+Authenticated Manifest structure is deliberately compiled as a second phase of the
+same graph only after `SignatureValue` succeeds; malformed or expensive unauthenticated
+Manifest content is never parsed speculatively. Manifest dependency cycles are rejected
+before their digest execution, while signing analyzes concrete mutable `DigestValue`
+and `SignatureValue` targets and rejects cycles before changing the caller's document.
+
 `SigningPolicy::manifest_processing` controls direct `<Object>/<Manifest>`
 reference generation. Processing fills Manifest digests before SignedInfo so a
 SignedInfo reference to the Manifest authenticates the final values; Manifest

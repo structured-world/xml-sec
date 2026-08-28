@@ -118,6 +118,7 @@ pub(crate) struct TransformExecutionBudget {
     xml_base_resolution: XmlBaseResolutionBudget,
     xml_parse_work: XmlParseWorkBudget,
     xml_parse_settings: DocumentParseSettings,
+    state: TransformChainState,
 }
 
 impl Default for TransformExecutionBudget {
@@ -319,6 +320,7 @@ impl TransformExecutionBudget {
                 &crate::policy::ResourcePolicy::default(),
             ),
             xml_parse_settings: DocumentParseSettings::default(),
+            state: TransformChainState::default(),
         }
     }
 
@@ -337,6 +339,7 @@ impl TransformExecutionBudget {
                 &crate::policy::ResourcePolicy::default(),
             ),
             xml_parse_settings: DocumentParseSettings::default(),
+            state: TransformChainState::default(),
         }
     }
 
@@ -352,6 +355,7 @@ impl TransformExecutionBudget {
                 &crate::policy::ResourcePolicy::default(),
             ),
             xml_parse_settings: DocumentParseSettings::default(),
+            state: TransformChainState::default(),
         }
     }
 
@@ -394,6 +398,7 @@ impl TransformExecutionBudget {
                 resources.max_xml_depth,
                 resources.max_xml_document_bytes,
             ),
+            state: TransformChainState::default(),
         }
     }
 
@@ -974,11 +979,10 @@ pub(crate) fn execute_transforms_with_options_and_budget<'a>(
     budget: &TransformExecutionBudget,
 ) -> Result<Vec<u8>, TransformError> {
     ensure_transform_count(transforms.len())?;
-    let state = TransformChainState::default();
     let context = TransformExecutionContext {
         options,
         budget,
-        state: &state,
+        state: &budget.state,
     };
     execute_transform_chain(
         signature_node,
@@ -1065,11 +1069,10 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
             opaque_dependencies.insert(index);
         }
     }
-    let state = TransformChainState::default();
     let context = TransformExecutionContext {
         options,
         budget,
-        state: &state,
+        state: &budget.state,
     };
     let output = execute_transform_chain(
         signature_node,
