@@ -11,7 +11,7 @@
 
 use std::cell::Cell;
 
-use roxmltree::Node;
+use crate::xml::dom::Node;
 
 use super::NodeVisibility;
 
@@ -168,13 +168,30 @@ pub(crate) fn resolve_uri_from_node_with_budget(
     reference: &str,
     budget: &XmlBaseResolutionBudget,
 ) -> Result<String, XmlBaseResolutionError> {
+    resolve_uri_from_node_with_document_base_with_budget(origin, reference, None, budget)
+}
+
+/// Resolve a URI against an owning external document and its inherited XML Base.
+#[cfg(feature = "xmldsig")]
+pub(crate) fn resolve_uri_from_node_with_document_base_with_budget(
+    origin: Node<'_, '_>,
+    reference: &str,
+    document_base: Option<&str>,
+    budget: &XmlBaseResolutionBudget,
+) -> Result<String, XmlBaseResolutionError> {
     if has_scheme(reference) {
         return resolve_uri_with_budget("", reference, budget);
     }
-    match compute_effective_xml_base_with_budget(origin, None, budget)? {
-        Some(base) => resolve_uri_with_budget(&base, reference, budget),
-        None => resolve_uri_with_budget("", reference, budget),
-    }
+    let inherited_base = compute_effective_xml_base_with_budget(origin, None, budget)?;
+    let base = match (document_base, inherited_base) {
+        (Some(document_base), Some(xml_base)) => {
+            resolve_uri_with_budget(document_base, &xml_base, budget)?
+        }
+        (Some(document_base), None) => document_base.to_owned(),
+        (None, Some(xml_base)) => xml_base,
+        (None, None) => String::new(),
+    };
+    resolve_uri_with_budget(&base, reference, budget)
 }
 
 /// Whether a selected element establishes its source `xml:base` context in the
@@ -520,7 +537,7 @@ fn remove_dot_segments_with_unmatched_parents(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use roxmltree::Document;
+    use crate::xml::dom::Document;
 
     // ── resolve_uri tests ────────────────────────────────────────────
 

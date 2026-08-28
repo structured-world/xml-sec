@@ -107,11 +107,12 @@ fn example(encrypted_xml: &str) -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Callers that already parsed a containing XML document can use
-`parse_encrypted_data_node_with_policy` on the selected `roxmltree::Node`. Encryption frontends
+`parse_encrypted_data_node_with_policy` on the backend-neutral `xml_sec::Node`. Encryption frontends
 that inspect caller-owned templates use `parse_encrypted_data_template_node_with_policy`, which
 applies the same complete structure and metadata limits but permits empty `CipherValue`
 placeholders. Both node-oriented APIs avoid serializing a subtree and losing namespace declarations
-inherited from its ancestors.
+inherited from its ancestors. Their `_and_backend` variants retain an explicitly selected compiled
+backend while revalidating the containing document; the shorter entry points use the build default.
 
 `PrivateKeyDecryptor` unwraps embedded RSA-OAEP `EncryptedKey` values and `KekDecryptor`
 unwraps AES-KW values. RSA PKCS#1 v1.5 transport, `CipherReference`, and unauthenticated external

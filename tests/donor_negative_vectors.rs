@@ -10,8 +10,8 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use roxmltree::Document;
 use x509_parser::prelude::{FromDer, X509Certificate};
+use xml_sec::XmlDomDocument as Document;
 use xml_sec::policy::PolicyViolation;
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DsigError, DsigStatus, FailureReason, KeyInfoSource, KeyResolverConfig,

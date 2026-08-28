@@ -1,14 +1,16 @@
 //! Shared XML lexical invariants used before serialization.
 
+pub mod dom;
+
 #[cfg(any(feature = "xmldsig", test))]
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 
 #[cfg(any(feature = "xmldsig", test))]
-use roxmltree::Document;
-use roxmltree::Node;
+use crate::xml::dom::Document;
+use crate::xml::dom::Node;
 
 #[cfg(feature = "xmldsig")]
-use roxmltree::NodeId;
+use crate::xml::dom::NodeId;
 
 /// Default ID attribute names shared by XMLDSig and XMLEnc selection.
 #[cfg(any(feature = "xmldsig", test))]
@@ -117,16 +119,6 @@ pub(crate) struct XmlIdIndex<'a> {
 
 #[cfg(any(feature = "xmldsig", test))]
 impl<'a> XmlIdIndex<'a> {
-    /// Index standard ID spellings plus caller-declared local attribute names.
-    #[cfg(feature = "xmldsig")]
-    pub(crate) fn with_extra_attrs(document: &'a Document<'a>, extra_attrs: &[&str]) -> Self {
-        let registrations = extra_attrs
-            .iter()
-            .map(|name| IdAttributeRegistration::global(*name))
-            .collect::<Vec<_>>();
-        Self::with_registrations(document, &registrations)
-    }
-
     /// Index standard ID spellings plus caller-declared registrations.
     pub(crate) fn with_registrations(
         document: &'a Document<'a>,
@@ -172,7 +164,7 @@ impl<'a> XmlIdIndex<'a> {
 
     #[cfg(feature = "xmldsig")]
     pub(crate) fn node_id(&self, id: &str) -> Option<NodeId> {
-        self.nodes.get(id).map(Node::id)
+        self.nodes.get(id).map(|node| node.id())
     }
 
     pub(crate) fn node(&self, id: &str) -> Option<Node<'a, 'a>> {
@@ -208,15 +200,15 @@ pub(crate) fn is_xml_ncname(value: &str) -> bool {
         return false;
     }
 
-    // Delegate the complete Unicode Name grammar to the parser used by the
-    // rest of the crate instead of maintaining a partial ASCII approximation.
-    roxmltree::Document::parse(&format!("<{value}/>"))
+    // Delegate the complete Unicode Name grammar to the selected backend
+    // instead of maintaining a partial ASCII approximation.
+    dom::Document::parse(&format!("<{value}/>"))
         .is_ok_and(|document| document.root_element().tag_name().name() == value)
 }
 
 #[cfg(test)]
 mod tests {
-    use roxmltree::{Document, ParsingOptions};
+    use crate::xml::dom::{Document, ParsingOptions};
 
     use super::{IdAttributeRegistration, XmlIdIndex};
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]

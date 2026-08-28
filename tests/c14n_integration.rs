@@ -4,6 +4,7 @@
 //! using libxml2 (system xmllint). These are the authoritative C14N implementations.
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize, canonicalize_xml};
+use xml_sec::{XmlDomDocument as Document, XmlDomNode as Node};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -396,14 +397,13 @@ fn c14n_1_1_xml_id_is_not_inherited_in_subset() {
     // C14N 1.1 §2.4 excludes xml:id from inheritance. Root has xml:id="doc1",
     // but a subset containing only child must not resurrect that attribute.
     let xml = r#"<root xml:id="doc1" xmlns:a="http://a"><a:child>text</a:child></root>"#;
-    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let doc = Document::parse(xml).expect("parse");
     let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
 
     let child = doc.root_element().first_element_child().expect("child");
     let child_id = child.id();
     // Include child and its text node
-    let pred =
-        |n: roxmltree::Node| n.id() == child_id || n.parent().is_some_and(|p| p.id() == child_id);
+    let pred = |n: Node| n.id() == child_id || n.parent().is_some_and(|p| p.id() == child_id);
 
     let mut output = Vec::new();
     canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
@@ -425,12 +425,12 @@ fn c14n_1_1_inherits_xml_lang_but_not_xml_id() {
     // Simple inheritance applies to xml:lang, but C14N 1.1 explicitly
     // excludes xml:id from that processing.
     let xml = r#"<root xml:lang="en" xml:id="r1"><child/></root>"#;
-    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let doc = Document::parse(xml).expect("parse");
     let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
 
     let child = doc.root_element().first_element_child().expect("child");
     let child_id = child.id();
-    let pred = |n: roxmltree::Node| n.id() == child_id;
+    let pred = |n: Node| n.id() == child_id;
 
     let mut output = Vec::new();
     canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
@@ -448,13 +448,12 @@ fn c14n_1_1_xml_base_resolved_in_subset() {
     // In a subset excluding root, child's xml:base should be resolved
     // to "http://example.com/sub/" (not raw "sub/").
     let xml = r#"<root xml:base="http://example.com/"><child xml:base="sub/">text</child></root>"#;
-    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let doc = Document::parse(xml).expect("parse");
     let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
 
     let child = doc.root_element().first_element_child().expect("child");
     let child_id = child.id();
-    let pred =
-        |n: roxmltree::Node| n.id() == child_id || n.parent().is_some_and(|p| p.id() == child_id);
+    let pred = |n: Node| n.id() == child_id || n.parent().is_some_and(|p| p.id() == child_id);
 
     let mut output = Vec::new();
     canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
@@ -471,14 +470,14 @@ fn c14n_1_1_xml_base_inherited_resolved() {
     // Root has xml:base, middle has xml:base. Subset includes only leaf.
     // Inherited xml:base should be the fully resolved effective URI.
     let xml = r#"<a xml:base="http://ex.com/x/"><b xml:base="y/"><c/></b></a>"#;
-    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let doc = Document::parse(xml).expect("parse");
     let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
 
     let a = doc.root_element();
     let b = a.first_element_child().expect("b");
     let c = b.first_element_child().expect("c");
     let c_id = c.id();
-    let pred = |n: roxmltree::Node| n.id() == c_id;
+    let pred = |n: Node| n.id() == c_id;
 
     let mut output = Vec::new();
     canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
@@ -495,14 +494,14 @@ fn c14n_1_1_xml_base_inherited_resolved() {
 fn c14n_1_1_xml_base_dotdot_resolved() {
     // Relative xml:base with .. segment should be resolved.
     let xml = r#"<a xml:base="http://ex.com/a/b/"><b xml:base="../c/"><d/></b></a>"#;
-    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let doc = Document::parse(xml).expect("parse");
     let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
 
     let a = doc.root_element();
     let b = a.first_element_child().expect("b");
     let d = b.first_element_child().expect("d");
     let d_id = d.id();
-    let pred = |n: roxmltree::Node| n.id() == d_id;
+    let pred = |n: Node| n.id() == d_id;
 
     let mut output = Vec::new();
     canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
@@ -519,13 +518,12 @@ fn c14n_1_1_xml_base_dotdot_resolved() {
 fn c14n_1_0_xml_base_not_resolved() {
     // C14N 1.0 does NOT resolve xml:base — inherited value is raw.
     let xml = r#"<root xml:base="http://example.com/"><child xml:base="sub/">text</child></root>"#;
-    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let doc = Document::parse(xml).expect("parse");
     let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
 
     let child = doc.root_element().first_element_child().expect("child");
     let child_id = child.id();
-    let pred =
-        |n: roxmltree::Node| n.id() == child_id || n.parent().is_some_and(|p| p.id() == child_id);
+    let pred = |n: Node| n.id() == child_id || n.parent().is_some_and(|p| p.id() == child_id);
 
     let mut output = Vec::new();
     canonicalize(&doc, Some(&pred), &algo, &mut output).expect("c14n");
@@ -549,7 +547,7 @@ fn subset_xmlns_empty_with_excluded_default_ns_ancestor() {
     // parent_rendered is empty (root wasn't rendered), but child MUST emit
     // xmlns="" to undeclare the inherited default namespace from source tree.
     let xml = r#"<root xmlns="http://example.com"><child xmlns=""/></root>"#;
-    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let doc = Document::parse(xml).expect("parse");
     let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
 
     let child_id = doc
@@ -581,7 +579,7 @@ fn subset_no_spurious_xmlns_empty() {
     // Scenario: no default namespace anywhere in document.
     // Node-set includes only child. xmlns="" must NOT appear.
     let xml = r#"<root xmlns:a="http://a"><child/></root>"#;
-    let doc = roxmltree::Document::parse(xml).expect("parse");
+    let doc = Document::parse(xml).expect("parse");
     let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
 
     let child_id = doc

@@ -349,7 +349,7 @@ fn native_algorithm_claims_match_the_rust_api() {
                 )
         })
         .collect();
-    assert_eq!(claims.len(), 41);
+    assert_eq!(claims.len(), 51);
     for item in claims {
         assert_native_uri_support(item);
     }
@@ -380,16 +380,26 @@ fn assert_native_uri_support(item: &Item) {
             assert!(C14nAlgorithm::from_uri(uri).is_some(), "{}", item_id(item));
         }
         "xmlSecHrefDsaSha1"
+        | "xmlSecHrefDsaSha256"
+        | "xmlSecHrefEcdsaSha1"
+        | "xmlSecHrefEcdsaSha224"
         | "xmlSecHrefEcdsaSha256"
         | "xmlSecHrefEcdsaSha384"
+        | "xmlSecHrefEcdsaSha512"
         | "xmlSecHrefHmacSha1"
+        | "xmlSecHrefHmacSha224"
+        | "xmlSecHrefHmacSha256"
+        | "xmlSecHrefHmacSha384"
+        | "xmlSecHrefHmacSha512"
         | "xmlSecHrefRsaSha1"
+        | "xmlSecHrefRsaSha224"
         | "xmlSecHrefRsaSha256"
         | "xmlSecHrefRsaSha384"
         | "xmlSecHrefRsaSha512" => {
             assert_eq!(SignatureAlgorithm::from_uri(uri).unwrap().uri(), uri);
         }
-        "xmlSecHrefSha1" | "xmlSecHrefSha256" | "xmlSecHrefSha384" | "xmlSecHrefSha512" => {
+        "xmlSecHrefSha1" | "xmlSecHrefSha224" | "xmlSecHrefSha256" | "xmlSecHrefSha384"
+        | "xmlSecHrefSha512" => {
             assert_eq!(DigestAlgorithm::from_uri(uri).unwrap().uri(), uri);
         }
         "xmlSecHrefKWAes128" | "xmlSecHrefKWAes256" => {
@@ -530,6 +540,7 @@ fn legacy_algorithm_claims_are_policy_gated() {
         actual,
         BTreeSet::from([
             "xmlSecHrefDsaSha1",
+            "xmlSecHrefEcdsaSha1",
             "xmlSecHrefHmacSha1",
             "xmlSecHrefRsaSha1",
         ])
@@ -542,13 +553,55 @@ fn legacy_algorithm_claims_are_policy_gated() {
         .expect("SHA-1 digest URI must remain inventoried");
     let sha1_classification = classification(&ledger, sha1);
     assert_eq!(sha1_classification.outcome, "behavior-compatible");
-    assert!(sha1_classification.rationale.contains("verification-only"));
+    assert!(
+        sha1_classification
+            .rationale
+            .contains("secure signing defaults")
+    );
     assert!(
         xml_sec::policy::VerificationPolicy::default()
             .digest_algorithms
             .is_none()
     );
     assert!(!xml_sec::xmldsig::DigestAlgorithm::Sha1.signing_allowed());
+
+    let fixture = std::fs::read_to_string(
+        "tests/fixtures/xmldsig/xmldsig11-interop-2012/signature-enveloping-p256_sha1.xml",
+    )
+    .expect("SHA-1 interoperability fixture must be readable");
+    let mut verification_policy = xml_sec::policy::VerificationPolicy::default();
+    verification_policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(xml_sec::xmldsig::SignatureAlgorithm::EcdsaSha1);
+    let resolver = xml_sec::xmldsig::DefaultKeyResolver::default();
+    let result = xml_sec::xmldsig::VerifyContext::new()
+        .key_resolver(&resolver)
+        .policy(verification_policy)
+        .verify(&fixture)
+        .expect("explicit compatibility policy must execute SHA-1 verification");
+    assert_eq!(result.status, xml_sec::xmldsig::DsigStatus::Valid);
+
+    let builder = xml_sec::xmldsig::SignatureBuilder::new(
+        xml_sec::c14n::C14nAlgorithm::new(xml_sec::c14n::C14nMode::Exclusive1_0, false),
+        xml_sec::xmldsig::SignatureAlgorithm::RsaSha1,
+    )
+    .add_reference(
+        xml_sec::xmldsig::ReferenceBuilder::new(xml_sec::xmldsig::DigestAlgorithm::Sha1).uri(""),
+    );
+    assert!(builder.build_template().is_err());
+    let signing_policy = xml_sec::policy::SigningPolicy {
+        signature_algorithms: Some(std::collections::HashSet::from([
+            xml_sec::xmldsig::SignatureAlgorithm::RsaSha1,
+        ])),
+        digest_algorithms: Some(std::collections::HashSet::from([
+            xml_sec::xmldsig::DigestAlgorithm::Sha1,
+        ])),
+        ..xml_sec::policy::SigningPolicy::default()
+    };
+    builder
+        .build_template_with_policy(&signing_policy)
+        .expect("explicit compatibility policy must enable SHA-1 template construction");
 }
 
 #[cfg(feature = "xmldsig")]
@@ -849,6 +902,7 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
         "crypto",
         "crypto-config",
         "gen-key",
+        "hmac-key",
         "pkcs8-der",
         "pkcs8-pem",
         "print-crypto-library-errors",
@@ -873,6 +927,17 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
         .iter()
         .map(|spec| spec.canonical)
         .collect();
+    // Native extensions are intentionally absent from the donor inventory.
+    // Keep the list explicit so adding an option cannot silently weaken the
+    // libxmlsec1 compatibility classification below.
+    let native_extension_options = BTreeSet::from(["xml-backend"]);
+    assert!(native_extension_options.is_subset(&runtime_options));
+    assert!(native_extension_options.iter().all(|option| {
+        !ledger
+            .items
+            .iter()
+            .any(|item| item.kind == "cli-option" && item.name == format!("--{option}"))
+    }));
     let runtime_supported_options: BTreeSet<_> = runtime_options
         .iter()
         .copied()
@@ -893,6 +958,9 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
     assert_eq!(runtime_supported_options, ledger_supported_options);
 
     for spec in cli_args::OPTION_SPECS {
+        if native_extension_options.contains(spec.canonical) {
+            continue;
+        }
         let option = format!("--{}", spec.canonical);
         let item = ledger
             .items
@@ -954,3 +1022,4 @@ fn deprecated_surface_is_explicitly_unsupported() {
             .all(|item| classification(&ledger, item).outcome == "intentionally-unsupported")
     );
 }
+use xml_sec as roxmltree;

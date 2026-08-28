@@ -17,7 +17,7 @@ applyTo: "**/*.rs"
 - Use `TryFrom`/`TryInto` for fallible conversions; `as` casts need `#[expect(clippy::cast_possible_truncation)]` with reason
 - No `unwrap()` / `expect()` on I/O paths — use `Result` propagation
 - `expect()` is acceptable for programmer invariants (lock poisoning) with `#[expect(clippy::expect_used, reason = "...")]`
-- Code must pass `cargo clippy --all-features -- -D warnings`
+- Code must pass clippy with `xmldsig,xmlenc,c14n` and each XML backend mode, including differential comparison
 
 ## Testing
 

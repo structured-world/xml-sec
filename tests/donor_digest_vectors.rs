@@ -8,6 +8,8 @@
 use std::fs;
 use std::path::Path;
 
+use xml_sec::XmlDomDocument as Document;
+
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
 use xml_sec::xmldsig::uri::UriReferenceResolver;
 use xml_sec::xmldsig::verify::process_all_references;
@@ -20,7 +22,7 @@ fn donor_xml(name: &str) -> String {
 
 fn assert_donor_reference_digest_valid(name: &str) {
     let xml = donor_xml(name);
-    let doc = roxmltree::Document::parse(&xml)
+    let doc = Document::parse(&xml)
         .unwrap_or_else(|err| panic!("failed to parse donor XML {name}: {err}"));
     let sig_node = find_signature_node(&doc)
         .unwrap_or_else(|| panic!("missing Signature element in donor XML {name}"));

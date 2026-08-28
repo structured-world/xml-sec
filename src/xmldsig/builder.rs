@@ -60,7 +60,7 @@ pub enum SignatureBuilderError {
     /// An XPath parameter cannot be parsed or exceeds its resource bounds.
     #[error("invalid XPath expression: {0}")]
     InvalidXPath(String),
-    /// SHA-1 algorithms are available for verification but not new signatures.
+    /// The selected algorithm is disabled by the immutable signing policy.
     #[error("algorithm is not allowed for signing: {0}")]
     SigningAlgorithmDisabled(&'static str),
     /// The XML writer failed.
@@ -71,7 +71,7 @@ pub enum SignatureBuilderError {
     InvalidUtf8(#[from] std::string::FromUtf8Error),
     /// The generated template could not be parsed under the selected policy.
     #[error("generated XML template is invalid: {0}")]
-    GeneratedXml(#[from] roxmltree::Error),
+    GeneratedXml(#[from] crate::xml::dom::ParseError),
     /// The generated SignedInfo could not be canonicalized.
     #[error("generated SignedInfo canonicalization failed: {0}")]
     Canonicalization(#[from] crate::c14n::C14nError),
@@ -510,22 +510,7 @@ impl SignatureBuilder {
                 ));
             }
         }
-        if !self.sign_method.signing_allowed() {
-            return Err(SignatureBuilderError::SigningAlgorithmDisabled(
-                self.sign_method.uri(),
-            ));
-        }
-        if policy
-            .signature_algorithms
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&self.sign_method))
-        {
-            return Err(PolicyViolation::Algorithm {
-                operation: "signing",
-                algorithm: self.sign_method.uri().to_owned(),
-            }
-            .into());
-        }
+        policy.check_signature_algorithm(self.sign_method)?;
         if policy
             .transforms
             .allowed_algorithms
@@ -547,22 +532,7 @@ impl SignatureBuilder {
                     value: id.clone(),
                 });
             }
-            if !reference.digest_method.signing_allowed() {
-                return Err(SignatureBuilderError::SigningAlgorithmDisabled(
-                    reference.digest_method.uri(),
-                ));
-            }
-            if policy
-                .digest_algorithms
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&reference.digest_method))
-            {
-                return Err(PolicyViolation::Algorithm {
-                    operation: "signing",
-                    algorithm: reference.digest_method.uri().to_owned(),
-                }
-                .into());
-            }
+            policy.check_digest_algorithm(reference.digest_method)?;
         }
         Ok(())
     }

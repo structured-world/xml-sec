@@ -36,7 +36,7 @@ fn public_owned_parser_uses_the_operation_policy_snapshot() {
     let strict = SigningPolicy::default();
     assert!(matches!(
         XmlDocument::parse_with_policy(dtd_xml, &strict),
-        Err(XmlDocumentError::Parse(roxmltree::Error::DtdDetected))
+        Err(XmlDocumentError::Parse(xml_sec::ParseError::DtdDetected))
     ));
 
     let bounded = SigningPolicy {
@@ -48,7 +48,9 @@ fn public_owned_parser_uses_the_operation_policy_snapshot() {
     };
     assert!(matches!(
         XmlDocument::parse_with_policy("<root><child/></root>", &bounded),
-        Err(XmlDocumentError::Parse(roxmltree::Error::NodesLimitReached))
+        Err(XmlDocumentError::Parse(
+            xml_sec::ParseError::NodesLimitReached
+        ))
     ));
 
     let depth_bounded = SigningPolicy {

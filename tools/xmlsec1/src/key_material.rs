@@ -4,21 +4,37 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use roxmltree::Document;
+use aes::cipher::{BlockModeDecrypt as _, KeyIvInit as _, block_padding::Pkcs7};
+use crypto_bigint::{
+    BoxedUint,
+    modular::{BoxedMontyForm, BoxedMontyParams},
+};
+use der::{Decode as _, asn1::UintRef};
+use dsa::{
+    Components as DsaComponents, SigningKey as NativeDsaSigningKey, VerifyingKey as DsaVerifyingKey,
+};
+use md5::{Digest as _, Md5};
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
     pkcs1::{DecodeRsaPrivateKey as _, DecodeRsaPublicKey as _},
     pkcs8::{
         DecodePrivateKey as _, DecodePublicKey as _, EncodePrivateKey as _, EncodePublicKey as _,
+        EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef,
     },
 };
 use x509_parser::prelude::FromDer as _;
 use xml_sec::policy::{PolicyViolation, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
-    EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfo, RsaSigningKey, SignatureAlgorithm,
-    SigningKey, VerificationKey, find_signature_node, parse_key_info, parse_signed_info,
+    DsaSigningKey, DsigError, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey,
+    KeyInfo, ReferenceProcessingError, RsaSigningKey, SignatureAlgorithm, SigningKey,
+    VerificationKey, find_signature_node, materialize_signing_key_info_references,
+    materialize_verification_key_info_references, parse_key_info, parse_signed_info,
     uri::UriReferenceResolver,
 };
+use xml_sec::{
+    XmlDomDocument as Document, XmlDomNode as Node, XmlDomParsingOptions as ParsingOptions,
+};
+use zeroize::Zeroizing;
 
 // This is an absolute process-safety ceiling, not deployment policy. Parsed
 // key sizes remain governed by the operation policy after bounded ingestion.
@@ -63,6 +79,12 @@ pub enum KeyMaterialError {
 pub struct SignatureMetadata {
     pub algorithm: SignatureAlgorithm,
     pub key_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationKeyNameResolution {
+    IgnoreDocumentKeyInfo,
+    ResolveDocumentKeyInfo,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -119,17 +141,24 @@ pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialError> {
 ///
 /// libxmlsec1 uses a depth-first `xmlSecFindNode` lookup from the operation start
 /// node, so later signatures in the same subtree do not make selection ambiguous.
+/// Reference materialization is a key-selection concern: callers that pin a
+/// complete direct identity should request `IgnoreDocumentKeyInfo` and leave unused
+/// document references to the core resolver's `consumes_document_key_info`
+/// contract.
 pub fn verification_signature_metadata(
     xml: &str,
     start_node_id: Option<&str>,
     id_attributes: &[xml_sec::IdAttributeRegistration],
     policy: &VerificationPolicy,
+    key_name_resolution: VerificationKeyNameResolution,
+    xml_backend: xml_sec::XmlBackend,
 ) -> Result<SignatureMetadata, KeyMaterialError> {
     policy.validate()?;
     let document = parse_signature_document(
         xml,
         policy.xml.allow_internal_dtd,
         policy.resources.max_xml_nodes,
+        xml_backend,
     )?;
     let signature = select_signature(&document, start_node_id, id_attributes)?;
     let signed_info = signature
@@ -139,9 +168,29 @@ pub fn verification_signature_metadata(
     let algorithm = parse_signed_info(signed_info)
         .map(|info| info.signature_method)
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
+    let key_info = if key_name_resolution == VerificationKeyNameResolution::IgnoreDocumentKeyInfo {
+        None
+    } else {
+        let mut key_info = signature_key_info(signature)
+            .map(parse_key_info)
+            .transpose()
+            .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
+        if let Some(key_info) = &mut key_info {
+            let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
+            materialize_verification_key_info_references(
+                key_info,
+                resolver,
+                policy,
+                xml_sec::provider::default_provider(),
+                xml_backend,
+            )
+            .map_err(map_key_info_reference_error)?;
+        }
+        key_info
+    };
     Ok(SignatureMetadata {
         algorithm,
-        key_names: signature_key_names(signature),
+        key_names: key_names(&key_info),
     })
 }
 
@@ -150,12 +199,14 @@ pub fn signing_signature_metadata(
     start_node_id: Option<&str>,
     id_attributes: &[xml_sec::IdAttributeRegistration],
     policy: &SigningPolicy,
+    xml_backend: xml_sec::XmlBackend,
 ) -> Result<SigningTemplateMetadata, KeyMaterialError> {
     policy.validate()?;
     let document = parse_signature_document(
         xml,
         policy.xml.allow_internal_dtd,
         policy.resources.max_xml_nodes,
+        xml_backend,
     )?;
     let signature = select_signature(&document, start_node_id, id_attributes)?;
     let algorithm_uri = signature
@@ -171,22 +222,45 @@ pub fn signing_signature_metadata(
     let algorithm = SignatureAlgorithm::from_uri(algorithm_uri).ok_or_else(|| {
         KeyMaterialError::Signature(format!("unsupported signature algorithm: {algorithm_uri}"))
     })?;
-    let key_info = signature_key_info(signature)
+    let mut key_info = signature_key_info(signature)
         .map(parse_key_info)
         .transpose()
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
+    if let Some(key_info) = &mut key_info {
+        let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
+        materialize_signing_key_info_references(
+            key_info,
+            resolver,
+            policy,
+            xml_sec::provider::default_provider(),
+            xml_backend,
+        )
+        .map_err(map_key_info_reference_error)?;
+    }
     Ok(SigningTemplateMetadata {
         algorithm,
-        key_names: signature_key_names(signature),
+        key_names: key_names(&key_info),
         key_info,
     })
+}
+
+fn map_key_info_reference_error(error: DsigError) -> KeyMaterialError {
+    match error {
+        DsigError::Policy(error) => KeyMaterialError::Policy(error),
+        DsigError::InvalidStructure { reason } => KeyMaterialError::Signature(reason.to_owned()),
+        DsigError::Reference(ReferenceProcessingError::UriDereference(error)) => {
+            KeyMaterialError::Signature(error.to_string())
+        }
+        DsigError::ParseKeyInfo(error) => KeyMaterialError::Signature(error.to_string()),
+        error => KeyMaterialError::Signature(error.to_string()),
+    }
 }
 
 fn select_signature<'a>(
     document: &'a Document<'a>,
     start_node_id: Option<&str>,
     id_attributes: &[xml_sec::IdAttributeRegistration],
-) -> Result<roxmltree::Node<'a, 'a>, KeyMaterialError> {
+) -> Result<Node<'a, 'a>, KeyMaterialError> {
     match start_node_id {
         Some(id) => UriReferenceResolver::with_id_registrations(document, id_attributes)
             .node_for_id(id)
@@ -202,39 +276,34 @@ fn parse_signature_document(
     xml: &str,
     allow_internal_dtd: bool,
     max_xml_nodes: usize,
+    xml_backend: xml_sec::XmlBackend,
 ) -> Result<Document<'_>, KeyMaterialError> {
     let nodes_limit = u32::try_from(max_xml_nodes).map_err(|_| {
         KeyMaterialError::Signature("XML node ceiling does not fit the parser limit".into())
     })?;
-    Document::parse_with_options(
+    Document::parse_with_options_and_backend(
         xml,
-        roxmltree::ParsingOptions {
+        ParsingOptions {
             allow_dtd: allow_internal_dtd,
             nodes_limit,
-            entity_resolver: None,
         },
+        xml_backend,
     )
     .map_err(|error| KeyMaterialError::Signature(error.to_string()))
 }
 
-fn signature_key_names(signature: roxmltree::Node<'_, '_>) -> Vec<String> {
-    signature_key_info(signature)
-        .into_iter()
-        .flat_map(|key_info| key_info.children())
-        .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
-        .map(|key_name| {
-            key_name
-                .children()
-                .filter(roxmltree::Node::is_text)
-                .filter_map(|child| child.text())
-                .collect()
+fn key_names(key_info: &Option<KeyInfo>) -> Vec<String> {
+    key_info
+        .iter()
+        .flat_map(|key_info| &key_info.sources)
+        .filter_map(|source| match source {
+            xml_sec::xmldsig::KeyInfoSource::KeyName(name) => Some(name.clone()),
+            _ => None,
         })
         .collect()
 }
 
-fn signature_key_info<'a, 'input>(
-    signature: roxmltree::Node<'a, 'input>,
-) -> Option<roxmltree::Node<'a, 'input>> {
+fn signature_key_info<'a, 'input>(signature: Node<'a, 'input>) -> Option<Node<'a, 'input>> {
     signature
         .children()
         .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")))
@@ -242,46 +311,466 @@ fn signature_key_info<'a, 'input>(
 
 /// Decode caller-owned signing key bytes after the operation layer has charged
 /// their source length to its aggregate external-material budget.
+///
+/// `--pwd` is a credential available while reading a key, not a declaration
+/// that the selected container is encrypted. Container structure selects the
+/// decoder first, so a wrong password cannot fall through into plaintext key
+/// parsing while an unencrypted key remains valid when a password was supplied.
 pub fn decode_signing_key(
     path: &Path,
     bytes: &[u8],
     format: PrivateKeyFormat,
+    algorithm: SignatureAlgorithm,
+    password: Option<&[u8]>,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
-    if matches!(format, PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem)
-        && let Ok(text) = std::str::from_utf8(bytes)
+    match algorithm {
+        SignatureAlgorithm::RsaSha1
+        | SignatureAlgorithm::RsaSha224
+        | SignatureAlgorithm::RsaSha256
+        | SignatureAlgorithm::RsaSha384
+        | SignatureAlgorithm::RsaSha512 => decode_rsa_signing_key(path, bytes, format, password),
+        SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
+            // XMLDSig defines DSA signature methods only for SHA-1 and
+            // SHA-256. SHA-224 URIs exist for other key families, not DSA.
+            decode_dsa_signing_key(path, bytes, format, password)
+        }
+        SignatureAlgorithm::EcdsaSha1
+        | SignatureAlgorithm::EcdsaSha224
+        | SignatureAlgorithm::EcdsaSha256
+        | SignatureAlgorithm::EcdsaSha384
+        | SignatureAlgorithm::EcdsaSha512 => {
+            decode_ecdsa_signing_key(path, bytes, format, password)
+        }
+        SignatureAlgorithm::HmacSha1
+        | SignatureAlgorithm::HmacSha224
+        | SignatureAlgorithm::HmacSha256
+        | SignatureAlgorithm::HmacSha384
+        | SignatureAlgorithm::HmacSha512 => {
+            Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+        }
+        _ => Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
+    }
+}
+
+trait Pkcs8SigningKey: SigningKey + Sized + 'static {
+    fn decode_pkcs8_pem(text: &str) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
+    fn decode_pkcs8_der(bytes: &[u8]) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
+    fn decode_pkcs8_encrypted_pem(
+        text: &str,
+        password: &[u8],
+    ) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
+    fn decode_pkcs8_encrypted_der(
+        bytes: &[u8],
+        password: &[u8],
+    ) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
+}
+
+trait Sec1SigningKey: SigningKey + Sized + 'static {
+    fn decode_sec1_der(bytes: &[u8]) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Pkcs8ContainerKind {
+    Plain,
+    Encrypted,
+}
+
+#[derive(der::Sequence)]
+struct TraditionalDsaPrivateKey<'a> {
+    version: u8,
+    p: UintRef<'a>,
+    q: UintRef<'a>,
+    g: UintRef<'a>,
+    y: UintRef<'a>,
+    x: UintRef<'a>,
+}
+
+fn pkcs8_container_kind(bytes: &[u8], format: PrivateKeyFormat) -> Option<Pkcs8ContainerKind> {
+    match format {
+        PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem => {
+            match rsa::pkcs8::der::pem::decode_label(bytes).ok()? {
+                "PRIVATE KEY" => Some(Pkcs8ContainerKind::Plain),
+                "ENCRYPTED PRIVATE KEY" => Some(Pkcs8ContainerKind::Encrypted),
+                _ => None,
+            }
+        }
+        PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der => {
+            if PrivateKeyInfoRef::try_from(bytes).is_ok() {
+                Some(Pkcs8ContainerKind::Plain)
+            } else if EncryptedPrivateKeyInfoRef::try_from(bytes).is_ok() {
+                Some(Pkcs8ContainerKind::Encrypted)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+macro_rules! impl_pkcs8_signing_key {
+    ($($key:ty),+ $(,)?) => {
+        $(
+            impl Pkcs8SigningKey for $key {
+                fn decode_pkcs8_pem(
+                    text: &str,
+                ) -> Result<Self, xml_sec::xmldsig::SigningKeyError> {
+                    Self::from_pkcs8_pem(text)
+                }
+
+                fn decode_pkcs8_der(
+                    bytes: &[u8],
+                ) -> Result<Self, xml_sec::xmldsig::SigningKeyError> {
+                    Self::from_pkcs8_der(bytes)
+                }
+
+                fn decode_pkcs8_encrypted_pem(
+                    text: &str,
+                    password: &[u8],
+                ) -> Result<Self, xml_sec::xmldsig::SigningKeyError> {
+                    Self::from_pkcs8_encrypted_pem(text, password)
+                }
+
+                fn decode_pkcs8_encrypted_der(
+                    bytes: &[u8],
+                    password: &[u8],
+                ) -> Result<Self, xml_sec::xmldsig::SigningKeyError> {
+                    Self::from_pkcs8_encrypted_der(bytes, password)
+                }
+            }
+        )+
+    };
+}
+
+impl_pkcs8_signing_key!(
+    RsaSigningKey,
+    DsaSigningKey,
+    EcdsaP256SigningKey,
+    EcdsaP384SigningKey,
+    EcdsaP521SigningKey,
+);
+
+macro_rules! impl_sec1_signing_key {
+    ($($key:ty),+ $(,)?) => {
+        $(
+            impl Sec1SigningKey for $key {
+                fn decode_sec1_der(
+                    bytes: &[u8],
+                ) -> Result<Self, xml_sec::xmldsig::SigningKeyError> {
+                    Self::from_sec1_der(bytes)
+                }
+            }
+        )+
+    };
+}
+
+impl_sec1_signing_key!(
+    EcdsaP256SigningKey,
+    EcdsaP384SigningKey,
+    EcdsaP521SigningKey,
+);
+
+fn decode_pkcs8_signing_key<K: Pkcs8SigningKey>(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+    password: Option<&[u8]>,
+) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+    let key = match (format, pkcs8_container_kind(bytes, format), password) {
+        (
+            PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem,
+            Some(Pkcs8ContainerKind::Plain),
+            _,
+        ) => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| K::decode_pkcs8_pem(text).ok()),
+        (
+            PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der,
+            Some(Pkcs8ContainerKind::Plain),
+            _,
+        ) => K::decode_pkcs8_der(bytes).ok(),
+        (
+            PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem,
+            Some(Pkcs8ContainerKind::Encrypted),
+            Some(password),
+        ) => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| K::decode_pkcs8_encrypted_pem(text, password).ok()),
+        (
+            PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der,
+            Some(Pkcs8ContainerKind::Encrypted),
+            Some(password),
+        ) => K::decode_pkcs8_encrypted_der(bytes, password).ok(),
+        (_, Some(Pkcs8ContainerKind::Encrypted) | None, _) => None,
+    };
+    key.map(|key| Box::new(key) as Box<dyn SigningKey>)
+        .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+}
+
+fn decode_ecdsa_signing_key(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+    password: Option<&[u8]>,
+) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+    decode_ecdsa_curve::<EcdsaP256SigningKey>(path, bytes, format, password)
+        .or_else(|_| decode_ecdsa_curve::<EcdsaP384SigningKey>(path, bytes, format, password))
+        .or_else(|_| decode_ecdsa_curve::<EcdsaP521SigningKey>(path, bytes, format, password))
+}
+
+fn decode_ecdsa_curve<K: Pkcs8SigningKey + Sec1SigningKey>(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+    password: Option<&[u8]>,
+) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+    if pkcs8_container_kind(bytes, format).is_some() {
+        return decode_pkcs8_signing_key::<K>(path, bytes, format, password);
+    }
+
+    let pem_der = match format {
+        PrivateKeyFormat::Pem => {
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+            Some(decode_openssl_traditional_pem(
+                text,
+                "EC PRIVATE KEY",
+                password,
+                path,
+            )?)
+        }
+        PrivateKeyFormat::Der => None,
+        PrivateKeyFormat::Pkcs8Pem | PrivateKeyFormat::Pkcs8Der => {
+            return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+        }
+    };
+    let der = pem_der.as_ref().map_or(bytes, |der| der.as_slice());
+    let key = K::decode_sec1_der(der).ok();
+    key.map(|key| Box::new(key) as Box<dyn SigningKey>)
+        .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+}
+
+fn decode_dsa_signing_key(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+    password: Option<&[u8]>,
+) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+    if pkcs8_container_kind(bytes, format).is_some() {
+        return decode_pkcs8_signing_key::<DsaSigningKey>(path, bytes, format, password);
+    }
+
+    let pem_der = match format {
+        PrivateKeyFormat::Pem => {
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+            // Generic PEM uses the same password-aware OpenSSL envelope
+            // contract for DSA as for traditional RSA and SEC1 keys.
+            Some(decode_openssl_traditional_pem(
+                text,
+                "DSA PRIVATE KEY",
+                password,
+                path,
+            )?)
+        }
+        PrivateKeyFormat::Der => None,
+        PrivateKeyFormat::Pkcs8Pem | PrivateKeyFormat::Pkcs8Der => {
+            return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+        }
+    };
+    let der = pem_der.as_deref().map_or(bytes, Vec::as_slice);
+    let traditional = TraditionalDsaPrivateKey::from_der(der)
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    if traditional.version != 0 {
+        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    }
+
+    let p = BoxedUint::from_be_slice_vartime(traditional.p.as_bytes());
+    let q = BoxedUint::from_be_slice_vartime(traditional.q.as_bytes());
+    let g = BoxedUint::from_be_slice_vartime(traditional.g.as_bytes());
+    let y = BoxedUint::from_be_slice_vartime(traditional.y.as_bytes());
+    let x = BoxedUint::from_be_slice_vartime(traditional.x.as_bytes());
+    let components = DsaComponents::from_components(p, q, g)
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+
+    let params = BoxedMontyParams::new(components.p().clone());
+    let expected_y = BoxedMontyForm::new((**components.g()).clone(), &params)
+        .pow(&x)
+        .retrieve();
+    if expected_y != y {
+        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    }
+
+    let verifying_key = DsaVerifyingKey::from_components(components, y)
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    let key = NativeDsaSigningKey::from_components(verifying_key, x)
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    let normalized = key
+        .to_pkcs8_der()
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    DsaSigningKey::from_pkcs8_der(normalized.as_bytes())
+        .map(|key| Box::new(key) as Box<dyn SigningKey>)
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+}
+
+fn decode_rsa_signing_key(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+    password: Option<&[u8]>,
+) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+    if pkcs8_container_kind(bytes, format).is_some() {
+        return decode_pkcs8_signing_key::<RsaSigningKey>(path, bytes, format, password);
+    }
+    match format {
+        PrivateKeyFormat::Pem => {
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+            let key = decode_traditional_rsa_pem(text, password, path)?;
+            normalize_rsa_signing_key(key, path)
+        }
+        PrivateKeyFormat::Der => RsaPrivateKey::from_pkcs1_der(bytes).map_or_else(
+            |_| Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
+            |key| normalize_rsa_signing_key(key, path),
+        ),
+        PrivateKeyFormat::Pkcs8Pem | PrivateKeyFormat::Pkcs8Der => {
+            Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+        }
+    }
+}
+
+fn decode_traditional_rsa_pem(
+    text: &str,
+    password: Option<&[u8]>,
+    path: &Path,
+) -> Result<RsaPrivateKey, KeyMaterialError> {
+    let der = decode_openssl_traditional_pem(text, "RSA PRIVATE KEY", password, path)?;
+    RsaPrivateKey::from_pkcs1_der(&der)
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+}
+
+fn decode_openssl_traditional_pem(
+    text: &str,
+    expected_tag: &str,
+    password: Option<&[u8]>,
+    path: &Path,
+) -> Result<Zeroizing<Vec<u8>>, KeyMaterialError> {
+    // The header-aware parser accepts surrounding input, so enforce a single
+    // complete block before trusting its OpenSSL encryption metadata.
+    let text = text.trim_matches(|character: char| character.is_ascii_whitespace());
+    let begin = format!("-----BEGIN {expected_tag}-----");
+    let end = format!("-----END {expected_tag}-----");
+    if !text.starts_with(&begin)
+        || !text.ends_with(&end)
+        || text.matches(&begin).count() != 1
+        || text.matches(&end).count() != 1
     {
-        if let Ok(key) = RsaSigningKey::from_pkcs8_pem(text) {
-            return Ok(Box::new(key));
-        }
-        if let Ok(key) = EcdsaP256SigningKey::from_pkcs8_pem(text) {
-            return Ok(Box::new(key));
-        }
-        if let Ok(key) = EcdsaP384SigningKey::from_pkcs8_pem(text) {
-            return Ok(Box::new(key));
-        }
-        if format == PrivateKeyFormat::Pem
-            && let Ok(rsa) = RsaPrivateKey::from_pkcs1_pem(text)
-        {
-            return normalize_rsa_signing_key(rsa, path);
-        }
+        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
     }
-    if matches!(format, PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der) {
-        if let Ok(key) = RsaSigningKey::from_pkcs8_der(bytes) {
-            return Ok(Box::new(key));
-        }
-        if let Ok(key) = EcdsaP256SigningKey::from_pkcs8_der(bytes) {
-            return Ok(Box::new(key));
-        }
-        if let Ok(key) = EcdsaP384SigningKey::from_pkcs8_der(bytes) {
-            return Ok(Box::new(key));
-        }
-        if format == PrivateKeyFormat::Der
-            && let Ok(rsa) = RsaPrivateKey::from_pkcs1_der(bytes)
-        {
-            return normalize_rsa_signing_key(rsa, path);
-        }
+    let envelope =
+        pem::parse(text).map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    if envelope.tag() != expected_tag {
+        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
     }
-    Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+
+    let headers = envelope.headers();
+    if headers.iter().next().is_none() {
+        return Ok(Zeroizing::new(envelope.contents().to_vec()));
+    }
+    if headers.iter().count() != 2 || headers.get("Proc-Type") != Some("4,ENCRYPTED") {
+        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    }
+    let (cipher, encoded_iv) = headers
+        .get("DEK-Info")
+        .and_then(|value| value.split_once(','))
+        .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    let iv = decode_hex(encoded_iv)
+        .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    let password =
+        password.ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    decrypt_openssl_legacy_pem(cipher, &iv, envelope.contents(), password, path)
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|digits| {
+            let pair = std::str::from_utf8(digits).ok()?;
+            if !pair.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            u8::from_str_radix(pair, 16).ok()
+        })
+        .collect()
+}
+
+fn decrypt_openssl_legacy_pem(
+    cipher: &str,
+    iv: &[u8],
+    ciphertext: &[u8],
+    password: &[u8],
+    path: &Path,
+) -> Result<Zeroizing<Vec<u8>>, KeyMaterialError> {
+    let (key_len, iv_len) = match cipher {
+        "AES-128-CBC" => (16, 16),
+        "AES-192-CBC" => (24, 16),
+        "AES-256-CBC" => (32, 16),
+        "DES-CBC" => (8, 8),
+        "DES-EDE-CBC" => (16, 8),
+        "DES-EDE3-CBC" => (24, 8),
+        _ => return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
+    };
+    if iv.len() != iv_len || ciphertext.is_empty() || !ciphertext.len().is_multiple_of(iv_len) {
+        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    }
+
+    let key = openssl_legacy_key(password, &iv[..8], key_len);
+    let mut plaintext = Zeroizing::new(ciphertext.to_vec());
+    macro_rules! decrypt {
+        ($cipher:ty) => {{
+            let length = cbc::Decryptor::<$cipher>::new_from_slices(&key, iv)
+                .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?
+                .decrypt_padded::<Pkcs7>(&mut plaintext)
+                .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?
+                .len();
+            plaintext.truncate(length);
+        }};
+    }
+    match cipher {
+        "AES-128-CBC" => decrypt!(aes::Aes128),
+        "AES-192-CBC" => decrypt!(aes::Aes192),
+        "AES-256-CBC" => decrypt!(aes::Aes256),
+        "DES-CBC" => decrypt!(des::Des),
+        "DES-EDE-CBC" => decrypt!(des::TdesEde2),
+        "DES-EDE3-CBC" => decrypt!(des::TdesEde3),
+        _ => unreachable!("cipher allowlist was checked above"),
+    }
+    Ok(plaintext)
+}
+
+fn openssl_legacy_key(password: &[u8], salt: &[u8], key_len: usize) -> Zeroizing<Vec<u8>> {
+    // Traditional PEM uses OpenSSL EVP_BytesToKey with one MD5 iteration and
+    // the first eight IV bytes as salt. Only the key is derived; DEK-Info
+    // carries the complete IV used by CBC.
+    let mut key = Zeroizing::new(Vec::with_capacity(key_len));
+    let mut previous: Option<Zeroizing<[u8; 16]>> = None;
+    while key.len() < key_len {
+        let mut digest = Md5::new();
+        if let Some(previous) = previous.as_deref() {
+            digest.update(previous);
+        }
+        digest.update(password);
+        digest.update(salt);
+        let block = Zeroizing::new(<[u8; 16]>::from(digest.finalize()));
+        key.extend_from_slice(block.as_ref());
+        previous = Some(block);
+    }
+    key.truncate(key_len);
+    key
 }
 
 fn normalize_rsa_signing_key(
@@ -524,6 +1013,9 @@ pub(crate) fn decode_symmetric(
 mod tests {
     use std::fs;
 
+    use aes::cipher::BlockModeEncrypt as _;
+    use base64::Engine as _;
+    use der::Encode as _;
     use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
     use rsa::pkcs1::{EncodeRsaPrivateKey as _, EncodeRsaPublicKey as _};
 
@@ -535,7 +1027,273 @@ mod tests {
     ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
         let path = path.as_ref();
         let bytes = read(path)?;
-        decode_signing_key(path, &bytes, format)
+        decode_signing_key(path, &bytes, format, SignatureAlgorithm::RsaSha256, None)
+    }
+
+    fn traditional_dsa_der(key: &NativeDsaSigningKey, version: u8, y: &[u8]) -> Vec<u8> {
+        let verifying_key = key.verifying_key();
+        let components = verifying_key.components();
+        let p = components.p().to_be_bytes_trimmed_vartime();
+        let q = components.q().to_be_bytes_trimmed_vartime();
+        let g = components.g().to_be_bytes_trimmed_vartime();
+        let x = key.x().to_be_bytes_trimmed_vartime();
+        TraditionalDsaPrivateKey {
+            version,
+            p: UintRef::new(p.as_ref()).unwrap(),
+            q: UintRef::new(q.as_ref()).unwrap(),
+            g: UintRef::new(g.as_ref()).unwrap(),
+            y: UintRef::new(y).unwrap(),
+            x: UintRef::new(x.as_ref()).unwrap(),
+        }
+        .to_der()
+        .unwrap()
+    }
+
+    fn encrypted_traditional_pem(tag: &str, der: &[u8], password: &[u8]) -> String {
+        let iv = [0x39; 16];
+        let key = openssl_legacy_key(password, &iv[..8], 32);
+        let mut ciphertext = vec![0_u8; der.len() + 16];
+        ciphertext[..der.len()].copy_from_slice(der);
+        let ciphertext_len = cbc::Encryptor::<aes::Aes256>::new_from_slices(&key, &iv)
+            .unwrap()
+            .encrypt_padded::<Pkcs7>(&mut ciphertext, der.len())
+            .unwrap()
+            .len();
+        ciphertext.truncate(ciphertext_len);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(ciphertext);
+        let body = encoded
+            .as_bytes()
+            .chunks(64)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "-----BEGIN {tag}-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,{}\n\n{body}\n-----END {tag}-----\n",
+            iv.iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>()
+        )
+    }
+
+    #[test]
+    #[expect(
+        deprecated,
+        reason = "traditional OpenSSL DSA compatibility includes legacy 1024/160 containers"
+    )]
+    fn traditional_dsa_decoder_rejects_ambiguous_or_inconsistent_containers() {
+        // The generic DER option accepts the OpenSSL DSA structure only when
+        // its complete ASN.1 container and public/private components agree.
+        let mut rng = ChaCha20Rng::seed_from_u64(0xD5A1_D5A1);
+        let components = DsaComponents::try_generate_from_rng_with_key_size(
+            &mut rng,
+            dsa::KeySize::DSA_1024_160,
+        )
+        .unwrap();
+        let key = NativeDsaSigningKey::try_generate_from_rng_with_components(&mut rng, components)
+            .unwrap();
+        let y = key.verifying_key().y().to_be_bytes_trimmed_vartime();
+        let valid = traditional_dsa_der(&key, 0, y.as_ref());
+        let path = Path::new("traditional-dsa.der");
+        decode_signing_key(
+            path,
+            &valid,
+            PrivateKeyFormat::Der,
+            SignatureAlgorithm::DsaSha256,
+            None,
+        )
+        .expect("valid traditional DSA DER must decode");
+
+        let password = b"legacy-dsa-password";
+        let encrypted = encrypted_traditional_pem("DSA PRIVATE KEY", &valid, password);
+        let encrypted_path = Path::new("traditional-encrypted-dsa.pem");
+        decode_signing_key(
+            encrypted_path,
+            encrypted.as_bytes(),
+            PrivateKeyFormat::Pem,
+            SignatureAlgorithm::DsaSha256,
+            Some(password),
+        )
+        .expect("the correct password must decrypt traditional DSA PEM");
+        for rejected_password in [None, Some(b"wrong-password".as_slice())] {
+            assert!(
+                decode_signing_key(
+                    encrypted_path,
+                    encrypted.as_bytes(),
+                    PrivateKeyFormat::Pem,
+                    SignatureAlgorithm::DsaSha256,
+                    rejected_password,
+                )
+                .is_err(),
+                "missing or incorrect passwords must fail closed"
+            );
+        }
+        let trailing = format!("{encrypted}not-pem-trailing-input");
+        assert!(
+            decode_signing_key(
+                encrypted_path,
+                trailing.as_bytes(),
+                PrivateKeyFormat::Pem,
+                SignatureAlgorithm::DsaSha256,
+                Some(password),
+            )
+            .is_err(),
+            "encrypted DSA PEM must occupy the complete input"
+        );
+
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        let mut mismatched_y = y.to_vec();
+        *mismatched_y.last_mut().unwrap() ^= 1;
+        for (bytes, format) in [
+            (
+                traditional_dsa_der(&key, 1, y.as_ref()),
+                PrivateKeyFormat::Der,
+            ),
+            (trailing, PrivateKeyFormat::Der),
+            (
+                traditional_dsa_der(&key, 0, &mismatched_y),
+                PrivateKeyFormat::Der,
+            ),
+            (valid, PrivateKeyFormat::Pkcs8Der),
+        ] {
+            assert!(
+                decode_signing_key(path, &bytes, format, SignatureAlgorithm::DsaSha256, None,)
+                    .is_err(),
+                "malformed or misclassified traditional DSA must be rejected"
+            );
+        }
+    }
+
+    fn signing_template_with_key_info(key_info: &str, targets: &str) -> String {
+        format!(
+            r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:SignedInfo><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/></ds:SignedInfo><ds:SignatureValue/>{key_info}{targets}</ds:Signature>"##
+        )
+    }
+
+    #[test]
+    fn signing_metadata_rejects_invalid_key_info_reference_graphs() {
+        // Signing key selection must fail closed on the same malformed graph
+        // shapes rejected by verification rather than silently discarding the
+        // reference and selecting an unconstrained key.
+        let cases = [
+            (
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#missing\"/></ds:KeyInfo>",
+                "",
+                "KeyInfoReference target is missing or ambiguous",
+            ),
+            (
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
+                "<ds:Object Id=\"target\"/>",
+                "KeyInfoReference target must be KeyInfo",
+            ),
+            (
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
+                "<ds:KeyInfo Id=\"target\"><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
+                "KeyInfoReference cycle detected",
+            ),
+            (
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"keys.xml#target\"/></ds:KeyInfo>",
+                "",
+                "KeyInfoReference URI policy rejected the operation",
+            ),
+        ];
+        for (key_info, targets, expected) in cases {
+            let error = signing_signature_metadata(
+                &signing_template_with_key_info(key_info, targets),
+                None,
+                &[],
+                &SigningPolicy::default(),
+                xml_sec::XmlBackend::default(),
+            )
+            .expect_err("invalid KeyInfoReference graph must be rejected");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn signing_metadata_bounds_key_info_reference_depth() {
+        // Acyclic chains remain attacker-controlled, so traversal depth must
+        // consume the operation policy limit before parsing the next target.
+        let maximum = SigningPolicy::default()
+            .resources
+            .max_key_info_reference_depth;
+        let targets = (0..=maximum)
+            .map(|index| {
+                if index == maximum {
+                    format!("<ds:KeyInfo Id=\"level-{index}\"><ds:KeyName>key</ds:KeyName></ds:KeyInfo>")
+                } else {
+                    format!("<ds:KeyInfo Id=\"level-{index}\"><dsig11:KeyInfoReference URI=\"#level-{}\"/></ds:KeyInfo>", index + 1)
+                }
+            })
+            .collect::<String>();
+        let error = signing_signature_metadata(
+            &signing_template_with_key_info(
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#level-0\"/></ds:KeyInfo>",
+                &targets,
+            ),
+            None,
+            &[],
+            &SigningPolicy::default(),
+            xml_sec::XmlBackend::default(),
+        )
+        .expect_err("over-deep KeyInfoReference chain must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("policy maximum {maximum}")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn signing_metadata_bounds_key_info_reference_candidate_work() {
+        // Referenced sources share one aggregate candidate budget with the
+        // reference nodes themselves; each nested KeyInfo cannot reset it.
+        let mut policy = SigningPolicy::default();
+        policy.resources.max_key_candidates = 2;
+        let error = signing_signature_metadata(
+            &signing_template_with_key_info(
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
+                "<ds:KeyInfo Id=\"target\"><ds:KeyName>one</ds:KeyName><ds:KeyName>two</ds:KeyName></ds:KeyInfo>",
+            ),
+            None,
+            &[],
+            &policy,
+            xml_sec::XmlBackend::default(),
+        )
+        .expect_err("aggregate candidate work must respect operation policy");
+        assert!(
+            error
+                .to_string()
+                .contains("key candidates exceeds policy maximum 2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn signing_metadata_enforces_key_info_reference_uri_policy() {
+        // The signing policy can disable KeyInfoReference independently of
+        // ordinary signed-payload references; metadata selection must honor it
+        // before dereferencing even a valid same-document target.
+        let mut policy = SigningPolicy::default();
+        policy.uris.key_info_references = xml_sec::xmldsig::UriTypeSet::new(false, false, false);
+        let error = signing_signature_metadata(
+            &signing_template_with_key_info(
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
+                "<ds:KeyInfo Id=\"target\"><ds:KeyName>key</ds:KeyName></ds:KeyInfo>",
+            ),
+            None,
+            &[],
+            &policy,
+            xml_sec::XmlBackend::default(),
+        )
+        .expect_err("disabled KeyInfoReference URI class must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("KeyInfoReference URI policy rejected the operation"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -564,6 +1322,145 @@ mod tests {
         .expect("PKCS#1 public key must normalize");
         RsaPublicKey::from_public_key_der(&key.public_key_bytes)
             .expect("verification key must use SPKI DER");
+    }
+
+    #[test]
+    fn decrypts_traditional_encrypted_rsa_pem() {
+        // `--privkey-pem` follows libxmlsec1's container-agnostic PEM
+        // contract, including the OpenSSL legacy encrypted PKCS#1 envelope.
+        let encrypted = include_bytes!(
+            "../../../tests/fixtures/keys/rsa/rsa-2048-key-traditional-encrypted.pem"
+        );
+        let path = Path::new("rsa-2048-key-traditional-encrypted.pem");
+
+        decode_signing_key(
+            path,
+            encrypted,
+            PrivateKeyFormat::Pem,
+            SignatureAlgorithm::RsaSha256,
+            Some(b"legacy-rsa-password"),
+        )
+        .expect("the correct password must decrypt traditional RSA PEM");
+
+        for password in [None, Some(b"wrong-password".as_slice())] {
+            assert!(
+                decode_signing_key(
+                    path,
+                    encrypted,
+                    PrivateKeyFormat::Pem,
+                    SignatureAlgorithm::RsaSha256,
+                    password,
+                )
+                .is_err(),
+                "missing or incorrect passwords must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypts_traditional_encrypted_sec1_pem_for_every_curve() {
+        // Generic PEM keys use one password-aware OpenSSL envelope contract for
+        // every supported EC curve; explicit PKCS#8 options remain container-strict.
+        let password = b"legacy-ec-password";
+        let cases = [
+            (
+                SignatureAlgorithm::EcdsaSha256,
+                p256::SecretKey::from_slice(&[0x11; 32])
+                    .unwrap()
+                    .to_sec1_der()
+                    .unwrap()
+                    .to_vec(),
+            ),
+            (
+                SignatureAlgorithm::EcdsaSha384,
+                p384::SecretKey::from_slice(&[0x22; 48])
+                    .unwrap()
+                    .to_sec1_der()
+                    .unwrap()
+                    .to_vec(),
+            ),
+            (
+                SignatureAlgorithm::EcdsaSha512,
+                p521::SecretKey::from_slice(&[0x01; 66])
+                    .unwrap()
+                    .to_sec1_der()
+                    .unwrap()
+                    .to_vec(),
+            ),
+        ];
+
+        for (algorithm, der) in cases {
+            let encrypted = encrypted_traditional_pem("EC PRIVATE KEY", &der, password);
+            let path = Path::new("traditional-encrypted-ec.pem");
+            decode_signing_key(
+                path,
+                encrypted.as_bytes(),
+                PrivateKeyFormat::Pem,
+                algorithm,
+                Some(password),
+            )
+            .expect("the correct password must decrypt traditional SEC1 PEM");
+
+            for rejected_password in [None, Some(b"wrong-password".as_slice())] {
+                assert!(
+                    decode_signing_key(
+                        path,
+                        encrypted.as_bytes(),
+                        PrivateKeyFormat::Pem,
+                        algorithm,
+                        rejected_password,
+                    )
+                    .is_err(),
+                    "missing or incorrect passwords must fail closed"
+                );
+            }
+
+            let trailing = format!("{encrypted}not-pem-trailing-input");
+            assert!(
+                decode_signing_key(
+                    path,
+                    trailing.as_bytes(),
+                    PrivateKeyFormat::Pem,
+                    algorithm,
+                    Some(password),
+                )
+                .is_err(),
+                "encrypted SEC1 PEM must occupy the complete input"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_traditional_encrypted_rsa_pem() {
+        // Legacy PEM metadata is a parser configuration boundary: an
+        // unknown cipher, malformed IV, or extra input must never fall back to
+        // interpreting encrypted bytes as a plaintext private key.
+        let encrypted =
+            include_str!("../../../tests/fixtures/keys/rsa/rsa-2048-key-traditional-encrypted.pem");
+        let path = Path::new("rsa-2048-key-traditional-encrypted.pem");
+        let cases = [
+            encrypted.replace("AES-256-CBC", "RC2-CBC"),
+            encrypted.replace(
+                "C98DDAE6A971742BF435D3FF6CD60028",
+                "C98DDAE6A971742BF435D3FF6CD6002Z",
+            ),
+            format!("{encrypted}\nnot-pem-trailing-input"),
+            format!("{encrypted}\n{encrypted}"),
+        ];
+
+        for malformed in cases {
+            assert!(
+                decode_signing_key(
+                    path,
+                    malformed.as_bytes(),
+                    PrivateKeyFormat::Pem,
+                    SignatureAlgorithm::RsaSha256,
+                    Some(b"legacy-rsa-password"),
+                )
+                .is_err(),
+                "malformed legacy PEM envelopes must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -722,13 +1619,38 @@ mod tests {
             Some("ec"),
             &[],
             &xml_sec::policy::VerificationPolicy::default(),
+            VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
+            xml_sec::XmlBackend::default(),
         )
         .unwrap();
         assert_eq!(metadata.algorithm, SignatureAlgorithm::EcdsaSha256);
     }
 
     #[test]
-    fn signature_metadata_preserves_every_direct_key_name() {
+    fn direct_verification_metadata_ignores_malformed_document_keys() {
+        // A pinned caller key makes document KeyInfo irrelevant. Malformed key
+        // metadata must therefore remain for the core verifier to ignore.
+        let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
+        let xml = format!(
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue><ds:KeyInfo><dsig11:DEREncodedKeyValue>not-base64!</dsig11:DEREncodedKeyValue></ds:KeyInfo></ds:Signature>"#
+        );
+
+        let metadata = verification_signature_metadata(
+            &xml,
+            None,
+            &[],
+            &VerificationPolicy::default(),
+            VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
+            xml_sec::XmlBackend::default(),
+        )
+        .expect("unused malformed document keys must not block a pinned key");
+
+        assert_eq!(metadata.algorithm, SignatureAlgorithm::RsaSha256);
+        assert!(metadata.key_names.is_empty());
+    }
+
+    #[test]
+    fn signature_metadata_preserves_every_key_name_for_resolution() {
         // KeyInfo is an ordered list of lookup sources; collapsing it to the
         // first KeyName makes later valid key-manager entries unreachable.
         let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
@@ -741,10 +1663,47 @@ mod tests {
             None,
             &[],
             &xml_sec::policy::VerificationPolicy::default(),
+            VerificationKeyNameResolution::ResolveDocumentKeyInfo,
+            xml_sec::XmlBackend::default(),
         )
         .unwrap();
 
         assert_eq!(metadata.key_names, ["old", "wanted"]);
+    }
+
+    #[test]
+    fn verification_metadata_resolves_referenced_key_names() {
+        // CLI candidate selection precedes core verification, so it must see
+        // the same bounded KeyInfoReference graph as the verifier.
+        let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
+        let xml = format!(
+            r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue><ds:KeyInfo><dsig11:KeyInfoReference URI="#target"/></ds:KeyInfo></ds:Signature><ds:KeyInfo Id="target"><ds:KeyName>wanted</ds:KeyName></ds:KeyInfo></root>"##
+        );
+
+        let metadata = verification_signature_metadata(
+            &xml,
+            None,
+            &[],
+            &VerificationPolicy::default(),
+            VerificationKeyNameResolution::ResolveDocumentKeyInfo,
+            xml_sec::XmlBackend::default(),
+        )
+        .expect("same-document KeyInfoReference must resolve before candidate selection");
+
+        assert_eq!(metadata.key_names, ["wanted"]);
+
+        let mut disabled = VerificationPolicy::default();
+        disabled.key_sources.key_info_reference = false;
+        let error = verification_signature_metadata(
+            &xml,
+            None,
+            &[],
+            &disabled,
+            VerificationKeyNameResolution::ResolveDocumentKeyInfo,
+            xml_sec::XmlBackend::default(),
+        )
+        .expect_err("metadata selection must honor the verification key-source policy");
+        assert!(error.to_string().contains("key sources are disabled"));
     }
 
     #[test]
@@ -763,7 +1722,15 @@ mod tests {
             ..xml_sec::policy::VerificationPolicy::default()
         };
 
-        let error = verification_signature_metadata(&xml, None, &[], &policy).unwrap_err();
+        let error = verification_signature_metadata(
+            &xml,
+            None,
+            &[],
+            &policy,
+            VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
+            xml_sec::XmlBackend::default(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("nodes limit"));
     }
 }

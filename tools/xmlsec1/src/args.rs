@@ -10,6 +10,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
 };
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -114,13 +115,28 @@ pub struct OptionValue {
     pub value: Option<OsString>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct Invocation {
     pub command: Command,
     pub(crate) help_target: Option<HelpTarget>,
     pub options: BTreeMap<String, Vec<OptionValue>>,
     ordered_options: Vec<OptionValue>,
     pub positional: Vec<OsString>,
+    password: Option<Zeroizing<Vec<u8>>>,
+}
+
+impl fmt::Debug for Invocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Invocation")
+            .field("command", &self.command)
+            .field("help_target", &self.help_target)
+            .field("options", &self.options)
+            .field("ordered_options", &self.ordered_options)
+            .field("positional", &self.positional)
+            .field("password_present", &self.password.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -181,6 +197,7 @@ macro_rules! option_spec {
 pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
     option_spec!("output", ["o"], VALUE, false, SINGLE),
     option_spec!("crypto", [], VALUE, false, SINGLE),
+    option_spec!("xml-backend", [], VALUE, false, SINGLE),
     option_spec!("crypto-config", [], VALUE, false, SINGLE),
     option_spec!("verbose", [], FLAG, false, SINGLE),
     option_spec!("print-crypto-library-errors", [], FLAG, false, SINGLE),
@@ -247,10 +264,11 @@ impl Invocation {
             .map_err(|_| ParseError::NonUtf8)?;
         let (command, help_target) = Command::parse(&command_text)
             .ok_or_else(|| ParseError::UnknownCommand(command_text.clone()))?;
-        let remaining = args.collect::<Vec<_>>();
+        let mut remaining = args.collect::<Vec<_>>();
         let mut options = BTreeMap::<String, Vec<OptionValue>>::new();
         let mut ordered_options = Vec::new();
         let mut positional = Vec::new();
+        let mut password = None;
         let mut index = 0;
         let mut options_finished = false;
         while index < remaining.len() {
@@ -304,16 +322,23 @@ impl Invocation {
             {
                 return Err(ParseError::RepeatedOption(format!("--{name}")));
             }
-            let value =
-                match option_arity(name) {
-                    Arity::Flag => None,
-                    Arity::Value => {
-                        index += 1;
-                        Some(remaining.get(index).cloned().ok_or_else(|| {
-                            ParseError::MissingOptionValue(argument_text.to_owned())
-                        })?)
+            let missing_value_error = argument_text.to_owned();
+            let value = match option_arity(name) {
+                Arity::Flag => None,
+                Arity::Value => {
+                    index += 1;
+                    let raw = remaining
+                        .get_mut(index)
+                        .map(std::mem::take)
+                        .ok_or(ParseError::MissingOptionValue(missing_value_error))?;
+                    if name == "pwd" {
+                        password = Some(Zeroizing::new(raw.into_encoded_bytes()));
+                        None
+                    } else {
+                        Some(raw)
                     }
-                };
+                }
+            };
             let option = OptionValue {
                 name: name.to_owned(),
                 parameter,
@@ -329,6 +354,7 @@ impl Invocation {
             options,
             ordered_options,
             positional,
+            password,
         })
     }
 
@@ -341,6 +367,10 @@ impl Invocation {
             .get(name)
             .and_then(|values| values.last())
             .and_then(|entry| entry.value.as_deref())
+    }
+
+    pub(crate) fn password_bytes(&self) -> Option<&[u8]> {
+        self.password.as_deref().map(Vec::as_slice)
     }
 
     pub fn values(&self, name: &str) -> impl Iterator<Item = &OptionValue> {
@@ -455,6 +485,19 @@ mod tests {
                 OsStr::new("third.der")
             ]
         );
+    }
+
+    #[test]
+    fn password_is_not_retained_in_ordinary_option_storage() {
+        // Password bytes must have one zeroizing owner and must never be
+        // duplicated into debuggable option values.
+        let parsed = parse(&["xmlsec1", "sign", "--pwd", "private-value", "input.xml"])
+            .expect("password-bearing arguments must parse");
+
+        assert!(parsed.flag("pwd"));
+        assert_eq!(parsed.last_value("pwd"), None);
+        assert_eq!(parsed.password_bytes(), Some(b"private-value".as_slice()));
+        assert!(!format!("{parsed:?}").contains("private-value"));
     }
 
     #[test]

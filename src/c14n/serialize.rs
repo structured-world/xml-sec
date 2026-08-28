@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 
-use roxmltree::{Document, Node, NodeId, NodeType};
+use crate::xml::dom::{Document, Node, NodeId, NodeType};
 
 #[cfg(test)]
 use super::ClosureVisibility;
@@ -826,7 +826,7 @@ fn write_qualified_name(node: Node, output: &mut CanonicalOutput<'_>) -> io::Res
 mod tests {
     use super::super::ns_inclusive::InclusiveNsRenderer;
     use super::*;
-    use roxmltree::NodeId;
+    use crate::xml::dom::NodeId;
 
     #[test]
     fn empty_element_expanded() {

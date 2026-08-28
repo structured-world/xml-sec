@@ -1,6 +1,6 @@
 //! Sign an XML document with an enveloped RSA-SHA256 XMLDSig signature.
 //!
-//! Run with `cargo run --example sign --all-features`. The example uses test
+//! Run with `cargo run --example sign`. The example uses test
 //! credentials solely to demonstrate the API; applications must load their own
 //! PKCS#8 private key and matching X.509 certificate from secure storage.
 

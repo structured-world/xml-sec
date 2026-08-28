@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
-xml-sec = { path = "..", features = ["xmldsig"] }
+xml-sec = { path = "..", default-features = false, features = ["xmldsig", "xml-backend-differential"] }
 
 [[bin]]
 name = "xmldsig_verify"

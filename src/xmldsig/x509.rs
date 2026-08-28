@@ -718,11 +718,9 @@ fn verify_certificate_signature_with_provider(
     // RFC 5280 sections 4.1.1.2 and 4.1.2.3 require the outer and signed
     // AlgorithmIdentifier values to be identical. Enforce this independently
     // of the backend so the legacy DSA path cannot bypass the invariant.
-    if certificate.signature_algorithm != certificate.tbs_certificate.signature {
-        return Ok(false);
-    }
-    verify_x509_signature_with_provider(
+    verify_x509_signed_object_with_provider(
         &certificate.signature_algorithm,
+        &certificate.tbs_certificate.signature,
         &certificate.signature_value.data,
         certificate.tbs_certificate.as_ref(),
         issuer.public_key().raw,
@@ -781,14 +779,32 @@ fn verify_crl_signature_with_provider(
 ) -> Result<bool, X509ChainError> {
     // RFC 5280 sections 5.1.1.2 and 5.1.2.2 impose the same equality rule on
     // CRLs as certificates.
-    if crl.signature_algorithm != crl.tbs_cert_list.signature {
-        return Ok(false);
-    }
-    verify_x509_signature_with_provider(
+    verify_x509_signed_object_with_provider(
         &crl.signature_algorithm,
+        &crl.tbs_cert_list.signature,
         &crl.signature_value.data,
         crl.tbs_cert_list.as_ref(),
         issuer.public_key().raw,
+        provider,
+    )
+}
+
+fn verify_x509_signed_object_with_provider(
+    outer_algorithm: &AlgorithmIdentifier<'_>,
+    signed_algorithm: &AlgorithmIdentifier<'_>,
+    signature_der: &[u8],
+    signed_data: &[u8],
+    issuer_spki_der: &[u8],
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<bool, X509ChainError> {
+    if outer_algorithm != signed_algorithm {
+        return Ok(false);
+    }
+    verify_x509_signature_with_provider(
+        outer_algorithm,
+        signature_der,
+        signed_data,
+        issuer_spki_der,
         provider,
     )
 }
@@ -817,11 +833,15 @@ fn x509_signature_algorithm(
     let oid = identifier.algorithm.to_id_string();
     let algorithm = match oid.as_str() {
         "1.2.840.10040.4.3" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha1),
+        "2.16.840.1.101.3.4.3.1" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha224),
         "2.16.840.1.101.3.4.3.2" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha256),
         "2.16.840.1.101.3.4.3.3" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha384),
         "2.16.840.1.101.3.4.3.4" => X509SignatureAlgorithm::Dsa(super::DigestAlgorithm::Sha512),
         "1.2.840.113549.1.1.5" | "1.3.14.3.2.29" => {
             X509SignatureAlgorithm::RsaPkcs1v15(super::DigestAlgorithm::Sha1)
+        }
+        "1.2.840.113549.1.1.14" => {
+            X509SignatureAlgorithm::RsaPkcs1v15(super::DigestAlgorithm::Sha224)
         }
         "1.2.840.113549.1.1.11" => {
             X509SignatureAlgorithm::RsaPkcs1v15(super::DigestAlgorithm::Sha256)
@@ -834,6 +854,7 @@ fn x509_signature_algorithm(
         }
         "1.2.840.113549.1.1.10" => parse_rsa_pss_algorithm(identifier)?,
         "1.2.840.10045.4.1" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha1),
+        "1.2.840.10045.4.3.1" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha224),
         "1.2.840.10045.4.3.2" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha256),
         "1.2.840.10045.4.3.3" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha384),
         "1.2.840.10045.4.3.4" => X509SignatureAlgorithm::Ecdsa(super::DigestAlgorithm::Sha512),
@@ -939,6 +960,7 @@ fn parse_rsa_pss_algorithm(
 fn x509_digest_algorithm(oid: &str) -> Result<super::DigestAlgorithm, X509ChainError> {
     match oid {
         "1.3.14.3.2.26" => Ok(super::DigestAlgorithm::Sha1),
+        "2.16.840.1.101.3.4.2.4" => Ok(super::DigestAlgorithm::Sha224),
         "2.16.840.1.101.3.4.2.1" => Ok(super::DigestAlgorithm::Sha256),
         "2.16.840.1.101.3.4.2.2" => Ok(super::DigestAlgorithm::Sha384),
         "2.16.840.1.101.3.4.2.3" => Ok(super::DigestAlgorithm::Sha512),
@@ -1729,9 +1751,9 @@ mod tests {
     use std::str::FromStr as _;
 
     use super::*;
+    use crate::xml::dom::Document;
     use crate::xmldsig::{KeyInfoSource, parse::XMLDSIG_NS, parse_key_info};
     use p256::pkcs8::EncodePublicKey;
-    use roxmltree::Document;
     use sha2::{Digest, Sha256, Sha384};
     use signature::hazmat::PrehashSigner;
     use std::time::Duration;
@@ -2086,6 +2108,10 @@ mod tests {
         // implement it even when RustCrypto does not.
         for (oid, expected) in [
             (
+                "2.16.840.1.101.3.4.3.1",
+                X509SignatureAlgorithm::Dsa(super::super::DigestAlgorithm::Sha224),
+            ),
+            (
                 "2.16.840.1.101.3.4.3.2",
                 X509SignatureAlgorithm::Dsa(super::super::DigestAlgorithm::Sha256),
             ),
@@ -2100,6 +2126,14 @@ mod tests {
             (
                 "1.2.840.10045.4.1",
                 X509SignatureAlgorithm::Ecdsa(super::super::DigestAlgorithm::Sha1),
+            ),
+            (
+                "1.2.840.113549.1.1.14",
+                X509SignatureAlgorithm::RsaPkcs1v15(super::super::DigestAlgorithm::Sha224),
+            ),
+            (
+                "1.2.840.10045.4.3.1",
+                X509SignatureAlgorithm::Ecdsa(super::super::DigestAlgorithm::Sha224),
             ),
             (
                 "1.2.840.10045.4.3.4",
@@ -2122,8 +2156,10 @@ mod tests {
         // parameters. A NULL is not equivalent for these algorithm profiles.
         for oid in [
             "1.2.840.10040.4.3",
+            "2.16.840.1.101.3.4.3.1",
             "2.16.840.1.101.3.4.3.2",
             "1.2.840.10045.4.1",
+            "1.2.840.10045.4.3.1",
             "1.2.840.10045.4.3.2",
             "1.3.101.112",
         ] {
@@ -2142,26 +2178,37 @@ mod tests {
 
         // RSA PKCS#1 signature identifiers accept absent and NULL parameters
         // for interoperability, but no other ASN.1 value.
-        let rsa_oid =
-            Oid::from_str("1.2.840.113549.1.1.11").expect("static RSA signature OID must parse");
-        for parameters in [None, Some(Any::from_tag_and_data(Tag::Null, &[]))] {
+        for (oid, digest) in [
+            (
+                "1.2.840.113549.1.1.14",
+                super::super::DigestAlgorithm::Sha224,
+            ),
+            (
+                "1.2.840.113549.1.1.11",
+                super::super::DigestAlgorithm::Sha256,
+            ),
+        ] {
+            let rsa_oid = Oid::from_str(oid).expect("static RSA signature OID must parse");
+            for parameters in [None, Some(Any::from_tag_and_data(Tag::Null, &[]))] {
+                assert_eq!(
+                    x509_signature_algorithm(&AlgorithmIdentifier::new(
+                        rsa_oid.clone(),
+                        parameters,
+                    )),
+                    Ok(X509SignatureAlgorithm::RsaPkcs1v15(digest)),
+                );
+            }
             assert!(matches!(
-                x509_signature_algorithm(&AlgorithmIdentifier::new(rsa_oid.clone(), parameters)),
-                Ok(X509SignatureAlgorithm::RsaPkcs1v15(
-                    super::super::DigestAlgorithm::Sha256
-                ))
+                x509_signature_algorithm(&AlgorithmIdentifier::new(
+                    rsa_oid,
+                    Some(Any::from_tag_and_data(Tag::OctetString, &[])),
+                )),
+                Err(X509ChainError::InvalidDer {
+                    kind: "X.509 signature AlgorithmIdentifier parameters",
+                    ..
+                })
             ));
         }
-        assert!(matches!(
-            x509_signature_algorithm(&AlgorithmIdentifier::new(
-                rsa_oid,
-                Some(Any::from_tag_and_data(Tag::OctetString, &[])),
-            )),
-            Err(X509ChainError::InvalidDer {
-                kind: "X.509 signature AlgorithmIdentifier parameters",
-                ..
-            })
-        ));
     }
 
     #[test]
@@ -2199,6 +2246,31 @@ mod tests {
                 digest: super::super::DigestAlgorithm::Sha256,
                 mgf_digest: super::super::DigestAlgorithm::Sha256,
                 salt_len: 32,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_sha224_rsa_pss_certificate_parameters() {
+        // RFC 4055 permits SHA-224 independently for the message digest and
+        // MGF1. The provider-neutral parser must preserve that capability.
+        let der = [
+            0x30, 0x41, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a, 0x30,
+            0x34, 0xa0, 0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04,
+            0x02, 0x04, 0x05, 0x00, 0xa1, 0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+            0xf7, 0x0d, 0x01, 0x01, 0x08, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65,
+            0x03, 0x04, 0x02, 0x04, 0x05, 0x00, 0xa2, 0x03, 0x02, 0x01, 0x1c,
+        ];
+        let (rest, identifier) = AlgorithmIdentifier::from_der(&der)
+            .expect("standard SHA-224 RSA-PSS AlgorithmIdentifier must parse");
+        assert!(rest.is_empty());
+
+        assert_eq!(
+            x509_signature_algorithm(&identifier),
+            Ok(X509SignatureAlgorithm::RsaPss {
+                digest: super::super::DigestAlgorithm::Sha224,
+                mgf_digest: super::super::DigestAlgorithm::Sha224,
+                salt_len: 28,
             })
         );
     }

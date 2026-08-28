@@ -8,7 +8,7 @@ use base64::Engine as _;
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::policy::{
-    EcdsaSignatureValueEncoding, ManifestProcessing, SigningPolicy, VerificationPolicy,
+    EcdsaSignatureValueEncoding, HmacPolicy, ManifestProcessing, SigningPolicy, VerificationPolicy,
 };
 use xml_sec::xmldsig::mutation::append_signature_to_root;
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
@@ -16,12 +16,12 @@ use xml_sec::xmldsig::uri::UriReferenceResolver;
 use xml_sec::xmldsig::verify::process_all_references;
 use xml_sec::xmldsig::{
     DEFAULT_IMPLICIT_C14N_URI, DefaultKeyResolver, DigestAlgorithm, DsigStatus,
-    EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriter, ReferenceBuilder, RsaSigningKey,
-    SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError,
-    SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, TransformError, VerificationKey,
-    VerifyContext, X509CertificateKeyInfoWriter, XPathExpression, compute_reference_digest_values,
-    fill_reference_digest_values, parse_key_info, validate_signing_key,
-    verify_signature_with_pem_key,
+    EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriter, KeyValueInfoWriter, ReferenceBuilder,
+    RsaSigningKey, SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError,
+    SigningError, SigningKey, SigningKeyError, SigningPublicKeyInfo, Transform, TransformError,
+    VerificationKey, VerifyContext, X509CertificateKeyInfoWriter, XPathExpression,
+    compute_reference_digest_values, fill_reference_digest_values, parse_key_info,
+    validate_signing_key, verify_signature_with_pem_key,
 };
 
 fn exclusive_c14n() -> C14nAlgorithm {
@@ -287,9 +287,9 @@ fn rsa_signing_key_exposes_structured_public_key_info() {
 }
 
 #[test]
-fn signing_key_preflight_rejects_verify_only_algorithms() {
-    // Candidate search must not classify RSA-SHA1 as usable and then fail only
-    // after choosing that key; the shared preflight owns signing capability.
+fn signing_key_preflight_enforces_legacy_algorithm_policy() {
+    // Candidate search must reject RSA-SHA1 under secure defaults, while an
+    // explicit compatibility allowlist can opt into the implemented primitive.
     let key =
         RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
             .expect("RSA private key fixture must parse");
@@ -297,12 +297,75 @@ fn signing_key_preflight_rejects_verify_only_algorithms() {
 
     assert!(matches!(
         validate_signing_key(&key, SignatureAlgorithm::RsaSha1, &policy),
-        Err(SigningError::Key(
-            SigningKeyError::UnsupportedAlgorithm { .. }
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::Algorithm { .. }
         ))
     ));
+    let ecdsa_key = EcdsaP256SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime256v1-key.pem",
+    ))
+    .expect("P-256 private key fixture must parse");
+    assert!(matches!(
+        validate_signing_key(&ecdsa_key, SignatureAlgorithm::EcdsaSha1, &policy),
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::Algorithm { .. }
+        ))
+    ));
+    let mut compatibility_policy = policy.clone();
+    compatibility_policy.signature_algorithms = Some([SignatureAlgorithm::RsaSha1].into());
+    validate_signing_key(&key, SignatureAlgorithm::RsaSha1, &compatibility_policy)
+        .expect("an explicit compatibility policy may enable implemented RSA-SHA1 signing");
     validate_signing_key(&key, SignatureAlgorithm::RsaSha256, &policy)
         .expect("secure signing algorithm must remain usable");
+}
+
+#[test]
+fn signing_key_preflight_compares_custom_hmac_metadata_in_bits() {
+    struct HmacMetadataKey {
+        key_bits: usize,
+    }
+
+    impl SigningKey for HmacMetadataKey {
+        fn sign(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _canonical_signed_info: &[u8],
+        ) -> Result<Vec<u8>, SigningKeyError> {
+            Ok(vec![0; 32])
+        }
+
+        fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+            Ok(SigningPublicKeyInfo::Hmac {
+                key_bits: self.key_bits,
+            })
+        }
+    }
+
+    // Metadata from HSM-backed implementations is already measured in bits;
+    // rounding 127 up to 16 bytes would overstate the key's actual strength.
+    let policy = SigningPolicy {
+        hmac: HmacPolicy {
+            minimum_key_bits: 128,
+            minimum_output_bits: 128,
+        },
+        ..SigningPolicy::default()
+    };
+    assert!(matches!(
+        validate_signing_key(
+            &HmacMetadataKey { key_bits: 127 },
+            SignatureAlgorithm::HmacSha256,
+            &policy,
+        ),
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::InvalidKeyMaterial { .. }
+        ))
+    ));
+    validate_signing_key(
+        &HmacMetadataKey { key_bits: 128 },
+        SignatureAlgorithm::HmacSha256,
+        &policy,
+    )
+    .expect("an exact 128-bit HMAC key must meet the configured minimum");
 }
 
 #[test]
@@ -1494,7 +1557,9 @@ fn signing_internal_dtd_policy_reaches_builder_and_mutation_reparses() {
     assert!(matches!(
         SignContext::new(&private_key).sign_with_builder(xml, &builder),
         Err(SigningError::XmlMutation(
-            xml_sec::xmldsig::mutation::XmlMutationError::XmlParse(roxmltree::Error::DtdDetected)
+            xml_sec::xmldsig::mutation::XmlMutationError::XmlParse(
+                xml_sec::ParseError::DtdDetected
+            )
         ))
     ));
 
@@ -1983,8 +2048,8 @@ fn signing_template_bounds_xpath_expressions_across_references() {
 
 #[test]
 fn rejects_sha1_digest_for_signing_template() {
-    // SHA-1 remains verify-only. This manually crafted template bypasses the
-    // builder, so the digest pass must enforce the same policy before signing.
+    // SHA-1 remains disabled by default. This manually crafted template bypasses
+    // the builder, so the digest pass must enforce the same policy before signing.
     let xml = r##"<root><payload ID="payload">hello</payload><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#payload"><DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><DigestValue/></Reference></SignedInfo><SignatureValue/></Signature></root>"##;
 
     let err = compute_reference_digest_values(xml).expect_err("SHA-1 signing digest must fail");
@@ -2836,6 +2901,53 @@ fn signs_rsa_donor_templates_and_verifies_round_trip() {
 }
 
 #[test]
+fn explicit_legacy_sha1_policy_builds_signs_and_verifies() {
+    // A compatibility opt-in must reach builder validation, digest filling,
+    // built-in RSA signing, and verification without weakening secure defaults.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha1)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha1)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        )
+        .key_info(true);
+    assert!(
+        builder.build_template().is_err(),
+        "secure defaults must continue to reject SHA-1 signing"
+    );
+
+    let signing_policy = SigningPolicy {
+        signature_algorithms: Some(HashSet::from([SignatureAlgorithm::RsaSha1])),
+        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+        ..SigningPolicy::default()
+    };
+    let signed = SignContext::new(&private_key)
+        .policy(signing_policy)
+        .key_info_writer(&KeyValueInfoWriter)
+        .sign_with_builder(
+            "<root><payload ID=\"payload\">legacy interop</payload></root>",
+            &builder,
+        )
+        .expect("explicit compatibility policy must enable RSA-SHA1 signing");
+
+    let mut verification_policy = VerificationPolicy::default();
+    verification_policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(SignatureAlgorithm::RsaSha1);
+    let resolver = DefaultKeyResolver::default();
+    let result = VerifyContext::new()
+        .key_resolver(&resolver)
+        .policy(verification_policy)
+        .verify(&signed)
+        .expect("explicit compatibility policy must verify generated RSA-SHA1");
+    assert_eq!(result.status, DsigStatus::Valid);
+}
+
+#[test]
 fn signs_ecdsa_donor_templates_and_verifies_round_trip() {
     // The donor enveloped ECDSA templates include an XPath transform, which is
     // intentionally blocked until XPath support lands. The enveloping templates
@@ -2868,3 +2980,4 @@ fn signs_ecdsa_donor_templates_and_verifies_round_trip() {
         "tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem",
     );
 }
+use xml_sec as roxmltree;

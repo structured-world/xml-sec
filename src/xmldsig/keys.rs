@@ -10,6 +10,7 @@ use x509_parser::{
     public_key::PublicKey,
     x509::SubjectPublicKeyInfo,
 };
+use zeroize::Zeroizing;
 
 use super::signature::{
     signature_value_matches_spki, signature_value_matches_spki_with_encoding,
@@ -21,7 +22,7 @@ use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
     X509ChainOptions, X509DataInfo,
     parse::{
-        EC_P256_OID, EC_P384_OID, ParseError, X509ChainBuildError,
+        EC_P256_OID, EC_P384_OID, EC_P521_OID, ParseError, X509ChainBuildError,
         build_x509_certificate_paths_to_selector_targets,
         build_x509_certificate_paths_to_trusted_prefix, distinguished_names_equal,
         parse_x509_certificate, x509_certificate_matches_any_selector,
@@ -31,23 +32,26 @@ use super::{
     x509::verify_x509_certificate_chain_with_provider,
 };
 
-/// Caller-owned HMAC-SHA1 verification key.
+/// Caller-owned HMAC verification key.
+///
+/// Policy-free [`VerifyingKey`] calls enforce [`crate::policy::HmacPolicy::default`].
+/// [`super::VerifyContext`] supplies its immutable operation policy through the
+/// policy-aware hooks, so legacy truncation always requires an explicit opt-in.
+/// Owned secret bytes are zeroized when the key is dropped.
 #[derive(Clone)]
-pub struct HmacSha1VerificationKey {
-    secret: Vec<u8>,
-    output_len: usize,
+pub struct HmacVerificationKey {
+    secret: Zeroizing<Vec<u8>>,
 }
 
-impl fmt::Debug for HmacSha1VerificationKey {
+impl fmt::Debug for HmacVerificationKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("HmacSha1VerificationKey")
-            .field("output_length_bits", &(self.output_len * 8))
+            .debug_struct("HmacVerificationKey")
             .finish_non_exhaustive()
     }
 }
 
-impl HmacSha1VerificationKey {
+impl HmacVerificationKey {
     /// Construct a key from non-empty secret bytes.
     pub fn new(secret: impl Into<Vec<u8>>) -> Result<Self, KeyResolutionError> {
         let secret = secret.into();
@@ -55,34 +59,82 @@ impl HmacSha1VerificationKey {
             return Err(KeyResolutionError::InvalidPublicKey);
         }
         Ok(Self {
-            secret,
-            output_len: 20,
+            secret: Zeroizing::new(secret),
         })
     }
 
-    /// Bind this key to an XMLDSig HMAC output length in bits.
-    pub fn with_output_length_bits(
-        mut self,
-        output_length_bits: u16,
-    ) -> Result<Self, KeyResolutionError> {
-        if !(80..=160).contains(&output_length_bits) || !output_length_bits.is_multiple_of(8) {
-            return Err(KeyResolutionError::InvalidHmacOutputLength);
+    fn validate_output(
+        &self,
+        policy: crate::policy::HmacPolicy,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<(), DsigError> {
+        if algorithm.hmac_output_bits().is_none() {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
-        self.output_len = usize::from(output_length_bits / 8);
-        Ok(self)
+        policy.validate_key_bytes(self.secret.len())?;
+        policy.validate_output(algorithm, signature_value.len().saturating_mul(8))?;
+        Ok(())
+    }
+
+    fn verify_with_hmac_policy(
+        &self,
+        policy: crate::policy::HmacPolicy,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.validate_output(policy, algorithm, signature_value)?;
+        macro_rules! verify_hmac {
+            ($digest:ty) => {{
+                let mut mac = hmac::Hmac::<$digest>::new_from_slice(&self.secret)
+                    .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+                mac.update(signed_data);
+                let expected = mac.finalize().into_bytes();
+                subtle::ConstantTimeEq::ct_eq(&expected[..signature_value.len()], signature_value)
+                    .into()
+            }};
+        }
+        Ok(match algorithm {
+            SignatureAlgorithm::HmacSha1 => verify_hmac!(sha1::Sha1),
+            SignatureAlgorithm::HmacSha224 => verify_hmac!(sha2::Sha224),
+            SignatureAlgorithm::HmacSha256 => verify_hmac!(sha2::Sha256),
+            SignatureAlgorithm::HmacSha384 => verify_hmac!(sha2::Sha384),
+            SignatureAlgorithm::HmacSha512 => verify_hmac!(sha2::Sha512),
+            _ => return Err(KeyResolutionError::AlgorithmMismatch.into()),
+        })
     }
 }
 
-impl VerifyingKey for HmacSha1VerificationKey {
+impl VerifyingKey for HmacVerificationKey {
+    fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
+        policy
+            .hmac
+            .validate_key_bytes(self.secret.len())
+            .map_err(Into::into)
+    }
+
     fn validate_signature_value(
         &self,
         algorithm: SignatureAlgorithm,
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        if algorithm != SignatureAlgorithm::HmacSha1 {
-            return Err(KeyResolutionError::AlgorithmMismatch.into());
-        }
-        Ok(signature_value.len() == self.output_len)
+        self.validate_output(
+            crate::policy::HmacPolicy::default(),
+            algorithm,
+            signature_value,
+        )?;
+        Ok(true)
+    }
+
+    fn validate_signature_value_with_policy(
+        &self,
+        policy: &crate::policy::VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.validate_output(policy.hmac, algorithm, signature_value)?;
+        Ok(true)
     }
 
     fn verify(
@@ -91,19 +143,27 @@ impl VerifyingKey for HmacSha1VerificationKey {
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        if algorithm != SignatureAlgorithm::HmacSha1 {
-            return Err(KeyResolutionError::AlgorithmMismatch.into());
-        }
-        if signature_value.len() != self.output_len {
-            return Ok(false);
-        }
-        let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(&self.secret)
-            .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
-        mac.update(signed_data);
-        let expected = mac.finalize().into_bytes();
-        Ok(subtle::ConstantTimeEq::ct_eq(&expected[..self.output_len], signature_value).into())
+        self.verify_with_hmac_policy(
+            crate::policy::HmacPolicy::default(),
+            algorithm,
+            signed_data,
+            signature_value,
+        )
+    }
+
+    fn verify_with_policy(
+        &self,
+        policy: &crate::policy::VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.verify_with_hmac_policy(policy.hmac, algorithm, signed_data, signature_value)
     }
 }
+
+/// Compatibility name for the verification key originally limited to HMAC-SHA1.
+pub type HmacSha1VerificationKey = HmacVerificationKey;
 
 /// A public verification key available to key resolvers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,11 +181,14 @@ pub struct VerificationKey {
 impl VerifyingKey for VerificationKey {
     fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
         let result = match self.algorithm {
-            SignatureAlgorithm::DsaSha1 => validate_dsa_signature_spki_with_minimum(
-                &self.public_key_bytes,
-                policy.key_trust.dsa_keys.minimum_modulus_bits,
-            ),
+            SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
+                validate_dsa_signature_spki_with_minimum(
+                    &self.public_key_bytes,
+                    policy.key_trust.dsa_keys.minimum_modulus_bits,
+                )
+            }
             SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
             | SignatureAlgorithm::RsaSha512 => validate_rsa_signature_spki_with_minimum(
@@ -134,8 +197,15 @@ impl VerifyingKey for VerificationKey {
                 policy.key_trust.rsa_keys.minimum_modulus_bits,
             ),
             SignatureAlgorithm::HmacSha1
+            | SignatureAlgorithm::HmacSha224
+            | SignatureAlgorithm::HmacSha256
+            | SignatureAlgorithm::HmacSha384
+            | SignatureAlgorithm::HmacSha512
+            | SignatureAlgorithm::EcdsaSha1
+            | SignatureAlgorithm::EcdsaSha224
             | SignatureAlgorithm::EcdsaSha256
-            | SignatureAlgorithm::EcdsaSha384 => Ok(()),
+            | SignatureAlgorithm::EcdsaSha384
+            | SignatureAlgorithm::EcdsaSha512 => Ok(()),
         };
         result.map_err(DsigError::Crypto)
     }
@@ -180,16 +250,23 @@ impl VerifyingKey for VerificationKey {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
         let result = match algorithm {
-            SignatureAlgorithm::DsaSha1 => verify_dsa_signature_spki_primitive(
-                algorithm,
-                &self.public_key_bytes,
-                signed_data,
-                signature_value,
-            ),
-            SignatureAlgorithm::HmacSha1 => {
+            SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
+                verify_dsa_signature_spki_primitive(
+                    algorithm,
+                    &self.public_key_bytes,
+                    signed_data,
+                    signature_value,
+                )
+            }
+            SignatureAlgorithm::HmacSha1
+            | SignatureAlgorithm::HmacSha224
+            | SignatureAlgorithm::HmacSha256
+            | SignatureAlgorithm::HmacSha384
+            | SignatureAlgorithm::HmacSha512 => {
                 return Err(KeyResolutionError::AlgorithmMismatch.into());
             }
             SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
             | SignatureAlgorithm::RsaSha512 => verify_rsa_signature_spki_primitive(
@@ -198,14 +275,16 @@ impl VerifyingKey for VerificationKey {
                 signed_data,
                 signature_value,
             ),
-            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384 => {
-                verify_ecdsa_signature_spki(
-                    algorithm,
-                    &self.public_key_bytes,
-                    signed_data,
-                    signature_value,
-                )
-            }
+            SignatureAlgorithm::EcdsaSha1
+            | SignatureAlgorithm::EcdsaSha224
+            | SignatureAlgorithm::EcdsaSha256
+            | SignatureAlgorithm::EcdsaSha384
+            | SignatureAlgorithm::EcdsaSha512 => verify_ecdsa_signature_spki(
+                algorithm,
+                &self.public_key_bytes,
+                signed_data,
+                signature_value,
+            ),
         };
         result.map_err(DsigError::Crypto)
     }
@@ -222,7 +301,11 @@ impl VerifyingKey for VerificationKey {
         }
         if matches!(
             algorithm,
-            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384
+            SignatureAlgorithm::EcdsaSha1
+                | SignatureAlgorithm::EcdsaSha224
+                | SignatureAlgorithm::EcdsaSha256
+                | SignatureAlgorithm::EcdsaSha384
+                | SignatureAlgorithm::EcdsaSha512
         ) {
             return verify_ecdsa_signature_spki_with_encoding(
                 algorithm,
@@ -273,14 +356,17 @@ impl VerifyingKey for PolicyBoundVerificationKey {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
         let result = match algorithm {
-            SignatureAlgorithm::DsaSha1 => verify_dsa_signature_spki_with_minimum(
-                algorithm,
-                &self.key.public_key_bytes,
-                signed_data,
-                signature_value,
-                self.dsa_minimum_bits,
-            ),
+            SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
+                verify_dsa_signature_spki_with_minimum(
+                    algorithm,
+                    &self.key.public_key_bytes,
+                    signed_data,
+                    signature_value,
+                    self.dsa_minimum_bits,
+                )
+            }
             SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
             | SignatureAlgorithm::RsaSha512 => verify_rsa_signature_spki_with_minimum(
@@ -304,7 +390,11 @@ impl VerifyingKey for PolicyBoundVerificationKey {
     ) -> Result<bool, DsigError> {
         if matches!(
             algorithm,
-            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384
+            SignatureAlgorithm::EcdsaSha1
+                | SignatureAlgorithm::EcdsaSha224
+                | SignatureAlgorithm::EcdsaSha256
+                | SignatureAlgorithm::EcdsaSha384
+                | SignatureAlgorithm::EcdsaSha512
         ) {
             return self
                 .key
@@ -327,9 +417,6 @@ pub enum KeyResolutionError {
     /// Configured or embedded public key DER could not be parsed completely.
     #[error("invalid public key DER")]
     InvalidPublicKey,
-    /// HMAC-SHA1 output length is outside XMLDSig's byte-aligned 80-160 bit range.
-    #[error("HMAC-SHA1 output length must be byte-aligned and between 80 and 160 bits")]
-    InvalidHmacOutputLength,
     /// More than one configured certificate satisfies all X.509 selectors.
     #[error("X.509 lookup selectors match multiple configured certificates")]
     AmbiguousCertificate,
@@ -421,11 +508,15 @@ fn validate_key_info_source_permissions(
             KeyInfoSource::KeyValue(_) if !allowed.key_value => {
                 Some("KeyValue key sources are disabled")
             }
+            KeyInfoSource::KeyInfoReference { .. } if !allowed.key_info_reference => {
+                Some("KeyInfoReference key sources are disabled")
+            }
             KeyInfoSource::X509Data(_)
             | KeyInfoSource::DerEncodedKeyValue(_)
             | KeyInfoSource::KeyName(_)
             | KeyInfoSource::KeyValue(_)
-            | KeyInfoSource::RetrievalMethod { .. } => None,
+            | KeyInfoSource::RetrievalMethod { .. }
+            | KeyInfoSource::KeyInfoReference { .. } => None,
         };
         if let Some(reason) = disabled_reason {
             return Err(crate::policy::PolicyViolation::KeyTrust { reason });
@@ -826,7 +917,10 @@ impl DefaultKeyResolver {
     ) -> Result<Option<VerificationKey>, KeyResolutionError> {
         let public_key_bytes = match key_value {
             KeyValueInfo::Dsa { p, q, g, y } => {
-                if algorithm != SignatureAlgorithm::DsaSha1 {
+                if !matches!(
+                    algorithm,
+                    SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256
+                ) {
                     return Err(KeyResolutionError::AlgorithmMismatch);
                 }
                 let (Some(p), Some(q), Some(g)) = (p.as_deref(), q.as_deref(), g.as_deref()) else {
@@ -838,6 +932,7 @@ impl DefaultKeyResolver {
                 if !matches!(
                     algorithm,
                     SignatureAlgorithm::RsaSha1
+                        | SignatureAlgorithm::RsaSha224
                         | SignatureAlgorithm::RsaSha256
                         | SignatureAlgorithm::RsaSha384
                         | SignatureAlgorithm::RsaSha512
@@ -852,7 +947,11 @@ impl DefaultKeyResolver {
             } => {
                 if !matches!(
                     algorithm,
-                    SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384
+                    SignatureAlgorithm::EcdsaSha1
+                        | SignatureAlgorithm::EcdsaSha224
+                        | SignatureAlgorithm::EcdsaSha256
+                        | SignatureAlgorithm::EcdsaSha384
+                        | SignatureAlgorithm::EcdsaSha512
                 ) {
                     return Ok(None);
                 }
@@ -929,6 +1028,10 @@ impl DefaultKeyResolver {
                     }
                 }
                 KeyInfoSource::RetrievalMethod { .. } => {
+                    candidate_budget.charge()?;
+                    None
+                }
+                KeyInfoSource::KeyInfoReference { .. } => {
                     candidate_budget.charge()?;
                     None
                 }
@@ -1092,6 +1195,11 @@ fn ec_key_value_to_spki_der(
             .to_public_key_der()
             .map_err(|_| KeyResolutionError::InvalidPublicKey)
             .map(|der| der.as_bytes().to_vec()),
+        EC_P521_OID => p521::PublicKey::from_sec1_bytes(public_key)
+            .map_err(|_| KeyResolutionError::InvalidPublicKey)?
+            .to_public_key_der()
+            .map_err(|_| KeyResolutionError::InvalidPublicKey)
+            .map(|der| der.as_bytes().to_vec()),
         _ => Err(KeyResolutionError::InvalidPublicKey),
     }
 }
@@ -1125,23 +1233,30 @@ fn validate_spki_algorithm(
         .and_then(|value| value.as_oid().ok())
         .map(|oid| oid.to_id_string());
     match (algorithm, parsed) {
-        (SignatureAlgorithm::DsaSha1, PublicKey::DSA(_)) => {
+        (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256, PublicKey::DSA(_)) => {
             let _ = dsa::VerifyingKey::from_public_key_der(public_key_bytes)
                 .map_err(|_| KeyResolutionError::AlgorithmMismatch)?;
             Ok(())
         }
         (
             SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
             | SignatureAlgorithm::RsaSha512,
             PublicKey::RSA(_),
         ) => Ok(()),
-        (SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384, PublicKey::EC(_))
-            if matches!(
-                curve_oid.as_deref(),
-                Some("1.2.840.10045.3.1.7" | "1.3.132.0.34" | "1.3.132.0.35")
-            ) =>
+        (
+            SignatureAlgorithm::EcdsaSha1
+            | SignatureAlgorithm::EcdsaSha224
+            | SignatureAlgorithm::EcdsaSha256
+            | SignatureAlgorithm::EcdsaSha384
+            | SignatureAlgorithm::EcdsaSha512,
+            PublicKey::EC(_),
+        ) if matches!(
+            curve_oid.as_deref(),
+            Some(EC_P256_OID | EC_P384_OID | EC_P521_OID)
+        ) =>
         {
             Ok(())
         }
@@ -1151,6 +1266,7 @@ fn validate_spki_algorithm(
 
 #[cfg(test)]
 mod tests {
+    use crate::xml::dom as roxmltree;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -1621,39 +1737,58 @@ mod tests {
     }
 
     #[test]
-    fn hmac_key_enforces_its_bound_output_length() {
-        let full = HmacSha1VerificationKey::new(b"secret".to_vec())
+    fn hmac_key_uses_the_operation_policy_for_truncation() {
+        // Output length belongs to SignatureMethod and operation policy, not
+        // reusable secret key material. Legacy truncation therefore requires
+        // an explicit compatibility policy even on the policy-aware key hook.
+        let key = HmacVerificationKey::new(b"secret".to_vec())
             .expect("the fixture HMAC secret is non-empty");
-        let truncated = HmacSha1VerificationKey::new(b"secret".to_vec())
-            .expect("the fixture HMAC secret is non-empty")
-            .with_output_length_bits(80)
-            .expect("80 bits is a valid HMAC-SHA1 output length");
         let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(b"secret")
             .expect("HMAC accepts an arbitrary non-empty secret");
         mac.update(b"data");
         let expected = mac.finalize().into_bytes();
 
+        let policy = crate::policy::VerificationPolicy {
+            hmac: crate::policy::HmacPolicy {
+                minimum_key_bits: 40,
+                minimum_output_bits: 80,
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
         assert!(
-            !full
-                .verify(SignatureAlgorithm::HmacSha1, b"data", &expected[..10])
-                .expect("the key and algorithm match")
+            key.verify_with_policy(
+                &policy,
+                SignatureAlgorithm::HmacSha1,
+                b"data",
+                &expected[..10],
+            )
+            .expect("the compatibility policy and algorithm match")
         );
         assert!(
-            truncated
-                .verify(SignatureAlgorithm::HmacSha1, b"data", &expected[..10])
-                .expect("the key and algorithm match")
+            !key.verify_with_policy(&policy, SignatureAlgorithm::HmacSha1, b"data", &[0_u8; 10],)
+                .expect("a mismatched truncated MAC must be rejected")
         );
+    }
+
+    #[test]
+    fn hmac_key_direct_api_rejects_attacker_selected_short_output() {
+        // The policy-free trait method applies secure defaults; signature bytes
+        // cannot act as their own one-byte truncation declaration.
+        let key = HmacVerificationKey::new([0x42; 16]).expect("fixed HMAC key must parse");
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&[0x42; 16])
+            .expect("HMAC accepts the fixed secret");
+        mac.update(b"data");
+        let expected = mac.finalize().into_bytes();
+
         assert!(matches!(
-            HmacSha1VerificationKey::new(b"secret".to_vec())
-                .expect("the fixture HMAC secret is non-empty")
-                .with_output_length_bits(79),
-            Err(KeyResolutionError::InvalidHmacOutputLength)
-        ));
-        assert!(matches!(
-            HmacSha1VerificationKey::new(b"secret".to_vec())
-                .expect("the fixture HMAC secret is non-empty")
-                .with_output_length_bits(81),
-            Err(KeyResolutionError::InvalidHmacOutputLength)
+            key.verify(SignatureAlgorithm::HmacSha256, b"data", &expected[..1]),
+            Err(DsigError::Policy(
+                crate::policy::PolicyViolation::HmacOutputLength {
+                    minimum: 128,
+                    maximum: 256,
+                    actual: 8,
+                }
+            ))
         ));
     }
 
@@ -1661,10 +1796,8 @@ mod tests {
     fn hmac_key_debug_redacts_secret_material() {
         // Debug output may expose public verification parameters, never caller secrets.
         let secret = b"unique-debug-secret-marker";
-        let key = HmacSha1VerificationKey::new(secret.to_vec())
-            .expect("the fixture HMAC secret is non-empty")
-            .with_output_length_bits(80)
-            .expect("80 bits is a valid HMAC-SHA1 output length");
+        let key = HmacVerificationKey::new(secret.to_vec())
+            .expect("the fixture HMAC secret is non-empty");
 
         let debug = format!("{key:?}");
         assert!(
@@ -1672,8 +1805,7 @@ mod tests {
                 .contains(std::str::from_utf8(secret).expect("the debug marker is literal ASCII"))
         );
         assert!(!debug.contains(&format!("{secret:?}")));
-        assert!(debug.contains("output_length_bits"));
-        assert!(debug.contains("80"));
+        assert!(!debug.contains("output_length_bits"));
     }
 
     #[test]
@@ -2505,7 +2637,7 @@ mod tests {
             "certificate must repeat its signature OID"
         );
         for offset in offsets {
-            unsupported_intermediate[offset + ecdsa_sha256_oid.len() - 1] = 0x04;
+            unsupported_intermediate[offset + ecdsa_sha256_oid.len() - 1] = 0x05;
         }
 
         let anchored = x509_info(
@@ -2548,7 +2680,7 @@ mod tests {
                 crate::provider::default_provider(),
             ),
             Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { ref oid })
-                if oid == "1.2.840.10045.4.3.4"
+                if oid == "1.2.840.10045.4.3.5"
         ));
     }
 

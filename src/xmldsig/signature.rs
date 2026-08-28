@@ -20,7 +20,7 @@ use rsa::{
     traits::PublicKeyParts,
 };
 use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha384, Sha512};
+use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 use signature::Verifier;
 use x509_parser::prelude::FromDer;
 use x509_parser::public_key::{ECPoint, PublicKey};
@@ -46,26 +46,43 @@ pub(crate) fn signature_value_matches_algorithm_with_encoding(
     encoding: EcdsaSignatureValueEncoding,
 ) -> bool {
     match algorithm {
-        SignatureAlgorithm::DsaSha1 => signature_value.len() == 40,
-        SignatureAlgorithm::HmacSha1 => (10..=20).contains(&signature_value.len()),
+        SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => algorithm
+            .dsa_component_len()
+            .is_some_and(|component_len| signature_value.len() == component_len * 2),
+        SignatureAlgorithm::HmacSha1
+        | SignatureAlgorithm::HmacSha224
+        | SignatureAlgorithm::HmacSha256
+        | SignatureAlgorithm::HmacSha384
+        | SignatureAlgorithm::HmacSha512 => algorithm
+            .hmac_output_bits()
+            .is_some_and(|bits| (1..=bits / 8).contains(&signature_value.len())),
         // Opaque custom keys expose no modulus here, so the default can enforce
         // only non-empty framing under the absolute ceiling. Built-in keys
         // override this with the exact modulus width.
         SignatureAlgorithm::RsaSha1
+        | SignatureAlgorithm::RsaSha224
         | SignatureAlgorithm::RsaSha256
         | SignatureAlgorithm::RsaSha384
         | SignatureAlgorithm::RsaSha512 => {
             (1..=crate::hard_limits::RSA_MODULUS_BIT_CEILING / 8).contains(&signature_value.len())
         }
-        SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384 => [32, 48, 66]
-            .into_iter()
-            .any(|component_len| match encoding {
-                EcdsaSignatureValueEncoding::XmlDsig => signature_value.len() == component_len * 2,
-                EcdsaSignatureValueEncoding::XmlSecAsn1Der => {
-                    inspect_der_encoded_ecdsa_signature(signature_value, component_len)
-                        .is_ok_and(|value| value.is_some())
-                }
-            }),
+        SignatureAlgorithm::EcdsaSha1
+        | SignatureAlgorithm::EcdsaSha224
+        | SignatureAlgorithm::EcdsaSha256
+        | SignatureAlgorithm::EcdsaSha384
+        | SignatureAlgorithm::EcdsaSha512 => {
+            [32, 48, 66]
+                .into_iter()
+                .any(|component_len| match encoding {
+                    EcdsaSignatureValueEncoding::XmlDsig => {
+                        signature_value.len() == component_len * 2
+                    }
+                    EcdsaSignatureValueEncoding::XmlSecAsn1Der => {
+                        inspect_der_encoded_ecdsa_signature(signature_value, component_len)
+                            .is_ok_and(|value| value.is_some())
+                    }
+                })
+        }
     }
 }
 
@@ -98,9 +115,21 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
 
     match (algorithm, public_key) {
-        (SignatureAlgorithm::DsaSha1, PublicKey::DSA(_)) => Ok(signature_value.len() == 40),
+        (
+            algorithm @ (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256),
+            PublicKey::DSA(_),
+        ) => {
+            let key = dsa::VerifyingKey::from_public_key_der(public_key_spki_der)
+                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+            let component_len = usize::try_from(key.components().q().bits_vartime())
+                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
+                .div_ceil(8);
+            Ok(algorithm.dsa_component_len() == Some(component_len)
+                && signature_value.len() == component_len * 2)
+        }
         (
             SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
             | SignatureAlgorithm::RsaSha384
             | SignatureAlgorithm::RsaSha512,
@@ -110,7 +139,14 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
                 .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
             Ok(signature_value.len() == key.size())
         }
-        (SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384, PublicKey::EC(ec)) => {
+        (
+            SignatureAlgorithm::EcdsaSha1
+            | SignatureAlgorithm::EcdsaSha224
+            | SignatureAlgorithm::EcdsaSha256
+            | SignatureAlgorithm::EcdsaSha384
+            | SignatureAlgorithm::EcdsaSha512,
+            PublicKey::EC(ec),
+        ) => {
             validate_ec_public_key_encoding(&ec, &spki.subject_public_key.data)?;
             let (_, component_len) = ecdsa_curve_and_component_len(&spki, &ec)?;
             match encoding {
@@ -123,11 +159,16 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
             }
             Ok(true)
         }
-        (SignatureAlgorithm::HmacSha1, _) => {
-            Err(SignatureVerificationError::KeyAlgorithmMismatch {
-                uri: algorithm.uri().to_owned(),
-            })
-        }
+        (
+            SignatureAlgorithm::HmacSha1
+            | SignatureAlgorithm::HmacSha224
+            | SignatureAlgorithm::HmacSha256
+            | SignatureAlgorithm::HmacSha384
+            | SignatureAlgorithm::HmacSha512,
+            _,
+        ) => Err(SignatureVerificationError::KeyAlgorithmMismatch {
+            uri: algorithm.uri().to_owned(),
+        }),
         _ => Err(SignatureVerificationError::KeyAlgorithmMismatch {
             uri: algorithm.uri().to_owned(),
         }),
@@ -326,6 +367,9 @@ pub(crate) fn verify_rsa_signature_spki_primitive(
         SignatureAlgorithm::RsaSha1 => RsaVerifyingKey::<Sha1>::new(key)
             .verify(signed_data, &signature)
             .is_ok(),
+        SignatureAlgorithm::RsaSha224 => RsaVerifyingKey::<Sha224>::new(key)
+            .verify(signed_data, &signature)
+            .is_ok(),
         SignatureAlgorithm::RsaSha256 => RsaVerifyingKey::<Sha256>::new(key)
             .verify(signed_data, &signature)
             .is_ok(),
@@ -397,24 +441,39 @@ pub(crate) fn verify_dsa_signature_spki_primitive(
     signed_data: &[u8],
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
-    if algorithm != SignatureAlgorithm::DsaSha1 {
+    if !matches!(
+        algorithm,
+        SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256
+    ) {
         return Err(SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_string(),
         });
     }
-    if signature_value.len() != 40 {
-        return Ok(false);
-    }
     let key = dsa::VerifyingKey::from_public_key_der(public_key_spki_der)
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let component_len = usize::try_from(key.components().q().bits_vartime())
+        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
+        .div_ceil(8);
+    if algorithm.dsa_component_len() != Some(component_len) {
+        return Ok(false);
+    }
+    if signature_value.len() != component_len.saturating_mul(2) {
+        return Ok(false);
+    }
     let Some(signature) = dsa::Signature::from_components(
-        crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[..20]),
-        crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[20..]),
+        crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[..component_len]),
+        crypto_bigint::BoxedUint::from_be_slice_vartime(&signature_value[component_len..]),
     ) else {
         return Ok(false);
     };
-    let digest = Sha1::digest(signed_data);
-    Ok(key.verify_prehash(&digest, &signature).is_ok())
+    let verified = match algorithm {
+        SignatureAlgorithm::DsaSha1 => key.verify_prehash(&Sha1::digest(signed_data), &signature),
+        SignatureAlgorithm::DsaSha256 => {
+            key.verify_prehash(&Sha256::digest(signed_data), &signature)
+        }
+        _ => unreachable!("DSA algorithm checked above"),
+    };
+    Ok(verified.is_ok())
 }
 
 /// Verify an ECDSA XMLDSig signature using DER-encoded SPKI public key bytes.
@@ -450,7 +509,11 @@ pub fn verify_ecdsa_signature_spki_with_encoding(
 ) -> Result<bool, SignatureVerificationError> {
     if !matches!(
         algorithm,
-        SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384
+        SignatureAlgorithm::EcdsaSha1
+            | SignatureAlgorithm::EcdsaSha224
+            | SignatureAlgorithm::EcdsaSha256
+            | SignatureAlgorithm::EcdsaSha384
+            | SignatureAlgorithm::EcdsaSha512
     ) {
         return Err(SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_string(),
@@ -487,8 +550,11 @@ pub fn verify_ecdsa_signature_spki_with_encoding(
                 }
             };
             let prehash = match algorithm {
+                SignatureAlgorithm::EcdsaSha1 => Sha1::digest(signed_data).to_vec(),
+                SignatureAlgorithm::EcdsaSha224 => Sha224::digest(signed_data).to_vec(),
                 SignatureAlgorithm::EcdsaSha256 => Sha256::digest(signed_data).to_vec(),
                 SignatureAlgorithm::EcdsaSha384 => Sha384::digest(signed_data).to_vec(),
+                SignatureAlgorithm::EcdsaSha512 => Sha512::digest(signed_data).to_vec(),
                 _ => unreachable!("ECDSA algorithm was validated above"),
             };
             match curve {
@@ -566,6 +632,7 @@ fn ensure_rsa_signature_algorithm(
 ) -> Result<(), SignatureVerificationError> {
     match algorithm {
         SignatureAlgorithm::RsaSha1
+        | SignatureAlgorithm::RsaSha224
         | SignatureAlgorithm::RsaSha256
         | SignatureAlgorithm::RsaSha384
         | SignatureAlgorithm::RsaSha512 => Ok(()),
@@ -637,24 +704,55 @@ fn verify_ecdsa_p521(
     verify_p521_signature(&key, signature_value, signature_encoding, prehash)
 }
 
+trait DecodeEcdsaSignature: Sized {
+    fn decode_fixed_width(bytes: &[u8]) -> Result<Self, SignatureVerificationError>;
+    fn decode_der(bytes: &[u8]) -> Result<Self, SignatureVerificationError>;
+}
+
+macro_rules! impl_ecdsa_signature_decoder {
+    ($signature:ty) => {
+        impl DecodeEcdsaSignature for $signature {
+            fn decode_fixed_width(bytes: &[u8]) -> Result<Self, SignatureVerificationError> {
+                Self::from_slice(bytes)
+                    .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)
+            }
+
+            fn decode_der(bytes: &[u8]) -> Result<Self, SignatureVerificationError> {
+                Self::from_der(bytes)
+                    .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)
+            }
+        }
+    };
+}
+
+impl_ecdsa_signature_decoder!(P256Signature);
+impl_ecdsa_signature_decoder!(P384Signature);
+impl_ecdsa_signature_decoder!(P521Signature);
+
+fn verify_ecdsa_signature<K, S>(
+    key: &K,
+    signature_value: &[u8],
+    signature_encoding: EcdsaSignatureEncoding,
+    prehash: &[u8],
+) -> Result<bool, SignatureVerificationError>
+where
+    K: PrehashVerifier<S>,
+    S: DecodeEcdsaSignature,
+{
+    let signature = match signature_encoding {
+        EcdsaSignatureEncoding::XmlDsigFixed => S::decode_fixed_width(signature_value)?,
+        EcdsaSignatureEncoding::Asn1Der => S::decode_der(signature_value)?,
+    };
+    Ok(key.verify_prehash(prehash, &signature).is_ok())
+}
+
 fn verify_p256_signature(
     key: &P256VerifyingKey,
     signature_value: &[u8],
     signature_encoding: EcdsaSignatureEncoding,
     prehash: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
-    match signature_encoding {
-        EcdsaSignatureEncoding::XmlDsigFixed => {
-            let signature = P256Signature::from_slice(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
-        EcdsaSignatureEncoding::Asn1Der => {
-            let signature = P256Signature::from_der(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
-    }
+    verify_ecdsa_signature::<_, P256Signature>(key, signature_value, signature_encoding, prehash)
 }
 
 fn verify_p384_signature(
@@ -663,18 +761,7 @@ fn verify_p384_signature(
     signature_encoding: EcdsaSignatureEncoding,
     prehash: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
-    match signature_encoding {
-        EcdsaSignatureEncoding::XmlDsigFixed => {
-            let signature = P384Signature::from_slice(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
-        EcdsaSignatureEncoding::Asn1Der => {
-            let signature = P384Signature::from_der(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
-    }
+    verify_ecdsa_signature::<_, P384Signature>(key, signature_value, signature_encoding, prehash)
 }
 
 fn verify_p521_signature(
@@ -683,18 +770,7 @@ fn verify_p521_signature(
     signature_encoding: EcdsaSignatureEncoding,
     prehash: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
-    match signature_encoding {
-        EcdsaSignatureEncoding::XmlDsigFixed => {
-            let signature = P521Signature::from_slice(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
-        EcdsaSignatureEncoding::Asn1Der => {
-            let signature = P521Signature::from_der(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
-    }
+    verify_ecdsa_signature::<_, P521Signature>(key, signature_value, signature_encoding, prehash)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

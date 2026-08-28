@@ -19,6 +19,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use xml_sec::{XmlDomDocument as Document, XmlDomNode as Node};
 
 use sha1::{Digest, Sha1};
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize, canonicalize_xml};
@@ -205,17 +206,14 @@ fn c14n11_xml_base_inclusive_c14n11() {
 // This tests subtree exclusive C14N without needing XPath evaluation.
 
 /// Find the element with a given Id attribute value in a roxmltree document.
-fn find_element_by_id<'a>(
-    doc: &'a roxmltree::Document<'a>,
-    id_value: &str,
-) -> roxmltree::Node<'a, 'a> {
+fn find_element_by_id<'a>(doc: &'a Document<'a>, id_value: &str) -> Node<'a, 'a> {
     doc.descendants()
         .find(|n| n.attribute("Id") == Some(id_value))
         .unwrap_or_else(|| panic!("element with Id=\"{id_value}\" not found"))
 }
 
 /// Build a node-set predicate that includes a node and all its descendants.
-fn subtree_predicate(root: roxmltree::Node) -> impl Fn(roxmltree::Node) -> bool + use<> {
+fn subtree_predicate(root: Node) -> impl Fn(Node) -> bool + use<> {
     let mut ids = HashSet::new();
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
@@ -224,12 +222,12 @@ fn subtree_predicate(root: roxmltree::Node) -> impl Fn(roxmltree::Node) -> bool 
             stack.push(child);
         }
     }
-    move |n: roxmltree::Node| ids.contains(&n.id())
+    move |n: Node| ids.contains(&n.id())
 }
 
 /// Canonicalize a subtree identified by Id and return the canonical bytes.
 fn canonicalize_subtree_by_id(xml_str: &str, id_value: &str, algo: &C14nAlgorithm) -> Vec<u8> {
-    let doc = roxmltree::Document::parse(xml_str).expect("parse XML");
+    let doc = Document::parse(xml_str).expect("parse XML");
     let target = find_element_by_id(&doc, id_value);
     let pred = subtree_predicate(target);
     let mut output = Vec::new();
@@ -307,7 +305,7 @@ fn merlin_xpath_subset_and_signed_info_match_all_28_golden_outputs() {
     // combination. Comparing exact octets catches node-kind, namespace, and
     // inherited-attribute errors that digest-only checks cannot localize.
     let xml = fixture("merlin-c14n-three/signature.xml");
-    let document = roxmltree::Document::parse(&xml).expect("Merlin signature must parse");
+    let document = Document::parse(&xml).expect("Merlin signature must parse");
     let signature = find_signature_node(&document).expect("Merlin Signature element");
     let signed_info_node = signature
         .children()

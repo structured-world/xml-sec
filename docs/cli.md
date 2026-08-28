@@ -76,7 +76,12 @@ when decoding fails.
 
 Capability checks and runtime dispatch use one registry. A transform or key-data
 class absent from `list-*` is not silently substituted and causes `check-*` to
-fail. Backend selection is equally strict: `--crypto rustcrypto` and
+fail. XML parser selection is available on `sign`, `verify`, `encrypt`, and
+`decrypt` through `--xml-backend xmloxide|roxmltree|differential`. The selected
+backend is preserved through metadata discovery, recursive external XML,
+transforms, mutation validation, and the complete operation pipeline. A thin
+binary rejects an implementation that was not compiled; no parser fallback is
+performed. Crypto backend selection is equally strict: `--crypto rustcrypto` and
 `--crypto default` select the built-in provider; other backend names do not
 fall back to RustCrypto. The upstream runners pass `--crypto-config` for every
 backend. RustCrypto accepts an absent or empty configuration directory because
@@ -130,6 +135,12 @@ xmlsec1 sign --privkey-pem signing-key.pem --output signed.xml template.xml
 xmlsec1 verify --pubkey-pem signing-key.pub.pem signed.xml
 ```
 
+The binary is an explicit libxmlsec1 compatibility boundary: `sign` and
+`verify` accept the implemented SHA-1 signature and digest methods used by
+legacy donor documents. This opt-in is local to the CLI. Library callers retain
+the secure defaults and must explicitly allow each legacy algorithm through
+their immutable signing or verification policy.
+
 Signing key options accept libxmlsec1's comma-separated certificate form,
 `key.pem,leaf.pem,intermediate.pem,...`. Every certificate is structurally
 validated, and the first certificate must contain the signing key. When the
@@ -160,6 +171,20 @@ are checked during each attempt rather than only after selecting a key. The CLI
 rejects an oversized candidate ring before opening any private-key source, and
 every successfully read private-key source and certificate companion is also
 charged to one invocation-wide external-material byte budget before decoding.
+Before signing- or verification-key selection, the CLI recursively materializes
+same-document `KeyInfoReference` sources under the operation policy's shared
+depth and key-candidate limits. Referenced `KeyName` and public identity sources therefore
+participate in the same selection and validation as direct children. Missing,
+ambiguous, non-`KeyInfo`, cyclic, over-budget, and external references fail
+closed; the CLI never reads external key metadata implicitly.
+For RSA, DSA, P-256, P-384, and P-521 signing, `--pwd` decrypts
+password-protected PKCS#8 PEM or DER supplied through the matching private-key
+option. The generic `--privkey-pem` option also accepts OpenSSL traditional
+encrypted PKCS#1 RSA, DSA, and SEC1 P-256/P-384/P-521 PEM. The container label,
+headers, or DER structure select encrypted versus plain decoding first: a
+supplied password is ignored for a plain key, while a missing or wrong password
+for an encrypted key fails without a plaintext fallback, before output is
+committed, and is never included in diagnostics.
 
 Verification accepts `-` as the conventional stdin marker. Verification starts
 at the document root and uses the first descendant `Signature` in document order.
@@ -314,6 +339,15 @@ A direct `--aes-key` cannot satisfy an `EncryptedKey` recipient embedded in the
 template, so that inconsistent combination is rejected rather than preserving
 a stale wrapped key.
 
+For HMAC templates, both `sign` and `verify` accept `--hmac-key[:name] path` and
+read the file as raw secret bytes; certificate companions are not applicable.
+The compatibility CLI accepts the legacy 40-bit minimum used by the donor
+suite, while library callers retain the typed policy default of 128 bits.
+Named HMAC and asymmetric options participate in the same `KeyName` selection
+and candidate-budget rules. The compatibility boundary likewise admits legacy
+DSA 1024/160 keys for DSA-SHA1; the core signing and verification policies keep
+their 2048-bit default unless callers explicitly choose otherwise.
+
 Generate an AES key store using the upstream command shape:
 
 ```sh
@@ -327,9 +361,16 @@ The key name is optional. `--gen-key aes-128` writes an unnamed key without a
 
 The command and status surface is available now, while individual key formats,
 algorithms, selectors, and policy controls remain capability-limited. Current
-private-key loading accepts unencrypted PKCS#8 RSA, P-256, and P-384 plus
-PKCS#1 RSA in PEM or DER; `--privkey-p8-pem` and `--privkey-p8-der` are accepted
-as upstream PKCS#8 aliases. Public verification accepts SubjectPublicKeyInfo,
+private-key loading accepts plain and password-encrypted PKCS#8 RSA, DSA, P-256,
+P-384, and P-521 in PEM or DER. The generic PEM option additionally accepts
+plain or OpenSSL traditional encrypted PKCS#1 RSA, traditional DSA, and SEC1
+P-256/P-384/P-521 keys. The generic DER option accepts their plain containers.
+`--privkey-p8-pem` and `--privkey-p8-der` are accepted as upstream PKCS#8
+aliases. The template signature method selects the key family before decoding,
+while ECDSA keys select their curve from PKCS#8 or SEC1 parameters. Explicit
+PKCS#8 options reject traditional containers rather than silently broadening
+their documented format contract.
+Public verification accepts SubjectPublicKeyInfo,
 PKCS#1 RSA public keys, and X.509 certificates. Encryption accepts RSA public
 keys or RSA X.509 recipient certificates in PEM or DER. Explicit verification
 certificate options pin verification to that certificate's public key instead
@@ -343,10 +384,9 @@ also build a valid path to one of them. `--verify-crls` applies to that validate
 path and does not turn a pinned certificate without anchors into a chain-based
 trust source. Direct XMLEnc keys accept
 AES-128/256; RSA-OAEP supports both the XMLEnc 1.0 `rsa-oaep-mgf1p` and XMLEnc
-1.1 parameter contracts. Encrypted
-PKCS#8, PKCS#12, platform crypto stores, external DTDs, implicit network access,
-and unsupported CLI policy knobs fail rather than weakening policy or falling
-back.
+1.1 parameter contracts. PKCS#12, platform crypto stores, external DTDs,
+implicit network access, and unsupported CLI policy knobs fail rather than
+weakening policy or falling back.
 
 The compatibility CLI accepts `--X509-skip-strict-checks` at the explicit donor
 boundary. In libxmlsec1 1.3.13 the OpenSSL backend selected by the compatibility

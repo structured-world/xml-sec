@@ -39,6 +39,7 @@ pub(crate) mod resource_name {
     pub const ENCRYPTION_RECIPIENTS: &str = "encryption recipients";
     pub const ENCRYPTION_METADATA_BYTES: &str = "encryption metadata bytes";
     pub const KEY_CANDIDATES: &str = "key candidates";
+    pub const KEY_INFO_REFERENCE_DEPTH: &str = "KeyInfoReference depth";
     pub const BASE64_TRANSFORM_INPUT_BYTES: &str = "Base64 transform input bytes";
     pub const BASE64_TRANSFORM_OUTPUT_BYTES: &str = "Base64 transform output bytes";
     pub const XPATH_EXPRESSIONS: &str = "XPath expressions";
@@ -69,6 +70,17 @@ pub enum PolicyViolation {
         operation: &'static str,
         /// Stable algorithm URI or diagnostic name.
         algorithm: String,
+    },
+    /// An HMAC output length is outside the operation's configured bounds.
+    #[cfg(feature = "xmldsig")]
+    #[error("HMAC output length must be between {minimum} and {maximum} bits: got {actual}")]
+    HmacOutputLength {
+        /// Minimum output length selected by policy.
+        minimum: usize,
+        /// Full output width of the selected HMAC algorithm.
+        maximum: usize,
+        /// Parsed output length.
+        actual: usize,
     },
     /// An input exceeds a configured resource ceiling.
     #[error("{resource} exceeds policy maximum {maximum}: got {actual}")]
@@ -138,6 +150,78 @@ pub enum PolicyViolation {
     },
 }
 
+/// HMAC key-strength and truncation requirements shared by signing and verification.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HmacPolicy {
+    /// Minimum caller-owned secret length in bits.
+    pub minimum_key_bits: usize,
+    /// Minimum emitted or accepted MAC length in bits.
+    pub minimum_output_bits: usize,
+}
+
+#[cfg(feature = "xmldsig")]
+impl Default for HmacPolicy {
+    fn default() -> Self {
+        Self {
+            minimum_key_bits: 128,
+            minimum_output_bits: 128,
+        }
+    }
+}
+
+#[cfg(feature = "xmldsig")]
+impl HmacPolicy {
+    pub(crate) fn validate(self) -> Result<(), PolicyViolation> {
+        if self.minimum_key_bits == 0 || self.minimum_output_bits == 0 {
+            return Err(PolicyViolation::KeyTrust {
+                reason: "HMAC minimum key and output lengths must be nonzero",
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_key_bytes(self, key_bytes: usize) -> Result<(), PolicyViolation> {
+        self.validate_key_bits(key_bytes.saturating_mul(8))
+    }
+
+    pub(crate) fn validate_key_bits(self, key_bits: usize) -> Result<(), PolicyViolation> {
+        if key_bits < self.minimum_key_bits {
+            return Err(PolicyViolation::InvalidKeyMaterial {
+                operation: "HMAC",
+                key_type: "symmetric",
+                reason: "secret is shorter than the configured minimum",
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_output(
+        self,
+        algorithm: SignatureAlgorithm,
+        selected_bits: usize,
+    ) -> Result<(), PolicyViolation> {
+        let maximum = algorithm
+            .hmac_output_bits()
+            .ok_or_else(|| PolicyViolation::Algorithm {
+                operation: "HMAC",
+                algorithm: algorithm.uri().to_owned(),
+            })?;
+        // XMLDSig 1.1 section 6.3.1 makes this a protocol floor, not a
+        // deployment preference: truncation is at least 80 bits and at least
+        // half the underlying digest width. Caller policy may only tighten it.
+        let minimum = self.minimum_output_bits.max(80).max(maximum / 2);
+        if selected_bits < minimum || selected_bits > maximum {
+            return Err(PolicyViolation::HmacOutputLength {
+                minimum,
+                maximum,
+                actual: selected_bits,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// RSA strength and structural requirements for outbound cryptographic operations.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,16 +251,11 @@ impl Default for DsaKeyPolicy {
 impl DsaKeyPolicy {
     /// Validate the configured minimum against the implementation ceiling.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
-        if self.minimum_modulus_bits == 0 || !self.minimum_modulus_bits.is_multiple_of(64) {
-            return Err(PolicyViolation::InvalidResourceLimit {
-                resource: "minimum DSA modulus bits",
-                requirement: "minimum must be a nonzero multiple of 64 bits",
-                actual: self.minimum_modulus_bits,
-            });
-        }
-        ResourcePolicy::within(
+        validate_modulus_minimum(
             "minimum DSA modulus bits",
             self.minimum_modulus_bits,
+            64,
+            "minimum must be a nonzero multiple of 64 bits",
             crate::hard_limits::DSA_MODULUS_BIT_CEILING,
         )
     }
@@ -211,16 +290,11 @@ impl Default for RsaKeyPolicy {
 impl RsaKeyPolicy {
     /// Validate the configured minimum against the implementation ceiling.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
-        if self.minimum_modulus_bits == 0 || !self.minimum_modulus_bits.is_multiple_of(8) {
-            return Err(PolicyViolation::InvalidResourceLimit {
-                resource: "minimum RSA modulus bits",
-                requirement: "minimum must be a nonzero whole-byte width",
-                actual: self.minimum_modulus_bits,
-            });
-        }
-        ResourcePolicy::within(
+        validate_modulus_minimum(
             "minimum RSA modulus bits",
             self.minimum_modulus_bits,
+            8,
+            "minimum must be a nonzero whole-byte width",
             crate::hard_limits::RSA_MODULUS_BIT_CEILING,
         )
     }
@@ -282,6 +356,24 @@ impl RsaKeyPolicy {
     }
 }
 
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+fn validate_modulus_minimum(
+    resource: &'static str,
+    minimum_bits: usize,
+    alignment_bits: usize,
+    requirement: &'static str,
+    ceiling: usize,
+) -> Result<(), PolicyViolation> {
+    if minimum_bits == 0 || !minimum_bits.is_multiple_of(alignment_bits) {
+        return Err(PolicyViolation::InvalidResourceLimit {
+            resource,
+            requirement,
+            actual: minimum_bits,
+        });
+    }
+    ResourcePolicy::within(resource, minimum_bits, ceiling)
+}
+
 /// Resource ceilings shared by parsing, transforms, and cryptographic output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourcePolicy {
@@ -313,8 +405,11 @@ pub struct ResourcePolicy {
     pub max_encryption_recipients: usize,
     /// Maximum caller-controlled XMLEnc metadata bytes per field.
     pub max_encryption_metadata_bytes: usize,
-    /// Maximum key and certificate candidates inspected by one operation.
+    /// Maximum key-source expansion work and concrete key or certificate
+    /// candidates inspected by one operation stage.
     pub max_key_candidates: usize,
+    /// Maximum nested `KeyInfoReference` dereference depth.
+    pub max_key_info_reference_depth: usize,
     /// Maximum bytes accepted by Base64 transforms before decoding.
     pub max_base64_transform_input_bytes: usize,
     /// Maximum cumulative bytes emitted by Base64 transforms in one operation.
@@ -368,6 +463,7 @@ impl Default for ResourcePolicy {
             max_encryption_recipients: crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
             max_encryption_metadata_bytes: crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
             max_key_candidates: crate::hard_limits::KEY_CANDIDATE_CEILING,
+            max_key_info_reference_depth: crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
             max_base64_transform_input_bytes:
                 crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
             max_base64_transform_output_bytes:
@@ -472,6 +568,11 @@ impl ResourcePolicy {
                 crate::hard_limits::KEY_CANDIDATE_CEILING,
             ),
             (
+                resource_name::KEY_INFO_REFERENCE_DEPTH,
+                self.max_key_info_reference_depth,
+                crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
+            ),
+            (
                 resource_name::BASE64_TRANSFORM_INPUT_BYTES,
                 self.max_base64_transform_input_bytes,
                 crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
@@ -569,11 +670,25 @@ impl ResourcePolicy {
     }
 
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-    pub(crate) fn validate_key_candidates(&self, actual: usize) -> Result<(), PolicyViolation> {
+    /// Reject aggregate key-candidate work beyond this policy snapshot.
+    pub fn validate_key_candidates(&self, actual: usize) -> Result<(), PolicyViolation> {
         if actual > self.max_key_candidates {
             return Err(PolicyViolation::ResourceLimit {
                 resource: resource_name::KEY_CANDIDATES,
                 maximum: self.max_key_candidates,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    /// Reject `KeyInfoReference` traversal beyond this policy snapshot.
+    #[cfg(feature = "xmldsig")]
+    pub fn validate_key_info_reference_depth(&self, actual: usize) -> Result<(), PolicyViolation> {
+        if actual > self.max_key_info_reference_depth {
+            return Err(PolicyViolation::ResourceLimit {
+                resource: resource_name::KEY_INFO_REFERENCE_DEPTH,
+                maximum: self.max_key_info_reference_depth,
                 actual,
             });
         }
@@ -693,6 +808,8 @@ pub struct UriPolicy {
     pub references: UriTypeSet,
     /// URI classes accepted by RetrievalMethod processing.
     pub retrieval_methods: UriTypeSet,
+    /// URI classes accepted by XMLDSig 1.1 `KeyInfoReference` processing.
+    pub key_info_references: UriTypeSet,
 }
 
 #[cfg(feature = "xmldsig")]
@@ -701,6 +818,7 @@ impl Default for UriPolicy {
         Self {
             references: UriTypeSet::SAME_DOCUMENT,
             retrieval_methods: UriTypeSet::SAME_DOCUMENT,
+            key_info_references: UriTypeSet::SAME_DOCUMENT,
         }
     }
 }
@@ -719,6 +837,8 @@ pub struct KeySourcePolicy {
     pub der_encoded_key_value: bool,
     /// Permit certificates and selectors embedded in `X509Data`.
     pub x509_data: bool,
+    /// Permit `KeyInfoReference` indirection to another bounded `KeyInfo`.
+    pub key_info_reference: bool,
 }
 
 #[cfg(feature = "xmldsig")]
@@ -730,6 +850,7 @@ impl Default for KeySourcePolicy {
             key_value: true,
             der_encoded_key_value: true,
             x509_data: true,
+            key_info_reference: true,
         }
     }
 }
@@ -858,6 +979,8 @@ pub struct VerificationPolicy {
     pub signature_algorithms: Option<HashSet<SignatureAlgorithm>>,
     /// Allowed reference digest methods; `None` accepts every implemented method.
     pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
+    /// HMAC secret and output-length requirements.
+    pub hmac: HmacPolicy,
     /// Required ECDSA `SignatureValue` wire representation.
     pub ecdsa_signature_value_encoding: EcdsaSignatureValueEncoding,
     /// Key and certificate trust rules.
@@ -881,7 +1004,8 @@ impl VerificationPolicy {
     /// Validate the complete snapshot against implementation hard ceilings.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         self.resources.validate()?;
-        self.key_trust.validate()
+        self.key_trust.validate()?;
+        self.hmac.validate()
     }
 
     /// Enforce the signature algorithm after key resolution.
@@ -894,6 +1018,7 @@ impl VerificationPolicy {
             SignatureAlgorithm::RsaSha1
                 | SignatureAlgorithm::DsaSha1
                 | SignatureAlgorithm::HmacSha1
+                | SignatureAlgorithm::EcdsaSha1
         ) && !self
             .key_trust
             .allowed_legacy_signature_algorithms
@@ -926,10 +1051,14 @@ pub struct SigningPolicy {
     pub signature_algorithms: Option<HashSet<SignatureAlgorithm>>,
     /// Allowed reference digest methods; `None` uses the implemented secure defaults.
     pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
+    /// HMAC secret and output-length requirements.
+    pub hmac: HmacPolicy,
     /// ECDSA `SignatureValue` wire representation emitted by signing.
     pub ecdsa_signature_value_encoding: EcdsaSignatureValueEncoding,
     /// RSA requirements enforced before producing a signature.
     pub rsa_keys: RsaKeyPolicy,
+    /// DSA requirements enforced before producing a signature.
+    pub dsa_keys: DsaKeyPolicy,
     /// Reference URI permissions. External URIs remain unsupported until the
     /// caller supplies request-scoped external bytes through the signing API.
     pub uris: UriPolicy,
@@ -948,7 +1077,50 @@ impl SigningPolicy {
     /// Validate the complete snapshot before signing work begins.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         self.resources.validate()?;
-        self.rsa_keys.validate()
+        self.rsa_keys.validate()?;
+        self.dsa_keys.validate()?;
+        self.hmac.validate()
+    }
+
+    pub(crate) fn check_signature_algorithm(
+        &self,
+        algorithm: SignatureAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_signing_algorithm(
+            self.signature_algorithms.as_ref(),
+            algorithm,
+            algorithm.signing_allowed(),
+            algorithm.uri(),
+        )
+    }
+
+    pub(crate) fn check_digest_algorithm(
+        &self,
+        algorithm: DigestAlgorithm,
+    ) -> Result<(), PolicyViolation> {
+        check_signing_algorithm(
+            self.digest_algorithms.as_ref(),
+            algorithm,
+            algorithm.signing_allowed(),
+            algorithm.uri(),
+        )
+    }
+}
+
+#[cfg(feature = "xmldsig")]
+fn check_signing_algorithm<T: Eq + std::hash::Hash>(
+    allowlist: Option<&HashSet<T>>,
+    algorithm: T,
+    default_allowed: bool,
+    uri: &str,
+) -> Result<(), PolicyViolation> {
+    if allowlist.map_or(default_allowed, |allowed| allowed.contains(&algorithm)) {
+        Ok(())
+    } else {
+        Err(PolicyViolation::Algorithm {
+            operation: "signing",
+            algorithm: uri.to_owned(),
+        })
     }
 }
 
@@ -1128,6 +1300,11 @@ mod tests {
                 |p| &mut p.max_key_candidates,
             ),
             (
+                resource_name::KEY_INFO_REFERENCE_DEPTH,
+                crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
+                |p| &mut p.max_key_info_reference_depth,
+            ),
+            (
                 resource_name::BASE64_TRANSFORM_INPUT_BYTES,
                 crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
                 |p| &mut p.max_base64_transform_input_bytes,
@@ -1245,6 +1422,7 @@ mod tests {
             max_encryption_recipients: 0,
             max_encryption_metadata_bytes: 0,
             max_key_candidates: 0,
+            max_key_info_reference_depth: 0,
             max_base64_transform_input_bytes: 0,
             max_base64_transform_output_bytes: 0,
             max_xpath_expressions: 0,
@@ -1382,6 +1560,7 @@ mod tests {
             SignatureAlgorithm::RsaSha1,
             SignatureAlgorithm::DsaSha1,
             SignatureAlgorithm::HmacSha1,
+            SignatureAlgorithm::EcdsaSha1,
         ];
         let mut policy = VerificationPolicy::default();
 
@@ -1427,6 +1606,30 @@ mod tests {
                 actual_bits: 4096,
                 ..
             })
+        ));
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn hmac_output_policy_cannot_weaken_the_xmldsig_floor() {
+        // Caller policy may tighten but cannot weaken XMLDSig section 6.3.1:
+        // truncation is at least 80 bits and at least half the digest width.
+        let compatibility = HmacPolicy {
+            minimum_key_bits: 40,
+            minimum_output_bits: 40,
+        };
+
+        assert_eq!(
+            compatibility.validate_output(SignatureAlgorithm::HmacSha1, 80),
+            Ok(())
+        );
+        assert!(matches!(
+            compatibility.validate_output(SignatureAlgorithm::HmacSha1, 72),
+            Err(PolicyViolation::HmacOutputLength { minimum: 80, .. })
+        ));
+        assert!(matches!(
+            compatibility.validate_output(SignatureAlgorithm::HmacSha256, 120),
+            Err(PolicyViolation::HmacOutputLength { minimum: 128, .. })
         ));
     }
 

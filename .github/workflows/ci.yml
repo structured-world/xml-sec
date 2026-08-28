@@ -60,13 +60,19 @@ jobs:
         include:
           - rust: stable
             xml-backend: xmloxide
-            cargo-args: --all-features
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide
           - rust: stable
             xml-backend: roxmltree
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-roxmltree
+          - rust: stable
+            xml-backend: differential
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-differential
+          - rust: stable
+            xml-backend: fat-runtime
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backends-all
           - rust: "1.92.0"
             xml-backend: xmloxide
-            cargo-args: --all-features
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide
           - rust: "1.92.0"
             xml-backend: roxmltree
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-roxmltree
@@ -96,13 +102,19 @@ jobs:
         include:
           - rust: stable
             xml-backend: xmloxide
-            cargo-args: --all-features
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide
           - rust: stable
             xml-backend: roxmltree
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-roxmltree
+          - rust: stable
+            xml-backend: differential
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-differential
+          - rust: stable
+            xml-backend: fat-runtime
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backends-all
           - rust: "1.92.0"
             xml-backend: xmloxide
-            cargo-args: --all-features
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide
           - rust: "1.92.0"
             xml-backend: roxmltree
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-roxmltree
@@ -154,9 +166,13 @@ jobs:
       matrix:
         include:
           - xml-backend: xmloxide
-            cargo-args: --all-features
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide
           - xml-backend: roxmltree
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-roxmltree
+          - xml-backend: differential
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-differential
+          - xml-backend: fat-runtime
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backends-all
     steps:
       - uses: actions/checkout@v7
         with:

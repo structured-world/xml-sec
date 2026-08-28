@@ -14,8 +14,9 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
-use roxmltree::{Document, Node, NodeId};
+use crate::xml::dom::{Document, Node, NodeId};
 
 use crate::c14n::xml_base::{
     XmlBaseResolutionBudget, XmlBaseResolutionError, resolve_uri_from_node_with_budget,
@@ -107,10 +108,11 @@ impl ExternalResourceBudget {
 ///
 /// ```
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use xml_sec::Document;
 /// use xml_sec::xmldsig::uri::UriReferenceResolver;
 ///
 /// let xml = r#"<root><item ID="abc">content</item></root>"#;
-/// let doc = roxmltree::Document::parse(xml)?;
+/// let doc = Document::parse(xml)?;
 /// let resolver = UriReferenceResolver::new(&doc);
 ///
 /// assert!(resolver.has_id("abc"));
@@ -121,15 +123,24 @@ impl ExternalResourceBudget {
 pub struct UriReferenceResolver<'a> {
     doc: &'a Document<'a>,
     view: Option<crate::DocumentView<'a>>,
+    resource_identity: Option<String>,
+    id_registrations: Vec<crate::IdAttributeRegistration>,
     id_index: ResolverIdIndex<'a>,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
-    external_resource_budget: ExternalResourceBudget,
+    external_resource_budget: Rc<ExternalResourceBudget>,
     same_document_id_semantics: SameDocumentIdSemantics,
 }
 
 enum ResolverIdIndex<'a> {
     Borrowed(XmlIdIndex<'a>),
     Retained(HashMap<String, NodeId>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TraversalDocumentIdentity {
+    Owned(crate::DocumentIdentity),
+    External(String),
+    Borrowed(usize),
 }
 
 impl<'a> ResolverIdIndex<'a> {
@@ -173,18 +184,25 @@ impl<'a> UriReferenceResolver<'a> {
     /// The defaults (`ID`, `Id`, `id`) are always included; `extra_attrs`
     /// adds to them (does not replace). Pass an empty slice to use only defaults.
     ///
-    /// Attribute names are matched using `roxmltree`'s *local-name* view of
-    /// attributes: any namespace prefix is stripped before comparison. For
-    /// example, an attribute written as `wsu:Id="..."` in the XML is seen as
-    /// simply `Id` by `roxmltree`, so callers **must** pass `"Id"`, not
-    /// `"wsu:Id"` or `"{namespace}Id"`.
+    /// Attribute names use the semantic DOM's local-name view, independent of
+    /// the selected XML parser backend. For example, `wsu:Id="..."` is
+    /// registered as `"Id"`, not `"wsu:Id"` or `"{namespace}Id"`.
     pub fn with_id_attrs(doc: &'a Document<'a>, extra_attrs: &[&str]) -> Self {
+        let id_registrations = extra_attrs
+            .iter()
+            .map(|name| crate::IdAttributeRegistration::global(*name))
+            .collect::<Vec<_>>();
         Self {
             doc,
             view: None,
-            id_index: ResolverIdIndex::Borrowed(XmlIdIndex::with_extra_attrs(doc, extra_attrs)),
+            resource_identity: None,
+            id_index: ResolverIdIndex::Borrowed(XmlIdIndex::with_registrations(
+                doc,
+                &id_registrations,
+            )),
+            id_registrations,
             external_resources: None,
-            external_resource_budget: ExternalResourceBudget::default(),
+            external_resource_budget: Rc::new(ExternalResourceBudget::default()),
             same_document_id_semantics: SameDocumentIdSemantics::Specification,
         }
     }
@@ -194,12 +212,18 @@ impl<'a> UriReferenceResolver<'a> {
         doc: &'a Document<'a>,
         registrations: &[crate::IdAttributeRegistration],
     ) -> Self {
+        let id_registrations = registrations.to_vec();
         Self {
             doc,
             view: None,
-            id_index: ResolverIdIndex::Borrowed(XmlIdIndex::with_registrations(doc, registrations)),
+            resource_identity: None,
+            id_index: ResolverIdIndex::Borrowed(XmlIdIndex::with_registrations(
+                doc,
+                &id_registrations,
+            )),
+            id_registrations,
             external_resources: None,
-            external_resource_budget: ExternalResourceBudget::default(),
+            external_resource_budget: Rc::new(ExternalResourceBudget::default()),
             same_document_id_semantics: SameDocumentIdSemantics::Specification,
         }
     }
@@ -208,12 +232,15 @@ impl<'a> UriReferenceResolver<'a> {
         view: crate::DocumentView<'a>,
         registrations: &[crate::IdAttributeRegistration],
     ) -> Self {
+        let id_registrations = registrations.to_vec();
         Self {
             doc: view.document(),
             view: Some(view),
-            id_index: ResolverIdIndex::Retained(view.id_index(registrations)),
+            resource_identity: None,
+            id_index: ResolverIdIndex::Retained(view.id_index(&id_registrations)),
+            id_registrations,
             external_resources: None,
-            external_resource_budget: ExternalResourceBudget::default(),
+            external_resource_budget: Rc::new(ExternalResourceBudget::default()),
             same_document_id_semantics: SameDocumentIdSemantics::Specification,
         }
     }
@@ -224,6 +251,55 @@ impl<'a> UriReferenceResolver<'a> {
     ) -> Self {
         self.same_document_id_semantics = semantics;
         self
+    }
+
+    /// Rebind document-local URI resolution while retaining caller-owned
+    /// external resources and their aggregate byte budget.
+    pub(crate) fn for_document_view<'b>(
+        &self,
+        view: crate::DocumentView<'b>,
+    ) -> UriReferenceResolver<'b>
+    where
+        'a: 'b,
+    {
+        UriReferenceResolver {
+            doc: view.document(),
+            view: Some(view),
+            resource_identity: None,
+            id_index: ResolverIdIndex::Retained(view.id_index(&self.id_registrations)),
+            id_registrations: self.id_registrations.clone(),
+            external_resources: self.external_resources,
+            external_resource_budget: Rc::clone(&self.external_resource_budget),
+            same_document_id_semantics: self.same_document_id_semantics,
+        }
+    }
+
+    /// Rebind document-local URI resolution to a stable external resource.
+    ///
+    /// The identity survives reparsing, so recursive reference traversal can
+    /// distinguish equal fragments in different resources without overlooking
+    /// a cycle that returns to the same resource.
+    pub(crate) fn for_external_document_view<'b>(
+        &self,
+        view: crate::DocumentView<'b>,
+        resource_identity: &str,
+    ) -> UriReferenceResolver<'b>
+    where
+        'a: 'b,
+    {
+        let mut resolver = self.for_document_view(view);
+        resolver.resource_identity = Some(resource_identity.to_owned());
+        resolver
+    }
+
+    pub(crate) fn traversal_document_identity(&self) -> TraversalDocumentIdentity {
+        if let Some(identity) = &self.resource_identity {
+            TraversalDocumentIdentity::External(identity.clone())
+        } else if let Some(view) = self.view {
+            TraversalDocumentIdentity::Owned(view.identity())
+        } else {
+            TraversalDocumentIdentity::Borrowed(self.doc as *const Document<'_> as usize)
+        }
     }
 
     /// Attach an explicit caller-owned external-resource map.
@@ -241,8 +317,10 @@ impl<'a> UriReferenceResolver<'a> {
         max_resource_bytes: usize,
         max_total_bytes: usize,
     ) -> Self {
-        self.external_resource_budget =
-            ExternalResourceBudget::with_limits(max_resource_bytes, max_total_bytes);
+        self.external_resource_budget = Rc::new(ExternalResourceBudget::with_limits(
+            max_resource_bytes,
+            max_total_bytes,
+        ));
         self
     }
 
@@ -434,10 +512,14 @@ impl<'a> UriReferenceResolver<'a> {
     }
 
     /// Resolve a same-document URI to an element under the configured grammar.
-    pub(crate) fn node_for_same_document_reference(
+    /// An empty URI selects the document element for element-valued consumers.
+    pub fn node_for_same_document_reference(
         &self,
         uri: &str,
     ) -> Result<Option<Node<'a, 'a>>, TransformError> {
+        if uri.is_empty() {
+            return Ok(Some(self.doc.root_element()));
+        }
         Ok(self
             .node_id_for_same_document_reference(uri)?
             .and_then(|id| self.doc.get_node(id)))
@@ -505,6 +587,22 @@ pub(crate) fn parse_xpointer_id_fragment(fragment: &str) -> Option<&str> {
 mod tests {
     use super::super::types::NodeSet;
     use super::*;
+
+    #[test]
+    fn empty_same_document_node_reference_selects_the_document_element() {
+        // Element-valued consumers of the Reference URI contract interpret an
+        // empty URI as the root element of the current XML document.
+        let document = Document::parse("<root><child/></root>").unwrap();
+        let resolver = UriReferenceResolver::new(&document);
+
+        assert_eq!(
+            resolver
+                .node_for_same_document_reference("")
+                .unwrap()
+                .unwrap(),
+            document.root_element()
+        );
+    }
 
     #[test]
     fn empty_uri_returns_whole_document() {

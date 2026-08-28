@@ -10,13 +10,13 @@
 //! - [`compute_digest`] + [`constant_time_eq`] for digest computation and comparison
 //! - [`verify_signature_with_pem_key`] for full pipeline validation (`SignedInfo` + `SignatureValue`)
 
+use crate::xml::dom::{Node, NodeId};
 use base64::Engine;
-use roxmltree::{Node, NodeId};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::c14n::canonicalize_bounded_with_xml_base_budget;
-use crate::document::{DocumentParseSettings, DocumentView, XmlDocument};
+use crate::document::{DocumentParseSettings, DocumentView, XmlDocument, XmlDocumentError};
 use crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING;
 
 #[cfg(test)]
@@ -31,8 +31,8 @@ use super::parse::{
     RetrievalMethodTransforms, SignatureAlgorithm, XMLDSIG_NS,
 };
 use super::parse::{
-    parse_key_info_with_policy_budgets, parse_reference_with_xpath_budget,
-    parse_signed_info_with_xpath_budget, parse_x509_certificate,
+    parse_key_info_with_policy_budgets, parse_key_info_with_policy_budgets_and_document_base,
+    parse_reference_with_xpath_budget, parse_signed_info_with_xpath_budget, parse_x509_certificate,
     parse_x509_data_dispatch_with_budget_and_provider, reference_digest_method,
 };
 use super::signature::{
@@ -190,7 +190,7 @@ pub trait KeyResolver {
     }
 }
 
-/// Allowed URI classes for `<Reference URI="...">`.
+/// Allowed structural URI classes for XMLDSig reference and key-source policy.
 ///
 /// External URIs resolve only from bytes supplied through
 /// [`VerifyContext::external_resources`]; allowing them never enables I/O.
@@ -245,7 +245,8 @@ impl UriTypeSet {
         allow_external: true,
     };
 
-    pub(crate) fn allows(self, uri: &str) -> bool {
+    /// Return whether this set permits the URI's structural class.
+    pub fn allows(self, uri: &str) -> bool {
         match classify_uri(uri) {
             UriClass::Empty => self.allow_empty,
             UriClass::SameDocument => self.allow_same_document,
@@ -279,6 +280,7 @@ pub struct VerifyContext<'a> {
     key_resolver: Option<&'a dyn KeyResolver>,
     policy: crate::policy::VerificationPolicy,
     provider: &'a dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
     store_pre_digest: bool,
     external_resources: Option<&'a HashMap<String, Vec<u8>>>,
     signature_selection: SignatureSelection<'a>,
@@ -300,6 +302,7 @@ impl<'a> VerifyContext<'a> {
             key_resolver: None,
             policy: crate::policy::VerificationPolicy::default(),
             provider: crate::provider::default_provider(),
+            xml_backend: crate::XmlBackend::default(),
             store_pre_digest: false,
             external_resources: None,
             signature_selection: SignatureSelection::UniqueDocumentSignature,
@@ -333,6 +336,12 @@ impl<'a> VerifyContext<'a> {
     /// Select the cryptographic provider for this verification operation.
     pub fn provider(mut self, provider: &'a dyn crate::provider::CryptoProvider) -> Self {
         self.provider = provider;
+        self
+    }
+
+    /// Select the compiled XML parser backend for this verification operation.
+    pub fn xml_backend(mut self, backend: crate::XmlBackend) -> Self {
+        self.xml_backend = backend;
         self
     }
 
@@ -971,7 +980,7 @@ pub enum DsigError {
 
     /// XML parsing failed.
     #[error("XML parse error: {0}")]
-    XmlParse(#[from] roxmltree::Error),
+    XmlParse(#[from] crate::xml::dom::ParseError),
 
     /// The owned XML document boundary rejected the document or identity.
     #[error("XML document error: {0}")]
@@ -1134,19 +1143,25 @@ fn verify_signature_with_context(
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
     ctx.policy.validate()?;
     ctx.policy.resources.validate_xml_document_len(xml.len())?;
-    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
-    let settings = DocumentParseSettings::from_policy(&ctx.policy.xml, &ctx.policy.resources);
+    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources)
+        .with_xml_backend(ctx.xml_backend);
+    let settings = DocumentParseSettings::from_policy(&ctx.policy.xml, &ctx.policy.resources)
+        .with_backend(ctx.xml_backend);
     let document = XmlDocument::parse_with_settings_and_budget(
         xml.to_owned(),
         settings,
         execution_budget.xml_parse_work(),
     )
-    .map_err(|error| match error.into_policy_violation(settings) {
-        Ok(error) => DsigError::Policy(error),
-        Err(crate::document::XmlDocumentError::Parse(error)) => DsigError::XmlParse(error),
-        Err(error) => DsigError::Document(error),
-    })?;
+    .map_err(|error| map_document_parse_error(error, settings))?;
     verify_signature_document_with_context_and_budget(&document, ctx, &execution_budget)
+}
+
+fn map_document_parse_error(error: XmlDocumentError, settings: DocumentParseSettings) -> DsigError {
+    match error.into_policy_violation(settings) {
+        Ok(error) => DsigError::Policy(error),
+        Err(XmlDocumentError::Parse(error)) => DsigError::XmlParse(error),
+        Err(error) => DsigError::Document(error),
+    }
 }
 
 #[cfg(test)]
@@ -1181,7 +1196,8 @@ fn verify_signature_document_with_context(
     document: &XmlDocument,
     ctx: &VerifyContext<'_>,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
-    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources);
+    let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources)
+        .with_xml_backend(ctx.xml_backend);
     verify_signature_document_with_context_and_budget(document, ctx, &execution_budget)
 }
 
@@ -1350,15 +1366,27 @@ fn verify_signature_view<'a>(
             xpath_parse: &mut xpath_parse_budget,
             execution: execution_budget,
             resources: &ctx.policy.resources,
+            xml_backend: ctx.xml_backend,
         };
-        materialize_retrieval_methods_with_budgets(
+        let mut materialization = KeyInfoMaterializationState::default();
+        let mut outcome = materialize_key_info_references_with_budgets(
+            info,
+            &resolver,
+            &ctx.policy,
+            ctx.provider,
+            &mut retrieval_budgets,
+            &mut materialization,
+        )?;
+        outcome.merge(materialize_retrieval_methods_with_budgets(
             info,
             &resolver,
             ctx.policy.uris.retrieval_methods,
             ctx.allowed_transform_uris(),
             ctx.provider,
             &mut retrieval_budgets,
-        )?
+            &mut materialization.candidate_work,
+        )?);
+        outcome
     } else {
         RetrievalMaterialization::default()
     };
@@ -1421,8 +1449,13 @@ fn verify_signature_view<'a>(
     canonicalized_data_budget.charge(canonical_signed_info.len())?;
 
     let signature_value = decode_signature_value(signature_children.signature_value_node)?;
-    if signed_info.signature_method == SignatureAlgorithm::HmacSha1 {
-        let expected_bits = signed_info.hmac_output_length_bits.unwrap_or(160);
+    if let Some(full_output_bits) = signed_info.signature_method.hmac_output_bits() {
+        let expected_bits = signed_info
+            .hmac_output_length_bits
+            .unwrap_or(full_output_bits);
+        ctx.policy
+            .hmac
+            .validate_output(signed_info.signature_method, expected_bits)?;
         if signature_value.len() != expected_bits / 8 {
             return Err(SignatureVerificationPipelineError::InvalidStructure {
                 reason: "SignatureValue length does not match HMACOutputLength",
@@ -1565,10 +1598,378 @@ struct RetrievalMaterialization {
     deferred_error: Option<SignatureVerificationPipelineError>,
 }
 
+impl RetrievalMaterialization {
+    fn merge(&mut self, other: Self) {
+        if self.deferred_error.is_none() {
+            self.deferred_error = other.deferred_error;
+        }
+    }
+}
+
 struct RetrievalMaterializationBudgets<'a> {
     xpath_parse: &'a mut XPathSignatureParseBudget,
     execution: &'a TransformExecutionBudget,
     resources: &'a crate::policy::ResourcePolicy,
+    xml_backend: crate::XmlBackend,
+}
+
+#[derive(Default)]
+struct KeyInfoMaterializationState {
+    active: HashSet<(super::uri::TraversalDocumentIdentity, String)>,
+    candidate_work: usize,
+}
+
+trait KeyInfoReferencePolicy {
+    fn resources(&self) -> &crate::policy::ResourcePolicy;
+    fn xml(&self) -> &crate::policy::XmlInputPolicy;
+    fn key_info_reference_uris(&self) -> UriTypeSet;
+    fn retrieval_method_uris(&self) -> UriTypeSet;
+    fn key_info_reference_source_enabled(&self) -> bool;
+    fn allowed_transforms(&self) -> Option<&HashSet<String>>;
+}
+
+impl KeyInfoReferencePolicy for crate::policy::SigningPolicy {
+    fn resources(&self) -> &crate::policy::ResourcePolicy {
+        &self.resources
+    }
+
+    fn xml(&self) -> &crate::policy::XmlInputPolicy {
+        &self.xml
+    }
+
+    fn key_info_reference_uris(&self) -> UriTypeSet {
+        self.uris.key_info_references
+    }
+
+    fn retrieval_method_uris(&self) -> UriTypeSet {
+        self.uris.retrieval_methods
+    }
+
+    fn key_info_reference_source_enabled(&self) -> bool {
+        true
+    }
+
+    fn allowed_transforms(&self) -> Option<&HashSet<String>> {
+        self.transforms.allowed_algorithms.as_ref()
+    }
+}
+
+impl KeyInfoReferencePolicy for crate::policy::VerificationPolicy {
+    fn resources(&self) -> &crate::policy::ResourcePolicy {
+        &self.resources
+    }
+
+    fn xml(&self) -> &crate::policy::XmlInputPolicy {
+        &self.xml
+    }
+
+    fn key_info_reference_uris(&self) -> UriTypeSet {
+        self.uris.key_info_references
+    }
+
+    fn retrieval_method_uris(&self) -> UriTypeSet {
+        self.uris.retrieval_methods
+    }
+
+    fn key_info_reference_source_enabled(&self) -> bool {
+        self.key_sources.key_info_reference
+    }
+
+    fn allowed_transforms(&self) -> Option<&HashSet<String>> {
+        self.transforms.allowed_algorithms.as_ref()
+    }
+}
+
+struct KeyInfoReferenceMaterializationContext<'a, 'budget, P> {
+    policy: &'a P,
+    provider: &'a dyn crate::provider::CryptoProvider,
+    budgets: &'a mut RetrievalMaterializationBudgets<'budget>,
+}
+
+fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
+    key_info: &mut KeyInfo,
+    resolver: &UriReferenceResolver<'_>,
+    policy: &P,
+    provider: &dyn crate::provider::CryptoProvider,
+    budgets: &mut RetrievalMaterializationBudgets<'_>,
+    materialization: &mut KeyInfoMaterializationState,
+) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
+    fn visit<P: KeyInfoReferencePolicy>(
+        key_info: &mut KeyInfo,
+        resolver: &UriReferenceResolver<'_>,
+        context: &mut KeyInfoReferenceMaterializationContext<'_, '_, P>,
+        materialization: &mut KeyInfoMaterializationState,
+        depth: usize,
+    ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
+        let mut materialized = Vec::new();
+        let mut outcome = RetrievalMaterialization::default();
+        for source in std::mem::take(&mut key_info.sources) {
+            let source_work = match &source {
+                super::parse::KeyInfoSource::X509Data(info) => info.certificates.len().max(1),
+                _ => 1,
+            };
+            materialization.candidate_work =
+                materialization.candidate_work.saturating_add(source_work);
+            context
+                .policy
+                .resources()
+                .validate_key_candidates(materialization.candidate_work)?;
+
+            let super::parse::KeyInfoSource::KeyInfoReference { uri } = source else {
+                materialized.push(source);
+                continue;
+            };
+            if !context.policy.key_info_reference_source_enabled() {
+                return Err(crate::policy::PolicyViolation::KeyTrust {
+                    reason: "KeyInfoReference key sources are disabled",
+                }
+                .into());
+            }
+            if !context.policy.key_info_reference_uris().allows(&uri) {
+                return Err(crate::policy::PolicyViolation::Uri {
+                    operation: "KeyInfoReference",
+                    reason: "URI class is disabled",
+                }
+                .into());
+            }
+            let next_depth = depth.saturating_add(1);
+            context
+                .policy
+                .resources()
+                .validate_key_info_reference_depth(next_depth)?;
+            let cycle_key = (resolver.traversal_document_identity(), uri.clone());
+            if !materialization.active.insert(cycle_key.clone()) {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "KeyInfoReference cycle detected",
+                });
+            }
+
+            let is_same_document = uri.is_empty() || uri.starts_with('#');
+            let (mut referenced, mut nested_outcome) = if is_same_document {
+                let node = resolver
+                    .node_for_same_document_reference(&uri)
+                    .map_err(|error| {
+                        SignatureVerificationPipelineError::from(
+                            ReferenceProcessingError::UriDereference(error),
+                        )
+                    })?
+                    .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "KeyInfoReference target is missing or ambiguous",
+                    })?;
+                if !node.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
+                    return Err(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "KeyInfoReference target must be KeyInfo",
+                    });
+                }
+                (
+                    parse_key_info_with_policy_budgets(
+                        node,
+                        context.provider,
+                        context.budgets.execution.xml_base_resolution(),
+                        context.policy.resources(),
+                    )
+                    .map_err(map_key_info_parse_error)?,
+                    RetrievalMaterialization::default(),
+                )
+            } else {
+                // The fragment selects a node inside the retrieved document; it
+                // is not part of either the caller-owned resource identity or
+                // the base URI used by references nested in that document.
+                let (resource_uri, fragment) = uri
+                    .split_once('#')
+                    .map_or((uri.as_str(), None), |(resource, fragment)| {
+                        (resource, (!fragment.is_empty()).then_some(fragment))
+                    });
+                let bytes = resolver
+                    .external_resource(resource_uri)
+                    .map_err(|error| {
+                        SignatureVerificationPipelineError::from(
+                            ReferenceProcessingError::UriDereference(error),
+                        )
+                    })?
+                    .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "KeyInfoReference external resource is unavailable",
+                    })?;
+                let xml = crate::encoding::decode_xml_octets(bytes).map_err(|_| {
+                    SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "KeyInfoReference external resource has an invalid XML encoding",
+                    }
+                })?;
+                let settings = DocumentParseSettings::from_policy(
+                    context.policy.xml(),
+                    context.policy.resources(),
+                )
+                .with_backend(context.budgets.xml_backend);
+                let document = XmlDocument::parse_with_settings_and_budget(
+                    xml.into_owned(),
+                    settings,
+                    context.budgets.execution.xml_parse_work(),
+                )
+                .map_err(|error| map_document_parse_error(error, settings))?;
+                document.with_view(|view| {
+                    let external_resolver = resolver.for_external_document_view(view, resource_uri);
+                    let target = match fragment {
+                        Some(fragment) => external_resolver
+                            .node_for_same_document_reference(&format!("#{fragment}"))
+                            .map_err(|error| {
+                                SignatureVerificationPipelineError::from(
+                                    ReferenceProcessingError::UriDereference(error),
+                                )
+                            })?
+                            .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+                                reason: "KeyInfoReference external target is missing or ambiguous",
+                            })?,
+                        _ => view.document().root_element(),
+                    };
+                    if !target.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
+                        return Err(SignatureVerificationPipelineError::InvalidStructure {
+                            reason: "KeyInfoReference external target must be KeyInfo",
+                        });
+                    }
+                    let mut referenced = parse_key_info_with_policy_budgets_and_document_base(
+                        target,
+                        context.provider,
+                        context.budgets.execution.xml_base_resolution(),
+                        context.policy.resources(),
+                        Some(resource_uri),
+                    )
+                    .map_err(map_key_info_parse_error)?;
+                    let mut nested_outcome = visit(
+                        &mut referenced,
+                        &external_resolver,
+                        context,
+                        materialization,
+                        next_depth,
+                    )?;
+                    nested_outcome.merge(materialize_retrieval_methods_with_budgets(
+                        &mut referenced,
+                        &external_resolver,
+                        context.policy.retrieval_method_uris(),
+                        context.policy.allowed_transforms(),
+                        context.provider,
+                        context.budgets,
+                        &mut materialization.candidate_work,
+                    )?);
+                    // RetrievalMethod nodes are meaningful only in the document
+                    // whose resolver owns their same-document URI context.
+                    referenced.sources.retain(|source| {
+                        !matches!(source, super::parse::KeyInfoSource::RetrievalMethod { .. })
+                    });
+                    Ok((referenced, nested_outcome))
+                })?
+            };
+            if is_same_document {
+                nested_outcome.merge(visit(
+                    &mut referenced,
+                    resolver,
+                    context,
+                    materialization,
+                    next_depth,
+                )?);
+            }
+            outcome.merge(nested_outcome);
+            materialization.active.remove(&cycle_key);
+            materialized.extend(referenced.sources);
+        }
+        key_info.sources = materialized;
+        context
+            .policy
+            .resources()
+            .validate_key_candidates(key_info.embedded_candidate_count())?;
+        Ok(outcome)
+    }
+
+    let mut context = KeyInfoReferenceMaterializationContext {
+        policy,
+        provider,
+        budgets,
+    };
+    visit(key_info, resolver, &mut context, materialization, 0)
+}
+
+fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
+    key_info: &mut KeyInfo,
+    resolver: UriReferenceResolver<'_>,
+    policy: &P,
+    provider: &dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
+) -> Result<(), DsigError> {
+    let resolver = resolver.with_external_resource_limits(
+        policy.resources().max_external_resource_bytes,
+        policy.resources().max_external_resource_total_bytes,
+    );
+    let mut xpath_parse_budget = XPathSignatureParseBudget::from_resources(policy.resources());
+    let execution_budget = TransformExecutionBudget::from_resources(policy.resources());
+    let mut budgets = RetrievalMaterializationBudgets {
+        xpath_parse: &mut xpath_parse_budget,
+        execution: &execution_budget,
+        resources: policy.resources(),
+        xml_backend,
+    };
+    let mut materialization = KeyInfoMaterializationState::default();
+    // Candidate-local retrieval failures remain deferred: this metadata-only
+    // entry point cannot know whether a later key-selection stage needs them.
+    materialize_key_info_references_with_budgets(
+        key_info,
+        &resolver,
+        policy,
+        provider,
+        &mut budgets,
+        &mut materialization,
+    )?;
+    Ok(())
+}
+
+/// Resolve and recursively expand policy-allowed `KeyInfoReference` sources
+/// while preparing caller-supplied key material for signing.
+///
+/// The recursive reference traversal shares the verifier's candidate-work,
+/// depth, cycle, target, XML parsing, and external-resource bounds. Retrieval
+/// methods nested in an external referenced document are materialized while
+/// that document's URI context is active; retrieval methods in the caller's
+/// document remain the responsibility of the complete signing pipeline.
+/// candidate failures are deferred so an earlier usable key source can still
+/// be selected; the complete signing pipeline reports the retained failure if
+/// no source resolves to a key. URI classes remain controlled by the signing
+/// policy's `uris` field; external
+/// bytes must be attached to `resolver` explicitly by the caller. The resolver
+/// is consumed so this operation can bind a fresh aggregate external-resource
+/// budget to the supplied policy. `xml_backend` is used for every recursively
+/// referenced XML document, preserving the caller's parser semantics.
+pub fn materialize_signing_key_info_references(
+    key_info: &mut KeyInfo,
+    resolver: UriReferenceResolver<'_>,
+    policy: &crate::policy::SigningPolicy,
+    provider: &dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
+) -> Result<(), DsigError> {
+    policy.validate()?;
+    materialize_key_info_references_for_policy(key_info, resolver, policy, provider, xml_backend)
+}
+
+/// Resolve and recursively expand policy-allowed `KeyInfoReference` sources
+/// before verification key selection.
+///
+/// In addition to URI and resource policy, this entry point enforces the
+/// verification policy's `key_sources.key_info_reference` trust gate. Retrieval
+/// methods nested in an external referenced document are materialized in that
+/// document's URI context; retrieval methods in the caller's document remain
+/// the responsibility of the complete verification pipeline. Candidate-local
+/// retrieval failures remain deferred so usable sibling sources survive; the
+/// complete pipeline reports one only when key selection has no fallback.
+/// External bytes must be attached to `resolver` explicitly by the caller. The resolver is
+/// consumed so this operation can bind a fresh aggregate external-resource
+/// budget to the supplied policy. `xml_backend` is used for every recursively
+/// referenced XML document, preserving the caller's parser semantics.
+pub fn materialize_verification_key_info_references(
+    key_info: &mut KeyInfo,
+    resolver: UriReferenceResolver<'_>,
+    policy: &crate::policy::VerificationPolicy,
+    provider: &dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
+) -> Result<(), DsigError> {
+    policy.validate()?;
+    materialize_key_info_references_for_policy(key_info, resolver, policy, provider, xml_backend)
 }
 
 fn materialize_retrieval_methods_with_budgets(
@@ -1578,6 +1979,7 @@ fn materialize_retrieval_methods_with_budgets(
     allowed_transforms: Option<&HashSet<String>>,
     provider: &dyn crate::provider::CryptoProvider,
     budgets: &mut RetrievalMaterializationBudgets<'_>,
+    candidate_work: &mut usize,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
     let retrieval_count = key_info
         .sources
@@ -1591,7 +1993,6 @@ fn materialize_retrieval_methods_with_budgets(
     }
 
     let mut total_binary_len = existing_x509_binary_len(key_info)?;
-    let mut materialized_candidate_preflight_count = key_info.embedded_candidate_count();
     let mut seen = HashSet::new();
     let mut materialized = Vec::with_capacity(key_info.sources.len());
     let mut outcome = RetrievalMaterialization::default();
@@ -1649,11 +2050,8 @@ fn materialize_retrieval_methods_with_budgets(
                 });
                 continue;
             };
-            materialized_candidate_preflight_count =
-                materialized_candidate_preflight_count.saturating_add(1);
-            budgets
-                .resources
-                .validate_key_candidates(materialized_candidate_preflight_count)?;
+            *candidate_work = candidate_work.saturating_add(1);
+            budgets.resources.validate_key_candidates(*candidate_work)?;
             if certificate.len() > MAX_X509_DECODED_BINARY_LEN {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "raw X509 RetrievalMethod certificate exceeds maximum allowed length",
@@ -1694,10 +2092,20 @@ fn materialize_retrieval_methods_with_budgets(
             }
             let target = resolver
                 .node_for_same_document_reference(&resolved_uri)
-                .map_err(ReferenceProcessingError::Transform)?
-                .ok_or(SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "X509Data RetrievalMethod target is missing or ambiguous",
-                })?;
+                .map_err(ReferenceProcessingError::Transform)?;
+            let Some(target) = target else {
+                outcome.deferred_error.get_or_insert(
+                    SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "X509Data RetrievalMethod target is missing or ambiguous",
+                    },
+                );
+                materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
+                    uri: resolved_uri,
+                    resource_type,
+                    transforms,
+                });
+                continue;
+            };
             let node = match transforms {
                 RetrievalMethodTransforms::None
                     if target.has_tag_name((XMLDSIG_NS, "X509Data")) =>
@@ -1733,7 +2141,7 @@ fn materialize_retrieval_methods_with_budgets(
             let data = parse_x509_data_dispatch_with_budget_and_provider(
                 node,
                 &mut total_binary_len,
-                &mut materialized_candidate_preflight_count,
+                candidate_work,
                 provider,
                 budgets.resources,
             )
@@ -1808,7 +2216,9 @@ fn materialize_retrieval_methods(
         xpath_parse: &mut xpath_parse_budget,
         execution: &execution_budget,
         resources: &resources,
+        xml_backend: crate::XmlBackend::default(),
     };
+    let mut candidate_work = key_info.embedded_candidate_count();
     materialize_retrieval_methods_with_budgets(
         key_info,
         resolver,
@@ -1816,6 +2226,7 @@ fn materialize_retrieval_methods(
         allowed_transforms,
         provider,
         &mut budgets,
+        &mut candidate_work,
     )
 }
 
@@ -2428,7 +2839,7 @@ fn verify_with_algorithm(
     signature_value: &[u8],
 ) -> Result<bool, SignatureVerificationPipelineError> {
     match algorithm {
-        SignatureAlgorithm::DsaSha1 => {
+        SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
             let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
                 .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
             if !rest.iter().all(|byte| byte.is_ascii_whitespace()) || pem.label != "PUBLIC KEY" {
@@ -2441,11 +2852,16 @@ fn verify_with_algorithm(
                 signature_value,
             )?)
         }
-        SignatureAlgorithm::HmacSha1 => Err(SignatureVerificationError::UnsupportedAlgorithm {
+        SignatureAlgorithm::HmacSha1
+        | SignatureAlgorithm::HmacSha224
+        | SignatureAlgorithm::HmacSha256
+        | SignatureAlgorithm::HmacSha384
+        | SignatureAlgorithm::HmacSha512 => Err(SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_string(),
         }
         .into()),
         SignatureAlgorithm::RsaSha1
+        | SignatureAlgorithm::RsaSha224
         | SignatureAlgorithm::RsaSha256
         | SignatureAlgorithm::RsaSha384
         | SignatureAlgorithm::RsaSha512 => Ok(verify_rsa_signature_pem(
@@ -2454,7 +2870,11 @@ fn verify_with_algorithm(
             signed_data,
             signature_value,
         )?),
-        SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384 => {
+        SignatureAlgorithm::EcdsaSha1
+        | SignatureAlgorithm::EcdsaSha224
+        | SignatureAlgorithm::EcdsaSha256
+        | SignatureAlgorithm::EcdsaSha384
+        | SignatureAlgorithm::EcdsaSha512 => {
             // Malformed ECDSA signature bytes are treated as a verification miss
             // (Ok(false)) instead of a pipeline error; only key/algorithm and
             // crypto-operation failures propagate as Err.
@@ -2477,13 +2897,13 @@ fn verify_with_algorithm(
 mod tests {
     use super::*;
     use crate::c14n::C14nAlgorithm;
+    use crate::xml::dom::Document;
     use crate::xmldsig::TransformError;
     use crate::xmldsig::digest::DigestAlgorithm;
     use crate::xmldsig::parse::{Reference, parse_signed_info};
     use crate::xmldsig::transforms::Transform;
     use crate::xmldsig::uri::UriReferenceResolver;
     use base64::Engine;
-    use roxmltree::Document;
 
     // ── Helpers ──────────────────────────────────────────────────────
 
@@ -5058,6 +5478,520 @@ mod tests {
     }
 
     #[test]
+    fn key_info_reference_materializes_an_allowed_empty_uri() {
+        // Empty URI is a same-document Reference URI. Element-valued
+        // KeyInfoReference dereferencing therefore selects a KeyInfo document
+        // element rather than consulting the external-resource map.
+        let document = XmlDocument::parse(format!(
+            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>root-key</ds:KeyName></ds:KeyInfo>"#
+        ))
+        .unwrap();
+        let mut key_info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                uri: String::new(),
+            }],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_sources.key_info_reference = true;
+        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
+        let mut budgets = RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse_budget,
+            execution: &execution_budget,
+            resources: &policy.resources,
+            xml_backend: crate::XmlBackend::default(),
+        };
+        let mut materialization = KeyInfoMaterializationState::default();
+
+        document
+            .with_view(|view| {
+                materialize_key_info_references_with_budgets(
+                    &mut key_info,
+                    &UriReferenceResolver::with_document_view(view, &[]),
+                    &policy,
+                    crate::provider::default_provider(),
+                    &mut budgets,
+                    &mut materialization,
+                )?;
+                Ok::<_, SignatureVerificationPipelineError>(())
+            })
+            .unwrap();
+
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [super::super::parse::KeyInfoSource::KeyName(name)] if name == "root-key"
+        ));
+    }
+
+    #[test]
+    fn empty_key_info_reference_participates_in_cycle_detection() {
+        // Empty URI resolves to the owning document's root KeyInfo. It must
+        // recurse through the same traversal state rather than leave the
+        // self-reference materialized and bypass cycle/depth enforcement.
+        let document = XmlDocument::parse(format!(
+            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><dsig11:KeyInfoReference URI=""/></ds:KeyInfo>"#
+        ))
+        .unwrap();
+        let mut key_info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                uri: String::new(),
+            }],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_sources.key_info_reference = true;
+        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
+        let mut budgets = RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse_budget,
+            execution: &execution_budget,
+            resources: &policy.resources,
+            xml_backend: crate::XmlBackend::default(),
+        };
+        let mut materialization = KeyInfoMaterializationState::default();
+
+        let error = document
+            .with_view(|view| {
+                materialize_key_info_references_with_budgets(
+                    &mut key_info,
+                    &UriReferenceResolver::with_document_view(view, &[]),
+                    &policy,
+                    crate::provider::default_provider(),
+                    &mut budgets,
+                    &mut materialization,
+                )
+            })
+            .expect_err("empty-URI self-reference must be rejected as a cycle");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "KeyInfoReference cycle detected"
+            }
+        ));
+    }
+
+    #[test]
+    fn key_info_materialization_shares_candidate_work_across_source_kinds() {
+        // The reference, nested RetrievalMethod, and resulting certificate are
+        // three units of materialization work in one operation.
+        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
+        let document = XmlDocument::parse(format!(
+            r##"<root xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:KeyInfo ID="target"><ds:RetrievalMethod URI="signer.der" Type="{RAW_X509_TYPE}"/></ds:KeyInfo></root>"##
+        ))
+        .unwrap();
+        let certificate = include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
+        )
+        .to_vec();
+        let resources = HashMap::from([("signer.der".to_owned(), certificate)]);
+        let mut key_info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                uri: "#target".into(),
+            }],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_sources.key_info_reference = true;
+        policy.uris.retrieval_methods = UriTypeSet::ALL;
+        policy.resources.max_key_candidates = 2;
+        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
+        let mut budgets = RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse_budget,
+            execution: &execution_budget,
+            resources: &policy.resources,
+            xml_backend: crate::XmlBackend::default(),
+        };
+        let mut materialization = KeyInfoMaterializationState::default();
+
+        let error = document
+            .with_view(|view| {
+                let resolver = UriReferenceResolver::with_document_view(view, &[])
+                    .with_external_resources(&resources);
+                let mut outcome = materialize_key_info_references_with_budgets(
+                    &mut key_info,
+                    &resolver,
+                    &policy,
+                    crate::provider::default_provider(),
+                    &mut budgets,
+                    &mut materialization,
+                )?;
+                outcome.merge(materialize_retrieval_methods_with_budgets(
+                    &mut key_info,
+                    &resolver,
+                    policy.uris.retrieval_methods,
+                    policy.transforms.allowed_algorithms.as_ref(),
+                    crate::provider::default_provider(),
+                    &mut budgets,
+                    &mut materialization.candidate_work,
+                )?);
+                Ok::<_, DsigError>(outcome)
+            })
+            .expect_err("all materializers must share the candidate-work limit");
+
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                maximum: 2,
+                actual: 3,
+            })
+        ));
+    }
+
+    #[test]
+    fn public_key_info_materialization_binds_external_resource_policy() {
+        // Public helpers must not inherit the resolver's permissive hard-limit
+        // budget when the operation policy selects a stricter byte ceiling.
+        let document = Document::parse("<root/>").unwrap();
+        let external = format!(
+            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>external</ds:KeyName></ds:KeyInfo>"#
+        );
+        let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+        let mut key_info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                uri: "key.xml".into(),
+            }],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_sources.key_info_reference = true;
+        policy.uris.key_info_references = UriTypeSet::ALL;
+        policy.resources.max_external_resource_bytes = 0;
+
+        let error = materialize_verification_key_info_references(
+            &mut key_info,
+            resolver,
+            &policy,
+            crate::provider::default_provider(),
+            crate::XmlBackend::default(),
+        )
+        .expect_err("policy must reject non-empty external KeyInfo bytes");
+
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                maximum: 0,
+                actual,
+            }) if actual == resources["key.xml"].len()
+        ));
+    }
+
+    #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
+    #[test]
+    fn public_key_info_materialization_uses_the_selected_backend() {
+        // Public materialization is a standalone parse boundary. Its backend
+        // must be caller-selected just like the complete sign/verify pipeline.
+        let external = format!(
+            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>external</ds:KeyName></ds:KeyInfo>"#
+        );
+        let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
+        let document = Document::parse("<root/>").unwrap();
+
+        for backend in [crate::XmlBackend::Xmloxide, crate::XmlBackend::Roxmltree] {
+            let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+            let mut key_info = KeyInfo {
+                sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                    uri: "key.xml".into(),
+                }],
+            };
+            let mut policy = crate::policy::VerificationPolicy::default();
+            policy.key_sources.key_info_reference = true;
+            policy.uris.key_info_references = UriTypeSet::ALL;
+
+            materialize_verification_key_info_references(
+                &mut key_info,
+                resolver,
+                &policy,
+                crate::provider::default_provider(),
+                backend,
+            )
+            .unwrap_or_else(|error| panic!("{backend:?} materialization failed: {error}"));
+
+            assert!(matches!(
+                key_info.sources.as_slice(),
+                [super::super::parse::KeyInfoSource::KeyName(name)] if name == "external"
+            ));
+        }
+    }
+
+    #[test]
+    fn public_key_info_materialization_defers_nested_retrieval_failure() {
+        // Metadata expansion must preserve an earlier usable source when a
+        // later retrieval candidate fails. The complete operation reports the
+        // deferred error only if key selection exhausts all usable sources.
+        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
+        let external = format!(
+            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>usable</ds:KeyName><ds:RetrievalMethod URI="missing.der" Type="{RAW_X509_TYPE}"/></ds:KeyInfo>"#
+        );
+        let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
+        let document = Document::parse("<root/>").unwrap();
+
+        for operation in ["signing", "verification"] {
+            let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+            let mut key_info = KeyInfo {
+                sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                    uri: "key.xml".into(),
+                }],
+            };
+            match operation {
+                "signing" => {
+                    let mut policy = crate::policy::SigningPolicy::default();
+                    policy.uris.key_info_references = UriTypeSet::ALL;
+                    policy.uris.retrieval_methods = UriTypeSet::ALL;
+                    materialize_signing_key_info_references(
+                        &mut key_info,
+                        resolver,
+                        &policy,
+                        crate::provider::default_provider(),
+                        crate::XmlBackend::default(),
+                    )
+                }
+                "verification" => {
+                    let mut policy = crate::policy::VerificationPolicy::default();
+                    policy.key_sources.key_info_reference = true;
+                    policy.uris.key_info_references = UriTypeSet::ALL;
+                    policy.uris.retrieval_methods = UriTypeSet::ALL;
+                    materialize_verification_key_info_references(
+                        &mut key_info,
+                        resolver,
+                        &policy,
+                        crate::provider::default_provider(),
+                        crate::XmlBackend::default(),
+                    )
+                }
+                _ => unreachable!(),
+            }
+            .unwrap_or_else(|error| panic!("{operation} materialization failed: {error}"));
+
+            assert!(matches!(
+                key_info.sources.as_slice(),
+                [super::super::parse::KeyInfoSource::KeyName(name)] if name == "usable"
+            ));
+        }
+    }
+
+    #[test]
+    fn public_key_info_materialization_binds_xpath_policy() {
+        // Both public helpers must carry the caller's XPath parse limits into
+        // RetrievalMethod transforms nested in an external KeyInfo document.
+        let external = format!(
+            r##"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}">
+                <ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data">
+                    <ds:Transforms><ds:Transform Algorithm="{XPATH_TRANSFORM_URI}">
+                        <ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath>
+                    </ds:Transform></ds:Transforms>
+                </ds:RetrievalMethod>
+                <ds:X509Data Id="target"><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data>
+            </ds:KeyInfo>"##
+        );
+        let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
+        let document = Document::parse("<root/>").unwrap();
+
+        for operation in ["signing", "verification"] {
+            let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+            let mut key_info = KeyInfo {
+                sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                    uri: "key.xml".into(),
+                }],
+            };
+            let error = match operation {
+                "signing" => {
+                    let mut policy = crate::policy::SigningPolicy::default();
+                    policy.uris.key_info_references = UriTypeSet::ALL;
+                    policy.resources.max_xpath_expressions = 0;
+                    materialize_signing_key_info_references(
+                        &mut key_info,
+                        resolver,
+                        &policy,
+                        crate::provider::default_provider(),
+                        crate::XmlBackend::default(),
+                    )
+                }
+                "verification" => {
+                    let mut policy = crate::policy::VerificationPolicy::default();
+                    policy.key_sources.key_info_reference = true;
+                    policy.uris.key_info_references = UriTypeSet::ALL;
+                    policy.resources.max_xpath_expressions = 0;
+                    materialize_verification_key_info_references(
+                        &mut key_info,
+                        resolver,
+                        &policy,
+                        crate::provider::default_provider(),
+                        crate::XmlBackend::default(),
+                    )
+                }
+                _ => unreachable!(),
+            }
+            .expect_err("the public helper must enforce the supplied XPath expression limit");
+
+            assert!(
+                matches!(
+                    error,
+                    DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                        resource: crate::policy::resource_name::XPATH_EXPRESSIONS,
+                        maximum: 0,
+                        actual: 1,
+                    })
+                ),
+                "unexpected {operation} error: {error:?}"
+            );
+        }
+    }
+
+    fn materialize_external_key_info_chain(
+        terminal_reference: &str,
+    ) -> Result<KeyInfo, SignatureVerificationPipelineError> {
+        let a = format!(
+            r##"<doc xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+                <ds:KeyInfo ID="root"><dsig11:KeyInfoReference URI="#next"/></ds:KeyInfo>
+                <ds:KeyInfo ID="next"><dsig11:KeyInfoReference URI="b.xml#root"/></ds:KeyInfo>
+            </doc>"##
+        );
+        let b = format!(
+            r##"<doc xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
+                <ds:KeyInfo ID="root"><dsig11:KeyInfoReference URI="#next"/></ds:KeyInfo>
+                <ds:KeyInfo ID="next">{terminal_reference}</ds:KeyInfo>
+            </doc>"##
+        );
+        let resources = HashMap::from([
+            ("a.xml".to_owned(), a.into_bytes()),
+            ("b.xml".to_owned(), b.into_bytes()),
+        ]);
+        let document = XmlDocument::parse("<root/>").unwrap();
+        let mut key_info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                uri: "a.xml#root".into(),
+            }],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_sources.key_info_reference = true;
+        policy.uris.key_info_references = UriTypeSet::ALL;
+        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
+        let mut budgets = RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse_budget,
+            execution: &execution_budget,
+            resources: &policy.resources,
+            xml_backend: crate::XmlBackend::default(),
+        };
+        let mut materialization = KeyInfoMaterializationState::default();
+
+        document.with_view(|view| {
+            let resolver = UriReferenceResolver::with_document_view(view, &[])
+                .with_external_resources(&resources);
+            materialize_key_info_references_with_budgets(
+                &mut key_info,
+                &resolver,
+                &policy,
+                crate::provider::default_provider(),
+                &mut budgets,
+                &mut materialization,
+            )?;
+            Ok::<_, SignatureVerificationPipelineError>(())
+        })?;
+        Ok(key_info)
+    }
+
+    fn materialize_external_key_info_bytes(
+        encoded: Vec<u8>,
+    ) -> Result<KeyInfo, SignatureVerificationPipelineError> {
+        let resources = HashMap::from([("key.xml".to_owned(), encoded)]);
+        let document = XmlDocument::parse("<root/>").unwrap();
+        let mut key_info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                uri: "key.xml".into(),
+            }],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_sources.key_info_reference = true;
+        policy.uris.key_info_references = UriTypeSet::ALL;
+        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
+        let mut budgets = RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse_budget,
+            execution: &execution_budget,
+            resources: &policy.resources,
+            xml_backend: crate::XmlBackend::default(),
+        };
+        let mut materialization = KeyInfoMaterializationState::default();
+
+        document.with_view(|view| {
+            let resolver = UriReferenceResolver::with_document_view(view, &[])
+                .with_external_resources(&resources);
+            materialize_key_info_references_with_budgets(
+                &mut key_info,
+                &resolver,
+                &policy,
+                crate::provider::default_provider(),
+                &mut budgets,
+                &mut materialization,
+            )?;
+            Ok::<_, SignatureVerificationPipelineError>(())
+        })?;
+        Ok(key_info)
+    }
+
+    #[test]
+    fn external_key_info_reference_decodes_utf16_xml_octets() {
+        // External XML follows the XML encoding declaration/BOM contract, not
+        // the UTF-8-only contract of Rust strings passed by direct callers.
+        let xml = format!(
+            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>utf16-key</ds:KeyName></ds:KeyInfo>"#
+        );
+        let mut encoded = vec![0xff, 0xfe];
+        encoded.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+        let key_info = materialize_external_key_info_bytes(encoded)
+            .expect("UTF-16 external KeyInfo must materialize");
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [super::super::parse::KeyInfoSource::KeyName(name)] if name == "utf16-key"
+        ));
+    }
+
+    #[test]
+    fn external_key_info_reference_rejects_malformed_xml_encoding() {
+        // A BOM selecting UTF-16 must not permit a truncated code unit to reach
+        // the XML parser under a misleading structural diagnostic.
+        let error = materialize_external_key_info_bytes(vec![0xff, 0xfe, b'<'])
+            .expect_err("truncated UTF-16 must be rejected during octet decoding");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "KeyInfoReference external resource has an invalid XML encoding"
+            }
+        ));
+    }
+
+    #[test]
+    fn key_info_reference_cycle_identity_includes_the_owning_resource() {
+        // Equal fragment spellings in separate external documents are distinct
+        // references and must not be rejected as a recursive cycle.
+        let key_info = materialize_external_key_info_chain("<ds:KeyName>terminal</ds:KeyName>")
+            .expect("cross-document duplicate fragments must materialize");
+        assert!(matches!(
+            key_info.sources.as_slice(),
+            [super::super::parse::KeyInfoSource::KeyName(name)] if name == "terminal"
+        ));
+    }
+
+    #[test]
+    fn key_info_reference_cycle_identity_survives_external_reparse() {
+        // Returning to the same external resource must remain a cycle even
+        // though each dereference creates a fresh owned XML document.
+        let error =
+            materialize_external_key_info_chain("<dsig11:KeyInfoReference URI=\"a.xml#root\"/>")
+                .expect_err("a resource cycle must fail before exhausting depth");
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "KeyInfoReference cycle detected"
+            }
+        ));
+    }
+
+    #[test]
     fn retrieval_method_materialization_deduplicates_within_count_limit() {
         // Repeated references to the same raw certificate produce one parsed
         // key source rather than one certificate clone per XML element.
@@ -5127,7 +6061,9 @@ mod tests {
             xpath_parse: &mut xpath_parse_budget,
             execution: &execution_budget,
             resources: &resource_policy,
+            xml_backend: crate::XmlBackend::default(),
         };
+        let mut candidate_work = key_info.embedded_candidate_count();
 
         let error = materialize_retrieval_methods_with_budgets(
             &mut key_info,
@@ -5136,6 +6072,7 @@ mod tests {
             None,
             crate::provider::default_provider(),
             &mut budgets,
+            &mut candidate_work,
         )
         .expect_err("the retrieved certificate must exceed the aggregate candidate limit");
 
@@ -5520,6 +6457,54 @@ mod tests {
             .expect("an unused missing retrieval fallback must not abort verification");
 
         assert_eq!(result.status, DsigStatus::Valid);
+    }
+
+    #[test]
+    fn verify_context_does_not_eagerly_fail_unused_same_document_x509_retrieval() {
+        // Same-document X509Data retrieval is an ordered alternative just like
+        // raw-certificate retrieval; a resolved earlier source makes it unused.
+        let xml = signature_with_target_reference("AQ==").replace(
+            "</ds:SignatureValue>\n  </ds:Signature>",
+            r##"</ds:SignatureValue>
+    <ds:KeyInfo>
+      <ds:KeyName>primary</ds:KeyName>
+      <ds:RetrievalMethod URI="#missing" Type="http://www.w3.org/2000/09/xmldsig#X509Data"/>
+    </ds:KeyInfo>
+  </ds:Signature>"##,
+        );
+
+        let result = VerifyContext::new()
+            .key_resolver(&EarlyKeyInfoResolver)
+            .verify(&xml)
+            .expect("an unused missing X509Data retrieval fallback must not abort verification");
+
+        assert_eq!(result.status, DsigStatus::Valid);
+    }
+
+    #[test]
+    fn verify_context_reports_missing_same_document_x509_retrieval_without_fallback() {
+        // Deferred failures retain their exact diagnostic when no alternative
+        // source resolves the verification key.
+        let xml = signature_with_target_reference("AQ==").replace(
+            "</ds:SignatureValue>\n  </ds:Signature>",
+            r##"</ds:SignatureValue>
+    <ds:KeyInfo>
+      <ds:RetrievalMethod URI="#missing" Type="http://www.w3.org/2000/09/xmldsig#X509Data"/>
+    </ds:KeyInfo>
+  </ds:Signature>"##,
+        );
+
+        let error = VerifyContext::new()
+            .key_resolver(&ConsumingKeyInfoResolver)
+            .verify(&xml)
+            .expect_err("a sole missing X509Data retrieval must remain an explicit error");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "X509Data RetrievalMethod target is missing or ambiguous"
+            }
+        ));
     }
 
     #[test]

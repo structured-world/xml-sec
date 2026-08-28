@@ -139,19 +139,25 @@ fn rejects_incomplete_or_unsafe_signing_templates() {
     let sha1_signature = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha1)
         .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256))
         .build_template()
-        .expect_err("SHA-1 signatures are verify-only");
+        .expect_err("SHA-1 signatures are disabled by the default policy");
     assert!(matches!(
         sha1_signature,
-        SignatureBuilderError::SigningAlgorithmDisabled(_)
+        SignatureBuilderError::Policy(PolicyViolation::Algorithm {
+            operation: "signing",
+            ..
+        })
     ));
 
     let sha1_digest = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
         .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha1))
         .build_template()
-        .expect_err("SHA-1 digests are verify-only");
+        .expect_err("SHA-1 digests are disabled by the default policy");
     assert!(matches!(
         sha1_digest,
-        SignatureBuilderError::SigningAlgorithmDisabled(_)
+        SignatureBuilderError::Policy(PolicyViolation::Algorithm {
+            operation: "signing",
+            ..
+        })
     ));
 }
 
@@ -924,3 +930,4 @@ fn rejects_non_ncname_signature_and_reference_ids() {
             .expect_err("markup must not satisfy Reference Id validation");
     assert!(injected_reference_id.to_string().contains("Reference Id"));
 }
+use xml_sec as roxmltree;

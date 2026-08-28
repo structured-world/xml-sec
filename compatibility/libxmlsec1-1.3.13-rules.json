@@ -19,7 +19,7 @@
     },
     "sha1-verification-tests": {
       "test": "capability_ledger::legacy_algorithm_claims_are_policy_gated",
-      "description": "SHA-1 reference digests remain available for verification interoperability while every signing path rejects them."
+      "description": "SHA-1 interoperability verification executes through the public pipeline; secure signing defaults reject SHA-1 while an explicit compatibility policy enables builder construction and signing."
     },
     "provider-contract": {
       "test": "capability_ledger::backend_surface_distinguishes_provider_capabilities_from_unimplemented_apis",
@@ -54,7 +54,7 @@
     {
       "id": "native-supported-uri",
       "kinds": ["algorithm-uri"],
-      "name_regex": "^xmlSecHref(?:Aes128Cbc|Aes256Cbc|Aes128Gcm|Aes256Gcm|KWAes128|KWAes256|Base64|C14N|C14NWithComments|C14N11|C14N11WithComments|ExcC14N|ExcC14NWithComments|DEREncodedKeyValue|DSAKeyValue|ECKeyValue|Enveloped|RSAKeyValue|RsaSha256|RsaSha384|RsaSha512|EcdsaSha256|EcdsaSha384|Sha256|Sha384|Sha512|RsaOaep|RsaOaepEnc11|Mgf1Sha1|Mgf1Sha256|Mgf1Sha384|Mgf1Sha512|X509Data|RawX509Cert|EncryptedKey)$",
+      "name_regex": "^xmlSecHref(?:Aes128Cbc|Aes256Cbc|Aes128Gcm|Aes256Gcm|KWAes128|KWAes256|Base64|C14N|C14NWithComments|C14N11|C14N11WithComments|ExcC14N|ExcC14NWithComments|DEREncodedKeyValue|DSAKeyValue|ECKeyValue|Enveloped|RSAKeyValue|DsaSha256|HmacSha224|HmacSha256|HmacSha384|HmacSha512|RsaSha224|RsaSha256|RsaSha384|RsaSha512|EcdsaSha224|EcdsaSha256|EcdsaSha384|EcdsaSha512|Sha224|Sha256|Sha384|Sha512|RsaOaep|RsaOaepEnc11|Mgf1Sha1|Mgf1Sha256|Mgf1Sha384|Mgf1Sha512|X509Data|RawX509Cert|EncryptedKey)$",
       "outcome": "behavior-compatible",
       "rationale": "The native Rust API parses and executes this standard URI, with unit or interoperability coverage in the repository.",
       "evidence": "native-algorithm-tests"
@@ -64,13 +64,13 @@
       "kinds": ["algorithm-uri"],
       "name_regex": "^xmlSecHrefSha1$",
       "outcome": "behavior-compatible",
-      "rationale": "The native Rust API provides verification-only SHA-1 reference digest compatibility; signing rejects SHA-1 independently of policy.",
+      "rationale": "The native Rust API implements SHA-1 reference digests; secure signing defaults reject SHA-1 while an explicit compatibility policy can opt in.",
       "evidence": "sha1-verification-tests"
     },
     {
       "id": "policy-gated-legacy-uri",
       "kinds": ["algorithm-uri"],
-      "name_regex": "^xmlSecHref(?:DsaSha1|HmacSha1|RsaSha1)$",
+      "name_regex": "^xmlSecHref(?:DsaSha1|EcdsaSha1|HmacSha1|RsaSha1)$",
       "outcome": "compatibility-profile-only",
       "rationale": "The implementation retains this legacy algorithm for interoperability, but the compiled policy must explicitly permit it.",
       "evidence": "legacy-policy-tests"
@@ -144,7 +144,7 @@
     {
       "id": "native-cli-provider-options",
       "kinds": ["cli-option"],
-      "name_regex": "^--(?:X509-skip-strict-checks|aes-key|crypto|crypto-config|gen-key|pkcs8-der|pkcs8-pem|print-crypto-library-errors|privkey-der|privkey-pem|pubkey-cert-der|pubkey-cert-pem|pubkey-der|pubkey-pem|trusted-der|trusted-pem|untrusted-der|untrusted-pem)$",
+      "name_regex": "^--(?:X509-skip-strict-checks|aes-key|crypto|crypto-config|gen-key|hmac-key|pkcs8-der|pkcs8-pem|print-crypto-library-errors|privkey-der|privkey-pem|pubkey-cert-der|pubkey-cert-pem|pubkey-der|pubkey-pem|trusted-der|trusted-pem|untrusted-der|untrusted-pem)$",
       "outcome": "provider-limited",
       "rationale": "The native CLI implements this option only for the formats, algorithms, or fixed RustCrypto provider behavior advertised by its capability registry.",
       "evidence": "native-cli-tests"

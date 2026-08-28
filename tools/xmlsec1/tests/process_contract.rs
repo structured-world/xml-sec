@@ -6,6 +6,10 @@ use std::{
 };
 
 use base64::Engine as _;
+use der::{Encode as _, asn1::UintRef};
+use p256::SecretKey as P256SecretKey;
+use p384::SecretKey as P384SecretKey;
+use p521::SecretKey as P521SecretKey;
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
@@ -17,11 +21,12 @@ use rsa::{
 use x509_parser::{extensions::ParsedExtension, prelude::FromDer as _};
 use xml_sec::{
     c14n::{C14nAlgorithm, C14nMode},
-    policy::{EncryptionPolicy, VerificationPolicy},
+    policy::{EncryptionPolicy, HmacPolicy, VerificationPolicy},
     provider::default_provider,
     xmldsig::{
-        DigestAlgorithm, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
-        SignatureBuilder, Transform, XPathExpression, mutation::append_signature_to_root,
+        DigestAlgorithm, HmacVerificationKey, ReferenceBuilder, RsaSigningKey, SignContext,
+        SignatureAlgorithm, SignatureBuilder, Transform, VerifyContext, XPathExpression,
+        mutation::append_signature_to_root,
     },
     xmlenc::{
         DataEncryptionAlgorithm, EncryptedDataBuilder, EncryptionRecipient, KeyCandidateBudget,
@@ -36,6 +41,48 @@ fn project_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
+#[derive(der::Sequence)]
+struct TraditionalDsaPrivateKey<'a> {
+    version: u8,
+    p: UintRef<'a>,
+    q: UintRef<'a>,
+    g: UintRef<'a>,
+    y: UintRef<'a>,
+    x: UintRef<'a>,
+}
+
+fn traditional_dsa_private_key_der(key: &dsa::SigningKey) -> Vec<u8> {
+    let verifying_key = key.verifying_key();
+    let components = verifying_key.components();
+    let p = components.p().to_be_bytes_trimmed_vartime();
+    let q = components.q().to_be_bytes_trimmed_vartime();
+    let g = components.g().to_be_bytes_trimmed_vartime();
+    let y = verifying_key.y().to_be_bytes_trimmed_vartime();
+    let x = key.x().to_be_bytes_trimmed_vartime();
+
+    TraditionalDsaPrivateKey {
+        version: 0,
+        p: UintRef::new(p.as_ref()).unwrap(),
+        q: UintRef::new(q.as_ref()).unwrap(),
+        g: UintRef::new(g.as_ref()).unwrap(),
+        y: UintRef::new(y.as_ref()).unwrap(),
+        x: UintRef::new(x.as_ref()).unwrap(),
+    }
+    .to_der()
+    .unwrap()
+}
+
+fn traditional_dsa_private_key_pem(der: &[u8]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let body = encoded
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("-----BEGIN DSA PRIVATE KEY-----\n{body}\n-----END DSA PRIVATE KEY-----\n")
+}
+
 fn signature_template_without_key_info() -> &'static str {
     r##"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
 <SignedInfo>
@@ -46,6 +93,1051 @@ fn signature_template_without_key_info() -> &'static str {
 <SignatureValue/>
 <Object Id="object">payload</Object>
 </Signature>"##
+}
+
+fn rsa_sha1_signature_template() -> String {
+    signature_template_without_key_info()
+        .replace(
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
+        )
+        .replace(
+            "http://www.w3.org/2001/04/xmlenc#sha256",
+            "http://www.w3.org/2000/09/xmldsig#sha1",
+        )
+}
+
+#[test]
+fn compatibility_cli_signs_and_verifies_legacy_sha1_templates() {
+    // The xmlsec1-compatible binary is an explicit legacy boundary. It must
+    // accept donor SHA-1 templates without weakening the core library defaults.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("rsa-sha1-template.xml");
+    let signed = temp.path().join("rsa-sha1-signed.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(&template, rsa_sha1_signature_template()).unwrap();
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[cfg(all(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree"))]
+#[test]
+fn runtime_xml_backend_selector_drives_every_security_command() {
+    // A fat binary must carry one explicit backend through metadata parsing,
+    // the core operation, recursive parsing, and output validation.
+    let temp = tempfile::tempdir().unwrap();
+    let signature_template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let encryption_template = temp.path().join("encryption-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let symmetric_key = temp.path().join("key.bin");
+    fs::write(
+        &encryption_template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"runtime backend payload").unwrap();
+    fs::write(&symmetric_key, b"0123456789abcdef").unwrap();
+
+    for backend in ["xmloxide", "roxmltree", "differential"] {
+        let signed = temp.path().join(format!("signed-{backend}.xml"));
+        let sign = Command::new(binary())
+            .args(["sign", "--xml-backend", backend, "--privkey-pem"])
+            .arg(&private_key)
+            .arg("--output")
+            .arg(&signed)
+            .arg(&signature_template)
+            .output()
+            .unwrap();
+        assert!(
+            sign.status.success(),
+            "{backend} sign: {}",
+            String::from_utf8_lossy(&sign.stderr)
+        );
+        let verify = Command::new(binary())
+            .args(["verify", "--xml-backend", backend, "--pubkey-pem"])
+            .arg(&public_key)
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "{backend} verify: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+
+        let encrypted = temp.path().join(format!("encrypted-{backend}.xml"));
+        let decrypted = temp.path().join(format!("decrypted-{backend}.bin"));
+        let encrypt = Command::new(binary())
+            .args(["encrypt", "--xml-backend", backend, "--aeskey"])
+            .arg(&symmetric_key)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&encryption_template)
+            .output()
+            .unwrap();
+        assert!(
+            encrypt.status.success(),
+            "{backend} encrypt: {}",
+            String::from_utf8_lossy(&encrypt.stderr)
+        );
+        let decrypt = Command::new(binary())
+            .args(["decrypt", "--xml-backend", backend, "--aeskey"])
+            .arg(&symmetric_key)
+            .arg("--output")
+            .arg(&decrypted)
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            decrypt.status.success(),
+            "{backend} decrypt: {}",
+            String::from_utf8_lossy(&decrypt.stderr)
+        );
+        assert_eq!(fs::read(&decrypted).unwrap(), fs::read(&plaintext).unwrap());
+    }
+}
+
+#[test]
+fn pinned_direct_verification_ignores_unused_key_info_references() {
+    // A caller-pinned direct key is the complete verification identity. An
+    // unrelated document KeyInfo must not become a failure surface merely
+    // because compatibility metadata is collected before core verification.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("rsa-sha1-template.xml");
+    let signed = temp.path().join("rsa-sha1-signed.xml");
+    let unused_reference = temp.path().join("rsa-sha1-unused-reference.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(&template, rsa_sha1_signature_template()).unwrap();
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let mut modified = fs::read_to_string(&signed).unwrap();
+    let object_start = modified.find("<Object").unwrap();
+    modified.insert_str(
+        object_start,
+        r##"<KeyInfo><dsig11:KeyInfoReference xmlns:dsig11="http://www.w3.org/2009/xmldsig11#" URI="#missing"/></KeyInfo>"##,
+    );
+    fs::write(&unused_reference, modified).unwrap();
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&unused_reference)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
+fn compatibility_cli_resolves_key_info_reference_before_signing_key_selection() {
+    // The donor template puts its KeyName behind a same-document
+    // KeyInfoReference. Compatibility key selection must resolve that identity
+    // before matching a named private-key option.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root().join(
+        "tests/fixtures/xmldsig/xmldsig11-interop-2012/signature-enveloping-keyinforeference-rsa.tmpl",
+    );
+    let private_key = temp.path().join("rsa-4096-private.der");
+    let fixture_key = RsaPrivateKey::from_pkcs8_pem(
+        &fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem"))
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(&private_key, fixture_key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
+    let signed = temp.path().join("key-info-reference-signed.xml");
+
+    let sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-rsa-4096"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem:TestKeyName-rsa-4096"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    let unnamed_signed = temp.path().join("key-info-reference-unnamed-signed.xml");
+    let unnamed_sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&unnamed_signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        unnamed_sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unnamed_sign.stderr)
+    );
+
+    // Materialized KeyName constrains named selection. An unrelated name must
+    // fail rather than falling back to the only loaded private key.
+    let mismatched = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-unrelated"])
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!mismatched.status.success());
+}
+
+#[test]
+fn compatibility_cli_signs_hmac_templates_with_named_raw_keys() {
+    // The global hmac-key option is part of the xmlsec1 sign contract. The CLI
+    // consumes its file verbatim and applies the compatibility HMAC minima.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root().join(
+        "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-hmac-sha1.tmpl",
+    );
+    let key = project_root().join("tests/fixtures/keys/hmackey.bin");
+    let signed = temp.path().join("hmac-signed.xml");
+
+    let sign = Command::new(binary())
+        .args(["sign", "--hmac-key:TeskKeyName-Hmac"])
+        .arg(&key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let secret = fs::read(&key).unwrap();
+    let verification_key = HmacVerificationKey::new(secret).unwrap();
+    let mut policy = VerificationPolicy {
+        hmac: HmacPolicy {
+            minimum_key_bits: 40,
+            minimum_output_bits: 40,
+        },
+        ..VerificationPolicy::default()
+    };
+    policy
+        .key_trust
+        .allowed_legacy_signature_algorithms
+        .insert(SignatureAlgorithm::HmacSha1);
+    let verified = VerifyContext::new()
+        .key(&verification_key)
+        .policy(policy)
+        .verify(&fs::read_to_string(&signed).unwrap())
+        .expect("CLI-generated HMAC signature must verify");
+    assert_eq!(verified.status, xml_sec::xmldsig::DsigStatus::Valid);
+
+    let cli_verified = Command::new(binary())
+        .args(["verify", "--hmac-key:TeskKeyName-Hmac"])
+        .arg(&key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        cli_verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli_verified.stderr)
+    );
+
+    let wrong_key = temp.path().join("wrong-hmac.bin");
+    fs::write(&wrong_key, b"wrong-secret").unwrap();
+    let rejected_wrong_key = Command::new(binary())
+        .args(["verify", "--hmac-key:TeskKeyName-Hmac"])
+        .arg(&wrong_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(!rejected_wrong_key.status.success());
+
+    let short_key = temp.path().join("short-hmac.bin");
+    fs::write(&short_key, [0_u8; 4]).unwrap();
+    let rejected = Command::new(binary())
+        .args(["sign", "--hmac-key:TeskKeyName-Hmac"])
+        .arg(&short_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("configured minimum"));
+
+    let rejected_verify = Command::new(binary())
+        .args(["verify", "--hmac-key:TeskKeyName-Hmac"])
+        .arg(&short_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(!rejected_verify.status.success());
+    assert!(String::from_utf8_lossy(&rejected_verify.stderr).contains("configured minimum"));
+}
+
+#[test]
+#[expect(
+    deprecated,
+    reason = "the compatibility CLI must retain coverage for legacy DSA 1024/160 keys"
+)]
+fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
+    // The CLI decoder must cover every asymmetric family admitted by its
+    // compatibility policy, not just the historically implemented subset.
+    let temp = tempfile::tempdir().unwrap();
+
+    let encrypted_dsa =
+        fs::read(project_root().join("tests/fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der"))
+            .unwrap();
+    let dsa_key = dsa::SigningKey::from_pkcs8_encrypted_der(&encrypted_dsa, b"secret123").unwrap();
+    let dsa_public = temp.path().join("dsa-public.der");
+    fs::write(
+        &dsa_public,
+        dsa_key
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let dsa_template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-dsa2048-sha256.tmpl");
+    let dsa_signed = temp.path().join("dsa-signed.xml");
+    let dsa_sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-dsa-2048"])
+        .arg(project_root().join("tests/fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der"))
+        .args(["--pwd", "secret123"])
+        .arg("--output")
+        .arg(&dsa_signed)
+        .arg(&dsa_template)
+        .output()
+        .unwrap();
+    assert!(
+        dsa_sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dsa_sign.stderr)
+    );
+    let wrong_password_output = temp.path().join("dsa-wrong-password.xml");
+    let wrong_password = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-dsa-2048"])
+        .arg(project_root().join("tests/fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der"))
+        .args(["--pwd", "not-secret123-sentinel"])
+        .arg("--output")
+        .arg(&wrong_password_output)
+        .arg(&dsa_template)
+        .output()
+        .unwrap();
+    assert!(!wrong_password.status.success());
+    assert!(!wrong_password_output.exists());
+    assert!(!String::from_utf8_lossy(&wrong_password.stderr).contains("not-secret123-sentinel"));
+    let dsa_verify = Command::new(binary())
+        .args(["verify", "--pubkey-der:TestKeyName-dsa-2048"])
+        .arg(&dsa_public)
+        .arg(&dsa_signed)
+        .output()
+        .unwrap();
+    assert!(
+        dsa_verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dsa_verify.stderr)
+    );
+
+    let traditional_dsa_der = traditional_dsa_private_key_der(&dsa_key);
+    for (option, extension, contents) in [
+        (
+            "--privkey-der:TestKeyName-dsa-2048",
+            "der",
+            traditional_dsa_der.clone(),
+        ),
+        (
+            "--privkey-pem:TestKeyName-dsa-2048",
+            "pem",
+            traditional_dsa_private_key_pem(&traditional_dsa_der).into_bytes(),
+        ),
+    ] {
+        let private = temp.path().join(format!("dsa-traditional.{extension}"));
+        let signed = temp.path().join(format!("dsa-traditional-{extension}.xml"));
+        fs::write(&private, contents).unwrap();
+        let sign = Command::new(binary())
+            .args(["sign", option])
+            .arg(&private)
+            .arg("--output")
+            .arg(&signed)
+            .arg(&dsa_template)
+            .output()
+            .unwrap();
+        assert!(
+            sign.status.success(),
+            "{option}: {}",
+            String::from_utf8_lossy(&sign.stderr)
+        );
+        let verify = Command::new(binary())
+            .args(["verify", "--pubkey-der:TestKeyName-dsa-2048"])
+            .arg(&dsa_public)
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "{option}: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+    }
+
+    let mut legacy_rng = ChaCha8Rng::seed_from_u64(0xD5A1_1024);
+    let legacy_components = dsa::Components::try_generate_from_rng_with_key_size(
+        &mut legacy_rng,
+        dsa::KeySize::DSA_1024_160,
+    )
+    .expect("legacy DSA parameters must generate");
+    let legacy_dsa =
+        dsa::SigningKey::try_generate_from_rng_with_components(&mut legacy_rng, legacy_components)
+            .expect("legacy DSA key must generate");
+    let legacy_private = temp.path().join("dsa-1024-private.der");
+    let legacy_public = temp.path().join("dsa-1024-public.der");
+    fs::write(
+        &legacy_private,
+        legacy_dsa.to_pkcs8_der().unwrap().as_bytes(),
+    )
+    .unwrap();
+    fs::write(
+        &legacy_public,
+        legacy_dsa
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let donor_legacy_template = project_root()
+        .join("tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-dsa.tmpl");
+    let legacy_template = temp.path().join("dsa-1024-template.xml");
+    let verifying_key = legacy_dsa.verifying_key();
+    let components = verifying_key.components();
+    let encode_component = |value: &[u8]| base64::engine::general_purpose::STANDARD.encode(value);
+    let dsa_key_value = format!(
+        "    <KeyValue><DSAKeyValue><P>{}</P><Q>{}</Q><G>{}</G><Y>{}</Y></DSAKeyValue></KeyValue>",
+        encode_component(components.p().to_be_bytes_trimmed_vartime().as_ref()),
+        encode_component(components.q().to_be_bytes_trimmed_vartime().as_ref()),
+        encode_component(components.g().to_be_bytes_trimmed_vartime().as_ref()),
+        encode_component(verifying_key.y().to_be_bytes_trimmed_vartime().as_ref()),
+    );
+    fs::write(
+        &legacy_template,
+        fs::read_to_string(donor_legacy_template)
+            .unwrap()
+            .replace("    <KeyValue>\n    </KeyValue>", &dsa_key_value),
+    )
+    .unwrap();
+    let legacy_signed = temp.path().join("dsa-1024-signed.xml");
+    let legacy_sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-dsa-1024"])
+        .arg(&legacy_private)
+        .arg("--output")
+        .arg(&legacy_signed)
+        .arg(&legacy_template)
+        .output()
+        .unwrap();
+    assert!(
+        legacy_sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&legacy_sign.stderr)
+    );
+    let legacy_verify = Command::new(binary())
+        .args(["verify", "--pubkey-der:TestKeyName-dsa-1024"])
+        .arg(&legacy_public)
+        .arg(&legacy_signed)
+        .output()
+        .unwrap();
+    assert!(
+        legacy_verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&legacy_verify.stderr)
+    );
+
+    let y_only_template = temp.path().join("dsa-1024-y-only-template.xml");
+    let y_only_key_value = format!(
+        "    <KeyValue><DSAKeyValue><Y>{}</Y></DSAKeyValue></KeyValue>",
+        encode_component(verifying_key.y().to_be_bytes_trimmed_vartime().as_ref()),
+    );
+    fs::write(
+        &y_only_template,
+        fs::read_to_string(&legacy_template)
+            .unwrap()
+            .replace(&dsa_key_value, &y_only_key_value),
+    )
+    .unwrap();
+    let y_only_sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-dsa-1024"])
+        .arg(&legacy_private)
+        .arg(&y_only_template)
+        .output()
+        .unwrap();
+    assert!(
+        y_only_sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&y_only_sign.stderr)
+    );
+
+    let mismatched_template = temp.path().join("dsa-1024-mismatched-template.xml");
+    let mut mismatched_y = verifying_key.y().to_be_bytes_trimmed_vartime().to_vec();
+    mismatched_y[0] ^= 1;
+    let mismatched_key_value = dsa_key_value.replace(
+        &encode_component(verifying_key.y().to_be_bytes_trimmed_vartime().as_ref()),
+        &encode_component(&mismatched_y),
+    );
+    fs::write(
+        &mismatched_template,
+        fs::read_to_string(&legacy_template)
+            .unwrap()
+            .replace(&dsa_key_value, &mismatched_key_value),
+    )
+    .unwrap();
+    let mismatched_sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-dsa-1024"])
+        .arg(&legacy_private)
+        .arg(&mismatched_template)
+        .output()
+        .unwrap();
+    assert!(!mismatched_sign.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatched_sign.stderr)
+            .contains("preserved KeyInfo does not match the selected signing key")
+    );
+
+    let p521_template = temp.path().join("p521-template.xml");
+    fs::write(
+        &p521_template,
+        ecdsa_signature_template().replace(
+            "<SignatureValue/>",
+            "<SignatureValue/><KeyInfo><KeyName>TestKeyName-ec-prime521v1</KeyName></KeyInfo>",
+        ),
+    )
+    .unwrap();
+    let p521_private =
+        project_root().join("tests/fixtures/xmldsig/xmldsig11-interop-2012/keys/p521-key-orig.der");
+    let p521_certificate =
+        project_root().join("tests/fixtures/xmldsig/xmldsig11-interop-2012/keys/p521-key.crt");
+    let p521_signed = temp.path().join("p521-signed.xml");
+    let p521_sign = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-ec-prime521v1"])
+        .arg(&p521_private)
+        .arg("--output")
+        .arg(&p521_signed)
+        .arg(&p521_template)
+        .output()
+        .unwrap();
+    assert!(
+        p521_sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&p521_sign.stderr)
+    );
+    let p521_verify = Command::new(binary())
+        .args(["verify", "--insecure", "--pubkey-cert-der"])
+        .arg(&p521_certificate)
+        .arg(&p521_signed)
+        .output()
+        .unwrap();
+    assert!(
+        p521_verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&p521_verify.stderr)
+    );
+}
+
+#[test]
+fn compatibility_cli_decrypts_rsa_and_ecdsa_pkcs8_signing_keys() {
+    // --pwd describes PKCS#8 key-container encryption, so every asymmetric
+    // family accepted by the CLI must decrypt the same PEM and DER formats.
+    let temp = tempfile::tempdir().unwrap();
+    let password = b"shared-pkcs8-password";
+    let mut rng = ChaCha8Rng::seed_from_u64(0x504B_4353_3800_0001);
+
+    let rsa = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let rsa_plain_private = temp.path().join("rsa-plain.der");
+    let rsa_private = temp.path().join("rsa-encrypted.der");
+    let rsa_public = temp.path().join("rsa-public.der");
+    let rsa_der = rsa.to_pkcs8_der().unwrap();
+    fs::write(&rsa_plain_private, rsa_der.as_bytes()).unwrap();
+    let encrypted_rsa = pkcs8::PrivateKeyInfoRef::try_from(rsa_der.as_bytes())
+        .unwrap()
+        .encrypt_with_rng(&mut rng, password)
+        .unwrap();
+    fs::write(&rsa_private, encrypted_rsa.as_bytes()).unwrap();
+    fs::write(
+        &rsa_public,
+        RsaPublicKey::from(&rsa)
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    assert_pkcs8_cli_round_trip(
+        temp.path(),
+        "rsa-plain",
+        signature_template_without_key_info(),
+        &rsa_plain_private,
+        &rsa_public,
+        b"unused-for-plain-container",
+        false,
+    );
+    assert_pkcs8_cli_round_trip(
+        temp.path(),
+        "rsa",
+        signature_template_without_key_info(),
+        &rsa_private,
+        &rsa_public,
+        password,
+        true,
+    );
+
+    let p256 = P256SecretKey::from_pkcs8_pem(
+        &fs::read_to_string(project_root().join("tests/fixtures/keys/ec/ec-prime256v1-key.pem"))
+            .unwrap(),
+    )
+    .unwrap();
+    let p256_plain_private = temp.path().join("p256-plain.pem");
+    let p256_private = temp.path().join("p256-encrypted.pem");
+    let p256_public = temp.path().join("p256-public.der");
+    let p256_der = p256.to_pkcs8_der().unwrap();
+    fs::write(
+        &p256_plain_private,
+        p256.to_pkcs8_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
+    )
+    .unwrap();
+    let encrypted_p256 = pkcs8::PrivateKeyInfoRef::try_from(p256_der.as_bytes())
+        .unwrap()
+        .encrypt_with_rng(&mut rng, password)
+        .unwrap();
+    fs::write(
+        &p256_private,
+        encrypted_p256
+            .to_pem("ENCRYPTED PRIVATE KEY", pkcs8::LineEnding::LF)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    fs::write(
+        &p256_public,
+        p256.public_key().to_public_key_der().unwrap().as_bytes(),
+    )
+    .unwrap();
+    assert_pkcs8_cli_round_trip(
+        temp.path(),
+        "p256-plain",
+        ecdsa_signature_template(),
+        &p256_plain_private,
+        &p256_public,
+        b"unused-for-plain-container",
+        false,
+    );
+    assert_pkcs8_cli_round_trip(
+        temp.path(),
+        "p256",
+        ecdsa_signature_template(),
+        &p256_private,
+        &p256_public,
+        password,
+        true,
+    );
+}
+
+#[test]
+fn compatibility_cli_signs_with_traditional_encrypted_rsa_pem() {
+    // The generic PEM option mirrors libxmlsec1's OpenSSL legacy RSA envelope
+    // support; explicit PKCS#8 options retain their narrower format contract.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("rsa-traditional-template.xml");
+    let signed = temp.path().join("rsa-traditional-signed.xml");
+    let private_key =
+        project_root().join("tests/fixtures/keys/rsa/rsa-2048-key-traditional-encrypted.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    fs::write(&template, signature_template_without_key_info()).unwrap();
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--pwd", "legacy-rsa-password"])
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    let rejected_output = temp.path().join("rsa-traditional-rejected.xml");
+    let wrong_password = "wrong-legacy-password-sentinel";
+    let rejected = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--pwd", wrong_password])
+        .arg("--output")
+        .arg(&rejected_output)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(!rejected_output.exists());
+    assert!(!String::from_utf8_lossy(&rejected.stderr).contains(wrong_password));
+}
+
+#[test]
+fn compatibility_cli_signs_with_traditional_encrypted_dsa_pem() {
+    // Generic PEM loading applies the password before DSA ASN.1 validation;
+    // encrypted input must never fall back to password-blind plain decoding.
+    let temp = tempfile::tempdir().unwrap();
+    let template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-dsa2048-sha256.tmpl");
+    let signed = temp.path().join("dsa-traditional-signed.xml");
+    let private_key =
+        project_root().join("tests/fixtures/keys/dsa/dsa-2048-key-traditional-encrypted.pem");
+    let public_key = project_root().join("tests/fixtures/keys/dsa/dsa-2048-public.pem");
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem:TestKeyName-dsa-2048"])
+        .arg(&private_key)
+        .args(["--pwd", "legacy-dsa-password"])
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem:TestKeyName-dsa-2048"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    for password in [None, Some("wrong-legacy-password-sentinel")] {
+        let rejected_output = temp.path().join(format!(
+            "dsa-traditional-rejected-{}.xml",
+            password.unwrap_or("missing")
+        ));
+        let mut rejected = Command::new(binary());
+        rejected
+            .args(["sign", "--privkey-pem:TestKeyName-dsa-2048"])
+            .arg(&private_key);
+        if let Some(password) = password {
+            rejected.args(["--pwd", password]);
+        }
+        let rejected = rejected
+            .arg("--output")
+            .arg(&rejected_output)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(!rejected_output.exists());
+        if let Some(password) = password {
+            assert!(!String::from_utf8_lossy(&rejected.stderr).contains(password));
+        }
+    }
+}
+
+#[test]
+fn compatibility_cli_accepts_generic_sec1_ecdsa_keys() {
+    // Generic private-key options accept the traditional ECPrivateKey container,
+    // while the explicitly named PKCS#8 options remain container-strict.
+    let temp = tempfile::tempdir().unwrap();
+    let p256 = P256SecretKey::from_slice(&[0x11; 32]).unwrap();
+    let p384 = P384SecretKey::from_slice(&[0x22; 48]).unwrap();
+    let p521 = P521SecretKey::from_slice(&[0x01; 66]).unwrap();
+
+    assert_sec1_cli_round_trip(
+        temp.path(),
+        "p256",
+        p256.to_sec1_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
+        p256.to_sec1_der().unwrap().as_ref(),
+        p256.public_key().to_public_key_der().unwrap().as_bytes(),
+    );
+    assert_sec1_cli_round_trip(
+        temp.path(),
+        "p384",
+        p384.to_sec1_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
+        p384.to_sec1_der().unwrap().as_ref(),
+        p384.public_key().to_public_key_der().unwrap().as_bytes(),
+    );
+    assert_sec1_cli_round_trip(
+        temp.path(),
+        "p521",
+        p521.to_sec1_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
+        p521.to_sec1_der().unwrap().as_ref(),
+        p521.public_key().to_public_key_der().unwrap().as_bytes(),
+    );
+}
+
+#[test]
+fn compatibility_cli_signs_with_traditional_encrypted_sec1_pem() {
+    // The generic PEM option applies the password before SEC1 curve decoding;
+    // no password-blind plaintext fallback may accept a malformed envelope.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("ec-traditional-template.xml");
+    let signed = temp.path().join("ec-traditional-signed.xml");
+    let private_key =
+        project_root().join("tests/fixtures/keys/ec/p256-key-traditional-encrypted.pem");
+    let public_key =
+        project_root().join("tests/fixtures/xmldsig/xmldsig11-interop-2012/keys/p256-key.der");
+    fs::write(&template, ecdsa_signature_template()).unwrap();
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--pwd", "legacy-ec-password"])
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-der"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    for password in [None, Some("wrong-legacy-password-sentinel")] {
+        let rejected_output = temp.path().join(format!(
+            "ec-traditional-rejected-{}.xml",
+            password.unwrap_or("missing")
+        ));
+        let mut rejected = Command::new(binary());
+        rejected.args(["sign", "--privkey-pem"]).arg(&private_key);
+        if let Some(password) = password {
+            rejected.args(["--pwd", password]);
+        }
+        let rejected = rejected
+            .arg("--output")
+            .arg(&rejected_output)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(!rejected_output.exists());
+        if let Some(password) = password {
+            assert!(!String::from_utf8_lossy(&rejected.stderr).contains(password));
+        }
+    }
+}
+
+fn assert_sec1_cli_round_trip(
+    directory: &Path,
+    name: &str,
+    private_pem: &[u8],
+    private_der: &[u8],
+    public_der: &[u8],
+) {
+    let template = directory.join(format!("{name}-template.xml"));
+    let public_key = directory.join(format!("{name}-public.der"));
+    fs::write(&template, ecdsa_signature_template()).unwrap();
+    fs::write(&public_key, public_der).unwrap();
+
+    for (encoding, bytes) in [("pem", private_pem), ("der", private_der)] {
+        let private_key = directory.join(format!("{name}-private.{encoding}"));
+        let signed = directory.join(format!("{name}-{encoding}-signed.xml"));
+        fs::write(&private_key, bytes).unwrap();
+
+        let sign = Command::new(binary())
+            .arg("sign")
+            .arg(format!("--privkey-{encoding}"))
+            .arg(&private_key)
+            .arg("--output")
+            .arg(&signed)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(
+            sign.status.success(),
+            "{name} SEC1 {encoding}: {}",
+            String::from_utf8_lossy(&sign.stderr)
+        );
+
+        let verify = Command::new(binary())
+            .args(["verify", "--pubkey-der"])
+            .arg(&public_key)
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "{name} SEC1 {encoding}: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+
+        let rejected = Command::new(binary())
+            .arg("sign")
+            .arg(format!("--pkcs8-{encoding}"))
+            .arg(&private_key)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+    }
+}
+
+fn assert_pkcs8_cli_round_trip(
+    directory: &Path,
+    name: &str,
+    template: &str,
+    private_key: &Path,
+    public_key: &Path,
+    password: &[u8],
+    reject_wrong_password: bool,
+) {
+    let template_path = directory.join(format!("{name}-template.xml"));
+    let signed_path = directory.join(format!("{name}-signed.xml"));
+    fs::write(&template_path, template).unwrap();
+    let private_key_option = if private_key
+        .extension()
+        .is_some_and(|extension| extension == "pem")
+    {
+        "--pkcs8-pem"
+    } else {
+        "--pkcs8-der"
+    };
+    let sign = Command::new(binary())
+        .arg("sign")
+        .arg(private_key_option)
+        .arg(private_key)
+        .arg("--pwd")
+        .arg(std::str::from_utf8(password).unwrap())
+        .arg("--output")
+        .arg(&signed_path)
+        .arg(&template_path)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    if reject_wrong_password {
+        let wrong_password_output = directory.join(format!("{name}-wrong-password.xml"));
+        let wrong_password = "wrong-password-sentinel";
+        let rejected = Command::new(binary())
+            .arg("sign")
+            .arg(private_key_option)
+            .arg(private_key)
+            .args(["--pwd", wrong_password])
+            .arg("--output")
+            .arg(&wrong_password_output)
+            .arg(&template_path)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(!wrong_password_output.exists());
+        assert!(!String::from_utf8_lossy(&rejected.stderr).contains(wrong_password));
+    }
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-der"])
+        .arg(public_key)
+        .arg(&signed_path)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
 }
 
 fn ecdsa_signature_template() -> &'static str {

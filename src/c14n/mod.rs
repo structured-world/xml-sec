@@ -32,7 +32,7 @@ pub(crate) mod xml_base;
 
 use std::collections::HashSet;
 
-use roxmltree::{Document, Node, NodeId};
+use crate::xml::dom::{Document, Node, NodeId};
 
 use ns_exclusive::ExclusiveNsRenderer;
 use ns_inclusive::InclusiveNsRenderer;
@@ -503,6 +503,15 @@ fn serialize_canonical_visible_with_position_dispatch(
 /// Returns `C14nError::Parse` for invalid UTF-8, malformed XML, or exceeded
 /// input ceilings.
 pub fn canonicalize_xml(xml: &[u8], algo: &C14nAlgorithm) -> Result<Vec<u8>, C14nError> {
+    canonicalize_xml_with_backend(xml, algo, crate::XmlBackend::default())
+}
+
+/// Parse and canonicalize a complete XML document with an explicit backend.
+pub fn canonicalize_xml_with_backend(
+    xml: &[u8],
+    algo: &C14nAlgorithm,
+    backend: crate::XmlBackend,
+) -> Result<Vec<u8>, C14nError> {
     if xml.len() > crate::hard_limits::XML_DOCUMENT_BYTE_CEILING {
         return Err(C14nError::Parse(format!(
             "input exceeds maximum XML document size of {} bytes: got {}",
@@ -514,7 +523,7 @@ pub fn canonicalize_xml(xml: &[u8], algo: &C14nAlgorithm) -> Result<Vec<u8>, C14
         std::str::from_utf8(xml).map_err(|e| C14nError::Parse(format!("invalid UTF-8: {e}")))?;
     let document = crate::document::parse_borrowed_with_settings_and_budget(
         xml_str,
-        crate::document::DocumentParseSettings::default(),
+        crate::document::DocumentParseSettings::default().with_backend(backend),
         None,
     )
     .map_err(|error| C14nError::Parse(error.to_string()))?;
@@ -699,7 +708,7 @@ mod tests {
     fn c14n_1_1_xml_id_is_not_inherited_in_subset() {
         // C14N 1.1 explicitly excludes xml:id from simple inheritable
         // attributes, so omitting its owner must also omit the attribute.
-        use roxmltree::Document;
+        use crate::xml::dom::Document;
         use std::collections::HashSet;
 
         let xml = r#"<root xml:id="r1"><child>text</child></root>"#;
@@ -715,7 +724,7 @@ mod tests {
                 stack.push(c);
             }
         }
-        let pred = move |n: roxmltree::Node| ids.contains(&n.id());
+        let pred = move |n: crate::xml::dom::Node| ids.contains(&n.id());
 
         let algo = C14nAlgorithm::new(C14nMode::Inclusive1_1, false);
         let mut out = Vec::new();
@@ -732,7 +741,7 @@ mod tests {
     fn c14n_1_0_xml_id_is_inherited_in_subset() {
         // C14N 1.0 predates the C14N 1.1 xml:id exception, so xml:id follows
         // the general xml:* apex inheritance rule in a document subset.
-        use roxmltree::Document;
+        use crate::xml::dom::Document;
         use std::collections::HashSet;
 
         let xml = r#"<root xml:id="r1"><child>text</child></root>"#;
@@ -742,7 +751,7 @@ mod tests {
             .descendants()
             .map(|node| node.id())
             .collect::<HashSet<_>>();
-        let pred = move |node: roxmltree::Node| ids.contains(&node.id());
+        let pred = move |node: crate::xml::dom::Node| ids.contains(&node.id());
 
         let algo = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
         let mut out = Vec::new();

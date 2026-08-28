@@ -22,8 +22,8 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 
+use crate::xml::dom::{Document, Node, NodeId, NodeType};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use roxmltree::{Document, Node, NodeId, NodeType};
 use sha2::{Digest as _, Sha256};
 
 use super::parse::XMLDSIG_NS;
@@ -217,8 +217,8 @@ impl C14nOutputBudget {
 mod c14n_budget_regression_tests {
     use super::*;
     use crate::c14n::C14nMode;
+    use crate::xml::dom::Document;
     use crate::xmldsig::types::NodeSet;
-    use roxmltree::Document;
 
     #[test]
     fn bounded_c14n_failure_exhausts_the_shared_budget() {
@@ -397,6 +397,11 @@ impl TransformExecutionBudget {
         }
     }
 
+    pub(crate) fn with_xml_backend(mut self, backend: crate::XmlBackend) -> Self {
+        self.xml_parse_settings = self.xml_parse_settings.with_backend(backend);
+        self
+    }
+
     pub(crate) fn charge_c14n_output(&self, bytes: usize) -> Result<(), TransformError> {
         self.c14n.charge(bytes).map_err(TransformError::from)
     }
@@ -471,8 +476,8 @@ impl TransformOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct XPathHereNodes {
-    specification_xpath_element: roxmltree::NodeId,
-    xmlsec_legacy_transform_element: roxmltree::NodeId,
+    specification_xpath_element: NodeId,
+    xmlsec_legacy_transform_element: NodeId,
     document: XPathDocumentIdentity,
 }
 
@@ -565,10 +570,7 @@ impl XPathExpression {
         &self.namespaces
     }
 
-    pub(crate) fn here_context_node(
-        &self,
-        semantics: XPathHereSemantics,
-    ) -> Option<roxmltree::NodeId> {
+    pub(crate) fn here_context_node(&self, semantics: XPathHereSemantics) -> Option<NodeId> {
         self.here_nodes.map(|nodes| match semantics {
             XPathHereSemantics::Specification => nodes.specification_xpath_element,
             XPathHereSemantics::XmlSecLegacy => nodes.xmlsec_legacy_transform_element,
@@ -1760,7 +1762,7 @@ fn parse_xpath_filter2_transform(
 
 fn parse_xpath_expression(
     xpath_node: Node,
-    transform_node: roxmltree::NodeId,
+    transform_node: NodeId,
     xpath_state: &mut XPathParseState,
 ) -> Result<XPathExpression, TransformError> {
     let mut source = String::new();
@@ -1824,7 +1826,7 @@ fn parse_xpath_expression(
             // bearing the expression, not as the text node itself.
             specification_xpath_element: xpath_node.id(),
             xmlsec_legacy_transform_element: transform_node,
-            // NodeId is only meaningful within one roxmltree Document. Keep an
+            // NodeId is only meaningful within one semantic DOM Document. Keep an
             // owned content identity so parsed transforms cannot outlive the
             // source and later alias unrelated nodes carrying the same indices.
             document: xpath_state.document_identity(xpath_node.document()),
@@ -2128,8 +2130,8 @@ fn parse_inclusive_prefixes(transform_node: Node) -> Result<Option<String>, Tran
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
 mod tests {
     use super::*;
+    use crate::xml::dom::Document;
     use crate::xmldsig::NodeSet;
-    use roxmltree::Document;
 
     fn assert_resource_limit(error: &TransformError, expected_resource: &'static str) {
         assert!(
@@ -2649,7 +2651,7 @@ mod tests {
         // operation meter rather than receiving a parser-local allowance.
         let signature_document = Document::parse("<Signature/>").unwrap();
         let xml = b"<root/>";
-        let parser_passes = 2 + usize::from(cfg!(feature = "xml-backend-xmloxide"));
+        let parser_passes = crate::document::selected_parser_passes();
         let resources = crate::policy::ResourcePolicy {
             max_xml_parse_work_bytes: xml.len() * parser_passes,
             ..crate::policy::ResourcePolicy::default()
@@ -2688,7 +2690,7 @@ mod tests {
     #[test]
     fn binary_to_node_set_adapter_bounds_external_xml_nodes_during_parse() {
         // The parser must reject a dense external XML resource before allocating
-        // an unbounded roxmltree arena or beginning XPath materialization.
+        // an unbounded semantic DOM arena or beginning XPath materialization.
         let signature_document = Document::parse("<Signature/>").unwrap();
         let xml = format!(
             "<root>{}</root>",

@@ -59,10 +59,16 @@ pub enum ProviderCapability<'a> {
     /// Message digest computation for an XMLDSig digest method.
     #[cfg(feature = "xmldsig")]
     Digest(DigestAlgorithm),
-    /// Signature generation for an XMLDSig signature method.
+    /// Provider dispatch for an XMLDSig signing method.
+    ///
+    /// The opaque signing key remains responsible for accepting the method and
+    /// implementing its primitive.
     #[cfg(feature = "xmldsig")]
     Sign(crate::xmldsig::SignatureAlgorithm),
-    /// Signature verification for an XMLDSig signature method.
+    /// Provider dispatch for an XMLDSig verification method.
+    ///
+    /// The opaque verification key remains responsible for accepting the
+    /// method and implementing its primitive.
     #[cfg(feature = "xmldsig")]
     Verify(crate::xmldsig::SignatureAlgorithm),
     /// X.509 signature verification with complete algorithm parameters.
@@ -207,15 +213,18 @@ impl X509SignatureAlgorithm {
     pub const fn oid(self) -> &'static str {
         match self {
             Self::Dsa(DigestAlgorithm::Sha1) => "1.2.840.10040.4.3",
+            Self::Dsa(DigestAlgorithm::Sha224) => "2.16.840.1.101.3.4.3.1",
             Self::Dsa(DigestAlgorithm::Sha256) => "2.16.840.1.101.3.4.3.2",
             Self::Dsa(DigestAlgorithm::Sha384) => "2.16.840.1.101.3.4.3.3",
             Self::Dsa(DigestAlgorithm::Sha512) => "2.16.840.1.101.3.4.3.4",
             Self::RsaPkcs1v15(DigestAlgorithm::Sha1) => "1.2.840.113549.1.1.5",
+            Self::RsaPkcs1v15(DigestAlgorithm::Sha224) => "1.2.840.113549.1.1.14",
             Self::RsaPkcs1v15(DigestAlgorithm::Sha256) => "1.2.840.113549.1.1.11",
             Self::RsaPkcs1v15(DigestAlgorithm::Sha384) => "1.2.840.113549.1.1.12",
             Self::RsaPkcs1v15(DigestAlgorithm::Sha512) => "1.2.840.113549.1.1.13",
             Self::RsaPss { .. } => "1.2.840.113549.1.1.10",
             Self::Ecdsa(DigestAlgorithm::Sha1) => "1.2.840.10045.4.1",
+            Self::Ecdsa(DigestAlgorithm::Sha224) => "1.2.840.10045.4.3.1",
             Self::Ecdsa(DigestAlgorithm::Sha256) => "1.2.840.10045.4.3.2",
             Self::Ecdsa(DigestAlgorithm::Sha384) => "1.2.840.10045.4.3.3",
             Self::Ecdsa(DigestAlgorithm::Sha512) => "1.2.840.10045.4.3.4",
@@ -363,7 +372,11 @@ pub trait CryptoProvider: Send + Sync {
     /// Stable provider name for diagnostics and capability reporting.
     fn name(&self) -> &'static str;
 
-    /// Return whether this build supports the requested operation and parameters.
+    /// Return whether this build can dispatch the requested capability.
+    ///
+    /// [`ProviderCapability::Sign`] and [`ProviderCapability::Verify`] describe
+    /// provider dispatch only: the supplied opaque key performs the executable
+    /// algorithm-support check when the operation runs.
     fn supports(&self, capability: ProviderCapability<'_>) -> bool;
 
     /// Fill caller-owned output with cryptographically secure random bytes.
@@ -694,9 +707,9 @@ impl CryptoProvider for RustCryptoProvider {
             #[cfg(feature = "xmldsig")]
             ProviderCapability::Digest(_) => true,
             #[cfg(feature = "xmldsig")]
-            ProviderCapability::Sign(algorithm) => is_supported_signing_uri(algorithm.uri()),
-            #[cfg(feature = "xmldsig")]
-            ProviderCapability::Verify(algorithm) => is_supported_signature_uri(algorithm.uri()),
+            // Opaque keys own these primitives and reject unsupported methods
+            // during dispatch; the provider advertises its dispatch surface.
+            ProviderCapability::Sign(_) | ProviderCapability::Verify(_) => true,
             #[cfg(feature = "xmldsig")]
             ProviderCapability::VerifyCertificate(algorithm) => {
                 is_supported_x509_signature(algorithm)
@@ -734,9 +747,10 @@ impl CryptoProvider for RustCryptoProvider {
     #[cfg(feature = "xmldsig")]
     fn digest(&self, algorithm: DigestAlgorithm, data: &[u8]) -> Result<Vec<u8>, ProviderError> {
         use sha1::Sha1;
-        use sha2::{Digest, Sha256, Sha384, Sha512};
+        use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
         Ok(match algorithm {
             DigestAlgorithm::Sha1 => Sha1::digest(data).to_vec(),
+            DigestAlgorithm::Sha224 => Sha224::digest(data).to_vec(),
             DigestAlgorithm::Sha256 => Sha256::digest(data).to_vec(),
             DigestAlgorithm::Sha384 => Sha384::digest(data).to_vec(),
             DigestAlgorithm::Sha512 => Sha512::digest(data).to_vec(),
@@ -860,38 +874,11 @@ fn validate_oaep_parameters(parameters: &RsaOaepParameters) -> Result<(), Provid
 }
 
 #[cfg(feature = "xmldsig")]
-fn is_supported_signature_uri(algorithm: &str) -> bool {
-    matches!(
-        algorithm,
-        "http://www.w3.org/2000/09/xmldsig#dsa-sha1"
-            | "http://www.w3.org/2000/09/xmldsig#hmac-sha1"
-            | "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
-            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
-            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384"
-            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384"
-    )
-}
-
-#[cfg(feature = "xmldsig")]
-fn is_supported_signing_uri(algorithm: &str) -> bool {
-    matches!(
-        algorithm,
-        "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
-            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384"
-            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384"
-    )
-}
-
-#[cfg(feature = "xmldsig")]
 fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
     match algorithm {
         X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1)
         | X509SignatureAlgorithm::RsaPkcs1v15(_)
-        | X509SignatureAlgorithm::Ecdsa(DigestAlgorithm::Sha256 | DigestAlgorithm::Sha384)
+        | X509SignatureAlgorithm::Ecdsa(_)
         | X509SignatureAlgorithm::Ed25519 => true,
         X509SignatureAlgorithm::RsaPss {
             digest, mgf_digest, ..
@@ -901,8 +888,7 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
                 DigestAlgorithm::Sha256 | DigestAlgorithm::Sha384 | DigestAlgorithm::Sha512
             ) && digest == mgf_digest
         }
-        X509SignatureAlgorithm::Dsa(_)
-        | X509SignatureAlgorithm::Ecdsa(DigestAlgorithm::Sha1 | DigestAlgorithm::Sha512) => false,
+        X509SignatureAlgorithm::Dsa(_) => false,
     }
 }
 
@@ -1045,7 +1031,7 @@ mod rustcrypto_x509 {
                 RsaPssVerifyingKey::<Sha512>::new_with_salt_len(key, salt_len)
                     .verify(signed_data, &signature)
             }
-            DigestAlgorithm::Sha1 => {
+            DigestAlgorithm::Sha1 | DigestAlgorithm::Sha224 => {
                 return unsupported(X509SignatureAlgorithm::RsaPss {
                     digest,
                     mgf_digest: digest,
@@ -1130,6 +1116,7 @@ mod rustcrypto_x509 {
     fn x509_digest_from_oid(oid: &str) -> Option<DigestAlgorithm> {
         match oid {
             "1.3.14.3.2.26" => Some(DigestAlgorithm::Sha1),
+            "2.16.840.1.101.3.4.2.4" => Some(DigestAlgorithm::Sha224),
             "2.16.840.1.101.3.4.2.1" => Some(DigestAlgorithm::Sha256),
             "2.16.840.1.101.3.4.2.2" => Some(DigestAlgorithm::Sha384),
             "2.16.840.1.101.3.4.2.3" => Some(DigestAlgorithm::Sha512),
@@ -1140,6 +1127,7 @@ mod rustcrypto_x509 {
     const fn rsa_pkcs1_algorithm(digest: DigestAlgorithm) -> Option<SignatureAlgorithm> {
         match digest {
             DigestAlgorithm::Sha1 => Some(SignatureAlgorithm::RsaSha1),
+            DigestAlgorithm::Sha224 => Some(SignatureAlgorithm::RsaSha224),
             DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::RsaSha256),
             DigestAlgorithm::Sha384 => Some(SignatureAlgorithm::RsaSha384),
             DigestAlgorithm::Sha512 => Some(SignatureAlgorithm::RsaSha512),
@@ -1148,9 +1136,11 @@ mod rustcrypto_x509 {
 
     const fn ecdsa_algorithm(digest: DigestAlgorithm) -> Option<SignatureAlgorithm> {
         match digest {
+            DigestAlgorithm::Sha1 => Some(SignatureAlgorithm::EcdsaSha1),
+            DigestAlgorithm::Sha224 => Some(SignatureAlgorithm::EcdsaSha224),
             DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::EcdsaSha256),
             DigestAlgorithm::Sha384 => Some(SignatureAlgorithm::EcdsaSha384),
-            DigestAlgorithm::Sha1 | DigestAlgorithm::Sha512 => None,
+            DigestAlgorithm::Sha512 => Some(SignatureAlgorithm::EcdsaSha512),
         }
     }
 
@@ -1690,12 +1680,77 @@ mod tests {
             peer_public_key: &[],
         };
         assert!(!RUST_CRYPTO_PROVIDER.supports(ProviderCapability::KeyAgreement(&agreement)));
-        assert!(!RUST_CRYPTO_PROVIDER.supports(ProviderCapability::Sign(
+        assert!(RUST_CRYPTO_PROVIDER.supports(ProviderCapability::Sign(
             crate::xmldsig::SignatureAlgorithm::RsaSha1
         )));
         assert!(RUST_CRYPTO_PROVIDER.supports(ProviderCapability::Verify(
             crate::xmldsig::SignatureAlgorithm::RsaSha1
         )));
+        for digest in [DigestAlgorithm::Sha1, DigestAlgorithm::Sha512] {
+            assert!(
+                RUST_CRYPTO_PROVIDER.supports(ProviderCapability::VerifyCertificate(
+                    X509SignatureAlgorithm::Ecdsa(digest)
+                ))
+            );
+        }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn x509_digest_key_info_uses_the_selected_provider() {
+        use crate::xmldsig::{
+            DigestAlgorithm, KeyInfoWriteError, KeyInfoWriter, RsaSigningKey,
+            X509DigestKeyInfoWriter,
+        };
+
+        // KeyInfo generation is part of the signing operation's provider
+        // boundary; a writer must not silently fall back to RustCrypto.
+        let key = RsaSigningKey::from_pkcs8_pem(include_str!(
+            "../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+        ))
+        .expect("RSA fixture must parse");
+        let writer = X509DigestKeyInfoWriter::from_pem(
+            include_str!("../tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+            DigestAlgorithm::Sha224,
+        )
+        .expect("certificate fixture must parse");
+        let provider = CountingRandomProvider {
+            random_calls: AtomicUsize::new(0),
+            reject_digest: Some(DigestAlgorithm::Sha224),
+            extra_digest_byte: false,
+            accept_signatures: false,
+        };
+
+        let error = writer
+            .write_key_info_with_provider(&key, &provider)
+            .expect_err("the selected provider must control X509Digest");
+        assert!(matches!(
+            error,
+            KeyInfoWriteError::Provider(ProviderError::Unsupported {
+                operation: ProviderOperation::Digest,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn x509_digest_writer_rejects_trailing_certificate_der() {
+        use crate::xmldsig::{DigestAlgorithm, KeyInfoWriteError, X509DigestKeyInfoWriter};
+
+        // The writer retains both digest bytes and the validated signing-key
+        // identity, so construction must accept exactly one DER certificate.
+        let (_, certificate) = x509_parser::pem::parse_x509_pem(include_bytes!(
+            "../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+        ))
+        .expect("certificate fixture must parse");
+        let mut certificate_der = certificate.contents;
+        certificate_der.push(0);
+
+        assert!(matches!(
+            X509DigestKeyInfoWriter::from_der(&certificate_der, DigestAlgorithm::Sha256),
+            Err(KeyInfoWriteError::InvalidCertificateDer)
+        ));
     }
 
     #[cfg(all(feature = "xmldsig", feature = "xmlenc"))]

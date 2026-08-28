@@ -31,7 +31,9 @@
 #![warn(missing_docs)]
 
 #[cfg(not(any(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree")))]
-compile_error!("select one XML backend feature: `xml-backend-xmloxide` or `xml-backend-roxmltree`");
+compile_error!(
+    "compile at least one XML backend: `xml-backend-xmloxide` or `xml-backend-roxmltree`"
+);
 
 pub mod c14n;
 pub mod document;
@@ -45,6 +47,12 @@ pub mod provider;
 mod xml;
 
 pub use xml::IdAttributeRegistration;
+pub use xml::dom::{
+    Ancestors, Attribute, Attributes, Children, Descendants, Document, Document as XmlDomDocument,
+    ExpandedName, Namespace, Namespaces, Node, Node as XmlDomNode, NodeId, NodeId as XmlDomNodeId,
+    NodeType, PI, ParseError, ParseError as XmlDomParseError, ParsingOptions,
+    ParsingOptions as XmlDomParsingOptions, XmlBackend,
+};
 
 #[cfg(feature = "xmldsig")]
 pub mod xmldsig;

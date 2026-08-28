@@ -12,8 +12,8 @@
 //! ## Signing and verification
 //!
 //! Build an enveloped signature with a modern algorithm, then verify it with
-//! the embedded certificate. New signatures must use SHA-256 or stronger;
-//! SHA-1 remains verification-only for legacy interoperability.
+//! the embedded certificate. Secure defaults require SHA-224 or stronger;
+//! legacy SHA-1 methods require an explicit operation policy opt-in.
 //!
 //! ```no_run
 //! use xml_sec::c14n::{C14nAlgorithm, C14nMode};
@@ -70,8 +70,8 @@ mod xpath;
 pub use builder::{ReferenceBuilder, SignatureBuilder, SignatureBuilderError};
 pub use digest::{DigestAlgorithm, compute_digest, compute_digest_with_provider, constant_time_eq};
 pub use keys::{
-    DefaultKeyResolver, HmacSha1VerificationKey, KeyResolutionError, KeyResolverConfig,
-    VerificationKey,
+    DefaultKeyResolver, HmacSha1VerificationKey, HmacVerificationKey, KeyResolutionError,
+    KeyResolverConfig, VerificationKey,
 };
 pub use parse::{
     KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, RetrievalMethodTransforms,
@@ -79,10 +79,12 @@ pub use parse::{
     parse_reference, parse_signed_info, x509_certificate_matches_selectors,
 };
 pub use sign::{
-    ComputedReferenceDigest, EcdsaP256SigningKey, EcdsaP384SigningKey, KeyInfoWriteError,
-    KeyInfoWriter, RsaSigningKey, SignContext, SignatureTemplateSelection, SigningDigestError,
+    ComputedReferenceDigest, DerEncodedKeyValueInfoWriter, DsaSigningKey, EcdsaP256SigningKey,
+    EcdsaP384SigningKey, EcdsaP521SigningKey, HmacSigningKey, KeyInfoWriteError, KeyInfoWriter,
+    KeyValueInfoWriter, RsaSigningKey, SignContext, SignatureTemplateSelection, SigningDigestError,
     SigningError, SigningKey, SigningKeyError, SigningPublicKeyInfo, X509CertificateKeyInfoWriter,
-    compute_reference_digest_values, fill_reference_digest_values, validate_signing_key,
+    X509DigestKeyInfoWriter, compute_reference_digest_values, fill_reference_digest_values,
+    validate_signing_key,
 };
 pub use signature::{
     SignatureVerificationError, verify_dsa_signature_spki, verify_ecdsa_signature_pem,
@@ -98,6 +100,8 @@ pub use types::{NodeSet, TransformData, TransformError};
 pub use verify::{
     DsigError, DsigStatus, FailureReason, KeyResolver, ReferenceProcessingError, ReferenceResult,
     ReferenceSet, ReferencesResult, SignatureSelection, UriTypeSet, VerifyContext, VerifyResult,
-    VerifyingKey, process_all_references, process_reference, verify_signature_with_pem_key,
+    VerifyingKey, materialize_signing_key_info_references,
+    materialize_verification_key_info_references, process_all_references, process_reference,
+    verify_signature_with_pem_key,
 };
 pub use x509::{X509ChainError, X509ChainOptions, verify_x509_certificate_chain};

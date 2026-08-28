@@ -256,6 +256,11 @@ fn policy(algorithm: SignatureAlgorithm, verify_x509_chains: bool) -> Verificati
         .insert(algorithm);
     policy.key_trust.rsa_keys.minimum_modulus_bits = 1024;
     policy.key_trust.dsa_keys.minimum_modulus_bits = 1024;
+    if algorithm == SignatureAlgorithm::HmacSha1 {
+        // The published Phaos corpus intentionally uses a four-byte secret.
+        policy.hmac.minimum_key_bits = 32;
+        policy.hmac.minimum_output_bits = 40;
+    }
     policy.key_trust.verify_x509_chains = verify_x509_chains;
     policy.key_trust.verification_time =
         Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2009));
@@ -330,9 +335,7 @@ fn execute(case: Case) -> Result<xml_sec::xmldsig::VerifyResult, DsigError> {
         }
         Setup::Hmac80 => {
             let key = HmacSha1VerificationKey::new(certificate("hmackey.bin"))
-                .expect("Phaos HMAC key is valid")
-                .with_output_length_bits(80)
-                .expect("Phaos HMAC truncation is valid");
+                .expect("Phaos HMAC key is valid");
             VerifyContext::new()
                 .policy(policy(SignatureAlgorithm::HmacSha1, false))
                 .key(&key)

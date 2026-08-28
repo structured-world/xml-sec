@@ -489,3 +489,4 @@ fn enveloped_preserves_surrounding_whitespace() {
     );
     assert!(!output.contains("SignedInfo"), "output: {output}");
 }
+use xml_sec as roxmltree;

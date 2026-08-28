@@ -635,3 +635,4 @@ fn process_single_reference_with_pre_digest_valid() {
     assert!(pre_digest_str.contains("important"));
     assert!(!pre_digest_str.contains("Signature"));
 }
+use xml_sec as roxmltree;

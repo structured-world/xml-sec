@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use roxmltree::Node;
+use crate::xml::dom::Node;
 
 use super::NodeVisibility;
 use super::ns_common::collect_ns_declarations;
@@ -41,7 +41,7 @@ impl NsRenderer for InclusiveNsRenderer {
 mod tests {
     use super::super::serialize::{C14nConfig, serialize_canonical};
     use super::*;
-    use roxmltree::Document;
+    use crate::xml::dom::Document;
 
     #[test]
     fn namespaces_rendered_on_first_element() {

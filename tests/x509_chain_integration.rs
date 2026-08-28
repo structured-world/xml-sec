@@ -12,7 +12,7 @@ use rcgen::{
     CrlIssuingDistributionPoint, CrlScope, IsCa, Issuer, KeyIdMethod, KeyPair, KeyUsagePurpose,
     RevokedCertParams, SerialNumber, date_time_ymd,
 };
-use roxmltree::Document;
+use xml_sec::XmlDomDocument as Document;
 use xml_sec::xmldsig::{
     KeyInfoSource, X509ChainError, X509ChainOptions, X509DataInfo, parse_key_info,
     verify_x509_certificate_chain,

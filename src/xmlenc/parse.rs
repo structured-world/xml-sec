@@ -1,9 +1,9 @@
 //! Strict parsing for the subset of XMLEnc needed by the decryption API.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use roxmltree::Node;
 #[cfg(test)]
-use roxmltree::{Document, ParsingOptions};
+use crate::xml::dom::ParsingOptions;
+use crate::xml::dom::{Document, Node};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use crate::document::{
     DocumentParseSettings, XmlParseWorkBudget, parse_borrowed_with_settings_and_budget,
@@ -53,10 +53,21 @@ pub(super) fn parse_encrypted_data_with_policy(
     xml: &str,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
+    parse_encrypted_data_with_policy_and_backend(xml, policy, crate::XmlBackend::default())
+}
+
+pub(super) fn parse_encrypted_data_with_policy_and_backend(
+    xml: &str,
+    policy: &crate::policy::DecryptionPolicy,
+    backend: crate::XmlBackend,
+) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
     policy.resources.validate_xml_document_len(xml.len())?;
     let parse_budget = XmlParseWorkBudget::from_resources(&policy.resources);
-    let document = parse_policy_document(xml, policy.into(), &parse_budget)?;
+    let settings =
+        DocumentParseSettings::from_policy(&policy.xml, &policy.resources).with_backend(backend);
+    let document = parse_borrowed_with_settings_and_budget(xml, settings, Some(&parse_budget))
+        .map_err(|error| map_document_error(error, settings))?;
     parse_encrypted_data_node(document.root_element(), policy.into(), false)
 }
 
@@ -71,18 +82,28 @@ pub fn parse_encrypted_data_node_with_policy(
     node: Node<'_, '_>,
     policy: &crate::policy::DecryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
+    parse_encrypted_data_node_with_policy_and_backend(node, policy, crate::XmlBackend::default())
+}
+
+/// Parse a selected `xenc:EncryptedData` node with an explicit parser backend.
+pub fn parse_encrypted_data_node_with_policy_and_backend(
+    node: Node<'_, '_>,
+    policy: &crate::policy::DecryptionPolicy,
+    backend: crate::XmlBackend,
+) -> Result<EncryptedData, XmlEncError> {
     let parse_budget = XmlParseWorkBudget::from_resources(&policy.resources);
-    parse_encrypted_data_node_with_policy_and_budget(node, policy, &parse_budget)
+    parse_encrypted_data_node_with_policy_and_budget(node, policy, &parse_budget, backend)
 }
 
 pub(super) fn parse_encrypted_data_node_with_policy_and_budget(
     node: Node<'_, '_>,
     policy: &crate::policy::DecryptionPolicy,
     parse_budget: &XmlParseWorkBudget,
+    backend: crate::XmlBackend,
 ) -> Result<EncryptedData, XmlEncError> {
     policy.validate()?;
     let policy = ParsingPolicy::from(policy);
-    validate_node_document_policy(node, policy, parse_budget)?;
+    validate_node_document_policy(node, policy, parse_budget, backend)?;
     parse_encrypted_data_node(node, policy, false)
 }
 
@@ -96,10 +117,23 @@ pub fn parse_encrypted_data_template_node_with_policy(
     node: Node<'_, '_>,
     policy: &crate::policy::EncryptionPolicy,
 ) -> Result<EncryptedData, XmlEncError> {
+    parse_encrypted_data_template_node_with_policy_and_backend(
+        node,
+        policy,
+        crate::XmlBackend::default(),
+    )
+}
+
+/// Parse an `xenc:EncryptedData` template node with an explicit parser backend.
+pub fn parse_encrypted_data_template_node_with_policy_and_backend(
+    node: Node<'_, '_>,
+    policy: &crate::policy::EncryptionPolicy,
+    backend: crate::XmlBackend,
+) -> Result<EncryptedData, XmlEncError> {
     let parse_budget = XmlParseWorkBudget::from_resources(&policy.resources);
     policy.validate()?;
     let policy = ParsingPolicy::from(policy);
-    validate_node_document_policy(node, policy, &parse_budget)?;
+    validate_node_document_policy(node, policy, &parse_budget, backend)?;
     parse_encrypted_data_node(node, policy, true)
 }
 
@@ -107,8 +141,9 @@ fn validate_node_document_policy(
     node: Node<'_, '_>,
     policy: ParsingPolicy<'_>,
     parse_budget: &XmlParseWorkBudget,
+    backend: crate::XmlBackend,
 ) -> Result<(), XmlEncError> {
-    parse_policy_document(node.document().input_text(), policy, parse_budget)?;
+    parse_policy_document(node.document().input_text(), policy, parse_budget, backend)?;
     Ok(())
 }
 
@@ -116,8 +151,10 @@ fn parse_policy_document<'a>(
     xml: &'a str,
     policy: ParsingPolicy<'_>,
     parse_budget: &XmlParseWorkBudget,
-) -> Result<roxmltree::Document<'a>, XmlEncError> {
-    let settings = DocumentParseSettings::from_policy(policy.xml, policy.resources);
+    backend: crate::XmlBackend,
+) -> Result<Document<'a>, XmlEncError> {
+    let settings =
+        DocumentParseSettings::from_policy(policy.xml, policy.resources).with_backend(backend);
     parse_borrowed_with_settings_and_budget(xml, settings, Some(parse_budget))
         .map_err(|error| map_document_error(error, settings))
 }
@@ -768,6 +805,51 @@ mod tests {
         let parsed = parse_encrypted_data(DATA).expect("valid XMLEnc data must parse");
         assert_eq!(parsed.cipher_data.value, "YWJjZA==");
         assert_eq!(parsed.encrypted_type, Some(EncryptedDataType::Element));
+    }
+
+    #[cfg(feature = "xml-backend-differential")]
+    #[test]
+    fn node_revalidation_uses_the_operation_backend() {
+        // A node selected from an operation-scoped document must not silently
+        // switch to the build default when its containing XML is revalidated.
+        let backend = crate::XmlBackend::Roxmltree;
+        let document = Document::parse_with_backend(DATA, backend).expect("test XML must parse");
+        let expected_work = DATA.len() * 3;
+        let resources = crate::policy::ResourcePolicy {
+            max_xml_parse_work_bytes: expected_work,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let policy = crate::policy::DecryptionPolicy {
+            resources: resources.clone(),
+            ..crate::policy::DecryptionPolicy::default()
+        };
+        let budget = XmlParseWorkBudget::from_resources(&resources);
+
+        parse_encrypted_data_node_with_policy_and_budget(
+            document.root_element(),
+            &policy,
+            &budget,
+            backend,
+        )
+        .expect("node revalidation must retain the selected backend");
+        assert_eq!(budget.consumed(), expected_work);
+
+        parse_encrypted_data_node_with_policy_and_backend(
+            document.root_element(),
+            &policy,
+            backend,
+        )
+        .expect("public decryption parser must retain the selected backend");
+        let encryption_policy = crate::policy::EncryptionPolicy {
+            resources,
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        parse_encrypted_data_template_node_with_policy_and_backend(
+            document.root_element(),
+            &encryption_policy,
+            backend,
+        )
+        .expect("public template parser must retain the selected backend");
     }
 
     #[test]
