@@ -259,13 +259,15 @@ consume the operation's shared aggregate external-resource budget and never
 trigger implicit I/O.
 Callers that inspect template or signature metadata before running a complete
 operation can use `materialize_signing_key_info_references` or
-`materialize_verification_key_info_references`. Both entry points execute the
-same core traversal as `VerifyContext`, including candidate-work, depth, cycle,
-target, parser, transform, and external-resource bounds; they differ only in
-the typed signing or verification policy applied at the boundary. Each entry
-point consumes its caller-configured `UriReferenceResolver` so it can bind a
-fresh operation-scoped external-resource budget to that policy before any
-dereference.
+`materialize_verification_key_info_references`. Both entry points recursively
+expand `KeyInfoReference` under the same candidate-work, depth, cycle, target,
+parser, and external-resource bounds as the complete operation. Retrieval
+methods nested in an external referenced document are processed while that
+document's URI context is active. Same-document `RetrievalMethod` sources remain
+unmaterialized for the complete signing or verification pipeline to process.
+The entry points differ only in the typed policy applied at the boundary and
+consume their caller-configured `UriReferenceResolver` to bind a fresh
+operation-scoped external-resource budget before any dereference.
 
 Direct policy-free calls on `HmacVerificationKey` enforce the secure default
 HMAC key and output minima. Compatibility truncation is available only through

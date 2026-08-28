@@ -1907,11 +1907,15 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
 /// Resolve and recursively expand policy-allowed `KeyInfoReference` sources
 /// while preparing caller-supplied key material for signing.
 ///
-/// The traversal shares the verifier's candidate-work, depth, cycle, target,
-/// XML parsing, and transform bounds. URI classes remain controlled by the
-/// signing policy's `uris` field; external bytes must be attached to `resolver`
-/// explicitly by the caller. The resolver is consumed so this operation can
-/// bind a fresh aggregate external-resource budget to the supplied policy.
+/// The recursive reference traversal shares the verifier's candidate-work,
+/// depth, cycle, target, XML parsing, and external-resource bounds. Retrieval
+/// methods nested in an external referenced document are materialized while
+/// that document's URI context is active; retrieval methods in the caller's
+/// document remain the responsibility of the complete signing pipeline. URI
+/// classes remain controlled by the signing policy's `uris` field; external
+/// bytes must be attached to `resolver` explicitly by the caller. The resolver
+/// is consumed so this operation can bind a fresh aggregate external-resource
+/// budget to the supplied policy.
 pub fn materialize_signing_key_info_references(
     key_info: &mut KeyInfo,
     resolver: UriReferenceResolver<'_>,
@@ -1926,9 +1930,12 @@ pub fn materialize_signing_key_info_references(
 /// before verification key selection.
 ///
 /// In addition to URI and resource policy, this entry point enforces the
-/// verification policy's `key_sources.key_info_reference` trust gate. External
-/// bytes must be attached to `resolver` explicitly by the caller. The resolver
-/// is consumed so this operation can bind a fresh aggregate external-resource
+/// verification policy's `key_sources.key_info_reference` trust gate. Retrieval
+/// methods nested in an external referenced document are materialized in that
+/// document's URI context; retrieval methods in the caller's document remain
+/// the responsibility of the complete verification pipeline. External bytes
+/// must be attached to `resolver` explicitly by the caller. The resolver is
+/// consumed so this operation can bind a fresh aggregate external-resource
 /// budget to the supplied policy.
 pub fn materialize_verification_key_info_references(
     key_info: &mut KeyInfo,

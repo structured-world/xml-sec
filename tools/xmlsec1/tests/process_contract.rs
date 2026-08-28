@@ -100,6 +100,54 @@ fn compatibility_cli_signs_and_verifies_legacy_sha1_templates() {
 }
 
 #[test]
+fn pinned_direct_verification_ignores_unused_key_info_references() {
+    // A caller-pinned direct key is the complete verification identity. An
+    // unrelated document KeyInfo must not become a failure surface merely
+    // because compatibility metadata is collected before core verification.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("rsa-sha1-template.xml");
+    let signed = temp.path().join("rsa-sha1-signed.xml");
+    let unused_reference = temp.path().join("rsa-sha1-unused-reference.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(&template, rsa_sha1_signature_template()).unwrap();
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let mut modified = fs::read_to_string(&signed).unwrap();
+    let object_start = modified.find("<Object").unwrap();
+    modified.insert_str(
+        object_start,
+        r##"<KeyInfo><dsig11:KeyInfoReference xmlns:dsig11="http://www.w3.org/2009/xmldsig11#" URI="#missing"/></KeyInfo>"##,
+    );
+    fs::write(&unused_reference, modified).unwrap();
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&unused_reference)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
 fn compatibility_cli_resolves_key_info_reference_before_signing_key_selection() {
     // The donor template puts its KeyName behind a same-document
     // KeyInfoReference. Compatibility key selection must resolve that identity
@@ -130,6 +178,19 @@ fn compatibility_cli_resolves_key_info_reference_before_signing_key_selection() 
         sign.status.success(),
         "{}",
         String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem:TestKeyName-rsa-4096"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
     );
 
     let unnamed_signed = temp.path().join("key-info-reference-unnamed-signed.xml");

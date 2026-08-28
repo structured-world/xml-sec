@@ -69,6 +69,12 @@ pub struct SignatureMetadata {
     pub key_names: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationKeyNameResolution {
+    DirectOnly,
+    MaterializeReferences,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct SigningTemplateMetadata {
     pub algorithm: SignatureAlgorithm,
@@ -123,11 +129,16 @@ pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialError> {
 ///
 /// libxmlsec1 uses a depth-first `xmlSecFindNode` lookup from the operation start
 /// node, so later signatures in the same subtree do not make selection ambiguous.
+/// Reference materialization is a key-selection concern: callers that pin a
+/// complete direct identity should request `DirectOnly` and leave unused
+/// document references to the core resolver's `consumes_document_key_info`
+/// contract.
 pub fn verification_signature_metadata(
     xml: &str,
     start_node_id: Option<&str>,
     id_attributes: &[xml_sec::IdAttributeRegistration],
     policy: &VerificationPolicy,
+    key_name_resolution: VerificationKeyNameResolution,
 ) -> Result<SignatureMetadata, KeyMaterialError> {
     policy.validate()?;
     let document = parse_signature_document(
@@ -147,7 +158,9 @@ pub fn verification_signature_metadata(
         .map(parse_key_info)
         .transpose()
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-    if let Some(key_info) = &mut key_info {
+    if key_name_resolution == VerificationKeyNameResolution::MaterializeReferences
+        && let Some(key_info) = &mut key_info
+    {
         let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
         materialize_verification_key_info_references(
             key_info,
@@ -966,6 +979,7 @@ mod tests {
             Some("ec"),
             &[],
             &xml_sec::policy::VerificationPolicy::default(),
+            VerificationKeyNameResolution::DirectOnly,
         )
         .unwrap();
         assert_eq!(metadata.algorithm, SignatureAlgorithm::EcdsaSha256);
@@ -985,6 +999,7 @@ mod tests {
             None,
             &[],
             &xml_sec::policy::VerificationPolicy::default(),
+            VerificationKeyNameResolution::DirectOnly,
         )
         .unwrap();
 
@@ -1000,16 +1015,27 @@ mod tests {
             r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue><ds:KeyInfo><dsig11:KeyInfoReference URI="#target"/></ds:KeyInfo></ds:Signature><ds:KeyInfo Id="target"><ds:KeyName>wanted</ds:KeyName></ds:KeyInfo></root>"##
         );
 
-        let metadata =
-            verification_signature_metadata(&xml, None, &[], &VerificationPolicy::default())
-                .expect("same-document KeyInfoReference must resolve before candidate selection");
+        let metadata = verification_signature_metadata(
+            &xml,
+            None,
+            &[],
+            &VerificationPolicy::default(),
+            VerificationKeyNameResolution::MaterializeReferences,
+        )
+        .expect("same-document KeyInfoReference must resolve before candidate selection");
 
         assert_eq!(metadata.key_names, ["wanted"]);
 
         let mut disabled = VerificationPolicy::default();
         disabled.key_sources.key_info_reference = false;
-        let error = verification_signature_metadata(&xml, None, &[], &disabled)
-            .expect_err("metadata selection must honor the verification key-source policy");
+        let error = verification_signature_metadata(
+            &xml,
+            None,
+            &[],
+            &disabled,
+            VerificationKeyNameResolution::MaterializeReferences,
+        )
+        .expect_err("metadata selection must honor the verification key-source policy");
         assert!(error.to_string().contains("key sources are disabled"));
     }
 
@@ -1029,7 +1055,14 @@ mod tests {
             ..xml_sec::policy::VerificationPolicy::default()
         };
 
-        let error = verification_signature_metadata(&xml, None, &[], &policy).unwrap_err();
+        let error = verification_signature_metadata(
+            &xml,
+            None,
+            &[],
+            &policy,
+            VerificationKeyNameResolution::DirectOnly,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("nodes limit"));
     }
 }

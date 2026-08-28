@@ -1158,11 +1158,20 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
+    let key_name_resolution = if lax_key_search
+        || explicit_keys.is_empty()
+        || matches!(explicit_keys.as_slice(), [(key, _)] if key.parameter.is_none())
+    {
+        key_material::VerificationKeyNameResolution::DirectOnly
+    } else {
+        key_material::VerificationKeyNameResolution::MaterializeReferences
+    };
     let signature = key_material::verification_signature_metadata(
         &xml,
         start_node_id,
         &id_attributes,
         &policy,
+        key_name_resolution,
     )?;
     let algorithm = signature.algorithm;
     let selected_keys = if explicit_keys.is_empty() {
