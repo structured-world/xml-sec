@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use aes::cipher::{BlockModeDecrypt as _, KeyIvInit as _, block_padding::Pkcs7};
 use crypto_bigint::{
     BoxedUint,
     modular::{BoxedMontyForm, BoxedMontyParams},
@@ -12,6 +13,7 @@ use der::{Decode as _, asn1::UintRef};
 use dsa::{
     Components as DsaComponents, SigningKey as NativeDsaSigningKey, VerifyingKey as DsaVerifyingKey,
 };
+use md5::{Digest as _, Md5};
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
     pkcs1::{DecodeRsaPrivateKey as _, DecodeRsaPublicKey as _},
@@ -611,13 +613,12 @@ fn decode_rsa_signing_key(
         return decode_pkcs8_signing_key::<RsaSigningKey>(path, bytes, format, password);
     }
     match format {
-        PrivateKeyFormat::Pem => std::str::from_utf8(bytes)
-            .ok()
-            .and_then(|text| RsaPrivateKey::from_pkcs1_pem(text).ok())
-            .map_or_else(
-                || Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
-                |key| normalize_rsa_signing_key(key, path),
-            ),
+        PrivateKeyFormat::Pem => {
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+            let key = decode_traditional_rsa_pem(text, password, path)?;
+            normalize_rsa_signing_key(key, path)
+        }
         PrivateKeyFormat::Der => RsaPrivateKey::from_pkcs1_der(bytes).map_or_else(
             |_| Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
             |key| normalize_rsa_signing_key(key, path),
@@ -626,6 +627,134 @@ fn decode_rsa_signing_key(
             Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
         }
     }
+}
+
+fn decode_traditional_rsa_pem(
+    text: &str,
+    password: Option<&[u8]>,
+    path: &Path,
+) -> Result<RsaPrivateKey, KeyMaterialError> {
+    // The header-aware parser accepts surrounding input, so enforce a single
+    // complete block before trusting its OpenSSL encryption metadata.
+    let text = text.trim_matches(|character: char| character.is_ascii_whitespace());
+    const BEGIN: &str = "-----BEGIN RSA PRIVATE KEY-----";
+    const END: &str = "-----END RSA PRIVATE KEY-----";
+    if !text.starts_with(BEGIN)
+        || !text.ends_with(END)
+        || text.matches(BEGIN).count() != 1
+        || text.matches(END).count() != 1
+    {
+        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    }
+    let envelope =
+        pem::parse(text).map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    if envelope.tag() != "RSA PRIVATE KEY" {
+        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    }
+
+    let headers = envelope.headers();
+    if headers.iter().next().is_none() {
+        return RsaPrivateKey::from_pkcs1_der(envelope.contents())
+            .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    }
+    if headers.iter().count() != 2 || headers.get("Proc-Type") != Some("4,ENCRYPTED") {
+        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    }
+    let (cipher, encoded_iv) = headers
+        .get("DEK-Info")
+        .and_then(|value| value.split_once(','))
+        .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    let iv = decode_hex(encoded_iv)
+        .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    let password =
+        password.ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    let decrypted = decrypt_openssl_legacy_pem(cipher, &iv, envelope.contents(), password, path)?;
+    RsaPrivateKey::from_pkcs1_der(&decrypted)
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|digits| {
+            let pair = std::str::from_utf8(digits).ok()?;
+            if !pair.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            u8::from_str_radix(pair, 16).ok()
+        })
+        .collect()
+}
+
+fn decrypt_openssl_legacy_pem(
+    cipher: &str,
+    iv: &[u8],
+    ciphertext: &[u8],
+    password: &[u8],
+    path: &Path,
+) -> Result<Zeroizing<Vec<u8>>, KeyMaterialError> {
+    let (key_len, iv_len) = match cipher {
+        "AES-128-CBC" => (16, 16),
+        "AES-192-CBC" => (24, 16),
+        "AES-256-CBC" => (32, 16),
+        "DES-CBC" => (8, 8),
+        "DES-EDE-CBC" => (16, 8),
+        "DES-EDE3-CBC" => (24, 8),
+        _ => return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned())),
+    };
+    if iv.len() != iv_len || ciphertext.is_empty() || !ciphertext.len().is_multiple_of(iv_len) {
+        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    }
+
+    let key = openssl_legacy_key(password, &iv[..8], key_len);
+    let mut plaintext = Zeroizing::new(ciphertext.to_vec());
+    macro_rules! decrypt {
+        ($cipher:ty) => {{
+            let length = cbc::Decryptor::<$cipher>::new_from_slices(&key, iv)
+                .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?
+                .decrypt_padded::<Pkcs7>(&mut plaintext)
+                .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?
+                .len();
+            plaintext.truncate(length);
+        }};
+    }
+    match cipher {
+        "AES-128-CBC" => decrypt!(aes::Aes128),
+        "AES-192-CBC" => decrypt!(aes::Aes192),
+        "AES-256-CBC" => decrypt!(aes::Aes256),
+        "DES-CBC" => decrypt!(des::Des),
+        "DES-EDE-CBC" => decrypt!(des::TdesEde2),
+        "DES-EDE3-CBC" => decrypt!(des::TdesEde3),
+        _ => unreachable!("cipher allowlist was checked above"),
+    }
+    Ok(plaintext)
+}
+
+fn openssl_legacy_key(password: &[u8], salt: &[u8], key_len: usize) -> Zeroizing<Vec<u8>> {
+    // Traditional PEM uses OpenSSL EVP_BytesToKey with one MD5 iteration and
+    // the first eight IV bytes as salt. Only the key is derived; DEK-Info
+    // carries the complete IV used by CBC.
+    let mut key = Zeroizing::new(Vec::with_capacity(key_len));
+    let mut previous: Option<[u8; 16]> = None;
+    while key.len() < key_len {
+        let mut digest = Md5::new();
+        if let Some(previous) = previous {
+            digest.update(previous);
+        }
+        digest.update(password);
+        digest.update(salt);
+        let block: [u8; 16] = digest.finalize().into();
+        key.extend_from_slice(&block);
+        previous = Some(block);
+    }
+    key.truncate(key_len);
+    key
 }
 
 fn normalize_rsa_signing_key(
@@ -1112,6 +1241,72 @@ mod tests {
         .expect("PKCS#1 public key must normalize");
         RsaPublicKey::from_public_key_der(&key.public_key_bytes)
             .expect("verification key must use SPKI DER");
+    }
+
+    #[test]
+    fn decrypts_traditional_encrypted_rsa_pem() {
+        // `--privkey-pem` follows libxmlsec1's container-agnostic PEM
+        // contract, including the OpenSSL legacy encrypted PKCS#1 envelope.
+        let encrypted = include_bytes!(
+            "../../../tests/fixtures/keys/rsa/rsa-2048-key-traditional-encrypted.pem"
+        );
+        let path = Path::new("rsa-2048-key-traditional-encrypted.pem");
+
+        decode_signing_key(
+            path,
+            encrypted,
+            PrivateKeyFormat::Pem,
+            SignatureAlgorithm::RsaSha256,
+            Some(b"legacy-rsa-password"),
+        )
+        .expect("the correct password must decrypt traditional RSA PEM");
+
+        for password in [None, Some(b"wrong-password".as_slice())] {
+            assert!(
+                decode_signing_key(
+                    path,
+                    encrypted,
+                    PrivateKeyFormat::Pem,
+                    SignatureAlgorithm::RsaSha256,
+                    password,
+                )
+                .is_err(),
+                "missing or incorrect passwords must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_traditional_encrypted_rsa_pem() {
+        // Legacy PEM metadata is a parser configuration boundary: an
+        // unknown cipher, malformed IV, or extra input must never fall back to
+        // interpreting encrypted bytes as a plaintext private key.
+        let encrypted =
+            include_str!("../../../tests/fixtures/keys/rsa/rsa-2048-key-traditional-encrypted.pem");
+        let path = Path::new("rsa-2048-key-traditional-encrypted.pem");
+        let cases = [
+            encrypted.replace("AES-256-CBC", "RC2-CBC"),
+            encrypted.replace(
+                "C98DDAE6A971742BF435D3FF6CD60028",
+                "C98DDAE6A971742BF435D3FF6CD6002Z",
+            ),
+            format!("{encrypted}\nnot-pem-trailing-input"),
+            format!("{encrypted}\n{encrypted}"),
+        ];
+
+        for malformed in cases {
+            assert!(
+                decode_signing_key(
+                    path,
+                    malformed.as_bytes(),
+                    PrivateKeyFormat::Pem,
+                    SignatureAlgorithm::RsaSha256,
+                    Some(b"legacy-rsa-password"),
+                )
+                .is_err(),
+                "malformed legacy PEM envelopes must fail closed"
+            );
+        }
     }
 
     #[test]

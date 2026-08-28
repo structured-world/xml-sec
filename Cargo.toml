@@ -68,6 +68,9 @@ aes = { version = "0.9.2", optional = true }
 aes-gcm = { version = "0.11.1", optional = true }
 aes-kw = { version = "0.3.1", optional = true }
 cbc = { version = "0.2.1", optional = true }
+des = { version = "0.9", optional = true }
+md-5 = { version = "0.11", optional = true }
+pem = { version = "3", optional = true }
 
 # X.509 certificates
 x509-parser = { version = "0.18", features = ["verify"], optional = true }
@@ -103,9 +106,12 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:der",
     "dep:crypto-bigint",
     "dep:dsa",
+    "dep:des",
     "dep:ed25519-dalek",
     "dep:getrandom",
     "dep:hmac",
+    "dep:md-5",
+    "dep:pem",
     "dep:p256",
     "dep:p384",
     "dep:p521",

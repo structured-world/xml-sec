@@ -802,6 +802,61 @@ fn compatibility_cli_decrypts_rsa_and_ecdsa_pkcs8_signing_keys() {
 }
 
 #[test]
+fn compatibility_cli_decrypts_traditional_rsa_pem() {
+    // The generic PEM option mirrors libxmlsec1's OpenSSL legacy RSA envelope
+    // support; explicit PKCS#8 options retain their narrower format contract.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("rsa-traditional-template.xml");
+    let signed = temp.path().join("rsa-traditional-signed.xml");
+    let private_key =
+        project_root().join("tests/fixtures/keys/rsa/rsa-2048-key-traditional-encrypted.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    fs::write(&template, signature_template_without_key_info()).unwrap();
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--pwd", "legacy-rsa-password"])
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    let rejected_output = temp.path().join("rsa-traditional-rejected.xml");
+    let wrong_password = "wrong-legacy-password-sentinel";
+    let rejected = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--pwd", wrong_password])
+        .arg("--output")
+        .arg(&rejected_output)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(!rejected_output.exists());
+    assert!(!String::from_utf8_lossy(&rejected.stderr).contains(wrong_password));
+}
+
+#[test]
 fn compatibility_cli_accepts_generic_sec1_ecdsa_keys() {
     // Generic private-key options accept the traditional ECPrivateKey container,
     // while the explicitly named PKCS#8 options remain container-strict.

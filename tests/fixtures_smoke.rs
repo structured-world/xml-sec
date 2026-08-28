@@ -20,6 +20,11 @@ fn rsa_2048_key_files_are_valid_pem() {
     assert_pem_file(&dir.join("rsa-2048-key.pem"), "PRIVATE KEY");
     assert_pem_file(&dir.join("rsa-2048-cert.pem"), "CERTIFICATE");
     assert_pem_file(&dir.join("rsa-2048-pubkey.pem"), "PUBLIC KEY");
+    let encrypted = fs::read_to_string(dir.join("rsa-2048-key-traditional-encrypted.pem"))
+        .expect("traditional encrypted RSA key must exist");
+    assert!(encrypted.starts_with("-----BEGIN RSA PRIVATE KEY-----\n"));
+    assert!(encrypted.contains("Proc-Type: 4,ENCRYPTED\n"));
+    assert!(encrypted.contains("DEK-Info: AES-256-CBC,"));
 }
 
 /// Verify RSA 4096 key triplet exists and contains valid PEM markers.
@@ -176,7 +181,7 @@ fn c14n11_xml_base_input_present() {
 #[test]
 fn fixture_file_count_matches_expected() {
     let expected = [
-        ("keys", 24),
+        ("keys", 25),
         ("c14n", 41),
         ("xmldsig", 203),
         ("saml", 2),

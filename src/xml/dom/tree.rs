@@ -723,6 +723,9 @@ impl<'a, 'input> Node<'a, 'input> {
     }
     /// Finds an in-scope prefix for a namespace URI.
     pub fn lookup_prefix(self, uri: &str) -> Option<&'a str> {
+        if uri == XML_NAMESPACE_URI {
+            return Some("xml");
+        }
         self.namespaces()
             .filter(|namespace| namespace.uri() == uri)
             .find_map(Namespace::name)
@@ -1109,6 +1112,10 @@ mod tests {
         assert_eq!(
             child.lookup_namespace_uri(Some("xml")),
             Some("http://www.w3.org/XML/1998/namespace")
+        );
+        assert_eq!(
+            child.lookup_prefix("http://www.w3.org/XML/1998/namespace"),
+            Some("xml")
         );
     }
 
