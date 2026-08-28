@@ -1356,12 +1356,14 @@ fn verify_signature_view<'a>(
             execution: execution_budget,
             resources: &ctx.policy.resources,
         };
+        let mut materialization = KeyInfoMaterializationState::default();
         let mut outcome = materialize_key_info_references_with_budgets(
             info,
             &resolver,
             &ctx.policy,
             ctx.provider,
             &mut retrieval_budgets,
+            &mut materialization,
         )?;
         outcome.merge(materialize_retrieval_methods_with_budgets(
             info,
@@ -1370,6 +1372,7 @@ fn verify_signature_view<'a>(
             ctx.allowed_transform_uris(),
             ctx.provider,
             &mut retrieval_budgets,
+            &mut materialization.candidate_work,
         )?);
         outcome
     } else {
@@ -1598,9 +1601,9 @@ struct RetrievalMaterializationBudgets<'a> {
 }
 
 #[derive(Default)]
-struct KeyInfoReferenceTraversal {
+struct KeyInfoMaterializationState {
     active: HashSet<(super::uri::TraversalDocumentIdentity, String)>,
-    candidate_materialization_work: usize,
+    candidate_work: usize,
 }
 
 trait KeyInfoReferencePolicy {
@@ -1676,12 +1679,13 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
     policy: &P,
     provider: &dyn crate::provider::CryptoProvider,
     budgets: &mut RetrievalMaterializationBudgets<'_>,
+    materialization: &mut KeyInfoMaterializationState,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
     fn visit<P: KeyInfoReferencePolicy>(
         key_info: &mut KeyInfo,
         resolver: &UriReferenceResolver<'_>,
         context: &mut KeyInfoReferenceMaterializationContext<'_, '_, P>,
-        traversal: &mut KeyInfoReferenceTraversal,
+        materialization: &mut KeyInfoMaterializationState,
         depth: usize,
     ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
         let mut materialized = Vec::new();
@@ -1691,13 +1695,12 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                 super::parse::KeyInfoSource::X509Data(info) => info.certificates.len().max(1),
                 _ => 1,
             };
-            traversal.candidate_materialization_work = traversal
-                .candidate_materialization_work
-                .saturating_add(source_work);
+            materialization.candidate_work =
+                materialization.candidate_work.saturating_add(source_work);
             context
                 .policy
                 .resources()
-                .validate_key_candidates(traversal.candidate_materialization_work)?;
+                .validate_key_candidates(materialization.candidate_work)?;
 
             let super::parse::KeyInfoSource::KeyInfoReference { uri } = source else {
                 materialized.push(source);
@@ -1722,7 +1725,7 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                 .resources()
                 .validate_key_info_reference_depth(next_depth)?;
             let cycle_key = (resolver.traversal_document_identity(), uri.clone());
-            if !traversal.active.insert(cycle_key.clone()) {
+            if !materialization.active.insert(cycle_key.clone()) {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "KeyInfoReference cycle detected",
                 });
@@ -1820,7 +1823,7 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                         &mut referenced,
                         &external_resolver,
                         context,
-                        traversal,
+                        materialization,
                         next_depth,
                     )?;
                     nested_outcome.merge(materialize_retrieval_methods_with_budgets(
@@ -1830,6 +1833,7 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                         context.policy.allowed_transforms(),
                         context.provider,
                         context.budgets,
+                        &mut materialization.candidate_work,
                     )?);
                     // RetrievalMethod nodes are meaningful only in the document
                     // whose resolver owns their same-document URI context.
@@ -1844,12 +1848,12 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                     &mut referenced,
                     resolver,
                     context,
-                    traversal,
+                    materialization,
                     next_depth,
                 )?);
             }
             outcome.merge(nested_outcome);
-            traversal.active.remove(&cycle_key);
+            materialization.active.remove(&cycle_key);
             materialized.extend(referenced.sources);
         }
         key_info.sources = materialized;
@@ -1860,21 +1864,24 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
         Ok(outcome)
     }
 
-    let mut traversal = KeyInfoReferenceTraversal::default();
     let mut context = KeyInfoReferenceMaterializationContext {
         policy,
         provider,
         budgets,
     };
-    visit(key_info, resolver, &mut context, &mut traversal, 0)
+    visit(key_info, resolver, &mut context, materialization, 0)
 }
 
 fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
     key_info: &mut KeyInfo,
-    resolver: &UriReferenceResolver<'_>,
+    resolver: UriReferenceResolver<'_>,
     policy: &P,
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<(), DsigError> {
+    let resolver = resolver.with_external_resource_limits(
+        policy.resources().max_external_resource_bytes,
+        policy.resources().max_external_resource_total_bytes,
+    );
     let mut xpath_parse_budget = XPathSignatureParseBudget::default();
     let execution_budget = TransformExecutionBudget::from_resources(policy.resources());
     let mut budgets = RetrievalMaterializationBudgets {
@@ -1882,12 +1889,14 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
         execution: &execution_budget,
         resources: policy.resources(),
     };
+    let mut materialization = KeyInfoMaterializationState::default();
     let outcome = materialize_key_info_references_with_budgets(
         key_info,
-        resolver,
+        &resolver,
         policy,
         provider,
         &mut budgets,
+        &mut materialization,
     )?;
     if let Some(error) = outcome.deferred_error {
         return Err(error);
@@ -1901,10 +1910,11 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
 /// The traversal shares the verifier's candidate-work, depth, cycle, target,
 /// XML parsing, and transform bounds. URI classes remain controlled by the
 /// signing policy's `uris` field; external bytes must be attached to `resolver`
-/// explicitly by the caller.
+/// explicitly by the caller. The resolver is consumed so this operation can
+/// bind a fresh aggregate external-resource budget to the supplied policy.
 pub fn materialize_signing_key_info_references(
     key_info: &mut KeyInfo,
-    resolver: &UriReferenceResolver<'_>,
+    resolver: UriReferenceResolver<'_>,
     policy: &crate::policy::SigningPolicy,
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<(), DsigError> {
@@ -1917,10 +1927,12 @@ pub fn materialize_signing_key_info_references(
 ///
 /// In addition to URI and resource policy, this entry point enforces the
 /// verification policy's `key_sources.key_info_reference` trust gate. External
-/// bytes must be attached to `resolver` explicitly by the caller.
+/// bytes must be attached to `resolver` explicitly by the caller. The resolver
+/// is consumed so this operation can bind a fresh aggregate external-resource
+/// budget to the supplied policy.
 pub fn materialize_verification_key_info_references(
     key_info: &mut KeyInfo,
-    resolver: &UriReferenceResolver<'_>,
+    resolver: UriReferenceResolver<'_>,
     policy: &crate::policy::VerificationPolicy,
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<(), DsigError> {
@@ -1935,6 +1947,7 @@ fn materialize_retrieval_methods_with_budgets(
     allowed_transforms: Option<&HashSet<String>>,
     provider: &dyn crate::provider::CryptoProvider,
     budgets: &mut RetrievalMaterializationBudgets<'_>,
+    candidate_work: &mut usize,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
     let retrieval_count = key_info
         .sources
@@ -1948,7 +1961,6 @@ fn materialize_retrieval_methods_with_budgets(
     }
 
     let mut total_binary_len = existing_x509_binary_len(key_info)?;
-    let mut materialized_candidate_preflight_count = key_info.embedded_candidate_count();
     let mut seen = HashSet::new();
     let mut materialized = Vec::with_capacity(key_info.sources.len());
     let mut outcome = RetrievalMaterialization::default();
@@ -2006,11 +2018,8 @@ fn materialize_retrieval_methods_with_budgets(
                 });
                 continue;
             };
-            materialized_candidate_preflight_count =
-                materialized_candidate_preflight_count.saturating_add(1);
-            budgets
-                .resources
-                .validate_key_candidates(materialized_candidate_preflight_count)?;
+            *candidate_work = candidate_work.saturating_add(1);
+            budgets.resources.validate_key_candidates(*candidate_work)?;
             if certificate.len() > MAX_X509_DECODED_BINARY_LEN {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
                     reason: "raw X509 RetrievalMethod certificate exceeds maximum allowed length",
@@ -2090,7 +2099,7 @@ fn materialize_retrieval_methods_with_budgets(
             let data = parse_x509_data_dispatch_with_budget_and_provider(
                 node,
                 &mut total_binary_len,
-                &mut materialized_candidate_preflight_count,
+                candidate_work,
                 provider,
                 budgets.resources,
             )
@@ -2166,6 +2175,7 @@ fn materialize_retrieval_methods(
         execution: &execution_budget,
         resources: &resources,
     };
+    let mut candidate_work = key_info.embedded_candidate_count();
     materialize_retrieval_methods_with_budgets(
         key_info,
         resolver,
@@ -2173,6 +2183,7 @@ fn materialize_retrieval_methods(
         allowed_transforms,
         provider,
         &mut budgets,
+        &mut candidate_work,
     )
 }
 
@@ -5446,6 +5457,7 @@ mod tests {
             execution: &execution_budget,
             resources: &policy.resources,
         };
+        let mut materialization = KeyInfoMaterializationState::default();
 
         document
             .with_view(|view| {
@@ -5455,6 +5467,7 @@ mod tests {
                     &policy,
                     crate::provider::default_provider(),
                     &mut budgets,
+                    &mut materialization,
                 )?;
                 Ok::<_, SignatureVerificationPipelineError>(())
             })
@@ -5489,6 +5502,7 @@ mod tests {
             execution: &execution_budget,
             resources: &policy.resources,
         };
+        let mut materialization = KeyInfoMaterializationState::default();
 
         let error = document
             .with_view(|view| {
@@ -5498,6 +5512,7 @@ mod tests {
                     &policy,
                     crate::provider::default_provider(),
                     &mut budgets,
+                    &mut materialization,
                 )
             })
             .expect_err("empty-URI self-reference must be rejected as a cycle");
@@ -5507,6 +5522,111 @@ mod tests {
             SignatureVerificationPipelineError::InvalidStructure {
                 reason: "KeyInfoReference cycle detected"
             }
+        ));
+    }
+
+    #[test]
+    fn key_info_materialization_shares_candidate_work_across_source_kinds() {
+        // The reference, nested RetrievalMethod, and resulting certificate are
+        // three units of materialization work in one operation.
+        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
+        let document = XmlDocument::parse(format!(
+            r##"<root xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:KeyInfo ID="target"><ds:RetrievalMethod URI="signer.der" Type="{RAW_X509_TYPE}"/></ds:KeyInfo></root>"##
+        ))
+        .unwrap();
+        let certificate = include_bytes!(
+            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
+        )
+        .to_vec();
+        let resources = HashMap::from([("signer.der".to_owned(), certificate)]);
+        let mut key_info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                uri: "#target".into(),
+            }],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_sources.key_info_reference = true;
+        policy.uris.retrieval_methods = UriTypeSet::ALL;
+        policy.resources.max_key_candidates = 2;
+        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
+        let mut budgets = RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse_budget,
+            execution: &execution_budget,
+            resources: &policy.resources,
+        };
+        let mut materialization = KeyInfoMaterializationState::default();
+
+        let error = document
+            .with_view(|view| {
+                let resolver = UriReferenceResolver::with_document_view(view, &[])
+                    .with_external_resources(&resources);
+                let mut outcome = materialize_key_info_references_with_budgets(
+                    &mut key_info,
+                    &resolver,
+                    &policy,
+                    crate::provider::default_provider(),
+                    &mut budgets,
+                    &mut materialization,
+                )?;
+                outcome.merge(materialize_retrieval_methods_with_budgets(
+                    &mut key_info,
+                    &resolver,
+                    policy.uris.retrieval_methods,
+                    policy.transforms.allowed_algorithms.as_ref(),
+                    crate::provider::default_provider(),
+                    &mut budgets,
+                    &mut materialization.candidate_work,
+                )?);
+                Ok::<_, DsigError>(outcome)
+            })
+            .expect_err("all materializers must share the candidate-work limit");
+
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::KEY_CANDIDATES,
+                maximum: 2,
+                actual: 3,
+            })
+        ));
+    }
+
+    #[test]
+    fn public_key_info_materialization_binds_external_resource_policy() {
+        // Public helpers must not inherit the resolver's permissive hard-limit
+        // budget when the operation policy selects a stricter byte ceiling.
+        let document = Document::parse("<root/>").unwrap();
+        let external = format!(
+            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>external</ds:KeyName></ds:KeyInfo>"#
+        );
+        let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
+        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+        let mut key_info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                uri: "key.xml".into(),
+            }],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_sources.key_info_reference = true;
+        policy.uris.key_info_references = UriTypeSet::ALL;
+        policy.resources.max_external_resource_bytes = 0;
+
+        let error = materialize_verification_key_info_references(
+            &mut key_info,
+            resolver,
+            &policy,
+            crate::provider::default_provider(),
+        )
+        .expect_err("policy must reject non-empty external KeyInfo bytes");
+
+        assert!(matches!(
+            error,
+            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                maximum: 0,
+                actual,
+            }) if actual == resources["key.xml"].len()
         ));
     }
 
@@ -5545,6 +5665,7 @@ mod tests {
             execution: &execution_budget,
             resources: &policy.resources,
         };
+        let mut materialization = KeyInfoMaterializationState::default();
 
         document.with_view(|view| {
             let resolver = UriReferenceResolver::with_document_view(view, &[])
@@ -5555,6 +5676,7 @@ mod tests {
                 &policy,
                 crate::provider::default_provider(),
                 &mut budgets,
+                &mut materialization,
             )?;
             Ok::<_, SignatureVerificationPipelineError>(())
         })?;
@@ -5581,6 +5703,7 @@ mod tests {
             execution: &execution_budget,
             resources: &policy.resources,
         };
+        let mut materialization = KeyInfoMaterializationState::default();
 
         document.with_view(|view| {
             let resolver = UriReferenceResolver::with_document_view(view, &[])
@@ -5591,6 +5714,7 @@ mod tests {
                 &policy,
                 crate::provider::default_provider(),
                 &mut budgets,
+                &mut materialization,
             )?;
             Ok::<_, SignatureVerificationPipelineError>(())
         })?;
@@ -5727,6 +5851,7 @@ mod tests {
             execution: &execution_budget,
             resources: &resource_policy,
         };
+        let mut candidate_work = key_info.embedded_candidate_count();
 
         let error = materialize_retrieval_methods_with_budgets(
             &mut key_info,
@@ -5735,6 +5860,7 @@ mod tests {
             None,
             crate::provider::default_provider(),
             &mut budgets,
+            &mut candidate_work,
         )
         .expect_err("the retrieved certificate must exceed the aggregate candidate limit");
 

@@ -587,7 +587,6 @@ pub(super) fn merge_key_info_source_at_index_with_budget(
                     && is_dsig_key_name(node.tag_name().namespace(), node.tag_name().name());
                 if !(replaces_key_material || replaces_key_name)
                     || !has_cryptographic_identity_content(node)
-                    || is_matching_empty_placeholder(node, &generated_key_material_sources)
                 {
                     return Vec::new();
                 }
@@ -896,17 +895,6 @@ fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, XmlMut
         })
         .filter_map(|result| result.transpose())
         .collect()
-}
-
-fn is_matching_empty_placeholder(
-    node: crate::xml::dom::Node<'_, '_>,
-    generated_sources: &[(Option<&str>, &str)],
-) -> bool {
-    generated_sources.iter().any(|(namespace, name)| {
-        node.tag_name().namespace() == *namespace
-            && node.tag_name().name() == *name
-            && is_reusable_placeholder(node)
-    })
 }
 
 fn is_reusable_placeholder(node: crate::xml::dom::Node<'_, '_>) -> bool {
@@ -1974,6 +1962,26 @@ mod tests {
 
         let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect("generated reference must replace stale identity");
+        let document = dom::Document::parse(&merged).expect("merged XML must parse");
+        let references = document
+            .descendants()
+            .filter(|node| node.has_tag_name((XMLDSIG11_NS, "KeyInfoReference")))
+            .collect::<Vec<_>>();
+
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].attribute("URI"), Some("#generated"));
+        assert!(!merged.contains("#stale"));
+    }
+
+    #[test]
+    fn key_info_source_merge_replaces_self_closing_uri_reference() {
+        // A URI is cryptographic identity even when the element has no child
+        // nodes; the self-closing syntax must not turn it into a placeholder.
+        let source = r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:KeyInfo><dsig11:KeyInfoReference URI="#stale"/></ds:KeyInfo></ds:Signature>"##;
+        let generated = r##"<dsig11:KeyInfoReference xmlns:dsig11="http://www.w3.org/2009/xmldsig11#" URI="#generated"/>"##;
+
+        let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
+            .expect("generated reference must replace self-closing stale identity");
         let document = dom::Document::parse(&merged).expect("merged XML must parse");
         let references = document
             .descendants()

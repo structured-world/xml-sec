@@ -262,7 +262,10 @@ operation can use `materialize_signing_key_info_references` or
 `materialize_verification_key_info_references`. Both entry points execute the
 same core traversal as `VerifyContext`, including candidate-work, depth, cycle,
 target, parser, transform, and external-resource bounds; they differ only in
-the typed signing or verification policy applied at the boundary.
+the typed signing or verification policy applied at the boundary. Each entry
+point consumes its caller-configured `UriReferenceResolver` so it can bind a
+fresh operation-scoped external-resource budget to that policy before any
+dereference.
 
 Direct policy-free calls on `HmacVerificationKey` enforce the secure default
 HMAC key and output minima. Compatibility truncation is available only through

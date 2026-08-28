@@ -151,7 +151,7 @@ pub fn verification_signature_metadata(
         let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
         materialize_verification_key_info_references(
             key_info,
-            &resolver,
+            resolver,
             policy,
             xml_sec::provider::default_provider(),
         )
@@ -197,7 +197,7 @@ pub fn signing_signature_metadata(
         let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
         materialize_signing_key_info_references(
             key_info,
-            &resolver,
+            resolver,
             policy,
             xml_sec::provider::default_provider(),
         )
