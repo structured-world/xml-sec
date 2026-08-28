@@ -9,6 +9,8 @@ use std::{
 
 use super::{ParseError, ParsingOptions, XmlBackend};
 
+const XML_NAMESPACE_URI: &str = "http://www.w3.org/XML/1998/namespace";
+
 /// Stable arena index for a node in one parsed document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(u32);
@@ -648,14 +650,20 @@ impl<'a, 'input> Node<'a, 'input> {
             } => ExpandedName {
                 name,
                 namespace: namespace.as_deref(),
+                match_namespace: true,
             },
             _ => ExpandedName {
                 name: "",
                 namespace: None,
+                match_namespace: true,
             },
         }
     }
-    /// Tests an element against a local or expanded name.
+    /// Tests an element against a local-name selector or an exact expanded name.
+    ///
+    /// A bare string matches any namespace, mirroring roxmltree. Tuple forms
+    /// match the namespace exactly, including `(None, name)` for an
+    /// unqualified element.
     pub fn has_tag_name<'n, N>(self, name: N) -> bool
     where
         N: Into<ExpandedName<'n>>,
@@ -665,9 +673,7 @@ impl<'a, 'input> Node<'a, 'input> {
         }
         let name = name.into();
         self.tag_name().name() == name.name()
-            && name
-                .namespace()
-                .is_none_or(|namespace| self.tag_name().namespace() == Some(namespace))
+            && (!name.match_namespace || self.tag_name().namespace() == name.namespace())
     }
     /// Returns the element's lexical namespace prefix.
     pub fn prefix(self) -> Option<&'a str> {
@@ -708,6 +714,9 @@ impl<'a, 'input> Node<'a, 'input> {
     }
     /// Resolves a namespace prefix in this element's in-scope bindings.
     pub fn lookup_namespace_uri(self, prefix: Option<&str>) -> Option<&'a str> {
+        if prefix == Some("xml") {
+            return Some(XML_NAMESPACE_URI);
+        }
         self.namespaces()
             .find(|ns| ns.name() == prefix)
             .map(Namespace::uri)
@@ -746,10 +755,13 @@ impl<'a, 'input> Node<'a, 'input> {
 }
 
 /// Expanded XML name used by element and attribute comparisons.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct ExpandedName<'a> {
     name: &'a str,
     namespace: Option<&'a str>,
+    // Selector intent is separate from the represented expanded name so
+    // equality remains a comparison of XML names, not matching syntax.
+    match_namespace: bool,
 }
 impl<'a> ExpandedName<'a> {
     /// Returns the local name.
@@ -761,17 +773,28 @@ impl<'a> ExpandedName<'a> {
         self.namespace
     }
 }
+impl PartialEq for ExpandedName<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.namespace == other.namespace
+    }
+}
+impl Eq for ExpandedName<'_> {}
 impl<'a> From<&'a str> for ExpandedName<'a> {
     fn from(name: &'a str) -> Self {
         Self {
             name,
             namespace: None,
+            match_namespace: false,
         }
     }
 }
 impl<'a> From<(Option<&'a str>, &'a str)> for ExpandedName<'a> {
     fn from((namespace, name): (Option<&'a str>, &'a str)) -> Self {
-        Self { name, namespace }
+        Self {
+            name,
+            namespace,
+            match_namespace: true,
+        }
     }
 }
 impl<'a> From<(&'a str, &'a str)> for ExpandedName<'a> {
@@ -779,6 +802,7 @@ impl<'a> From<(&'a str, &'a str)> for ExpandedName<'a> {
         Self {
             name,
             namespace: Some(namespace),
+            match_namespace: true,
         }
     }
 }
@@ -1049,6 +1073,43 @@ mod tests {
         assert_eq!(child.lookup_namespace_uri(Some("p")), Some("urn:p2"));
         assert_eq!(child.lookup_namespace_uri(None), Some(""));
         assert_eq!(child.namespaces().count(), 2);
+    }
+
+    #[test]
+    fn tag_name_matcher_distinguishes_local_from_unqualified_names() {
+        // A bare string mirrors roxmltree's local-name selector, while an
+        // explicit optional namespace represents exact expanded-name intent.
+        let document = Document::parse(r#"<r xmlns:p="urn:p"><item/><p:item/></r>"#)
+            .expect("namespace matching fixture must parse");
+        let mut items = document
+            .root_element()
+            .children()
+            .filter(|node| node.is_element());
+        let unqualified = items.next().expect("unqualified item must exist");
+        let namespaced = items.next().expect("namespaced item must exist");
+
+        assert!(unqualified.has_tag_name("item"));
+        assert!(namespaced.has_tag_name("item"));
+        assert!(unqualified.has_tag_name((None, "item")));
+        assert!(!namespaced.has_tag_name((None, "item")));
+        assert!(namespaced.has_tag_name((Some("urn:p"), "item")));
+    }
+
+    #[test]
+    fn namespace_lookup_includes_the_predefined_xml_binding() {
+        // Namespaces in XML binds `xml` on every element without requiring a
+        // lexical declaration in the source document.
+        let document = Document::parse("<root><child xml:lang=\"en\"/></root>")
+            .expect("predefined namespace fixture must parse");
+        let child = document
+            .root_element()
+            .first_element_child()
+            .expect("fixture must contain a child");
+
+        assert_eq!(
+            child.lookup_namespace_uri(Some("xml")),
+            Some("http://www.w3.org/XML/1998/namespace")
+        );
     }
 
     #[test]

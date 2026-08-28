@@ -1744,7 +1744,8 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                 });
             }
 
-            let (mut referenced, mut nested_outcome) = if uri.is_empty() || uri.starts_with('#') {
+            let is_same_document = uri.is_empty() || uri.starts_with('#');
+            let (mut referenced, mut nested_outcome) = if is_same_document {
                 let node = resolver
                     .node_for_same_document_reference(&uri)
                     .map_err(|error| {
@@ -1857,7 +1858,7 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                     Ok((referenced, nested_outcome))
                 })?
             };
-            if uri.is_empty() || uri.starts_with('#') {
+            if is_same_document {
                 nested_outcome.merge(visit(
                     &mut referenced,
                     resolver,
@@ -1906,7 +1907,9 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
         xml_backend,
     };
     let mut materialization = KeyInfoMaterializationState::default();
-    let outcome = materialize_key_info_references_with_budgets(
+    // Candidate-local retrieval failures remain deferred: this metadata-only
+    // entry point cannot know whether a later key-selection stage needs them.
+    materialize_key_info_references_with_budgets(
         key_info,
         &resolver,
         policy,
@@ -1914,9 +1917,6 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
         &mut budgets,
         &mut materialization,
     )?;
-    if let Some(error) = outcome.deferred_error {
-        return Err(error);
-    }
     Ok(())
 }
 
@@ -1927,8 +1927,11 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
 /// depth, cycle, target, XML parsing, and external-resource bounds. Retrieval
 /// methods nested in an external referenced document are materialized while
 /// that document's URI context is active; retrieval methods in the caller's
-/// document remain the responsibility of the complete signing pipeline. URI
-/// classes remain controlled by the signing policy's `uris` field; external
+/// document remain the responsibility of the complete signing pipeline.
+/// candidate failures are deferred so an earlier usable key source can still
+/// be selected; the complete signing pipeline reports the retained failure if
+/// no source resolves to a key. URI classes remain controlled by the signing
+/// policy's `uris` field; external
 /// bytes must be attached to `resolver` explicitly by the caller. The resolver
 /// is consumed so this operation can bind a fresh aggregate external-resource
 /// budget to the supplied policy. `xml_backend` is used for every recursively
@@ -1951,8 +1954,10 @@ pub fn materialize_signing_key_info_references(
 /// verification policy's `key_sources.key_info_reference` trust gate. Retrieval
 /// methods nested in an external referenced document are materialized in that
 /// document's URI context; retrieval methods in the caller's document remain
-/// the responsibility of the complete verification pipeline. External bytes
-/// must be attached to `resolver` explicitly by the caller. The resolver is
+/// the responsibility of the complete verification pipeline. Candidate-local
+/// retrieval failures remain deferred so usable sibling sources survive; the
+/// complete pipeline reports one only when key selection has no fallback.
+/// External bytes must be attached to `resolver` explicitly by the caller. The resolver is
 /// consumed so this operation can bind a fresh aggregate external-resource
 /// budget to the supplied policy. `xml_backend` is used for every recursively
 /// referenced XML document, preserving the caller's parser semantics.
@@ -5706,6 +5711,62 @@ mod tests {
             assert!(matches!(
                 key_info.sources.as_slice(),
                 [super::super::parse::KeyInfoSource::KeyName(name)] if name == "external"
+            ));
+        }
+    }
+
+    #[test]
+    fn public_key_info_materialization_defers_nested_retrieval_failure() {
+        // Metadata expansion must preserve an earlier usable source when a
+        // later retrieval candidate fails. The complete operation reports the
+        // deferred error only if key selection exhausts all usable sources.
+        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
+        let external = format!(
+            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>usable</ds:KeyName><ds:RetrievalMethod URI="missing.der" Type="{RAW_X509_TYPE}"/></ds:KeyInfo>"#
+        );
+        let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
+        let document = Document::parse("<root/>").unwrap();
+
+        for operation in ["signing", "verification"] {
+            let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+            let mut key_info = KeyInfo {
+                sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                    uri: "key.xml".into(),
+                }],
+            };
+            match operation {
+                "signing" => {
+                    let mut policy = crate::policy::SigningPolicy::default();
+                    policy.uris.key_info_references = UriTypeSet::ALL;
+                    policy.uris.retrieval_methods = UriTypeSet::ALL;
+                    materialize_signing_key_info_references(
+                        &mut key_info,
+                        resolver,
+                        &policy,
+                        crate::provider::default_provider(),
+                        crate::XmlBackend::default(),
+                    )
+                }
+                "verification" => {
+                    let mut policy = crate::policy::VerificationPolicy::default();
+                    policy.key_sources.key_info_reference = true;
+                    policy.uris.key_info_references = UriTypeSet::ALL;
+                    policy.uris.retrieval_methods = UriTypeSet::ALL;
+                    materialize_verification_key_info_references(
+                        &mut key_info,
+                        resolver,
+                        &policy,
+                        crate::provider::default_provider(),
+                        crate::XmlBackend::default(),
+                    )
+                }
+                _ => unreachable!(),
+            }
+            .unwrap_or_else(|error| panic!("{operation} materialization failed: {error}"));
+
+            assert!(matches!(
+                key_info.sources.as_slice(),
+                [super::super::parse::KeyInfoSource::KeyName(name)] if name == "usable"
             ));
         }
     }

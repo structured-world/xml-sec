@@ -40,8 +40,8 @@ use super::mutation::{
     padded_base64_len_for_xml,
 };
 use super::parse::{
-    MAX_REFERENCES_PER_SIGNATURE, SignatureAlgorithm, XMLDSIG_NS,
-    parse_signed_info_with_xpath_budget,
+    EC_P256_OID, EC_P384_OID, EC_P521_OID, MAX_REFERENCES_PER_SIGNATURE, SignatureAlgorithm,
+    XMLDSIG_NS, parse_signed_info_with_xpath_budget,
 };
 use super::signature::{encode_ecdsa_signature_as_der, maximum_ecdsa_der_signature_len};
 use super::transforms::{
@@ -1199,7 +1199,7 @@ impl SigningKey for EcdsaP256SigningKey {
     }
 
     fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
-        ecdsa_public_key_info(self.key.verifying_key(), "1.2.840.10045.3.1.7")
+        ecdsa_public_key_info(self.key.verifying_key(), EC_P256_OID)
     }
 }
 
@@ -1287,7 +1287,7 @@ impl SigningKey for EcdsaP384SigningKey {
     }
 
     fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
-        ecdsa_public_key_info(self.key.verifying_key(), "1.3.132.0.34")
+        ecdsa_public_key_info(self.key.verifying_key(), EC_P384_OID)
     }
 }
 
@@ -1375,7 +1375,7 @@ impl SigningKey for EcdsaP521SigningKey {
     }
 
     fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
-        ecdsa_public_key_info(self.key.verifying_key(), "1.3.132.0.35")
+        ecdsa_public_key_info(self.key.verifying_key(), EC_P521_OID)
     }
 }
 

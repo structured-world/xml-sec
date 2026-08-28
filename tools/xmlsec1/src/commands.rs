@@ -736,25 +736,7 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
     // allowlists opt its sign command into every implemented libxmlsec1 method,
     // including legacy SHA-1, without weakening the core library defaults.
     let mut policy = SigningPolicy {
-        signature_algorithms: Some(HashSet::from([
-            SignatureAlgorithm::DsaSha1,
-            SignatureAlgorithm::DsaSha256,
-            SignatureAlgorithm::HmacSha1,
-            SignatureAlgorithm::HmacSha224,
-            SignatureAlgorithm::HmacSha256,
-            SignatureAlgorithm::HmacSha384,
-            SignatureAlgorithm::HmacSha512,
-            SignatureAlgorithm::RsaSha1,
-            SignatureAlgorithm::RsaSha224,
-            SignatureAlgorithm::RsaSha256,
-            SignatureAlgorithm::RsaSha384,
-            SignatureAlgorithm::RsaSha512,
-            SignatureAlgorithm::EcdsaSha1,
-            SignatureAlgorithm::EcdsaSha224,
-            SignatureAlgorithm::EcdsaSha256,
-            SignatureAlgorithm::EcdsaSha384,
-            SignatureAlgorithm::EcdsaSha512,
-        ])),
+        signature_algorithms: Some(HashSet::from(SignatureAlgorithm::ALL)),
         digest_algorithms: Some(HashSet::from([
             DigestAlgorithm::Sha1,
             DigestAlgorithm::Sha224,

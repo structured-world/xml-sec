@@ -328,6 +328,8 @@ pub fn decode_signing_key(
         | SignatureAlgorithm::RsaSha384
         | SignatureAlgorithm::RsaSha512 => decode_rsa_signing_key(path, bytes, format, password),
         SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
+            // XMLDSig defines DSA signature methods only for SHA-1 and
+            // SHA-256. SHA-224 URIs exist for other key families, not DSA.
             decode_dsa_signing_key(path, bytes, format, password)
         }
         SignatureAlgorithm::EcdsaSha1

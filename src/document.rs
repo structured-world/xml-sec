@@ -136,6 +136,13 @@ impl Default for DocumentParseSettings {
     }
 }
 
+impl DocumentParseSettings {
+    pub(crate) const fn with_backend(mut self, backend: XmlBackend) -> Self {
+        self.backend = backend;
+        self
+    }
+}
+
 #[cfg(any(feature = "xmldsig", feature = "xmlenc", test))]
 impl DocumentParseSettings {
     #[cfg(test)]
@@ -173,11 +180,6 @@ impl DocumentParseSettings {
             resources.max_xml_depth,
             resources.max_xml_document_bytes,
         )
-    }
-
-    pub(crate) const fn with_backend(mut self, backend: XmlBackend) -> Self {
-        self.backend = backend;
-        self
     }
 }
 

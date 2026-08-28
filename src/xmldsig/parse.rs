@@ -120,6 +120,27 @@ pub enum SignatureAlgorithm {
 }
 
 impl SignatureAlgorithm {
+    /// Every signature algorithm recognized by this release.
+    pub const ALL: [Self; 17] = [
+        Self::DsaSha1,
+        Self::DsaSha256,
+        Self::HmacSha1,
+        Self::HmacSha224,
+        Self::HmacSha256,
+        Self::HmacSha384,
+        Self::HmacSha512,
+        Self::RsaSha1,
+        Self::RsaSha224,
+        Self::RsaSha256,
+        Self::RsaSha384,
+        Self::RsaSha512,
+        Self::EcdsaSha1,
+        Self::EcdsaSha224,
+        Self::EcdsaSha256,
+        Self::EcdsaSha384,
+        Self::EcdsaSha512,
+    ];
+
     /// Fixed XMLDSig component width for DSA's `r || s` representation.
     pub(crate) const fn dsa_component_len(self) -> Option<usize> {
         match self {
@@ -2579,16 +2600,7 @@ mod tests {
 
     #[test]
     fn signature_algorithm_uri_round_trip() {
-        for algo in [
-            SignatureAlgorithm::DsaSha1,
-            SignatureAlgorithm::HmacSha1,
-            SignatureAlgorithm::RsaSha1,
-            SignatureAlgorithm::RsaSha256,
-            SignatureAlgorithm::RsaSha384,
-            SignatureAlgorithm::RsaSha512,
-            SignatureAlgorithm::EcdsaSha256,
-            SignatureAlgorithm::EcdsaSha384,
-        ] {
+        for algo in SignatureAlgorithm::ALL {
             assert_eq!(
                 SignatureAlgorithm::from_uri(algo.uri()),
                 Some(algo),

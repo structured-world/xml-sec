@@ -705,19 +705,19 @@ fn verify_ecdsa_p521(
 }
 
 trait DecodeEcdsaSignature: Sized {
-    fn from_fixed_width(bytes: &[u8]) -> Result<Self, SignatureVerificationError>;
-    fn from_der(bytes: &[u8]) -> Result<Self, SignatureVerificationError>;
+    fn decode_fixed_width(bytes: &[u8]) -> Result<Self, SignatureVerificationError>;
+    fn decode_der(bytes: &[u8]) -> Result<Self, SignatureVerificationError>;
 }
 
 macro_rules! impl_ecdsa_signature_decoder {
     ($signature:ty) => {
         impl DecodeEcdsaSignature for $signature {
-            fn from_fixed_width(bytes: &[u8]) -> Result<Self, SignatureVerificationError> {
+            fn decode_fixed_width(bytes: &[u8]) -> Result<Self, SignatureVerificationError> {
                 Self::from_slice(bytes)
                     .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)
             }
 
-            fn from_der(bytes: &[u8]) -> Result<Self, SignatureVerificationError> {
+            fn decode_der(bytes: &[u8]) -> Result<Self, SignatureVerificationError> {
                 Self::from_der(bytes)
                     .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)
             }
@@ -740,8 +740,8 @@ where
     S: DecodeEcdsaSignature,
 {
     let signature = match signature_encoding {
-        EcdsaSignatureEncoding::XmlDsigFixed => S::from_fixed_width(signature_value)?,
-        EcdsaSignatureEncoding::Asn1Der => S::from_der(signature_value)?,
+        EcdsaSignatureEncoding::XmlDsigFixed => S::decode_fixed_width(signature_value)?,
+        EcdsaSignatureEncoding::Asn1Der => S::decode_der(signature_value)?,
     };
     Ok(key.verify_prehash(prehash, &signature).is_ok())
 }
