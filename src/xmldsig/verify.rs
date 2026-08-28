@@ -1891,6 +1891,7 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
     resolver: UriReferenceResolver<'_>,
     policy: &P,
     provider: &dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
 ) -> Result<(), DsigError> {
     let resolver = resolver.with_external_resource_limits(
         policy.resources().max_external_resource_bytes,
@@ -1902,7 +1903,7 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
         xpath_parse: &mut xpath_parse_budget,
         execution: &execution_budget,
         resources: policy.resources(),
-        xml_backend: crate::XmlBackend::default(),
+        xml_backend,
     };
     let mut materialization = KeyInfoMaterializationState::default();
     let outcome = materialize_key_info_references_with_budgets(
@@ -1930,15 +1931,17 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
 /// classes remain controlled by the signing policy's `uris` field; external
 /// bytes must be attached to `resolver` explicitly by the caller. The resolver
 /// is consumed so this operation can bind a fresh aggregate external-resource
-/// budget to the supplied policy.
+/// budget to the supplied policy. `xml_backend` is used for every recursively
+/// referenced XML document, preserving the caller's parser semantics.
 pub fn materialize_signing_key_info_references(
     key_info: &mut KeyInfo,
     resolver: UriReferenceResolver<'_>,
     policy: &crate::policy::SigningPolicy,
     provider: &dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
 ) -> Result<(), DsigError> {
     policy.validate()?;
-    materialize_key_info_references_for_policy(key_info, resolver, policy, provider)
+    materialize_key_info_references_for_policy(key_info, resolver, policy, provider, xml_backend)
 }
 
 /// Resolve and recursively expand policy-allowed `KeyInfoReference` sources
@@ -1951,15 +1954,17 @@ pub fn materialize_signing_key_info_references(
 /// the responsibility of the complete verification pipeline. External bytes
 /// must be attached to `resolver` explicitly by the caller. The resolver is
 /// consumed so this operation can bind a fresh aggregate external-resource
-/// budget to the supplied policy.
+/// budget to the supplied policy. `xml_backend` is used for every recursively
+/// referenced XML document, preserving the caller's parser semantics.
 pub fn materialize_verification_key_info_references(
     key_info: &mut KeyInfo,
     resolver: UriReferenceResolver<'_>,
     policy: &crate::policy::VerificationPolicy,
     provider: &dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
 ) -> Result<(), DsigError> {
     policy.validate()?;
-    materialize_key_info_references_for_policy(key_info, resolver, policy, provider)
+    materialize_key_info_references_for_policy(key_info, resolver, policy, provider, xml_backend)
 }
 
 fn materialize_retrieval_methods_with_budgets(
@@ -5653,6 +5658,7 @@ mod tests {
             resolver,
             &policy,
             crate::provider::default_provider(),
+            crate::XmlBackend::default(),
         )
         .expect_err("policy must reject non-empty external KeyInfo bytes");
 
@@ -5664,6 +5670,44 @@ mod tests {
                 actual,
             }) if actual == resources["key.xml"].len()
         ));
+    }
+
+    #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
+    #[test]
+    fn public_key_info_materialization_uses_the_selected_backend() {
+        // Public materialization is a standalone parse boundary. Its backend
+        // must be caller-selected just like the complete sign/verify pipeline.
+        let external = format!(
+            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>external</ds:KeyName></ds:KeyInfo>"#
+        );
+        let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
+        let document = Document::parse("<root/>").unwrap();
+
+        for backend in [crate::XmlBackend::Xmloxide, crate::XmlBackend::Roxmltree] {
+            let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
+            let mut key_info = KeyInfo {
+                sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                    uri: "key.xml".into(),
+                }],
+            };
+            let mut policy = crate::policy::VerificationPolicy::default();
+            policy.key_sources.key_info_reference = true;
+            policy.uris.key_info_references = UriTypeSet::ALL;
+
+            materialize_verification_key_info_references(
+                &mut key_info,
+                resolver,
+                &policy,
+                crate::provider::default_provider(),
+                backend,
+            )
+            .unwrap_or_else(|error| panic!("{backend:?} materialization failed: {error}"));
+
+            assert!(matches!(
+                key_info.sources.as_slice(),
+                [super::super::parse::KeyInfoSource::KeyName(name)] if name == "external"
+            ));
+        }
     }
 
     #[test]
@@ -5700,6 +5744,7 @@ mod tests {
                         resolver,
                         &policy,
                         crate::provider::default_provider(),
+                        crate::XmlBackend::default(),
                     )
                 }
                 "verification" => {
@@ -5712,6 +5757,7 @@ mod tests {
                         resolver,
                         &policy,
                         crate::provider::default_provider(),
+                        crate::XmlBackend::default(),
                     )
                 }
                 _ => unreachable!(),

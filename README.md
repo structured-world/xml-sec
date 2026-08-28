@@ -98,10 +98,14 @@ Install the `xmlsec1` command from the same package:
 
 ```sh
 cargo install xml-sec
+xmlsec1 verify --xml-backend xmloxide signed.xml
 ```
 
 Adding `xml-sec` as a dependency builds its library target, not the executable.
 `cargo install` builds and installs the binary target.
+The CLI accepts `--xml-backend xmloxide|roxmltree|differential` on every XML
+Security operation. A thin binary rejects a backend that was not compiled;
+install a fat build with `--features xml-backends-all` when runtime switching is required.
 
 ## Capabilities
 

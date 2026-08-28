@@ -820,19 +820,25 @@ fn charge_node_set_string_bytes(
     additional: usize,
     max_bytes: usize,
 ) -> Result<usize, TransformError> {
-    let total = current.checked_add(additional).ok_or_else(|| {
-        transform_resource_limit(
-            crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
-            max_bytes,
-            usize::MAX,
-        )
-    })?;
+    charge_resource_bytes(
+        current,
+        additional,
+        max_bytes,
+        crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+    )
+}
+
+pub(super) fn charge_resource_bytes(
+    current: usize,
+    additional: usize,
+    max_bytes: usize,
+    resource: &'static str,
+) -> Result<usize, TransformError> {
+    let total = current
+        .checked_add(additional)
+        .ok_or_else(|| transform_resource_limit(resource, max_bytes, usize::MAX))?;
     if total > max_bytes {
-        return Err(transform_resource_limit(
-            crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
-            max_bytes,
-            total,
-        ));
+        return Err(transform_resource_limit(resource, max_bytes, total));
     }
     Ok(total)
 }

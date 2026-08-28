@@ -197,6 +197,7 @@ macro_rules! option_spec {
 pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
     option_spec!("output", ["o"], VALUE, false, SINGLE),
     option_spec!("crypto", [], VALUE, false, SINGLE),
+    option_spec!("xml-backend", [], VALUE, false, SINGLE),
     option_spec!("crypto-config", [], VALUE, false, SINGLE),
     option_spec!("verbose", [], FLAG, false, SINGLE),
     option_spec!("print-crypto-library-errors", [], FLAG, false, SINGLE),

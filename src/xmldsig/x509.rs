@@ -718,11 +718,9 @@ fn verify_certificate_signature_with_provider(
     // RFC 5280 sections 4.1.1.2 and 4.1.2.3 require the outer and signed
     // AlgorithmIdentifier values to be identical. Enforce this independently
     // of the backend so the legacy DSA path cannot bypass the invariant.
-    if certificate.signature_algorithm != certificate.tbs_certificate.signature {
-        return Ok(false);
-    }
-    verify_x509_signature_with_provider(
+    verify_x509_signed_object_with_provider(
         &certificate.signature_algorithm,
+        &certificate.tbs_certificate.signature,
         &certificate.signature_value.data,
         certificate.tbs_certificate.as_ref(),
         issuer.public_key().raw,
@@ -781,14 +779,32 @@ fn verify_crl_signature_with_provider(
 ) -> Result<bool, X509ChainError> {
     // RFC 5280 sections 5.1.1.2 and 5.1.2.2 impose the same equality rule on
     // CRLs as certificates.
-    if crl.signature_algorithm != crl.tbs_cert_list.signature {
-        return Ok(false);
-    }
-    verify_x509_signature_with_provider(
+    verify_x509_signed_object_with_provider(
         &crl.signature_algorithm,
+        &crl.tbs_cert_list.signature,
         &crl.signature_value.data,
         crl.tbs_cert_list.as_ref(),
         issuer.public_key().raw,
+        provider,
+    )
+}
+
+fn verify_x509_signed_object_with_provider(
+    outer_algorithm: &AlgorithmIdentifier<'_>,
+    signed_algorithm: &AlgorithmIdentifier<'_>,
+    signature_der: &[u8],
+    signed_data: &[u8],
+    issuer_spki_der: &[u8],
+    provider: &dyn crate::provider::CryptoProvider,
+) -> Result<bool, X509ChainError> {
+    if outer_algorithm != signed_algorithm {
+        return Ok(false);
+    }
+    verify_x509_signature_with_provider(
+        outer_algorithm,
+        signature_der,
+        signed_data,
+        issuer_spki_der,
         provider,
     )
 }

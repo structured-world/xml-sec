@@ -149,12 +149,14 @@ pub fn verification_signature_metadata(
     id_attributes: &[xml_sec::IdAttributeRegistration],
     policy: &VerificationPolicy,
     key_name_resolution: VerificationKeyNameResolution,
+    xml_backend: xml_sec::XmlBackend,
 ) -> Result<SignatureMetadata, KeyMaterialError> {
     policy.validate()?;
     let document = parse_signature_document(
         xml,
         policy.xml.allow_internal_dtd,
         policy.resources.max_xml_nodes,
+        xml_backend,
     )?;
     let signature = select_signature(&document, start_node_id, id_attributes)?;
     let signed_info = signature
@@ -178,6 +180,7 @@ pub fn verification_signature_metadata(
                 resolver,
                 policy,
                 xml_sec::provider::default_provider(),
+                xml_backend,
             )
             .map_err(map_key_info_reference_error)?;
         }
@@ -194,12 +197,14 @@ pub fn signing_signature_metadata(
     start_node_id: Option<&str>,
     id_attributes: &[xml_sec::IdAttributeRegistration],
     policy: &SigningPolicy,
+    xml_backend: xml_sec::XmlBackend,
 ) -> Result<SigningTemplateMetadata, KeyMaterialError> {
     policy.validate()?;
     let document = parse_signature_document(
         xml,
         policy.xml.allow_internal_dtd,
         policy.resources.max_xml_nodes,
+        xml_backend,
     )?;
     let signature = select_signature(&document, start_node_id, id_attributes)?;
     let algorithm_uri = signature
@@ -226,6 +231,7 @@ pub fn signing_signature_metadata(
             resolver,
             policy,
             xml_sec::provider::default_provider(),
+            xml_backend,
         )
         .map_err(map_key_info_reference_error)?;
     }
@@ -268,16 +274,18 @@ fn parse_signature_document(
     xml: &str,
     allow_internal_dtd: bool,
     max_xml_nodes: usize,
+    xml_backend: xml_sec::XmlBackend,
 ) -> Result<Document<'_>, KeyMaterialError> {
     let nodes_limit = u32::try_from(max_xml_nodes).map_err(|_| {
         KeyMaterialError::Signature("XML node ceiling does not fit the parser limit".into())
     })?;
-    Document::parse_with_options(
+    Document::parse_with_options_and_backend(
         xml,
         ParsingOptions {
             allow_dtd: allow_internal_dtd,
             nodes_limit,
         },
+        xml_backend,
     )
     .map_err(|error| KeyMaterialError::Signature(error.to_string()))
 }
@@ -983,6 +991,7 @@ mod tests {
                 None,
                 &[],
                 &SigningPolicy::default(),
+                xml_sec::XmlBackend::default(),
             )
             .expect_err("invalid KeyInfoReference graph must be rejected");
             assert!(error.to_string().contains(expected), "{error}");
@@ -1013,6 +1022,7 @@ mod tests {
             None,
             &[],
             &SigningPolicy::default(),
+            xml_sec::XmlBackend::default(),
         )
         .expect_err("over-deep KeyInfoReference chain must be rejected");
         assert!(
@@ -1037,6 +1047,7 @@ mod tests {
             None,
             &[],
             &policy,
+            xml_sec::XmlBackend::default(),
         )
         .expect_err("aggregate candidate work must respect operation policy");
         assert!(
@@ -1062,6 +1073,7 @@ mod tests {
             None,
             &[],
             &policy,
+            xml_sec::XmlBackend::default(),
         )
         .expect_err("disabled KeyInfoReference URI class must be rejected");
         assert!(
@@ -1257,6 +1269,7 @@ mod tests {
             &[],
             &xml_sec::policy::VerificationPolicy::default(),
             VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
+            xml_sec::XmlBackend::default(),
         )
         .unwrap();
         assert_eq!(metadata.algorithm, SignatureAlgorithm::EcdsaSha256);
@@ -1277,6 +1290,7 @@ mod tests {
             &[],
             &VerificationPolicy::default(),
             VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
+            xml_sec::XmlBackend::default(),
         )
         .expect("unused malformed document keys must not block a pinned key");
 
@@ -1299,6 +1313,7 @@ mod tests {
             &[],
             &xml_sec::policy::VerificationPolicy::default(),
             VerificationKeyNameResolution::ResolveDocumentKeyInfo,
+            xml_sec::XmlBackend::default(),
         )
         .unwrap();
 
@@ -1320,6 +1335,7 @@ mod tests {
             &[],
             &VerificationPolicy::default(),
             VerificationKeyNameResolution::ResolveDocumentKeyInfo,
+            xml_sec::XmlBackend::default(),
         )
         .expect("same-document KeyInfoReference must resolve before candidate selection");
 
@@ -1333,6 +1349,7 @@ mod tests {
             &[],
             &disabled,
             VerificationKeyNameResolution::ResolveDocumentKeyInfo,
+            xml_sec::XmlBackend::default(),
         )
         .expect_err("metadata selection must honor the verification key-source policy");
         assert!(error.to_string().contains("key sources are disabled"));
@@ -1360,6 +1377,7 @@ mod tests {
             &[],
             &policy,
             VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
+            xml_sec::XmlBackend::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("nodes limit"));

@@ -704,24 +704,55 @@ fn verify_ecdsa_p521(
     verify_p521_signature(&key, signature_value, signature_encoding, prehash)
 }
 
+trait DecodeEcdsaSignature: Sized {
+    fn from_fixed_width(bytes: &[u8]) -> Result<Self, SignatureVerificationError>;
+    fn from_der(bytes: &[u8]) -> Result<Self, SignatureVerificationError>;
+}
+
+macro_rules! impl_ecdsa_signature_decoder {
+    ($signature:ty) => {
+        impl DecodeEcdsaSignature for $signature {
+            fn from_fixed_width(bytes: &[u8]) -> Result<Self, SignatureVerificationError> {
+                Self::from_slice(bytes)
+                    .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)
+            }
+
+            fn from_der(bytes: &[u8]) -> Result<Self, SignatureVerificationError> {
+                Self::from_der(bytes)
+                    .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)
+            }
+        }
+    };
+}
+
+impl_ecdsa_signature_decoder!(P256Signature);
+impl_ecdsa_signature_decoder!(P384Signature);
+impl_ecdsa_signature_decoder!(P521Signature);
+
+fn verify_ecdsa_signature<K, S>(
+    key: &K,
+    signature_value: &[u8],
+    signature_encoding: EcdsaSignatureEncoding,
+    prehash: &[u8],
+) -> Result<bool, SignatureVerificationError>
+where
+    K: PrehashVerifier<S>,
+    S: DecodeEcdsaSignature,
+{
+    let signature = match signature_encoding {
+        EcdsaSignatureEncoding::XmlDsigFixed => S::from_fixed_width(signature_value)?,
+        EcdsaSignatureEncoding::Asn1Der => S::from_der(signature_value)?,
+    };
+    Ok(key.verify_prehash(prehash, &signature).is_ok())
+}
+
 fn verify_p256_signature(
     key: &P256VerifyingKey,
     signature_value: &[u8],
     signature_encoding: EcdsaSignatureEncoding,
     prehash: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
-    match signature_encoding {
-        EcdsaSignatureEncoding::XmlDsigFixed => {
-            let signature = P256Signature::from_slice(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
-        EcdsaSignatureEncoding::Asn1Der => {
-            let signature = P256Signature::from_der(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
-    }
+    verify_ecdsa_signature::<_, P256Signature>(key, signature_value, signature_encoding, prehash)
 }
 
 fn verify_p384_signature(
@@ -730,18 +761,7 @@ fn verify_p384_signature(
     signature_encoding: EcdsaSignatureEncoding,
     prehash: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
-    match signature_encoding {
-        EcdsaSignatureEncoding::XmlDsigFixed => {
-            let signature = P384Signature::from_slice(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
-        EcdsaSignatureEncoding::Asn1Der => {
-            let signature = P384Signature::from_der(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
-    }
+    verify_ecdsa_signature::<_, P384Signature>(key, signature_value, signature_encoding, prehash)
 }
 
 fn verify_p521_signature(
@@ -750,18 +770,7 @@ fn verify_p521_signature(
     signature_encoding: EcdsaSignatureEncoding,
     prehash: &[u8],
 ) -> Result<bool, SignatureVerificationError> {
-    match signature_encoding {
-        EcdsaSignatureEncoding::XmlDsigFixed => {
-            let signature = P521Signature::from_slice(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
-        EcdsaSignatureEncoding::Asn1Der => {
-            let signature = P521Signature::from_der(signature_value)
-                .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
-            Ok(key.verify_prehash(prehash, &signature).is_ok())
-        }
-    }
+    verify_ecdsa_signature::<_, P521Signature>(key, signature_value, signature_encoding, prehash)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

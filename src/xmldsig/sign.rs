@@ -8,10 +8,16 @@
 use crate::xml::dom::{Document, Node, NodeId};
 use base64::Engine;
 use hmac::{KeyInit, Mac};
-use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
+use p256::ecdsa::{
+    Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
+};
 use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
-use p384::ecdsa::{Signature as P384Signature, SigningKey as P384SigningKey};
-use p521::ecdsa::{Signature as P521Signature, SigningKey as P521SigningKey};
+use p384::ecdsa::{
+    Signature as P384Signature, SigningKey as P384SigningKey, VerifyingKey as P384VerifyingKey,
+};
+use p521::ecdsa::{
+    Signature as P521Signature, SigningKey as P521SigningKey, VerifyingKey as P521VerifyingKey,
+};
 use rsa::RsaPrivateKey;
 use rsa::pkcs1v15::Signature as RsaPkcs1v15Signature;
 use rsa::pkcs1v15::SigningKey as RsaPkcs1v15SigningKey;
@@ -1039,6 +1045,76 @@ fn sign_rsa_pkcs1v15_with_rng(
     Ok(signature.to_vec())
 }
 
+fn ecdsa_digest_algorithm(
+    algorithm: SignatureAlgorithm,
+) -> Result<DigestAlgorithm, SigningKeyError> {
+    match algorithm {
+        SignatureAlgorithm::EcdsaSha1 => Ok(DigestAlgorithm::Sha1),
+        SignatureAlgorithm::EcdsaSha224 => Ok(DigestAlgorithm::Sha224),
+        SignatureAlgorithm::EcdsaSha256 => Ok(DigestAlgorithm::Sha256),
+        SignatureAlgorithm::EcdsaSha384 => Ok(DigestAlgorithm::Sha384),
+        SignatureAlgorithm::EcdsaSha512 => Ok(DigestAlgorithm::Sha512),
+        _ => Err(SigningKeyError::UnsupportedAlgorithm {
+            uri: algorithm.uri().to_owned(),
+        }),
+    }
+}
+
+fn sign_ecdsa_with_provider<S, K>(
+    key: &K,
+    provider: &dyn crate::provider::CryptoProvider,
+    algorithm: SignatureAlgorithm,
+    canonical_signed_info: &[u8],
+) -> Result<Vec<u8>, SigningKeyError>
+where
+    K: PrehashSigner<S>,
+    S: SignatureEncoding,
+{
+    let digest_algorithm = ecdsa_digest_algorithm(algorithm)?;
+    let prehash =
+        super::compute_digest_with_provider(provider, digest_algorithm, canonical_signed_info)?;
+    let signature = key
+        .sign_prehash(&prehash)
+        .map_err(|_| SigningKeyError::SigningFailed)?;
+    Ok(signature.to_vec())
+}
+
+trait EcdsaPublicKeyEncoding {
+    fn spki_der(&self) -> Result<Vec<u8>, SigningKeyError>;
+    fn uncompressed_sec1(&self) -> Vec<u8>;
+}
+
+macro_rules! impl_ecdsa_public_key_encoding {
+    ($key:ty) => {
+        impl EcdsaPublicKeyEncoding for $key {
+            fn spki_der(&self) -> Result<Vec<u8>, SigningKeyError> {
+                self.to_public_key_der()
+                    .map(|document| document.as_bytes().to_vec())
+                    .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)
+            }
+
+            fn uncompressed_sec1(&self) -> Vec<u8> {
+                self.to_sec1_point(false).as_bytes().to_vec()
+            }
+        }
+    };
+}
+
+impl_ecdsa_public_key_encoding!(P256VerifyingKey);
+impl_ecdsa_public_key_encoding!(P384VerifyingKey);
+impl_ecdsa_public_key_encoding!(P521VerifyingKey);
+
+fn ecdsa_public_key_info(
+    key: &impl EcdsaPublicKeyEncoding,
+    curve_oid: &'static str,
+) -> Result<SigningPublicKeyInfo, SigningKeyError> {
+    Ok(SigningPublicKeyInfo::Ec {
+        spki_der: key.spki_der()?,
+        curve_oid,
+        public_key: key.uncompressed_sec1(),
+    })
+}
+
 /// ECDSA P-256 private key for XMLDSig signing.
 pub struct EcdsaP256SigningKey {
     key: P256SigningKey,
@@ -1114,38 +1190,16 @@ impl SigningKey for EcdsaP256SigningKey {
         algorithm: SignatureAlgorithm,
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
-        let digest_algorithm = match algorithm {
-            SignatureAlgorithm::EcdsaSha1 => DigestAlgorithm::Sha1,
-            SignatureAlgorithm::EcdsaSha224 => DigestAlgorithm::Sha224,
-            SignatureAlgorithm::EcdsaSha256 => DigestAlgorithm::Sha256,
-            SignatureAlgorithm::EcdsaSha384 => DigestAlgorithm::Sha384,
-            SignatureAlgorithm::EcdsaSha512 => DigestAlgorithm::Sha512,
-            _ => {
-                return Err(SigningKeyError::UnsupportedAlgorithm {
-                    uri: algorithm.uri().to_string(),
-                });
-            }
-        };
-        let prehash =
-            super::compute_digest_with_provider(provider, digest_algorithm, canonical_signed_info)?;
-        let signature: P256Signature = self
-            .key
-            .sign_prehash(&prehash)
-            .map_err(|_| SigningKeyError::SigningFailed)?;
-        Ok(signature.to_bytes().to_vec())
+        sign_ecdsa_with_provider::<P256Signature, _>(
+            &self.key,
+            provider,
+            algorithm,
+            canonical_signed_info,
+        )
     }
 
     fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
-        let verifying_key = self.key.verifying_key();
-        let spki_der = verifying_key
-            .to_public_key_der()
-            .map(|doc| doc.as_bytes().to_vec())
-            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)?;
-        Ok(SigningPublicKeyInfo::Ec {
-            spki_der,
-            curve_oid: "1.2.840.10045.3.1.7",
-            public_key: verifying_key.to_sec1_point(false).as_bytes().to_vec(),
-        })
+        ecdsa_public_key_info(self.key.verifying_key(), "1.2.840.10045.3.1.7")
     }
 }
 
@@ -1224,38 +1278,16 @@ impl SigningKey for EcdsaP384SigningKey {
         algorithm: SignatureAlgorithm,
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
-        let digest_algorithm = match algorithm {
-            SignatureAlgorithm::EcdsaSha1 => DigestAlgorithm::Sha1,
-            SignatureAlgorithm::EcdsaSha224 => DigestAlgorithm::Sha224,
-            SignatureAlgorithm::EcdsaSha256 => DigestAlgorithm::Sha256,
-            SignatureAlgorithm::EcdsaSha384 => DigestAlgorithm::Sha384,
-            SignatureAlgorithm::EcdsaSha512 => DigestAlgorithm::Sha512,
-            _ => {
-                return Err(SigningKeyError::UnsupportedAlgorithm {
-                    uri: algorithm.uri().to_string(),
-                });
-            }
-        };
-        let prehash =
-            super::compute_digest_with_provider(provider, digest_algorithm, canonical_signed_info)?;
-        let signature: P384Signature = self
-            .key
-            .sign_prehash(&prehash)
-            .map_err(|_| SigningKeyError::SigningFailed)?;
-        Ok(signature.to_bytes().to_vec())
+        sign_ecdsa_with_provider::<P384Signature, _>(
+            &self.key,
+            provider,
+            algorithm,
+            canonical_signed_info,
+        )
     }
 
     fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
-        let verifying_key = self.key.verifying_key();
-        let spki_der = verifying_key
-            .to_public_key_der()
-            .map(|doc| doc.as_bytes().to_vec())
-            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)?;
-        Ok(SigningPublicKeyInfo::Ec {
-            spki_der,
-            curve_oid: "1.3.132.0.34",
-            public_key: verifying_key.to_sec1_point(false).as_bytes().to_vec(),
-        })
+        ecdsa_public_key_info(self.key.verifying_key(), "1.3.132.0.34")
     }
 }
 
@@ -1334,38 +1366,16 @@ impl SigningKey for EcdsaP521SigningKey {
         algorithm: SignatureAlgorithm,
         canonical_signed_info: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
-        let digest_algorithm = match algorithm {
-            SignatureAlgorithm::EcdsaSha1 => DigestAlgorithm::Sha1,
-            SignatureAlgorithm::EcdsaSha224 => DigestAlgorithm::Sha224,
-            SignatureAlgorithm::EcdsaSha256 => DigestAlgorithm::Sha256,
-            SignatureAlgorithm::EcdsaSha384 => DigestAlgorithm::Sha384,
-            SignatureAlgorithm::EcdsaSha512 => DigestAlgorithm::Sha512,
-            _ => {
-                return Err(SigningKeyError::UnsupportedAlgorithm {
-                    uri: algorithm.uri().to_owned(),
-                });
-            }
-        };
-        let prehash =
-            super::compute_digest_with_provider(provider, digest_algorithm, canonical_signed_info)?;
-        let signature: P521Signature = self
-            .key
-            .sign_prehash(&prehash)
-            .map_err(|_| SigningKeyError::SigningFailed)?;
-        Ok(signature.to_bytes().to_vec())
+        sign_ecdsa_with_provider::<P521Signature, _>(
+            &self.key,
+            provider,
+            algorithm,
+            canonical_signed_info,
+        )
     }
 
     fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
-        let verifying_key = self.key.verifying_key();
-        let spki_der = verifying_key
-            .to_public_key_der()
-            .map(|doc| doc.as_bytes().to_vec())
-            .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)?;
-        Ok(SigningPublicKeyInfo::Ec {
-            spki_der,
-            curve_oid: "1.3.132.0.35",
-            public_key: verifying_key.to_sec1_point(false).as_bytes().to_vec(),
-        })
+        ecdsa_public_key_info(self.key.verifying_key(), "1.3.132.0.35")
     }
 }
 

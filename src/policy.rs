@@ -251,16 +251,11 @@ impl Default for DsaKeyPolicy {
 impl DsaKeyPolicy {
     /// Validate the configured minimum against the implementation ceiling.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
-        if self.minimum_modulus_bits == 0 || !self.minimum_modulus_bits.is_multiple_of(64) {
-            return Err(PolicyViolation::InvalidResourceLimit {
-                resource: "minimum DSA modulus bits",
-                requirement: "minimum must be a nonzero multiple of 64 bits",
-                actual: self.minimum_modulus_bits,
-            });
-        }
-        ResourcePolicy::within(
+        validate_modulus_minimum(
             "minimum DSA modulus bits",
             self.minimum_modulus_bits,
+            64,
+            "minimum must be a nonzero multiple of 64 bits",
             crate::hard_limits::DSA_MODULUS_BIT_CEILING,
         )
     }
@@ -295,16 +290,11 @@ impl Default for RsaKeyPolicy {
 impl RsaKeyPolicy {
     /// Validate the configured minimum against the implementation ceiling.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
-        if self.minimum_modulus_bits == 0 || !self.minimum_modulus_bits.is_multiple_of(8) {
-            return Err(PolicyViolation::InvalidResourceLimit {
-                resource: "minimum RSA modulus bits",
-                requirement: "minimum must be a nonzero whole-byte width",
-                actual: self.minimum_modulus_bits,
-            });
-        }
-        ResourcePolicy::within(
+        validate_modulus_minimum(
             "minimum RSA modulus bits",
             self.minimum_modulus_bits,
+            8,
+            "minimum must be a nonzero whole-byte width",
             crate::hard_limits::RSA_MODULUS_BIT_CEILING,
         )
     }
@@ -364,6 +354,24 @@ impl RsaKeyPolicy {
         }
         Ok(modulus.len())
     }
+}
+
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+fn validate_modulus_minimum(
+    resource: &'static str,
+    minimum_bits: usize,
+    alignment_bits: usize,
+    requirement: &'static str,
+    ceiling: usize,
+) -> Result<(), PolicyViolation> {
+    if minimum_bits == 0 || !minimum_bits.is_multiple_of(alignment_bits) {
+        return Err(PolicyViolation::InvalidResourceLimit {
+            resource,
+            requirement,
+            actual: minimum_bits,
+        });
+    }
+    ResourcePolicy::within(resource, minimum_bits, ceiling)
 }
 
 /// Resource ceilings shared by parsing, transforms, and cryptographic output.
@@ -1078,44 +1086,41 @@ impl SigningPolicy {
         &self,
         algorithm: SignatureAlgorithm,
     ) -> Result<(), PolicyViolation> {
-        let explicitly_allowed = self
-            .signature_algorithms
-            .as_ref()
-            .is_some_and(|allowed| allowed.contains(&algorithm));
-        if (!algorithm.signing_allowed() && !explicitly_allowed)
-            || self
-                .signature_algorithms
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&algorithm))
-        {
-            return Err(PolicyViolation::Algorithm {
-                operation: "signing",
-                algorithm: algorithm.uri().to_owned(),
-            });
-        }
-        Ok(())
+        check_signing_algorithm(
+            self.signature_algorithms.as_ref(),
+            algorithm,
+            algorithm.signing_allowed(),
+            algorithm.uri(),
+        )
     }
 
     pub(crate) fn check_digest_algorithm(
         &self,
         algorithm: DigestAlgorithm,
     ) -> Result<(), PolicyViolation> {
-        let explicitly_allowed = self
-            .digest_algorithms
-            .as_ref()
-            .is_some_and(|allowed| allowed.contains(&algorithm));
-        if (!algorithm.signing_allowed() && !explicitly_allowed)
-            || self
-                .digest_algorithms
-                .as_ref()
-                .is_some_and(|allowed| !allowed.contains(&algorithm))
-        {
-            return Err(PolicyViolation::Algorithm {
-                operation: "signing",
-                algorithm: algorithm.uri().to_owned(),
-            });
-        }
+        check_signing_algorithm(
+            self.digest_algorithms.as_ref(),
+            algorithm,
+            algorithm.signing_allowed(),
+            algorithm.uri(),
+        )
+    }
+}
+
+#[cfg(feature = "xmldsig")]
+fn check_signing_algorithm<T: Eq + std::hash::Hash>(
+    allowlist: Option<&HashSet<T>>,
+    algorithm: T,
+    default_allowed: bool,
+    uri: &str,
+) -> Result<(), PolicyViolation> {
+    if allowlist.map_or(default_allowed, |allowed| allowed.contains(&algorithm)) {
         Ok(())
+    } else {
+        Err(PolicyViolation::Algorithm {
+            operation: "signing",
+            algorithm: uri.to_owned(),
+        })
     }
 }
 

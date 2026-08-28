@@ -76,7 +76,12 @@ when decoding fails.
 
 Capability checks and runtime dispatch use one registry. A transform or key-data
 class absent from `list-*` is not silently substituted and causes `check-*` to
-fail. Backend selection is equally strict: `--crypto rustcrypto` and
+fail. XML parser selection is available on `sign`, `verify`, `encrypt`, and
+`decrypt` through `--xml-backend xmloxide|roxmltree|differential`. The selected
+backend is preserved through metadata discovery, recursive external XML,
+transforms, mutation validation, and the complete operation pipeline. A thin
+binary rejects an implementation that was not compiled; no parser fallback is
+performed. Crypto backend selection is equally strict: `--crypto rustcrypto` and
 `--crypto default` select the built-in provider; other backend names do not
 fall back to RustCrypto. The upstream runners pass `--crypto-config` for every
 backend. RustCrypto accepts an absent or empty configuration directory because

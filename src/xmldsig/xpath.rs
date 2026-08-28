@@ -1265,21 +1265,12 @@ impl<'d> Mirror<'d> {
 }
 
 fn charge_xpath_mirror_bytes(current: usize, additional: usize) -> Result<usize, TransformError> {
-    let total = current.checked_add(additional).ok_or_else(|| {
-        transform_resource_limit(
-            crate::policy::resource_name::XPATH_MIRROR_STRING_BYTES,
-            MAX_XPATH_MIRROR_STRING_BYTES,
-            usize::MAX,
-        )
-    })?;
-    if total > MAX_XPATH_MIRROR_STRING_BYTES {
-        return Err(transform_resource_limit(
-            crate::policy::resource_name::XPATH_MIRROR_STRING_BYTES,
-            MAX_XPATH_MIRROR_STRING_BYTES,
-            total,
-        ));
-    }
-    Ok(total)
+    super::types::charge_resource_bytes(
+        current,
+        additional,
+        MAX_XPATH_MIRROR_STRING_BYTES,
+        crate::policy::resource_name::XPATH_MIRROR_STRING_BYTES,
+    )
 }
 
 /// Resolves XML Signature's `here()` function to the node selected by the

@@ -968,35 +968,29 @@ fn element_children<'a>(node: Node<'a, 'a>) -> impl Iterator<Item = Node<'a, 'a>
 
 /// Verify that a node is a `<ds:{expected_name}>` element.
 fn verify_ds_element(node: Node, expected_name: &'static str) -> Result<(), ParseError> {
-    if !node.is_element() {
-        return Err(ParseError::InvalidStructure(format!(
-            "expected element <{expected_name}>, got non-element node"
-        )));
-    }
-    let tag = node.tag_name();
-    if tag.name() != expected_name || tag.namespace() != Some(XMLDSIG_NS) {
-        return Err(ParseError::InvalidStructure(format!(
-            "expected <ds:{expected_name}>, got <{}{}>",
-            tag.namespace()
-                .map(|ns| format!("{{{ns}}}"))
-                .unwrap_or_default(),
-            tag.name()
-        )));
-    }
-    Ok(())
+    verify_namespaced_element(node, expected_name, XMLDSIG_NS, "ds")
 }
 
 /// Verify that a node is a `<dsig11:{expected_name}>` element.
 fn verify_dsig11_element(node: Node, expected_name: &'static str) -> Result<(), ParseError> {
+    verify_namespaced_element(node, expected_name, XMLDSIG11_NS, "dsig11")
+}
+
+fn verify_namespaced_element(
+    node: Node,
+    expected_name: &'static str,
+    expected_namespace: &'static str,
+    diagnostic_prefix: &'static str,
+) -> Result<(), ParseError> {
     if !node.is_element() {
         return Err(ParseError::InvalidStructure(format!(
             "expected element <{expected_name}>, got non-element node"
         )));
     }
     let tag = node.tag_name();
-    if tag.name() != expected_name || tag.namespace() != Some(XMLDSIG11_NS) {
+    if tag.name() != expected_name || tag.namespace() != Some(expected_namespace) {
         return Err(ParseError::InvalidStructure(format!(
-            "expected <dsig11:{expected_name}>, got <{}{}>",
+            "expected <{diagnostic_prefix}:{expected_name}>, got <{}{}>",
             tag.namespace()
                 .map(|ns| format!("{{{ns}}}"))
                 .unwrap_or_default(),

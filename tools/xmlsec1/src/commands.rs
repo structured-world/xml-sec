@@ -14,7 +14,7 @@ use rsa::{
 };
 use x509_parser::prelude::FromDer as _;
 use xml_sec::{
-    IdAttributeRegistration,
+    IdAttributeRegistration, XmlBackend,
     policy::{
         DecryptionPolicy, EcdsaSignatureValueEncoding, EncryptionPolicy, HmacPolicy,
         ManifestProcessing, ResourcePolicy, SameDocumentIdSemantics, SigningPolicy,
@@ -34,7 +34,7 @@ use xml_sec::{
         EncryptedDataBuilder, EncryptedDataType, EncryptedKey, EncryptionMethod,
         EncryptionRecipient, KeyCandidateBudget, KeyTransportAlgorithm, OaepDigestAlgorithm,
         PrivateKeyDecryptor, RsaOaepParameters, XmlEncError,
-        parse_encrypted_data_template_node_with_policy, validate_rsa_recipient_key,
+        parse_encrypted_data_template_node_with_policy_and_backend, validate_rsa_recipient_key,
     },
 };
 use xml_sec::{
@@ -58,6 +58,7 @@ const GENERIC_OPTIONS: &[&str] = &[
     "help",
 ];
 const SIGN_OPTIONS: &[&str] = &[
+    "xml-backend",
     "print-debug",
     "print-xml-debug",
     "output",
@@ -78,6 +79,7 @@ const SIGN_OPTIONS: &[&str] = &[
     "enable-asn1-signatures-hack",
 ];
 const VERIFY_OPTIONS: &[&str] = &[
+    "xml-backend",
     "print-debug",
     "print-xml-debug",
     "pubkey-pem",
@@ -109,6 +111,7 @@ const VERIFY_OPTIONS: &[&str] = &[
     "enable-asn1-signatures-hack",
 ];
 const ENCRYPT_OPTIONS: &[&str] = &[
+    "xml-backend",
     "print-debug",
     "print-xml-debug",
     "output",
@@ -127,6 +130,7 @@ const ENCRYPT_OPTIONS: &[&str] = &[
     "add-id-attr",
 ];
 const DECRYPT_OPTIONS: &[&str] = &[
+    "xml-backend",
     "print-debug",
     "print-xml-debug",
     "output",
@@ -169,6 +173,10 @@ pub enum CommandError {
     InapplicableOption { option: String, command: Command },
     #[error("unsupported crypto provider: {0}")]
     UnsupportedProvider(String),
+    #[error("unsupported XML backend: {0}; expected xmloxide, roxmltree, or differential")]
+    UnsupportedXmlBackend(String),
+    #[error("XML backend {0} is not compiled into this binary")]
+    UnavailableXmlBackend(String),
     #[error("I/O error for {}: {source}", path.display())]
     Io {
         path: PathBuf,
@@ -366,6 +374,23 @@ fn validate_crypto_config(invocation: &Invocation) -> Result<(), CommandError> {
         Ok(())
     } else {
         Err(CommandError::UnsupportedOption("crypto-config".into()))
+    }
+}
+
+fn selected_xml_backend(invocation: &Invocation) -> Result<XmlBackend, CommandError> {
+    let Some(name) = option_text(invocation, "xml-backend")? else {
+        return Ok(XmlBackend::default());
+    };
+    let backend = match name {
+        "xmloxide" => XmlBackend::Xmloxide,
+        "roxmltree" => XmlBackend::Roxmltree,
+        "differential" => XmlBackend::Differential,
+        _ => return Err(CommandError::UnsupportedXmlBackend(name.to_owned())),
+    };
+    if backend.is_available() {
+        Ok(backend)
+    } else {
+        Err(CommandError::UnavailableXmlBackend(name.to_owned()))
     }
 }
 
@@ -661,6 +686,7 @@ fn named_candidate_search<'a, T: Copy>(
 
 fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, SIGN_OPTIONS)?;
+    let xml_backend = selected_xml_backend(invocation)?;
     validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     let password = invocation.password_bytes();
     // This binary is an explicit libxmlsec1 compatibility boundary. Its sign
@@ -669,8 +695,13 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
-    let signature =
-        key_material::signing_signature_metadata(&xml, start_node_id, &id_attributes, &policy)?;
+    let signature = key_material::signing_signature_metadata(
+        &xml,
+        start_node_id,
+        &id_attributes,
+        &policy,
+        xml_backend,
+    )?;
     let selected = select_signing_key(
         invocation,
         &signature.key_names,
@@ -681,6 +712,7 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     )?;
     let mut context = SignContext::new(selected.key.as_ref())
         .policy(policy)
+        .xml_backend(xml_backend)
         .signature_template_selection(SignatureTemplateSelection::FirstDescendant);
     if let Some(id) = start_node_id {
         context = context.start_node_id(id);
@@ -756,21 +788,18 @@ fn write_signing_diagnostics(
     algorithm: SignatureAlgorithm,
     stdout: &mut dyn Write,
 ) -> Result<(), CommandError> {
-    if invocation.flag("print-debug") {
-        writeln!(stdout, "== Signature Context").map_err(stdout_error)?;
-        writeln!(stdout, "Status: succeeded").map_err(stdout_error)?;
-        writeln!(stdout, "Signature Method: {}", algorithm.uri()).map_err(stdout_error)?;
-    }
-    if invocation.flag("print-xml-debug") {
-        writeln!(
-            stdout,
-            "<SignatureContext status=\"SUCCEEDED\" failureReason=\"UNKNOWN\">"
-        )
-        .map_err(stdout_error)?;
-        write_debug_transform(stdout, "SignatureMethod", algorithm.uri())?;
-        writeln!(stdout, "</SignatureContext>").map_err(stdout_error)?;
-    }
-    Ok(())
+    write_operation_diagnostics(
+        invocation,
+        stdout,
+        algorithm.uri(),
+        DiagnosticFormat {
+            text_context: "Signature Context",
+            text_method: "Signature Method",
+            xml_context: "SignatureContext",
+            xml_status: "SUCCEEDED",
+            xml_method: "SignatureMethod",
+        },
+    )
 }
 
 struct SigningKeyCandidate {
@@ -1133,6 +1162,7 @@ fn ecdsa_signature_value_encoding(invocation: &Invocation) -> EcdsaSignatureValu
 
 fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, VERIFY_OPTIONS)?;
+    let xml_backend = selected_xml_backend(invocation)?;
     validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     reject_unimplemented_verification_policy(invocation)?;
     let explicit_keys = invocation
@@ -1172,6 +1202,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         &id_attributes,
         &policy,
         key_name_resolution,
+        xml_backend,
     )?;
     let algorithm = signature.algorithm;
     let selected_keys = if explicit_keys.is_empty() {
@@ -1242,14 +1273,14 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             lax_key_search,
             policy.key_trust.check_crls,
         );
-        verification_context(policy, start_node_id, &id_attributes)
+        verification_context(policy, start_node_id, &id_attributes, xml_backend)
             .key_resolver(&resolver)
             .verify(&xml)
             .map_err(|error| CommandError::Signature(error.to_string()))?
     } else {
         let config = configured_certificates.into_resolver_config();
         let resolver = DefaultKeyResolver::new(config);
-        verification_context(policy, start_node_id, &id_attributes)
+        verification_context(policy, start_node_id, &id_attributes, xml_backend)
             .key_resolver(&resolver)
             .verify(&xml)
             .map_err(|error| CommandError::Signature(error.to_string()))?
@@ -1458,9 +1489,11 @@ fn verification_context<'a>(
     policy: VerificationPolicy,
     start_node_id: Option<&'a str>,
     id_attributes: &'a [IdAttributeRegistration],
+    xml_backend: XmlBackend,
 ) -> VerifyContext<'a> {
     let context = VerifyContext::new()
         .policy(policy)
+        .xml_backend(xml_backend)
         .id_attributes(id_attributes);
     match start_node_id {
         Some(id) => context.start_node_id(id),
@@ -1720,6 +1753,7 @@ fn load_explicit_certificate_key_info(
 
 fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, ENCRYPT_OPTIONS)?;
+    let xml_backend = selected_xml_backend(invocation)?;
     validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     let has_binary_data = invocation.last_value("binary-data").is_some();
     let has_xml_data = invocation.last_value("xml-data").is_some();
@@ -1734,12 +1768,20 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let template = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
-    let metadata = encryption_template(&template, start_node_id, &id_attributes, &policy)?;
+    let metadata = encryption_template(
+        &template,
+        start_node_id,
+        &id_attributes,
+        &policy,
+        xml_backend,
+    )?;
     let algorithm = metadata.algorithm;
     let encrypted_type = metadata.encrypted_type;
     let explicit_xml_type = metadata.explicit_xml_type;
     let template_placement = metadata.placement;
-    let mut builder = EncryptedDataBuilder::new(algorithm).policy(policy.clone());
+    let mut builder = EncryptedDataBuilder::new(algorithm)
+        .policy(policy.clone())
+        .xml_backend(xml_backend);
     let aes_keys = invocation.values("aes-key").collect::<Vec<_>>();
     let public_keys = invocation
         .ordered_values(&[
@@ -1834,6 +1876,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             &id_attributes,
             &policy,
             template_recipients.len(),
+            xml_backend,
         )?;
         for (template_recipient, metadata) in
             template_recipients.into_iter().zip(recipient_metadata)
@@ -1930,7 +1973,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         builder.encrypt_binary(&data)
     } else if let Some(path) = invocation.last_value("xml-data") {
         let data = read_xml_data(path, maximum_document_bytes)?;
-        let plaintext = xml_data_plaintext(&data, &encrypted_type, &policy)?;
+        let plaintext = xml_data_plaintext(&data, &encrypted_type, &policy, xml_backend)?;
         builder.encrypt_xml(plaintext.as_ref())
     } else {
         return Err(CommandError::Usage(
@@ -1944,6 +1987,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         start_node_id,
         &id_attributes,
         &policy,
+        xml_backend,
     )?;
     write_result_then_stdout_diagnostics(invocation, rendered.as_bytes(), stdout, |stdout| {
         write_encryption_diagnostics(invocation, algorithm, stdout)
@@ -1964,12 +2008,13 @@ fn xml_data_plaintext<'a>(
     xml: &'a str,
     encrypted_type: &EncryptedDataType,
     policy: &EncryptionPolicy,
+    xml_backend: XmlBackend,
 ) -> Result<Cow<'a, str>, CommandError> {
     // libxmlsec1 parses --xml-data into a document and passes its root node to
     // xmlSecEncCtxXmlEncrypt. Element serializes that node; Content serializes
     // only its children. The document declaration and boundary nodes therefore
     // never become encrypted replacement plaintext.
-    let document = parse_encryption_document(xml, &policy.xml, &policy.resources)?;
+    let document = parse_encryption_document(xml, &policy.xml, &policy.resources, xml_backend)?;
     let root = document.root_element();
     let element = &xml[root.range()];
     match encrypted_type {
@@ -2015,19 +2060,49 @@ fn write_encryption_diagnostics(
     algorithm: DataEncryptionAlgorithm,
     stdout: &mut dyn Write,
 ) -> Result<(), CommandError> {
+    write_operation_diagnostics(
+        invocation,
+        stdout,
+        algorithm.uri(),
+        DiagnosticFormat {
+            text_context: "Data Encryption Context",
+            text_method: "Encryption Method",
+            xml_context: "DataEncryptionContext",
+            xml_status: "replaced",
+            xml_method: "EncryptionMethod",
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct DiagnosticFormat {
+    text_context: &'static str,
+    text_method: &'static str,
+    xml_context: &'static str,
+    xml_status: &'static str,
+    xml_method: &'static str,
+}
+
+fn write_operation_diagnostics(
+    invocation: &Invocation,
+    stdout: &mut dyn Write,
+    algorithm_uri: &str,
+    format: DiagnosticFormat,
+) -> Result<(), CommandError> {
     if invocation.flag("print-debug") {
-        writeln!(stdout, "== Data Encryption Context").map_err(stdout_error)?;
+        writeln!(stdout, "== {}", format.text_context).map_err(stdout_error)?;
         writeln!(stdout, "Status: succeeded").map_err(stdout_error)?;
-        writeln!(stdout, "Encryption Method: {}", algorithm.uri()).map_err(stdout_error)?;
+        writeln!(stdout, "{}: {}", format.text_method, algorithm_uri).map_err(stdout_error)?;
     }
     if invocation.flag("print-xml-debug") {
         writeln!(
             stdout,
-            "<DataEncryptionContext status=\"replaced\" failureReason=\"UNKNOWN\">"
+            "<{} status=\"{}\" failureReason=\"UNKNOWN\">",
+            format.xml_context, format.xml_status
         )
         .map_err(stdout_error)?;
-        write_debug_transform(stdout, "EncryptionMethod", algorithm.uri())?;
-        writeln!(stdout, "</DataEncryptionContext>").map_err(stdout_error)?;
+        write_debug_transform(stdout, format.xml_method, algorithm_uri)?;
+        writeln!(stdout, "</{}>", format.xml_context).map_err(stdout_error)?;
     }
     Ok(())
 }
@@ -2134,8 +2209,10 @@ fn recipient_key_metadata(
     id_attributes: &[IdAttributeRegistration],
     policy: &EncryptionPolicy,
     expected_recipients: usize,
+    xml_backend: XmlBackend,
 ) -> Result<Vec<Option<ParsedRecipientKeyMetadata>>, CommandError> {
-    let document = parse_encryption_document(template, &policy.xml, &policy.resources)?;
+    let document =
+        parse_encryption_document(template, &policy.xml, &policy.resources, xml_backend)?;
     let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
     let encrypted_keys = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
         .into_iter()
@@ -2352,9 +2429,12 @@ fn apply_encryption_template(
     start_node_id: Option<&str>,
     id_attributes: &[IdAttributeRegistration],
     policy: &EncryptionPolicy,
+    xml_backend: XmlBackend,
 ) -> Result<String, CommandError> {
-    let template_document = parse_encryption_document(template, &policy.xml, &policy.resources)?;
-    let generated_document = parse_encryption_document(generated, &policy.xml, &policy.resources)?;
+    let template_document =
+        parse_encryption_document(template, &policy.xml, &policy.resources, xml_backend)?;
+    let generated_document =
+        parse_encryption_document(generated, &policy.xml, &policy.resources, xml_backend)?;
     let template_data = select_encrypted_data(&template_document, start_node_id, id_attributes)?;
     let generated_data = generated_document.root_element();
     let template_cipher = required_cipher_value(template_data, "template EncryptedData")?;
@@ -2485,7 +2565,7 @@ fn apply_encryption_template(
             "encrypted template output exceeds XML document policy".into(),
         ));
     }
-    parse_encryption_document(&output, &policy.xml, &policy.resources)?;
+    parse_encryption_document(&output, &policy.xml, &policy.resources, xml_backend)?;
     Ok(output)
 }
 
@@ -2753,6 +2833,7 @@ fn direct_encrypted_keys<'a, 'input>(key_info: Node<'a, 'input>) -> Vec<Node<'a,
 
 fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     validate_options(invocation, DECRYPT_OPTIONS)?;
+    let xml_backend = selected_xml_backend(invocation)?;
     validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
     if invocation.flag("pwd") {
         return Err(CommandError::UnsupportedOption("pwd".into()));
@@ -2761,7 +2842,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let encrypted_data_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
-    let document = parse_encryption_document(&xml, &policy.xml, &policy.resources)?;
+    let document = parse_encryption_document(&xml, &policy.xml, &policy.resources, xml_backend)?;
     let encrypted_data = select_encrypted_data(&document, encrypted_data_id, &id_attributes)?;
     let standalone = encrypted_data == document.root_element();
     let content_key_name = encrypted_data_key_name(encrypted_data)?;
@@ -2813,6 +2894,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             standalone,
             policy,
             &id_attributes,
+            xml_backend,
         )?
     } else if !private_keys.is_empty() {
         let selected = select_recipient_private_keys(
@@ -2887,6 +2969,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
             standalone,
             policy,
             &id_attributes,
+            xml_backend,
         )?
     } else {
         return Err(CommandError::Usage(
@@ -3076,9 +3159,11 @@ fn decrypt_input(
     standalone: bool,
     policy: DecryptionPolicy,
     id_attributes: &[IdAttributeRegistration],
+    xml_backend: XmlBackend,
 ) -> Result<Vec<u8>, CommandError> {
     let context = DecryptContext::new(resolver)
         .policy(policy)
+        .xml_backend(xml_backend)
         .id_attributes(id_attributes);
     if standalone {
         return context
@@ -3121,14 +3206,19 @@ fn encryption_template(
     start_node_id: Option<&str>,
     id_attributes: &[IdAttributeRegistration],
     policy: &EncryptionPolicy,
+    xml_backend: XmlBackend,
 ) -> Result<EncryptionTemplateMetadata, CommandError> {
-    let document = parse_encryption_document(xml, &policy.xml, &policy.resources)?;
+    let document = parse_encryption_document(xml, &policy.xml, &policy.resources, xml_backend)?;
     let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
     // Templates preserve every non-cipher field. Parse the selected node through
     // the reciprocal core path first so encryption cannot emit a document that
     // the same policy snapshot would reject during decryption.
-    let parsed = parse_encrypted_data_template_node_with_policy(encrypted_data, policy)
-        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let parsed = parse_encrypted_data_template_node_with_policy_and_backend(
+        encrypted_data,
+        policy,
+        xml_backend,
+    )
+    .map_err(|error| CommandError::Encryption(error.to_string()))?;
     let algorithm = DataEncryptionAlgorithm::from_uri(&parsed.encryption_method.algorithm)
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
     let explicit_xml_type = matches!(
@@ -3308,6 +3398,7 @@ fn parse_encryption_document<'a>(
     xml: &'a str,
     xml_policy: &XmlInputPolicy,
     resources: &ResourcePolicy,
+    xml_backend: XmlBackend,
 ) -> Result<Document<'a>, CommandError> {
     resources
         .validate()
@@ -3315,12 +3406,13 @@ fn parse_encryption_document<'a>(
     let nodes_limit = u32::try_from(resources.max_xml_nodes).map_err(|_| {
         CommandError::Encryption("XML node ceiling does not fit the parser limit".into())
     })?;
-    Document::parse_with_options(
+    Document::parse_with_options_and_backend(
         xml,
         ParsingOptions {
             allow_dtd: xml_policy.allow_internal_dtd,
             nodes_limit,
         },
+        xml_backend,
     )
     .map_err(|error| CommandError::Encryption(error.to_string()))
 }
@@ -3731,6 +3823,34 @@ mod tests {
     }
 
     #[test]
+    fn xml_backend_selector_is_strict_and_build_aware() {
+        // Runtime selection must neither accept unknown names nor fall back
+        // when a thin binary does not contain the requested implementation.
+        let invalid = invocation(&["xmlsec1", "verify", "--xml-backend", "libxml2", "input.xml"]);
+        assert!(matches!(
+            selected_xml_backend(&invalid),
+            Err(CommandError::UnsupportedXmlBackend(name)) if name == "libxml2"
+        ));
+
+        for (name, backend) in [
+            ("xmloxide", XmlBackend::Xmloxide),
+            ("roxmltree", XmlBackend::Roxmltree),
+            ("differential", XmlBackend::Differential),
+        ] {
+            let invocation = invocation(&["xmlsec1", "verify", "--xml-backend", name, "input.xml"]);
+            let selected = selected_xml_backend(&invocation);
+            if backend.is_available() {
+                assert_eq!(selected.unwrap(), backend);
+            } else {
+                assert!(matches!(
+                    selected,
+                    Err(CommandError::UnavailableXmlBackend(rejected)) if rejected == name
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn command_help_is_an_action_and_semantic_no_ops_fail_closed() {
         let mut output = Vec::new();
         execute(
@@ -3860,6 +3980,7 @@ mod tests {
             None,
             &[],
             &EncryptionPolicy::default(),
+            XmlBackend::default(),
         )
         .unwrap();
         let document = Document::parse(&rendered)
@@ -3893,6 +4014,7 @@ mod tests {
             None,
             &[],
             &EncryptionPolicy::default(),
+            XmlBackend::default(),
         )
         .expect("empty KeyInfo must accept a generated recipient");
         let document = Document::parse(&rendered).expect("merged output must parse");
@@ -3923,6 +4045,7 @@ mod tests {
             None,
             &[],
             &EncryptionPolicy::default(),
+            XmlBackend::default(),
         )
         .expect("all generated key metadata must merge without overlapping edits");
         let document = Document::parse(&rendered).expect("merged output must remain XML");
@@ -3974,6 +4097,7 @@ mod tests {
             None,
             &[],
             &EncryptionPolicy::default(),
+            XmlBackend::default(),
         )
         .expect("CipherValue payload replacement must preserve template metadata");
         let document = Document::parse(&rendered).unwrap();
@@ -4033,8 +4157,15 @@ mod tests {
             ..EncryptionPolicy::default()
         };
 
-        let error = apply_encryption_template(&template, &generated, None, &[], &policy)
-            .expect_err("the aggregate merged document must be reparsed under policy");
+        let error = apply_encryption_template(
+            &template,
+            &generated,
+            None,
+            &[],
+            &policy,
+            XmlBackend::default(),
+        )
+        .expect_err("the aggregate merged document must be reparsed under policy");
         assert!(error.to_string().contains("nodes limit"), "{error}");
     }
 
@@ -4059,8 +4190,15 @@ mod tests {
             ..EncryptionPolicy::default()
         };
 
-        let error = apply_encryption_template(&template, &generated, None, &[], &policy)
-            .expect_err("merged output must be bounded before reparsing");
+        let error = apply_encryption_template(
+            &template,
+            &generated,
+            None,
+            &[],
+            &policy,
+            XmlBackend::default(),
+        )
+        .expect_err("merged output must be bounded before reparsing");
         assert!(
             matches!(&error, CommandError::Encryption(message) if message.contains("encrypted template output exceeds XML document policy")),
             "{error}"
@@ -4098,7 +4236,13 @@ mod tests {
         }
         xml.push_str("</EncryptedData>");
 
-        let error = match encryption_template(&xml, None, &[], &EncryptionPolicy::default()) {
+        let error = match encryption_template(
+            &xml,
+            None,
+            &[],
+            &EncryptionPolicy::default(),
+            XmlBackend::default(),
+        ) {
             Ok(_) => panic!("over-budget template must fail"),
             Err(error) => error,
         };
@@ -4480,7 +4624,12 @@ mod tests {
         };
 
         assert!(matches!(
-            xml_data_plaintext(xml, &EncryptedDataType::Content, &policy),
+            xml_data_plaintext(
+                xml,
+                &EncryptedDataType::Content,
+                &policy,
+                XmlBackend::default(),
+            ),
             Err(CommandError::PlaintextTooLarge { maximum: 32 })
         ));
     }

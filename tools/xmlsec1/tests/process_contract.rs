@@ -145,6 +145,88 @@ fn compatibility_cli_signs_and_verifies_legacy_sha1_templates() {
     );
 }
 
+#[cfg(all(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree"))]
+#[test]
+fn runtime_xml_backend_selector_drives_every_security_command() {
+    // A fat binary must carry one explicit backend through metadata parsing,
+    // the core operation, recursive parsing, and output validation.
+    let temp = tempfile::tempdir().unwrap();
+    let signature_template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.tmpl");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    let encryption_template = temp.path().join("encryption-template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let symmetric_key = temp.path().join("key.bin");
+    fs::write(
+        &encryption_template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"runtime backend payload").unwrap();
+    fs::write(&symmetric_key, b"0123456789abcdef").unwrap();
+
+    for backend in ["xmloxide", "roxmltree", "differential"] {
+        let signed = temp.path().join(format!("signed-{backend}.xml"));
+        let sign = Command::new(binary())
+            .args(["sign", "--xml-backend", backend, "--privkey-pem"])
+            .arg(&private_key)
+            .arg("--output")
+            .arg(&signed)
+            .arg(&signature_template)
+            .output()
+            .unwrap();
+        assert!(
+            sign.status.success(),
+            "{backend} sign: {}",
+            String::from_utf8_lossy(&sign.stderr)
+        );
+        let verify = Command::new(binary())
+            .args(["verify", "--xml-backend", backend, "--pubkey-pem"])
+            .arg(&public_key)
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "{backend} verify: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+
+        let encrypted = temp.path().join(format!("encrypted-{backend}.xml"));
+        let decrypted = temp.path().join(format!("decrypted-{backend}.bin"));
+        let encrypt = Command::new(binary())
+            .args(["encrypt", "--xml-backend", backend, "--aeskey"])
+            .arg(&symmetric_key)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&encryption_template)
+            .output()
+            .unwrap();
+        assert!(
+            encrypt.status.success(),
+            "{backend} encrypt: {}",
+            String::from_utf8_lossy(&encrypt.stderr)
+        );
+        let decrypt = Command::new(binary())
+            .args(["decrypt", "--xml-backend", backend, "--aeskey"])
+            .arg(&symmetric_key)
+            .arg("--output")
+            .arg(&decrypted)
+            .arg(&encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            decrypt.status.success(),
+            "{backend} decrypt: {}",
+            String::from_utf8_lossy(&decrypt.stderr)
+        );
+        assert_eq!(fs::read(&decrypted).unwrap(), fs::read(&plaintext).unwrap());
+    }
+}
+
 #[test]
 fn pinned_direct_verification_ignores_unused_key_info_references() {
     // A caller-pinned direct key is the complete verification identity. An

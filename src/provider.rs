@@ -697,9 +697,9 @@ impl CryptoProvider for RustCryptoProvider {
             #[cfg(feature = "xmldsig")]
             ProviderCapability::Digest(_) => true,
             #[cfg(feature = "xmldsig")]
-            ProviderCapability::Sign(algorithm) => is_supported_signing_uri(algorithm.uri()),
+            ProviderCapability::Sign(_) => true,
             #[cfg(feature = "xmldsig")]
-            ProviderCapability::Verify(algorithm) => is_supported_signature_uri(algorithm.uri()),
+            ProviderCapability::Verify(_) => true,
             #[cfg(feature = "xmldsig")]
             ProviderCapability::VerifyCertificate(algorithm) => {
                 is_supported_x509_signature(algorithm)
@@ -861,54 +861,6 @@ fn validate_oaep_parameters(parameters: &RsaOaepParameters) -> Result<(), Provid
             ProviderInputError::LegacyRsaOaepMgf,
         ))
     }
-}
-
-#[cfg(feature = "xmldsig")]
-fn is_supported_signature_uri(algorithm: &str) -> bool {
-    matches!(
-        algorithm,
-        "http://www.w3.org/2000/09/xmldsig#dsa-sha1"
-            | "http://www.w3.org/2009/xmldsig11#dsa-sha256"
-            | "http://www.w3.org/2000/09/xmldsig#hmac-sha1"
-            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha224"
-            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"
-            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha384"
-            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha512"
-            | "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
-            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha224"
-            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
-            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384"
-            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha1"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha224"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512"
-    )
-}
-
-#[cfg(feature = "xmldsig")]
-fn is_supported_signing_uri(algorithm: &str) -> bool {
-    matches!(
-        algorithm,
-        "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
-            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
-            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha224"
-            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384"
-            | "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512"
-            | "http://www.w3.org/2009/xmldsig11#dsa-sha256"
-            | "http://www.w3.org/2000/09/xmldsig#dsa-sha1"
-            | "http://www.w3.org/2000/09/xmldsig#hmac-sha1"
-            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha224"
-            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"
-            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha384"
-            | "http://www.w3.org/2001/04/xmldsig-more#hmac-sha512"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha1"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha224"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384"
-            | "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512"
-    )
 }
 
 #[cfg(feature = "xmldsig")]

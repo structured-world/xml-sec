@@ -927,6 +927,17 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
         .iter()
         .map(|spec| spec.canonical)
         .collect();
+    // Native extensions are intentionally absent from the donor inventory.
+    // Keep the list explicit so adding an option cannot silently weaken the
+    // libxmlsec1 compatibility classification below.
+    let native_extension_options = BTreeSet::from(["xml-backend"]);
+    assert!(native_extension_options.is_subset(&runtime_options));
+    assert!(native_extension_options.iter().all(|option| {
+        !ledger
+            .items
+            .iter()
+            .any(|item| item.kind == "cli-option" && item.name == format!("--{option}"))
+    }));
     let runtime_supported_options: BTreeSet<_> = runtime_options
         .iter()
         .copied()
@@ -947,6 +958,9 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
     assert_eq!(runtime_supported_options, ledger_supported_options);
 
     for spec in cli_args::OPTION_SPECS {
+        if native_extension_options.contains(spec.canonical) {
+            continue;
+        }
         let option = format!("--{}", spec.canonical);
         let item = ledger
             .items
