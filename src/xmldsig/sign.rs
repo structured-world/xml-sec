@@ -697,6 +697,7 @@ impl KeyInfoWriter for X509CertificateKeyInfoWriter {
 /// Writes an XMLDSig 1.1 `X509Digest` selector for the signing certificate.
 pub struct X509DigestKeyInfoWriter {
     certificate_der: Vec<u8>,
+    certificate_spki_der: Vec<u8>,
     digest_algorithm: DigestAlgorithm,
 }
 
@@ -706,13 +707,15 @@ impl X509DigestKeyInfoWriter {
         certificate_der: &[u8],
         digest_algorithm: DigestAlgorithm,
     ) -> Result<Self, KeyInfoWriteError> {
-        let (rest, _) = x509_parser::certificate::X509Certificate::from_der(certificate_der)
-            .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
+        let (rest, certificate) =
+            x509_parser::certificate::X509Certificate::from_der(certificate_der)
+                .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
         if !rest.is_empty() {
             return Err(KeyInfoWriteError::InvalidCertificateDer);
         }
         Ok(Self {
             certificate_der: certificate_der.to_vec(),
+            certificate_spki_der: certificate.public_key().raw.to_vec(),
             digest_algorithm,
         })
     }
@@ -736,10 +739,7 @@ impl KeyInfoWriter for X509DigestKeyInfoWriter {
         signing_key: &dyn SigningKey,
         provider: &dyn crate::provider::CryptoProvider,
     ) -> Result<String, KeyInfoWriteError> {
-        let (_, certificate) =
-            x509_parser::certificate::X509Certificate::from_der(&self.certificate_der)
-                .map_err(|_| KeyInfoWriteError::InvalidCertificateDer)?;
-        if signing_key.public_key_info()?.spki_der() != Some(certificate.public_key().raw) {
+        if signing_key.public_key_info()?.spki_der() != Some(self.certificate_spki_der.as_slice()) {
             return Err(KeyInfoWriteError::CertificateKeyMismatch);
         }
         let digest = super::compute_digest_with_provider(

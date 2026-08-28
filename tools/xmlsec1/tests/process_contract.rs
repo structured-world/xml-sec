@@ -802,7 +802,7 @@ fn compatibility_cli_decrypts_rsa_and_ecdsa_pkcs8_signing_keys() {
 }
 
 #[test]
-fn compatibility_cli_decrypts_traditional_rsa_pem() {
+fn compatibility_cli_signs_with_traditional_encrypted_rsa_pem() {
     // The generic PEM option mirrors libxmlsec1's OpenSSL legacy RSA envelope
     // support; explicit PKCS#8 options retain their narrower format contract.
     let temp = tempfile::tempdir().unwrap();

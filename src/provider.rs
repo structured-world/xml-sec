@@ -1723,6 +1723,26 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn x509_digest_writer_rejects_trailing_certificate_der() {
+        use crate::xmldsig::{DigestAlgorithm, KeyInfoWriteError, X509DigestKeyInfoWriter};
+
+        // The writer retains both digest bytes and the validated signing-key
+        // identity, so construction must accept exactly one DER certificate.
+        let (_, certificate) = x509_parser::pem::parse_x509_pem(include_bytes!(
+            "../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+        ))
+        .expect("certificate fixture must parse");
+        let mut certificate_der = certificate.contents;
+        certificate_der.push(0);
+
+        assert!(matches!(
+            X509DigestKeyInfoWriter::from_der(&certificate_der, DigestAlgorithm::Sha256),
+            Err(KeyInfoWriteError::InvalidCertificateDer)
+        ));
+    }
+
     #[cfg(all(feature = "xmldsig", feature = "xmlenc"))]
     #[test]
     fn capability_queries_include_oaep_and_pss_parameters() {

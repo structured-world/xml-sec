@@ -741,16 +741,16 @@ fn openssl_legacy_key(password: &[u8], salt: &[u8], key_len: usize) -> Zeroizing
     // the first eight IV bytes as salt. Only the key is derived; DEK-Info
     // carries the complete IV used by CBC.
     let mut key = Zeroizing::new(Vec::with_capacity(key_len));
-    let mut previous: Option<[u8; 16]> = None;
+    let mut previous: Option<Zeroizing<[u8; 16]>> = None;
     while key.len() < key_len {
         let mut digest = Md5::new();
-        if let Some(previous) = previous {
+        if let Some(previous) = previous.as_deref() {
             digest.update(previous);
         }
         digest.update(password);
         digest.update(salt);
-        let block: [u8; 16] = digest.finalize().into();
-        key.extend_from_slice(&block);
+        let block = Zeroizing::new(<[u8; 16]>::from(digest.finalize()));
+        key.extend_from_slice(block.as_ref());
         previous = Some(block);
     }
     key.truncate(key_len);

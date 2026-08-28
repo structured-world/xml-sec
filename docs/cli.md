@@ -362,9 +362,9 @@ The key name is optional. `--gen-key aes-128` writes an unnamed key without a
 The command and status surface is available now, while individual key formats,
 algorithms, selectors, and policy controls remain capability-limited. Current
 private-key loading accepts plain and password-encrypted PKCS#8 RSA, DSA, P-256,
-P-384, and P-521 in PEM or DER, plus plain or OpenSSL traditional encrypted
-PKCS#1 RSA, traditional DSA, and SEC1 P-256/P-384/P-521 keys through the generic
-PEM or DER options;
+P-384, and P-521 in PEM or DER. The generic PEM or DER options additionally
+accept plain or OpenSSL traditional encrypted PKCS#1 RSA, plus plain traditional
+DSA and plain SEC1 P-256/P-384/P-521 keys;
 `--privkey-p8-pem` and `--privkey-p8-der` are accepted as upstream PKCS#8
 aliases. The template signature method selects the key family before decoding,
 while ECDSA keys select their curve from PKCS#8 or SEC1 parameters. Explicit
@@ -384,10 +384,9 @@ also build a valid path to one of them. `--verify-crls` applies to that validate
 path and does not turn a pinned certificate without anchors into a chain-based
 trust source. Direct XMLEnc keys accept
 AES-128/256; RSA-OAEP supports both the XMLEnc 1.0 `rsa-oaep-mgf1p` and XMLEnc
-1.1 parameter contracts. Encrypted
-PKCS#8, PKCS#12, platform crypto stores, external DTDs, implicit network access,
-and unsupported CLI policy knobs fail rather than weakening policy or falling
-back.
+1.1 parameter contracts. PKCS#12, platform crypto stores, external DTDs,
+implicit network access, and unsupported CLI policy knobs fail rather than
+weakening policy or falling back.
 
 The compatibility CLI accepts `--X509-skip-strict-checks` at the explicit donor
 boundary. In libxmlsec1 1.3.13 the OpenSSL backend selected by the compatibility
