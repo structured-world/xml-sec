@@ -767,6 +767,26 @@ impl RsaSigningKey {
             .map_err(|_| SigningKeyError::InvalidKeyDer)?;
         Ok(Self { key })
     }
+
+    /// Decrypt and parse a password-protected PKCS#8 `ENCRYPTED PRIVATE KEY` PEM block.
+    pub fn from_pkcs8_encrypted_pem(
+        private_key_pem: &str,
+        password: impl AsRef<[u8]>,
+    ) -> Result<Self, SigningKeyError> {
+        let key = RsaPrivateKey::from_pkcs8_encrypted_pem(private_key_pem, password)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+
+    /// Decrypt and parse password-protected PKCS#8 DER.
+    pub fn from_pkcs8_encrypted_der(
+        private_key_der: &[u8],
+        password: impl AsRef<[u8]>,
+    ) -> Result<Self, SigningKeyError> {
+        let key = RsaPrivateKey::from_pkcs8_encrypted_der(private_key_der, password)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
 }
 
 impl SigningKey for RsaSigningKey {
@@ -908,6 +928,16 @@ impl DsaSigningKey {
         Ok(Self { key })
     }
 
+    /// Decrypt and parse a password-protected PKCS#8 `ENCRYPTED PRIVATE KEY` PEM block.
+    pub fn from_pkcs8_encrypted_pem(
+        private_key_pem: &str,
+        password: impl AsRef<[u8]>,
+    ) -> Result<Self, SigningKeyError> {
+        let key = dsa::SigningKey::from_pkcs8_encrypted_pem(private_key_pem, password)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+
     /// Decrypt and parse password-protected PKCS#8 DER.
     pub fn from_pkcs8_encrypted_der(
         private_key_der: &[u8],
@@ -1027,6 +1057,26 @@ impl EcdsaP256SigningKey {
             .map_err(|_| SigningKeyError::InvalidKeyDer)?;
         Ok(Self { key })
     }
+
+    /// Decrypt and parse a password-protected PKCS#8 `ENCRYPTED PRIVATE KEY` PEM block.
+    pub fn from_pkcs8_encrypted_pem(
+        private_key_pem: &str,
+        password: impl AsRef<[u8]>,
+    ) -> Result<Self, SigningKeyError> {
+        let key = P256SigningKey::from_pkcs8_encrypted_pem(private_key_pem, password)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+
+    /// Decrypt and parse password-protected PKCS#8 DER.
+    pub fn from_pkcs8_encrypted_der(
+        private_key_der: &[u8],
+        password: impl AsRef<[u8]>,
+    ) -> Result<Self, SigningKeyError> {
+        let key = P256SigningKey::from_pkcs8_encrypted_der(private_key_der, password)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
 }
 
 impl SigningKey for EcdsaP256SigningKey {
@@ -1101,6 +1151,26 @@ impl EcdsaP384SigningKey {
             .map_err(|_| SigningKeyError::InvalidKeyDer)?;
         Ok(Self { key })
     }
+
+    /// Decrypt and parse a password-protected PKCS#8 `ENCRYPTED PRIVATE KEY` PEM block.
+    pub fn from_pkcs8_encrypted_pem(
+        private_key_pem: &str,
+        password: impl AsRef<[u8]>,
+    ) -> Result<Self, SigningKeyError> {
+        let key = P384SigningKey::from_pkcs8_encrypted_pem(private_key_pem, password)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+
+    /// Decrypt and parse password-protected PKCS#8 DER.
+    pub fn from_pkcs8_encrypted_der(
+        private_key_der: &[u8],
+        password: impl AsRef<[u8]>,
+    ) -> Result<Self, SigningKeyError> {
+        let key = P384SigningKey::from_pkcs8_encrypted_der(private_key_der, password)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
 }
 
 impl SigningKey for EcdsaP384SigningKey {
@@ -1172,6 +1242,26 @@ impl EcdsaP521SigningKey {
     /// Parse unencrypted PKCS#8 private key DER.
     pub fn from_pkcs8_der(private_key_der: &[u8]) -> Result<Self, SigningKeyError> {
         let key = P521SigningKey::from_pkcs8_der(private_key_der)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+
+    /// Decrypt and parse a password-protected PKCS#8 `ENCRYPTED PRIVATE KEY` PEM block.
+    pub fn from_pkcs8_encrypted_pem(
+        private_key_pem: &str,
+        password: impl AsRef<[u8]>,
+    ) -> Result<Self, SigningKeyError> {
+        let key = P521SigningKey::from_pkcs8_encrypted_pem(private_key_pem, password)
+            .map_err(|_| SigningKeyError::InvalidKeyDer)?;
+        Ok(Self { key })
+    }
+
+    /// Decrypt and parse password-protected PKCS#8 DER.
+    pub fn from_pkcs8_encrypted_der(
+        private_key_der: &[u8],
+        password: impl AsRef<[u8]>,
+    ) -> Result<Self, SigningKeyError> {
+        let key = P521SigningKey::from_pkcs8_encrypted_der(private_key_der, password)
             .map_err(|_| SigningKeyError::InvalidKeyDer)?;
         Ok(Self { key })
     }

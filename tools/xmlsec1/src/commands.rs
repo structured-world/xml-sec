@@ -1162,9 +1162,9 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         || explicit_keys.is_empty()
         || matches!(explicit_keys.as_slice(), [(key, _)] if key.parameter.is_none())
     {
-        key_material::VerificationKeyNameResolution::DirectOnly
+        key_material::VerificationKeyNameResolution::IgnoreDocumentKeyInfo
     } else {
-        key_material::VerificationKeyNameResolution::MaterializeReferences
+        key_material::VerificationKeyNameResolution::ResolveDocumentKeyInfo
     };
     let signature = key_material::verification_signature_metadata(
         &xml,

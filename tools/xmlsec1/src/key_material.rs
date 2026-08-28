@@ -71,8 +71,8 @@ pub struct SignatureMetadata {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationKeyNameResolution {
-    DirectOnly,
-    MaterializeReferences,
+    IgnoreDocumentKeyInfo,
+    ResolveDocumentKeyInfo,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -130,7 +130,7 @@ pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, KeyMaterialError> {
 /// libxmlsec1 uses a depth-first `xmlSecFindNode` lookup from the operation start
 /// node, so later signatures in the same subtree do not make selection ambiguous.
 /// Reference materialization is a key-selection concern: callers that pin a
-/// complete direct identity should request `DirectOnly` and leave unused
+/// complete direct identity should request `IgnoreDocumentKeyInfo` and leave unused
 /// document references to the core resolver's `consumes_document_key_info`
 /// contract.
 pub fn verification_signature_metadata(
@@ -154,22 +154,25 @@ pub fn verification_signature_metadata(
     let algorithm = parse_signed_info(signed_info)
         .map(|info| info.signature_method)
         .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-    let mut key_info = signature_key_info(signature)
-        .map(parse_key_info)
-        .transpose()
-        .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
-    if key_name_resolution == VerificationKeyNameResolution::MaterializeReferences
-        && let Some(key_info) = &mut key_info
-    {
-        let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
-        materialize_verification_key_info_references(
-            key_info,
-            resolver,
-            policy,
-            xml_sec::provider::default_provider(),
-        )
-        .map_err(map_key_info_reference_error)?;
-    }
+    let key_info = if key_name_resolution == VerificationKeyNameResolution::IgnoreDocumentKeyInfo {
+        None
+    } else {
+        let mut key_info = signature_key_info(signature)
+            .map(parse_key_info)
+            .transpose()
+            .map_err(|error| KeyMaterialError::Signature(error.to_string()))?;
+        if let Some(key_info) = &mut key_info {
+            let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
+            materialize_verification_key_info_references(
+                key_info,
+                resolver,
+                policy,
+                xml_sec::provider::default_provider(),
+            )
+            .map_err(map_key_info_reference_error)?;
+        }
+        key_info
+    };
     Ok(SignatureMetadata {
         algorithm,
         key_names: key_names(&key_info),
@@ -300,24 +303,17 @@ pub fn decode_signing_key(
         | SignatureAlgorithm::RsaSha224
         | SignatureAlgorithm::RsaSha256
         | SignatureAlgorithm::RsaSha384
-        | SignatureAlgorithm::RsaSha512 => decode_rsa_signing_key(path, bytes, format),
+        | SignatureAlgorithm::RsaSha512 => decode_rsa_signing_key(path, bytes, format, password),
         SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
-            if let Some(password) = password {
-                if format != PrivateKeyFormat::Pkcs8Der {
-                    return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
-                }
-                DsaSigningKey::from_pkcs8_encrypted_der(bytes, password)
-                    .map(|key| Box::new(key) as Box<dyn SigningKey>)
-                    .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
-            } else {
-                decode_pkcs8_signing_key::<DsaSigningKey>(path, bytes, format)
-            }
+            decode_pkcs8_signing_key::<DsaSigningKey>(path, bytes, format, password)
         }
         SignatureAlgorithm::EcdsaSha1
         | SignatureAlgorithm::EcdsaSha224
         | SignatureAlgorithm::EcdsaSha256
         | SignatureAlgorithm::EcdsaSha384
-        | SignatureAlgorithm::EcdsaSha512 => decode_ecdsa_signing_key(path, bytes, format),
+        | SignatureAlgorithm::EcdsaSha512 => {
+            decode_ecdsa_signing_key(path, bytes, format, password)
+        }
         SignatureAlgorithm::HmacSha1
         | SignatureAlgorithm::HmacSha224
         | SignatureAlgorithm::HmacSha256
@@ -332,6 +328,14 @@ pub fn decode_signing_key(
 trait Pkcs8SigningKey: SigningKey + Sized + 'static {
     fn decode_pkcs8_pem(text: &str) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
     fn decode_pkcs8_der(bytes: &[u8]) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
+    fn decode_pkcs8_encrypted_pem(
+        text: &str,
+        password: &[u8],
+    ) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
+    fn decode_pkcs8_encrypted_der(
+        bytes: &[u8],
+        password: &[u8],
+    ) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
 }
 
 macro_rules! impl_pkcs8_signing_key {
@@ -348,6 +352,20 @@ macro_rules! impl_pkcs8_signing_key {
                     bytes: &[u8],
                 ) -> Result<Self, xml_sec::xmldsig::SigningKeyError> {
                     Self::from_pkcs8_der(bytes)
+                }
+
+                fn decode_pkcs8_encrypted_pem(
+                    text: &str,
+                    password: &[u8],
+                ) -> Result<Self, xml_sec::xmldsig::SigningKeyError> {
+                    Self::from_pkcs8_encrypted_pem(text, password)
+                }
+
+                fn decode_pkcs8_encrypted_der(
+                    bytes: &[u8],
+                    password: &[u8],
+                ) -> Result<Self, xml_sec::xmldsig::SigningKeyError> {
+                    Self::from_pkcs8_encrypted_der(bytes, password)
                 }
             }
         )+
@@ -366,12 +384,23 @@ fn decode_pkcs8_signing_key<K: Pkcs8SigningKey>(
     path: &Path,
     bytes: &[u8],
     format: PrivateKeyFormat,
+    password: Option<&[u8]>,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
-    let key = match format {
-        PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem => std::str::from_utf8(bytes)
+    let key = match (format, password) {
+        (PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem, Some(password)) => {
+            std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|text| K::decode_pkcs8_encrypted_pem(text, password).ok())
+        }
+        (PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der, Some(password)) => {
+            K::decode_pkcs8_encrypted_der(bytes, password).ok()
+        }
+        (PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem, None) => std::str::from_utf8(bytes)
             .ok()
             .and_then(|text| K::decode_pkcs8_pem(text).ok()),
-        PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der => K::decode_pkcs8_der(bytes).ok(),
+        (PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der, None) => {
+            K::decode_pkcs8_der(bytes).ok()
+        }
     };
     key.map(|key| Box::new(key) as Box<dyn SigningKey>)
         .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
@@ -381,18 +410,20 @@ fn decode_ecdsa_signing_key(
     path: &Path,
     bytes: &[u8],
     format: PrivateKeyFormat,
+    password: Option<&[u8]>,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
-    decode_pkcs8_signing_key::<EcdsaP256SigningKey>(path, bytes, format)
-        .or_else(|_| decode_pkcs8_signing_key::<EcdsaP384SigningKey>(path, bytes, format))
-        .or_else(|_| decode_pkcs8_signing_key::<EcdsaP521SigningKey>(path, bytes, format))
+    decode_pkcs8_signing_key::<EcdsaP256SigningKey>(path, bytes, format, password)
+        .or_else(|_| decode_pkcs8_signing_key::<EcdsaP384SigningKey>(path, bytes, format, password))
+        .or_else(|_| decode_pkcs8_signing_key::<EcdsaP521SigningKey>(path, bytes, format, password))
 }
 
 fn decode_rsa_signing_key(
     path: &Path,
     bytes: &[u8],
     format: PrivateKeyFormat,
+    password: Option<&[u8]>,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
-    if let Ok(key) = decode_pkcs8_signing_key::<RsaSigningKey>(path, bytes, format) {
+    if let Ok(key) = decode_pkcs8_signing_key::<RsaSigningKey>(path, bytes, format, password) {
         return Ok(key);
     }
     match format {
@@ -979,14 +1010,36 @@ mod tests {
             Some("ec"),
             &[],
             &xml_sec::policy::VerificationPolicy::default(),
-            VerificationKeyNameResolution::DirectOnly,
+            VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
         )
         .unwrap();
         assert_eq!(metadata.algorithm, SignatureAlgorithm::EcdsaSha256);
     }
 
     #[test]
-    fn signature_metadata_preserves_every_direct_key_name() {
+    fn direct_verification_metadata_ignores_malformed_document_keys() {
+        // A pinned caller key makes document KeyInfo irrelevant. Malformed key
+        // metadata must therefore remain for the core verifier to ignore.
+        let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
+        let xml = format!(
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue><ds:KeyInfo><dsig11:DEREncodedKeyValue>not-base64!</dsig11:DEREncodedKeyValue></ds:KeyInfo></ds:Signature>"#
+        );
+
+        let metadata = verification_signature_metadata(
+            &xml,
+            None,
+            &[],
+            &VerificationPolicy::default(),
+            VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
+        )
+        .expect("unused malformed document keys must not block a pinned key");
+
+        assert_eq!(metadata.algorithm, SignatureAlgorithm::RsaSha256);
+        assert!(metadata.key_names.is_empty());
+    }
+
+    #[test]
+    fn signature_metadata_preserves_every_key_name_for_resolution() {
         // KeyInfo is an ordered list of lookup sources; collapsing it to the
         // first KeyName makes later valid key-manager entries unreachable.
         let digest = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32]);
@@ -999,7 +1052,7 @@ mod tests {
             None,
             &[],
             &xml_sec::policy::VerificationPolicy::default(),
-            VerificationKeyNameResolution::DirectOnly,
+            VerificationKeyNameResolution::ResolveDocumentKeyInfo,
         )
         .unwrap();
 
@@ -1020,7 +1073,7 @@ mod tests {
             None,
             &[],
             &VerificationPolicy::default(),
-            VerificationKeyNameResolution::MaterializeReferences,
+            VerificationKeyNameResolution::ResolveDocumentKeyInfo,
         )
         .expect("same-document KeyInfoReference must resolve before candidate selection");
 
@@ -1033,7 +1086,7 @@ mod tests {
             None,
             &[],
             &disabled,
-            VerificationKeyNameResolution::MaterializeReferences,
+            VerificationKeyNameResolution::ResolveDocumentKeyInfo,
         )
         .expect_err("metadata selection must honor the verification key-source policy");
         assert!(error.to_string().contains("key sources are disabled"));
@@ -1060,7 +1113,7 @@ mod tests {
             None,
             &[],
             &policy,
-            VerificationKeyNameResolution::DirectOnly,
+            VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
         )
         .unwrap_err();
         assert!(error.to_string().contains("nodes limit"));

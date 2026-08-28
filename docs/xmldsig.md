@@ -76,8 +76,9 @@ the same operation ceiling as the rest of the signature.
 Built-in writers emit `RSAKeyValue`/`ECKeyValue`, `DEREncodedKeyValue`, embedded
 X.509 certificate chains, or `X509Digest` selectors. Cryptographic writer work,
 including the certificate digest used by `X509Digest`, runs through the same
-operation provider as reference digests and signature generation. DSA signing accepts plain
-or password-encrypted PKCS#8 DER and emits XMLDSig's fixed-width `r || s` value;
+operation provider as reference digests and signature generation. RSA, DSA, P-256, P-384, and
+P-521 signing keys accept plain or password-encrypted PKCS#8 PEM and DER. DSA signatures emit
+XMLDSig's fixed-width `r || s` value;
 DSA-SHA1 requires a 160-bit `q`, while DSA-SHA256 requires a 256-bit `q`, so a
 key whose component width cannot be represented by the selected wire format is
 rejected before signing.
