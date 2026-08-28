@@ -32,7 +32,10 @@ impl XmlBackend for DifferentialBackend {
 fn equivalent_rejection(left: &ParseError, right: &ParseError) -> bool {
     matches!(
         (left, right),
-        (ParseError::DtdDetected, ParseError::DtdDetected)
+        (
+            ParseError::ByteLimitReached { .. },
+            ParseError::ByteLimitReached { .. }
+        ) | (ParseError::DtdDetected, ParseError::DtdDetected)
             | (ParseError::NodesLimitReached, ParseError::NodesLimitReached)
             | (
                 ParseError::EntityExpansionLimitReached { .. },
@@ -60,6 +63,7 @@ fn acceptance_summary(
 ) -> String {
     let state = |result: &Result<Document<'_>, ParseError>| match result {
         Ok(_) => "accepted",
+        Err(ParseError::ByteLimitReached { .. }) => "rejected by byte limit",
         Err(ParseError::DtdDetected) => "rejected as DTD-disabled",
         Err(ParseError::NodesLimitReached) => "rejected by node limit",
         Err(ParseError::EntityExpansionLimitReached { .. }) => "rejected by entity expansion limit",

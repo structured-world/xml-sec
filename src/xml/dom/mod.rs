@@ -53,6 +53,13 @@ impl Default for ParsingOptions {
 /// Stable parser-neutral XML parse error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParseError {
+    /// The absolute source-document byte ceiling was exceeded.
+    ByteLimitReached {
+        /// Maximum accepted UTF-8 source length.
+        maximum: usize,
+        /// Source length presented by the caller.
+        actual: usize,
+    },
     /// A DTD was found while DTD processing was disabled.
     DtdDetected,
     /// The retained semantic node ceiling was exceeded.
@@ -102,6 +109,12 @@ pub enum ParseError {
 impl fmt::Display for ParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ByteLimitReached { maximum, actual } => {
+                write!(
+                    formatter,
+                    "XML byte limit reached: maximum {maximum}, actual {actual}"
+                )
+            }
             Self::DtdDetected => formatter.write_str("DTD detected"),
             Self::NodesLimitReached => formatter.write_str("nodes limit reached"),
             Self::EntityExpansionLimitReached { maximum, actual } => write!(

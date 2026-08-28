@@ -1061,6 +1061,35 @@ mod tests {
     }
 
     #[test]
+    fn selected_backend_enforces_the_absolute_byte_ceiling_before_dom_allocation() {
+        // Direct semantic-DOM callers have no policy object that can bound the
+        // source, so the crate ceiling must run before either native backend.
+        let maximum = crate::hard_limits::XML_DOCUMENT_BYTE_CEILING;
+        let xml = format!("<r>{}</r>", "x".repeat(maximum));
+        let expected = ParseError::ByteLimitReached {
+            maximum,
+            actual: xml.len(),
+        };
+
+        assert_eq!(
+            Document::parse(&xml)
+                .expect_err("default direct parsing must enforce the byte ceiling"),
+            expected,
+        );
+        assert_eq!(
+            Document::parse_with_options(
+                &xml,
+                ParsingOptions {
+                    allow_dtd: false,
+                    nodes_limit: u32::MAX,
+                },
+            )
+            .expect_err("custom direct parsing must retain the absolute byte ceiling"),
+            expected,
+        );
+    }
+
+    #[test]
     fn selected_backend_bounds_direct_entity_expansion_count() {
         // A shallow sequence of references bypasses roxmltree's nested-entity
         // loop detector. Direct DOM parsing still needs a finite aggregate cap.

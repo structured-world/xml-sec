@@ -6,6 +6,7 @@ use std::{
 };
 
 use base64::Engine as _;
+use der::{Encode as _, asn1::UintRef};
 use p256::SecretKey as P256SecretKey;
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};
 use rsa::{
@@ -36,6 +37,48 @@ fn binary() -> &'static str {
 
 fn project_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+#[derive(der::Sequence)]
+struct TraditionalDsaPrivateKey<'a> {
+    version: u8,
+    p: UintRef<'a>,
+    q: UintRef<'a>,
+    g: UintRef<'a>,
+    y: UintRef<'a>,
+    x: UintRef<'a>,
+}
+
+fn traditional_dsa_private_key_der(key: &dsa::SigningKey) -> Vec<u8> {
+    let verifying_key = key.verifying_key();
+    let components = verifying_key.components();
+    let p = components.p().to_be_bytes_trimmed_vartime();
+    let q = components.q().to_be_bytes_trimmed_vartime();
+    let g = components.g().to_be_bytes_trimmed_vartime();
+    let y = verifying_key.y().to_be_bytes_trimmed_vartime();
+    let x = key.x().to_be_bytes_trimmed_vartime();
+
+    TraditionalDsaPrivateKey {
+        version: 0,
+        p: UintRef::new(p.as_ref()).unwrap(),
+        q: UintRef::new(q.as_ref()).unwrap(),
+        g: UintRef::new(g.as_ref()).unwrap(),
+        y: UintRef::new(y.as_ref()).unwrap(),
+        x: UintRef::new(x.as_ref()).unwrap(),
+    }
+    .to_der()
+    .unwrap()
+}
+
+fn traditional_dsa_private_key_pem(der: &[u8]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let body = encoded
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("-----BEGIN DSA PRIVATE KEY-----\n{body}\n-----END DSA PRIVATE KEY-----\n")
 }
 
 fn signature_template_without_key_info() -> &'static str {
@@ -373,6 +416,48 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         "{}",
         String::from_utf8_lossy(&dsa_verify.stderr)
     );
+
+    let traditional_dsa_der = traditional_dsa_private_key_der(&dsa_key);
+    for (option, extension, contents) in [
+        (
+            "--privkey-der:TestKeyName-dsa-2048",
+            "der",
+            traditional_dsa_der.clone(),
+        ),
+        (
+            "--privkey-pem:TestKeyName-dsa-2048",
+            "pem",
+            traditional_dsa_private_key_pem(&traditional_dsa_der).into_bytes(),
+        ),
+    ] {
+        let private = temp.path().join(format!("dsa-traditional.{extension}"));
+        let signed = temp.path().join(format!("dsa-traditional-{extension}.xml"));
+        fs::write(&private, contents).unwrap();
+        let sign = Command::new(binary())
+            .args(["sign", option])
+            .arg(&private)
+            .arg("--output")
+            .arg(&signed)
+            .arg(&dsa_template)
+            .output()
+            .unwrap();
+        assert!(
+            sign.status.success(),
+            "{option}: {}",
+            String::from_utf8_lossy(&sign.stderr)
+        );
+        let verify = Command::new(binary())
+            .args(["verify", "--pubkey-der:TestKeyName-dsa-2048"])
+            .arg(&dsa_public)
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "{option}: {}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+    }
 
     let mut legacy_rng = ChaCha8Rng::seed_from_u64(0xD5A1_1024);
     let legacy_components = dsa::Components::try_generate_from_rng_with_key_size(

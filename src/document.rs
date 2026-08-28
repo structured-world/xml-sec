@@ -1841,12 +1841,6 @@ fn build_cell(
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<DocumentCell, XmlDocumentError> {
-    if xml.len() > settings.max_bytes {
-        return Err(XmlDocumentError::DocumentTooLarge {
-            maximum: settings.max_bytes,
-            actual: xml.len(),
-        });
-    }
     preflight_document_limits(&xml, settings, budget)?;
     build_cell_after_preflight(xml, settings, budget)
 }
@@ -1881,12 +1875,6 @@ pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<Document<'a>, XmlDocumentError> {
-    if xml.len() > settings.max_bytes {
-        return Err(XmlDocumentError::DocumentTooLarge {
-            maximum: settings.max_bytes,
-            actual: xml.len(),
-        });
-    }
     preflight_document_limits(xml, settings, budget)?;
     charge_semantic_parser_work(budget, xml.len())?;
     let (document, _) = parse_semantic_document(xml, settings)?;
@@ -1900,6 +1888,12 @@ fn preflight_document_limits(
 ) -> Result<(), XmlDocumentError> {
     // This bounded lexical pass is the first parser stage for every entry
     // point, before either backend is allowed to construct a DOM.
+    if xml.len() > settings.max_bytes {
+        return Err(XmlDocumentError::DocumentTooLarge {
+            maximum: settings.max_bytes,
+            actual: xml.len(),
+        });
+    }
     charge_parse_work(budget, xml.len())?;
     let mut dtd = InternalDtd::default();
     let mut expansion_stack = HashSet::new();
@@ -2327,13 +2321,16 @@ pub(crate) fn preflight_dom_limits(
         allow_dtd: effective.allow_dtd,
         nodes_limit: effective.nodes_limit,
         depth_limit: crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
-        max_bytes: usize::MAX,
+        max_bytes: crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
     };
     match preflight_document_limits(xml, settings, None) {
         Ok(()) => Ok(effective),
         Err(XmlDocumentError::Parse(error)) => Err(error),
         Err(XmlDocumentError::DocumentTooDeep { maximum, actual }) => {
             Err(ParseError::DepthLimitReached { maximum, actual })
+        }
+        Err(XmlDocumentError::DocumentTooLarge { maximum, actual }) => {
+            Err(ParseError::ByteLimitReached { maximum, actual })
         }
         Err(error) => Err(ParseError::Backend {
             backend: "xml-limit-preflight",
@@ -2391,7 +2388,7 @@ fn collect_internal_dtd(doctype: &str, dtd: &mut InternalDtd) {
                 // roxmltree resolves the first declaration with a matching name.
                 dtd.entities
                     .entry(name.to_owned())
-                    .or_insert_with(|| value.to_owned());
+                    .or_insert_with(|| normalize_internal_entity_value(value));
             }
             offset = declaration_end + 1;
         } else if bytes[offset..].starts_with(b"<!ATTLIST") {
@@ -2578,6 +2575,46 @@ fn parse_internal_general_entity(declaration: &str) -> Option<(&str, &str)> {
         .position(|byte| *byte == quote)?
         + 1;
     Some((name, &definition[1..value_end]))
+}
+
+fn normalize_internal_entity_value(value: &str) -> String {
+    // XML 1.0 §4.4 expands numeric character references while reading the
+    // entity declaration. General and predefined entity references remain
+    // lexical input for the later replacement-text pass.
+    let mut normalized = String::with_capacity(value.len());
+    let mut offset = 0;
+    while let Some(relative_start) = value[offset..].find("&#") {
+        let start = offset + relative_start;
+        normalized.push_str(&value[offset..start]);
+        let Some(relative_end) = value[start + 2..].find(';') else {
+            normalized.push_str(&value[start..]);
+            return normalized;
+        };
+        let end = start + 2 + relative_end;
+        let digits = &value[start + 2..end];
+        let (radix, digits) = digits
+            .strip_prefix('x')
+            .map_or((10, digits), |digits| (16, digits));
+        let replacement = u32::from_str_radix(digits, radix)
+            .ok()
+            .filter(|codepoint| is_xml_character(*codepoint))
+            .and_then(char::from_u32);
+        if let Some(replacement) = replacement {
+            normalized.push(replacement);
+        } else {
+            normalized.push_str(&value[start..=end]);
+        }
+        offset = end + 1;
+    }
+    normalized.push_str(&value[offset..]);
+    normalized
+}
+
+const fn is_xml_character(codepoint: u32) -> bool {
+    matches!(
+        codepoint,
+        0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+    )
 }
 
 fn find_unquoted_byte(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
@@ -2945,6 +2982,24 @@ mod tests {
     }
 
     #[test]
+    fn depth_preflight_observes_markup_generated_by_a_character_reference() {
+        // Numeric references are normalized while the entity declaration is
+        // read, so `&#60;` becomes markup when the replacement is later parsed.
+        let xml = r#"<!DOCTYPE root [
+            <!ENTITY generated "&#60;a><b/></a>">
+        ]><root>&generated;</root>"#;
+        let settings = DocumentParseSettings::new_with_depth(true, 16, 2, xml.len());
+
+        assert!(matches!(
+            preflight_document_limits(xml, settings, None),
+            Err(XmlDocumentError::DocumentTooDeep {
+                maximum: 2,
+                actual: 3,
+            })
+        ));
+    }
+
+    #[test]
     fn entity_preflight_ignores_declarations_inside_dtd_comments() {
         // Comment text is not a declaration. Treating it as one would let a
         // harmless reference acquire attacker-controlled phantom markup.
@@ -2976,6 +3031,31 @@ mod tests {
 
         assert!(matches!(
             build_cell(xml.to_owned(), settings, Some(&budget)),
+            Err(XmlDocumentError::Policy(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum: observed_maximum,
+                actual,
+            })) if observed_maximum == maximum
+                && actual == xml.len() + first_replacement + nested_replacement
+        ));
+    }
+
+    #[test]
+    fn entity_preflight_charges_a_reference_generated_by_a_character_reference() {
+        // Declaration-time `&#38;` normalization exposes a general reference
+        // which must recurse through the same aggregate parse-work budget.
+        let xml = r#"<!DOCTYPE root [
+            <!ENTITY nested "0123456789">
+            <!ENTITY generated "&#38;nested;">
+        ]><root>&generated;</root>"#;
+        let first_replacement = "&nested;".len();
+        let nested_replacement = "0123456789".len();
+        let maximum = xml.len() + first_replacement + nested_replacement - 1;
+        let budget = XmlParseWorkBudget::with_limit(maximum);
+        let settings = DocumentParseSettings::new_with_depth(true, 16, 2, xml.len());
+
+        assert!(matches!(
+            preflight_document_limits(xml, settings, Some(&budget)),
             Err(XmlDocumentError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
                 maximum: observed_maximum,

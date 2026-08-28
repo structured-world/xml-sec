@@ -4,6 +4,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crypto_bigint::{
+    BoxedUint,
+    modular::{BoxedMontyForm, BoxedMontyParams},
+};
+use der::{Decode as _, asn1::UintRef};
+use dsa::{
+    Components as DsaComponents, SigningKey as NativeDsaSigningKey, VerifyingKey as DsaVerifyingKey,
+};
 use rsa::{
     RsaPrivateKey, RsaPublicKey,
     pkcs1::{DecodeRsaPrivateKey as _, DecodeRsaPublicKey as _},
@@ -24,6 +32,7 @@ use xml_sec::xmldsig::{
 use xml_sec::{
     XmlDomDocument as Document, XmlDomNode as Node, XmlDomParsingOptions as ParsingOptions,
 };
+use zeroize::Zeroizing;
 
 // This is an absolute process-safety ceiling, not deployment policy. Parsed
 // key sizes remain governed by the operation policy after bounded ingestion.
@@ -311,7 +320,7 @@ pub fn decode_signing_key(
         | SignatureAlgorithm::RsaSha384
         | SignatureAlgorithm::RsaSha512 => decode_rsa_signing_key(path, bytes, format, password),
         SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
-            decode_pkcs8_signing_key::<DsaSigningKey>(path, bytes, format, password)
+            decode_dsa_signing_key(path, bytes, format, password)
         }
         SignatureAlgorithm::EcdsaSha1
         | SignatureAlgorithm::EcdsaSha224
@@ -348,6 +357,16 @@ trait Pkcs8SigningKey: SigningKey + Sized + 'static {
 enum Pkcs8ContainerKind {
     Plain,
     Encrypted,
+}
+
+#[derive(der::Sequence)]
+struct TraditionalDsaPrivateKey<'a> {
+    version: u8,
+    p: UintRef<'a>,
+    q: UintRef<'a>,
+    g: UintRef<'a>,
+    y: UintRef<'a>,
+    x: UintRef<'a>,
 }
 
 fn pkcs8_container_kind(bytes: &[u8], format: PrivateKeyFormat) -> Option<Pkcs8ContainerKind> {
@@ -461,14 +480,73 @@ fn decode_ecdsa_signing_key(
         .or_else(|_| decode_pkcs8_signing_key::<EcdsaP521SigningKey>(path, bytes, format, password))
 }
 
+fn decode_dsa_signing_key(
+    path: &Path,
+    bytes: &[u8],
+    format: PrivateKeyFormat,
+    password: Option<&[u8]>,
+) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
+    if pkcs8_container_kind(bytes, format).is_some() {
+        return decode_pkcs8_signing_key::<DsaSigningKey>(path, bytes, format, password);
+    }
+
+    let pem_der = match format {
+        PrivateKeyFormat::Pem => {
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+            Some(Zeroizing::new(
+                parse_pem(text, "DSA PRIVATE KEY", path)
+                    .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?,
+            ))
+        }
+        PrivateKeyFormat::Der => None,
+        PrivateKeyFormat::Pkcs8Pem | PrivateKeyFormat::Pkcs8Der => {
+            return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+        }
+    };
+    let der = pem_der.as_deref().map_or(bytes, Vec::as_slice);
+    let traditional = TraditionalDsaPrivateKey::from_der(der)
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    if traditional.version != 0 {
+        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    }
+
+    let p = BoxedUint::from_be_slice_vartime(traditional.p.as_bytes());
+    let q = BoxedUint::from_be_slice_vartime(traditional.q.as_bytes());
+    let g = BoxedUint::from_be_slice_vartime(traditional.g.as_bytes());
+    let y = BoxedUint::from_be_slice_vartime(traditional.y.as_bytes());
+    let x = BoxedUint::from_be_slice_vartime(traditional.x.as_bytes());
+    let components = DsaComponents::from_components(p, q, g)
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+
+    let params = BoxedMontyParams::new(components.p().clone());
+    let expected_y = BoxedMontyForm::new((**components.g()).clone(), &params)
+        .pow(&x)
+        .retrieve();
+    if expected_y != y {
+        return Err(KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
+    }
+
+    let verifying_key = DsaVerifyingKey::from_components(components, y)
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    let key = NativeDsaSigningKey::from_components(verifying_key, x)
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    let normalized = key
+        .to_pkcs8_der()
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))?;
+    DsaSigningKey::from_pkcs8_der(normalized.as_bytes())
+        .map(|key| Box::new(key) as Box<dyn SigningKey>)
+        .map_err(|_| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))
+}
+
 fn decode_rsa_signing_key(
     path: &Path,
     bytes: &[u8],
     format: PrivateKeyFormat,
     password: Option<&[u8]>,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
-    if let Ok(key) = decode_pkcs8_signing_key::<RsaSigningKey>(path, bytes, format, password) {
-        return Ok(key);
+    if pkcs8_container_kind(bytes, format).is_some() {
+        return decode_pkcs8_signing_key::<RsaSigningKey>(path, bytes, format, password);
     }
     match format {
         PrivateKeyFormat::Pem => std::str::from_utf8(bytes)
@@ -728,6 +806,7 @@ pub(crate) fn decode_symmetric(
 mod tests {
     use std::fs;
 
+    use der::Encode as _;
     use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
     use rsa::pkcs1::{EncodeRsaPrivateKey as _, EncodeRsaPublicKey as _};
 
@@ -740,6 +819,77 @@ mod tests {
         let path = path.as_ref();
         let bytes = read(path)?;
         decode_signing_key(path, &bytes, format, SignatureAlgorithm::RsaSha256, None)
+    }
+
+    fn traditional_dsa_der(key: &NativeDsaSigningKey, version: u8, y: &[u8]) -> Vec<u8> {
+        let verifying_key = key.verifying_key();
+        let components = verifying_key.components();
+        let p = components.p().to_be_bytes_trimmed_vartime();
+        let q = components.q().to_be_bytes_trimmed_vartime();
+        let g = components.g().to_be_bytes_trimmed_vartime();
+        let x = key.x().to_be_bytes_trimmed_vartime();
+        TraditionalDsaPrivateKey {
+            version,
+            p: UintRef::new(p.as_ref()).unwrap(),
+            q: UintRef::new(q.as_ref()).unwrap(),
+            g: UintRef::new(g.as_ref()).unwrap(),
+            y: UintRef::new(y).unwrap(),
+            x: UintRef::new(x.as_ref()).unwrap(),
+        }
+        .to_der()
+        .unwrap()
+    }
+
+    #[test]
+    #[expect(
+        deprecated,
+        reason = "traditional OpenSSL DSA compatibility includes legacy 1024/160 containers"
+    )]
+    fn traditional_dsa_decoder_rejects_ambiguous_or_inconsistent_containers() {
+        // The generic DER option accepts the OpenSSL DSA structure only when
+        // its complete ASN.1 container and public/private components agree.
+        let mut rng = ChaCha20Rng::seed_from_u64(0xD5A1_D5A1);
+        let components = DsaComponents::try_generate_from_rng_with_key_size(
+            &mut rng,
+            dsa::KeySize::DSA_1024_160,
+        )
+        .unwrap();
+        let key = NativeDsaSigningKey::try_generate_from_rng_with_components(&mut rng, components)
+            .unwrap();
+        let y = key.verifying_key().y().to_be_bytes_trimmed_vartime();
+        let valid = traditional_dsa_der(&key, 0, y.as_ref());
+        let path = Path::new("traditional-dsa.der");
+        decode_signing_key(
+            path,
+            &valid,
+            PrivateKeyFormat::Der,
+            SignatureAlgorithm::DsaSha256,
+            None,
+        )
+        .expect("valid traditional DSA DER must decode");
+
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        let mut mismatched_y = y.to_vec();
+        *mismatched_y.last_mut().unwrap() ^= 1;
+        for (bytes, format) in [
+            (
+                traditional_dsa_der(&key, 1, y.as_ref()),
+                PrivateKeyFormat::Der,
+            ),
+            (trailing, PrivateKeyFormat::Der),
+            (
+                traditional_dsa_der(&key, 0, &mismatched_y),
+                PrivateKeyFormat::Der,
+            ),
+            (valid, PrivateKeyFormat::Pkcs8Der),
+        ] {
+            assert!(
+                decode_signing_key(path, &bytes, format, SignatureAlgorithm::DsaSha256, None,)
+                    .is_err(),
+                "malformed or misclassified traditional DSA must be rejected"
+            );
+        }
     }
 
     fn signing_template_with_key_info(key_info: &str, targets: &str) -> String {
