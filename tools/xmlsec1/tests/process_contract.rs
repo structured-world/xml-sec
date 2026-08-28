@@ -888,6 +888,67 @@ fn compatibility_cli_accepts_generic_sec1_ecdsa_keys() {
     );
 }
 
+#[test]
+fn compatibility_cli_signs_with_traditional_encrypted_sec1_pem() {
+    // The generic PEM option applies the password before SEC1 curve decoding;
+    // no password-blind plaintext fallback may accept a malformed envelope.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("ec-traditional-template.xml");
+    let signed = temp.path().join("ec-traditional-signed.xml");
+    let private_key =
+        project_root().join("tests/fixtures/keys/ec/p256-key-traditional-encrypted.pem");
+    let public_key =
+        project_root().join("tests/fixtures/xmldsig/xmldsig11-interop-2012/keys/p256-key.der");
+    fs::write(&template, ecdsa_signature_template()).unwrap();
+
+    let sign = Command::new(binary())
+        .args(["sign", "--privkey-pem"])
+        .arg(&private_key)
+        .args(["--pwd", "legacy-ec-password"])
+        .arg("--output")
+        .arg(&signed)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        sign.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+
+    let verify = Command::new(binary())
+        .args(["verify", "--pubkey-der"])
+        .arg(&public_key)
+        .arg(&signed)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    for password in [None, Some("wrong-legacy-password")] {
+        let rejected_output = temp.path().join(format!(
+            "ec-traditional-rejected-{}.xml",
+            password.unwrap_or("missing")
+        ));
+        let mut rejected = Command::new(binary());
+        rejected.args(["sign", "--privkey-pem"]).arg(&private_key);
+        if let Some(password) = password {
+            rejected.args(["--pwd", password]);
+        }
+        let rejected = rejected
+            .arg("--output")
+            .arg(&rejected_output)
+            .arg(&template)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(!rejected_output.exists());
+    }
+}
+
 fn assert_sec1_cli_round_trip(
     directory: &Path,
     name: &str,
