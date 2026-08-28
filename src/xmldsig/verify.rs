@@ -1781,7 +1781,7 @@ fn materialize_key_info_references(
                     Ok((referenced, nested_outcome))
                 })?
             };
-            if uri.starts_with('#') {
+            if uri.is_empty() || uri.starts_with('#') {
                 nested_outcome.merge(visit(
                     &mut referenced,
                     resolver,
@@ -5348,6 +5348,51 @@ mod tests {
         assert!(matches!(
             key_info.sources.as_slice(),
             [super::super::parse::KeyInfoSource::KeyName(name)] if name == "root-key"
+        ));
+    }
+
+    #[test]
+    fn empty_key_info_reference_participates_in_cycle_detection() {
+        // Empty URI resolves to the owning document's root KeyInfo. It must
+        // recurse through the same traversal state rather than leave the
+        // self-reference materialized and bypass cycle/depth enforcement.
+        let document = XmlDocument::parse(format!(
+            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><dsig11:KeyInfoReference URI=""/></ds:KeyInfo>"#
+        ))
+        .unwrap();
+        let mut key_info = KeyInfo {
+            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
+                uri: String::new(),
+            }],
+        };
+        let mut policy = crate::policy::VerificationPolicy::default();
+        policy.key_sources.key_info_reference = true;
+        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
+        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
+        let mut budgets = RetrievalMaterializationBudgets {
+            xpath_parse: &mut xpath_parse_budget,
+            execution: &execution_budget,
+            resources: &policy.resources,
+        };
+
+        let error = document
+            .with_view(|view| {
+                materialize_key_info_references(
+                    &mut key_info,
+                    &UriReferenceResolver::with_document_view(view, &[]),
+                    &policy,
+                    crate::provider::default_provider(),
+                    None,
+                    &mut budgets,
+                )
+            })
+            .expect_err("empty-URI self-reference must be rejected as a cycle");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "KeyInfoReference cycle detected"
+            }
         ));
     }
 

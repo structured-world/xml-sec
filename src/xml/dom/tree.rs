@@ -935,7 +935,11 @@ mod tests {
 
         assert!(!namespace_axes_equivalent(
             &[a.clone(), a.clone()],
-            &[a.clone(), b]
+            &[a.clone(), b.clone()]
+        ));
+        assert!(!namespace_axes_equivalent(
+            &[a.clone(), b],
+            &[a.clone(), a.clone()]
         ));
         assert!(namespace_axes_equivalent(
             &[a.clone(), a.clone()],

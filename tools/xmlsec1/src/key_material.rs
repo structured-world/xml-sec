@@ -200,7 +200,7 @@ pub fn signing_signature_metadata(
 trait MetadataKeyInfoPolicy {
     fn resources(&self) -> &ResourcePolicy;
     fn key_info_reference_uris(&self) -> UriTypeSet;
-    fn allows_key_info_reference(&self) -> bool;
+    fn key_info_reference_source_enabled(&self) -> bool;
 }
 
 impl MetadataKeyInfoPolicy for SigningPolicy {
@@ -212,7 +212,9 @@ impl MetadataKeyInfoPolicy for SigningPolicy {
         self.uris.key_info_references
     }
 
-    fn allows_key_info_reference(&self) -> bool {
+    fn key_info_reference_source_enabled(&self) -> bool {
+        // Signing selects caller-supplied key material; unlike verification,
+        // it has no document-source trust decision beyond the URI policy.
         true
     }
 }
@@ -226,7 +228,7 @@ impl MetadataKeyInfoPolicy for VerificationPolicy {
         self.uris.key_info_references
     }
 
-    fn allows_key_info_reference(&self) -> bool {
+    fn key_info_reference_source_enabled(&self) -> bool {
         self.key_sources.key_info_reference
     }
 }
@@ -259,7 +261,7 @@ fn materialize_key_info_references<P: MetadataKeyInfoPolicy>(
                 materialized.push(source);
                 continue;
             };
-            if !policy.allows_key_info_reference() {
+            if !policy.key_info_reference_source_enabled() {
                 return Err(KeyMaterialError::Policy(PolicyViolation::KeyTrust {
                     reason: "KeyInfoReference key sources are disabled",
                 }));

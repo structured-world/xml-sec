@@ -146,6 +146,16 @@ fn compatibility_cli_resolves_key_info_reference_before_signing_key_selection() 
         "{}",
         String::from_utf8_lossy(&unnamed_sign.stderr)
     );
+
+    // Materialized KeyName constrains named selection. An unrelated name must
+    // fail rather than falling back to the only loaded private key.
+    let mismatched = Command::new(binary())
+        .args(["sign", "--pkcs8-der:TestKeyName-unrelated"])
+        .arg(&private_key)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(!mismatched.status.success());
 }
 
 #[test]
@@ -281,7 +291,7 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
     let wrong_password = Command::new(binary())
         .args(["sign", "--pkcs8-der:TestKeyName-dsa-2048"])
         .arg(project_root().join("tests/fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der"))
-        .args(["--pwd", "wrong"])
+        .args(["--pwd", "not-secret123-sentinel"])
         .arg("--output")
         .arg(&wrong_password_output)
         .arg(&dsa_template)
@@ -289,7 +299,7 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         .unwrap();
     assert!(!wrong_password.status.success());
     assert!(!wrong_password_output.exists());
-    assert!(!String::from_utf8_lossy(&wrong_password.stderr).contains("wrong"));
+    assert!(!String::from_utf8_lossy(&wrong_password.stderr).contains("not-secret123-sentinel"));
     let dsa_verify = Command::new(binary())
         .args(["verify", "--pubkey-der:TestKeyName-dsa-2048"])
         .arg(&dsa_public)

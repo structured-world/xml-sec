@@ -1550,6 +1550,7 @@ mod tests {
             SignatureAlgorithm::RsaSha1,
             SignatureAlgorithm::DsaSha1,
             SignatureAlgorithm::HmacSha1,
+            SignatureAlgorithm::EcdsaSha1,
         ];
         let mut policy = VerificationPolicy::default();
 

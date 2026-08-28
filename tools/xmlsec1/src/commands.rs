@@ -1074,7 +1074,9 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         uris: UriPolicy {
             references: UriTypeSet::ALL,
             retrieval_methods: UriTypeSet::ALL,
-            key_info_references: UriTypeSet::ALL,
+            // CLI metadata selection has no request-scoped external resource
+            // resolver, so advertise only the URI classes it can execute.
+            key_info_references: UriTypeSet::SAME_DOCUMENT,
         },
         transforms: TransformPolicy {
             xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
@@ -3769,6 +3771,7 @@ mod tests {
         );
         assert_eq!(policy.key_trust.dsa_keys.minimum_modulus_bits, 1024);
         assert_eq!(policy.hmac.minimum_key_bits, 40);
+        assert_eq!(policy.uris.key_info_references, UriTypeSet::SAME_DOCUMENT);
     }
 
     #[test]

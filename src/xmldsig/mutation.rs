@@ -1574,7 +1574,7 @@ fn signature_stack_index(
 #[cfg(test)]
 mod tests {
     use crate::c14n::{C14nAlgorithm, C14nMode};
-    use crate::xml::dom as roxmltree;
+    use crate::xml::dom;
     use crate::xmldsig::{
         DigestAlgorithm, ReferenceBuilder, SignatureAlgorithm, SignatureBuilder, Transform,
     };
@@ -1657,11 +1657,11 @@ mod tests {
     fn appends_signature_template_to_non_empty_root() {
         let signed = append_signature_to_root("<root><payload ID=\"ref-0\"/></root>", &template(1))
             .expect("append signature");
-        let document = roxmltree::Document::parse(&signed).expect("parse output");
+        let document = dom::Document::parse(&signed).expect("parse output");
         let root = document.root_element();
         let children: Vec<_> = root
             .children()
-            .filter(roxmltree::Node::is_element)
+            .filter(dom::Node::is_element)
             .map(|node| node.tag_name().name())
             .collect();
         assert_eq!(children, ["payload", "Signature"]);
@@ -1677,7 +1677,7 @@ mod tests {
     #[test]
     fn appends_signature_template_to_empty_root() {
         let signed = append_signature_to_root("<root/>", &template(1)).expect("append signature");
-        let document = roxmltree::Document::parse(&signed).expect("parse output");
+        let document = dom::Document::parse(&signed).expect("parse output");
         let root = document.root_element();
         assert_eq!(
             root.first_element_child()
@@ -1703,7 +1703,7 @@ mod tests {
             .append_child(scope, &template(1))
             .expect("selected empty element must accept a signature");
         let signed = document.into_xml();
-        let output = roxmltree::Document::parse(&signed).expect("output must parse");
+        let output = dom::Document::parse(&signed).expect("output must parse");
         let scope = output
             .descendants()
             .find(|node| node.has_tag_name(("urn:scope", "scope")))
@@ -1777,7 +1777,7 @@ mod tests {
         let signed = append_signature_to_root("<root/>", &template(2)).expect("append signature");
         let filled =
             fill_digest_values(&signed, ["digest-one", "digest-two"]).expect("fill digest values");
-        let document = roxmltree::Document::parse(&filled).expect("parse output");
+        let document = dom::Document::parse(&filled).expect("parse output");
         let values: Vec<_> = document
             .descendants()
             .filter(|node| node.has_tag_name((XMLDSIG_NS, "DigestValue")))
@@ -1791,7 +1791,7 @@ mod tests {
         let signed = append_signature_to_root("<root/>", &template(1)).expect("append signature");
         let filled =
             fill_signature_values(&signed, ["signature&bytes"]).expect("fill signature value");
-        let document = roxmltree::Document::parse(&filled).expect("parse output");
+        let document = dom::Document::parse(&filled).expect("parse output");
         let signature_value = document
             .descendants()
             .find(|node| node.has_tag_name((XMLDSIG_NS, "SignatureValue")))
@@ -1823,7 +1823,7 @@ mod tests {
         let source = r#"<root xmlns:foreign="urn:test"><foreign:DigestValue>keep</foreign:DigestValue></root>"#;
         let signed = append_signature_to_root(source, &template(1)).expect("append signature");
         let filled = fill_digest_values(&signed, ["digest"]).expect("fill digest");
-        let document = roxmltree::Document::parse(&filled).expect("parse output");
+        let document = dom::Document::parse(&filled).expect("parse output");
         let foreign = document
             .descendants()
             .find(|node| node.has_tag_name(("urn:test", "DigestValue")))
@@ -1840,7 +1840,7 @@ mod tests {
     fn replacement_preserves_target_end_after_self_closing_child() {
         let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:Reference><ds:DigestValue><marker/></ds:DigestValue></ds:Reference></ds:SignedInfo></ds:Signature>"#;
         let filled = fill_digest_values(source, ["digest"]).expect("fill digest");
-        let document = roxmltree::Document::parse(&filled).expect("parse output");
+        let document = dom::Document::parse(&filled).expect("parse output");
         let digest_value = document
             .descendants()
             .find(|node| node.has_tag_name((XMLDSIG_NS, "DigestValue")))
@@ -1877,7 +1877,7 @@ mod tests {
         let filled =
             fill_signed_info_digest_values_at_index_with_options(source, ["outer-new"], 0, None)
                 .expect("outer signature replacement must ignore nested signatures");
-        let document = roxmltree::Document::parse(&filled).expect("filled XML must parse");
+        let document = dom::Document::parse(&filled).expect("filled XML must parse");
         let values = document
             .descendants()
             .filter(|node| node.has_tag_name((XMLDSIG_NS, "DigestValue")))
@@ -1896,7 +1896,7 @@ mod tests {
 
         let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect("matching source must populate the placeholder");
-        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let document = dom::Document::parse(&merged).expect("merged XML must parse");
         let x509_data = document
             .descendants()
             .find(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
@@ -1926,7 +1926,7 @@ mod tests {
 
         let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect("a named namespace binding must qualify the generated attribute");
-        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let document = dom::Document::parse(&merged).expect("merged XML must parse");
         let x509_data = document
             .descendants()
             .find(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
@@ -1950,7 +1950,7 @@ mod tests {
 
         assert!(merged.contains("<!--keep-->"));
         assert!(merged.contains("<?audit preserve?>"));
-        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let document = dom::Document::parse(&merged).expect("merged XML must parse");
         let x509_sources = document
             .descendants()
             .filter(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
@@ -1973,7 +1973,7 @@ mod tests {
 
         let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect("generated identity must not replace non-whitespace character data");
-        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let document = dom::Document::parse(&merged).expect("merged XML must parse");
         let x509_sources = document
             .descendants()
             .filter(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
@@ -1997,7 +1997,7 @@ mod tests {
 
         let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect("generated KeyName must replace stale template identity");
-        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let document = dom::Document::parse(&merged).expect("merged XML must parse");
         let key_names = document
             .descendants()
             .filter(|node| node.has_tag_name((XMLDSIG_NS, "KeyName")))
@@ -2016,7 +2016,7 @@ mod tests {
 
         let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect("generated identity must preserve revocation metadata");
-        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let document = dom::Document::parse(&merged).expect("merged XML must parse");
         let x509_sources = document
             .descendants()
             .filter(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
@@ -2107,7 +2107,7 @@ mod tests {
 
         let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect("generated source may shadow an inherited namespace");
-        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let document = dom::Document::parse(&merged).expect("merged XML must parse");
         let x509_data = document
             .descendants()
             .find(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
@@ -2149,7 +2149,7 @@ mod tests {
 
         let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect("generated attributes must populate the placeholder");
-        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let document = dom::Document::parse(&merged).expect("merged XML must parse");
         let x509_data = document
             .descendants()
             .find(|node| node.has_tag_name((XMLDSIG_NS, "X509Data")))
@@ -2171,7 +2171,7 @@ mod tests {
 
         let merged = merge_key_info_source_at_index_with_options(source, generated, 0, None)
             .expect("valid namespace declaration whitespace must be preserved");
-        let document = roxmltree::Document::parse(&merged).expect("merged XML must parse");
+        let document = dom::Document::parse(&merged).expect("merged XML must parse");
         assert!(
             document
                 .descendants()
@@ -2246,7 +2246,7 @@ mod tests {
         let source = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:ext="urn:inherited"><ds:KeyInfo/></ds:Signature>"#;
         let generated =
             r#"<ds:KeyName xmlns:ds="http://www.w3.org/2000/09/xmldsig#">recipient</ds:KeyName>"#;
-        let document = roxmltree::Document::parse(source).expect("source must parse");
+        let document = dom::Document::parse(source).expect("source must parse");
         let key_info = document
             .descendants()
             .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))

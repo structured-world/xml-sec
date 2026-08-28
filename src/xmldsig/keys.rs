@@ -1255,7 +1255,7 @@ fn validate_spki_algorithm(
             PublicKey::EC(_),
         ) if matches!(
             curve_oid.as_deref(),
-            Some("1.2.840.10045.3.1.7" | "1.3.132.0.34" | "1.3.132.0.35")
+            Some(EC_P256_OID | EC_P384_OID | EC_P521_OID)
         ) =>
         {
             Ok(())
