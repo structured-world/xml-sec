@@ -2067,10 +2067,20 @@ fn materialize_retrieval_methods_with_budgets(
             }
             let target = resolver
                 .node_for_same_document_reference(&resolved_uri)
-                .map_err(ReferenceProcessingError::Transform)?
-                .ok_or(SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "X509Data RetrievalMethod target is missing or ambiguous",
-                })?;
+                .map_err(ReferenceProcessingError::Transform)?;
+            let Some(target) = target else {
+                outcome.deferred_error.get_or_insert(
+                    SignatureVerificationPipelineError::InvalidStructure {
+                        reason: "X509Data RetrievalMethod target is missing or ambiguous",
+                    },
+                );
+                materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
+                    uri: resolved_uri,
+                    resource_type,
+                    transforms,
+                });
+                continue;
+            };
             let node = match transforms {
                 RetrievalMethodTransforms::None
                     if target.has_tag_name((XMLDSIG_NS, "X509Data")) =>
@@ -6318,6 +6328,54 @@ mod tests {
             .expect("an unused missing retrieval fallback must not abort verification");
 
         assert_eq!(result.status, DsigStatus::Valid);
+    }
+
+    #[test]
+    fn verify_context_does_not_eagerly_fail_unused_same_document_x509_retrieval() {
+        // Same-document X509Data retrieval is an ordered alternative just like
+        // raw-certificate retrieval; a resolved earlier source makes it unused.
+        let xml = signature_with_target_reference("AQ==").replace(
+            "</ds:SignatureValue>\n  </ds:Signature>",
+            r##"</ds:SignatureValue>
+    <ds:KeyInfo>
+      <ds:KeyName>primary</ds:KeyName>
+      <ds:RetrievalMethod URI="#missing" Type="http://www.w3.org/2000/09/xmldsig#X509Data"/>
+    </ds:KeyInfo>
+  </ds:Signature>"##,
+        );
+
+        let result = VerifyContext::new()
+            .key_resolver(&EarlyKeyInfoResolver)
+            .verify(&xml)
+            .expect("an unused missing X509Data retrieval fallback must not abort verification");
+
+        assert_eq!(result.status, DsigStatus::Valid);
+    }
+
+    #[test]
+    fn verify_context_reports_missing_same_document_x509_retrieval_without_fallback() {
+        // Deferred failures retain their exact diagnostic when no alternative
+        // source resolves the verification key.
+        let xml = signature_with_target_reference("AQ==").replace(
+            "</ds:SignatureValue>\n  </ds:Signature>",
+            r##"</ds:SignatureValue>
+    <ds:KeyInfo>
+      <ds:RetrievalMethod URI="#missing" Type="http://www.w3.org/2000/09/xmldsig#X509Data"/>
+    </ds:KeyInfo>
+  </ds:Signature>"##,
+        );
+
+        let error = VerifyContext::new()
+            .key_resolver(&ConsumingKeyInfoResolver)
+            .verify(&xml)
+            .expect_err("a sole missing X509Data retrieval must remain an explicit error");
+
+        assert!(matches!(
+            error,
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "X509Data RetrievalMethod target is missing or ambiguous"
+            }
+        ));
     }
 
     #[test]

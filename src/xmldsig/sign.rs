@@ -2414,7 +2414,7 @@ fn parse_signing_document<'a>(
     })
 }
 
-fn parse_private_key_pem(private_key_pem: &str) -> Result<Vec<u8>, SigningKeyError> {
+fn parse_private_key_pem(private_key_pem: &str) -> Result<Zeroizing<Vec<u8>>, SigningKeyError> {
     let (rest, pem) = x509_parser::pem::parse_x509_pem(private_key_pem.as_bytes())
         .map_err(|_| SigningKeyError::InvalidKeyPem)?;
     if !rest.iter().all(|byte| byte.is_ascii_whitespace()) {
@@ -2423,7 +2423,7 @@ fn parse_private_key_pem(private_key_pem: &str) -> Result<Vec<u8>, SigningKeyErr
     if pem.label != "PRIVATE KEY" {
         return Err(SigningKeyError::InvalidKeyFormat { label: pem.label });
     }
-    Ok(pem.contents)
+    Ok(Zeroizing::new(pem.contents))
 }
 
 enum SigningSignatureTarget {

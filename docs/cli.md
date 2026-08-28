@@ -174,8 +174,10 @@ ambiguous, non-`KeyInfo`, cyclic, over-budget, and external references fail
 closed; the CLI never reads external key metadata implicitly.
 For RSA, DSA, P-256, P-384, and P-521 signing, `--pwd` decrypts
 password-protected PKCS#8 PEM or DER supplied through the matching private-key
-option. A wrong password fails before output is committed and is never included
-in diagnostics.
+option. The container label or DER structure selects encrypted versus plain
+decoding first: a supplied password is ignored for a plain key, while a wrong
+password for an encrypted key fails without a plaintext fallback, before output
+is committed, and is never included in diagnostics.
 
 Verification accepts `-` as the conventional stdin marker. Verification starts
 at the document root and uses the first descendant `Signature` in document order.

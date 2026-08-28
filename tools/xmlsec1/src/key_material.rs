@@ -9,6 +9,7 @@ use rsa::{
     pkcs1::{DecodeRsaPrivateKey as _, DecodeRsaPublicKey as _},
     pkcs8::{
         DecodePrivateKey as _, DecodePublicKey as _, EncodePrivateKey as _, EncodePublicKey as _,
+        EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef,
     },
 };
 use x509_parser::prelude::FromDer as _;
@@ -291,6 +292,11 @@ fn signature_key_info<'a, 'input>(signature: Node<'a, 'input>) -> Option<Node<'a
 
 /// Decode caller-owned signing key bytes after the operation layer has charged
 /// their source length to its aggregate external-material budget.
+///
+/// `--pwd` is a credential available while reading a key, not a declaration
+/// that the selected container is encrypted. Container structure selects the
+/// decoder first, so a wrong password cannot fall through into plaintext key
+/// parsing while an unencrypted key remains valid when a password was supplied.
 pub fn decode_signing_key(
     path: &Path,
     bytes: &[u8],
@@ -336,6 +342,33 @@ trait Pkcs8SigningKey: SigningKey + Sized + 'static {
         bytes: &[u8],
         password: &[u8],
     ) -> Result<Self, xml_sec::xmldsig::SigningKeyError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Pkcs8ContainerKind {
+    Plain,
+    Encrypted,
+}
+
+fn pkcs8_container_kind(bytes: &[u8], format: PrivateKeyFormat) -> Option<Pkcs8ContainerKind> {
+    match format {
+        PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem => {
+            match rsa::pkcs8::der::pem::decode_label(bytes).ok()? {
+                "PRIVATE KEY" => Some(Pkcs8ContainerKind::Plain),
+                "ENCRYPTED PRIVATE KEY" => Some(Pkcs8ContainerKind::Encrypted),
+                _ => None,
+            }
+        }
+        PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der => {
+            if PrivateKeyInfoRef::try_from(bytes).is_ok() {
+                Some(Pkcs8ContainerKind::Plain)
+            } else if EncryptedPrivateKeyInfoRef::try_from(bytes).is_ok() {
+                Some(Pkcs8ContainerKind::Encrypted)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 macro_rules! impl_pkcs8_signing_key {
@@ -386,21 +419,32 @@ fn decode_pkcs8_signing_key<K: Pkcs8SigningKey>(
     format: PrivateKeyFormat,
     password: Option<&[u8]>,
 ) -> Result<Box<dyn SigningKey>, KeyMaterialError> {
-    let key = match (format, password) {
-        (PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem, Some(password)) => {
-            std::str::from_utf8(bytes)
-                .ok()
-                .and_then(|text| K::decode_pkcs8_encrypted_pem(text, password).ok())
-        }
-        (PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der, Some(password)) => {
-            K::decode_pkcs8_encrypted_der(bytes, password).ok()
-        }
-        (PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem, None) => std::str::from_utf8(bytes)
+    let key = match (format, pkcs8_container_kind(bytes, format), password) {
+        (
+            PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem,
+            Some(Pkcs8ContainerKind::Plain),
+            _,
+        ) => std::str::from_utf8(bytes)
             .ok()
             .and_then(|text| K::decode_pkcs8_pem(text).ok()),
-        (PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der, None) => {
-            K::decode_pkcs8_der(bytes).ok()
-        }
+        (
+            PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der,
+            Some(Pkcs8ContainerKind::Plain),
+            _,
+        ) => K::decode_pkcs8_der(bytes).ok(),
+        (
+            PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem,
+            Some(Pkcs8ContainerKind::Encrypted),
+            Some(password),
+        ) => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| K::decode_pkcs8_encrypted_pem(text, password).ok()),
+        (
+            PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der,
+            Some(Pkcs8ContainerKind::Encrypted),
+            Some(password),
+        ) => K::decode_pkcs8_encrypted_der(bytes, password).ok(),
+        (_, Some(Pkcs8ContainerKind::Encrypted) | None, _) => None,
     };
     key.map(|key| Box::new(key) as Box<dyn SigningKey>)
         .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()))

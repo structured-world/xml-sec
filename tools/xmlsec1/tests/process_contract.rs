@@ -544,9 +544,11 @@ fn compatibility_cli_decrypts_rsa_and_ecdsa_pkcs8_signing_keys() {
     let mut rng = ChaCha8Rng::seed_from_u64(0x504B_4353_3800_0001);
 
     let rsa = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let rsa_plain_private = temp.path().join("rsa-plain.der");
     let rsa_private = temp.path().join("rsa-encrypted.der");
     let rsa_public = temp.path().join("rsa-public.der");
     let rsa_der = rsa.to_pkcs8_der().unwrap();
+    fs::write(&rsa_plain_private, rsa_der.as_bytes()).unwrap();
     let encrypted_rsa = pkcs8::PrivateKeyInfoRef::try_from(rsa_der.as_bytes())
         .unwrap()
         .encrypt_with_rng(&mut rng, password)
@@ -560,13 +562,23 @@ fn compatibility_cli_decrypts_rsa_and_ecdsa_pkcs8_signing_keys() {
             .as_bytes(),
     )
     .unwrap();
-    assert_encrypted_pkcs8_cli_round_trip(
+    assert_pkcs8_cli_round_trip(
+        temp.path(),
+        "rsa-plain",
+        signature_template_without_key_info(),
+        &rsa_plain_private,
+        &rsa_public,
+        b"unused-for-plain-container",
+        false,
+    );
+    assert_pkcs8_cli_round_trip(
         temp.path(),
         "rsa",
         signature_template_without_key_info(),
         &rsa_private,
         &rsa_public,
         password,
+        true,
     );
 
     let p256 = P256SecretKey::from_pkcs8_pem(
@@ -574,9 +586,15 @@ fn compatibility_cli_decrypts_rsa_and_ecdsa_pkcs8_signing_keys() {
             .unwrap(),
     )
     .unwrap();
+    let p256_plain_private = temp.path().join("p256-plain.pem");
     let p256_private = temp.path().join("p256-encrypted.pem");
     let p256_public = temp.path().join("p256-public.der");
     let p256_der = p256.to_pkcs8_der().unwrap();
+    fs::write(
+        &p256_plain_private,
+        p256.to_pkcs8_pem(pkcs8::LineEnding::LF).unwrap().as_bytes(),
+    )
+    .unwrap();
     let encrypted_p256 = pkcs8::PrivateKeyInfoRef::try_from(p256_der.as_bytes())
         .unwrap()
         .encrypt_with_rng(&mut rng, password)
@@ -594,23 +612,34 @@ fn compatibility_cli_decrypts_rsa_and_ecdsa_pkcs8_signing_keys() {
         p256.public_key().to_public_key_der().unwrap().as_bytes(),
     )
     .unwrap();
-    assert_encrypted_pkcs8_cli_round_trip(
+    assert_pkcs8_cli_round_trip(
+        temp.path(),
+        "p256-plain",
+        ecdsa_signature_template(),
+        &p256_plain_private,
+        &p256_public,
+        b"unused-for-plain-container",
+        false,
+    );
+    assert_pkcs8_cli_round_trip(
         temp.path(),
         "p256",
         ecdsa_signature_template(),
         &p256_private,
         &p256_public,
         password,
+        true,
     );
 }
 
-fn assert_encrypted_pkcs8_cli_round_trip(
+fn assert_pkcs8_cli_round_trip(
     directory: &Path,
     name: &str,
     template: &str,
     private_key: &Path,
     public_key: &Path,
     password: &[u8],
+    reject_wrong_password: bool,
 ) {
     let template_path = directory.join(format!("{name}-template.xml"));
     let signed_path = directory.join(format!("{name}-signed.xml"));
@@ -640,21 +669,23 @@ fn assert_encrypted_pkcs8_cli_round_trip(
         String::from_utf8_lossy(&sign.stderr)
     );
 
-    let wrong_password_output = directory.join(format!("{name}-wrong-password.xml"));
-    let wrong_password = "wrong-password-sentinel";
-    let rejected = Command::new(binary())
-        .arg("sign")
-        .arg(private_key_option)
-        .arg(private_key)
-        .args(["--pwd", wrong_password])
-        .arg("--output")
-        .arg(&wrong_password_output)
-        .arg(&template_path)
-        .output()
-        .unwrap();
-    assert!(!rejected.status.success());
-    assert!(!wrong_password_output.exists());
-    assert!(!String::from_utf8_lossy(&rejected.stderr).contains(wrong_password));
+    if reject_wrong_password {
+        let wrong_password_output = directory.join(format!("{name}-wrong-password.xml"));
+        let wrong_password = "wrong-password-sentinel";
+        let rejected = Command::new(binary())
+            .arg("sign")
+            .arg(private_key_option)
+            .arg(private_key)
+            .args(["--pwd", wrong_password])
+            .arg("--output")
+            .arg(&wrong_password_output)
+            .arg(&template_path)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(!wrong_password_output.exists());
+        assert!(!String::from_utf8_lossy(&rejected.stderr).contains(wrong_password));
+    }
 
     let verify = Command::new(binary())
         .args(["verify", "--pubkey-der"])
