@@ -23,6 +23,7 @@ XML Security in pure Rust, built to replace libxmlsec1.
 - **Native CLI** — `xmlsec1` command surface backed by the same Rust policy and provider pipelines
 - **Provider-neutral crypto** — typed capabilities and opaque key handles with RustCrypto as the pure-Rust default
 - **Reusable XML documents** — policy-aware retained parsing, stable semantic identities, shared indexes, and generation-safe mutation across C14N, XMLDSig, and XMLEnc
+- **Compiled operations** — deterministic dependency plans keep policy, cumulative budgets, resolver/cache state, authenticated identities, and mutation gates in one operation context
 - **Selectable XML backend** — `xmloxide` and `roxmltree` are interchangeable compile-time parsers behind one backend-neutral semantic DOM
 
 ## Why?

@@ -35,6 +35,29 @@ cargo run --example verify -- signed.xml
 ```
 
 The signing and verification contexts share the same reference-transform implementation.
+Both pipelines compile a deterministic operation graph before provider success or
+document mutation can be reported. The graph orders parsing, key and URI resolution,
+mutable-reference dependencies, transforms, digests, signature crypto, evidence, and
+the final mutation gate. One operation context owns the immutable policy snapshot,
+stable document generation, resolver and transform-cache state, cumulative budgets,
+authenticated node identities, and first-failure evidence. Nested helpers and reparses
+therefore cannot reset accounting or use identities captured from another generation.
+Every executable graph node checks its dependencies before entering the closure that
+performs parsing, resolution, canonicalization, or provider work. Nodes bound to a
+document or caller-owned external resource additionally require a freshly observed
+node identity or content fingerprint; the generic execution entry point rejects them.
+XPath document-identity caching is operation-owned but chain-scoped, so cache entries
+are reused within one live transform chain and invalidated before another chain or
+after an internal reparse. Controlled mutations verify the expected document
+generation before commit and advance that expectation by exactly one generation
+inside the operation context. That context is also the sole owner of the authenticated
+node set used to admit Manifest discovery.
+Authenticated Manifest structure is deliberately compiled as a second phase of the
+same graph only after `SignatureValue` succeeds; malformed or expensive unauthenticated
+Manifest content is never parsed speculatively. Manifest dependency cycles are rejected
+before their digest execution, while signing analyzes concrete mutable `DigestValue`
+and `SignatureValue` targets and rejects cycles before changing the caller's document.
+
 `SigningPolicy::manifest_processing` controls direct `<Object>/<Manifest>`
 reference generation. Processing fills Manifest digests before SignedInfo so a
 SignedInfo reference to the Manifest authenticates the final values; Manifest

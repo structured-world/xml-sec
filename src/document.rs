@@ -531,6 +531,13 @@ pub struct XmlDocument {
     cell: DocumentCell,
 }
 
+#[cfg(feature = "xmlenc")]
+pub(crate) struct PreparedDocumentMutation {
+    identity: DocumentIdentity,
+    generation: u64,
+    cell: DocumentCell,
+}
+
 /// Borrowed semantic view of one immutable [`XmlDocument`] generation.
 #[derive(Clone, Copy)]
 pub struct DocumentView<'a> {
@@ -788,6 +795,32 @@ impl XmlDocument {
         self.replace_range_with_settings(range, replacement, settings, Some(budget))
     }
 
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn prepare_element_replacement_with_budget(
+        &self,
+        target: NodeIdentity,
+        replacement: &str,
+        settings: DocumentParseSettings,
+        budget: &XmlParseWorkBudget,
+    ) -> Result<PreparedDocumentMutation, XmlDocumentError> {
+        let range = self.with_view(|view| {
+            let node = view.resolve_mutation_node(target)?;
+            if !node.is_element() {
+                return Err(XmlDocumentError::TargetNotElement);
+            }
+            Ok(node.range())
+        })?;
+        self.ensure_replacement_fits(&range, replacement.len(), settings.max_bytes)?;
+        self.validate_single_element_in_parent_context(
+            target,
+            replacement,
+            Some(settings.nodes_limit as usize),
+            settings,
+            Some(budget),
+        )?;
+        self.prepare_range_replacement(range, replacement, settings, budget)
+    }
+
     /// Replace one complete node with an XML fragment valid in its parent context.
     ///
     /// This operation is intended for XMLEnc Content replacement, where one
@@ -806,13 +839,13 @@ impl XmlDocument {
     }
 
     #[cfg(feature = "xmlenc")]
-    pub(crate) fn replace_node_with_fragment_with_budget(
-        &mut self,
+    pub(crate) fn prepare_node_fragment_replacement_with_budget(
+        &self,
         target: NodeIdentity,
         replacement: &str,
         settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
-    ) -> Result<(), XmlDocumentError> {
+    ) -> Result<PreparedDocumentMutation, XmlDocumentError> {
         let range = self.with_view(|view| {
             Ok::<_, XmlDocumentError>(view.resolve_mutation_node(target)?.range())
         })?;
@@ -824,7 +857,7 @@ impl XmlDocument {
             settings,
             Some(budget),
         )?;
-        self.replace_range_with_settings(range, replacement, settings, Some(budget))
+        self.prepare_range_replacement(range, replacement, settings, budget)
     }
 
     /// Replace all children of one element with a well-formed XML fragment.
@@ -1377,6 +1410,47 @@ impl XmlDocument {
     ) -> Result<(), XmlDocumentError> {
         let output = self.replaced_range(range, replacement, settings.max_bytes)?;
         self.replace_serialized_with_settings(output, settings, budget)
+    }
+
+    #[cfg(feature = "xmlenc")]
+    fn prepare_range_replacement(
+        &self,
+        range: std::ops::Range<usize>,
+        replacement: &str,
+        settings: DocumentParseSettings,
+        budget: &XmlParseWorkBudget,
+    ) -> Result<PreparedDocumentMutation, XmlDocumentError> {
+        let output = self.replaced_range(range, replacement, settings.max_bytes)?;
+        let cell = build_cell(output, settings, Some(budget)).map_err(|error| match error {
+            XmlDocumentError::Parse(ParseError::NodesLimitReached) => {
+                XmlDocumentError::ProjectedNodeLimit {
+                    maximum: settings.nodes_limit as usize,
+                }
+            }
+            error => error,
+        })?;
+        Ok(PreparedDocumentMutation {
+            identity: self.identity,
+            generation: self.generation,
+            cell,
+        })
+    }
+
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn commit_prepared(
+        &mut self,
+        prepared: PreparedDocumentMutation,
+    ) -> Result<(), XmlDocumentError> {
+        if self.identity != prepared.identity {
+            return Err(XmlDocumentError::ForeignIdentity);
+        }
+        if self.generation != prepared.generation {
+            return Err(XmlDocumentError::StaleIdentity {
+                identity: prepared.generation,
+                current: self.generation,
+            });
+        }
+        self.commit_cell(prepared.cell)
     }
 
     fn replaced_range(
@@ -3652,7 +3726,7 @@ mod tests {
     fn bounded_fragment_validation_uses_the_active_node_ceiling() {
         // The validation wrapper must not parse attacker-controlled plaintext
         // under a broader document-creation ceiling before the operation limit.
-        let mut document = XmlDocument::parse_with_settings(
+        let document = XmlDocument::parse_with_settings(
             "<root><target/></root>".into(),
             DocumentParseSettings::new(false, 128, 4_096),
         )
@@ -3669,13 +3743,14 @@ mod tests {
         let before = document.as_xml().to_owned();
         let budget = XmlParseWorkBudget::from_resources(&crate::policy::ResourcePolicy::default());
 
+        let replacement = document.prepare_node_fragment_replacement_with_budget(
+            target,
+            "<replacement><child/><child/><malformed>",
+            DocumentParseSettings::new(false, maximum as u32, 4_096),
+            &budget,
+        );
         assert!(matches!(
-            document.replace_node_with_fragment_with_budget(
-                target,
-                "<replacement><child/><child/><malformed>",
-                DocumentParseSettings::new(false, maximum as u32, 4_096),
-                &budget,
-            ),
+            replacement,
             Err(XmlDocumentError::ProjectedNodeLimit { maximum: rejected })
                 if rejected == maximum
         ));
@@ -4031,14 +4106,17 @@ mod tests {
         });
         let budget = XmlParseWorkBudget::from_resources(&crate::policy::ResourcePolicy::default());
 
-        document
-            .replace_node_with_fragment_with_budget(
+        let prepared = document
+            .prepare_node_fragment_replacement_with_budget(
                 target,
                 "middle",
                 DocumentParseSettings::new(false, 3, 1_024),
                 &budget,
             )
-            .expect("both boundary text pairs must merge in the committed document");
+            .expect("both boundary text pairs must fit in the prepared document");
+        document
+            .commit_prepared(prepared)
+            .expect("prepared replacement must commit atomically");
 
         assert_eq!(document.as_xml(), "<root>leftmiddleright</root>");
         assert_eq!(document.with_view(|view| view.node_count()), 3);

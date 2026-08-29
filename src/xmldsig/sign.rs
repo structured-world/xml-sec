@@ -31,6 +31,10 @@ use x509_parser::prelude::FromDer;
 use zeroize::Zeroizing;
 
 use crate::c14n::canonicalize_bounded_with_xml_base_budget;
+use crate::operation::{
+    OperationExecutionContext, OperationNodeId, OperationNodeKind, OperationPlanError,
+    OperationStage,
+};
 
 use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::DigestAlgorithm;
@@ -125,6 +129,12 @@ pub enum SigningDigestError {
     XmlMutation(#[from] XmlMutationError),
 }
 
+impl From<OperationPlanError> for SigningDigestError {
+    fn from(error: OperationPlanError) -> Self {
+        Self::InvalidStructure(error.to_string())
+    }
+}
+
 /// Errors returned by the full XMLDSig signing pipeline.
 #[derive(Debug, thiserror::Error)]
 pub enum SigningError {
@@ -172,6 +182,12 @@ pub enum SigningError {
     /// Signature template generation failed.
     #[error("signature template error: {0}")]
     Template(SignatureBuilderError),
+}
+
+impl From<OperationPlanError> for SigningError {
+    fn from(error: OperationPlanError) -> Self {
+        SigningDigestError::from(error).into()
+    }
 }
 
 impl From<SigningDigestError> for SigningError {
@@ -1546,9 +1562,7 @@ impl<'a> SignContext<'a> {
             )
             .map_err(map_owned_document_mutation_error)?;
         self.sign_document_in_place(&mut staged, &mut budgets)?;
-        document
-            .commit_staged(staged)
-            .map_err(map_owned_document_mutation_error)
+        commit_signed_staged(document, staged, &self.policy)
     }
 
     fn sign_document_in_place(
@@ -1593,7 +1607,19 @@ impl<'a> SignContext<'a> {
         let transform_options = TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics);
-        let with_key_info = if let Some(writer) = self.key_info_writer {
+        let binding = (document.identity(), document.generation());
+        let mut operation =
+            OperationExecutionContext::new(self.policy.clone(), &mut *budgets, Some(binding));
+        let key_info = operation.add_node(
+            OperationNodeKind::Key { index: 0 },
+            OperationStage::Resolve,
+            None,
+        );
+        operation.compile()?;
+        let with_key_info = operation.run_with_budgets(key_info, |budgets| {
+            let Some(writer) = self.key_info_writer else {
+                return Ok::<_, SigningError>(None);
+            };
             let key_info_content =
                 writer.write_key_info_with_provider(self.signing_key, self.provider)?;
             // Writer output is a separate untrusted XML input. Bound it before
@@ -1613,37 +1639,51 @@ impl<'a> SignContext<'a> {
             self.policy
                 .resources
                 .validate_xml_document_len(populated.len())?;
-            Some(populated)
+            Ok(Some(populated))
+        })?;
+        operation.extend();
+        let setup_gate = if let Some(populated) = with_key_info {
+            let mutation =
+                operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
+            operation.add_dependency(mutation, key_info)?;
+            operation.compile()?;
+            operation.run_document_transition(mutation, document, |document, budgets| {
+                document
+                    .replace_serialized_with_settings(
+                        populated,
+                        self.document_parse_settings(),
+                        Some(budgets.transforms.xml_parse_work()),
+                    )
+                    .map_err(map_owned_document_mutation_error)
+            })?;
+            mutation
         } else {
-            None
+            operation.compile()?;
+            key_info
         };
-        if let Some(populated) = with_key_info {
-            document
-                .replace_serialized_with_settings(
-                    populated,
-                    self.document_parse_settings(),
-                    Some(budgets.transforms.xml_parse_work()),
-                )
-                .map_err(map_owned_document_mutation_error)?;
-        }
-        fill_reference_digest_values_in_dependency_order(
+        operation.extend();
+        let plan_nodes = fill_reference_digest_values_in_dependency_order_with_operation(
             document,
             transform_options,
-            &self.policy,
             self.provider,
-            budgets,
+            &mut operation,
             target_signature,
             self.id_attributes,
+            Some(setup_gate),
         )?;
         self.policy
             .resources
             .validate_xml_document_len(document.as_xml().len())?;
-        let (algorithm, hmac_output_length_bits, canonical_signed_info) =
-            canonicalize_signed_info(document, &self.policy, budgets, target_signature)?;
-        budgets
-            .transforms
-            .charge_c14n_output(canonical_signed_info.len())
-            .map_err(SigningDigestError::Transform)?;
+        let (algorithm, hmac_output_length_bits, canonical_signed_info) = operation
+            .run_with_budgets(plan_nodes.canonicalization, |budgets| {
+                let result =
+                    canonicalize_signed_info(document, &self.policy, budgets, target_signature)?;
+                budgets
+                    .transforms
+                    .charge_c14n_output(result.2.len())
+                    .map_err(SigningDigestError::Transform)?;
+                Ok::<_, SigningError>(result)
+            })?;
         self.policy.check_signature_algorithm(algorithm)?;
         let expected_signature_len = expected_signature_output_len(
             self.signing_key,
@@ -1671,29 +1711,36 @@ impl<'a> SignContext<'a> {
         self.policy
             .resources
             .validate_xml_document_len(projected_document_len)?;
-        self.provider
-            .require_capability(crate::provider::ProviderCapability::Sign(algorithm))
-            .map_err(SigningKeyError::from)?;
-        let mut signature_value =
+        let signature_value = operation.run(plan_nodes.crypto, || {
             self.provider
-                .sign(self.signing_key, algorithm, &canonical_signed_info)?;
-        if algorithm.hmac_output_bits().is_some() {
-            signature_value.truncate(expected_signature_len);
-        }
-        validate_signature_output(expected_signature_len, &signature_value)?;
-        let signature_value = encode_signature_output(
-            algorithm,
-            signature_value,
-            self.policy.ecdsa_signature_value_encoding,
-        )?;
-        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature_value);
-        document
-            .replace_base64_contents_with_budget(
-                &[(signature_value_node, signature_b64)],
-                self.document_parse_settings(),
-                budgets.transforms.xml_parse_work(),
-            )
-            .map_err(map_owned_document_mutation_error)?;
+                .require_capability(crate::provider::ProviderCapability::Sign(algorithm))
+                .map_err(SigningKeyError::from)?;
+            let mut signature_value =
+                self.provider
+                    .sign(self.signing_key, algorithm, &canonical_signed_info)?;
+            if algorithm.hmac_output_bits().is_some() {
+                signature_value.truncate(expected_signature_len);
+            }
+            validate_signature_output(expected_signature_len, &signature_value)?;
+            Ok::<_, SigningError>(signature_value)
+        })?;
+        let signature_b64 = operation.run(plan_nodes.evidence, || {
+            let signature_value = encode_signature_output(
+                algorithm,
+                signature_value,
+                self.policy.ecdsa_signature_value_encoding,
+            )?;
+            Ok::<_, SigningError>(base64::engine::general_purpose::STANDARD.encode(signature_value))
+        })?;
+        operation.run_document_transition(plan_nodes.mutation, document, |document, budgets| {
+            document
+                .replace_base64_contents_with_budget(
+                    &[(signature_value_node, signature_b64)],
+                    self.document_parse_settings(),
+                    budgets.transforms.xml_parse_work(),
+                )
+                .map_err(map_owned_document_mutation_error)
+        })?;
         self.policy
             .resources
             .validate_xml_document_len(document.as_xml().len())?;
@@ -1748,9 +1795,7 @@ impl<'a> SignContext<'a> {
             )
             .map_err(map_owned_document_mutation_error)?;
         self.sign_document_with_builder_in_place(&mut staged, builder, &mut budgets)?;
-        document
-            .commit_staged(staged)
-            .map_err(map_owned_document_mutation_error)
+        commit_signed_staged(document, staged, &self.policy)
     }
 
     fn sign_document_with_builder_in_place(
@@ -1785,14 +1830,23 @@ impl<'a> SignContext<'a> {
         self.policy
             .resources
             .validate_xml_document_len(projected_document_len)?;
-        document
-            .append_generated_child_with_budget(
-                signature_parent,
-                &template,
-                self.document_parse_settings(),
-                budgets.transforms.xml_parse_work(),
-            )
-            .map_err(map_owned_document_mutation_error)?;
+        let binding = (document.identity(), document.generation());
+        let mut operation =
+            OperationExecutionContext::new(self.policy.clone(), &mut *budgets, Some(binding));
+        let mutation =
+            operation.add_node(OperationNodeKind::Mutation, OperationStage::Mutation, None);
+        operation.compile()?;
+        operation.run_document_transition(mutation, document, |document, budgets| {
+            document
+                .append_generated_child_with_budget(
+                    signature_parent,
+                    &template,
+                    self.document_parse_settings(),
+                    budgets.transforms.xml_parse_work(),
+                )
+                .map_err(map_owned_document_mutation_error)
+        })?;
+        drop(operation);
         self.policy
             .resources
             .validate_xml_document_len(document.as_xml().len())?;
@@ -1917,6 +1971,13 @@ struct SigningOperationBudgets {
     xpath_parse: XPathSignatureParseBudget,
 }
 
+struct SigningPlanNodes {
+    canonicalization: OperationNodeId,
+    crypto: OperationNodeId,
+    evidence: OperationNodeId,
+    mutation: OperationNodeId,
+}
+
 impl SigningOperationBudgets {
     fn from_resources(resources: &crate::policy::ResourcePolicy) -> Self {
         Self {
@@ -2003,51 +2064,58 @@ fn compute_reference_digest_values_with_options(
     )
 }
 
-fn fill_reference_digest_values_in_dependency_order(
+fn fill_reference_digest_values_in_dependency_order_with_operation(
     document: &mut XmlDocument,
     transform_options: TransformOptions,
-    policy: &crate::policy::SigningPolicy,
     provider: &dyn crate::provider::CryptoProvider,
-    budgets: &mut SigningOperationBudgets,
+    operation: &mut OperationExecutionContext<
+        crate::policy::SigningPolicy,
+        &mut SigningOperationBudgets,
+    >,
     target_signature: usize,
     id_attributes: &[crate::IdAttributeRegistration],
-) -> Result<(), SigningDigestError> {
+    setup_gate: Option<OperationNodeId>,
+) -> Result<SigningPlanNodes, SigningDigestError> {
+    let policy = operation.policy().clone();
     let reference_limit = policy
         .resources
         .max_references
         .min(MAX_REFERENCES_PER_SIGNATURE);
     let process_manifests =
         policy.manifest_processing == crate::policy::ManifestProcessing::Process;
-    let (signed_info_references, manifest_references) = document.with_view(|view| {
-        let signature = find_signing_signature_node(
-            view.document(),
-            SigningSignatureTarget::Index(target_signature),
-        )?;
-        let signed_info = find_required_child(signature, "SignedInfo")?;
-        let signed_info_references =
-            parse_signing_references_with_budget(signed_info, &mut budgets.xpath_parse)?;
-        validate_signing_references(
-            &signed_info_references,
-            signed_info_references.len(),
-            Some(policy),
-        )?;
-        let manifest_references = if process_manifests {
-            parse_signing_manifest_references(
-                signature,
-                &mut budgets.xpath_parse,
-                reference_limit.saturating_sub(signed_info_references.len()),
-                reference_limit,
-            )?
-        } else {
-            Vec::new()
-        };
-        Ok::<_, SigningDigestError>((signed_info_references, manifest_references))
-    })?;
+    let (signed_info_references, manifest_references) = {
+        let budgets = operation.budgets_mut();
+        document.with_view(|view| {
+            let signature = find_signing_signature_node(
+                view.document(),
+                SigningSignatureTarget::Index(target_signature),
+            )?;
+            let signed_info = find_required_child(signature, "SignedInfo")?;
+            let signed_info_references =
+                parse_signing_references_with_budget(signed_info, &mut budgets.xpath_parse)?;
+            validate_signing_references(
+                &signed_info_references,
+                signed_info_references.len(),
+                Some(&policy),
+            )?;
+            let manifest_references = if process_manifests {
+                parse_signing_manifest_references(
+                    signature,
+                    &mut budgets.xpath_parse,
+                    reference_limit.saturating_sub(signed_info_references.len()),
+                    reference_limit,
+                )?
+            } else {
+                Vec::new()
+            };
+            Ok::<_, SigningDigestError>((signed_info_references, manifest_references))
+        })?
+    };
     let total_references = signed_info_references
         .len()
         .checked_add(manifest_references.len())
         .ok_or_else(|| SigningDigestError::InvalidStructure("reference count overflow".into()))?;
-    validate_signing_references(&manifest_references, total_references, Some(policy))?;
+    validate_signing_references(&manifest_references, total_references, Some(&policy))?;
     let placeholder = "AA==";
     // SignatureValue is the final mutable value in the signing pipeline. Give
     // it concrete character data during analysis so references that retain the
@@ -2079,8 +2147,8 @@ fn fill_reference_digest_values_in_dependency_order(
         .map_err(map_owned_document_digest_mutation_error)?;
     let analysis_doc = parse_signing_document(
         &analysis_xml,
-        Some(policy),
-        budgets.transforms.xml_parse_work(),
+        Some(&policy),
+        operation.budgets().transforms.xml_parse_work(),
         document.xml_backend(),
     )?;
     let analysis_signature = find_signing_signature_node(
@@ -2088,12 +2156,14 @@ fn fill_reference_digest_values_in_dependency_order(
         SigningSignatureTarget::Index(target_signature),
     )?;
     let analysis_signed_info = find_required_child(analysis_signature, "SignedInfo")?;
-    let mut analysis_references =
-        parse_signing_references_with_budget(analysis_signed_info, &mut budgets.xpath_parse)?;
+    let mut analysis_references = parse_signing_references_with_budget(
+        analysis_signed_info,
+        &mut operation.budgets_mut().xpath_parse,
+    )?;
     if process_manifests {
         analysis_references.extend(parse_signing_manifest_references(
             analysis_signature,
-            &mut budgets.xpath_parse,
+            &mut operation.budgets_mut().xpath_parse,
             reference_limit.saturating_sub(signed_info_references.len()),
             reference_limit,
         )?);
@@ -2103,90 +2173,129 @@ fn fill_reference_digest_values_in_dependency_order(
         analysis_signature,
         &analysis_references,
         transform_options,
-        &budgets.transforms,
+        &operation.budgets().transforms,
         id_attributes,
         policy.transforms.same_document_id_semantics,
     )?;
-    for level in dependency_plan {
-        let replacements = document.with_view(|view| {
-            let current_doc = view.document();
-            let current_signature = find_signing_signature_node(
-                current_doc,
-                SigningSignatureTarget::Index(target_signature),
-            )?;
-            let current_signed_info = find_required_child(current_signature, "SignedInfo")?;
-            let current_signed_info_references = parse_signing_references_with_budget(
-                current_signed_info,
-                &mut budgets.xpath_parse,
-            )?;
-            let current_manifest_references = if process_manifests {
-                parse_signing_manifest_references(
-                    current_signature,
-                    &mut budgets.xpath_parse,
-                    reference_limit.saturating_sub(signed_info_references.len()),
-                    reference_limit,
-                )?
-            } else {
-                Vec::new()
-            };
-            if current_signed_info_references.len() != signed_info_references.len()
-                || current_manifest_references.len() != manifest_references.len()
-            {
-                return Err(SigningDigestError::InvalidStructure(
-                    "signing Reference set changed while filling digests".into(),
-                ));
-            }
-            let mut destinations = Vec::with_capacity(level.len());
-            let mut level_references = Vec::with_capacity(level.len());
-            for index in &level {
-                let reference = if *index < signed_info_references.len() {
-                    current_signed_info_references.get(*index)
-                } else {
-                    current_manifest_references.get(*index - signed_info_references.len())
-                }
-                .ok_or_else(|| {
-                    SigningDigestError::InvalidStructure(
-                        "signing Reference set changed while filling digests".into(),
+    let (node_levels, plan_nodes) =
+        compile_signing_operation_plan(operation, &dependency_plan, setup_gate)?;
+    for (level, node_level) in dependency_plan.levels.into_iter().zip(node_levels) {
+        operation.run_document_transition_batch_with_budgets(
+            &node_level,
+            document,
+            |document, budgets| {
+                let replacements = document.with_view(|view| {
+                    let current_doc = view.document();
+                    let current_signature = find_signing_signature_node(
+                        current_doc,
+                        SigningSignatureTarget::Index(target_signature),
+                    )?;
+                    let current_signed_info = find_required_child(current_signature, "SignedInfo")?;
+                    let current_signed_info_references = parse_signing_references_with_budget(
+                        current_signed_info,
+                        &mut budgets.xpath_parse,
+                    )?;
+                    let current_manifest_references = if process_manifests {
+                        parse_signing_manifest_references(
+                            current_signature,
+                            &mut budgets.xpath_parse,
+                            reference_limit.saturating_sub(signed_info_references.len()),
+                            reference_limit,
+                        )?
+                    } else {
+                        Vec::new()
+                    };
+                    if current_signed_info_references.len() != signed_info_references.len()
+                        || current_manifest_references.len() != manifest_references.len()
+                    {
+                        return Err(SigningDigestError::InvalidStructure(
+                            "signing Reference set changed while filling digests".into(),
+                        ));
+                    }
+                    let mut destinations = Vec::with_capacity(level.len());
+                    let mut level_references = Vec::with_capacity(level.len());
+                    for index in &level {
+                        let reference = if *index < signed_info_references.len() {
+                            current_signed_info_references.get(*index)
+                        } else {
+                            current_manifest_references.get(*index - signed_info_references.len())
+                        }
+                        .ok_or_else(|| {
+                            SigningDigestError::InvalidStructure(
+                                "signing Reference set changed while filling digests".into(),
+                            )
+                        })?;
+                        destinations.push(view.node_identity_by_id(reference.digest_value_node_id));
+                        level_references.push(reference.clone());
+                    }
+                    let computed = compute_signing_reference_digests(
+                        current_doc,
+                        current_signature,
+                        level_references,
+                        transform_options,
+                        provider,
+                        &budgets.transforms,
+                        SigningUriResolution {
+                            id_attributes,
+                            same_document_id_semantics: policy
+                                .transforms
+                                .same_document_id_semantics,
+                        },
+                    )?;
+                    if computed.len() != destinations.len() {
+                        return Err(SigningDigestError::InvalidStructure(
+                            "signing Reference set changed while computing digests".into(),
+                        ));
+                    }
+                    Ok::<_, SigningDigestError>(
+                        destinations
+                            .into_iter()
+                            .zip(computed)
+                            .map(|(target, digest)| (target, digest.digest_value))
+                            .collect::<Vec<_>>(),
                     )
                 })?;
-                destinations.push(view.node_identity_by_id(reference.digest_value_node_id));
-                level_references.push(reference.clone());
-            }
-            let computed = compute_signing_reference_digests(
-                current_doc,
-                current_signature,
-                level_references,
-                transform_options,
-                provider,
-                &budgets.transforms,
-                SigningUriResolution {
-                    id_attributes,
-                    same_document_id_semantics: policy.transforms.same_document_id_semantics,
-                },
-            )?;
-            if computed.len() != destinations.len() {
-                return Err(SigningDigestError::InvalidStructure(
-                    "signing Reference set changed while computing digests".into(),
-                ));
-            }
-            Ok::<_, SigningDigestError>(
-                destinations
-                    .into_iter()
-                    .zip(computed)
-                    .map(|(target, digest)| (target, digest.digest_value))
-                    .collect::<Vec<_>>(),
-            )
-        })?;
-        document
-            .replace_base64_contents_with_budget(
-                &replacements,
-                DocumentParseSettings::from_policy(&policy.xml, &policy.resources)
-                    .with_backend(document.xml_backend()),
-                budgets.transforms.xml_parse_work(),
-            )
-            .map_err(map_owned_document_digest_mutation_error)?;
+                document
+                    .replace_base64_contents_with_budget(
+                        &replacements,
+                        DocumentParseSettings::from_policy(&policy.xml, &policy.resources)
+                            .with_backend(document.xml_backend()),
+                        budgets.transforms.xml_parse_work(),
+                    )
+                    .map_err(map_owned_document_digest_mutation_error)
+            },
+        )?;
     }
-    Ok(())
+    Ok(plan_nodes)
+}
+
+#[cfg(test)]
+fn fill_reference_digest_values_in_dependency_order(
+    document: &mut XmlDocument,
+    transform_options: TransformOptions,
+    policy: &crate::policy::SigningPolicy,
+    provider: &dyn crate::provider::CryptoProvider,
+    budgets: &mut SigningOperationBudgets,
+    target_signature: usize,
+    id_attributes: &[crate::IdAttributeRegistration],
+) -> Result<(), SigningDigestError> {
+    let binding = (document.identity(), document.generation());
+    let mut operation = OperationExecutionContext::new(policy.clone(), budgets, Some(binding));
+    fill_reference_digest_values_in_dependency_order_with_operation(
+        document,
+        transform_options,
+        provider,
+        &mut operation,
+        target_signature,
+        id_attributes,
+        None,
+    )
+    .map(|_| ())
+}
+
+struct SigningDependencyPlan {
+    dependencies: Vec<HashSet<usize>>,
+    levels: Vec<Vec<usize>>,
 }
 
 fn reference_dependency_levels(
@@ -2197,7 +2306,7 @@ fn reference_dependency_levels(
     execution_budget: &TransformExecutionBudget,
     id_attributes: &[crate::IdAttributeRegistration],
     same_document_id_semantics: crate::policy::SameDocumentIdSemantics,
-) -> Result<Vec<Vec<usize>>, SigningDigestError> {
+) -> Result<SigningDependencyPlan, SigningDigestError> {
     let resolver = UriReferenceResolver::with_id_registrations(doc, id_attributes)
         .with_same_document_id_semantics(same_document_id_semantics);
     let terminal_signature_value_index = references.len();
@@ -2248,11 +2357,11 @@ fn reference_dependency_levels(
             "Reference dependency cycle includes the mutable SignatureValue".into(),
         ));
     }
-    let mut dependencies = analyses;
+    let mut remaining_dependencies = analyses.clone();
     let mut completed = vec![false; references.len()];
     let mut levels = Vec::new();
     while completed.iter().any(|done| !done) {
-        let ready = dependencies
+        let ready = remaining_dependencies
             .iter()
             .enumerate()
             .filter_map(|(index, dependencies)| {
@@ -2267,7 +2376,7 @@ fn reference_dependency_levels(
         for index in &ready {
             completed[*index] = true;
         }
-        for dependency_set in &mut dependencies {
+        for dependency_set in &mut remaining_dependencies {
             dependency_set.retain(|dependency| !completed[*dependency]);
         }
         levels.push(ready);
@@ -2280,7 +2389,125 @@ fn reference_dependency_levels(
         signature.range().start <= reference.digest_value_range.start
             && signature.range().end >= reference.digest_value_range.end
     }));
-    Ok(levels)
+    Ok(SigningDependencyPlan {
+        dependencies: analyses,
+        levels,
+    })
+}
+
+fn compile_signing_operation_plan(
+    operation: &mut OperationExecutionContext<
+        crate::policy::SigningPolicy,
+        &mut SigningOperationBudgets,
+    >,
+    dependency_plan: &SigningDependencyPlan,
+    setup_gate: Option<OperationNodeId>,
+) -> Result<(Vec<Vec<OperationNodeId>>, SigningPlanNodes), SigningDigestError> {
+    let reference_count = dependency_plan.levels.iter().map(Vec::len).sum::<usize>();
+    let mut digest_nodes = vec![None; reference_count];
+    for (index, digest_slot) in digest_nodes.iter_mut().enumerate() {
+        let digest_node = operation.add_node(
+            OperationNodeKind::Digest { index },
+            OperationStage::Digest,
+            None,
+        );
+        if let Some(setup_gate) = setup_gate {
+            operation
+                .add_dependency(digest_node, setup_gate)
+                .map_err(map_signing_digest_plan_error)?;
+        }
+        *digest_slot = Some(digest_node);
+    }
+
+    let mut node_levels = Vec::with_capacity(dependency_plan.levels.len());
+    for level in &dependency_plan.levels {
+        let nodes = level
+            .iter()
+            .map(|index| {
+                digest_nodes
+                    .get(*index)
+                    .and_then(|node| *node)
+                    .ok_or_else(|| {
+                        SigningDigestError::InvalidStructure(
+                            "compiled signing Reference index is unavailable".into(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (index, node) in level.iter().zip(&nodes) {
+            for dependency_index in &dependency_plan.dependencies[*index] {
+                let dependency = digest_nodes
+                    .get(*dependency_index)
+                    .and_then(|node| *node)
+                    .ok_or_else(|| {
+                        SigningDigestError::InvalidStructure(
+                            "compiled signing dependency index is unavailable".into(),
+                        )
+                    })?;
+                operation
+                    .add_dependency(*node, dependency)
+                    .map_err(map_signing_digest_plan_error)?;
+            }
+        }
+        node_levels.push(nodes);
+    }
+
+    let canonicalization = operation.add_node(
+        OperationNodeKind::Canonicalization,
+        OperationStage::Canonicalization,
+        None,
+    );
+    for digest in digest_nodes.iter().flatten() {
+        operation
+            .add_dependency(canonicalization, *digest)
+            .map_err(map_signing_digest_plan_error)?;
+    }
+    let crypto = operation.add_node(OperationNodeKind::Crypto, OperationStage::Crypto, None);
+    operation
+        .add_dependency(crypto, canonicalization)
+        .map_err(map_signing_digest_plan_error)?;
+    let evidence = operation.add_node(OperationNodeKind::Evidence, OperationStage::Evidence, None);
+    operation
+        .add_dependency(evidence, crypto)
+        .map_err(map_signing_digest_plan_error)?;
+    let mutation = operation.add_node(OperationNodeKind::Mutation, OperationStage::Mutation, None);
+    operation
+        .add_dependency(mutation, evidence)
+        .map_err(map_signing_digest_plan_error)?;
+    operation.compile().map_err(map_signing_digest_plan_error)?;
+
+    Ok((
+        node_levels,
+        SigningPlanNodes {
+            canonicalization,
+            crypto,
+            evidence,
+            mutation,
+        },
+    ))
+}
+
+fn map_signing_digest_plan_error(error: OperationPlanError) -> SigningDigestError {
+    SigningDigestError::InvalidStructure(error.to_string())
+}
+
+fn commit_signed_staged(
+    document: &mut XmlDocument,
+    staged: XmlDocument,
+    policy: &crate::policy::SigningPolicy,
+) -> Result<(), SigningError> {
+    let mut operation = OperationExecutionContext::new(
+        policy.clone(),
+        (),
+        Some((document.identity(), document.generation())),
+    );
+    let mutation = operation.add_node(OperationNodeKind::Mutation, OperationStage::Mutation, None);
+    operation.compile()?;
+    operation.run_document_transition(mutation, document, |document, _| {
+        document
+            .commit_staged(staged)
+            .map_err(map_owned_document_mutation_error)
+    })
 }
 
 fn validate_signing_references(

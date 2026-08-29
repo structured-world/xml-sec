@@ -41,6 +41,8 @@ pub mod encoding;
 pub mod error;
 mod hard_limits;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+mod operation;
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub mod policy;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub mod provider;

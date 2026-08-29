@@ -3,6 +3,21 @@
 Enable the `xmlenc` feature for AES-CBC/GCM content encryption and decryption, RSA-OAEP key
 transport, AES Key Wrap, multiple recipients, and Element/Content document replacement.
 
+Encryption and decryption compile explicit operation plans that order document parsing,
+key resolution, provider dispatch, evidence finalization, and optional mutation. The
+operation context owns the immutable policy, stable document identity/generation, XML
+parse-work and key-candidate budgets, and deterministic decision state. All recipient
+retries consume that single context; a successful provider call is not reported as an
+accepted operation until output validation succeeds, and document replacement remains
+the terminal graph node. Failed candidates or replacement validation leave an owned
+document and its generation unchanged.
+Dependency and resource checks run before the closure that performs each phase. A
+controlled replacement must start at the context's expected generation, commit exactly
+one new generation, and advance that expectation before any later node can execute;
+stale or foreign document state is therefore rejected before mutation work begins.
+Compiled graph failures are reported as `XmlEncError::OperationPlan`; malformed XMLEnc
+element order or namespaces remain `XmlEncError::InvalidStructure`.
+
 ## Direct-Key Encryption
 
 `EncryptedDataBuilder` can encrypt opaque bytes, one XML element, an XML content fragment, or a
