@@ -1037,10 +1037,23 @@ fn validate_encrypted_key_policy(
             }
             .into());
         }
-        let digest = parse_oaep_digest(encrypted_key.encryption_method.oaep_digest.as_deref())?;
-        let mgf_digest =
-            parse_oaep_mgf_digest(encrypted_key.encryption_method.mgf_algorithm.as_deref())?;
-        for selected in [digest, mgf_digest] {
+        let method = &encrypted_key.encryption_method;
+        let digest = parse_oaep_digest(method.oaep_digest.as_deref())?;
+        let mgf_digest = parse_oaep_mgf_digest(method.mgf_algorithm.as_deref())?;
+        let selected_algorithms = [
+            (
+                digest,
+                method.oaep_digest.as_deref().unwrap_or(digest.uri()),
+            ),
+            (
+                mgf_digest,
+                method
+                    .mgf_algorithm
+                    .as_deref()
+                    .unwrap_or(mgf_digest.mgf_uri()),
+            ),
+        ];
+        for (selected, wire_uri) in selected_algorithms {
             if policy
                 .oaep_digests
                 .as_ref()
@@ -1048,7 +1061,7 @@ fn validate_encrypted_key_policy(
             {
                 return Err(crate::policy::PolicyViolation::Algorithm {
                     operation: "decryption",
-                    algorithm: selected.uri().to_owned(),
+                    algorithm: wire_uri.to_owned(),
                 }
                 .into());
             }
@@ -3106,10 +3119,10 @@ mod tests {
             recipient: Some("selected".into()),
             key_name: None,
             encryption_method: super::super::EncryptionMethod {
-                algorithm: KeyTransportAlgorithm::RsaOaep11.uri().into(),
+                algorithm: KeyTransportAlgorithm::RsaOaepMgf1p.uri().into(),
                 key_size_bits: None,
                 oaep_digest: Some(OaepDigestAlgorithm::Sha256.uri().into()),
-                mgf_algorithm: Some("http://www.w3.org/2009/xmlenc11#mgf1sha1".into()),
+                mgf_algorithm: Some(OaepDigestAlgorithm::Sha384.mgf_uri().into()),
                 oaep_params: None,
             },
             cipher_data: super::super::CipherData {
@@ -3148,8 +3161,8 @@ mod tests {
             .policy(policy)
             .decrypt_data(&encrypted),
             Err(XmlEncError::Policy(
-                crate::policy::PolicyViolation::Algorithm { .. }
-            ))
+                crate::policy::PolicyViolation::Algorithm { algorithm, .. }
+            )) if algorithm == OaepDigestAlgorithm::Sha384.mgf_uri()
         ));
 
         let ciphertext = crate::provider::default_provider()

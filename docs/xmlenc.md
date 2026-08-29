@@ -83,17 +83,15 @@ while recipient mode consumes one candidate per independently wrapped recipient.
 `max_encryption_recipients` ceiling still applies, so the tighter of the two limits wins.
 `validate_rsa_recipient_key` exposes that same preflight to ordered key registries, allowing them
 to skip policy-invalid candidates before committing to one without duplicating policy limits.
-Configuration validation rejects any non-SHA-1 MGF digest for the legacy URI before provider
-dispatch because its wire format cannot represent an alternative.
 AES-KW configuration similarly validates the KEK size fixed by its algorithm URI before provider
 dispatch, so custom providers cannot reinterpret `kw-aes128` with a 256-bit KEK or `kw-aes256`
 with a 128-bit KEK. A custom provider's wrapped-key output must contain the complete RFC 3394 value,
 which is exactly eight bytes longer than the content key; the facade validates that framing before
 serializing `EncryptedKey`.
 The same `EncryptionMethod` structural validation applies to parsed XML and caller-constructed
-typed values: an explicit `xenc11:MGF` is valid only with the XML Encryption 1.1 RSA-OAEP URI and
-is rejected before key resolution on the legacy URI. Every supplied `KeySize` must be positive;
-fixed-width AES methods additionally require it to match the selected algorithm.
+typed values: an explicit `xenc11:MGF` is valid with either RSA-OAEP URI and rejected on non-OAEP
+methods. Every supplied `KeySize` must be positive; fixed-width AES methods additionally require it
+to match the selected algorithm.
 
 `encrypt_document` selects the root or an element by `Id`, `ID`, or `id`, then replaces either
 the complete element or only its child content according to `EncryptedDataType`. See
