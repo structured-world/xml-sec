@@ -6,6 +6,18 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub usize);
 
+/// Stable identity of any XPath node in one owned document.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NodeReference {
+    /// A root, element, text, comment, or processing-instruction arena node.
+    Node(NodeId),
+    /// An attribute identified within its owning element's stable attribute order.
+    Attribute { owner: NodeId, index: usize },
+    /// A namespace node identified within its owning element's namespace set.
+    Namespace { owner: NodeId, index: usize },
+}
+
 /// Namespace-expanded XML name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExpandedName {
@@ -208,39 +220,53 @@ impl Document {
             NodeKind::ProcessingInstruction { value, .. } => value.clone().unwrap_or_default(),
             NodeKind::Root | NodeKind::Element { .. } => {
                 let mut output = String::new();
-                self.collect_text(id, &mut output);
+                let mut pending = node.children.iter().rev().copied().collect::<Vec<_>>();
+                while let Some(current) = pending.pop() {
+                    let Some(current) = self.node(current) else {
+                        continue;
+                    };
+                    if let NodeKind::Text { value, .. } = &current.kind {
+                        output.push_str(value);
+                    }
+                    pending.extend(current.children.iter().rev().copied());
+                }
                 output
             }
         }
     }
 
-    fn collect_text(&self, id: NodeId, output: &mut String) {
-        let Some(node) = self.node(id) else { return };
-        if let NodeKind::Text { value, .. } = &node.kind {
-            output.push_str(value);
-        }
-        for child in &node.children {
-            self.collect_text(*child, output);
-        }
-    }
-
     pub(crate) fn retain_nodes(&mut self, mut keep: impl FnMut(NodeId, &Node) -> bool) {
-        for index in 0..self.nodes.len() {
-            let id = NodeId(index);
-            let children = self.nodes[index]
-                .children
-                .iter()
-                .copied()
-                .filter(|child| keep(*child, &self.nodes[child.0]))
-                .collect();
-            self.nodes[index].children = children;
-            let _ = id;
+        let mut retained = vec![self.root];
+        let mut cursor = 0;
+        while cursor < retained.len() {
+            let id = retained[cursor];
+            for child in &self.nodes[id.0].children {
+                if keep(*child, &self.nodes[child.0]) {
+                    retained.push(*child);
+                }
+            }
+            cursor += 1;
         }
+        let remap = retained
+            .iter()
+            .enumerate()
+            .map(|(new, old)| (*old, NodeId(new)))
+            .collect::<HashMap<_, _>>();
+        self.nodes = retained
+            .into_iter()
+            .map(|old| {
+                let mut node = self.nodes[old.0].clone();
+                node.parent = node.parent.and_then(|parent| remap.get(&parent).copied());
+                node.children = node
+                    .children
+                    .into_iter()
+                    .filter_map(|child| remap.get(&child).copied())
+                    .collect();
+                node
+            })
+            .collect();
+        self.root = NodeId(0);
         self.source_xml = None;
-    }
-
-    pub(crate) fn rebuild_source_xml(&mut self, xml: String) {
-        self.source_xml = Some(xml);
     }
 }
 
@@ -261,6 +287,9 @@ fn attribute_prefix(
     attribute: roxmltree::Attribute<'_, '_>,
 ) -> Option<String> {
     let namespace = attribute.namespace()?;
+    if namespace == "http://www.w3.org/XML/1998/namespace" {
+        return Some("xml".into());
+    }
     node.namespaces()
         .find(|entry| entry.uri() == namespace && entry.name().is_some())
         .and_then(|entry| entry.name())

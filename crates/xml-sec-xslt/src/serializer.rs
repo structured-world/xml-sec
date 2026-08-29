@@ -59,17 +59,56 @@ pub(crate) fn serialize(
     definition: &OutputDefinition,
     meter: &mut Meter,
 ) -> Result<SerializedOutput> {
+    serialize_charged(document, definition, meter, BudgetKind::SerializedBytes)
+}
+
+pub(crate) fn serialize_projection(document: &Document, meter: &mut Meter) -> Result<String> {
+    let definition = OutputDefinition {
+        omit_xml_declaration: true,
+        method_explicit: true,
+        ..OutputDefinition::default()
+    };
+    let output = serialize_charged(document, &definition, meter, BudgetKind::OwnedBytes)?;
+    String::from_utf8(output.bytes)
+        .map_err(|_| Error::Serialization("semantic projection is not UTF-8".into()))
+}
+
+fn serialize_charged(
+    document: &Document,
+    definition: &OutputDefinition,
+    meter: &mut Meter,
+    budget_kind: BudgetKind,
+) -> Result<SerializedOutput> {
     let mut definition = definition.clone();
     if !definition.method_explicit
-        && document
-            .node(document.root())
-            .and_then(|root| root.children.first())
-            .and_then(|id| document.node(*id))
+        && first_element(document)
             .is_some_and(|node| matches!(&node.kind, NodeKind::Element { name, .. } if name.namespace.is_none() && name.local.eq_ignore_ascii_case("html")))
     {
         definition.method = OutputMethod::Html;
     }
-    let mut text = String::new();
+    let mut counter = RenderBuffer::Count(EncodingCounter::new(&definition.encoding)?);
+    render(document, &definition, &mut counter)?;
+    let text_bytes = counter.len();
+    let encoded_bytes = counter.encoded_len();
+    meter.check_additional(budget_kind, encoded_bytes)?;
+    meter.charge(BudgetKind::OwnedBytes, text_bytes)?;
+    let mut text = RenderBuffer::Text(String::with_capacity(text_bytes));
+    render(document, &definition, &mut text)?;
+    let text = text.into_string();
+    validate_xml_characters(&text, definition.version.as_deref().unwrap_or("1.0"))?;
+    let bytes = encode(&text, &definition.encoding, meter, budget_kind)?;
+    Ok(SerializedOutput {
+        bytes,
+        encoding: definition.encoding.clone(),
+        media_type: definition.media_type.clone(),
+    })
+}
+
+fn render(
+    document: &Document,
+    definition: &OutputDefinition,
+    text: &mut RenderBuffer,
+) -> Result<()> {
     if definition.method == OutputMethod::Xml && !definition.omit_xml_declaration {
         text.push_str("<?xml version=\"");
         text.push_str(definition.version.as_deref().unwrap_or("1.0"));
@@ -97,21 +136,20 @@ pub(crate) fn serialize(
             }
             _ => None,
         })
-        && (definition.doctype_public.is_some() || definition.doctype_system.is_some())
+        && definition.doctype_system.is_some()
     {
         text.push_str("<!DOCTYPE ");
-        push_name(root_name.0, root_name.1, &mut text);
+        push_name(root_name.0, root_name.1, text);
         match (&definition.doctype_public, &definition.doctype_system) {
-            (Some(public), system) => {
+            (Some(public), Some(system)) => {
                 text.push_str(" PUBLIC \"");
                 text.push_str(public);
                 text.push('"');
-                if let Some(system) = system {
-                    text.push_str(" \"");
-                    text.push_str(system);
-                    text.push('"');
-                }
+                text.push_str(" \"");
+                text.push_str(system);
+                text.push('"');
             }
+            (Some(_), None) => {}
             (None, Some(system)) => {
                 text.push_str(" SYSTEM \"");
                 text.push_str(system);
@@ -129,24 +167,163 @@ pub(crate) fn serialize(
         .ok_or_else(|| Error::Serialization("missing result root".into()))?
         .children
     {
-        serialize_node(document, *child, &definition, &mut text, 0, None)?;
+        serialize_node(document, *child, definition, text, 0, None, false)?;
     }
-    let bytes = encode(&text, &definition.encoding)?;
-    meter.charge(BudgetKind::SerializedBytes, bytes.len())?;
-    Ok(SerializedOutput {
-        bytes,
-        encoding: definition.encoding.clone(),
-        media_type: definition.media_type.clone(),
-    })
+    Ok(())
+}
+
+enum RenderBuffer {
+    Count(EncodingCounter),
+    Text(String),
+}
+
+impl RenderBuffer {
+    fn push_str(&mut self, value: &str) {
+        match self {
+            Self::Count(counter) => counter.push_str(value),
+            Self::Text(output) => output.push_str(value),
+        }
+    }
+
+    fn push(&mut self, value: char) {
+        match self {
+            Self::Count(counter) => counter.push(value),
+            Self::Text(output) => output.push(value),
+        }
+    }
+
+    const fn len(&self) -> usize {
+        match self {
+            Self::Count(counter) => counter.utf8_bytes,
+            Self::Text(output) => output.len(),
+        }
+    }
+
+    fn into_string(self) -> String {
+        match self {
+            Self::Text(output) => output,
+            Self::Count(_) => unreachable!("counting buffer does not contain rendered text"),
+        }
+    }
+
+    fn encoded_len(&mut self) -> usize {
+        match self {
+            Self::Count(counter) => counter.finish(),
+            Self::Text(output) => output.len(),
+        }
+    }
+}
+
+enum EncodingCounterKind {
+    Utf8,
+    Latin1,
+    Utf16,
+    Other(encoding_rs::Encoder),
+}
+
+struct EncodingCounter {
+    utf8_bytes: usize,
+    encoded_bytes: usize,
+    kind: EncodingCounterKind,
+    finished: bool,
+}
+
+impl EncodingCounter {
+    fn new(label: &str) -> Result<Self> {
+        let kind = if label.eq_ignore_ascii_case("utf-8") {
+            EncodingCounterKind::Utf8
+        } else if label.eq_ignore_ascii_case("iso-8859-1") || label.eq_ignore_ascii_case("latin1") {
+            EncodingCounterKind::Latin1
+        } else if matches!(
+            label.to_ascii_lowercase().as_str(),
+            "utf-16" | "utf-16le" | "utf-16be"
+        ) {
+            EncodingCounterKind::Utf16
+        } else {
+            let encoding = encoding_rs::Encoding::for_label(label.as_bytes()).ok_or_else(|| {
+                Error::Serialization(format!("unsupported output encoding {label}"))
+            })?;
+            EncodingCounterKind::Other(encoding.new_encoder())
+        };
+        let encoded_bytes = matches!(kind, EncodingCounterKind::Utf16)
+            .then_some(2)
+            .unwrap_or(0);
+        Ok(Self {
+            utf8_bytes: 0,
+            encoded_bytes,
+            kind,
+            finished: false,
+        })
+    }
+
+    fn push(&mut self, character: char) {
+        let mut buffer = [0_u8; 4];
+        self.push_str(character.encode_utf8(&mut buffer));
+    }
+
+    fn push_str(&mut self, value: &str) {
+        self.utf8_bytes = self.utf8_bytes.saturating_add(value.len());
+        match &mut self.kind {
+            EncodingCounterKind::Utf8 => {
+                self.encoded_bytes = self.encoded_bytes.saturating_add(value.len())
+            }
+            EncodingCounterKind::Latin1 => {
+                for character in value.chars() {
+                    self.encoded_bytes = self.encoded_bytes.saturating_add(
+                        u8::try_from(u32::from(character))
+                            .map_or_else(|_| format!("&#{};", u32::from(character)).len(), |_| 1),
+                    );
+                }
+            }
+            EncodingCounterKind::Utf16 => {
+                self.encoded_bytes = self
+                    .encoded_bytes
+                    .saturating_add(value.encode_utf16().count().saturating_mul(2));
+            }
+            EncodingCounterKind::Other(encoder) => {
+                self.encoded_bytes = self
+                    .encoded_bytes
+                    .saturating_add(count_encoded(encoder, value, false));
+            }
+        }
+    }
+
+    fn finish(&mut self) -> usize {
+        if !self.finished {
+            if let EncodingCounterKind::Other(encoder) = &mut self.kind {
+                self.encoded_bytes = self
+                    .encoded_bytes
+                    .saturating_add(count_encoded(encoder, "", true));
+            }
+            self.finished = true;
+        }
+        self.encoded_bytes
+    }
+}
+
+fn count_encoded(encoder: &mut encoding_rs::Encoder, mut source: &str, last: bool) -> usize {
+    let mut total = 0usize;
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let (result, read, written, _) = encoder.encode_from_utf8(source, &mut buffer, last);
+        total = total.saturating_add(written);
+        source = &source[read..];
+        match result {
+            encoding_rs::CoderResult::InputEmpty => break,
+            encoding_rs::CoderResult::OutputFull => {}
+        }
+    }
+    total
 }
 
 fn serialize_node(
     document: &Document,
     id: NodeId,
     definition: &OutputDefinition,
-    output: &mut String,
+    output: &mut RenderBuffer,
     depth: usize,
     parent_name: Option<&crate::ExpandedName>,
+    parent_mixed: bool,
 ) -> Result<()> {
     let node = document
         .node(id)
@@ -154,7 +331,15 @@ fn serialize_node(
     match &node.kind {
         NodeKind::Root => {
             for child in &node.children {
-                serialize_node(document, *child, definition, output, depth, parent_name)?;
+                serialize_node(
+                    document,
+                    *child,
+                    definition,
+                    output,
+                    depth,
+                    parent_name,
+                    parent_mixed,
+                )?;
             }
         }
         NodeKind::Text {
@@ -197,7 +382,15 @@ fn serialize_node(
         }
         NodeKind::Element { .. } if definition.method == OutputMethod::Text => {
             for child in &node.children {
-                serialize_node(document, *child, definition, output, depth, parent_name)?;
+                serialize_node(
+                    document,
+                    *child,
+                    definition,
+                    output,
+                    depth,
+                    parent_name,
+                    parent_mixed,
+                )?;
             }
         }
         NodeKind::Element {
@@ -206,7 +399,13 @@ fn serialize_node(
             attributes,
             namespaces,
         } if definition.method != OutputMethod::Text => {
-            if definition.indent && depth > 0 {
+            let mixed = node.children.iter().any(|child| {
+                matches!(
+                    document.node(*child).map(|child| &child.kind),
+                    Some(NodeKind::Text { value, .. }) if !value.is_empty()
+                )
+            });
+            if definition.indent && depth > 0 && !parent_mixed {
                 output.push('\n');
                 output.push_str(&"  ".repeat(depth));
             }
@@ -231,9 +430,18 @@ fn serialize_node(
             }
             output.push('>');
             for child in &node.children {
-                serialize_node(document, *child, definition, output, depth + 1, Some(name))?;
+                serialize_node(
+                    document,
+                    *child,
+                    definition,
+                    output,
+                    depth + 1,
+                    Some(name),
+                    mixed,
+                )?;
             }
             if definition.indent
+                && !mixed
                 && node.children.iter().any(|child| {
                     matches!(
                         document.node(*child).map(|node| &node.kind),
@@ -273,7 +481,7 @@ fn serialize_node(
     Ok(())
 }
 
-fn push_name(prefix: Option<&str>, local: &str, output: &mut String) {
+fn push_name(prefix: Option<&str>, local: &str, output: &mut RenderBuffer) {
     if let Some(prefix) = prefix {
         output.push_str(prefix);
         output.push(':');
@@ -281,7 +489,7 @@ fn push_name(prefix: Option<&str>, local: &str, output: &mut String) {
     output.push_str(local);
 }
 
-fn escape_text(value: &str, output: &mut String) {
+fn escape_text(value: &str, output: &mut RenderBuffer) {
     for character in value.chars() {
         match character {
             '&' => output.push_str("&amp;"),
@@ -292,7 +500,7 @@ fn escape_text(value: &str, output: &mut String) {
     }
 }
 
-fn escape_attribute(value: &str, output: &mut String) {
+fn escape_attribute(value: &str, output: &mut RenderBuffer) {
     for character in value.chars() {
         match character {
             '&' => output.push_str("&amp;"),
@@ -306,30 +514,94 @@ fn escape_attribute(value: &str, output: &mut String) {
     }
 }
 
-fn encode(value: &str, label: &str) -> Result<Vec<u8>> {
+fn encode(value: &str, label: &str, meter: &mut Meter, budget_kind: BudgetKind) -> Result<Vec<u8>> {
     if label.eq_ignore_ascii_case("utf-8") {
+        meter.charge(budget_kind, value.len())?;
         return Ok(value.as_bytes().to_vec());
     }
     if label.eq_ignore_ascii_case("iso-8859-1") || label.eq_ignore_ascii_case("latin1") {
-        return value
-            .chars()
-            .map(|character| {
-                u8::try_from(u32::from(character)).map_err(|_| {
-                    Error::Serialization(format!(
-                        "character U+{:04X} is not representable in ISO-8859-1",
-                        u32::from(character)
-                    ))
-                })
-            })
-            .collect();
+        let mut bytes = Vec::new();
+        for character in value.chars() {
+            if let Ok(byte) = u8::try_from(u32::from(character)) {
+                meter.charge(budget_kind, 1)?;
+                bytes.push(byte);
+            } else {
+                let reference = format!("&#{};", u32::from(character));
+                meter.charge(budget_kind, reference.len())?;
+                bytes.extend_from_slice(reference.as_bytes());
+            }
+        }
+        return Ok(bytes);
+    }
+    if label.eq_ignore_ascii_case("utf-16") || label.eq_ignore_ascii_case("utf-16le") {
+        let units = value.encode_utf16().count();
+        let length = units
+            .checked_mul(2)
+            .and_then(|length| length.checked_add(2))
+            .unwrap_or(usize::MAX);
+        meter.charge(budget_kind, length)?;
+        let mut bytes = Vec::with_capacity(length);
+        bytes.extend_from_slice(&[0xFF, 0xFE]);
+        for unit in value.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        return Ok(bytes);
+    }
+    if label.eq_ignore_ascii_case("utf-16be") {
+        let units = value.encode_utf16().count();
+        let length = units
+            .checked_mul(2)
+            .and_then(|length| length.checked_add(2))
+            .unwrap_or(usize::MAX);
+        meter.charge(budget_kind, length)?;
+        let mut bytes = Vec::with_capacity(length);
+        bytes.extend_from_slice(&[0xFE, 0xFF]);
+        for unit in value.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        return Ok(bytes);
     }
     let encoding = encoding_rs::Encoding::for_label(label.as_bytes())
         .ok_or_else(|| Error::Serialization(format!("unsupported output encoding {label}")))?;
-    let (bytes, _, had_errors) = encoding.encode(value);
-    if had_errors {
-        return Err(Error::Serialization(format!(
-            "output is not representable in {label}"
-        )));
+    let mut encoder = encoding.new_encoder();
+    let mut source = value;
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let (result, read, written, _) = encoder.encode_from_utf8(source, &mut buffer, true);
+        meter.charge(budget_kind, written)?;
+        bytes.extend_from_slice(&buffer[..written]);
+        source = &source[read..];
+        match result {
+            encoding_rs::CoderResult::InputEmpty => break,
+            encoding_rs::CoderResult::OutputFull => {}
+        }
     }
-    Ok(bytes.into_owned())
+    Ok(bytes)
+}
+
+fn first_element(document: &Document) -> Option<&crate::Node> {
+    document
+        .node(document.root())?
+        .children
+        .iter()
+        .filter_map(|id| document.node(*id))
+        .find(|node| matches!(node.kind, NodeKind::Element { .. }))
+}
+
+fn validate_xml_characters(value: &str, version: &str) -> Result<()> {
+    for character in value.chars() {
+        let code = u32::from(character);
+        let valid = if version == "1.1" {
+            matches!(code, 0x1..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
+        } else {
+            matches!(code, 0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
+        };
+        if !valid {
+            return Err(Error::Serialization(format!(
+                "character U+{code:04X} is forbidden by XML {version}"
+            )));
+        }
+    }
+    Ok(())
 }

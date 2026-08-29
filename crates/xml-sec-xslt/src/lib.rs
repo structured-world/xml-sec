@@ -13,7 +13,7 @@
 //! # fn main() -> Result<(), xml_sec_xslt::Error> {
 //! let stylesheet = Compiler::new(
 //!     Arc::new(NoResolver),
-//!     CompileBudget::new(64 * 1024, 0, 256 * 1024),
+//!     CompileBudget::new(64 * 1024, 0, 128, 256 * 1024),
 //! ).compile(
 //!     r#"<xsl:stylesheet version="1.0"
 //!          xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
@@ -39,7 +39,9 @@ mod xpath;
 pub use budget::{BudgetKind, CompileBudget, ExecutionBudget};
 pub use compiler::{Compiler, Stylesheet};
 pub use error::{Error, ErrorKind, Result};
-pub use model::{Attribute, Document, ExpandedName, Namespace, Node, NodeId, NodeKind};
+pub use model::{
+    Attribute, Document, ExpandedName, Namespace, Node, NodeId, NodeKind, NodeReference,
+};
 pub use resolver::{NoResolver, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity};
 pub use runtime::{ExecutionOptions, Message, Parameters, TransformResult};
 pub use serializer::{OutputDefinition, OutputMethod, SerializedOutput};

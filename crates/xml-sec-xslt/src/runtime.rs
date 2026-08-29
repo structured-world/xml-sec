@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,15 +50,9 @@ impl Stylesheet {
         options: ExecutionOptions,
     ) -> Result<TransformResult> {
         let source_bytes = source.source_xml().map_or(0, str::len);
-        let prepared = self.prepare_source(source)?;
-        let mut state = Execution::new(
-            self,
-            &prepared,
-            parameters,
-            resolver,
-            options.budget,
-            source_bytes,
-        )?;
+        let mut meter = Meter::new(options.budget, source_bytes)?;
+        let prepared = self.prepare_source(source, source_bytes, &mut meter)?;
+        let mut state = Execution::new(self, prepared.as_ref(), parameters, resolver, meter)?;
         let root = SourceNode::Node(prepared.root());
         if let Some(name) = options.initial_template {
             state.call_named(&name, &HashMap::new(), &root, 1, 1, 1)?;
@@ -77,12 +72,18 @@ impl Stylesheet {
         })
     }
 
-    fn prepare_source(&self, source: &Document) -> Result<Document> {
+    fn prepare_source<'a>(
+        &self,
+        source: &'a Document,
+        source_bytes: usize,
+        meter: &mut Meter,
+    ) -> Result<Cow<'a, Document>> {
         if self.whitespace.is_empty() {
-            return Ok(source.clone());
+            return Ok(Cow::Borrowed(source));
         }
+        meter.charge(BudgetKind::OwnedBytes, source_bytes)?;
         let mut prepared = source.clone();
-        let original = source.clone();
+        let original = source;
         prepared.retain_nodes(|id, node| {
             let NodeKind::Text { value, .. } = &node.kind else {
                 return true;
@@ -93,42 +94,36 @@ impl Stylesheet {
             let Some(parent) = node.parent.and_then(|parent| original.node(parent)) else {
                 return true;
             };
-            let NodeKind::Element {
-                name, attributes, ..
-            } = &parent.kind
-            else {
+            let NodeKind::Element { name, .. } = &parent.kind else {
                 return true;
             };
-            if attributes.iter().any(|attribute| {
-                attribute.name.namespace.as_deref() == Some("http://www.w3.org/XML/1998/namespace")
-                    && attribute.name.local == "space"
-                    && attribute.value == "preserve"
-            }) {
+            let xml_space = node.parent.and_then(|mut ancestor| {
+                loop {
+                    let current = original.node(ancestor)?;
+                    if let NodeKind::Element { attributes, .. } = &current.kind
+                        && let Some(value) = attributes.iter().find_map(|attribute| {
+                            (attribute.name.namespace.as_deref()
+                                == Some("http://www.w3.org/XML/1998/namespace")
+                                && attribute.name.local == "space")
+                                .then_some(attribute.value.as_str())
+                        })
+                    {
+                        break Some(value);
+                    }
+                    ancestor = current.parent?;
+                }
+            });
+            if xml_space == Some("preserve") {
                 return true;
             }
             let decision = self
                 .whitespace
                 .iter()
                 .filter(|(test, _, _, _)| test.matches(name))
-                .max_by_key(|(_, _, precedence, order)| (*precedence, *order));
+                .max_by_key(|(test, _, precedence, order)| (*precedence, test.priority(), *order));
             !matches!(decision, Some((_, false, _, _))) || id == original.root()
         });
-        // XPath is evaluated by the independent SXD engine, so keep its lexical input in
-        // lockstep with the filtered semantic tree.
-        let mut meter = Meter::new(
-            ExecutionBudget::unlimited(),
-            source.source_xml().map_or(0, str::len),
-        )?;
-        let lexical = serialize(
-            &prepared,
-            &crate::serializer::OutputDefinition::default(),
-            &mut meter,
-        )?;
-        prepared.rebuild_source_xml(
-            String::from_utf8(lexical.bytes)
-                .map_err(|_| Error::Xml("prepared source is not UTF-8".into()))?,
-        );
-        Ok(prepared)
+        Ok(Cow::Owned(prepared))
     }
 }
 
@@ -171,16 +166,15 @@ impl<'a> Execution<'a> {
         source: &'a Document,
         parameters: &Parameters,
         resolver: Arc<R>,
-        budget: ExecutionBudget,
-        source_bytes: usize,
+        mut meter: Meter,
     ) -> Result<Self> {
         let mut state = Self {
             stylesheet,
-            evaluator: Evaluator::new(source)?,
+            evaluator: Evaluator::new(source, &mut meter)?,
             result: Document::empty(None),
             output_stack: vec![NodeId(0)],
             scopes: vec![parameters.clone()],
-            meter: Meter::new(budget, source_bytes)?,
+            meter,
             messages: vec![],
             _resolver: resolver,
             modes: vec![None],
@@ -195,20 +189,52 @@ impl<'a> Execution<'a> {
     }
 
     fn initialize_globals(&mut self, parameters: &Parameters) -> Result<()> {
-        let mut declarations = self.stylesheet.globals.iter().collect::<Vec<_>>();
-        declarations.sort_by_key(|global| (global.precedence, global.order));
-        for global in declarations {
-            if global.is_parameter && parameters.contains_key(&global.variable.name) {
-                continue;
+        let mut effective = HashMap::new();
+        for global in self.stylesheet.globals.iter() {
+            if effective.get(&global.variable.name).is_none_or(
+                |current: &&crate::compiler::GlobalVariable| global.precedence > current.precedence,
+            ) {
+                effective.insert(global.variable.name.clone(), global);
             }
-            let value = self.evaluate_variable(
-                &global.variable,
-                &SourceNode::Node(self.evaluator.source.root()),
-                1,
-                1,
-                1,
-            )?;
-            self.scopes[0].insert(global.variable.name.clone(), value);
+        }
+        let mut pending = effective.into_values().collect::<Vec<_>>();
+        pending.sort_by_key(|global| global.order);
+        while !pending.is_empty() {
+            let mut deferred = Vec::new();
+            let mut progressed = false;
+            for global in pending {
+                if global.is_parameter && parameters.contains_key(&global.variable.name) {
+                    progressed = true;
+                    continue;
+                }
+                match self.evaluate_variable(
+                    &global.variable,
+                    &SourceNode::Node(self.evaluator.source.root()),
+                    1,
+                    1,
+                    1,
+                ) {
+                    Ok(value) => {
+                        self.scopes[0].insert(global.variable.name.clone(), value);
+                        progressed = true;
+                    }
+                    Err(Error::Dynamic(message)) if message.contains("unknown variable") => {
+                        deferred.push(global)
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if !progressed {
+                let names = deferred
+                    .iter()
+                    .map(|global| global.variable.name.local.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::Dynamic(format!(
+                    "circular or unresolved global variable dependency: {names}"
+                )));
+            }
+            pending = deferred;
         }
         Ok(())
     }
@@ -423,7 +449,7 @@ impl<'a> Execution<'a> {
                 parameters,
             } => {
                 let mut nodes = self.select_nodes(select, node, position, size)?;
-                self.sort_nodes(&mut nodes, sorts)?;
+                self.sort_nodes(&mut nodes, sorts, node, position, size)?;
                 let supplied =
                     self.evaluate_with_params(parameters, node, position, size, depth)?;
                 let total = nodes.len();
@@ -462,7 +488,7 @@ impl<'a> Execution<'a> {
                 body,
             } => {
                 let mut nodes = self.select_nodes(select, node, position, size)?;
-                self.sort_nodes(&mut nodes, sorts)?;
+                self.sort_nodes(&mut nodes, sorts, node, position, size)?;
                 let total = nodes.len();
                 for (index, selected) in nodes.iter().enumerate() {
                     self.scopes.push(HashMap::new());
@@ -530,8 +556,11 @@ impl<'a> Execution<'a> {
                 match self.evaluate(select, node, position, size)? {
                     XPathValue::NodeSet(nodes) => {
                         for selected in nodes {
-                            self.copy_source(&selected, self.parent())?
+                            self.copy_source(&selected, self.parent(), depth + 1)?
                         }
+                    }
+                    XPathValue::ResultTreeFragment(fragment) => {
+                        self.copy_document(&fragment, fragment.root(), self.parent(), depth + 1)?;
                     }
                     value => {
                         let text = value.string(&self.evaluator);
@@ -627,6 +656,7 @@ impl<'a> Execution<'a> {
             Instruction::Element {
                 name,
                 namespace,
+                namespaces: static_namespaces,
                 body,
                 attribute_sets,
             } => {
@@ -639,7 +669,7 @@ impl<'a> Execution<'a> {
                     .or_else(|| {
                         prefix
                             .as_deref()
-                            .and_then(|prefix| self.lookup_namespace(prefix))
+                            .and_then(|prefix| static_namespace(static_namespaces, prefix))
                     });
                 let namespaces = namespace
                     .as_ref()
@@ -677,6 +707,7 @@ impl<'a> Execution<'a> {
             Instruction::Attribute {
                 name,
                 namespace,
+                namespaces: static_namespaces,
                 body,
             } => {
                 let lexical = self.evaluate_avt(name, node, position, size)?;
@@ -688,7 +719,7 @@ impl<'a> Execution<'a> {
                     .or_else(|| {
                         prefix
                             .as_deref()
-                            .and_then(|prefix| self.lookup_namespace(prefix))
+                            .and_then(|prefix| static_namespace(static_namespaces, prefix))
                     });
                 let value =
                     self.capture_text(body, node, position, size, depth, current_precedence)?;
@@ -788,6 +819,12 @@ impl<'a> Execution<'a> {
         position: usize,
         size: usize,
     ) -> Result<XPathValue> {
+        if let Some(name) = direct_variable_reference(expression)?
+            && let Some(value) = self.scopes.iter().rev().find_map(|scope| scope.get(&name))
+            && let Value::ResultTreeFragment(document) = value
+        {
+            return Ok(XPathValue::ResultTreeFragment(document.clone()));
+        }
         self.evaluator.evaluate(
             expression,
             node,
@@ -827,7 +864,7 @@ impl<'a> Execution<'a> {
         } else if variable.content.is_empty() {
             Ok(Value::String(String::new()))
         } else {
-            Ok(Value::ResultTreeFragment(self.capture_text(
+            Ok(Value::ResultTreeFragment(self.capture_fragment(
                 &variable.content,
                 node,
                 position,
@@ -892,15 +929,55 @@ impl<'a> Execution<'a> {
         }
         Ok(output)
     }
-    fn sort_nodes(&mut self, nodes: &mut [SourceNode], sorts: &[Sort]) -> Result<()> {
+    fn sort_nodes(
+        &mut self,
+        nodes: &mut [SourceNode],
+        sorts: &[Sort],
+        context_node: &SourceNode,
+        context_position: usize,
+        context_size: usize,
+    ) -> Result<()> {
         if sorts.is_empty() {
             return Ok(());
         }
+        let specs = sorts
+            .iter()
+            .map(|sort| {
+                Ok(EvaluatedSort {
+                    data_type: self.evaluate_avt(
+                        &sort.data_type,
+                        context_node,
+                        context_position,
+                        context_size,
+                    )?,
+                    order: self.evaluate_avt(
+                        &sort.order,
+                        context_node,
+                        context_position,
+                        context_size,
+                    )?,
+                    case_order: sort
+                        .case_order
+                        .as_ref()
+                        .map(|value| {
+                            self.evaluate_avt(value, context_node, context_position, context_size)
+                        })
+                        .transpose()?,
+                    lang: sort
+                        .lang
+                        .as_ref()
+                        .map(|value| {
+                            self.evaluate_avt(value, context_node, context_position, context_size)
+                        })
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let variables = self.variables();
         let mut keyed = Vec::with_capacity(nodes.len());
         for (index, node) in nodes.iter().enumerate() {
             let mut keys = vec![];
-            for sort in sorts {
+            for (sort, spec) in sorts.iter().zip(&specs) {
                 let value = self.evaluator.evaluate(
                     &sort.select,
                     node,
@@ -909,7 +986,7 @@ impl<'a> Execution<'a> {
                     &variables,
                     &mut self.meter,
                 )?;
-                let key = if sort.data_type == "number" {
+                let key = if spec.data_type == "number" {
                     SortKey::Number(value.number(&self.evaluator))
                 } else {
                     SortKey::Text(value.string(&self.evaluator))
@@ -921,7 +998,7 @@ impl<'a> Execution<'a> {
         let mut comparisons = 0usize;
         keyed.sort_by(|left, right| {
             comparisons = comparisons.saturating_add(1);
-            for ((l, r), spec) in left.1.iter().zip(&right.1).zip(sorts) {
+            for ((l, r), spec) in left.1.iter().zip(&right.1).zip(&specs) {
                 let mut ordering = l.compare(r, spec.case_order.as_deref(), spec.lang.as_deref());
                 if spec.order == "descending" {
                     ordering = ordering.reverse()
@@ -957,7 +1034,48 @@ impl<'a> Execution<'a> {
         result?;
         Ok(captured)
     }
-    fn copy_source(&mut self, node: &SourceNode, parent: NodeId) -> Result<()> {
+    fn capture_fragment(
+        &mut self,
+        body: &[Instruction],
+        node: &SourceNode,
+        position: usize,
+        size: usize,
+        depth: usize,
+        precedence: Option<usize>,
+    ) -> Result<Document> {
+        let previous = std::mem::replace(&mut self.result, Document::empty(None));
+        let stack = std::mem::replace(&mut self.output_stack, vec![NodeId(0)]);
+        let result = self.execute_sequence(body, node, position, size, depth + 1, precedence);
+        let captured = std::mem::replace(&mut self.result, previous);
+        self.output_stack = stack;
+        result?;
+        Ok(captured)
+    }
+    fn copy_document(
+        &mut self,
+        document: &Document,
+        source_id: NodeId,
+        parent: NodeId,
+        depth: usize,
+    ) -> Result<()> {
+        self.meter.recursion(depth)?;
+        let source = document
+            .node(source_id)
+            .ok_or_else(|| Error::Dynamic("stale result-tree-fragment node".into()))?;
+        if matches!(source.kind, NodeKind::Root) {
+            for child in &source.children {
+                self.copy_document(document, *child, parent, depth + 1)?;
+            }
+            return Ok(());
+        }
+        let target = self.push_node(parent, source.kind.clone())?;
+        for child in &source.children {
+            self.copy_document(document, *child, target, depth + 1)?;
+        }
+        Ok(())
+    }
+    fn copy_source(&mut self, node: &SourceNode, parent: NodeId, depth: usize) -> Result<()> {
+        self.meter.recursion(depth)?;
         match node {
             SourceNode::Node(id) => {
                 let source = self
@@ -967,13 +1085,13 @@ impl<'a> Execution<'a> {
                     .ok_or_else(|| Error::Dynamic("stale source node".into()))?;
                 if matches!(source.kind, NodeKind::Root) {
                     for child in &source.children {
-                        self.copy_source(&SourceNode::Node(*child), parent)?
+                        self.copy_source(&SourceNode::Node(*child), parent, depth + 1)?
                     }
                     return Ok(());
                 }
                 let target = self.push_node(parent, source.kind.clone())?;
                 for child in &source.children {
-                    self.copy_source(&SourceNode::Node(*child), target)?
+                    self.copy_source(&SourceNode::Node(*child), target, depth + 1)?
                 }
             }
             SourceNode::Attribute { owner, index } => {
@@ -1092,19 +1210,6 @@ impl<'a> Execution<'a> {
         }
         Ok(())
     }
-    fn lookup_namespace(&self, prefix: &str) -> Option<String> {
-        self.result
-            .node(self.parent())
-            .and_then(|node| match &node.kind {
-                NodeKind::Element { namespaces, .. } => namespaces
-                    .iter()
-                    .rev()
-                    .find(|namespace| namespace.prefix.as_deref() == Some(prefix))
-                    .map(|namespace| namespace.uri.clone()),
-                _ => None,
-            })
-    }
-
     fn alias_name(
         &self,
         name: &ExpandedName,
@@ -1259,6 +1364,13 @@ enum SortKey {
     Text(String),
     Number(f64),
 }
+
+struct EvaluatedSort {
+    data_type: String,
+    order: String,
+    case_order: Option<String>,
+    lang: Option<String>,
+}
 impl SortKey {
     fn compare(&self, other: &Self, case_order: Option<&str>, _lang: Option<&str>) -> Ordering {
         match (self, other) {
@@ -1268,8 +1380,8 @@ impl SortKey {
                     return primary;
                 }
                 match case_order {
-                    Some("upper-first") => right.cmp(left),
-                    Some("lower-first") => left.cmp(right),
+                    Some("upper-first") => left.cmp(right),
+                    Some("lower-first") => right.cmp(left),
                     _ => left.cmp(right),
                 }
             }
@@ -1290,19 +1402,42 @@ impl SortKey {
 }
 fn xpath_to_public(value: XPathValue) -> Value {
     match value {
-        XPathValue::NodeSet(nodes) => Value::NodeSet(
-            nodes
-                .into_iter()
-                .filter_map(|node| match node {
-                    SourceNode::Node(id) => Some(id),
-                    _ => None,
-                })
-                .collect(),
-        ),
+        XPathValue::NodeSet(nodes) => Value::NodeSet(nodes),
+        XPathValue::ResultTreeFragment(document) => Value::ResultTreeFragment(document),
         XPathValue::Boolean(value) => Value::Boolean(value),
         XPathValue::Number(value) => Value::Number(value),
         XPathValue::String(value) => Value::String(value),
     }
+}
+
+fn direct_variable_reference(
+    expression: &crate::compiler::Expression,
+) -> Result<Option<ExpandedName>> {
+    let source = expression.source.trim();
+    let Some(lexical) = source.strip_prefix('$') else {
+        return Ok(None);
+    };
+    if lexical.is_empty()
+        || lexical.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':'))
+        })
+    {
+        return Ok(None);
+    }
+    let (prefix, local) = lexical
+        .split_once(':')
+        .map_or((None, lexical), |(prefix, local)| (Some(prefix), local));
+    let namespace = prefix
+        .map(|prefix| {
+            expression
+                .namespaces
+                .iter()
+                .find(|(candidate, _)| candidate == prefix)
+                .map(|(_, namespace)| namespace.clone())
+                .ok_or_else(|| Error::Static(format!("unbound variable prefix {prefix}")))
+        })
+        .transpose()?;
+    Ok(Some(ExpandedName::new(namespace, local)))
 }
 fn split_name(value: &str) -> Result<(Option<String>, String)> {
     if let Some((prefix, local)) = value.split_once(':') {
@@ -1316,6 +1451,14 @@ fn split_name(value: &str) -> Result<(Option<String>, String)> {
         Ok((None, value.into()))
     }
 }
+
+fn static_namespace(namespaces: &[(String, String)], prefix: &str) -> Option<String> {
+    namespaces
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate == prefix)
+        .map(|(_, uri)| uri.clone())
+}
 fn format_number_sequence(
     values: &[f64],
     format: &str,
@@ -1324,11 +1467,83 @@ fn format_number_sequence(
     separator: Option<char>,
     size: Option<usize>,
 ) -> String {
-    values
+    let tokens = tokenize_number_format(format);
+    if tokens.formats.is_empty() {
+        return values
+            .iter()
+            .map(|value| format_number(*value, "1", letter_value, separator, size))
+            .collect::<Vec<_>>()
+            .join(".");
+    }
+    let mut output = tokens.prefix;
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push_str(
+                tokens
+                    .separators
+                    .get(index - 1)
+                    .or_else(|| tokens.separators.last())
+                    .map_or(".", String::as_str),
+            );
+        }
+        let token = tokens
+            .formats
+            .get(index)
+            .or_else(|| tokens.formats.last())
+            .map_or("1", String::as_str);
+        output.push_str(&format_number(*value, token, letter_value, separator, size));
+    }
+    output.push_str(&tokens.suffix);
+    output
+}
+
+struct NumberFormatTokens {
+    prefix: String,
+    formats: Vec<String>,
+    separators: Vec<String>,
+    suffix: String,
+}
+
+fn tokenize_number_format(format: &str) -> NumberFormatTokens {
+    let mut runs = Vec::<(bool, String)>::new();
+    for character in format.chars() {
+        let alphanumeric = character.is_alphanumeric();
+        if runs.last().is_some_and(|(kind, _)| *kind == alphanumeric) {
+            runs.last_mut().expect("run exists").1.push(character);
+        } else {
+            runs.push((alphanumeric, character.to_string()));
+        }
+    }
+    let prefix = runs
+        .first()
+        .filter(|(alphanumeric, _)| !*alphanumeric)
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    let suffix = runs
+        .last()
+        .filter(|(alphanumeric, _)| !*alphanumeric)
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    let formats = runs
         .iter()
-        .map(|value| format_number(*value, format, letter_value, separator, size))
-        .collect::<Vec<_>>()
-        .join(".")
+        .filter(|(alphanumeric, _)| *alphanumeric)
+        .map(|(_, value)| value.clone())
+        .collect::<Vec<_>>();
+    let separators = runs
+        .iter()
+        .skip_while(|(alphanumeric, _)| !*alphanumeric)
+        .skip(1)
+        .take_while(|_| true)
+        .filter(|(alphanumeric, _)| !*alphanumeric)
+        .map(|(_, value)| value.clone())
+        .take(formats.len().saturating_sub(1))
+        .collect();
+    NumberFormatTokens {
+        prefix,
+        formats,
+        separators,
+        suffix,
+    }
 }
 fn format_number(
     value: f64,
@@ -1346,7 +1561,17 @@ fn format_number(
             alphabetic(rounded as usize, format == "A")
         }
         "I" | "i" => roman(rounded as usize, format == "I"),
-        _ => format!("{rounded:.0}"),
+        _ => {
+            let width = format
+                .chars()
+                .filter(|character| character.is_numeric())
+                .count();
+            if width > 1 {
+                format!("{rounded:0width$.0}")
+            } else {
+                format!("{rounded:.0}")
+            }
+        }
     };
     if let (Some(separator), Some(size)) = (separator, size)
         && size > 0

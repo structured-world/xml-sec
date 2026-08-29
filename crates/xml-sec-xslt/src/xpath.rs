@@ -1,36 +1,37 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use sxd_document_no_unsafe::Package;
-use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, function, nodeset};
+use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, nodeset};
 
 use crate::budget::Meter;
 use crate::compiler::{DecimalFormat, Expression, KeyDeclaration, Pattern};
-use crate::{BudgetKind, Document, Error, ExpandedName, NodeId, NodeKind, Result, Value};
+use crate::{BudgetKind, Document, Error, ExpandedName, NodeKind, NodeReference, Result, Value};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum SourceNode {
-    Node(NodeId),
-    Attribute { owner: NodeId, index: usize },
-    Namespace { owner: NodeId, index: usize },
-}
+pub(crate) type SourceNode = NodeReference;
 
 pub(crate) struct Evaluator<'a> {
     pub(crate) source: &'a Document,
     package: Package,
-    key_index: HashMap<(ExpandedName, String), Vec<Vec<usize>>>,
+    maps: NodeMaps,
+    expressions: RefCell<HashMap<String, XPath>>,
+    key_index: HashMap<(ExpandedName, String), Vec<NodePath>>,
     decimal_formats: Vec<DecimalFormat>,
 }
 
 impl<'a> Evaluator<'a> {
-    pub(crate) fn new(source: &'a Document) -> Result<Self> {
-        let xml = source.source_xml().ok_or_else(|| {
-            Error::Dynamic("source document has no lexical XML representation".into())
-        })?;
-        let package = sxd_document_no_unsafe::parser::parse(xml)
+    pub(crate) fn new(source: &'a Document, meter: &mut Meter) -> Result<Self> {
+        // SXD receives the normalized semantic tree, not the caller's parser-specific
+        // lexical node layout. Typed paths then make every cross-model identity explicit.
+        let xml = crate::serializer::serialize_projection(source, meter)?;
+        let package = sxd_document_no_unsafe::parser::parse(&xml)
             .map_err(|error| Error::Xml(error.to_string()))?;
+        let maps = NodeMaps::new(source, package.as_document().root().into())?;
         Ok(Self {
             source,
             package,
+            maps,
+            expressions: RefCell::new(HashMap::new()),
             key_index: HashMap::new(),
             decimal_formats: Vec::new(),
         })
@@ -44,8 +45,7 @@ impl<'a> Evaluator<'a> {
     ) -> Result<()> {
         self.decimal_formats = decimal_formats.to_vec();
         let variables = HashMap::new();
-        let maps = NodeMaps::new(self.source, self.package.as_document().root().into());
-        let mut index = HashMap::<(ExpandedName, String), Vec<Vec<usize>>>::new();
+        let mut index = HashMap::<(ExpandedName, String), Vec<NodePath>>::new();
         for declaration in keys {
             for (id, _) in self.source.nodes() {
                 let node = SourceNode::Node(id);
@@ -61,10 +61,13 @@ impl<'a> Evaluator<'a> {
                         .collect::<Vec<_>>(),
                     value => vec![value.string(self)],
                 };
-                let Some(sxd) = maps.to_sxd(&node) else {
+                let Some(sxd) = self
+                    .maps
+                    .to_sxd(self.package.as_document().root().into(), &node)
+                else {
                     continue;
                 };
-                let path = path_to(&sxd);
+                let path = typed_path_to(&sxd);
                 for value in values {
                     meter.charge(BudgetKind::KeyEntries, 1)?;
                     index
@@ -89,27 +92,35 @@ impl<'a> Evaluator<'a> {
     ) -> Result<XPathValue> {
         meter.charge(BudgetKind::XPathEvaluations, 1)?;
         let document = self.package.as_document();
-        let maps = NodeMaps::new(self.source, document.root().into());
-        let context_node = maps
-            .to_sxd(node)
+        let context_node = self
+            .maps
+            .to_sxd(document.root().into(), node)
             .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
-        let xpath = Factory::new().build(&expression.source).map_err(|error| {
-            Error::Static(format!(
-                "invalid XPath expression `{}`: {error}",
-                expression.source
-            ))
-        })?;
+        let rewritten = rewrite_outer_context_functions(&expression.source);
+        if !self.expressions.borrow().contains_key(&rewritten) {
+            let xpath = Factory::new().build(&rewritten).map_err(|error| {
+                Error::Static(format!(
+                    "invalid XPath expression `{}`: {error}",
+                    expression.source
+                ))
+            })?;
+            self.expressions
+                .borrow_mut()
+                .insert(rewritten.clone(), xpath);
+        }
         let mut context = Context::new();
         for (prefix, uri) in &expression.namespaces {
             context.set_namespace(prefix, uri);
         }
         context.set_namespace("xml", "http://www.w3.org/XML/1998/namespace");
-        context.set_function("position", FixedNumber(position as f64));
-        context.set_function("last", FixedNumber(size as f64));
+        const CONTEXT_NS: &str = "urn:structured-world:xml-sec:xslt:context";
+        context.set_namespace("__xml_sec_ctx", CONTEXT_NS);
+        context.set_variable((CONTEXT_NS, "position"), position as f64);
+        context.set_variable((CONTEXT_NS, "last"), size as f64);
         context.set_function(
             "current",
             CurrentNode {
-                path: path_to(&context_node),
+                path: typed_path_to(&context_node),
             },
         );
         context.set_function(
@@ -154,13 +165,14 @@ impl<'a> Evaluator<'a> {
             match value {
                 Value::Boolean(value) => context.set_variable(qname.clone(), *value),
                 Value::Number(value) => context.set_variable(qname.clone(), *value),
-                Value::String(value) | Value::ResultTreeFragment(value) => {
-                    context.set_variable(qname.clone(), value.clone())
+                Value::String(value) => context.set_variable(qname.clone(), value.clone()),
+                Value::ResultTreeFragment(document) => {
+                    context.set_variable(qname.clone(), document.string_value(document.root()))
                 }
                 Value::NodeSet(nodes) => {
                     let mut set = nodeset::Nodeset::new();
-                    for id in nodes {
-                        if let Some(node) = maps.to_sxd(&SourceNode::Node(*id)) {
+                    for reference in nodes {
+                        if let Some(node) = self.maps.to_sxd(document.root().into(), reference) {
                             set.add(node);
                         }
                     }
@@ -168,10 +180,14 @@ impl<'a> Evaluator<'a> {
                 }
             }
         }
+        let expressions = self.expressions.borrow();
+        let xpath = expressions
+            .get(&rewritten)
+            .expect("compiled XPath was inserted into the execution cache");
         let value = xpath.evaluate(&context, context_node).map_err(|error| {
             Error::Dynamic(format!("XPath `{}` failed: {error}", expression.source))
         })?;
-        maps.project_value(value)
+        self.maps.project_value(value)
     }
 
     pub(crate) fn matches(
@@ -287,6 +303,7 @@ fn split_pattern_branches(source: &str) -> Vec<&str> {
 #[derive(Debug, Clone)]
 pub(crate) enum XPathValue {
     NodeSet(Vec<SourceNode>),
+    ResultTreeFragment(Document),
     Boolean(bool),
     Number(f64),
     String(String),
@@ -295,6 +312,9 @@ impl XPathValue {
     pub(crate) fn boolean(&self) -> bool {
         match self {
             Self::NodeSet(nodes) => !nodes.is_empty(),
+            Self::ResultTreeFragment(document) => document
+                .node(document.root())
+                .is_some_and(|root| !root.children.is_empty()),
             Self::Boolean(value) => *value,
             Self::Number(value) => *value != 0.0 && !value.is_nan(),
             Self::String(value) => !value.is_empty(),
@@ -306,9 +326,10 @@ impl XPathValue {
                 .first()
                 .map(|node| evaluator.string_value(node))
                 .unwrap_or_default(),
+            Self::ResultTreeFragment(document) => document.string_value(document.root()),
             Self::Boolean(true) => "true".into(),
             Self::Boolean(false) => "false".into(),
-            Self::Number(value) => Value::Number(*value).into_string(),
+            Self::Number(value) => crate::value::format_xpath_number(*value),
             Self::String(value) => value.clone(),
         }
     }
@@ -319,86 +340,133 @@ impl XPathValue {
             Self::Boolean(false) => 0.0,
             Self::String(value) => xpath_number(value),
             Self::NodeSet(_) => xpath_number(&self.string(evaluator)),
+            Self::ResultTreeFragment(document) => {
+                xpath_number(&document.string_value(document.root()))
+            }
         }
     }
 }
 
 fn xpath_number(value: &str) -> f64 {
     let trimmed = value.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
-    if trimmed.is_empty() {
+    let valid = !trimmed.is_empty()
+        && !trimmed.starts_with('+')
+        && !trimmed.contains(['e', 'E'])
+        && trimmed
+            .strip_prefix('-')
+            .unwrap_or(trimmed)
+            .split_once('.')
+            .map_or_else(
+                || {
+                    trimmed
+                        .strip_prefix('-')
+                        .unwrap_or(trimmed)
+                        .chars()
+                        .all(|c| c.is_ascii_digit())
+                },
+                |(integer, fraction)| {
+                    (integer.is_empty() || integer.chars().all(|c| c.is_ascii_digit()))
+                        && !fraction.is_empty()
+                        && fraction.chars().all(|c| c.is_ascii_digit())
+                },
+            );
+    if !valid {
         f64::NAN
     } else {
         trimmed.parse().unwrap_or(f64::NAN)
     }
 }
 
-struct NodeMaps<'d> {
-    forward: HashMap<SourceNode, nodeset::Node<'d>>,
-    reverse: Vec<(nodeset::Node<'d>, SourceNode)>,
+struct NodeMaps {
+    forward: HashMap<SourceNode, NodePath>,
+    reverse: HashMap<NodePath, SourceNode>,
 }
-impl<'d> NodeMaps<'d> {
-    fn new(source: &Document, root: nodeset::Node<'d>) -> Self {
-        let mut ordinary = vec![];
-        collect_ordinary(root.clone(), &mut ordinary);
-        let mut source_nodes = source
-            .nodes()
-            .map(|(id, _)| SourceNode::Node(id))
-            .collect::<Vec<_>>();
+impl NodeMaps {
+    fn new(source: &Document, root: nodeset::Node<'_>) -> Result<Self> {
         let mut forward = HashMap::new();
-        let mut reverse = Vec::new();
-        for (source_node, sxd) in source_nodes.drain(..).zip(ordinary) {
-            forward.insert(source_node.clone(), sxd.clone());
-            reverse.push((sxd, source_node));
-        }
+        let mut reverse = HashMap::new();
         for (id, node) in source.nodes() {
-            if let Some(element) = forward
-                .get(&SourceNode::Node(id))
-                .and_then(nodeset::Node::element)
-                && let NodeKind::Element {
-                    attributes,
-                    namespaces,
-                    ..
-                } = &node.kind
+            let path = semantic_node_path(source, id)?;
+            let key = SourceNode::Node(id);
+            forward.insert(key.clone(), path.clone());
+            reverse.insert(path.clone(), key);
+            if let NodeKind::Element {
+                attributes,
+                namespaces,
+                ..
+            } = &node.kind
             {
                 for (index, source_attribute) in attributes.iter().enumerate() {
-                    let Some(attribute) = element.attributes().into_iter().find(|candidate| {
-                        let name = candidate.name();
-                        let name = name.get();
-                        name.local_part() == source_attribute.name.local
-                            && name.namespace_uri() == source_attribute.name.namespace.as_deref()
-                    }) else {
-                        continue;
+                    let attribute_path = NodePath::Attribute {
+                        parent: path.ordinary().to_vec(),
+                        namespace: source_attribute.name.namespace.clone(),
+                        local: source_attribute.name.local.clone(),
                     };
                     let key = SourceNode::Attribute { owner: id, index };
-                    let value = nodeset::Node::Attribute(attribute);
-                    forward.insert(key.clone(), value.clone());
-                    reverse.push((value, key));
+                    forward.insert(key.clone(), attribute_path.clone());
+                    reverse.insert(attribute_path, key);
                 }
                 for (index, namespace) in namespaces.iter().enumerate() {
-                    if let Some(candidate) =
-                        element.namespaces_in_scope().into_iter().find(|candidate| {
-                            candidate.prefix() == namespace.prefix.as_deref().unwrap_or("")
-                                && candidate.uri() == namespace.uri
-                        })
-                    {
-                        let key = SourceNode::Namespace { owner: id, index };
-                        let value = nodeset::Node::Namespace(nodeset::Namespace {
-                            parent: element,
-                            prefix: sxd_document_no_unsafe::to_ns_str!(candidate.prefix()),
-                            uri: sxd_document_no_unsafe::to_ns_str!(candidate.uri()),
-                        });
-                        forward.insert(key.clone(), value.clone());
-                        reverse.push((value, key));
-                    }
+                    let namespace_path = NodePath::Namespace {
+                        parent: path.ordinary().to_vec(),
+                        prefix: namespace.prefix.clone().unwrap_or_default(),
+                        uri: namespace.uri.clone(),
+                    };
+                    let key = SourceNode::Namespace { owner: id, index };
+                    forward.insert(key.clone(), namespace_path.clone());
+                    reverse.insert(namespace_path, key);
                 }
             }
         }
-        Self { forward, reverse }
+        let maps = Self { forward, reverse };
+        for (node, path) in &maps.forward {
+            if maps.resolve(root.clone(), path).is_none() {
+                return Err(Error::Dynamic(format!(
+                    "semantic XPath projection cannot resolve {node:?}"
+                )));
+            }
+        }
+        Ok(maps)
     }
-    fn to_sxd(&self, node: &SourceNode) -> Option<nodeset::Node<'d>> {
-        self.forward.get(node).cloned()
+    fn to_sxd<'d>(&self, root: nodeset::Node<'d>, node: &SourceNode) -> Option<nodeset::Node<'d>> {
+        self.resolve(root, self.forward.get(node)?)
     }
-    fn project_value(&self, value: SxdValue<'d>) -> Result<XPathValue> {
+    fn resolve<'d>(&self, root: nodeset::Node<'d>, path: &NodePath) -> Option<nodeset::Node<'d>> {
+        let mut node = root;
+        for index in path.ordinary() {
+            node = node.children().get(*index)?.clone();
+        }
+        match path {
+            NodePath::Ordinary(_) => Some(node),
+            NodePath::Attribute {
+                namespace, local, ..
+            } => node
+                .element()?
+                .attributes()
+                .into_iter()
+                .find(|attribute| {
+                    let name = attribute.name();
+                    let name = name.get();
+                    name.local_part() == local && name.namespace_uri() == namespace.as_deref()
+                })
+                .map(nodeset::Node::Attribute),
+            NodePath::Namespace { prefix, uri, .. } => {
+                let element = node.element()?;
+                element
+                    .namespaces_in_scope()
+                    .into_iter()
+                    .find(|namespace| namespace.prefix() == prefix && namespace.uri() == uri)
+                    .map(|namespace| {
+                        nodeset::Node::Namespace(nodeset::Namespace {
+                            parent: element,
+                            prefix: sxd_document_no_unsafe::to_ns_str!(namespace.prefix()),
+                            uri: sxd_document_no_unsafe::to_ns_str!(namespace.uri()),
+                        })
+                    })
+            }
+        }
+    }
+    fn project_value(&self, value: SxdValue<'_>) -> Result<XPathValue> {
         Ok(match value {
             SxdValue::Boolean(value) => XPathValue::Boolean(value),
             SxdValue::Number(value) => XPathValue::Number(value),
@@ -407,22 +475,26 @@ impl<'d> NodeMaps<'d> {
                 nodes
                     .document_order()
                     .into_iter()
-                    .filter_map(|node| {
-                        self.reverse
-                            .iter()
-                            .find(|(candidate, _)| candidate == &node)
-                            .map(|(_, source)| source.clone())
-                    })
+                    .filter_map(|node| self.reverse.get(&typed_path_to(&node)).cloned())
                     .collect(),
             ),
         })
     }
 }
-fn collect_ordinary<'d>(node: nodeset::Node<'d>, output: &mut Vec<nodeset::Node<'d>>) {
-    output.push(node.clone());
-    for child in node.children() {
-        collect_ordinary(child, output)
+
+fn semantic_node_path(source: &Document, id: crate::NodeId) -> Result<NodePath> {
+    let mut current = id;
+    let mut path = Vec::new();
+    while let Some(parent) = source.node(current).and_then(|node| node.parent) {
+        let index = source
+            .node(parent)
+            .and_then(|node| node.children.iter().position(|child| *child == current))
+            .ok_or_else(|| Error::Dynamic("semantic tree has a stale parent edge".into()))?;
+        path.push(index);
+        current = parent;
     }
+    path.reverse();
+    Ok(NodePath::Ordinary(path))
 }
 fn path_to(node: &nodeset::Node<'_>) -> Vec<usize> {
     let mut current = node.clone();
@@ -439,21 +511,60 @@ fn path_to(node: &nodeset::Node<'_>) -> Vec<usize> {
     path.reverse();
     path
 }
-struct FixedNumber(f64);
-impl function::Function for FixedNumber {
-    fn evaluate<'c, 'd>(
-        &self,
-        _: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
-        args: Vec<SxdValue<'d>>,
-    ) -> std::result::Result<SxdValue<'d>, function::Error> {
-        if !args.is_empty() {
-            return Err(function::Error::TooManyArguments {
-                expected: 0,
-                actual: args.len(),
-            });
+fn rewrite_outer_context_functions(source: &str) -> String {
+    // XSLT supplies the outer position and size, while predicates must retain XPath's
+    // native dynamic context. Only calls outside predicates become private variables.
+    let mut output = String::with_capacity(source.len());
+    let mut quote = None;
+    let mut predicate_depth = 0usize;
+    let mut cursor = 0;
+    while cursor < source.len() {
+        let tail = &source[cursor..];
+        let character = tail
+            .chars()
+            .next()
+            .expect("cursor is at a character boundary");
+        if let Some(active) = quote {
+            output.push(character);
+            cursor += character.len_utf8();
+            if character == active {
+                quote = None;
+            }
+            continue;
         }
-        Ok(SxdValue::Number(self.0))
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '[' => predicate_depth += 1,
+            ']' => predicate_depth = predicate_depth.saturating_sub(1),
+            _ => {}
+        }
+        if predicate_depth == 0 {
+            let replacement = [
+                ("position()", "$__xml_sec_ctx:position"),
+                ("last()", "$__xml_sec_ctx:last"),
+            ]
+            .into_iter()
+            .find(|(function, _)| {
+                tail.starts_with(function)
+                    && source[..cursor]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|before| !is_xpath_name_character(before))
+            });
+            if let Some((function, variable)) = replacement {
+                output.push_str(variable);
+                cursor += function.len();
+                continue;
+            }
+        }
+        output.push(character);
+        cursor += character.len_utf8();
     }
+    output
+}
+
+fn is_xpath_name_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
 }
 
 struct GenerateId;
@@ -584,6 +695,7 @@ impl function::Function for FunctionAvailable {
                     | "concat"
                     | "contains"
                     | "count"
+                    | "current"
                     | "false"
                     | "floor"
                     | "format-number"
@@ -648,11 +760,62 @@ fn one_qname_argument(
     resolve_lexical_name(&args[0].string(), namespaces)
 }
 struct CurrentNode {
-    path: Vec<usize>,
+    path: NodePath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum NodePath {
+    Ordinary(Vec<usize>),
+    Attribute {
+        parent: Vec<usize>,
+        namespace: Option<String>,
+        local: String,
+    },
+    Namespace {
+        parent: Vec<usize>,
+        prefix: String,
+        uri: String,
+    },
+}
+
+impl NodePath {
+    fn ordinary(&self) -> &[usize] {
+        match self {
+            Self::Ordinary(path)
+            | Self::Attribute { parent: path, .. }
+            | Self::Namespace { parent: path, .. } => path,
+        }
+    }
+}
+
+fn typed_path_to(node: &nodeset::Node<'_>) -> NodePath {
+    match node {
+        nodeset::Node::Attribute(attribute) => {
+            let parent = attribute.parent();
+            let name = attribute.name();
+            let name = name.get();
+            NodePath::Attribute {
+                parent: parent
+                    .map(|parent| path_to(&nodeset::Node::Element(parent)))
+                    .unwrap_or_default(),
+                namespace: name.namespace_uri().map(str::to_owned),
+                local: name.local_part().to_owned(),
+            }
+        }
+        nodeset::Node::Namespace(namespace) => {
+            let parent = namespace.parent;
+            NodePath::Namespace {
+                parent: path_to(&nodeset::Node::Element(parent)),
+                prefix: namespace.prefix().to_owned(),
+                uri: namespace.uri().to_owned(),
+            }
+        }
+        _ => NodePath::Ordinary(path_to(node)),
+    }
 }
 
 struct KeyFunction {
-    index: HashMap<(ExpandedName, String), Vec<Vec<usize>>>,
+    index: HashMap<(ExpandedName, String), Vec<NodePath>>,
     namespaces: Vec<(String, String)>,
 }
 impl function::Function for KeyFunction {
@@ -679,7 +842,9 @@ impl function::Function for KeyFunction {
         for value in values {
             if let Some(paths) = self.index.get(&(name.clone(), value)) {
                 for path in paths {
-                    if let Some(node) = follow_path(context.node.document().root().into(), path) {
+                    if let Some(node) =
+                        resolve_node_path(context.node.document().root().into(), path)
+                    {
                         result.add(node);
                     }
                 }
@@ -752,6 +917,39 @@ fn follow_path<'d>(mut node: nodeset::Node<'d>, path: &[usize]) -> Option<nodese
     Some(node)
 }
 
+fn resolve_node_path<'d>(root: nodeset::Node<'d>, path: &NodePath) -> Option<nodeset::Node<'d>> {
+    let node = follow_path(root, path.ordinary())?;
+    match path {
+        NodePath::Ordinary(_) => Some(node),
+        NodePath::Attribute {
+            namespace, local, ..
+        } => node
+            .element()?
+            .attributes()
+            .into_iter()
+            .find(|attribute| {
+                let name = attribute.name();
+                let name = name.get();
+                name.local_part() == local && name.namespace_uri() == namespace.as_deref()
+            })
+            .map(nodeset::Node::Attribute),
+        NodePath::Namespace { prefix, uri, .. } => {
+            let element = node.element()?;
+            element
+                .namespaces_in_scope()
+                .into_iter()
+                .find(|namespace| namespace.prefix() == prefix && namespace.uri() == uri)
+                .map(|namespace| {
+                    nodeset::Node::Namespace(nodeset::Namespace {
+                        parent: element,
+                        prefix: sxd_document_no_unsafe::to_ns_str!(namespace.prefix()),
+                        uri: sxd_document_no_unsafe::to_ns_str!(namespace.uri()),
+                    })
+                })
+        }
+    }
+}
+
 fn default_decimal_format() -> DecimalFormat {
     DecimalFormat {
         name: None,
@@ -797,15 +995,21 @@ fn render_decimal(
     } else {
         1.0
     };
-    let first = selected
-        .find([format.digit, format.zero_digit])
+    let characters = selected.char_indices().collect::<Vec<_>>();
+    let first = characters
+        .iter()
+        .find(|(_, character)| matches!(*character, value if value == format.digit || value == format.zero_digit))
+        .map(|(index, _)| *index)
         .ok_or_else(|| function::Error::Other {
             what: "format-number pattern has no digit".into(),
         })?;
-    let last = selected
-        .rfind([format.digit, format.zero_digit])
+    let last = characters
+        .iter()
+        .rev()
+        .find(|(_, character)| *character == format.digit || *character == format.zero_digit)
+        .map(|(index, character)| index + character.len_utf8())
         .unwrap_or(first);
-    let number_pattern = &selected[first..=last];
+    let number_pattern = &selected[first..last];
     let mut split = number_pattern.split(format.decimal_separator);
     let integer_pattern = split.next().unwrap_or_default();
     let fraction_pattern = split.next().unwrap_or_default();
@@ -887,8 +1091,9 @@ impl function::Function for CurrentNode {
                 actual: args.len(),
             });
         }
+        let path = self.path.ordinary();
         let mut node = nodeset::Node::Root(context.node.document().root());
-        for index in &self.path {
+        for index in path {
             node = node
                 .children()
                 .get(*index)
@@ -896,6 +1101,45 @@ impl function::Function for CurrentNode {
                 .ok_or_else(|| function::Error::Other {
                     what: "current() context is stale".into(),
                 })?;
+        }
+        match &self.path {
+            NodePath::Ordinary(_) => {}
+            NodePath::Attribute {
+                namespace, local, ..
+            } => {
+                let element = node.element().ok_or_else(|| function::Error::Other {
+                    what: "current() owner is stale".into(),
+                })?;
+                let attribute = element
+                    .attributes()
+                    .into_iter()
+                    .find(|attribute| {
+                        let name = attribute.name();
+                        let name = name.get();
+                        name.local_part() == local && name.namespace_uri() == namespace.as_deref()
+                    })
+                    .ok_or_else(|| function::Error::Other {
+                        what: "current() attribute is stale".into(),
+                    })?;
+                node = nodeset::Node::Attribute(attribute);
+            }
+            NodePath::Namespace { prefix, uri, .. } => {
+                let element = node.element().ok_or_else(|| function::Error::Other {
+                    what: "current() owner is stale".into(),
+                })?;
+                let namespaces = element.namespaces_in_scope();
+                let namespace = namespaces
+                    .iter()
+                    .find(|namespace| namespace.prefix() == prefix && namespace.uri() == uri)
+                    .ok_or_else(|| function::Error::Other {
+                        what: "current() namespace is stale".into(),
+                    })?;
+                node = nodeset::Node::Namespace(nodeset::Namespace {
+                    parent: element,
+                    prefix: sxd_document_no_unsafe::to_ns_str!(namespace.prefix()),
+                    uri: sxd_document_no_unsafe::to_ns_str!(namespace.uri()),
+                });
+            }
         }
         let mut set = nodeset::Nodeset::new();
         set.add(node);

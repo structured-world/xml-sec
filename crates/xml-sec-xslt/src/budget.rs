@@ -24,15 +24,22 @@ pub enum BudgetKind {
 pub struct CompileBudget {
     pub stylesheet_bytes: usize,
     pub imported_modules: usize,
+    pub recursion_depth: usize,
     pub owned_bytes: usize,
 }
 
 impl CompileBudget {
     #[must_use]
-    pub const fn new(stylesheet_bytes: usize, imported_modules: usize, owned_bytes: usize) -> Self {
+    pub const fn new(
+        stylesheet_bytes: usize,
+        imported_modules: usize,
+        recursion_depth: usize,
+        owned_bytes: usize,
+    ) -> Self {
         Self {
             stylesheet_bytes,
             imported_modules,
+            recursion_depth,
             owned_bytes,
         }
     }
@@ -52,24 +59,6 @@ pub struct ExecutionBudget {
     pub serialized_bytes: usize,
     pub messages: usize,
     pub owned_bytes: usize,
-}
-
-impl ExecutionBudget {
-    pub(crate) const fn unlimited() -> Self {
-        Self {
-            source_bytes: usize::MAX,
-            external_documents: usize::MAX,
-            recursion_depth: usize::MAX,
-            xpath_evaluations: usize::MAX,
-            template_applications: usize::MAX,
-            sort_comparisons: usize::MAX,
-            key_entries: usize::MAX,
-            result_nodes: usize::MAX,
-            serialized_bytes: usize::MAX,
-            messages: usize::MAX,
-            owned_bytes: usize::MAX,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -143,6 +132,31 @@ impl Meter {
         ensure(kind, limit, actual)?;
         *used = actual;
         Ok(())
+    }
+
+    pub(crate) fn check_additional(&self, kind: BudgetKind, amount: usize) -> Result<()> {
+        let (used, limit) = match kind {
+            BudgetKind::ExternalDocuments => {
+                (self.external_documents, self.limits.external_documents)
+            }
+            BudgetKind::XPathEvaluations => (self.xpath_evaluations, self.limits.xpath_evaluations),
+            BudgetKind::TemplateApplications => (
+                self.template_applications,
+                self.limits.template_applications,
+            ),
+            BudgetKind::SortComparisons => (self.sort_comparisons, self.limits.sort_comparisons),
+            BudgetKind::KeyEntries => (self.key_entries, self.limits.key_entries),
+            BudgetKind::ResultNodes => (self.result_nodes, self.limits.result_nodes),
+            BudgetKind::SerializedBytes => (self.serialized_bytes, self.limits.serialized_bytes),
+            BudgetKind::Messages => (self.messages, self.limits.messages),
+            BudgetKind::OwnedBytes => (self.owned_bytes, self.limits.owned_bytes),
+            other => {
+                return Err(Error::Dynamic(format!(
+                    "{other:?} cannot be checked during execution"
+                )));
+            }
+        };
+        ensure(kind, limit, used.saturating_add(amount))
     }
 }
 

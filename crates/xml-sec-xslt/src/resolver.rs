@@ -5,7 +5,7 @@ use crate::Result;
 pub struct ResourceIdentity(pub String);
 
 /// Why the engine is resolving a resource.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ResolvePurpose {
     Include,

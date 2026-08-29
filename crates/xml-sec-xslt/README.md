@@ -13,6 +13,10 @@ variables and parameters, keys, whitespace declarations, decimal formats,
 namespace aliases, attribute sets, XSLT instruction execution, result-tree
 construction, numbering, sorting, and XML/HTML/text serialization.
 
+XPath node sets retain element, attribute, and namespace identities. Converting a
+public `Value` to a string therefore requires the associated `Document`; result-tree
+fragments remain owned temporary trees rather than flattened text.
+
 Runtime external-document resolution and the XMLDSig transform adapter are kept
 outside this crate's current execution path so their policy and identity contracts
 can be layered without introducing XML-security types into the reusable engine.
