@@ -55,10 +55,18 @@ exercise signing as well as verification.
 ### `xmldsig2ed-tests`
 
 XMLDSig Second Edition errata vectors. They exercise HMAC-SHA1, external URI
-references, XPath transforms, and Canonical XML 1.1. XPath and C14N 1.1 are
-implemented; HMAC-SHA1 is supported for verification, while documents that
-require another HMAC variant, an unavailable external resource, or an
-unsupported key source remain explicitly classified as fail-closed.
+references, XPath transforms, Canonical XML 1.1, and the comment-preservation
+difference between short-name and scheme-based XPointers. All nine signed XML
+documents, all three generation templates, and the detached C14N input are
+checked in. Seven signatures execute successfully through every compiled XML
+backend; the two XSLT-dependent signatures assert the exact unsupported
+transform URI until the separate XSLT engine is available.
+
+`defCan-1.tmpl` is signed end to end with caller-owned detached bytes. Signing
+materializes the Second Edition C14N 1.1 node-set conversion as an explicit
+`Transform`, reproduces the W3C digest, and verifies the result. Negative tests
+cover payload tampering, URI-policy denial, absent request bytes, aggregate
+resource exhaustion, and atomic failure of reusable owned documents.
 
 ### `merlin-xpath-filter2`
 

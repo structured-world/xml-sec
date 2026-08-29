@@ -17,7 +17,8 @@ Base64, XPath 1.0, and XPath Filter 2.0 transforms, RSA PKCS#1 v1.5, DSA,
 ECDSA with P-256/P-384/P-521 keys, HMAC truncation, embedded X.509 certificates,
 and configured key resolution.
 
-The complete Phaos XMLDSig 3 and 2012 XMLDSig 1.1 corpora are checked in for
+The complete Phaos XMLDSig 3, 2012 XMLDSig 1.1, and XMLDSig Second Edition
+corpora are checked in for
 deterministic offline interoperability testing. Every signature document is executed through the
 public verification API and must be classified exactly once. Supported vectors
 must verify, invalid vectors must return their exact failure class, and vectors
@@ -75,8 +76,12 @@ interoperating with legacy libxmlsec1 `here()` behavior can explicitly select
 [`XPathHereSemantics::XmlSecLegacy`] on both contexts.
 
 `SigningPolicy::transforms` applies to every canonicalization algorithm the signing pipeline
-executes, including the default C14N 1.0 coercion when a reference transform chain ends as a node
-set and the declared canonicalization method for `<SignedInfo>`. Reference output and
+executes. Verification follows XMLDSig's implicit C14N 1.0 coercion for a Reference chain ending
+as a node set. Signature generation follows the Second Edition recommendation instead: before
+digest planning it materializes C14N 1.1 as an explicit `Transform` wherever the generated chain
+still produces a node set. The mutation is operation-gated, policy-checked, bounded, and included
+in the canonicalized `<SignedInfo>` rather than being an invisible signing option. The declared
+canonicalization method for `<SignedInfo>` is governed by the same policy. Reference output and
 `<SignedInfo>` serialization consume one bounded canonicalization budget, so policy rejection
 occurs during rendering rather than after an oversized buffer has already been allocated.
 The same immutable policy controls the retained owned document and every committed signing
@@ -254,12 +259,14 @@ than validity statuses. Manifest policy violations and unsupported transforms re
 per-reference statuses as described above. Treat both `Invalid(reason)` and an API error as a
 rejected document; never continue an authentication flow after either outcome.
 
-External references are disabled by default. Callers must both allow their URI class with
-`UriTypeSet` and provide every payload through `VerifyContext::external_resources`; verification
-never performs network or filesystem I/O. Individual resources are limited to 8 MiB and the
+External references are disabled by default. Verification and signing callers must both allow
+their URI class with `UriTypeSet` and provide every payload through
+`VerifyContext::external_resources` or `SignContext::external_resources`; neither operation
+performs network or filesystem I/O. Individual resources are limited to 8 MiB and the
 complete map to 32 MiB. The same aggregate ceiling is charged again per successful dereference,
 so repeatedly referencing one map entry cannot multiply transform work or retained diagnostics
-without bound. External key retrieval has an independent policy boundary: callers must
+without bound. Signing dependency analysis and actual digest execution share that aggregate
+budget across reparsed document generations. External key retrieval has an independent policy boundary: callers must
 also opt in with `VerifyContext::allowed_retrieval_method_uri_types`. Allowing external signed
 payloads never implicitly allows external key material. `RetrievalMethod` currently accepts
 untransformed external `rawX509Certificate` data, untransformed direct same-document `X509Data`,

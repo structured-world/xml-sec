@@ -675,6 +675,13 @@ fn preserves_multiple_reference_digest_order() {
     assert_ne!(digests[0].digest_value, digests[1].digest_value);
 
     let filled = fill_reference_digest_values(&xml).expect("fill digest values");
+    assert_eq!(
+        filled
+            .matches("http://www.w3.org/2006/12/xml-c14n11")
+            .count(),
+        2,
+        "Second Edition generation must materialize C14N 1.1 for both node-set references"
+    );
     assert_reference_digests_verify(&filled);
 }
 

@@ -28,10 +28,7 @@ use super::types::{
     NodeSet, NodeSetMaterializationBudget, TransformData, TransformError, transform_resource_limit,
 };
 
-/// Validate both policy permission and request-context capability for signing URIs.
-///
-/// Signing currently has no external-resource request input. An allowlist may
-/// permit that URI class, but it cannot make the referenced bytes available.
+/// Validate signing URI policy independently of request-scoped resource bytes.
 pub(crate) fn validate_signing_reference_uri(
     uri: &str,
     policy: &crate::policy::SigningPolicy,
@@ -42,7 +39,15 @@ pub(crate) fn validate_signing_reference_uri(
             reason: "signing reference URI class is not permitted",
         });
     }
-    if !uri.is_empty() && !uri.starts_with('#') {
+    Ok(())
+}
+
+/// Require a request resource boundary before processing a detached signing URI.
+pub(crate) fn validate_signing_reference_request(
+    uri: &str,
+    has_external_resources: bool,
+) -> Result<(), crate::policy::PolicyViolation> {
+    if !uri.is_empty() && !uri.starts_with('#') && !has_external_resources {
         return Err(crate::policy::PolicyViolation::Uri {
             operation: "signing",
             reason: "external signing references require request-scoped resource bytes",
@@ -55,6 +60,52 @@ struct ExternalResourceBudget {
     remaining_total_bytes: Cell<usize>,
     max_resource_bytes: usize,
     max_total_bytes: usize,
+}
+
+/// Request-scoped external bytes and their shared aggregate work budget.
+///
+/// Signing reparses its staged document while filling dependent digests. This
+/// context keeps the external-resource budget continuous across every resolver
+/// rebound instead of silently resetting it for each parsed generation.
+pub(crate) struct ExternalResourceContext<'a> {
+    resources: Option<&'a HashMap<String, Vec<u8>>>,
+    budget: Rc<ExternalResourceBudget>,
+}
+
+impl<'a> ExternalResourceContext<'a> {
+    pub(crate) fn new(
+        resources: Option<&'a HashMap<String, Vec<u8>>>,
+        max_resource_bytes: usize,
+        max_total_bytes: usize,
+    ) -> Self {
+        Self {
+            resources,
+            budget: Rc::new(ExternalResourceBudget::with_limits(
+                max_resource_bytes,
+                max_total_bytes,
+            )),
+        }
+    }
+
+    pub(crate) fn is_configured(&self) -> bool {
+        self.resources.is_some()
+    }
+
+    pub(crate) fn bind<'doc>(
+        &'doc self,
+        doc: &'doc Document<'doc>,
+        registrations: &[crate::IdAttributeRegistration],
+        same_document_id_semantics: SameDocumentIdSemantics,
+    ) -> UriReferenceResolver<'doc>
+    where
+        'a: 'doc,
+    {
+        let mut resolver = UriReferenceResolver::with_id_registrations(doc, registrations)
+            .with_same_document_id_semantics(same_document_id_semantics);
+        resolver.external_resources = self.resources;
+        resolver.external_resource_budget = Rc::clone(&self.budget);
+        resolver
+    }
 }
 
 impl Default for ExternalResourceBudget {

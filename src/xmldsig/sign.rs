@@ -26,7 +26,10 @@ use rsa::traits::PublicKeyParts;
 use sha1::Sha1;
 use sha2::{Sha224, Sha256, Sha384, Sha512};
 use signature::hazmat::{PrehashSigner, RandomizedPrehashSigner};
-use std::{collections::HashSet, ops::Range};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 use x509_parser::prelude::FromDer;
 use zeroize::Zeroizing;
 
@@ -40,8 +43,7 @@ use super::builder::{SignatureBuilder, SignatureBuilderError};
 use super::digest::DigestAlgorithm;
 use super::mutation::{
     XmlMutationError, fill_signed_info_digest_values_at_index_with_budget,
-    fill_signed_info_digest_values_with_budget, merge_key_info_source_at_index_with_budget,
-    padded_base64_len_for_xml,
+    merge_key_info_source_at_index_with_budget, padded_base64_len_for_xml,
 };
 use super::parse::{
     EC_P256_OID, EC_P384_OID, EC_P521_OID, MAX_REFERENCES_PER_SIGNATURE, SignatureAlgorithm,
@@ -49,13 +51,17 @@ use super::parse::{
 };
 use super::signature::{encode_ecdsa_signature_as_der, maximum_ecdsa_der_signature_len};
 use super::transforms::{
-    Transform, TransformExecutionBudget, TransformOptions, XPathHereSemantics,
-    XPathSignatureParseBudget, execute_transforms_with_dependency_nodes,
+    BASE64_TRANSFORM_URI, ENVELOPED_SIGNATURE_URI, MAX_TRANSFORMS_PER_REFERENCE, Transform,
+    TransformExecutionBudget, TransformOptions, XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI,
+    XPathHereSemantics, XPathSignatureParseBudget, execute_transforms_with_dependency_nodes,
     execute_transforms_with_options_and_budget, map_c14n_resource_policy_violation,
     parse_transforms_with_budget, validate_signing_transform_policy,
 };
 use super::types::TransformError;
-use super::uri::{UriReferenceResolver, validate_signing_reference_uri};
+use super::uri::{
+    ExternalResourceContext, UriReferenceResolver, validate_signing_reference_request,
+    validate_signing_reference_uri,
+};
 use super::verify::parse_signature_children;
 use crate::document::{DocumentParseSettings, XmlDocument, XmlDocumentError, XmlParseWorkBudget};
 
@@ -1420,6 +1426,7 @@ pub struct SignContext<'a> {
     key_info_writer: Option<&'a dyn KeyInfoWriter>,
     start_node_id: Option<&'a str>,
     id_attributes: &'a [crate::IdAttributeRegistration],
+    external_resources: Option<&'a HashMap<String, Vec<u8>>>,
     template_selection: SignatureTemplateSelection,
     policy: crate::policy::SigningPolicy,
     provider: &'a dyn crate::provider::CryptoProvider,
@@ -1434,6 +1441,7 @@ impl<'a> SignContext<'a> {
             key_info_writer: None,
             start_node_id: None,
             id_attributes: &[],
+            external_resources: None,
             template_selection: SignatureTemplateSelection::default(),
             policy: crate::policy::SigningPolicy::default(),
             provider: crate::provider::default_provider(),
@@ -1499,6 +1507,18 @@ impl<'a> SignContext<'a> {
     #[must_use]
     pub fn id_attributes(mut self, registrations: &'a [crate::IdAttributeRegistration]) -> Self {
         self.id_attributes = registrations;
+        self
+    }
+
+    /// Provide detached Reference payloads explicitly.
+    ///
+    /// The map is the complete external I/O boundary: signing never performs
+    /// network or filesystem access. External URI classes must also be enabled
+    /// by [`crate::policy::SigningPolicy::uris`]. Keys are normalized RFC 3986
+    /// URI identities with dot segments removed and query/fragment retained.
+    #[must_use]
+    pub fn external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
+        self.external_resources = Some(resources);
         self
     }
 
@@ -1602,11 +1622,17 @@ impl<'a> SignContext<'a> {
             )?;
             parse_signature_children(signature)
                 .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
+            validate_signing_signed_info_methods(signature, &self.policy)?;
             Ok::<_, SigningError>(())
         })?;
         let transform_options = TransformOptions::default()
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics);
+        let external_resources = ExternalResourceContext::new(
+            self.external_resources,
+            self.policy.resources.max_external_resource_bytes,
+            self.policy.resources.max_external_resource_total_bytes,
+        );
         let binding = (document.identity(), document.generation());
         let mut operation =
             OperationExecutionContext::new(self.policy.clone(), &mut *budgets, Some(binding));
@@ -1616,7 +1642,7 @@ impl<'a> SignContext<'a> {
             None,
         );
         operation.compile()?;
-        let with_key_info = operation.run_with_budgets(key_info, |budgets| {
+        let key_info_content = operation.run(key_info, || {
             let Some(writer) = self.key_info_writer else {
                 return Ok::<_, SigningError>(None);
             };
@@ -1627,27 +1653,56 @@ impl<'a> SignContext<'a> {
             self.policy
                 .resources
                 .validate_xml_document_len(key_info_content.len())?;
-            // The mutation helper checks its namespace wrapper and every
-            // projected replacement against this policy before allocation.
-            let populated = merge_key_info_source_at_index_with_budget(
-                document.as_xml(),
-                &key_info_content,
-                target_signature,
-                Some(&self.policy),
-                Some(budgets.transforms.xml_parse_work()),
-            )?;
-            self.policy
-                .resources
-                .validate_xml_document_len(populated.len())?;
-            Ok(Some(populated))
+            Ok(Some(key_info_content))
         })?;
         operation.extend();
-        let setup_gate = if let Some(populated) = with_key_info {
+        // Validate reference inputs and build the normalization candidate only after
+        // independent key output has passed its own byte boundary. The execution pass
+        // revalidates the resulting document defensively after controlled mutations.
+        let c14n_candidate = materialize_second_edition_c14n11_candidate(
+            document,
+            target_signature,
+            &self.policy,
+            external_resources.is_configured(),
+        )?;
+        let normalization = if let Some(candidate) = c14n_candidate {
             let mutation =
                 operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
             operation.add_dependency(mutation, key_info)?;
             operation.compile()?;
             operation.run_document_transition(mutation, document, |document, budgets| {
+                document
+                    .replace_serialized_with_settings(
+                        candidate,
+                        self.document_parse_settings(),
+                        Some(budgets.transforms.xml_parse_work()),
+                    )
+                    .map_err(map_owned_document_mutation_error)
+            })?;
+            operation.extend();
+            Some(mutation)
+        } else {
+            None
+        };
+        let setup_gate = normalization.unwrap_or(key_info);
+        let setup_gate = if let Some(key_info_content) = key_info_content {
+            let mutation =
+                operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
+            operation.add_dependency(mutation, setup_gate)?;
+            operation.compile()?;
+            operation.run_document_transition(mutation, document, |document, budgets| {
+                // The mutation helper checks its namespace wrapper and every projected
+                // replacement against policy before allocating the committed candidate.
+                let populated = merge_key_info_source_at_index_with_budget(
+                    document.as_xml(),
+                    &key_info_content,
+                    target_signature,
+                    Some(&self.policy),
+                    Some(budgets.transforms.xml_parse_work()),
+                )?;
+                self.policy
+                    .resources
+                    .validate_xml_document_len(populated.len())?;
                 document
                     .replace_serialized_with_settings(
                         populated,
@@ -1656,19 +1711,21 @@ impl<'a> SignContext<'a> {
                     )
                     .map_err(map_owned_document_mutation_error)
             })?;
+            operation.extend();
             mutation
         } else {
-            operation.compile()?;
-            key_info
+            setup_gate
         };
-        operation.extend();
         let plan_nodes = fill_reference_digest_values_in_dependency_order_with_operation(
             document,
             transform_options,
             self.provider,
             &mut operation,
-            target_signature,
-            self.id_attributes,
+            SigningReferenceRequest {
+                target_signature,
+                id_attributes: self.id_attributes,
+                external_resources: &external_resources,
+            },
             Some(setup_gate),
         )?;
         self.policy
@@ -1971,6 +2028,12 @@ struct SigningOperationBudgets {
     xpath_parse: XPathSignatureParseBudget,
 }
 
+struct SigningReferenceRequest<'a, 'resources> {
+    target_signature: usize,
+    id_attributes: &'a [crate::IdAttributeRegistration],
+    external_resources: &'a ExternalResourceContext<'resources>,
+}
+
 struct SigningPlanNodes {
     canonicalization: OperationNodeId,
     crypto: OperationNodeId,
@@ -2034,6 +2097,15 @@ fn compute_reference_digest_values_with_options(
     target_signature: Option<usize>,
     id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
+    let resource_policy = policy
+        .map(|policy| &policy.resources)
+        .cloned()
+        .unwrap_or_default();
+    let external_resources = ExternalResourceContext::new(
+        None,
+        resource_policy.max_external_resource_bytes,
+        resource_policy.max_external_resource_total_bytes,
+    );
     let doc = parse_signing_document(
         xml,
         policy,
@@ -2046,7 +2118,7 @@ fn compute_reference_digest_values_with_options(
     )?;
     let signed_info = find_required_child(signature, "SignedInfo")?;
     let references = parse_signing_references(signed_info)?;
-    validate_signing_references(&references, references.len(), policy)?;
+    validate_signing_references(&references, references.len(), policy, false)?;
     compute_signing_reference_digests(
         &doc,
         signature,
@@ -2060,6 +2132,7 @@ fn compute_reference_digest_values_with_options(
                 crate::policy::SameDocumentIdSemantics::Specification,
                 |policy| policy.transforms.same_document_id_semantics,
             ),
+            external_resources: &external_resources,
         },
     )
 }
@@ -2072,8 +2145,7 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
         crate::policy::SigningPolicy,
         &mut SigningOperationBudgets,
     >,
-    target_signature: usize,
-    id_attributes: &[crate::IdAttributeRegistration],
+    request: SigningReferenceRequest<'_, '_>,
     setup_gate: Option<OperationNodeId>,
 ) -> Result<SigningPlanNodes, SigningDigestError> {
     let policy = operation.policy().clone();
@@ -2088,7 +2160,7 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
         document.with_view(|view| {
             let signature = find_signing_signature_node(
                 view.document(),
-                SigningSignatureTarget::Index(target_signature),
+                SigningSignatureTarget::Index(request.target_signature),
             )?;
             let signed_info = find_required_child(signature, "SignedInfo")?;
             let signed_info_references =
@@ -2097,6 +2169,7 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
                 &signed_info_references,
                 signed_info_references.len(),
                 Some(&policy),
+                request.external_resources.is_configured(),
             )?;
             let manifest_references = if process_manifests {
                 parse_signing_manifest_references(
@@ -2115,7 +2188,12 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
         .len()
         .checked_add(manifest_references.len())
         .ok_or_else(|| SigningDigestError::InvalidStructure("reference count overflow".into()))?;
-    validate_signing_references(&manifest_references, total_references, Some(&policy))?;
+    validate_signing_references(
+        &manifest_references,
+        total_references,
+        Some(&policy),
+        request.external_resources.is_configured(),
+    )?;
     let placeholder = "AA==";
     // SignatureValue is the final mutable value in the signing pipeline. Give
     // it concrete character data during analysis so references that retain the
@@ -2123,7 +2201,7 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
     let analysis_replacements = document.with_view(|view| {
         let signature = find_signing_signature_node(
             view.document(),
-            SigningSignatureTarget::Index(target_signature),
+            SigningSignatureTarget::Index(request.target_signature),
         )?;
         let signature_value = find_required_child(signature, "SignatureValue")?;
         let mut replacements = signed_info_references
@@ -2153,7 +2231,7 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
     )?;
     let analysis_signature = find_signing_signature_node(
         &analysis_doc,
-        SigningSignatureTarget::Index(target_signature),
+        SigningSignatureTarget::Index(request.target_signature),
     )?;
     let analysis_signed_info = find_required_child(analysis_signature, "SignedInfo")?;
     let mut analysis_references = parse_signing_references_with_budget(
@@ -2174,8 +2252,11 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
         &analysis_references,
         transform_options,
         &operation.budgets().transforms,
-        id_attributes,
-        policy.transforms.same_document_id_semantics,
+        SigningUriResolution {
+            id_attributes: request.id_attributes,
+            same_document_id_semantics: policy.transforms.same_document_id_semantics,
+            external_resources: request.external_resources,
+        },
     )?;
     let (node_levels, plan_nodes) =
         compile_signing_operation_plan(operation, &dependency_plan, setup_gate)?;
@@ -2188,7 +2269,7 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
                     let current_doc = view.document();
                     let current_signature = find_signing_signature_node(
                         current_doc,
-                        SigningSignatureTarget::Index(target_signature),
+                        SigningSignatureTarget::Index(request.target_signature),
                     )?;
                     let current_signed_info = find_required_child(current_signature, "SignedInfo")?;
                     let current_signed_info_references = parse_signing_references_with_budget(
@@ -2236,10 +2317,11 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
                         provider,
                         &budgets.transforms,
                         SigningUriResolution {
-                            id_attributes,
+                            id_attributes: request.id_attributes,
                             same_document_id_semantics: policy
                                 .transforms
                                 .same_document_id_semantics,
+                            external_resources: request.external_resources,
                         },
                     )?;
                     if computed.len() != destinations.len() {
@@ -2279,6 +2361,11 @@ fn fill_reference_digest_values_in_dependency_order(
     target_signature: usize,
     id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<(), SigningDigestError> {
+    let external_resources = ExternalResourceContext::new(
+        None,
+        policy.resources.max_external_resource_bytes,
+        policy.resources.max_external_resource_total_bytes,
+    );
     let binding = (document.identity(), document.generation());
     let mut operation = OperationExecutionContext::new(policy.clone(), budgets, Some(binding));
     fill_reference_digest_values_in_dependency_order_with_operation(
@@ -2286,8 +2373,11 @@ fn fill_reference_digest_values_in_dependency_order(
         transform_options,
         provider,
         &mut operation,
-        target_signature,
-        id_attributes,
+        SigningReferenceRequest {
+            target_signature,
+            id_attributes,
+            external_resources: &external_resources,
+        },
         None,
     )
     .map(|_| ())
@@ -2304,11 +2394,13 @@ fn reference_dependency_levels(
     references: &[SigningReference],
     transform_options: TransformOptions,
     execution_budget: &TransformExecutionBudget,
-    id_attributes: &[crate::IdAttributeRegistration],
-    same_document_id_semantics: crate::policy::SameDocumentIdSemantics,
+    uri_resolution: SigningUriResolution<'_, '_>,
 ) -> Result<SigningDependencyPlan, SigningDigestError> {
-    let resolver = UriReferenceResolver::with_id_registrations(doc, id_attributes)
-        .with_same_document_id_semantics(same_document_id_semantics);
+    let resolver = uri_resolution.external_resources.bind(
+        doc,
+        uri_resolution.id_attributes,
+        uri_resolution.same_document_id_semantics,
+    );
     let terminal_signature_value_index = references.len();
     let signature_value = find_required_child(signature, "SignatureValue")?;
     let mut tracked_mutable_nodes = references
@@ -2514,6 +2606,7 @@ fn validate_signing_references(
     references: &[SigningReference],
     total_references: usize,
     policy: Option<&crate::policy::SigningPolicy>,
+    has_external_resources: bool,
 ) -> Result<(), SigningDigestError> {
     if let Some(policy) = policy
         && total_references > policy.resources.max_references
@@ -2528,6 +2621,7 @@ fn validate_signing_references(
     for reference in references {
         if let Some(policy) = policy {
             validate_signing_reference_uri(&reference.uri, policy)?;
+            validate_signing_reference_request(&reference.uri, has_external_resources)?;
         }
         if let Some(policy) = policy
             && reference.transforms.len() > policy.resources.max_transforms_per_reference
@@ -2556,9 +2650,38 @@ fn validate_signing_references(
     Ok(())
 }
 
-struct SigningUriResolution<'a> {
+fn validate_signing_signed_info_methods(
+    signature: Node<'_, '_>,
+    policy: &crate::policy::SigningPolicy,
+) -> Result<(), SigningDigestError> {
+    let signed_info = find_required_child(signature, "SignedInfo")?;
+    let canonicalization_method =
+        element_children(signed_info)
+            .next()
+            .ok_or(SigningDigestError::MissingElement {
+                element: "CanonicalizationMethod",
+            })?;
+    verify_ds_element(canonicalization_method, "CanonicalizationMethod")?;
+    let algorithm = required_algorithm_attr(canonicalization_method, "CanonicalizationMethod")?;
+    if policy
+        .transforms
+        .allowed_algorithms
+        .as_ref()
+        .is_some_and(|allowed| !allowed.contains(algorithm))
+    {
+        return Err(crate::policy::PolicyViolation::Algorithm {
+            operation: "SignedInfo canonicalization",
+            algorithm: algorithm.to_owned(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+struct SigningUriResolution<'a, 'resources> {
     id_attributes: &'a [crate::IdAttributeRegistration],
     same_document_id_semantics: crate::policy::SameDocumentIdSemantics,
+    external_resources: &'a ExternalResourceContext<'resources>,
 }
 
 fn compute_signing_reference_digests(
@@ -2568,10 +2691,13 @@ fn compute_signing_reference_digests(
     transform_options: TransformOptions,
     provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
-    uri_resolution: SigningUriResolution<'_>,
+    uri_resolution: SigningUriResolution<'_, '_>,
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
-    let resolver = UriReferenceResolver::with_id_registrations(doc, uri_resolution.id_attributes)
-        .with_same_document_id_semantics(uri_resolution.same_document_id_semantics);
+    let resolver = uri_resolution.external_resources.bind(
+        doc,
+        uri_resolution.id_attributes,
+        uri_resolution.same_document_id_semantics,
+    );
     references
         .into_iter()
         .enumerate()
@@ -2608,7 +2734,8 @@ fn compute_signing_reference_digests(
 /// This is the signing counterpart to verification reference processing: it
 /// dereferences each `<Reference>`, applies transforms, computes the digest,
 /// and writes the base64 digest into the matching `<DigestValue>` in document
-/// order.
+/// order. As required for Second Edition generation, any reference chain that
+/// still produces a node-set is first made explicit with Canonical XML 1.1.
 pub fn fill_reference_digest_values(xml: &str) -> Result<String, SigningDigestError> {
     let execution_budget = TransformExecutionBudget::default();
     fill_reference_digest_values_with_options(
@@ -2631,40 +2758,50 @@ fn fill_reference_digest_values_with_options(
     target_signature: Option<usize>,
     id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<String, SigningDigestError> {
+    let default_policy = crate::policy::SigningPolicy::default();
+    let effective_policy = policy.unwrap_or(&default_policy);
+    let settings =
+        DocumentParseSettings::from_policy(&effective_policy.xml, &effective_policy.resources);
+    let document = XmlDocument::parse_with_settings_and_budget(
+        xml.to_owned(),
+        settings,
+        execution_budget.xml_parse_work(),
+    )
+    .map_err(map_owned_document_digest_mutation_error)?;
+    let target_signature = if let Some(target_signature) = target_signature {
+        target_signature
+    } else {
+        document.with_view(|view| {
+            let selected =
+                find_signing_signature_node(view.document(), SigningSignatureTarget::Last)?;
+            signature_index(view.document(), selected)
+        })?
+    };
+    let materialized = materialize_second_edition_c14n11_candidate(
+        &document,
+        target_signature,
+        effective_policy,
+        false,
+    )?;
+    let xml = materialized.as_deref().unwrap_or(xml);
     let digest_values = compute_reference_digest_values_with_options(
         xml,
         transform_options,
-        policy,
+        Some(effective_policy),
         provider,
         execution_budget,
-        target_signature,
+        Some(target_signature),
         id_attributes,
     )?
     .into_iter()
     .map(|digest| digest.digest_value);
-    Ok(if let Some(target_signature) = target_signature {
-        fill_signed_info_digest_values_at_index_with_budget(
-            xml,
-            digest_values,
-            target_signature,
-            policy,
-            Some(execution_budget.xml_parse_work()),
-        )?
-    } else if let Some(policy) = policy {
-        fill_signed_info_digest_values_with_budget(
-            xml,
-            digest_values,
-            Some(policy),
-            Some(execution_budget.xml_parse_work()),
-        )?
-    } else {
-        fill_signed_info_digest_values_with_budget(
-            xml,
-            digest_values,
-            None,
-            Some(execution_budget.xml_parse_work()),
-        )?
-    })
+    Ok(fill_signed_info_digest_values_at_index_with_budget(
+        xml,
+        digest_values,
+        target_signature,
+        Some(effective_policy),
+        Some(execution_budget.xml_parse_work()),
+    )?)
 }
 
 fn canonicalize_signed_info(
@@ -2724,6 +2861,259 @@ fn canonicalize_signed_info(
             canonical_signed_info,
         ))
     })
+}
+
+const SECOND_EDITION_GENERATION_C14N_URI: &str = "http://www.w3.org/2006/12/xml-c14n11";
+
+struct SourceEdit {
+    range: Range<usize>,
+    replacement: String,
+}
+
+fn materialize_second_edition_c14n11_candidate(
+    document: &XmlDocument,
+    target_signature: usize,
+    policy: &crate::policy::SigningPolicy,
+    has_external_resources: bool,
+) -> Result<Option<String>, SigningDigestError> {
+    let edits = document.with_view(|view| {
+        let signature = find_signing_signature_node(
+            view.document(),
+            SigningSignatureTarget::Index(target_signature),
+        )?;
+        let signed_info = find_required_child(signature, "SignedInfo")?;
+        let mut reference_nodes = element_children(signed_info)
+            .filter(|node| node.has_tag_name((XMLDSIG_NS, "Reference")))
+            .collect::<Vec<_>>();
+        if policy.manifest_processing == crate::policy::ManifestProcessing::Process {
+            let reference_limit = policy
+                .resources
+                .max_references
+                .min(MAX_REFERENCES_PER_SIGNATURE);
+            for manifest in signature
+                .children()
+                .filter(|node| node.has_tag_name((XMLDSIG_NS, "Object")))
+                .flat_map(|object| {
+                    object
+                        .children()
+                        .filter(|node| node.has_tag_name((XMLDSIG_NS, "Manifest")))
+                })
+            {
+                let mut manifest_references = 0usize;
+                for child in element_children(manifest) {
+                    verify_ds_element(child, "Reference")?;
+                    if reference_nodes.len() == reference_limit {
+                        return Err(crate::policy::PolicyViolation::ResourceLimit {
+                            resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
+                            maximum: reference_limit,
+                            actual: reference_limit.saturating_add(1),
+                        }
+                        .into());
+                    }
+                    reference_nodes.push(child);
+                    manifest_references += 1;
+                }
+                if manifest_references == 0 {
+                    return Err(SigningDigestError::MissingElement {
+                        element: "Reference",
+                    });
+                }
+            }
+        }
+        if reference_nodes.len() > policy.resources.max_references {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
+                maximum: policy.resources.max_references,
+                actual: reference_nodes.len(),
+            }
+            .into());
+        }
+
+        let mut edits = Vec::new();
+        for reference_node in reference_nodes {
+            let structure = parse_signing_reference_structure(reference_node)?;
+            validate_signing_reference_uri(structure.uri, policy)?;
+            validate_signing_reference_request(structure.uri, has_external_resources)?;
+            let digest_uri = required_algorithm_attr(structure.digest_method_node, "DigestMethod")?;
+            let digest_method = DigestAlgorithm::from_uri(digest_uri).ok_or_else(|| {
+                SigningDigestError::UnsupportedAlgorithm {
+                    uri: digest_uri.to_owned(),
+                }
+            })?;
+            policy.check_digest_algorithm(digest_method)?;
+
+            let transform_uris = generation_transform_uris(structure.transforms_node)?;
+            if transform_uris.len() > policy.resources.max_transforms_per_reference {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
+                    maximum: policy.resources.max_transforms_per_reference,
+                    actual: transform_uris.len(),
+                }
+                .into());
+            }
+            if let Some(allowed) = policy.transforms.allowed_algorithms.as_ref()
+                && let Some(disallowed) = transform_uris
+                    .iter()
+                    .find(|algorithm| !allowed.contains(**algorithm))
+            {
+                return Err(crate::policy::PolicyViolation::Algorithm {
+                    operation: "signing transform",
+                    algorithm: (*disallowed).to_owned(),
+                }
+                .into());
+            }
+            let initial_binary = !structure.uri.is_empty() && !structure.uri.starts_with('#');
+            if generation_chain_produces_binary(initial_binary, &transform_uris) {
+                continue;
+            }
+            if transform_uris.len() >= policy.resources.max_transforms_per_reference {
+                return Err(crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
+                    maximum: policy.resources.max_transforms_per_reference,
+                    actual: transform_uris.len().saturating_add(1),
+                }
+                .into());
+            }
+            if policy
+                .transforms
+                .allowed_algorithms
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(SECOND_EDITION_GENERATION_C14N_URI))
+            {
+                return Err(crate::policy::PolicyViolation::Algorithm {
+                    operation: "signing transform",
+                    algorithm: SECOND_EDITION_GENERATION_C14N_URI.to_owned(),
+                }
+                .into());
+            }
+
+            let edit = if let Some(transforms_node) = structure.transforms_node {
+                c14n11_edit_for_transforms(view.xml(), transforms_node)?
+            } else {
+                let prefix = reference_node.prefix().unwrap_or_default();
+                let qualifier = xml_qualifier(prefix);
+                SourceEdit {
+                    range: structure.digest_method_node.range().start
+                        ..structure.digest_method_node.range().start,
+                    replacement: format!(
+                        "<{qualifier}Transforms><{qualifier}Transform Algorithm=\"{SECOND_EDITION_GENERATION_C14N_URI}\"/></{qualifier}Transforms>"
+                    ),
+                }
+            };
+            edits.push(edit);
+        }
+        Ok::<_, SigningDigestError>(edits)
+    })?;
+    if edits.is_empty() {
+        return Ok(None);
+    }
+
+    let projected_len = edits
+        .iter()
+        .try_fold(document.as_xml().len(), |total, edit| {
+            total
+                .checked_sub(edit.range.len())
+                .and_then(|value| value.checked_add(edit.replacement.len()))
+                .ok_or_else(|| {
+                    SigningDigestError::InvalidStructure("document length overflow".into())
+                })
+        })?;
+    policy
+        .resources
+        .validate_xml_document_len(projected_len)
+        .map_err(SigningDigestError::Policy)?;
+
+    let mut candidate = document.as_xml().to_owned();
+    let mut edits = edits;
+    edits.sort_unstable_by_key(|edit| std::cmp::Reverse(edit.range.start));
+    for edit in edits {
+        candidate.replace_range(edit.range, &edit.replacement);
+    }
+    Ok(Some(candidate))
+}
+
+fn c14n11_edit_for_transforms(
+    xml: &str,
+    transforms_node: Node<'_, '_>,
+) -> Result<SourceEdit, SigningDigestError> {
+    let range = transforms_node.range();
+    let source = xml.get(range.clone()).ok_or_else(|| {
+        SigningDigestError::InvalidStructure("Transforms source range is unavailable".into())
+    })?;
+    let prefix = transforms_node.prefix().unwrap_or_default();
+    let qualifier = xml_qualifier(prefix);
+    let transform =
+        format!("<{qualifier}Transform Algorithm=\"{SECOND_EDITION_GENERATION_C14N_URI}\"/>");
+    if source.trim_end().ends_with("/>") {
+        return Ok(SourceEdit {
+            range,
+            replacement: format!("<{qualifier}Transforms>{transform}</{qualifier}Transforms>"),
+        });
+    }
+    let closing = source.rfind("</").ok_or_else(|| {
+        SigningDigestError::InvalidStructure("Transforms closing tag is unavailable".into())
+    })?;
+    let offset = range.start + closing;
+    Ok(SourceEdit {
+        range: offset..offset,
+        replacement: transform,
+    })
+}
+
+fn generation_transform_uris<'a>(
+    transforms_node: Option<Node<'a, 'a>>,
+) -> Result<Vec<&'a str>, SigningDigestError> {
+    let Some(transforms_node) = transforms_node else {
+        return Ok(Vec::new());
+    };
+    let mut algorithms = Vec::new();
+    for child in element_children(transforms_node) {
+        if algorithms.len() == MAX_TRANSFORMS_PER_REFERENCE {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
+                maximum: MAX_TRANSFORMS_PER_REFERENCE,
+                actual: MAX_TRANSFORMS_PER_REFERENCE.saturating_add(1),
+            }
+            .into());
+        }
+        if !child.has_tag_name((XMLDSIG_NS, "Transform")) {
+            return Err(TransformError::UnsupportedTransform(
+                "unexpected child element of <ds:Transforms>; only <ds:Transform> is allowed"
+                    .into(),
+            )
+            .into());
+        }
+        let algorithm = child.attribute("Algorithm").ok_or_else(|| {
+            TransformError::UnsupportedTransform(
+                "missing Algorithm attribute on <Transform>".into(),
+            )
+        })?;
+        if algorithm != ENVELOPED_SIGNATURE_URI
+            && algorithm != BASE64_TRANSFORM_URI
+            && algorithm != XPATH_TRANSFORM_URI
+            && algorithm != XPATH_FILTER2_TRANSFORM_URI
+            && crate::c14n::C14nAlgorithm::from_uri(algorithm).is_none()
+        {
+            return Err(TransformError::UnsupportedTransform(algorithm.to_owned()).into());
+        }
+        algorithms.push(algorithm);
+    }
+    Ok(algorithms)
+}
+
+fn generation_chain_produces_binary(initial_binary: bool, algorithms: &[&str]) -> bool {
+    algorithms.last().map_or(initial_binary, |algorithm| {
+        *algorithm == BASE64_TRANSFORM_URI
+            || crate::c14n::C14nAlgorithm::from_uri(algorithm).is_some()
+    })
+}
+
+fn xml_qualifier(prefix: &str) -> String {
+    if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}:")
+    }
 }
 
 fn parse_signing_document<'a>(
@@ -2922,52 +3312,70 @@ fn parse_signing_reference(
     reference_node: Node<'_, '_>,
     xpath_budget: &mut XPathSignatureParseBudget,
 ) -> Result<SigningReference, SigningDigestError> {
-    let uri = reference_node
-        .attribute("URI")
-        .ok_or_else(|| {
-            SigningDigestError::InvalidStructure(
-                "signing Reference must include URI attribute".into(),
-            )
-        })?
-        .to_string();
-    let mut children = element_children(reference_node);
-
-    let mut transforms = Vec::new();
-    let mut next = children.next().ok_or(SigningDigestError::MissingElement {
-        element: "DigestMethod",
-    })?;
-    if next.tag_name().name() == "Transforms" && next.tag_name().namespace() == Some(XMLDSIG_NS) {
-        transforms = parse_transforms_with_budget(next, xpath_budget)?;
-        next = children.next().ok_or(SigningDigestError::MissingElement {
-            element: "DigestMethod",
-        })?;
-    }
-
-    verify_ds_element(next, "DigestMethod")?;
-    let digest_uri = required_algorithm_attr(next, "DigestMethod")?;
+    let structure = parse_signing_reference_structure(reference_node)?;
+    let transforms = structure.transforms_node.map_or_else(
+        || Ok(Vec::new()),
+        |node| parse_transforms_with_budget(node, xpath_budget),
+    )?;
+    let digest_uri = required_algorithm_attr(structure.digest_method_node, "DigestMethod")?;
     let digest_method = DigestAlgorithm::from_uri(digest_uri).ok_or_else(|| {
         SigningDigestError::UnsupportedAlgorithm {
             uri: digest_uri.to_string(),
         }
     })?;
+
+    Ok(SigningReference {
+        uri: structure.uri.to_owned(),
+        transforms,
+        digest_method,
+        digest_value_range: structure.digest_value_node.range(),
+        digest_value_node_id: structure.digest_value_node.id(),
+    })
+}
+
+struct SigningReferenceStructure<'a> {
+    uri: &'a str,
+    transforms_node: Option<Node<'a, 'a>>,
+    digest_method_node: Node<'a, 'a>,
+    digest_value_node: Node<'a, 'a>,
+}
+
+fn parse_signing_reference_structure<'a>(
+    reference_node: Node<'a, 'a>,
+) -> Result<SigningReferenceStructure<'a>, SigningDigestError> {
+    let uri = reference_node.attribute("URI").ok_or_else(|| {
+        SigningDigestError::InvalidStructure("signing Reference must include URI attribute".into())
+    })?;
+    let mut children = element_children(reference_node);
+    let first = children.next().ok_or(SigningDigestError::MissingElement {
+        element: "DigestMethod",
+    })?;
+    let (transforms_node, digest_method_node) = if first.has_tag_name((XMLDSIG_NS, "Transforms")) {
+        (
+            Some(first),
+            children.next().ok_or(SigningDigestError::MissingElement {
+                element: "DigestMethod",
+            })?,
+        )
+    } else {
+        (None, first)
+    };
+    verify_ds_element(digest_method_node, "DigestMethod")?;
     let digest_value_node = children.next().ok_or(SigningDigestError::MissingElement {
         element: "DigestValue",
     })?;
     verify_ds_element(digest_value_node, "DigestValue")?;
-
     if let Some(unexpected) = children.next() {
         return Err(SigningDigestError::InvalidStructure(format!(
             "unexpected element <{}> after <DigestValue> in <Reference>",
             unexpected.tag_name().name()
         )));
     }
-
-    Ok(SigningReference {
+    Ok(SigningReferenceStructure {
         uri,
-        transforms,
-        digest_method,
-        digest_value_range: digest_value_node.range(),
-        digest_value_node_id: digest_value_node.id(),
+        transforms_node,
+        digest_method_node,
+        digest_value_node,
     })
 }
 
@@ -3574,5 +3982,47 @@ mod error_conversion_tests {
             ),
             "expected a SignatureValue dependency-cycle rejection, got: {error:?}"
         );
+    }
+
+    #[test]
+    fn second_edition_c14n_materialization_handles_both_reference_shapes() {
+        // Templates may omit <Transforms> entirely or serialize an empty
+        // prefixed element. Both forms must become one valid explicit chain.
+        let xml = r##"<root><payload Id="payload"/><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2006/12/xml-c14n11"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference><ds:Reference URI="#payload"><ds:Transforms/><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
+        let document = XmlDocument::parse(xml).expect("fixture must parse");
+        let candidate = materialize_second_edition_c14n11_candidate(
+            &document,
+            0,
+            &crate::policy::SigningPolicy::default(),
+            false,
+        )
+        .expect("materialization planning must succeed")
+        .expect("both node-set chains require explicit canonicalization");
+
+        assert_eq!(
+            candidate
+                .matches(SECOND_EDITION_GENERATION_C14N_URI)
+                .count(),
+            3
+        );
+        assert!(candidate.contains("<ds:Transforms><ds:Transform"));
+        XmlDocument::parse(candidate).expect("materialized candidate must remain well-formed");
+    }
+
+    #[test]
+    fn second_edition_c14n_materialization_is_idempotent_for_binary_chains() {
+        // An explicit canonicalization already produces octets; planning must
+        // avoid both duplicate transforms and a no-op document generation.
+        let xml = r##"<root><payload Id="payload"/><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2006/12/xml-c14n11"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2006/12/xml-c14n11"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
+        let document = XmlDocument::parse(xml).expect("fixture must parse");
+        let candidate = materialize_second_edition_c14n11_candidate(
+            &document,
+            0,
+            &crate::policy::SigningPolicy::default(),
+            false,
+        )
+        .expect("materialization planning must succeed");
+
+        assert!(candidate.is_none());
     }
 }

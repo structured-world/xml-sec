@@ -127,10 +127,11 @@ adapters, staged mutations, dependency levels, and decryption retries share one
 policy allowance rather than resetting limits inside helpers.
 
 Interoperability evidence is deterministic and offline. The complete Phaos
-XMLDSig 3 and XMLDSig 1.1 interoperability corpora are executed through the
-public sign/verify APIs with exact valid, invalid, and fail-closed classifications; the generated
-[compatibility ledger](docs/compatibility-ledger.md) keeps remaining libxmlsec1
-parity work explicit.
+XMLDSig 3, XMLDSig 1.1, and XMLDSig Second Edition interoperability corpora
+are executed through the public sign/verify APIs with exact valid, invalid,
+and fail-closed classifications; the generated
+[compatibility ledger](docs/compatibility-ledger.md) keeps remaining
+libxmlsec1 parity work explicit.
 
 ## Native CLI
 
@@ -208,7 +209,7 @@ The project tracks stable Rust and supports Rust 1.92 or newer.
 | [Canonical XML 1.0](https://www.w3.org/TR/xml-c14n/) | Implemented; full-document and document-subset vectors |
 | [Canonical XML 1.1](https://www.w3.org/TR/xml-c14n11/) | Implemented; `xml:id` and `xml:base` subset rules |
 | [Exclusive C14N](https://www.w3.org/TR/xml-exc-c14n/) | Implemented; `InclusiveNamespaces PrefixList` support |
-| [XMLDSig 1.0/1.1](https://www.w3.org/TR/xmldsig-core1/) | Core sign/verify pipelines; complete Merlin, Phaos 3, and 2012 XMLDSig 1.1 interop corpora classified and executed |
+| [XMLDSig 1.0/1.1](https://www.w3.org/TR/xmldsig-core1/) | Core sign/verify pipelines; complete Merlin, Phaos 3, 2012 XMLDSig 1.1, and Second Edition interop corpora classified and executed |
 | [XMLEnc](https://www.w3.org/TR/xmlenc-core1/) | Core AES-CBC/GCM encrypt/decrypt with RSA-OAEP and AES-KW implemented; broader conformance coverage in progress |
 
 ## License
