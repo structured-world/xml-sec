@@ -2017,6 +2017,7 @@ fn encode_signature_output(
 #[derive(Debug, Clone)]
 struct SigningReference {
     uri: String,
+    origin_node_id: NodeId,
     transforms: Vec<Transform>,
     digest_method: DigestAlgorithm,
     digest_value_range: Range<usize>,
@@ -2426,9 +2427,12 @@ fn reference_dependency_levels(
     let analyses = references
         .iter()
         .map(|reference| {
-            let initial_data = resolver.dereference_with_budget(
+            let origin = signing_reference_origin(doc, reference)?;
+            let initial_data = resolver.dereference_from_with_budget(
                 &reference.uri,
+                origin,
                 execution_budget.node_set_materialization(),
+                execution_budget.xml_base_resolution(),
             )?;
             let output = execute_transforms_with_dependency_nodes(
                 signature,
@@ -2484,6 +2488,17 @@ fn reference_dependency_levels(
     Ok(SigningDependencyPlan {
         dependencies: analyses,
         levels,
+    })
+}
+
+fn signing_reference_origin<'doc, 'input>(
+    doc: &'doc Document<'input>,
+    reference: &SigningReference,
+) -> Result<Node<'doc, 'input>, SigningDigestError> {
+    doc.get_node(reference.origin_node_id).ok_or_else(|| {
+        SigningDigestError::InvalidStructure(
+            "signing Reference origin changed while computing digests".into(),
+        )
     })
 }
 
@@ -2702,9 +2717,12 @@ fn compute_signing_reference_digests(
         .into_iter()
         .enumerate()
         .map(|(index, reference)| {
-            let initial_data = resolver.dereference_with_budget(
+            let origin = signing_reference_origin(doc, &reference)?;
+            let initial_data = resolver.dereference_from_with_budget(
                 &reference.uri,
+                origin,
                 execution_budget.node_set_materialization(),
+                execution_budget.xml_base_resolution(),
             )?;
             let pre_digest = execute_transforms_with_options_and_budget(
                 signature,
@@ -3045,9 +3063,16 @@ fn c14n11_edit_for_transforms(
     let transform =
         format!("<{qualifier}Transform Algorithm=\"{SECOND_EDITION_GENERATION_C14N_URI}\"/>");
     if source.trim_end().ends_with("/>") {
+        let trimmed = source.trim_end();
+        let opening = trimmed.strip_suffix("/>").ok_or_else(|| {
+            SigningDigestError::InvalidStructure(
+                "self-closing Transforms source is unavailable".into(),
+            )
+        })?;
+        let trailing = &source[trimmed.len()..];
         return Ok(SourceEdit {
             range,
-            replacement: format!("<{qualifier}Transforms>{transform}</{qualifier}Transforms>"),
+            replacement: format!("{opening}>{transform}</{qualifier}Transforms>{trailing}"),
         });
     }
     let closing = source.rfind("</").ok_or_else(|| {
@@ -3326,6 +3351,7 @@ fn parse_signing_reference(
 
     Ok(SigningReference {
         uri: structure.uri.to_owned(),
+        origin_node_id: reference_node.id(),
         transforms,
         digest_method,
         digest_value_range: structure.digest_value_node.range(),

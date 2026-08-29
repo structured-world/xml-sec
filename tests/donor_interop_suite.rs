@@ -922,6 +922,45 @@ fn detached_signing_enforces_policy_request_and_shared_budget_atomically() {
 }
 
 #[test]
+fn detached_signing_resolves_reference_xml_base() {
+    // External resource identities are resolved from the Reference node, so a
+    // caller supplies the normalized identity rather than its lexical URI.
+    let template = fs::read_to_string(format!("{XMLDSIG2ED_DIR}/defCan-1.tmpl"))
+        .expect("Second Edition signing template must be readable")
+        .replacen(
+            r#"<Reference URI="c14n11/xml-base-input.xml">"#,
+            r#"<Reference xml:base="vectors/" URI="../c14n11/xml-base-input.xml">"#,
+            1,
+        );
+    let external_xml = fs::read(format!("{XMLDSIG2ED_DIR}/c14n11/xml-base-input.xml"))
+        .expect("Second Edition external XML fixture must be readable");
+    let resources = HashMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
+    let key = HmacSigningKey::new(b"secret".to_vec())
+        .expect("upstream Second Edition HMAC key must parse");
+    let mut policy = SigningPolicy {
+        signature_algorithms: Some(HashSet::from([SignatureAlgorithm::HmacSha1])),
+        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+        hmac: HmacPolicy {
+            minimum_key_bits: 40,
+            minimum_output_bits: 40,
+        },
+        ..SigningPolicy::default()
+    };
+    policy.uris.references = UriTypeSet::ALL;
+
+    for backend in XmlBackend::available() {
+        SignContext::new(&key)
+            .policy(policy.clone())
+            .xml_backend(backend)
+            .external_resources(&resources)
+            .sign_template(&template)
+            .unwrap_or_else(|error| {
+                panic!("{backend:?} must resolve detached Reference xml:base: {error}")
+            });
+    }
+}
+
+#[test]
 fn dsa_sha256_upstream_vector_verifies_and_signs() {
     // XMLDSig 1.1 requires DSA-SHA256 even though the 2012 EC/HMAC corpus does
     // not include it; execute xmlsec1's encrypted-key vector in both directions.
