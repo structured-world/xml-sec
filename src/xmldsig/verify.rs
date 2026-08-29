@@ -52,7 +52,7 @@ use super::transforms::{
     transform_chain_produces_binary,
 };
 use super::types::{NodeSet, TransformError};
-use super::uri::UriReferenceResolver;
+use super::uri::{ExternalResourceMapError, UriReferenceResolver, validate_external_resource_map};
 use super::whitespace::{is_xml_whitespace_only, normalize_xml_base64_bytes};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
@@ -1517,30 +1517,19 @@ fn verify_signature_view<'a>(
     enforce_transform_allowed(ctx.allowed_transform_uris(), signed_info.c14n_method.uri())?;
 
     if let Some(resources) = ctx.external_resources {
-        let mut total = 0usize;
-        for bytes in resources.values() {
-            if bytes.len() > ctx.policy.resources.max_external_resource_bytes {
-                return Err(crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
-                    maximum: ctx.policy.resources.max_external_resource_bytes,
-                    actual: bytes.len(),
-                }
-                .into());
-            }
-            total = total.checked_add(bytes.len()).ok_or(
+        validate_external_resource_map(
+            resources,
+            ctx.policy.resources.max_external_resource_bytes,
+            ctx.policy.resources.max_external_resource_total_bytes,
+        )
+        .map_err(|error| match error {
+            ExternalResourceMapError::Policy(error) => error.into(),
+            ExternalResourceMapError::TotalLengthOverflow => {
                 SignatureVerificationPipelineError::InvalidStructure {
                     reason: "external resource total length overflow",
-                },
-            )?;
-        }
-        if total > ctx.policy.resources.max_external_resource_total_bytes {
-            return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
-                maximum: ctx.policy.resources.max_external_resource_total_bytes,
-                actual: total,
+                }
             }
-            .into());
-        }
+        })?;
     }
     let remaining_reference_capacity = ctx
         .policy

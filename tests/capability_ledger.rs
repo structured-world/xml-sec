@@ -165,7 +165,7 @@ fn complete_surface_categories_are_stable() {
         "https://github.com/lsh123/xmlsec"
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
-    assert_eq!(ledger.classifications.len(), 19);
+    assert_eq!(ledger.classifications.len(), 20);
     assert_eq!(ledger.availability.len(), 427);
 
     let counts = ledger
@@ -848,6 +848,30 @@ fn phaos_xmldsig_family_is_exhaustively_classified() {
     let suite = include_str!("phaos_interop.rs");
     assert!(suite.contains("every_phaos_signature_is_classified_once"));
     assert!(suite.contains("executes_every_phaos_signature_through_the_public_pipeline"));
+}
+
+#[test]
+fn xmldsig_second_edition_family_is_exhaustively_classified() {
+    // The family inventory is backed by exact positive and unsupported
+    // outcomes for every signed vector and generation template.
+    let ledger = ledger();
+    let families: Vec<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "test-family" && item.name == "xmldsig2ed-tests")
+        .collect();
+    assert_eq!(families.len(), 1);
+    let family = families[0];
+    let classification = classification(&ledger, family);
+    assert_eq!(family.classification, "xmldsig2ed-exhaustive");
+    assert_eq!(classification.outcome, "planned");
+    assert_eq!(classification.evidence, "xmldsig2ed-tests");
+
+    let suite = include_str!("donor_interop_suite.rs");
+    assert!(
+        suite.contains("complete_second_edition_verification_corpus_is_classified_and_executed")
+    );
+    assert!(suite.contains("second_edition_template_materializes_c14n11_and_signs_detached_xml"));
 }
 
 #[test]

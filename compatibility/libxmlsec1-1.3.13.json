@@ -44,6 +44,10 @@
       "test": "capability_ledger::deprecated_surface_is_explicitly_unsupported",
       "description": "Deprecated C compatibility aliases are not reproduced before a real C compatibility layer exists."
     },
+    "xmldsig2ed-tests": {
+      "test": "capability_ledger::xmldsig_second_edition_family_is_exhaustively_classified",
+      "description": "The Second Edition suite executes every signed document and generation template through the public API across compiled XML backends, including exact XSLT failure classification."
+    },
     "xpath-compatibility-tests": {
       "test": "capability_ledger::xpath_claims_record_libxmlsec_here_compatibility",
       "description": "XPath and XPath Filter 2.0 use standards behavior by default; integration tests exercise the explicit libxmlsec1-compatible here() binding."
@@ -144,6 +148,11 @@
       "outcome": "planned",
       "rationale": "The URI is part of the libxmlsec1 1.3.13 public vocabulary but is not yet implemented by the native Rust API.",
       "evidence": "planned-surface"
+    },
+    "xmldsig2ed-exhaustive": {
+      "outcome": "planned",
+      "rationale": "Every signed vector and generation template is executable and classified by the native public-pipeline suite; full family parity remains planned until the separately tracked XSLT engine is implemented.",
+      "evidence": "xmldsig2ed-tests"
     }
   },
   "availability": [
@@ -44019,7 +44028,7 @@
       "source": "tests/xmldsig2ed-tests/",
       "line": 1,
       "detail": "upstream test directory",
-      "classification": "planned-donor-families"
+      "classification": "xmldsig2ed-exhaustive"
     },
     {
       "kind": "test-family",

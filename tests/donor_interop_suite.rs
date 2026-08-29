@@ -7,17 +7,18 @@ use std::{
 };
 
 use base64::Engine as _;
-use xml_sec::IdAttributeRegistration;
 use xml_sec::policy::{
     HmacPolicy, PolicyViolation, RsaKeyPolicy, SigningPolicy, VerificationPolicy,
 };
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DerEncodedKeyValueInfoWriter, DigestAlgorithm, DsaSigningKey, DsigError,
     DsigStatus, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey, FailureReason,
-    HmacSigningKey, HmacVerificationKey, KeyResolverConfig, KeyValueInfoWriter, RsaSigningKey,
-    SignContext, SignatureAlgorithm, SigningKey, SigningKeyError, SigningPublicKeyInfo, UriTypeSet,
-    VerificationKey, VerifyContext, X509DigestKeyInfoWriter, validate_signing_key,
+    HmacSigningKey, HmacVerificationKey, KeyResolverConfig, KeyValueInfoWriter, ParseError,
+    RsaSigningKey, SignContext, SignatureAlgorithm, SigningDigestError, SigningError, SigningKey,
+    SigningKeyError, SigningPublicKeyInfo, TransformError, UriTypeSet, VerificationKey,
+    VerifyContext, X509DigestKeyInfoWriter, validate_signing_key,
 };
+use xml_sec::{IdAttributeRegistration, XmlBackend, XmlDocument};
 
 const XMLDSIG11_DIR: &str = "tests/fixtures/xmldsig/xmldsig11-interop-2012";
 const XMLDSIG2ED_DIR: &str = "tests/fixtures/xmldsig/xmldsig2ed-tests";
@@ -690,21 +691,308 @@ fn every_xmldsig11_template_signs_and_verifies() {
 }
 
 #[test]
-fn second_edition_vectors_remain_explicitly_fail_closed() {
-    // This task must not accidentally widen the separate Second Edition scope.
+fn complete_second_edition_verification_corpus_is_classified_and_executed() {
+    // Exact per-file outcomes prevent an arbitrary parse/policy error from
+    // masquerading as interoperability coverage.
     let paths = sorted_files(XMLDSIG2ED_DIR, "xml");
     assert_eq!(paths.len(), 9, "fixture import must retain the full corpus");
-    let resolver = DefaultKeyResolver::default();
-    for path in paths {
-        let xml = fs::read_to_string(&path).expect("Second Edition fixture must be readable");
+    let key = HmacVerificationKey::new(b"secret".to_vec())
+        .expect("upstream Second Edition HMAC key must parse");
+    let mut policy = compatibility_verification_policy();
+    policy.uris.references = UriTypeSet::ALL;
+    let external_xml = fs::read(format!("{XMLDSIG2ED_DIR}/c14n11/xml-base-input.xml"))
+        .expect("Second Edition external XML fixture must be readable");
+    let resources = HashMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
+    for backend in XmlBackend::available() {
+        let mut verified = 0;
+        let mut rejected_xslt = 0;
+        for path in &paths {
+            let xml = fs::read_to_string(path).expect("Second Edition fixture must be readable");
+            let name = path.file_name().and_then(|value| value.to_str()).unwrap();
+            let result = VerifyContext::new()
+                .key(&key)
+                .policy(policy.clone())
+                .xml_backend(backend)
+                .external_resources(&resources)
+                .verify(&xml);
+            if matches!(name, "defCan-2.xml" | "defCan-3.xml") {
+                assert!(
+                    matches!(
+                        result,
+                        Err(DsigError::ParseSignedInfo(ParseError::Transform(
+                            TransformError::UnsupportedTransform(ref uri),
+                        ))) if uri == "http://www.w3.org/TR/1999/REC-xslt-19991116"
+                    ),
+                    "{backend:?} {} must report the exact unsupported XSLT transform, got {result:?}",
+                    path.display()
+                );
+                rejected_xslt += 1;
+            } else {
+                let result = result.unwrap_or_else(|error| {
+                    panic!("{backend:?} {} must verify: {error}", path.display())
+                });
+                assert_valid(result.status, path);
+                verified += 1;
+            }
+        }
+
+        assert_eq!(verified, 7, "{backend:?} supported vector count");
+        assert_eq!(rejected_xslt, 2, "{backend:?} XSLT vector count");
+    }
+}
+
+#[test]
+fn second_edition_external_reference_detects_tampering() {
+    // Detached input is request context, so changing those bytes must invalidate
+    // the Reference without changing the signed XML fixture itself.
+    let xml = fs::read_to_string(format!("{XMLDSIG2ED_DIR}/defCan-1.xml"))
+        .expect("Second Edition signature fixture must be readable");
+    let key = HmacVerificationKey::new(b"secret".to_vec())
+        .expect("upstream Second Edition HMAC key must parse");
+    let mut policy = compatibility_verification_policy();
+    policy.uris.references = UriTypeSet::ALL;
+    let mut external_xml = fs::read(format!("{XMLDSIG2ED_DIR}/c14n11/xml-base-input.xml"))
+        .expect("Second Edition external XML fixture must be readable");
+    let marker = b"at=\"3\"";
+    let offset = external_xml
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("external fixture must contain the tamper marker");
+    external_xml[offset + marker.len() - 2] = b'4';
+    let resources = HashMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
+
+    let result = VerifyContext::new()
+        .key(&key)
+        .policy(policy)
+        .external_resources(&resources)
+        .verify(&xml)
+        .expect("tampering must produce a validation result, not a pipeline error");
+    assert_eq!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+    );
+}
+
+#[test]
+fn second_edition_template_materializes_c14n11_and_signs_detached_xml() {
+    // Second Edition generation must not rely on implicit C14N 1.0: the
+    // generated SignedInfo records C14N 1.1 as an explicit Reference transform.
+    let templates = sorted_files(XMLDSIG2ED_DIR, "tmpl");
+    assert_eq!(
+        templates.len(),
+        3,
+        "fixture import must retain every template"
+    );
+    let template = fs::read_to_string(format!("{XMLDSIG2ED_DIR}/defCan-1.tmpl"))
+        .expect("Second Edition signing template must be readable");
+    let external_xml = fs::read(format!("{XMLDSIG2ED_DIR}/c14n11/xml-base-input.xml"))
+        .expect("Second Edition external XML fixture must be readable");
+    let resources = HashMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
+    let key = HmacSigningKey::new(b"secret".to_vec())
+        .expect("upstream Second Edition HMAC key must parse");
+    let mut signing_policy = SigningPolicy {
+        signature_algorithms: Some(HashSet::from([SignatureAlgorithm::HmacSha1])),
+        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+        hmac: HmacPolicy {
+            minimum_key_bits: 40,
+            minimum_output_bits: 40,
+        },
+        ..SigningPolicy::default()
+    };
+    signing_policy.uris.references = UriTypeSet::ALL;
+
+    let verification_key = HmacVerificationKey::new(b"secret".to_vec())
+        .expect("upstream Second Edition HMAC key must parse");
+    let mut verification_policy = compatibility_verification_policy();
+    verification_policy.uris.references = UriTypeSet::ALL;
+    for backend in XmlBackend::available() {
+        let signed = SignContext::new(&key)
+            .policy(signing_policy.clone())
+            .xml_backend(backend)
+            .external_resources(&resources)
+            .sign_template(&template)
+            .unwrap_or_else(|error| panic!("{backend:?} detached signing failed: {error}"));
         assert!(
-            VerifyContext::new()
-                .key_resolver(&resolver)
-                .verify(&xml)
-                .is_err(),
-            "{} must remain outside the implemented contract",
-            path.display()
+            signed.contains(r#"<Transform Algorithm="http://www.w3.org/2006/12/xml-c14n11"/>"#),
+            "{backend:?} generation must materialize the C14N 1.1 conversion"
         );
+        assert!(
+            signed.contains("t7d2cL8Ink8A5i3cS9/bu9MBBU8="),
+            "{backend:?} generated digest must match the W3C vector"
+        );
+        let result = VerifyContext::new()
+            .key(&verification_key)
+            .policy(verification_policy.clone())
+            .xml_backend(backend)
+            .external_resources(&resources)
+            .verify(&signed)
+            .unwrap_or_else(|error| panic!("{backend:?} verification failed: {error}"));
+        assert_valid(result.status, Path::new("defCan-1.tmpl"));
+
+        for name in ["defCan-2.tmpl", "defCan-3.tmpl"] {
+            let xslt_template = fs::read_to_string(format!("{XMLDSIG2ED_DIR}/{name}"))
+                .expect("Second Edition XSLT template must be readable");
+            let result = SignContext::new(&key)
+                .policy(signing_policy.clone())
+                .xml_backend(backend)
+                .external_resources(&resources)
+                .sign_template(&xslt_template);
+            assert!(
+                matches!(
+                    result,
+                    Err(SigningError::Digest(SigningDigestError::Transform(
+                        TransformError::UnsupportedTransform(ref uri),
+                    ))) if uri == "http://www.w3.org/TR/1999/REC-xslt-19991116"
+                ),
+                "{backend:?} {name} must report the exact unsupported XSLT transform, got {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn detached_signing_enforces_policy_request_and_shared_budget_atomically() {
+    // External bytes are capability-bearing request context, but URI permission
+    // and aggregate work remain independent immutable policy decisions.
+    let template = fs::read_to_string(format!("{XMLDSIG2ED_DIR}/defCan-1.tmpl"))
+        .expect("Second Edition signing template must be readable");
+    let external_xml = fs::read(format!("{XMLDSIG2ED_DIR}/c14n11/xml-base-input.xml"))
+        .expect("Second Edition external XML fixture must be readable");
+    let resources = HashMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml.clone())]);
+    let key = HmacSigningKey::new(b"secret".to_vec())
+        .expect("upstream Second Edition HMAC key must parse");
+    let base_policy = SigningPolicy {
+        signature_algorithms: Some(HashSet::from([SignatureAlgorithm::HmacSha1])),
+        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+        hmac: HmacPolicy {
+            minimum_key_bits: 40,
+            minimum_output_bits: 40,
+        },
+        ..SigningPolicy::default()
+    };
+
+    let disallowed = SignContext::new(&key)
+        .policy(base_policy.clone())
+        .external_resources(&resources)
+        .sign_template(&template);
+    assert!(matches!(
+        disallowed,
+        Err(SigningError::Policy(PolicyViolation::Uri { .. }))
+    ));
+
+    let mut allowed_policy = base_policy.clone();
+    allowed_policy.uris.references = UriTypeSet::ALL;
+    let mut document = XmlDocument::parse(template.clone()).expect("template must parse");
+    let original_generation = document.generation();
+    let without_request = SignContext::new(&key)
+        .policy(allowed_policy.clone())
+        .sign_document(&mut document);
+    assert!(matches!(
+        without_request,
+        Err(SigningError::Policy(PolicyViolation::Uri { .. }))
+    ));
+    assert_eq!(document.as_xml(), template);
+    assert_eq!(document.generation(), original_generation);
+
+    let empty_resources = HashMap::new();
+    let missing = SignContext::new(&key)
+        .policy(allowed_policy.clone())
+        .external_resources(&empty_resources)
+        .sign_template(&template);
+    assert!(matches!(
+        missing,
+        Err(SigningError::Digest(SigningDigestError::Transform(
+            TransformError::UnsupportedUri(ref uri),
+        ))) if uri == "c14n11/xml-base-input.xml"
+    ));
+
+    allowed_policy.resources.max_external_resource_bytes = external_xml.len();
+    allowed_policy.resources.max_external_resource_total_bytes = external_xml.len();
+    let exhausted = SignContext::new(&key)
+        .policy(allowed_policy)
+        .external_resources(&resources)
+        .sign_template(&template);
+    assert!(matches!(
+        exhausted,
+        Err(SigningError::Policy(PolicyViolation::ResourceLimit {
+            resource: "aggregate external resource bytes",
+            ..
+        }))
+    ));
+
+    let unused = vec![0_u8; external_xml.len() * 2];
+    let complete_map = HashMap::from([
+        ("c14n11/xml-base-input.xml".to_owned(), external_xml.clone()),
+        ("unused.bin".to_owned(), unused.clone()),
+    ]);
+    let mut complete_map_policy = base_policy;
+    complete_map_policy.uris.references = UriTypeSet::ALL;
+    complete_map_policy.resources.max_external_resource_bytes = unused.len();
+    complete_map_policy
+        .resources
+        .max_external_resource_total_bytes = unused.len();
+    let mut oversized_map_document =
+        XmlDocument::parse(template.clone()).expect("template must parse");
+    let oversized_map_generation = oversized_map_document.generation();
+    let oversized_map = SignContext::new(&key)
+        .policy(complete_map_policy)
+        .external_resources(&complete_map)
+        .sign_document(&mut oversized_map_document);
+    assert!(matches!(
+        oversized_map,
+        Err(SigningError::Policy(PolicyViolation::ResourceLimit {
+            resource: "aggregate external resource bytes",
+            maximum,
+            actual,
+        })) if maximum == unused.len() && actual == external_xml.len() + unused.len()
+    ));
+    assert_eq!(oversized_map_document.as_xml(), template);
+    assert_eq!(
+        oversized_map_document.generation(),
+        oversized_map_generation
+    );
+}
+
+#[test]
+fn detached_signing_resolves_reference_xml_base() {
+    // External resource identities are resolved from the Reference node, so a
+    // caller supplies the normalized identity rather than its lexical URI.
+    let original_template = fs::read_to_string(format!("{XMLDSIG2ED_DIR}/defCan-1.tmpl"))
+        .expect("Second Edition signing template must be readable");
+    let template = original_template.replacen(
+        r#"<Reference URI="c14n11/xml-base-input.xml">"#,
+        r#"<Reference xml:base="vectors/" URI="../c14n11/xml-base-input.xml">"#,
+        1,
+    );
+    assert_ne!(
+        template, original_template,
+        "fixture Reference substitution must succeed"
+    );
+    let external_xml = fs::read(format!("{XMLDSIG2ED_DIR}/c14n11/xml-base-input.xml"))
+        .expect("Second Edition external XML fixture must be readable");
+    let resources = HashMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
+    let key = HmacSigningKey::new(b"secret".to_vec())
+        .expect("upstream Second Edition HMAC key must parse");
+    let mut policy = SigningPolicy {
+        signature_algorithms: Some(HashSet::from([SignatureAlgorithm::HmacSha1])),
+        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+        hmac: HmacPolicy {
+            minimum_key_bits: 40,
+            minimum_output_bits: 40,
+        },
+        ..SigningPolicy::default()
+    };
+    policy.uris.references = UriTypeSet::ALL;
+
+    for backend in XmlBackend::available() {
+        SignContext::new(&key)
+            .policy(policy.clone())
+            .xml_backend(backend)
+            .external_resources(&resources)
+            .sign_template(&template)
+            .unwrap_or_else(|error| {
+                panic!("{backend:?} must resolve detached Reference xml:base: {error}")
+            });
     }
 }
 

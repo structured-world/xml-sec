@@ -33,6 +33,10 @@
       "test": "capability_ledger::phaos_xmldsig_family_is_exhaustively_classified",
       "description": "The exhaustive Phaos integration suite executes every signature document through the public verification API and asserts exact valid, invalid, or unsupported outcomes without skips."
     },
+    "xmldsig2ed-tests": {
+      "test": "capability_ledger::xmldsig_second_edition_family_is_exhaustively_classified",
+      "description": "The Second Edition suite executes every signed document and generation template through the public API across compiled XML backends, including exact XSLT failure classification."
+    },
     "planned-surface": {
       "test": "capability_ledger::planned_surface_is_never_reported_as_supported",
       "description": "Unimplemented backend APIs, CLI, registry, format, URI, and donor-suite entries remain machine-readable planned work."
@@ -170,6 +174,14 @@
       "outcome": "planned",
       "rationale": "Native Rust key parsing exists, but the libxmlsec1 key-format enum contract is not yet reproduced.",
       "evidence": "planned-surface"
+    },
+    {
+      "id": "xmldsig2ed-exhaustive",
+      "kinds": ["test-family"],
+      "name_regex": "^xmldsig2ed-tests$",
+      "outcome": "planned",
+      "rationale": "Every signed vector and generation template is executable and classified by the native public-pipeline suite; full family parity remains planned until the separately tracked XSLT engine is implemented.",
+      "evidence": "xmldsig2ed-tests"
     },
     {
       "id": "phaos-xmldsig-exhaustive",

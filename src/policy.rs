@@ -1059,8 +1059,8 @@ pub struct SigningPolicy {
     pub rsa_keys: RsaKeyPolicy,
     /// DSA requirements enforced before producing a signature.
     pub dsa_keys: DsaKeyPolicy,
-    /// Reference URI permissions. External URIs remain unsupported until the
-    /// caller supplies request-scoped external bytes through the signing API.
+    /// Reference URI permissions. External URIs resolve only from caller-supplied
+    /// request bytes and never enable filesystem or network access.
     pub uris: UriPolicy,
     /// Transform and canonicalization permissions.
     pub transforms: TransformPolicy,

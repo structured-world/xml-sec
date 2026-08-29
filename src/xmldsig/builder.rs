@@ -17,7 +17,7 @@ use super::mutation::{
 };
 use super::transforms::{
     ENVELOPED_SIGNATURE_XPATH_EXPR, ENVELOPED_SIGNATURE_XPATH_PREFIX, TransformExecutionBudget,
-    XPathSignatureParseBudget, map_c14n_resource_policy_violation,
+    XPathSignatureParseBudget, map_c14n_resource_policy_violation, transform_chain_produces_binary,
     validate_signing_transform_policy, validate_xpath_namespace_budget_with_resources,
 };
 use super::uri::validate_signing_reference_uri;
@@ -405,18 +405,19 @@ impl SignatureBuilder {
         }
         for reference in &self.references {
             validate_signing_reference_uri(&reference.uri, policy)?;
-            if reference.transforms.len() > policy.resources.max_transforms_per_reference {
+            let generated_transforms = reference_transforms_for_generation(reference);
+            if generated_transforms.len() > policy.resources.max_transforms_per_reference {
                 return Err(PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
                     maximum: policy.resources.max_transforms_per_reference,
-                    actual: reference.transforms.len(),
+                    actual: generated_transforms.len(),
                 }
                 .into());
             }
             let initial_binary = !reference.uri.is_empty() && !reference.uri.starts_with('#');
             validate_signing_transform_policy(
                 initial_binary,
-                &reference.transforms,
+                &generated_transforms,
                 policy.transforms.allowed_algorithms.as_ref(),
             )?;
             for transform in &reference.transforms {
@@ -587,9 +588,10 @@ fn write_reference<W: Write>(
     element.push_attribute(("URI", reference.uri.as_str()));
     writer.write_event(Event::Start(element))?;
 
-    if !reference.transforms.is_empty() {
+    let generated_transforms = reference_transforms_for_generation(reference);
+    if !generated_transforms.is_empty() {
         write_start(writer, prefix, "Transforms")?;
-        for transform in &reference.transforms {
+        for transform in &generated_transforms {
             write_transform(writer, prefix, transform)?;
         }
         write_end(writer, prefix, "Transforms")?;
@@ -603,6 +605,18 @@ fn write_reference<W: Write>(
     write_empty(writer, prefix, "DigestValue")?;
     writer.write_event(Event::End(BytesEnd::new(name)))?;
     Ok(())
+}
+
+fn reference_transforms_for_generation(reference: &ReferenceBuilder) -> Vec<Transform> {
+    let mut transforms = reference.transforms.clone();
+    let initial_binary = !reference.uri.is_empty() && !reference.uri.starts_with('#');
+    if !transform_chain_produces_binary(initial_binary, &transforms) {
+        transforms.push(Transform::C14n(C14nAlgorithm::new(
+            C14nMode::Inclusive1_1,
+            false,
+        )));
+    }
+    transforms
 }
 
 fn write_transform<W: Write>(

@@ -21,6 +21,10 @@ fn exclusive_c14n() -> C14nAlgorithm {
     C14nAlgorithm::new(C14nMode::Exclusive1_0, false)
 }
 
+fn generation_c14n() -> C14nAlgorithm {
+    C14nAlgorithm::new(C14nMode::Inclusive1_1, false)
+}
+
 fn signing_material() -> (RsaSigningKey, X509CertificateKeyInfoWriter) {
     let private_key = fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-key.pem")
         .expect("RSA private-key fixture must load");
@@ -66,7 +70,7 @@ fn verify(signed: &str) -> Result<xml_sec::xmldsig::VerifyResult, DsigError> {
         .key_resolver(&resolver)
         .allowed_transforms([
             XPATH_FILTER2_TRANSFORM_URI,
-            DEFAULT_IMPLICIT_C14N_URI,
+            generation_c14n().uri(),
             exclusive_c14n().uri(),
         ])
         .verify(signed)
@@ -75,7 +79,7 @@ fn verify(signed: &str) -> Result<xml_sec::xmldsig::VerifyResult, DsigError> {
 #[test]
 fn filter2_round_trips_through_signing_and_verification() {
     // This crosses template serialization, strict parsing, XPath evaluation,
-    // implicit C14N, RSA signing, embedded-certificate resolution, and verify.
+    // explicit generation C14N, RSA signing, embedded-certificate resolution, and verify.
     let signed = sign_document();
     assert!(signed.contains(&format!("Algorithm=\"{XPATH_FILTER2_TRANSFORM_URI}\"")));
 
@@ -214,7 +218,7 @@ fn here_semantics_are_explicit_across_signing_and_verification() {
         .key_resolver(&resolver)
         .allowed_transforms([
             XPATH_TRANSFORM_URI,
-            DEFAULT_IMPLICIT_C14N_URI,
+            generation_c14n().uri(),
             exclusive_c14n().uri(),
         ])
         .verify(&standard)

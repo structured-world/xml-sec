@@ -228,10 +228,9 @@ fn rejects_transform_chains_that_execution_cannot_accept() {
 }
 
 #[test]
-fn rejects_node_set_reference_when_implicit_c14n_is_disallowed() {
-    // A node-set reference receives inclusive C14N 1.0 implicitly during
-    // digest computation, so template validation must enforce that hidden
-    // transform before emitting a template that signing cannot consume.
+fn rejects_node_set_reference_when_generation_c14n11_is_disallowed() {
+    // Second Edition generation serializes inclusive C14N 1.1 explicitly, so
+    // builder policy must authorize that emitted transform.
     let mut policy = SigningPolicy::default();
     policy.transforms.allowed_algorithms = Some(
         [
@@ -246,14 +245,14 @@ fn rejects_node_set_reference_when_implicit_c14n_is_disallowed() {
             ReferenceBuilder::new(DigestAlgorithm::Sha256).transform(Transform::Enveloped),
         )
         .build_template_with_policy(&policy)
-        .expect_err("builder must enforce the implicit canonicalization transform");
+        .expect_err("builder must enforce the generated canonicalization transform");
 
     assert!(matches!(
         error,
         SignatureBuilderError::Policy(PolicyViolation::Algorithm {
             operation: "signing transform",
             algorithm,
-        }) if algorithm == xml_sec::xmldsig::DEFAULT_IMPLICIT_C14N_URI
+        }) if algorithm == "http://www.w3.org/2006/12/xml-c14n11"
     ));
 }
 
@@ -385,18 +384,23 @@ fn rejects_signature_wide_xpath_expression_budget() {
         })
         .collect::<Vec<_>>();
     let mut max_reference = ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#item-0");
-    for _ in 0..64 {
+    for _ in 0..63 {
         max_reference = max_reference.transform(Transform::XPathFilter2(filters.clone()));
     }
     let mut builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
         .add_reference(max_reference);
-    builder
-        .clone()
-        .build_template()
-        .expect("one maximum-shaped Reference must remain accepted");
     builder = builder.add_reference(
         ReferenceBuilder::new(DigestAlgorithm::Sha256)
             .uri("#item-1")
+            .transform(Transform::XPathFilter2(filters)),
+    );
+    builder
+        .clone()
+        .build_template()
+        .expect("the exact signature-wide expression maximum must remain accepted");
+    builder = builder.add_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#item-2")
             .transform(Transform::XPath(XPathExpression::new("true()"))),
     );
 
@@ -578,9 +582,9 @@ fn policy_aware_builder_accounts_for_filled_digest_values() {
 }
 
 #[test]
-fn policy_aware_builder_rejects_unavailable_external_references() {
-    // Allowing an external URI class does not provide the request-scoped bytes
-    // that the signing API would need to digest that resource.
+fn policy_aware_builder_accepts_external_references_without_claiming_request_availability() {
+    // The builder validates static URI policy but has no request context.
+    // SignContext separately requires caller-owned bytes before digest work.
     let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
         .add_reference(
             ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("https://example.invalid/payload"),
@@ -588,17 +592,10 @@ fn policy_aware_builder_rejects_unavailable_external_references() {
     let mut policy = SigningPolicy::default();
     policy.uris.references = UriTypeSet::ALL;
 
-    let error = builder
+    let template = builder
         .build_template_with_policy(&policy)
-        .expect_err("builder must not emit a template the signing API cannot resolve");
-
-    assert!(matches!(
-        error,
-        SignatureBuilderError::Policy(PolicyViolation::Uri {
-            operation: "signing",
-            reason: "external signing references require request-scoped resource bytes",
-        })
-    ));
+        .expect("static policy allows the external reference template");
+    assert!(template.contains("URI=\"https://example.invalid/payload\""));
 }
 
 #[test]
@@ -664,9 +661,14 @@ fn serializes_and_reparses_general_xpath_filter2_parameters() {
         .find(|node| node.has_tag_name((DSIG_NS, "Transforms")))
         .expect("Transforms element");
     let parsed = parse_transforms(transforms).expect("serialized filters must parse");
-    let [Transform::XPathFilter2(parsed_filters)] = parsed.as_slice() else {
-        panic!("expected XPath Filter 2.0 transform");
+    let [
+        Transform::XPathFilter2(parsed_filters),
+        Transform::C14n(generated_c14n),
+    ] = parsed.as_slice()
+    else {
+        panic!("expected XPath Filter 2.0 followed by generated C14N 1.1");
     };
+    assert_eq!(generated_c14n.uri(), "http://www.w3.org/2006/12/xml-c14n11");
 
     assert_eq!(parsed_filters.len(), 2);
     assert_eq!(
