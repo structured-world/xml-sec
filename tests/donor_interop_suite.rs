@@ -957,13 +957,17 @@ fn detached_signing_enforces_policy_request_and_shared_budget_atomically() {
 fn detached_signing_resolves_reference_xml_base() {
     // External resource identities are resolved from the Reference node, so a
     // caller supplies the normalized identity rather than its lexical URI.
-    let template = fs::read_to_string(format!("{XMLDSIG2ED_DIR}/defCan-1.tmpl"))
-        .expect("Second Edition signing template must be readable")
-        .replacen(
-            r#"<Reference URI="c14n11/xml-base-input.xml">"#,
-            r#"<Reference xml:base="vectors/" URI="../c14n11/xml-base-input.xml">"#,
-            1,
-        );
+    let original_template = fs::read_to_string(format!("{XMLDSIG2ED_DIR}/defCan-1.tmpl"))
+        .expect("Second Edition signing template must be readable");
+    let template = original_template.replacen(
+        r#"<Reference URI="c14n11/xml-base-input.xml">"#,
+        r#"<Reference xml:base="vectors/" URI="../c14n11/xml-base-input.xml">"#,
+        1,
+    );
+    assert_ne!(
+        template, original_template,
+        "fixture Reference substitution must succeed"
+    );
     let external_xml = fs::read(format!("{XMLDSIG2ED_DIR}/c14n11/xml-base-input.xml"))
         .expect("Second Edition external XML fixture must be readable");
     let resources = HashMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
