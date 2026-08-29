@@ -335,6 +335,39 @@ impl<'a> UriReferenceResolver<'a> {
         Ok(Some(bytes))
     }
 
+    pub(crate) fn external_resource_identity(
+        &self,
+        uri: &str,
+    ) -> Option<crate::operation::OperationResourceIdentity> {
+        self.external_resources
+            .and_then(|resources| resources.get(uri))
+            .map(|bytes| crate::operation::OperationResourceIdentity::external(uri, bytes))
+    }
+
+    pub(crate) fn external_resource_set_identity(
+        &self,
+    ) -> crate::operation::OperationResourceIdentity {
+        use sha2::Digest;
+
+        let mut entries = self
+            .external_resources
+            .into_iter()
+            .flat_map(HashMap::iter)
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(uri, _)| *uri);
+        let mut hasher = sha2::Sha256::new();
+        for (uri, bytes) in entries {
+            hasher.update(uri.len().to_be_bytes());
+            hasher.update(uri.as_bytes());
+            hasher.update(bytes.len().to_be_bytes());
+            hasher.update(bytes);
+        }
+        crate::operation::OperationResourceIdentity::External {
+            uri: "caller-owned-external-resource-set".to_owned(),
+            fingerprint: hasher.finalize().into(),
+        }
+    }
+
     /// Dereference a URI string to a [`TransformData`].
     ///
     /// # URI forms

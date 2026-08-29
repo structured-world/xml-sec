@@ -11,6 +11,10 @@ retries consume that single context; a successful provider call is not reported 
 accepted operation until output validation succeeds, and document replacement remains
 the terminal graph node. Failed candidates or replacement validation leave an owned
 document and its generation unchanged.
+Dependency and resource checks run before the closure that performs each phase. A
+controlled replacement must start at the context's expected generation, commit exactly
+one new generation, and advance that expectation before any later node can execute;
+stale or foreign document state is therefore rejected before mutation work begins.
 
 ## Direct-Key Encryption
 

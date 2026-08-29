@@ -1,11 +1,11 @@
 //! Shared compilation and execution state for one XML Security operation.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeSet, HashSet},
 };
 
-use crate::{DocumentIdentity, DocumentView, NodeIdentity, XmlDocument, XmlDocumentError};
+use crate::{DocumentIdentity, DocumentView, NodeIdentity, XmlDocument};
 
 /// Stable identifier assigned in deterministic discovery order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -23,9 +23,8 @@ impl OperationNodeId {
 pub(crate) enum OperationStage {
     Parse,
     Resolve,
-    DependencyGraph,
-    Transform,
     Digest,
+    Canonicalization,
     Crypto,
     AuthenticatedDependency,
     Evidence,
@@ -36,11 +35,10 @@ pub(crate) enum OperationStage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OperationNodeKind {
     Document,
-    Reference { index: usize, manifest: bool },
     Manifest { index: usize },
     Key { index: usize },
-    Transform { index: usize },
     Digest { index: usize },
+    Canonicalization,
     Crypto,
     Evidence,
     Mutation,
@@ -50,8 +48,19 @@ pub(crate) enum OperationNodeKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum OperationResourceIdentity {
     DocumentNode(NodeIdentity),
-    External(String),
+    External { uri: String, fingerprint: [u8; 32] },
     Generated(&'static str, usize),
+}
+
+impl OperationResourceIdentity {
+    pub(crate) fn external(uri: impl Into<String>, bytes: &[u8]) -> Self {
+        use sha2::Digest;
+
+        Self::External {
+            uri: uri.into(),
+            fingerprint: sha2::Sha256::digest(bytes).into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +95,10 @@ pub(crate) enum OperationPlanError {
         "operation plan is bound to stale document generation {planned}; current generation is {current}"
     )]
     StaleGeneration { planned: u64, current: u64 },
+    #[error("operation resource identity changed after plan compilation")]
+    StaleResourceIdentity,
+    #[error("operation mutation did not advance the document by exactly one generation")]
+    InvalidGenerationTransition,
     #[error("operation node {node:?} executed before dependency {requires:?}")]
     DependencyNotExecuted {
         node: OperationNodeId,
@@ -182,6 +195,7 @@ impl OperationPlanBuilder {
         Ok(CompiledOperationPlan {
             nodes: self.nodes,
             edges: self.edges,
+            #[cfg(test)]
             order,
         })
     }
@@ -192,10 +206,12 @@ impl OperationPlanBuilder {
 pub(crate) struct CompiledOperationPlan {
     nodes: Vec<OperationNode>,
     edges: HashSet<OperationEdge>,
+    #[cfg(test)]
     order: Vec<OperationNodeId>,
 }
 
 impl CompiledOperationPlan {
+    #[cfg(test)]
     pub(crate) fn order(&self) -> &[OperationNodeId] {
         &self.order
     }
@@ -216,12 +232,28 @@ impl CompiledOperationPlan {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperationDecisionReason {
+    Completed,
+    ReferenceDigestVerified,
+    ReferenceDigestRejected,
+    KeyResolved,
+    KeyUnavailable,
+    SignatureVerified,
+    SignatureRejected,
+    EvidenceFinalized,
+    MutationCommitted,
+    ActionRejected,
+}
+
 /// Typed internal record used to preserve deterministic first-failure state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OperationDecision {
     pub(crate) node: OperationNodeId,
+    pub(crate) kind: OperationNodeKind,
+    pub(crate) resource: Option<OperationResourceIdentity>,
     pub(crate) accepted: bool,
-    pub(crate) reason: &'static str,
+    pub(crate) reason: OperationDecisionReason,
 }
 
 /// Single owner of immutable policy, cumulative budgets, identity state and
@@ -231,7 +263,7 @@ pub(crate) struct OperationExecutionContext<P, B> {
     budgets: B,
     builder: Option<OperationPlanBuilder>,
     plan: Option<CompiledOperationPlan>,
-    document: Option<(DocumentIdentity, u64)>,
+    document: Option<(DocumentIdentity, Cell<u64>)>,
     executed: RefCell<HashSet<OperationNodeId>>,
     authenticated_nodes: RefCell<HashSet<NodeIdentity>>,
     decisions: RefCell<Vec<OperationDecision>>,
@@ -245,7 +277,7 @@ impl<P, B> OperationExecutionContext<P, B> {
             budgets,
             builder: Some(OperationPlanBuilder::default()),
             plan: None,
-            document,
+            document: document.map(|(identity, generation)| (identity, Cell::new(generation))),
             executed: RefCell::new(HashSet::new()),
             authenticated_nodes: RefCell::new(HashSet::new()),
             decisions: RefCell::new(Vec::new()),
@@ -314,45 +346,36 @@ impl<P, B> OperationExecutionContext<P, B> {
         self.builder = Some(plan.builder());
     }
 
-    pub(crate) fn validate_document(
-        &self,
-        document: &XmlDocument,
-    ) -> Result<(), OperationPlanError> {
-        let Some((identity, generation)) = self.document else {
-            return Ok(());
-        };
-        if document.identity() != identity {
-            return Err(OperationPlanError::ForeignDocument);
-        }
-        if document.generation() != generation {
-            return Err(OperationPlanError::StaleGeneration {
-                planned: generation,
-                current: document.generation(),
-            });
-        }
-        Ok(())
-    }
-
     pub(crate) fn validate_document_view(
         &self,
         view: DocumentView<'_>,
     ) -> Result<(), OperationPlanError> {
-        let Some((identity, generation)) = self.document else {
+        let Some((identity, generation)) = &self.document else {
             return Ok(());
         };
-        if view.identity() != identity {
+        if view.identity() != *identity {
             return Err(OperationPlanError::ForeignDocument);
         }
-        if view.generation() != generation {
+        if view.generation() != generation.get() {
             return Err(OperationPlanError::StaleGeneration {
-                planned: generation,
+                planned: generation.get(),
                 current: view.generation(),
             });
         }
         Ok(())
     }
 
-    pub(crate) fn execute(&self, node: OperationNodeId) -> Result<(), OperationPlanError> {
+    fn validate_ready(
+        &self,
+        node: OperationNodeId,
+        observed: Option<&OperationResourceIdentity>,
+    ) -> Result<(), OperationPlanError> {
+        if node.index() >= self.plan().nodes.len() {
+            return Err(OperationPlanError::UnknownNode);
+        }
+        if self.plan().resource(node) != observed {
+            return Err(OperationPlanError::StaleResourceIdentity);
+        }
         if self.executed.borrow().contains(&node) {
             return Err(OperationPlanError::AlreadyExecuted);
         }
@@ -368,9 +391,209 @@ impl<P, B> OperationExecutionContext<P, B> {
         {
             return Err(OperationPlanError::DependencyNotExecuted { node, requires });
         }
-        let _resource_identity = self.plan().resource(node);
-        self.executed.borrow_mut().insert(node);
         Ok(())
+    }
+
+    fn completion_reason(&self, node: OperationNodeId) -> OperationDecisionReason {
+        match self.plan().kind(node) {
+            OperationNodeKind::Key { .. } => OperationDecisionReason::KeyResolved,
+            OperationNodeKind::Digest { .. } => OperationDecisionReason::ReferenceDigestVerified,
+            OperationNodeKind::Crypto => OperationDecisionReason::SignatureVerified,
+            OperationNodeKind::Evidence => OperationDecisionReason::EvidenceFinalized,
+            OperationNodeKind::Mutation => OperationDecisionReason::MutationCommitted,
+            OperationNodeKind::Document | OperationNodeKind::Manifest { .. } => {
+                OperationDecisionReason::Completed
+            }
+            OperationNodeKind::Canonicalization => OperationDecisionReason::Completed,
+        }
+    }
+
+    pub(crate) fn run<T, E>(
+        &self,
+        node: OperationNodeId,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<OperationPlanError>,
+    {
+        self.validate_ready(node, None).map_err(E::from)?;
+        self.run_ready(node, action)
+    }
+
+    pub(crate) fn run_with_budgets<T, E>(
+        &mut self,
+        node: OperationNodeId,
+        action: impl FnOnce(&mut B) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<OperationPlanError>,
+    {
+        self.validate_ready(node, None).map_err(E::from)?;
+        match action(&mut self.budgets) {
+            Ok(value) => {
+                self.executed.borrow_mut().insert(node);
+                self.record(node, true, self.completion_reason(node));
+                Ok(value)
+            }
+            Err(error) => {
+                self.record(node, false, OperationDecisionReason::ActionRejected);
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn run_batch<T, E>(
+        &self,
+        nodes: &[OperationNodeId],
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<OperationPlanError>,
+    {
+        for node in nodes {
+            self.validate_ready(*node, None).map_err(E::from)?;
+        }
+        match action() {
+            Ok(value) => {
+                for node in nodes {
+                    self.executed.borrow_mut().insert(*node);
+                    self.record(*node, true, self.completion_reason(*node));
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                for node in nodes {
+                    self.record(*node, false, OperationDecisionReason::ActionRejected);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn run_with_resource<T, E>(
+        &self,
+        node: OperationNodeId,
+        observed: &OperationResourceIdentity,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<OperationPlanError>,
+    {
+        self.validate_ready(node, Some(observed)).map_err(E::from)?;
+        self.run_ready(node, action)
+    }
+
+    pub(crate) fn run_batch_with_resources<T, E>(
+        &self,
+        nodes: &[(OperationNodeId, OperationResourceIdentity)],
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<OperationPlanError>,
+    {
+        for (node, observed) in nodes {
+            self.validate_ready(*node, Some(observed))
+                .map_err(E::from)?;
+        }
+        match action() {
+            Ok(value) => {
+                for (node, _) in nodes {
+                    self.executed.borrow_mut().insert(*node);
+                    self.record(*node, true, self.completion_reason(*node));
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                for (node, _) in nodes {
+                    self.record(*node, false, OperationDecisionReason::ActionRejected);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn run_document_transition<T, E>(
+        &mut self,
+        node: OperationNodeId,
+        document: &mut XmlDocument,
+        action: impl FnOnce(&mut XmlDocument, &mut B) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<OperationPlanError>,
+    {
+        self.run_document_transition_nodes(&[node], document, action)
+    }
+
+    pub(crate) fn run_document_transition_batch_with_budgets<T, E>(
+        &mut self,
+        nodes: &[OperationNodeId],
+        document: &mut XmlDocument,
+        action: impl FnOnce(&mut XmlDocument, &mut B) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<OperationPlanError>,
+    {
+        self.run_document_transition_nodes(nodes, document, action)
+    }
+
+    fn run_document_transition_nodes<T, E>(
+        &mut self,
+        nodes: &[OperationNodeId],
+        document: &mut XmlDocument,
+        action: impl FnOnce(&mut XmlDocument, &mut B) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<OperationPlanError>,
+    {
+        document
+            .with_view(|view| self.validate_document_view(view))
+            .map_err(E::from)?;
+        for node in nodes {
+            self.validate_ready(*node, None).map_err(E::from)?;
+        }
+        let generation = document.generation();
+        let value = match action(document, &mut self.budgets) {
+            Ok(value) => value,
+            Err(error) => {
+                for node in nodes {
+                    self.record(*node, false, OperationDecisionReason::ActionRejected);
+                }
+                return Err(error);
+            }
+        };
+        if document.generation() != generation.saturating_add(1) {
+            for node in nodes {
+                self.record(*node, false, OperationDecisionReason::ActionRejected);
+            }
+            return Err(E::from(OperationPlanError::InvalidGenerationTransition));
+        }
+        if let Some((_, expected)) = &self.document {
+            expected.set(document.generation());
+        }
+        for node in nodes {
+            self.executed.borrow_mut().insert(*node);
+            self.record(*node, true, self.completion_reason(*node));
+        }
+        Ok(value)
+    }
+
+    fn run_ready<T, E>(
+        &self,
+        node: OperationNodeId,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        match action() {
+            Ok(value) => {
+                self.executed.borrow_mut().insert(node);
+                self.record(node, true, self.completion_reason(node));
+                Ok(value)
+            }
+            Err(error) => {
+                self.record(node, false, OperationDecisionReason::ActionRejected);
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn authenticate(&self, node: NodeIdentity) {
@@ -381,9 +604,16 @@ impl<P, B> OperationExecutionContext<P, B> {
         self.authenticated_nodes.borrow().contains(&node)
     }
 
-    pub(crate) fn record(&self, node: OperationNodeId, accepted: bool, reason: &'static str) {
+    pub(crate) fn record(
+        &self,
+        node: OperationNodeId,
+        accepted: bool,
+        reason: OperationDecisionReason,
+    ) {
         let decision = OperationDecision {
             node,
+            kind: self.plan().kind(node).clone(),
+            resource: self.plan().resource(node).cloned(),
             accepted,
             reason,
         };
@@ -393,14 +623,27 @@ impl<P, B> OperationExecutionContext<P, B> {
         self.decisions.borrow_mut().push(decision);
     }
 
+    pub(crate) fn set_outcome(
+        &self,
+        node: OperationNodeId,
+        accepted: bool,
+        reason: OperationDecisionReason,
+    ) {
+        let mut decisions = self.decisions.borrow_mut();
+        let decision = decisions
+            .iter_mut()
+            .rev()
+            .find(|decision| decision.node == node)
+            .expect("operation outcome requires an executed node");
+        decision.accepted = accepted;
+        decision.reason = reason;
+        if !accepted && self.first_failure.borrow().is_none() {
+            *self.first_failure.borrow_mut() = Some(decision.clone());
+        }
+    }
+
     pub(crate) fn first_failure(&self) -> Option<OperationDecision> {
         self.first_failure.borrow().clone()
-    }
-}
-
-impl From<OperationPlanError> for XmlDocumentError {
-    fn from(error: OperationPlanError) -> Self {
-        Self::InvalidReplacement(error.to_string())
     }
 }
 
@@ -452,18 +695,23 @@ mod tests {
         let mut context = OperationExecutionContext::new((), (), None);
         context.builder = None;
         context.plan = Some(plan);
+        let ran = Cell::new(false);
         assert_eq!(
-            context.execute(crypto),
+            context.run(crypto, || {
+                ran.set(true);
+                Ok::<_, OperationPlanError>(())
+            }),
             Err(OperationPlanError::DependencyNotExecuted {
                 node: crypto,
                 requires: parse,
             })
         );
-        context.record(parse, false, "parse");
-        context.record(crypto, false, "crypto");
+        assert!(!ran.get(), "dependency checks must gate the action itself");
+        context.record(parse, false, OperationDecisionReason::ActionRejected);
+        context.record(crypto, false, OperationDecisionReason::ActionRejected);
         assert_eq!(
             context.first_failure().map(|item| item.reason),
-            Some("parse")
+            Some(OperationDecisionReason::ActionRejected)
         );
     }
 
@@ -471,7 +719,7 @@ mod tests {
     fn document_generation_binding_rejects_stale_plans() {
         // Mutation invalidates every plan compiled against the prior document
         // generation, preventing stale resolver or transform-cache reuse.
-        let mut document = XmlDocument::parse("<root><value/></root>").expect("document");
+        let mut document = crate::XmlDocument::parse("<root><value/></root>").expect("document");
         let mut builder = OperationPlanBuilder::default();
         node(&mut builder, OperationStage::Parse);
         let plan = builder.compile().expect("plan");
@@ -487,7 +735,7 @@ mod tests {
             .replace_element(target, "<changed/>")
             .expect("mutation");
         assert_eq!(
-            context.validate_document(&document),
+            document.with_view(|view| context.validate_document_view(view)),
             Err(OperationPlanError::StaleGeneration {
                 planned: 0,
                 current: 1,
@@ -507,9 +755,12 @@ mod tests {
             .add_dependency(crypto, parse)
             .expect("valid base edge");
         context.compile().expect("base plan");
-        context.execute(parse).expect("parse");
-        context.execute(crypto).expect("crypto");
-        context.record(crypto, true, "authenticated");
+        context
+            .run(parse, || Ok::<_, OperationPlanError>(()))
+            .expect("parse");
+        context
+            .run(crypto, || Ok::<_, OperationPlanError>(()))
+            .expect("crypto");
 
         context.extend();
         let left = context.add_node(
@@ -542,11 +793,126 @@ mod tests {
         context.add_dependency(crypto, first).expect("valid edge");
         context.compile().expect("plan");
         assert_eq!(
-            context.execute(crypto),
+            context.run(crypto, || Ok::<_, OperationPlanError>(())),
             Err(OperationPlanError::DependencyNotExecuted {
                 node: crypto,
                 requires: first,
             })
         );
+    }
+
+    #[test]
+    fn stage_regression_and_repeat_execution_are_rejected() {
+        let mut builder = OperationPlanBuilder::default();
+        let parse = node(&mut builder, OperationStage::Parse);
+        let crypto = node(&mut builder, OperationStage::Crypto);
+        assert_eq!(
+            builder.add_dependency(parse, crypto),
+            Err(OperationPlanError::StageRegression {
+                requires: OperationStage::Crypto,
+                dependent: OperationStage::Parse,
+            })
+        );
+
+        let mut context = OperationExecutionContext::new((), (), None);
+        let only = context.add_node(OperationNodeKind::Document, OperationStage::Parse, None);
+        context.compile().expect("plan");
+        context
+            .run(only, || Ok::<_, OperationPlanError>(()))
+            .expect("first execution");
+        assert_eq!(
+            context.run(only, || Ok::<_, OperationPlanError>(())),
+            Err(OperationPlanError::AlreadyExecuted)
+        );
+    }
+
+    #[test]
+    fn resource_identity_is_checked_before_the_action_runs() {
+        let expected = OperationResourceIdentity::external("urn:test", b"expected");
+        let observed = OperationResourceIdentity::external("urn:test", b"changed");
+        let mut context = OperationExecutionContext::new((), (), None);
+        let node = context.add_node(
+            OperationNodeKind::Digest { index: 0 },
+            OperationStage::Digest,
+            Some(expected),
+        );
+        context.compile().expect("plan");
+        let ran = Cell::new(false);
+
+        assert_eq!(
+            context.run_with_resource(node, &observed, || {
+                ran.set(true);
+                Ok::<_, OperationPlanError>(())
+            }),
+            Err(OperationPlanError::StaleResourceIdentity),
+        );
+        assert!(!ran.get(), "stale resource identity must gate the action");
+    }
+
+    #[test]
+    fn resource_bound_node_requires_an_observed_identity() {
+        // A caller cannot accidentally bypass provenance validation by using the
+        // generic execution entry point for a resource-bound operation node.
+        let expected = OperationResourceIdentity::external("urn:test", b"expected");
+        let mut context = OperationExecutionContext::new((), (), None);
+        let node = context.add_node(
+            OperationNodeKind::Digest { index: 0 },
+            OperationStage::Digest,
+            Some(expected),
+        );
+        context.compile().expect("plan");
+        let ran = Cell::new(false);
+
+        assert_eq!(
+            context.run(node, || {
+                ran.set(true);
+                Ok::<_, OperationPlanError>(())
+            }),
+            Err(OperationPlanError::StaleResourceIdentity)
+        );
+        assert!(
+            !ran.get(),
+            "missing resource observation must gate the action"
+        );
+    }
+
+    #[test]
+    fn controlled_mutations_advance_the_expected_generation() {
+        let mut document = XmlDocument::parse("<root/>").expect("document");
+        let mut context = OperationExecutionContext::new(
+            (),
+            (),
+            Some((document.identity(), document.generation())),
+        );
+        let first = context.add_node(OperationNodeKind::Mutation, OperationStage::Mutation, None);
+        let second = context.add_node(OperationNodeKind::Mutation, OperationStage::Mutation, None);
+        context
+            .add_dependency(second, first)
+            .expect("mutation order");
+        context.compile().expect("plan");
+
+        context
+            .run_document_transition(first, &mut document, |document, _| {
+                let root = document.with_view(|view| view.root_element());
+                document
+                    .replace_element(root, "<first/>")
+                    .expect("first mutation");
+                Ok::<_, OperationPlanError>(())
+            })
+            .expect("first transition");
+        context
+            .run_document_transition(second, &mut document, |document, _| {
+                let root = document.with_view(|view| view.root_element());
+                document
+                    .replace_element(root, "<second/>")
+                    .expect("second mutation");
+                Ok::<_, OperationPlanError>(())
+            })
+            .expect("second transition");
+
+        assert_eq!(document.generation(), 2);
+        document
+            .with_view(|view| context.validate_document_view(view))
+            .expect("context must track the controlled generation");
     }
 }

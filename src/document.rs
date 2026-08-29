@@ -531,6 +531,13 @@ pub struct XmlDocument {
     cell: DocumentCell,
 }
 
+#[cfg(feature = "xmlenc")]
+pub(crate) struct PreparedDocumentMutation {
+    identity: DocumentIdentity,
+    generation: u64,
+    cell: DocumentCell,
+}
+
 /// Borrowed semantic view of one immutable [`XmlDocument`] generation.
 #[derive(Clone, Copy)]
 pub struct DocumentView<'a> {
@@ -788,6 +795,32 @@ impl XmlDocument {
         self.replace_range_with_settings(range, replacement, settings, Some(budget))
     }
 
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn prepare_element_replacement_with_budget(
+        &self,
+        target: NodeIdentity,
+        replacement: &str,
+        settings: DocumentParseSettings,
+        budget: &XmlParseWorkBudget,
+    ) -> Result<PreparedDocumentMutation, XmlDocumentError> {
+        let range = self.with_view(|view| {
+            let node = view.resolve_mutation_node(target)?;
+            if !node.is_element() {
+                return Err(XmlDocumentError::TargetNotElement);
+            }
+            Ok(node.range())
+        })?;
+        self.ensure_replacement_fits(&range, replacement.len(), settings.max_bytes)?;
+        self.validate_single_element_in_parent_context(
+            target,
+            replacement,
+            Some(settings.nodes_limit as usize),
+            settings,
+            Some(budget),
+        )?;
+        self.prepare_range_replacement(range, replacement, settings, budget)
+    }
+
     /// Replace one complete node with an XML fragment valid in its parent context.
     ///
     /// This operation is intended for XMLEnc Content replacement, where one
@@ -806,13 +839,13 @@ impl XmlDocument {
     }
 
     #[cfg(feature = "xmlenc")]
-    pub(crate) fn replace_node_with_fragment_with_budget(
-        &mut self,
+    pub(crate) fn prepare_node_fragment_replacement_with_budget(
+        &self,
         target: NodeIdentity,
         replacement: &str,
         settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
-    ) -> Result<(), XmlDocumentError> {
+    ) -> Result<PreparedDocumentMutation, XmlDocumentError> {
         let range = self.with_view(|view| {
             Ok::<_, XmlDocumentError>(view.resolve_mutation_node(target)?.range())
         })?;
@@ -824,7 +857,24 @@ impl XmlDocument {
             settings,
             Some(budget),
         )?;
-        self.replace_range_with_settings(range, replacement, settings, Some(budget))
+        self.prepare_range_replacement(range, replacement, settings, budget)
+    }
+
+    #[cfg(all(feature = "xmlenc", test))]
+    pub(crate) fn replace_node_with_fragment_with_budget(
+        &mut self,
+        target: NodeIdentity,
+        replacement: &str,
+        settings: DocumentParseSettings,
+        budget: &XmlParseWorkBudget,
+    ) -> Result<(), XmlDocumentError> {
+        let prepared = self.prepare_node_fragment_replacement_with_budget(
+            target,
+            replacement,
+            settings,
+            budget,
+        )?;
+        self.commit_prepared(prepared)
     }
 
     /// Replace all children of one element with a well-formed XML fragment.
@@ -1377,6 +1427,47 @@ impl XmlDocument {
     ) -> Result<(), XmlDocumentError> {
         let output = self.replaced_range(range, replacement, settings.max_bytes)?;
         self.replace_serialized_with_settings(output, settings, budget)
+    }
+
+    #[cfg(feature = "xmlenc")]
+    fn prepare_range_replacement(
+        &self,
+        range: std::ops::Range<usize>,
+        replacement: &str,
+        settings: DocumentParseSettings,
+        budget: &XmlParseWorkBudget,
+    ) -> Result<PreparedDocumentMutation, XmlDocumentError> {
+        let output = self.replaced_range(range, replacement, settings.max_bytes)?;
+        let cell = build_cell(output, settings, Some(budget)).map_err(|error| match error {
+            XmlDocumentError::Parse(ParseError::NodesLimitReached) => {
+                XmlDocumentError::ProjectedNodeLimit {
+                    maximum: settings.nodes_limit as usize,
+                }
+            }
+            error => error,
+        })?;
+        Ok(PreparedDocumentMutation {
+            identity: self.identity,
+            generation: self.generation,
+            cell,
+        })
+    }
+
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn commit_prepared(
+        &mut self,
+        prepared: PreparedDocumentMutation,
+    ) -> Result<(), XmlDocumentError> {
+        if self.identity != prepared.identity {
+            return Err(XmlDocumentError::ForeignIdentity);
+        }
+        if self.generation != prepared.generation {
+            return Err(XmlDocumentError::StaleIdentity {
+                identity: prepared.generation,
+                current: self.generation,
+            });
+        }
+        self.commit_cell(prepared.cell)
     }
 
     fn replaced_range(

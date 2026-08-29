@@ -42,6 +42,16 @@ the final mutation gate. One operation context owns the immutable policy snapsho
 stable document generation, resolver and transform-cache state, cumulative budgets,
 authenticated node identities, and first-failure evidence. Nested helpers and reparses
 therefore cannot reset accounting or use identities captured from another generation.
+Every executable graph node checks its dependencies before entering the closure that
+performs parsing, resolution, canonicalization, or provider work. Nodes bound to a
+document or caller-owned external resource additionally require a freshly observed
+node identity or content fingerprint; the generic execution entry point rejects them.
+XPath document-identity caching is operation-owned but chain-scoped, so cache entries
+are reused within one live transform chain and invalidated before another chain or
+after an internal reparse. Controlled mutations verify the expected document
+generation before commit and advance that expectation by exactly one generation
+inside the operation context. That context is also the sole owner of the authenticated
+node set used to admit Manifest discovery.
 Authenticated Manifest structure is deliberately compiled as a second phase of the
 same graph only after `SignatureValue` succeeds; malformed or expensive unauthenticated
 Manifest content is never parsed speculatively. Manifest dependency cycles are rejected

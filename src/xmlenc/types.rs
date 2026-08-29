@@ -732,6 +732,12 @@ pub enum XmlEncError {
     Utf8(#[from] std::string::FromUtf8Error),
 }
 
+impl From<crate::operation::OperationPlanError> for XmlEncError {
+    fn from(error: crate::operation::OperationPlanError) -> Self {
+        Self::InvalidStructure(format!("invalid XML Encryption operation plan: {error}"))
+    }
+}
+
 impl fmt::Display for DataEncryptionAlgorithm {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {

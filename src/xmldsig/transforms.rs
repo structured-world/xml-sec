@@ -514,6 +514,13 @@ struct CachedXPathDocumentIdentity {
 }
 
 impl TransformChainState {
+    fn begin_chain(&self) {
+        // Document pointer identity is valid only while one transform chain
+        // keeps that parsed document alive. Never carry it into a later chain,
+        // where allocator address reuse could alias unrelated XML.
+        self.xpath_document_identity.set(None);
+    }
+
     fn xpath_document_identity(&self, document: &Document<'_>) -> XPathDocumentIdentity {
         let document_key = std::ptr::from_ref(document).cast::<()>();
         if let Some(cached) = self.xpath_document_identity.get()
@@ -979,6 +986,7 @@ pub(crate) fn execute_transforms_with_options_and_budget<'a>(
     budget: &TransformExecutionBudget,
 ) -> Result<Vec<u8>, TransformError> {
     ensure_transform_count(transforms.len())?;
+    budget.state.begin_chain();
     let context = TransformExecutionContext {
         options,
         budget,
@@ -1047,6 +1055,7 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
     tracked_nodes: Vec<(usize, NodeId)>,
 ) -> Result<TransformDependencyOutput, TransformError> {
     ensure_transform_count(transforms.len())?;
+    budget.state.begin_chain();
     let mut active_nodes = Vec::with_capacity(tracked_nodes.len());
     let mut opaque_dependencies = HashSet::new();
     let mut dormant_indexes = HashSet::new();
@@ -4029,6 +4038,47 @@ mod tests {
         assert_eq!(
             computations, 1,
             "one live document must be hashed once per chain"
+        );
+    }
+
+    #[test]
+    fn transform_cache_identity_does_not_cross_chain_boundaries() {
+        // One operation budget may execute multiple references, but a parsed
+        // document pointer is only a valid cache key while its chain is alive.
+        let document = Document::parse(
+            r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:Signature><ds:SignedInfo><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms></ds:Reference></ds:SignedInfo></ds:Signature></root>"#,
+        )
+        .unwrap();
+        let transforms_node = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "Transforms")))
+            .unwrap();
+        let transforms = parse_transforms(transforms_node).unwrap();
+        let signature = document
+            .descendants()
+            .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
+            .unwrap();
+        let budget = TransformExecutionBudget::default();
+
+        XPATH_DOCUMENT_IDENTITY_COMPUTATIONS.with(|count| count.set(0));
+        for _ in 0..2 {
+            let initial = NodeSet::entire_document_without_comments(&document)
+                .map(TransformData::NodeSet)
+                .unwrap();
+            execute_transforms_with_options_and_budget(
+                signature,
+                initial,
+                &transforms,
+                TransformOptions::default(),
+                &budget,
+            )
+            .unwrap();
+        }
+        let computations = XPATH_DOCUMENT_IDENTITY_COMPUTATIONS.with(Cell::get);
+
+        assert_eq!(
+            computations, 2,
+            "each transform chain must establish a fresh document identity"
         );
     }
 

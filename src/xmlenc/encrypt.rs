@@ -104,11 +104,12 @@ fn compile_encryption_plan(
     >,
     key_count: usize,
     mutation: bool,
+    input_resource: OperationResourceIdentity,
 ) -> Result<EncryptionPlanNodes, XmlEncError> {
     let document = operation.add_node(
         OperationNodeKind::Document,
         OperationStage::Parse,
-        Some(OperationResourceIdentity::Generated("encryption-input", 0)),
+        Some(input_resource),
     );
     let mut keys = Vec::with_capacity(key_count.max(1));
     for index in 0..key_count.max(1) {
@@ -384,8 +385,8 @@ impl EncryptedDataBuilder {
             budgets,
             Some((document.identity(), document.generation())),
         );
-        operation
-            .validate_document(document)
+        document
+            .with_view(|view| operation.validate_document_view(view))
             .map_err(map_encryption_plan_error)?;
 
         match self.encrypted_type {
@@ -411,19 +412,21 @@ impl EncryptedDataBuilder {
                     self.policy.resources.effective_xml_nodes() as usize,
                 )?;
                 let settings = self.document_parse_settings();
-                document
-                    .replace_element_with_budget(
-                        target,
-                        &result.encrypted_data_xml,
-                        settings,
-                        &operation.budgets().xml_parse,
-                    )
-                    .map_err(|error| map_document_error(error, settings))?;
                 if let Some(mutation) = generated.mutation {
-                    operation
-                        .execute(mutation)
-                        .map_err(map_encryption_plan_error)?;
-                    operation.record(mutation, true, "encrypted element replacement committed");
+                    operation.run_document_transition(
+                        mutation,
+                        document,
+                        |document, budgets| {
+                            document
+                                .replace_element_with_budget(
+                                    target,
+                                    &result.encrypted_data_xml,
+                                    settings,
+                                    &budgets.xml_parse,
+                                )
+                                .map_err(|error| map_document_error(error, settings))
+                        },
+                    )?;
                 }
                 Ok(())
             }
@@ -471,19 +474,21 @@ impl EncryptedDataBuilder {
                     self.policy.resources.effective_xml_nodes() as usize,
                 )?;
                 let settings = self.document_parse_settings();
-                document
-                    .replace_content_with_budget(
-                        target,
-                        &result.encrypted_data_xml,
-                        settings,
-                        &operation.budgets().xml_parse,
-                    )
-                    .map_err(|error| map_document_error(error, settings))?;
                 if let Some(mutation) = generated.mutation {
-                    operation
-                        .execute(mutation)
-                        .map_err(map_encryption_plan_error)?;
-                    operation.record(mutation, true, "encrypted content replacement committed");
+                    operation.run_document_transition(
+                        mutation,
+                        document,
+                        |document, budgets| {
+                            document
+                                .replace_content_with_budget(
+                                    target,
+                                    &result.encrypted_data_xml,
+                                    settings,
+                                    &budgets.xml_parse,
+                                )
+                                .map_err(|error| map_document_error(error, settings))
+                        },
+                    )?;
                 }
                 Ok(())
             }
@@ -503,61 +508,59 @@ impl EncryptedDataBuilder {
         >,
         mutates_document: bool,
     ) -> Result<GeneratedEncryption, XmlEncError> {
-        self.validate_plaintext_len(plaintext.len())?;
-        self.validate_configuration()?;
+        let input_resource = OperationResourceIdentity::external("encryption-input", plaintext);
         let plan = compile_encryption_plan(
             operation,
             self.recipients.len() + usize::from(self.direct_key.is_some()),
             mutates_document,
+            input_resource,
         )?;
-        operation
-            .execute(plan.document)
-            .map_err(map_encryption_plan_error)?;
+        let observed_input = OperationResourceIdentity::external("encryption-input", plaintext);
+        operation.run_with_resource(plan.document, &observed_input, || {
+            self.validate_plaintext_len(plaintext.len())?;
+            self.validate_configuration()
+        })?;
 
-        let content_key = if let Some(key) = &self.direct_key {
-            validate_content_key(self.algorithm, key)?;
-            key.clone()
-        } else {
-            random_bytes(self.provider.as_ref(), self.algorithm.key_len())?
-        };
-        let encrypted_keys = self
-            .recipients
-            .iter()
-            .map(|recipient| wrap_content_key(self.provider.as_ref(), recipient, &content_key))
-            .collect::<Result<Vec<_>, _>>()?;
-        for key in &plan.keys {
-            operation.execute(*key).map_err(map_encryption_plan_error)?;
-            operation.record(*key, true, "content key prepared");
-        }
-        let ciphertext = encrypt_content(
-            self.provider.as_ref(),
-            self.algorithm,
-            &content_key,
-            plaintext,
-        )?;
-        operation
-            .execute(plan.crypto)
-            .map_err(map_encryption_plan_error)?;
-        operation.record(plan.crypto, true, "plaintext encrypted");
-        let encrypted_data_xml = render_encrypted_data(
-            self.algorithm,
-            encrypted_type.as_ref(),
-            self.id.as_deref(),
-            self.direct_key_name.as_deref(),
-            &encrypted_keys,
-            &ciphertext,
-        )?;
-        self.validate_document_len(encrypted_data_xml.len())?;
-        let xml_nodes = count_generated_encrypted_data_nodes(
-            &encrypted_data_xml,
-            &self.policy,
-            &operation.budgets().xml_parse,
-            self.xml_backend,
-        )?;
-        operation
-            .execute(plan.evidence)
-            .map_err(map_encryption_plan_error)?;
-        operation.record(plan.evidence, true, "encrypted output validated");
+        let (content_key, encrypted_keys) = operation.run_batch(&plan.keys, || {
+            let content_key = if let Some(key) = &self.direct_key {
+                validate_content_key(self.algorithm, key)?;
+                key.clone()
+            } else {
+                random_bytes(self.provider.as_ref(), self.algorithm.key_len())?
+            };
+            let encrypted_keys = self
+                .recipients
+                .iter()
+                .map(|recipient| wrap_content_key(self.provider.as_ref(), recipient, &content_key))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, XmlEncError>((content_key, encrypted_keys))
+        })?;
+        let ciphertext = operation.run(plan.crypto, || {
+            encrypt_content(
+                self.provider.as_ref(),
+                self.algorithm,
+                &content_key,
+                plaintext,
+            )
+        })?;
+        let (encrypted_data_xml, xml_nodes) = operation.run(plan.evidence, || {
+            let encrypted_data_xml = render_encrypted_data(
+                self.algorithm,
+                encrypted_type.as_ref(),
+                self.id.as_deref(),
+                self.direct_key_name.as_deref(),
+                &encrypted_keys,
+                &ciphertext,
+            )?;
+            self.validate_document_len(encrypted_data_xml.len())?;
+            let xml_nodes = count_generated_encrypted_data_nodes(
+                &encrypted_data_xml,
+                &self.policy,
+                &operation.budgets().xml_parse,
+                self.xml_backend,
+            )?;
+            Ok::<_, XmlEncError>((encrypted_data_xml, xml_nodes))
+        })?;
         let replacement = match encrypted_type {
             Some(EncryptedDataType::Content) => ReplacementMode::ReplaceContent,
             Some(EncryptedDataType::Element | EncryptedDataType::Other(_)) | None => {
