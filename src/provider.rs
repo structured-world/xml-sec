@@ -252,6 +252,13 @@ pub enum ProviderInputError {
     /// AES key-wrap input or output framing is invalid.
     #[error("invalid AES key-wrap framing")]
     AesKeyWrapFraming,
+    /// Legacy compatibility variant retained for downstream construction and matching.
+    ///
+    /// Explicit MGF parameters are valid for both RSA-OAEP URIs, so current providers never
+    /// return this reason.
+    #[deprecated(note = "explicit MGF parameters are supported for both RSA-OAEP URIs")]
+    #[error("legacy RSA-OAEP requires MGF1-SHA1")]
+    LegacyRsaOaepMgf,
 }
 
 /// Failure returned by a cryptographic provider.

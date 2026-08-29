@@ -52,9 +52,9 @@ fn decrypts_xmlsec1_direct_aes_keyname_vectors() {
 
 #[test]
 fn decrypts_aleksey_rsa_oaep_document_vectors() {
-    // The final vector proves that libxmlsec1 accepts an explicit XMLEnc 1.1
-    // MGF child under the legacy OAEP URI. Generated round trips cannot prove
-    // this parser/provider interoperability contract.
+    // enc-aes256-kt-rsa_oaep_sha1_mgf1_sha512 proves that libxmlsec1 accepts
+    // an explicit XMLEnc 1.1 MGF child under the legacy OAEP URI. Generated
+    // round trips cannot prove this parser/provider interoperability contract.
     let pem = std::fs::read_to_string("tests/fixtures/keys/rsa/rsa-4096-key.pem")
         .expect("tracked Aleksey RSA key must be readable");
     let private_key =

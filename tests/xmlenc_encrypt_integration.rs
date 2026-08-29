@@ -272,13 +272,13 @@ fn every_supported_oaep_digest_and_mgf_combination_round_trips() {
                 EncryptionRecipient::rsa_oaep(public.clone()).oaep_parameters(parameters),
             )
             .encrypt_binary(b"legacy OAEP digest matrix")
-            .expect("legacy OAEP digest with fixed MGF1-SHA1 must encrypt");
+            .expect("legacy OAEP digest with default MGF1-SHA1 must encrypt");
         assert_eq!(
             decrypt(
                 &encrypted.encrypted_data_xml,
                 &PrivateKeyDecryptor::new(private.clone())
             )
-            .expect("legacy OAEP digest with fixed MGF1-SHA1 must decrypt"),
+            .expect("legacy OAEP digest with default MGF1-SHA1 must decrypt"),
             DecryptedContent::Bytes(b"legacy OAEP digest matrix".to_vec()),
             "legacy digest={digest:?}"
         );
