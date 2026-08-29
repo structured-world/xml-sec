@@ -886,8 +886,7 @@ fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, XmlMut
         .attributes()
         .map(|attribute| {
             let attribute = attribute.map_err(|_| XmlMutationError::InvalidAppendTarget)?;
-            let name = std::str::from_utf8(attribute.key.as_ref())
-                .map_err(|_| XmlMutationError::InvalidAppendTarget)?;
+            let name = attribute.key.as_ref();
             Ok(match name {
                 "xmlns" => Some(String::new()),
                 _ => name.strip_prefix("xmlns:").map(str::to_owned),
@@ -1151,7 +1150,7 @@ fn fill_dsig_values_matching(
     values: Vec<String>,
     policy: Option<&crate::policy::SigningPolicy>,
     budget: Option<&XmlParseWorkBudget>,
-    mut should_replace: impl FnMut(&[(bool, Vec<u8>, Option<usize>)], &ResolveResult<'_>) -> bool,
+    mut should_replace: impl FnMut(&[(bool, String, Option<usize>)], &ResolveResult<'_>) -> bool,
 ) -> Result<String, XmlMutationError> {
     if let Some(budget) = budget {
         budget.charge_policy(xml.len())?;
@@ -1161,7 +1160,7 @@ fn fill_dsig_values_matching(
     let mut buf = Vec::new();
     let mut value_index = 0usize;
     let mut replacing_depth: Option<usize> = None;
-    let mut element_stack: Vec<(bool, Vec<u8>, Option<usize>)> = Vec::new();
+    let mut element_stack: Vec<(bool, String, Option<usize>)> = Vec::new();
     let mut signature_index = 0usize;
 
     loop {
@@ -1194,7 +1193,7 @@ fn fill_dsig_values_matching(
                 );
                 element_stack.push((
                     is_dsig_namespace(&namespace),
-                    element.local_name().as_ref().to_vec(),
+                    element.local_name().as_ref().to_owned(),
                     signature,
                 ));
                 writer.write_event(Event::Start(element))?;
@@ -1224,7 +1223,7 @@ fn fill_dsig_values_matching(
                 );
                 element_stack.push((
                     is_dsig_namespace(&namespace),
-                    element.local_name().as_ref().to_vec(),
+                    element.local_name().as_ref().to_owned(),
                     signature,
                 ));
                 writer.write_event(Event::Start(element))?;
@@ -1265,13 +1264,13 @@ fn fill_dsig_element_raw_matching(
     local_name: &'static str,
     content: &str,
     policy: Option<&crate::policy::SigningPolicy>,
-    mut should_replace: impl FnMut(&[(bool, Vec<u8>, Option<usize>)], &ResolveResult<'_>) -> bool,
+    mut should_replace: impl FnMut(&[(bool, String, Option<usize>)], &ResolveResult<'_>) -> bool,
 ) -> Result<String, XmlMutationError> {
     let mut reader = NsReader::from_str(xml);
     let mut writer = Writer::new(Vec::new());
     let mut buf = Vec::new();
     let mut replacing_depth: Option<usize> = None;
-    let mut element_stack: Vec<(bool, Vec<u8>, Option<usize>)> = Vec::new();
+    let mut element_stack: Vec<(bool, String, Option<usize>)> = Vec::new();
     let mut signature_index = 0usize;
 
     loop {
@@ -1304,7 +1303,7 @@ fn fill_dsig_element_raw_matching(
                 );
                 element_stack.push((
                     is_dsig_namespace(&namespace),
-                    element.local_name().as_ref().to_vec(),
+                    element.local_name().as_ref().to_owned(),
                     signature,
                 ));
                 writer.write_event(Event::Start(element))?;
@@ -1332,7 +1331,7 @@ fn fill_dsig_element_raw_matching(
                 );
                 element_stack.push((
                     is_dsig_namespace(&namespace),
-                    element.local_name().as_ref().to_vec(),
+                    element.local_name().as_ref().to_owned(),
                     signature,
                 ));
                 writer.write_event(Event::Start(element))?;
@@ -1499,7 +1498,7 @@ fn is_dsig_node(node: crate::xml::dom::Node<'_, '_>, expected_local: &str) -> bo
 }
 
 fn is_signed_info_reference_context(
-    element_stack: &[(bool, Vec<u8>, Option<usize>)],
+    element_stack: &[(bool, String, Option<usize>)],
     namespace: &ResolveResult<'_>,
     target_signature: usize,
 ) -> bool {
@@ -1508,13 +1507,13 @@ fn is_signed_info_reference_context(
         && matches!(
             element_stack,
             [.., (true, signed_info, _), (true, reference, _)]
-                if signed_info.as_slice() == b"SignedInfo"
-                    && reference.as_slice() == b"Reference"
+                if signed_info == "SignedInfo"
+                    && reference == "Reference"
         )
 }
 
 fn is_direct_signature_context(
-    element_stack: &[(bool, Vec<u8>, Option<usize>)],
+    element_stack: &[(bool, String, Option<usize>)],
     namespace: &ResolveResult<'_>,
     target_signature: usize,
 ) -> bool {
@@ -1523,35 +1522,35 @@ fn is_direct_signature_context(
         && matches!(
             element_stack,
             [.., (true, signature, Some(index))]
-                if signature.as_slice() == b"Signature" && *index == target_signature
+                if signature == "Signature" && *index == target_signature
         )
 }
 
 fn is_in_target_signature(
-    element_stack: &[(bool, Vec<u8>, Option<usize>)],
+    element_stack: &[(bool, String, Option<usize>)],
     target_signature: usize,
 ) -> bool {
     element_stack
         .iter()
         .rev()
-        .find(|(is_dsig, local_name, _)| *is_dsig && local_name.as_slice() == b"Signature")
+        .find(|(is_dsig, local_name, _)| *is_dsig && local_name == "Signature")
         .is_some_and(|(_, _, signature)| *signature == Some(target_signature))
 }
 
-fn is_dsig_element(namespace: &ResolveResult<'_>, local: &[u8], expected_local: &str) -> bool {
-    is_dsig_namespace(namespace) && local == expected_local.as_bytes()
+fn is_dsig_element(namespace: &ResolveResult<'_>, local: &str, expected_local: &str) -> bool {
+    is_dsig_namespace(namespace) && local == expected_local
 }
 
 fn is_dsig_namespace(namespace: &ResolveResult<'_>) -> bool {
-    matches!(namespace, ResolveResult::Bound(Namespace(ns)) if *ns == XMLDSIG_NS.as_bytes())
+    matches!(namespace, ResolveResult::Bound(Namespace(ns)) if *ns == XMLDSIG_NS)
 }
 
 fn signature_stack_index(
     namespace: &ResolveResult<'_>,
-    local_name: &[u8],
+    local_name: &str,
     next_signature_index: &mut usize,
 ) -> Option<usize> {
-    if is_dsig_namespace(namespace) && local_name == b"Signature" {
+    if is_dsig_namespace(namespace) && local_name == "Signature" {
         let index = *next_signature_index;
         *next_signature_index += 1;
         Some(index)

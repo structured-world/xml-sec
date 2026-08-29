@@ -179,8 +179,8 @@ fn push_text_position(nodes: &mut Vec<SourceNode>, range: Range<usize>) {
     }
 }
 
-fn is_builtin_or_character_reference(reference: &[u8]) -> bool {
-    reference.starts_with(b"#") || matches!(reference, b"amp" | b"lt" | b"gt" | b"apos" | b"quot")
+fn is_builtin_or_character_reference(reference: &str) -> bool {
+    reference.starts_with('#') || matches!(reference, "amp" | "lt" | "gt" | "apos" | "quot")
 }
 
 fn source_offset(offset: u64) -> Result<usize, ParseError> {
