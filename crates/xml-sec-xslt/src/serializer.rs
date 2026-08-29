@@ -26,6 +26,8 @@ pub struct OutputDefinition {
     pub media_type: Option<String>,
     pub cdata_section_elements: HashSet<crate::ExpandedName>,
     pub(crate) method_explicit: bool,
+    pub(crate) encoding_explicit: bool,
+    pub(crate) indent_explicit: bool,
 }
 
 impl Default for OutputDefinition {
@@ -42,6 +44,8 @@ impl Default for OutputDefinition {
             media_type: None,
             cdata_section_elements: HashSet::new(),
             method_explicit: false,
+            encoding_explicit: false,
+            indent_explicit: false,
         }
     }
 }
@@ -86,6 +90,9 @@ fn serialize_charged(
     {
         definition.method = OutputMethod::Html;
     }
+    if definition.method == OutputMethod::Html && !definition.indent_explicit {
+        definition.indent = true;
+    }
     let mut counter = RenderBuffer::Count(EncodingCounter::new(&definition.encoding)?);
     render(document, &definition, &mut counter)?;
     let text_bytes = counter.len();
@@ -112,9 +119,12 @@ fn render(
     if definition.method == OutputMethod::Xml && !definition.omit_xml_declaration {
         text.push_str("<?xml version=\"");
         text.push_str(definition.version.as_deref().unwrap_or("1.0"));
-        text.push_str("\" encoding=\"");
-        text.push_str(&definition.encoding);
         text.push('"');
+        if definition.encoding_explicit {
+            text.push_str(" encoding=\"");
+            text.push_str(&definition.encoding);
+            text.push('"');
+        }
         if let Some(standalone) = definition.standalone {
             text.push_str(if standalone {
                 " standalone=\"yes\""
@@ -123,9 +133,7 @@ fn render(
             });
         }
         text.push_str("?>");
-        if definition.indent {
-            text.push('\n');
-        }
+        text.push('\n');
     }
     if let Some(root_name) = document
         .node(document.root())
@@ -167,7 +175,10 @@ fn render(
         .ok_or_else(|| Error::Serialization("missing result root".into()))?
         .children
     {
-        serialize_node(document, *child, definition, text, 0, None, false)?;
+        serialize_node(document, *child, definition, text, RenderContext::root())?;
+    }
+    if definition.method != OutputMethod::Text {
+        text.push('\n');
     }
     Ok(())
 }
@@ -316,14 +327,31 @@ fn count_encoded(encoder: &mut encoding_rs::Encoder, mut source: &str, last: boo
     total
 }
 
+#[derive(Clone, Copy)]
+struct RenderContext<'a> {
+    depth: usize,
+    parent_name: Option<&'a crate::ExpandedName>,
+    parent_mixed: bool,
+    in_scope_namespaces: &'a [(Option<String>, String)],
+}
+
+impl RenderContext<'_> {
+    const fn root() -> Self {
+        Self {
+            depth: 0,
+            parent_name: None,
+            parent_mixed: false,
+            in_scope_namespaces: &[],
+        }
+    }
+}
+
 fn serialize_node(
     document: &Document,
     id: NodeId,
     definition: &OutputDefinition,
     output: &mut RenderBuffer,
-    depth: usize,
-    parent_name: Option<&crate::ExpandedName>,
-    parent_mixed: bool,
+    context: RenderContext<'_>,
 ) -> Result<()> {
     let node = document
         .node(id)
@@ -331,15 +359,7 @@ fn serialize_node(
     match &node.kind {
         NodeKind::Root => {
             for child in &node.children {
-                serialize_node(
-                    document,
-                    *child,
-                    definition,
-                    output,
-                    depth,
-                    parent_name,
-                    parent_mixed,
-                )?;
+                serialize_node(document, *child, definition, output, context)?;
             }
         }
         NodeKind::Text {
@@ -348,13 +368,14 @@ fn serialize_node(
         } => {
             if definition.method == OutputMethod::Text
                 || *disable_output_escaping
-                || parent_name.is_some_and(|name| {
+                || context.parent_name.is_some_and(|name| {
                     definition.method == OutputMethod::Html
                         && matches!(name.local.to_ascii_lowercase().as_str(), "script" | "style")
                 })
             {
                 output.push_str(value);
-            } else if parent_name
+            } else if context
+                .parent_name
                 .is_some_and(|name| definition.cdata_section_elements.contains(name))
             {
                 output.push_str("<![CDATA[");
@@ -382,15 +403,7 @@ fn serialize_node(
         }
         NodeKind::Element { .. } if definition.method == OutputMethod::Text => {
             for child in &node.children {
-                serialize_node(
-                    document,
-                    *child,
-                    definition,
-                    output,
-                    depth,
-                    parent_name,
-                    parent_mixed,
-                )?;
+                serialize_node(document, *child, definition, output, context)?;
             }
         }
         NodeKind::Element {
@@ -405,13 +418,31 @@ fn serialize_node(
                     Some(NodeKind::Text { value, .. }) if !value.is_empty()
                 )
             });
-            if definition.indent && depth > 0 && !parent_mixed {
+            if definition.indent && context.depth > 0 && !context.parent_mixed {
                 output.push('\n');
-                output.push_str(&"  ".repeat(depth));
+                output.push_str(&"  ".repeat(context.depth));
             }
             output.push('<');
             push_name(prefix.as_deref(), &name.local, output);
-            for namespace in namespaces {
+            let mut current_namespaces = context.in_scope_namespaces.to_vec();
+            let mut ordered_namespaces = namespaces.iter().collect::<Vec<_>>();
+            if let Some(index) = ordered_namespaces.iter().position(|namespace| {
+                namespace.prefix.as_deref() == prefix.as_deref()
+                    && Some(namespace.uri.as_str()) == name.namespace.as_deref()
+            }) {
+                let element_namespace = ordered_namespaces.remove(index);
+                ordered_namespaces.insert(0, element_namespace);
+            }
+            for namespace in ordered_namespaces {
+                let binding = (namespace.prefix.clone(), namespace.uri.clone());
+                if current_namespaces
+                    .iter()
+                    .rev()
+                    .find(|(prefix, _)| prefix == &namespace.prefix)
+                    .is_some_and(|(_, uri)| uri == &namespace.uri)
+                {
+                    continue;
+                }
                 output.push_str(" xmlns");
                 if let Some(prefix) = &namespace.prefix {
                     output.push(':');
@@ -420,6 +451,14 @@ fn serialize_node(
                 output.push_str("=\"");
                 escape_attribute(&namespace.uri, output);
                 output.push('"');
+                if let Some(existing) = current_namespaces
+                    .iter_mut()
+                    .find(|(prefix, _)| prefix == &namespace.prefix)
+                {
+                    *existing = binding;
+                } else {
+                    current_namespaces.push(binding);
+                }
             }
             for attribute in attributes {
                 output.push(' ');
@@ -428,16 +467,35 @@ fn serialize_node(
                 escape_attribute(&attribute.value, output);
                 output.push('"');
             }
+            if node.children.is_empty() && definition.method == OutputMethod::Xml {
+                output.push_str("/>");
+                return Ok(());
+            }
             output.push('>');
+            if definition.method == OutputMethod::Html
+                && name.namespace.is_none()
+                && name.local.eq_ignore_ascii_case("head")
+                && !has_html_encoding_meta(document, node)
+            {
+                if definition.indent {
+                    output.push('\n');
+                }
+                output.push_str("<meta charset=\"");
+                escape_attribute(&definition.encoding, output);
+                output.push_str("\">");
+            }
             for child in &node.children {
                 serialize_node(
                     document,
                     *child,
                     definition,
                     output,
-                    depth + 1,
-                    Some(name),
-                    mixed,
+                    RenderContext {
+                        depth: context.depth + 1,
+                        parent_name: Some(name),
+                        parent_mixed: mixed,
+                        in_scope_namespaces: &current_namespaces,
+                    },
                 )?;
             }
             if definition.indent
@@ -450,7 +508,7 @@ fn serialize_node(
                 })
             {
                 output.push('\n');
-                output.push_str(&"  ".repeat(depth));
+                output.push_str(&"  ".repeat(context.depth));
             }
             let html_void = definition.method == OutputMethod::Html
                 && name.namespace.is_none()
@@ -479,6 +537,25 @@ fn serialize_node(
         _ => {}
     }
     Ok(())
+}
+
+fn has_html_encoding_meta(document: &Document, head: &crate::Node) -> bool {
+    head.children.iter().any(|child| {
+        let Some(NodeKind::Element {
+            name, attributes, ..
+        }) = document.node(*child).map(|node| &node.kind)
+        else {
+            return false;
+        };
+        name.namespace.is_none()
+            && name.local.eq_ignore_ascii_case("meta")
+            && attributes.iter().any(|attribute| {
+                attribute.name.namespace.is_none()
+                    && (attribute.name.local.eq_ignore_ascii_case("charset")
+                        || (attribute.name.local.eq_ignore_ascii_case("http-equiv")
+                            && attribute.value.eq_ignore_ascii_case("content-type")))
+            })
+    })
 }
 
 fn push_name(prefix: Option<&str>, local: &str, output: &mut RenderBuffer) {

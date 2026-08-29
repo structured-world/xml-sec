@@ -372,7 +372,6 @@ impl<R: Resolver> Compiler<R> {
                     required_attr(node, "stylesheet-prefix")?,
                 )?,
                 result_namespace: alias_namespace(node, required_attr(node, "result-prefix")?)?,
-                result_prefix: alias_prefix(required_attr(node, "result-prefix")?),
             }),
             "attribute-set" => state.attribute_sets.push(AttributeSet::parse(
                 node,
@@ -549,8 +548,8 @@ pub(crate) struct NumberInstruction {
     pub format: String,
     pub lang: Option<String>,
     pub letter_value: Option<String>,
-    pub grouping_separator: Option<char>,
-    pub grouping_size: Option<usize>,
+    pub grouping_separator: Option<AttributeValueTemplate>,
+    pub grouping_size: Option<AttributeValueTemplate>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct KeyDeclaration {
@@ -562,7 +561,6 @@ pub(crate) struct KeyDeclaration {
 pub(crate) struct NamespaceAlias {
     pub stylesheet_namespace: Option<String>,
     pub result_namespace: Option<String>,
-    pub result_prefix: String,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct AttributeSet {
@@ -721,14 +719,6 @@ fn alias_namespace(node: roxmltree::Node<'_, '_>, prefix: &str) -> Result<Option
                 prefix.unwrap_or("#default")
             ))
         })
-}
-
-fn alias_prefix(prefix: &str) -> String {
-    if prefix == "#default" {
-        String::new()
-    } else {
-        prefix.to_owned()
-    }
 }
 
 struct CompileState {
@@ -944,6 +934,16 @@ fn compile_instruction(
     context: CompileContext,
 ) -> Result<Instruction> {
     if node.tag_name().namespace() != Some(XSLT_NS) {
+        if is_extension_element(node)? {
+            let mut fallback = Vec::new();
+            for child in node
+                .children()
+                .filter(|child| child.has_tag_name((XSLT_NS, "fallback")))
+            {
+                fallback.extend(compile_sequence(child.children(), context.descend()?)?);
+            }
+            return Ok(Instruction::Fallback(fallback));
+        }
         return compile_literal_element(node, context);
     }
     let sequence = || compile_sequence(node.children(), context);
@@ -1007,6 +1007,9 @@ fn compile_instruction(
             for child in node.children() {
                 if child.has_tag_name((XSLT_NS, "sort")) && sorting {
                     sorts.push(compile_sort(child)?)
+                } else if child.is_text() && child.text().is_none_or(|text| text.trim().is_empty())
+                {
+                    continue;
                 } else {
                     sorting = false;
                     if child.is_text() {
@@ -1128,6 +1131,36 @@ fn compile_instruction(
         }
     })
 }
+
+fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {
+    let Some(namespace) = node.tag_name().namespace() else {
+        return Ok(false);
+    };
+    for ancestor in node.ancestors().filter(roxmltree::Node::is_element) {
+        let Some(prefixes) = ancestor
+            .attribute((XSLT_NS, "extension-element-prefixes"))
+            .or_else(|| ancestor.attribute("extension-element-prefixes"))
+        else {
+            continue;
+        };
+        for prefix in prefixes.split_ascii_whitespace() {
+            let resolved = if prefix == "#default" {
+                ancestor.lookup_namespace_uri(None)
+            } else {
+                ancestor.lookup_namespace_uri(Some(prefix))
+            };
+            if resolved == Some(namespace) {
+                return Ok(true);
+            }
+            if resolved.is_none() {
+                return Err(Error::Static(format!(
+                    "unbound extension-element-prefixes prefix {prefix}"
+                )));
+            }
+        }
+    }
+    Ok(false)
+}
 fn compile_literal_element(
     node: roxmltree::Node<'_, '_>,
     context: CompileContext,
@@ -1192,11 +1225,14 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<(bool, Ha
     ancestors.reverse();
     for ancestor in ancestors {
         for attribute in ["exclude-result-prefixes", "extension-element-prefixes"] {
-            let Some(value) = ancestor.attribute((XSLT_NS, attribute)).or_else(|| {
-                (ancestor.tag_name().namespace() == Some(XSLT_NS))
-                    .then(|| ancestor.attribute(attribute))
-                    .flatten()
-            }) else {
+            let value = if ancestor.tag_name().namespace() == Some(XSLT_NS) {
+                ancestor.attribute(attribute)
+            } else if attribute == "extension-element-prefixes" {
+                ancestor.attribute((XSLT_NS, attribute))
+            } else {
+                None
+            };
+            let Some(value) = value else {
                 continue;
             };
             for token in value.split_ascii_whitespace() {
@@ -1266,12 +1302,12 @@ fn compile_number(node: roxmltree::Node<'_, '_>) -> Result<NumberInstruction> {
         letter_value: node.attribute("letter-value").map(str::to_owned),
         grouping_separator: node
             .attribute("grouping-separator")
-            .and_then(|v| v.chars().next()),
+            .map(|value| parse_avt(value, node))
+            .transpose()?,
         grouping_size: node
             .attribute("grouping-size")
-            .map(str::parse)
-            .transpose()
-            .map_err(|_| Error::Static("invalid grouping-size".into()))?,
+            .map(|value| parse_avt(value, node))
+            .transpose()?,
     })
 }
 fn parse_avt(value: &str, node: roxmltree::Node<'_, '_>) -> Result<AttributeValueTemplate> {
@@ -1344,6 +1380,7 @@ fn merge_output(out: &mut OutputDefinition, node: roxmltree::Node<'_, '_>) -> Re
         out.version = Some(v.into())
     }
     if let Some(v) = node.attribute("encoding") {
+        out.encoding_explicit = true;
         out.encoding = v.into()
     }
     if node.attribute("omit-xml-declaration").is_some() {
@@ -1359,6 +1396,7 @@ fn merge_output(out: &mut OutputDefinition, node: roxmltree::Node<'_, '_>) -> Re
         out.doctype_system = Some(v.into())
     }
     if node.attribute("indent").is_some() {
+        out.indent_explicit = true;
         out.indent = yes_no(node.attribute("indent"))?
     }
     if let Some(v) = node.attribute("media-type") {

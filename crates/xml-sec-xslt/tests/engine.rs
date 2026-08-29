@@ -64,7 +64,7 @@ fn identity_transform_preserves_elements_attributes_and_namespaces() {
             stylesheet,
             r#"<p:r xmlns:p="urn:test" a="1">x<!--c--></p:r>"#
         ),
-        r#"<p:r xmlns:p="urn:test" a="1">x<!--c--></p:r>"#,
+        "<p:r xmlns:p=\"urn:test\" a=\"1\">x<!--c--></p:r>\n",
     );
 }
 
@@ -83,7 +83,7 @@ fn templates_modes_parameters_sort_keys_and_numbering_compose() {
             stylesheet,
             r#"<root><item id="b" name="z"/><item id="a" name="A"/></root>"#
         ),
-        "<out>B!A!z</out>",
+        "<out>B!A!z</out>\n",
     );
 }
 
@@ -100,7 +100,7 @@ fn whitespace_aliases_and_decimal_formats_affect_results() {
       </xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<root>  <item/>\n</root>"),
-        r#"<new:r xmlns:new="urn:new">0|1.234,50</new:r>"#,
+        "<old:r xmlns:old=\"urn:new\" xmlns:new=\"urn:new\">0|1.234,50</old:r>\n",
     );
 }
 
@@ -228,7 +228,7 @@ fn import_precedence_overrides_but_include_keeps_equal_precedence() {
         .expect("included transform must execute");
     assert_eq!(
         String::from_utf8(included_output.serialized.bytes).expect("UTF-8 output"),
-        "<included-after></included-after>"
+        "<included-after/>\n"
     );
     let output = stylesheet
         .execute(
@@ -244,7 +244,7 @@ fn import_precedence_overrides_but_include_keeps_equal_precedence() {
         .expect("transform must execute");
     assert_eq!(
         String::from_utf8(output.serialized.bytes).expect("UTF-8 output"),
-        "<local></local>"
+        "<local/>\n"
     );
 }
 
@@ -254,13 +254,13 @@ fn serializer_honors_doctype_cdata_html_and_text_contracts() {
     let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" doctype-system="result.dtd" cdata-section-elements="script"/><xsl:template match="/"><doc><script><xsl:text>if (a &lt; b) x = ']]&gt;';</xsl:text></script></doc></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(xml, "<source/>"),
-        "<!DOCTYPE doc SYSTEM \"result.dtd\"><doc><script><![CDATA[if (a < b) x = ']]><![CDATA[>';]]></script></doc>",
+        "<!DOCTYPE doc SYSTEM \"result.dtd\"><doc><script><![CDATA[if (a < b) x = ']]><![CDATA[>';]]></script></doc>\n",
     );
 
     let html = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><html><body><br/><script>if (a &lt; b) x++;</script></body></html></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(html, "<source/>"),
-        "<html><body><br><script>if (a < b) x++;</script></body></html>",
+        "<html>\n  <body>\n    <br>\n    <script>if (a < b) x++;</script>\n  </body>\n</html>\n",
     );
 
     let text = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><ignored>A<xsl:value-of select="'&lt;B'"/></ignored></xsl:template></xsl:stylesheet>"#;
@@ -324,7 +324,7 @@ fn control_flow_computed_nodes_and_messages_share_the_current_context() {
         .expect("transform must execute");
     assert_eq!(
         String::from_utf8(result.serialized.bytes).expect("UTF-8 output"),
-        "<row id=\"a\">A<?done ok?></row><row id=\"b\"><!--disabled--><?done ok?></row>"
+        "<row id=\"a\">A<?done ok?></row><row id=\"b\"><!--disabled--><?done ok?></row>\n"
     );
     assert_eq!(
         result
@@ -345,7 +345,7 @@ fn attribute_sets_variables_and_multiple_numbering_compose() {
             stylesheet,
             "<book><chapter><section id=\"x\"/><section id=\"y\"/></chapter></book>"
         ),
-        "<out><item class=\"entry\" label=\"Sx\">1.1</item><item class=\"entry\" label=\"Sy\">1.2</item></out>"
+        "<out><item class=\"entry\" label=\"Sx\">1.1</item><item class=\"entry\" label=\"Sy\">1.2</item></out>\n"
     );
 }
 
@@ -385,7 +385,7 @@ fn result_tree_fragments_preserve_nodes_and_global_dependencies_are_order_indepe
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:variable name="later" select="$base"/><xsl:variable name="base" select="'ok'"/><xsl:template match="/"><xsl:variable name="fragment"><b><xsl:value-of select="$later"/></b><xsl:comment>kept</xsl:comment><xsl:processing-instruction name="done">yes</xsl:processing-instruction></xsl:variable><out><xsl:copy-of select="$fragment"/></out></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<source/>"),
-        "<out><b>ok</b><!--kept--><?done yes?></out>"
+        "<out><b>ok</b><!--kept--><?done yes?></out>\n"
     );
 
     let cycle = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:variable name="a" select="$b"/><xsl:variable name="b" select="$a"/><xsl:template match="/"/></xsl:stylesheet>"#;
@@ -413,7 +413,7 @@ fn static_xpath_and_template_conflicts_are_resolved_during_compilation() {
     ));
 
     let union = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:apply-templates select="bar"/></xsl:template><xsl:template match="foo|*"><wild/></xsl:template><xsl:template match="bar"><specific/></xsl:template></xsl:stylesheet>"#;
-    assert_eq!(execute(union, "<bar/>"), "<specific></specific>");
+    assert_eq!(execute(union, "<bar/>"), "<specific/>\n");
 }
 
 #[test]
@@ -422,7 +422,7 @@ fn stylesheet_static_context_is_module_and_instruction_local() {
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:p"><xsl:output omit-xml-declaration="yes" exclude-result-prefixes="p"/><xsl:template match="/"><!--documented--><xsl:param name="v" select="'ok'"/><xsl:element name="p:out"><xsl:attribute name="p:value"><xsl:value-of select="$v"/></xsl:attribute></xsl:element></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<source/>"),
-        r#"<p:out xmlns:p="urn:p" p:value="ok"></p:out>"#
+        "<p:out xmlns:p=\"urn:p\" p:value=\"ok\"/>\n"
     );
 }
 
@@ -481,11 +481,11 @@ fn serializer_preserves_mixed_content_and_method_detection() {
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output indent="yes" omit-xml-declaration="yes"/><xsl:template match="/"><xsl:comment>lead</xsl:comment><html><body><p>Hello<b>world</b>!</p><br/></body></html></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<source/>"),
-        "<!--lead--><html>\n  <body>\n    <p>Hello<b>world</b>!</p>\n    <br>\n  </body>\n</html>"
+        "<!--lead--><html>\n  <body>\n    <p>Hello<b>world</b>!</p>\n    <br>\n  </body>\n</html>\n"
     );
 
     let public_only = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" doctype-public="public-id"/><xsl:template match="/"><root/></xsl:template></xsl:stylesheet>"#;
-    assert_eq!(execute(public_only, "<source/>"), "<root></root>");
+    assert_eq!(execute(public_only, "<source/>"), "<root/>\n");
 }
 
 #[test]
@@ -567,7 +567,7 @@ fn xslt_capability_and_include_contracts_match_execution() {
         .expect("included transform must execute");
     assert_eq!(
         String::from_utf8(output.serialized.bytes).expect("UTF-8 output"),
-        "<local></local>"
+        "<local/>\n"
     );
 }
 
@@ -774,7 +774,7 @@ fn namespaces_fallbacks_and_xml_characters_fail_or_emit_by_contract() {
     let excluded = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:unused="urn:unused" xmlns:used="urn:used" exclude-result-prefixes="unused used"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><used:out/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(excluded, "<source/>"),
-        r#"<used:out xmlns:used="urn:used"></used:out>"#
+        "<used:out xmlns:used=\"urn:used\"/>\n"
     );
 
     let fallback = r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:future><xsl:fallback><xsl:value-of select="["/></xsl:fallback></xsl:future></xsl:template></xsl:stylesheet>"#;

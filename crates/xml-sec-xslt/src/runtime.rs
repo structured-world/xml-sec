@@ -3,6 +3,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use icu_collator::preferences::CollationCaseFirst;
+use icu_collator::{Collator, CollatorBorrowed, CollatorPreferences, options::CollatorOptions};
+use icu_locale::Locale;
+
 use crate::budget::Meter;
 use crate::compiler::{
     AttributeValueTemplate, AvtPart, Instruction, Sort, Stylesheet, Template, Variable,
@@ -770,14 +774,31 @@ impl<'a> Execution<'a> {
                 } else {
                     self.number_sequence(number, node)?
                 };
+                let grouping_separator = number
+                    .grouping_separator
+                    .as_ref()
+                    .map(|value| self.evaluate_avt(value, node, position, size))
+                    .transpose()?
+                    .and_then(|value| {
+                        let mut characters = value.chars();
+                        let first = characters.next()?;
+                        characters.next().is_none().then_some(first)
+                    });
+                let grouping_size = number
+                    .grouping_size
+                    .as_ref()
+                    .map(|value| self.evaluate_avt(value, node, position, size))
+                    .transpose()?
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|size| *size > 0);
                 self.append_text(
                     &format_number_sequence(
                         &values,
                         &number.format,
                         number.lang.as_deref(),
                         number.letter_value.as_deref(),
-                        number.grouping_separator,
-                        number.grouping_size,
+                        grouping_separator,
+                        grouping_size,
                     ),
                     false,
                 )
@@ -943,6 +964,24 @@ impl<'a> Execution<'a> {
         let specs = sorts
             .iter()
             .map(|sort| {
+                let case_order = sort
+                    .case_order
+                    .as_ref()
+                    .map(|value| {
+                        self.evaluate_avt(value, context_node, context_position, context_size)
+                    })
+                    .transpose()?;
+                let lang = sort
+                    .lang
+                    .as_ref()
+                    .map(|value| {
+                        self.evaluate_avt(value, context_node, context_position, context_size)
+                    })
+                    .transpose()?;
+                let collator = lang
+                    .as_deref()
+                    .map(|lang| locale_collator(lang, case_order.as_deref()))
+                    .transpose()?;
                 Ok(EvaluatedSort {
                     data_type: self.evaluate_avt(
                         &sort.data_type,
@@ -956,20 +995,8 @@ impl<'a> Execution<'a> {
                         context_position,
                         context_size,
                     )?,
-                    case_order: sort
-                        .case_order
-                        .as_ref()
-                        .map(|value| {
-                            self.evaluate_avt(value, context_node, context_position, context_size)
-                        })
-                        .transpose()?,
-                    lang: sort
-                        .lang
-                        .as_ref()
-                        .map(|value| {
-                            self.evaluate_avt(value, context_node, context_position, context_size)
-                        })
-                        .transpose()?,
+                    case_order,
+                    collator,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -999,7 +1026,7 @@ impl<'a> Execution<'a> {
         keyed.sort_by(|left, right| {
             comparisons = comparisons.saturating_add(1);
             for ((l, r), spec) in left.1.iter().zip(&right.1).zip(&specs) {
-                let mut ordering = l.compare(r, spec.case_order.as_deref(), spec.lang.as_deref());
+                let mut ordering = l.compare(r, spec.case_order.as_deref(), spec.collator.as_ref());
                 if spec.order == "descending" {
                     ordering = ordering.reverse()
                 }
@@ -1159,13 +1186,18 @@ impl<'a> Execution<'a> {
         )?;
         Ok(())
     }
-    fn add_attribute(&mut self, attribute: Attribute) -> Result<()> {
+    fn add_attribute(&mut self, mut attribute: Attribute) -> Result<()> {
         let parent = self.parent();
         let node = self
             .result
             .node_mut(parent)
             .ok_or_else(|| Error::Dynamic("attribute has no result parent".into()))?;
-        let NodeKind::Element { attributes, .. } = &mut node.kind else {
+        let NodeKind::Element {
+            attributes,
+            namespaces,
+            ..
+        } = &mut node.kind
+        else {
             return Err(Error::Dynamic(
                 "attribute cannot be added after a non-element result".into(),
             ));
@@ -1175,6 +1207,7 @@ impl<'a> Execution<'a> {
                 "attribute cannot be added after result children".into(),
             ));
         }
+        fixup_attribute_namespace(&mut attribute, namespaces);
         if let Some(existing) = attributes
             .iter_mut()
             .find(|existing| existing.name == attribute.name)
@@ -1226,7 +1259,7 @@ impl<'a> Execution<'a> {
         };
         (
             ExpandedName::new(alias.result_namespace.clone(), name.local.clone()),
-            (!alias.result_prefix.is_empty()).then(|| alias.result_prefix.clone()),
+            prefix.map(str::to_owned),
         )
     }
 
@@ -1241,7 +1274,7 @@ impl<'a> Execution<'a> {
             return namespace.clone();
         };
         Namespace {
-            prefix: (!alias.result_prefix.is_empty()).then(|| alias.result_prefix.clone()),
+            prefix: namespace.prefix.clone(),
             uri: alias.result_namespace.clone().unwrap_or_default(),
         }
     }
@@ -1360,6 +1393,63 @@ impl<'a> Execution<'a> {
     }
 }
 
+fn fixup_attribute_namespace(attribute: &mut Attribute, namespaces: &mut Vec<Namespace>) {
+    const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+
+    let Some(uri) = attribute.name.namespace.as_deref() else {
+        attribute.prefix = None;
+        return;
+    };
+    if uri == XML_NAMESPACE {
+        attribute.prefix = Some("xml".into());
+        return;
+    }
+    let requested = attribute.prefix.as_deref().filter(|prefix| {
+        !matches!(*prefix, "xml" | "xmlns")
+            && namespaces
+                .iter()
+                .find(|namespace| namespace.prefix.as_deref() == Some(*prefix))
+                .is_none_or(|namespace| namespace.uri == uri)
+    });
+    let prefix = requested
+        .map(str::to_owned)
+        .or_else(|| {
+            namespaces
+                .iter()
+                .find(|namespace| {
+                    namespace.prefix.is_some()
+                        && namespace.uri == uri
+                        && !matches!(namespace.prefix.as_deref(), Some("xml" | "xmlns"))
+                })
+                .and_then(|namespace| namespace.prefix.clone())
+        })
+        .unwrap_or_else(|| unused_namespace_prefix(namespaces));
+    if namespaces
+        .iter()
+        .all(|namespace| namespace.prefix.as_deref() != Some(&prefix))
+    {
+        namespaces.push(Namespace {
+            prefix: Some(prefix.clone()),
+            uri: uri.to_owned(),
+        });
+    }
+    attribute.prefix = Some(prefix);
+}
+
+fn unused_namespace_prefix(namespaces: &[Namespace]) -> String {
+    let mut index = 1usize;
+    loop {
+        let candidate = format!("ns_{index}");
+        if namespaces
+            .iter()
+            .all(|namespace| namespace.prefix.as_deref() != Some(&candidate))
+        {
+            return candidate;
+        }
+        index = index.saturating_add(1);
+    }
+}
+
 enum SortKey {
     Text(String),
     Number(f64),
@@ -1369,12 +1459,20 @@ struct EvaluatedSort {
     data_type: String,
     order: String,
     case_order: Option<String>,
-    lang: Option<String>,
+    collator: Option<CollatorBorrowed<'static>>,
 }
 impl SortKey {
-    fn compare(&self, other: &Self, case_order: Option<&str>, _lang: Option<&str>) -> Ordering {
+    fn compare(
+        &self,
+        other: &Self,
+        case_order: Option<&str>,
+        collator: Option<&CollatorBorrowed<'static>>,
+    ) -> Ordering {
         match (self, other) {
             (Self::Text(left), Self::Text(right)) => {
+                if let Some(collator) = collator {
+                    return collator.compare(left, right);
+                }
                 let primary = left.to_lowercase().cmp(&right.to_lowercase());
                 if primary != Ordering::Equal {
                     return primary;
@@ -1399,6 +1497,20 @@ impl SortKey {
             _ => Ordering::Equal,
         }
     }
+}
+
+fn locale_collator(lang: &str, case_order: Option<&str>) -> Result<CollatorBorrowed<'static>> {
+    let locale = lang.parse::<Locale>().map_err(|error| {
+        Error::Dynamic(format!("xsl:sort lang value {lang:?} is invalid: {error}"))
+    })?;
+    let mut preferences = CollatorPreferences::from(locale);
+    preferences.case_first = match case_order {
+        Some("upper-first") => Some(CollationCaseFirst::Upper),
+        Some("lower-first") => Some(CollationCaseFirst::Lower),
+        _ => None,
+    };
+    Collator::try_new(preferences, CollatorOptions::default())
+        .map_err(|error| Error::Dynamic(format!("xsl:sort lang {lang:?} is unavailable: {error}")))
 }
 fn xpath_to_public(value: XPathValue) -> Value {
     match value {

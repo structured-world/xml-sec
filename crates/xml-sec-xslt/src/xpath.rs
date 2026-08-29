@@ -26,7 +26,9 @@ impl<'a> Evaluator<'a> {
         let xml = crate::serializer::serialize_projection(source, meter)?;
         let package = sxd_document_no_unsafe::parser::parse(&xml)
             .map_err(|error| Error::Xml(error.to_string()))?;
-        let maps = NodeMaps::new(source, package.as_document().root().into())?;
+        let root: nodeset::Node<'_> = package.as_document().root().into();
+        register_default_namespaces(root.clone());
+        let maps = NodeMaps::new(source, root)?;
         Ok(Self {
             source,
             package,
@@ -273,6 +275,21 @@ impl<'a> Evaluator<'a> {
     }
 }
 
+fn register_default_namespaces(root: nodeset::Node<'_>) {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if let Some(element) = node.element()
+            && let Some(uri) = element.recursive_default_namespace_uri()
+        {
+            // SXD stores the default namespace separately from the prefix map used
+            // by its XPath namespace axis. Mirror it under the empty prefix so the
+            // normalized semantic model exposes every XPath namespace node.
+            element.register_prefix("", &uri);
+        }
+        pending.extend(node.children());
+    }
+}
+
 fn split_pattern_branches(source: &str) -> Vec<&str> {
     let mut branches = Vec::new();
     let mut start = 0;
@@ -380,16 +397,23 @@ fn xpath_number(value: &str) -> f64 {
 struct NodeMaps {
     forward: HashMap<SourceNode, NodePath>,
     reverse: HashMap<NodePath, SourceNode>,
+    order: HashMap<SourceNode, NodeOrder>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct NodeOrder(usize, u8, usize);
+
 impl NodeMaps {
     fn new(source: &Document, root: nodeset::Node<'_>) -> Result<Self> {
         let mut forward = HashMap::new();
         let mut reverse = HashMap::new();
+        let mut order = HashMap::new();
         for (id, node) in source.nodes() {
             let path = semantic_node_path(source, id)?;
             let key = SourceNode::Node(id);
             forward.insert(key.clone(), path.clone());
-            reverse.insert(path.clone(), key);
+            reverse.insert(path.clone(), key.clone());
+            order.insert(key, NodeOrder(id.0.saturating_mul(3), 0, 0));
             if let NodeKind::Element {
                 attributes,
                 namespaces,
@@ -404,7 +428,8 @@ impl NodeMaps {
                     };
                     let key = SourceNode::Attribute { owner: id, index };
                     forward.insert(key.clone(), attribute_path.clone());
-                    reverse.insert(attribute_path, key);
+                    reverse.insert(attribute_path, key.clone());
+                    order.insert(key, NodeOrder(id.0.saturating_mul(3), 2, index));
                 }
                 for (index, namespace) in namespaces.iter().enumerate() {
                     let namespace_path = NodePath::Namespace {
@@ -414,15 +439,20 @@ impl NodeMaps {
                     };
                     let key = SourceNode::Namespace { owner: id, index };
                     forward.insert(key.clone(), namespace_path.clone());
-                    reverse.insert(namespace_path, key);
+                    reverse.insert(namespace_path, key.clone());
+                    order.insert(key, NodeOrder(id.0.saturating_mul(3), 1, index));
                 }
             }
         }
-        let maps = Self { forward, reverse };
+        let maps = Self {
+            forward,
+            reverse,
+            order,
+        };
         for (node, path) in &maps.forward {
             if maps.resolve(root.clone(), path).is_none() {
                 return Err(Error::Dynamic(format!(
-                    "semantic XPath projection cannot resolve {node:?}"
+                    "semantic XPath projection cannot resolve {node:?} at {path:?}"
                 )));
             }
         }
@@ -450,20 +480,7 @@ impl NodeMaps {
                     name.local_part() == local && name.namespace_uri() == namespace.as_deref()
                 })
                 .map(nodeset::Node::Attribute),
-            NodePath::Namespace { prefix, uri, .. } => {
-                let element = node.element()?;
-                element
-                    .namespaces_in_scope()
-                    .into_iter()
-                    .find(|namespace| namespace.prefix() == prefix && namespace.uri() == uri)
-                    .map(|namespace| {
-                        nodeset::Node::Namespace(nodeset::Namespace {
-                            parent: element,
-                            prefix: sxd_document_no_unsafe::to_ns_str!(namespace.prefix()),
-                            uri: sxd_document_no_unsafe::to_ns_str!(namespace.uri()),
-                        })
-                    })
-            }
+            NodePath::Namespace { prefix, uri, .. } => resolve_namespace_node(node, prefix, uri),
         }
     }
     fn project_value(&self, value: SxdValue<'_>) -> Result<XPathValue> {
@@ -471,13 +488,15 @@ impl NodeMaps {
             SxdValue::Boolean(value) => XPathValue::Boolean(value),
             SxdValue::Number(value) => XPathValue::Number(value),
             SxdValue::String(value) => XPathValue::String(value),
-            SxdValue::Nodeset(nodes) => XPathValue::NodeSet(
-                nodes
+            SxdValue::Nodeset(nodes) => {
+                let mut projected = nodes
                     .document_order()
                     .into_iter()
                     .filter_map(|node| self.reverse.get(&typed_path_to(&node)).cloned())
-                    .collect(),
-            ),
+                    .collect::<Vec<_>>();
+                projected.sort_by_key(|node| self.order.get(node).copied());
+                XPathValue::NodeSet(projected)
+            }
         })
     }
 }
@@ -933,21 +952,39 @@ fn resolve_node_path<'d>(root: nodeset::Node<'d>, path: &NodePath) -> Option<nod
                 name.local_part() == local && name.namespace_uri() == namespace.as_deref()
             })
             .map(nodeset::Node::Attribute),
-        NodePath::Namespace { prefix, uri, .. } => {
-            let element = node.element()?;
-            element
-                .namespaces_in_scope()
-                .into_iter()
-                .find(|namespace| namespace.prefix() == prefix && namespace.uri() == uri)
-                .map(|namespace| {
-                    nodeset::Node::Namespace(nodeset::Namespace {
-                        parent: element,
-                        prefix: sxd_document_no_unsafe::to_ns_str!(namespace.prefix()),
-                        uri: sxd_document_no_unsafe::to_ns_str!(namespace.uri()),
-                    })
-                })
-        }
+        NodePath::Namespace { prefix, uri, .. } => resolve_namespace_node(node, prefix, uri),
     }
+}
+
+fn resolve_namespace_node<'d>(
+    node: nodeset::Node<'d>,
+    prefix: &str,
+    uri: &str,
+) -> Option<nodeset::Node<'d>> {
+    let element = node.element()?;
+    if prefix.is_empty()
+        && element
+            .recursive_default_namespace_uri()
+            .as_deref()
+            .is_some_and(|namespace| namespace == uri)
+    {
+        return Some(nodeset::Node::Namespace(nodeset::Namespace {
+            parent: element,
+            prefix: sxd_document_no_unsafe::to_ns_str!(prefix),
+            uri: sxd_document_no_unsafe::to_ns_str!(uri),
+        }));
+    }
+    element
+        .namespaces_in_scope()
+        .into_iter()
+        .find(|namespace| namespace.prefix() == prefix && namespace.uri() == uri)
+        .map(|namespace| {
+            nodeset::Node::Namespace(nodeset::Namespace {
+                parent: element,
+                prefix: sxd_document_no_unsafe::to_ns_str!(namespace.prefix()),
+                uri: sxd_document_no_unsafe::to_ns_str!(namespace.uri()),
+            })
+        })
 }
 
 fn default_decimal_format() -> DecimalFormat {
@@ -1124,21 +1161,11 @@ impl function::Function for CurrentNode {
                 node = nodeset::Node::Attribute(attribute);
             }
             NodePath::Namespace { prefix, uri, .. } => {
-                let element = node.element().ok_or_else(|| function::Error::Other {
-                    what: "current() owner is stale".into(),
+                node = resolve_namespace_node(node, prefix, uri).ok_or_else(|| {
+                    function::Error::Other {
+                        what: "current() owner is stale".into(),
+                    }
                 })?;
-                let namespaces = element.namespaces_in_scope();
-                let namespace = namespaces
-                    .iter()
-                    .find(|namespace| namespace.prefix() == prefix && namespace.uri() == uri)
-                    .ok_or_else(|| function::Error::Other {
-                        what: "current() namespace is stale".into(),
-                    })?;
-                node = nodeset::Node::Namespace(nodeset::Namespace {
-                    parent: element,
-                    prefix: sxd_document_no_unsafe::to_ns_str!(namespace.prefix()),
-                    uri: sxd_document_no_unsafe::to_ns_str!(namespace.uri()),
-                });
             }
         }
         let mut set = nodeset::Nodeset::new();
