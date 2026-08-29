@@ -163,7 +163,10 @@ impl KeyWrapAlgorithm {
 /// Supported asymmetric session-key transport algorithms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyTransportAlgorithm {
-    /// XML Encryption 1.0 OAEP with SHA-1 and MGF1-SHA-1.
+    /// XML Encryption 1.0 OAEP URI with SHA-1/MGF1-SHA1 absent-field defaults.
+    ///
+    /// An explicit DigestMethod or XMLEnc 1.1 MGF child overrides the corresponding default,
+    /// matching libxmlsec1 1.3.13 behavior.
     RsaOaepMgf1p,
     /// XML Encryption 1.1 OAEP with explicitly parsed digest and MGF settings.
     RsaOaep11,
@@ -512,11 +515,6 @@ impl EncryptionMethod {
         {
             return Err(XmlEncError::InvalidStructure(
                 "OAEP parameters are only valid for RSA-OAEP EncryptionMethod".into(),
-            ));
-        }
-        if self.mgf_algorithm.is_some() && !is_oaep11 {
-            return Err(XmlEncError::InvalidStructure(
-                "MGF is only valid for XML Encryption 1.1 RSA-OAEP".into(),
             ));
         }
         if let (Some(actual), Some(expected)) =

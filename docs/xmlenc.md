@@ -58,11 +58,12 @@ public keys, or use `recipient_aes_kw` with a shared KEK. `EncryptedDataBuilder`
 content key through `CryptoProvider::fill_random` and wraps it once per recipient. The default
 `RustCryptoProvider` uses the operating-system RNG; `.provider(...)` can replace that behavior
 together with the cryptographic primitives. The crate's secure RSA-OAEP default is
-SHA-256/MGF1-SHA-256. XMLEnc 1.1 itself defaults omitted parameters to SHA-1/MGF1-SHA-1, so for
-the XML Encryption 1.1 RSA-OAEP URI `xml-sec` emits explicit `ds:DigestMethod` and `xenc11:MGF`
-values rather than relying on those implicit legacy defaults. SHA-1 OAEP remains available only
-through explicit parameters. The legacy `rsa-oaep-mgf1p` URI fixes MGF1 to SHA-1 and has no
-`xenc11:MGF` wire field.
+SHA-256/MGF1-SHA-256 and generated recipients serialize those choices explicitly. When consuming
+templates or encrypted input, both RSA-OAEP URIs default an omitted `ds:DigestMethod` and
+`xenc11:MGF` to SHA-1/MGF1-SHA-1. libxmlsec1 1.3.13 also accepts an explicit XMLEnc 1.1
+`xenc11:MGF` child under the legacy `rsa-oaep-mgf1p` URI; `xml-sec` parses, executes, and preserves
+that interoperable form. Serializing the legacy URI omits only a default MGF1-SHA1 choice and emits
+the child for every non-default MGF.
 `recipient_key_transport` accepts an opaque `KeyTransportKey` for provider-owned public keys;
 the RSA convenience constructor wraps a RustCrypto key into the same contract. The handle exposes
 only normalized public modulus/exponent metadata required by encryption policy and framing checks.
@@ -82,17 +83,15 @@ while recipient mode consumes one candidate per independently wrapped recipient.
 `max_encryption_recipients` ceiling still applies, so the tighter of the two limits wins.
 `validate_rsa_recipient_key` exposes that same preflight to ordered key registries, allowing them
 to skip policy-invalid candidates before committing to one without duplicating policy limits.
-Configuration validation rejects any non-SHA-1 MGF digest for the legacy URI before provider
-dispatch because its wire format cannot represent an alternative.
 AES-KW configuration similarly validates the KEK size fixed by its algorithm URI before provider
 dispatch, so custom providers cannot reinterpret `kw-aes128` with a 256-bit KEK or `kw-aes256`
 with a 128-bit KEK. A custom provider's wrapped-key output must contain the complete RFC 3394 value,
 which is exactly eight bytes longer than the content key; the facade validates that framing before
 serializing `EncryptedKey`.
 The same `EncryptionMethod` structural validation applies to parsed XML and caller-constructed
-typed values: an explicit `xenc11:MGF` is valid only with the XML Encryption 1.1 RSA-OAEP URI and
-is rejected before key resolution on the legacy URI. Every supplied `KeySize` must be positive;
-fixed-width AES methods additionally require it to match the selected algorithm.
+typed values: an explicit `xenc11:MGF` is valid with either RSA-OAEP URI and rejected on non-OAEP
+methods. Every supplied `KeySize` must be positive; fixed-width AES methods additionally require it
+to match the selected algorithm.
 
 `encrypt_document` selects the root or an element by `Id`, `ID`, or `id`, then replaces either
 the complete element or only its child content according to `EncryptedDataType`. See

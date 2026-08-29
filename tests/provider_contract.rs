@@ -6,7 +6,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use xml_sec::{
     provider::{
         CryptoProvider, KeyRecoveryKey, KeyTransportKey, ProviderCapability, ProviderError,
-        ProviderOperation, RustCryptoProvider,
+        ProviderInputError, ProviderOperation, RustCryptoProvider,
     },
     xmlenc::{
         DataEncryptionAlgorithm, DecryptContext, EncryptedDataBuilder, KeyWrapAlgorithm,
@@ -227,6 +227,15 @@ fn refused_public_capability_fails_before_provider_dispatch() {
             ..
         })
     ));
+}
+
+#[allow(deprecated)]
+#[test]
+fn legacy_oaep_mgf_input_error_remains_constructible() {
+    // Published enum variants remain part of the downstream construction and
+    // matching surface even after corrected runtime paths stop returning them.
+    let error = ProviderInputError::LegacyRsaOaepMgf;
+    assert!(matches!(error, ProviderInputError::LegacyRsaOaepMgf));
 }
 
 fn external_encrypted_xml() -> String {

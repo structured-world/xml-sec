@@ -197,7 +197,7 @@ fn fixture_file_count_matches_expected() {
         ("c14n", 41),
         ("xmldsig", 207),
         ("saml", 2),
-        ("xmlenc", 482),
+        ("xmlenc", 485),
     ];
 
     for (corpus, expected_count) in expected {
