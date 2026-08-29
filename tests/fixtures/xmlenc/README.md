@@ -2,8 +2,8 @@
 
 These fixtures are tracked so decryption interoperability tests do not depend
 on network access or a local xmlsec1 checkout. They were imported from the
-`xmlsec_1_3_12` tag of
-[lsh123/xmlsec](https://github.com/lsh123/xmlsec/tree/xmlsec_1_3_12/tests).
+`xmlsec_1_3_13` tag of
+[lsh123/xmlsec](https://github.com/lsh123/xmlsec/tree/xmlsec_1_3_13/tests).
 The commit recorded in the canonical
 [`libxmlsec1-1.3.13-donor-commit.txt`](../../../compatibility/libxmlsec1-1.3.13-donor-commit.txt)
 contains no changes to these
@@ -22,7 +22,8 @@ They must never be used outside tests.
 
 xmlsec1-produced direct-key vectors for AES-128/256-CBC and
 AES-128/256-GCM, plus RSA-OAEP wrapped AES-256-CBC vectors covering SHA-1,
-an explicit OAEP label, SHA-256, and XMLEnc 1.1 SHA-512/MGF1-SHA512. Tests
+an explicit OAEP label, SHA-256, an explicit XMLEnc 1.1 MGF child under the
+legacy OAEP URI, and XMLEnc 1.1 SHA-512/MGF1-SHA512. Tests
 compare standalone bytes or complete decrypted documents with each tracked
 `.data` file.
 

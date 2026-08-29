@@ -252,9 +252,6 @@ pub enum ProviderInputError {
     /// AES key-wrap input or output framing is invalid.
     #[error("invalid AES key-wrap framing")]
     AesKeyWrapFraming,
-    /// The legacy RSA-OAEP URI requires MGF1-SHA1.
-    #[error("legacy RSA-OAEP requires MGF1-SHA1")]
-    LegacyRsaOaepMgf,
 }
 
 /// Failure returned by a cryptographic provider.
@@ -719,8 +716,7 @@ impl CryptoProvider for RustCryptoProvider {
             #[cfg(feature = "xmlenc")]
             ProviderCapability::KeyWrap(_) | ProviderCapability::KeyUnwrap(_) => true,
             #[cfg(feature = "xmlenc")]
-            ProviderCapability::KeyTransport(parameters)
-            | ProviderCapability::KeyRecovery(parameters) => legacy_oaep_mgf_is_valid(parameters),
+            ProviderCapability::KeyTransport(_) | ProviderCapability::KeyRecovery(_) => true,
             ProviderCapability::Random => true,
             ProviderCapability::KeyAgreement(_) | ProviderCapability::Kdf(_) => false,
         }
@@ -838,7 +834,6 @@ impl CryptoProvider for RustCryptoProvider {
         parameters: &RsaOaepParameters,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
-        validate_oaep_parameters(parameters)?;
         self.require_capability(ProviderCapability::KeyTransport(parameters))?;
         key.transport_with_provider(self, parameters, plaintext)
     }
@@ -850,26 +845,8 @@ impl CryptoProvider for RustCryptoProvider {
         parameters: &RsaOaepParameters,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
-        validate_oaep_parameters(parameters)?;
         self.require_capability(ProviderCapability::KeyRecovery(parameters))?;
         key.recover_with_provider(self, parameters, ciphertext)
-    }
-}
-
-#[cfg(feature = "xmlenc")]
-fn legacy_oaep_mgf_is_valid(parameters: &RsaOaepParameters) -> bool {
-    parameters.algorithm != crate::xmlenc::KeyTransportAlgorithm::RsaOaepMgf1p
-        || parameters.mgf_digest == crate::xmlenc::OaepDigestAlgorithm::Sha1
-}
-
-#[cfg(feature = "xmlenc")]
-fn validate_oaep_parameters(parameters: &RsaOaepParameters) -> Result<(), ProviderError> {
-    if legacy_oaep_mgf_is_valid(parameters) {
-        Ok(())
-    } else {
-        Err(ProviderError::InvalidInput(
-            ProviderInputError::LegacyRsaOaepMgf,
-        ))
     }
 }
 
@@ -1395,7 +1372,6 @@ mod rustcrypto {
         parameters: &RsaOaepParameters,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
-        super::validate_oaep_parameters(parameters)?;
         let mut rng = super::ProviderRng(provider);
         macro_rules! encrypt_with {
             ($digest:ty, $mgf:ty) => {
@@ -1462,7 +1438,6 @@ mod rustcrypto {
         parameters: &RsaOaepParameters,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ProviderError> {
-        super::validate_oaep_parameters(parameters)?;
         let mut rng = super::ProviderRng(provider);
         macro_rules! decrypt_with {
             ($digest:ty, $mgf:ty) => {
@@ -1758,13 +1733,13 @@ mod tests {
     fn capability_queries_include_oaep_and_pss_parameters() {
         use crate::xmlenc::{KeyTransportAlgorithm, OaepDigestAlgorithm};
 
-        let invalid_legacy = RsaOaepParameters {
+        let explicit_legacy = RsaOaepParameters {
             algorithm: KeyTransportAlgorithm::RsaOaepMgf1p,
             digest: OaepDigestAlgorithm::Sha256,
             mgf_digest: OaepDigestAlgorithm::Sha256,
             label: Vec::new(),
         };
-        assert!(!RUST_CRYPTO_PROVIDER.supports(ProviderCapability::KeyTransport(&invalid_legacy)));
+        assert!(RUST_CRYPTO_PROVIDER.supports(ProviderCapability::KeyTransport(&explicit_legacy)));
         let modern =
             RsaOaepParameters::xmlenc11(OaepDigestAlgorithm::Sha256, OaepDigestAlgorithm::Sha512)
                 .label(b"label".to_vec());
@@ -2268,37 +2243,5 @@ mod tests {
                 )
                 .expect("oversized PSS salt must fail without panicking")
         );
-    }
-
-    #[cfg(feature = "xmlenc")]
-    #[test]
-    fn legacy_oaep_mgf_constraint_is_symmetric() {
-        use rsa::pkcs8::DecodePrivateKey;
-
-        // The legacy URI fixes MGF1 to SHA-1 for both directions; rejecting
-        // before RSA processing keeps transport and recovery capabilities equal.
-        let key = rsa::RsaPrivateKey::from_pkcs8_pem(include_str!(
-            "../tests/fixtures/keys/rsa/rsa-2048-key.pem"
-        ))
-        .expect("RSA fixture must parse");
-        let parameters = crate::xmlenc::RsaOaepParameters {
-            algorithm: crate::xmlenc::KeyTransportAlgorithm::RsaOaepMgf1p,
-            digest: crate::xmlenc::OaepDigestAlgorithm::Sha256,
-            mgf_digest: crate::xmlenc::OaepDigestAlgorithm::Sha256,
-            label: Vec::new(),
-        };
-
-        assert!(matches!(
-            RUST_CRYPTO_PROVIDER.recover_key(&key, &parameters, &[0_u8; 256]),
-            Err(ProviderError::InvalidInput(
-                ProviderInputError::LegacyRsaOaepMgf
-            ))
-        ));
-        assert!(matches!(
-            RUST_CRYPTO_PROVIDER.transport_key(&key.to_public_key(), &parameters, &[0_u8; 16]),
-            Err(ProviderError::InvalidInput(
-                ProviderInputError::LegacyRsaOaepMgf
-            ))
-        ));
     }
 }

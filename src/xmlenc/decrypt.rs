@@ -594,6 +594,7 @@ impl DecryptionKeyResolver for PrivateKeyDecryptor {
             KeyTransportAlgorithm::RsaOaepMgf1p => self.decrypt_oaep_mgf1p(
                 provider,
                 encrypted_key.encryption_method.oaep_digest.as_deref(),
+                encrypted_key.encryption_method.mgf_algorithm.as_deref(),
                 label,
                 &wrapped,
             ),
@@ -615,13 +616,14 @@ impl PrivateKeyDecryptor {
         &self,
         provider: &dyn crate::provider::CryptoProvider,
         digest: Option<&str>,
+        mgf: Option<&str>,
         label: Vec<u8>,
         wrapped: &[u8],
     ) -> Result<Vec<u8>, XmlEncError> {
         let parameters = RsaOaepParameters {
             algorithm: KeyTransportAlgorithm::RsaOaepMgf1p,
             digest: parse_oaep_digest(digest)?,
-            mgf_digest: OaepDigestAlgorithm::Sha1,
+            mgf_digest: parse_oaep_mgf_digest(mgf)?,
             label,
         };
         recover_rsa_oaep(provider, self.key.as_ref(), &parameters, wrapped)
@@ -1036,11 +1038,8 @@ fn validate_encrypted_key_policy(
             .into());
         }
         let digest = parse_oaep_digest(encrypted_key.encryption_method.oaep_digest.as_deref())?;
-        let mgf_digest = if transport == KeyTransportAlgorithm::RsaOaepMgf1p {
-            OaepDigestAlgorithm::Sha1
-        } else {
-            parse_oaep_mgf_digest(encrypted_key.encryption_method.mgf_algorithm.as_deref())?
-        };
+        let mgf_digest =
+            parse_oaep_mgf_digest(encrypted_key.encryption_method.mgf_algorithm.as_deref())?;
         for selected in [digest, mgf_digest] {
             if policy
                 .oaep_digests
@@ -2965,7 +2964,7 @@ mod tests {
 
     #[test]
     fn decrypts_legacy_oaep_uri_with_sha256_digest() {
-        // The legacy URI fixes MGF1 to SHA-1 while allowing an explicit message digest.
+        // The legacy URI defaults MGF1 to SHA-1 when no xenc11:MGF child is present.
         let private_key = RsaPrivateKey::from_pkcs8_pem(include_str!(
             "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
         ))
@@ -3009,7 +3008,7 @@ mod tests {
     #[test]
     fn decrypts_sha384_oaep_with_the_xmlenc_digest_uri() {
         // XML Encryption 1.1 reserves xmlenc#sha384 for SHA-384. Exercise both
-        // OAEP algorithm URIs because the legacy form still fixes MGF1 to SHA-1.
+        // OAEP algorithm URIs with their absent/explicit MGF1-SHA1 forms.
         let private_key = RsaPrivateKey::from_pkcs8_pem(include_str!(
             "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
         ))
@@ -3374,9 +3373,9 @@ mod tests {
     }
 
     #[test]
-    fn typed_legacy_oaep_mgf_is_rejected_before_key_resolution() {
-        // The legacy RSA-OAEP URI fixes MGF1 to SHA-1 and cannot carry an MGF
-        // child. Typed input must preserve the parser's structural invariant.
+    fn typed_legacy_oaep_accepts_explicit_mgf() {
+        // The legacy URI defaults to MGF1-SHA1 when MGF is absent, but
+        // libxmlsec1 also accepts the XMLEnc 1.1 child explicitly.
         let key = [0x43_u8; 16];
         let ciphertext = crate::provider::default_provider()
             .encrypt_data(DataEncryptionAlgorithm::Aes128Gcm, &key, b"data")
@@ -3418,26 +3417,13 @@ mod tests {
             key: key.to_vec(),
         };
 
-        assert!(matches!(
-            DecryptContext::new(&resolver).decrypt_data(&encrypted),
-            Err(XmlEncError::InvalidStructure(message))
-                if message == "MGF is only valid for XML Encryption 1.1 RSA-OAEP"
-        ));
-        assert_eq!(resolver.candidate_calls.get(), 0);
-
-        let private_key = RsaPrivateKey::from_pkcs8_pem(include_str!(
-            "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
-        ))
-        .expect("tracked RSA private key must parse");
-        assert!(matches!(
-            PrivateKeyDecryptor::new(private_key).resolve_key(
-                crate::provider::default_provider(),
-                DataEncryptionAlgorithm::Aes128Gcm,
-                encrypted.encrypted_keys.first(),
-            ),
-            Err(XmlEncError::InvalidStructure(message))
-                if message == "MGF is only valid for XML Encryption 1.1 RSA-OAEP"
-        ));
+        assert_eq!(
+            DecryptContext::new(&resolver)
+                .decrypt_data(&encrypted)
+                .expect("explicit legacy OAEP MGF must reach key resolution"),
+            DecryptedContent::Bytes(b"data".to_vec())
+        );
+        assert_eq!(resolver.candidate_calls.get(), 1);
     }
 
     #[test]

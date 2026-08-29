@@ -514,11 +514,6 @@ impl EncryptionMethod {
                 "OAEP parameters are only valid for RSA-OAEP EncryptionMethod".into(),
             ));
         }
-        if self.mgf_algorithm.is_some() && !is_oaep11 {
-            return Err(XmlEncError::InvalidStructure(
-                "MGF is only valid for XML Encryption 1.1 RSA-OAEP".into(),
-            ));
-        }
         if let (Some(actual), Some(expected)) =
             (self.key_size_bits, fixed_aes_key_size(&self.algorithm))
             && actual != expected

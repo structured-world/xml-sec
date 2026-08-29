@@ -621,13 +621,6 @@ impl EncryptedDataBuilder {
                     key_name,
                 } => {
                     validate_key_transport_recipient(public_key.as_ref(), &self.policy)?;
-                    if parameters.algorithm == super::KeyTransportAlgorithm::RsaOaepMgf1p
-                        && parameters.mgf_digest != super::OaepDigestAlgorithm::Sha1
-                    {
-                        return Err(XmlEncError::InvalidEncryptionConfig(
-                            "legacy RSA-OAEP fixes MGF1 to SHA-1".into(),
-                        ));
-                    }
                     if self
                         .policy
                         .key_transport_algorithms
@@ -1083,7 +1076,9 @@ fn write_encrypted_key(
             )?;
         }
         write_empty_with_algorithm(writer, "ds:DigestMethod", parameters.digest.uri())?;
-        if parameters.algorithm == super::KeyTransportAlgorithm::RsaOaep11 {
+        if parameters.algorithm == super::KeyTransportAlgorithm::RsaOaep11
+            || parameters.mgf_digest != super::OaepDigestAlgorithm::Sha1
+        {
             write_empty_with_algorithm(writer, "xenc11:MGF", parameters.mgf_digest.mgf_uri())?;
         }
         write_event(writer, Event::End(BytesEnd::new("xenc:EncryptionMethod")))?;
@@ -1596,9 +1591,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_oaep_rejects_non_sha1_mgf_during_configuration_validation() {
-        // The legacy URI has no MGF child on the wire, so accepting another
-        // digest here would let a permissive provider emit ambiguous ciphertext.
+    fn legacy_oaep_serializes_explicit_non_default_mgf() {
+        // libxmlsec1 accepts the XMLEnc 1.1 MGF child under both OAEP URIs. The
+        // legacy URI supplies SHA-1 only when the child is absent.
         let public = RsaPublicKey::from_public_key_pem(include_str!(
             "../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"
         ))
@@ -1609,13 +1604,11 @@ mod tests {
             mgf_digest: OaepDigestAlgorithm::Sha256,
             label: Vec::new(),
         };
-        let builder = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
-            .add_recipient(EncryptionRecipient::rsa_oaep(public).oaep_parameters(parameters));
-
-        assert!(matches!(
-            builder.validate_configuration(),
-            Err(XmlEncError::InvalidEncryptionConfig(_))
-        ));
+        let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .add_recipient(EncryptionRecipient::rsa_oaep(public).oaep_parameters(parameters))
+            .encrypt_binary(b"legacy OAEP with explicit MGF")
+            .expect("libxmlsec1-compatible legacy OAEP parameters must encrypt");
+        assert!(encrypted.encrypted_data_xml.contains("xenc11:MGF"));
     }
 
     #[test]

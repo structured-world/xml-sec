@@ -2341,16 +2341,15 @@ fn template_oaep_parameters(
             .as_deref()
             .unwrap_or(OaepDigestAlgorithm::Sha1.uri()),
     )?;
-    let mgf_digest = if transport == KeyTransportAlgorithm::RsaOaepMgf1p {
-        OaepDigestAlgorithm::Sha1
-    } else {
-        oaep_mgf_from_uri(
-            method
-                .mgf_algorithm
-                .as_deref()
-                .unwrap_or(OaepDigestAlgorithm::Sha1.mgf_uri()),
-        )?
-    };
+    // Both OAEP URIs default an absent MGF child to MGF1-SHA1. libxmlsec1
+    // also accepts an explicit XMLEnc 1.1 MGF child under the legacy URI, so
+    // template execution must consume the same metadata it preserves.
+    let mgf_digest = oaep_mgf_from_uri(
+        method
+            .mgf_algorithm
+            .as_deref()
+            .unwrap_or(OaepDigestAlgorithm::Sha1.mgf_uri()),
+    )?;
     Ok(Some(RsaOaepParameters {
         algorithm: transport,
         digest,

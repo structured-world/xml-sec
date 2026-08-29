@@ -537,10 +537,10 @@ fn tampered_generated_gcm_ciphertext_fails_authentication() {
 }
 
 #[test]
-fn generated_metadata_is_xml_escaped_and_legacy_mgf_is_restricted() {
+fn generated_metadata_is_xml_escaped_and_legacy_mgf_is_explicit() {
     // Free-form caller metadata must remain data after serialization while the
-    // schema-constrained XML ID remains an NCName. The legacy OAEP URI cannot
-    // falsely advertise a configurable non-SHA1 MGF.
+    // schema-constrained XML ID remains an NCName. A non-default MGF under the
+    // legacy OAEP URI must be serialized explicitly, as libxmlsec1 does.
     let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
         .id("encrypted-id")
         .add_recipient(
@@ -559,21 +559,33 @@ fn generated_metadata_is_xml_escaped_and_legacy_mgf_is_restricted() {
     );
     assert_eq!(parsed.encrypted_keys[0].key_name.as_deref(), Some("key<&"));
 
-    let invalid_legacy = RsaOaepParameters {
+    let explicit_legacy = RsaOaepParameters {
         algorithm: KeyTransportAlgorithm::RsaOaepMgf1p,
         digest: OaepDigestAlgorithm::Sha256,
         mgf_digest: OaepDigestAlgorithm::Sha256,
         label: Vec::new(),
     };
-    assert!(matches!(
-        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
-            .add_recipient(
-                EncryptionRecipient::rsa_oaep(public_key(RSA_2048_PUBLIC))
-                    .oaep_parameters(invalid_legacy)
-            )
-            .encrypt_binary(b"invalid legacy MGF"),
-        Err(XmlEncError::InvalidEncryptionConfig(_))
-    ));
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .add_recipient(
+            EncryptionRecipient::rsa_oaep(public_key(RSA_2048_PUBLIC))
+                .oaep_parameters(explicit_legacy),
+        )
+        .encrypt_binary(b"explicit legacy MGF")
+        .expect("legacy OAEP with an explicit MGF must encrypt");
+    assert!(
+        encrypted
+            .encrypted_data_xml
+            .contains(r#"<xenc11:MGF Algorithm="http://www.w3.org/2009/xmlenc11#mgf1sha256"/>"#)
+    );
+    let decrypted = decrypt(
+        &encrypted.encrypted_data_xml,
+        &PrivateKeyDecryptor::new(private_key(RSA_2048_PRIVATE)),
+    )
+    .expect("serialized legacy OAEP parameters must round trip");
+    assert_eq!(
+        decrypted,
+        DecryptedContent::Bytes(b"explicit legacy MGF".to_vec())
+    );
 }
 
 #[test]

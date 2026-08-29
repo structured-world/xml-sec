@@ -6295,19 +6295,71 @@ fn rsa_oaep_accepts_the_xmldsig_more_sha384_digest_uri() {
 }
 
 #[test]
-fn legacy_rsa_oaep_rejects_xmlenc11_mgf_parameters() {
-    // XML Encryption 1.0 fixes MGF1 to SHA-1. Preserving an XML Encryption 1.1
-    // MGF child would make the emitted structure contradict the wrapping mode.
+fn legacy_rsa_oaep_accepts_explicit_xmlenc11_mgf_parameters() {
+    // libxmlsec1 treats MGF1-SHA1 as the absent-child default for the legacy
+    // URI, while preserving and executing an explicit XMLEnc 1.1 MGF child.
     let temp = tempfile::tempdir().unwrap();
     let template = temp.path().join("legacy-oaep-with-mgf.xml");
     let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
     let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
     fs::write(
         &template,
         r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:xenc11="http://www.w3.org/2009/xmlenc11#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"><xenc11:MGF Algorithm="http://www.w3.org/2009/xmlenc11#mgf1sha256"/></EncryptionMethod><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
     )
     .unwrap();
-    fs::write(&plaintext, b"invalid legacy OAEP metadata").unwrap();
+    fs::write(&plaintext, b"explicit legacy OAEP MGF").unwrap();
+
+    let encrypt = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem"])
+        .arg(&public_key)
+        .arg("--binary-data")
+        .arg(&plaintext)
+        .arg("--output")
+        .arg(&encrypted)
+        .arg(&template)
+        .output()
+        .unwrap();
+    assert!(
+        encrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&encrypt.stderr)
+    );
+    assert!(
+        fs::read_to_string(&encrypted)
+            .unwrap()
+            .contains("http://www.w3.org/2009/xmlenc11#mgf1sha256")
+    );
+
+    let decrypt = Command::new(binary())
+        .args(["decrypt", "--privkey-pem"])
+        .arg(&private_key)
+        .arg(&encrypted)
+        .output()
+        .unwrap();
+    assert!(
+        decrypt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypt.stderr)
+    );
+    assert_eq!(decrypt.stdout, b"explicit legacy OAEP MGF");
+}
+
+#[test]
+fn legacy_rsa_oaep_rejects_unknown_mgf_algorithm() {
+    // Accepting the XMLEnc 1.1 child does not make its Algorithm extensible:
+    // an unknown URI must fail before key transport or output creation.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("legacy-oaep-with-unknown-mgf.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:xenc11="http://www.w3.org/2009/xmlenc11#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"><xenc11:MGF Algorithm="urn:unsupported:mgf"/></EncryptionMethod><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"unsupported MGF").unwrap();
 
     let rejected = Command::new(binary())
         .args(["encrypt", "--pubkey-pem"])
@@ -6318,7 +6370,7 @@ fn legacy_rsa_oaep_rejects_xmlenc11_mgf_parameters() {
         .output()
         .unwrap();
     assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("MGF"));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("urn:unsupported:mgf"));
 }
 
 #[test]
