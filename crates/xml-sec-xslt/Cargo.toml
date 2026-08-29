@@ -1,0 +1,26 @@
+[package]
+name = "xml-sec-xslt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "Safe Rust XSLT 1.0 compiler and runtime"
+repository = "https://github.com/structured-world/xml-sec"
+readme = "README.md"
+
+[dependencies]
+encoding_rs = "0.8"
+icu_collator = "2.3.1"
+icu_locale = "2.3.1"
+md-5 = "0.11"
+roxmltree = { version = "0.21", features = ["positions"] }
+quick-xml = "0.42"
+sha1 = "0.11"
+sxd-document-no-unsafe = { version = "0.4.1", default-features = false, features = ["no-unsafe"] }
+sxd-xpath-no-unsafe = { version = "0.5.1", default-features = false, features = ["no-unsafe"] }
+thiserror = "2"
+time = { version = "0.3.55", features = ["local-offset"] }
+url = "2"
+
+[dev-dependencies]
+pretty_assertions = "1"

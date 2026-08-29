@@ -407,6 +407,7 @@ struct ParsedDocument<'input> {
     document: Document<'input>,
     indexes: DocumentIndexes,
     node_count: usize,
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     max_depth: usize,
 }
 
@@ -1700,6 +1701,7 @@ impl<'a> DocumentView<'a> {
         self.parsed.node_count
     }
 
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub(crate) fn max_depth(self) -> usize {
         self.parsed.max_depth
     }
@@ -1986,6 +1988,7 @@ fn build_semantic_cell(
             document,
             indexes,
             node_count: metrics.node_count,
+            #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
             max_depth: metrics.max_depth,
         })
     })
@@ -2148,11 +2151,11 @@ fn preflight_xml_fragment(
                 // later events remain visible; the DOM still rejects bad pairs.
                 reader.config_mut().allow_unmatched_ends = true;
                 let event = match reader.read_event() {
-                    Ok(QuickXmlEvent::DocType(doctype)) => PreflightEvent::DocType(
-                        doctype.decode().ok().map(|value| value.into_owned()),
-                    ),
+                    Ok(QuickXmlEvent::DocType(doctype)) => {
+                        PreflightEvent::DocType(Some(doctype.as_ref().to_owned()))
+                    }
                     Ok(QuickXmlEvent::GeneralRef(reference)) => {
-                        let name = reference.decode().ok().map(|value| value.into_owned());
+                        let name = Some(reference.as_ref().to_owned());
                         let is_character_reference =
                             reference.resolve_char_ref().ok().flatten().is_some()
                                 || name.as_deref().is_some_and(|name| {
@@ -2166,8 +2169,8 @@ fn preflight_xml_fragment(
                     Ok(QuickXmlEvent::Text(text)) => PreflightEvent::CharacterData {
                         xml_whitespace: text
                             .as_ref()
-                            .iter()
-                            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n')),
+                            .chars()
+                            .all(|character| matches!(character, ' ' | '\t' | '\r' | '\n')),
                     },
                     Ok(QuickXmlEvent::CData(_)) => PreflightEvent::CharacterData {
                         xml_whitespace: false,
@@ -2332,8 +2335,8 @@ fn element_attribute_reference_source(
     dtd: &InternalDtd,
 ) -> Vec<u8> {
     let lexical = element.as_ref();
-    let mut source = if lexical.contains(&b'&') {
-        lexical.to_vec()
+    let mut source = if lexical.contains('&') {
+        lexical.as_bytes().to_vec()
     } else {
         Vec::new()
     };
@@ -2342,18 +2345,12 @@ fn element_attribute_reference_source(
     }
 
     let element_name = element.name();
-    let Ok(element_name) = std::str::from_utf8(element_name.as_ref()) else {
-        return source;
-    };
+    let element_name = element_name.as_ref();
     if let Some(defaults) = dtd.attribute_defaults.get(element_name) {
         let mut present_attributes: HashSet<_> = element
             .attributes()
             .flatten()
-            .filter_map(|attribute| {
-                std::str::from_utf8(attribute.key.as_ref())
-                    .ok()
-                    .map(ToOwned::to_owned)
-            })
+            .map(|attribute| attribute.key.as_ref().to_owned())
             .collect();
         for default in defaults {
             if present_attributes.insert(default.attribute_name.clone())

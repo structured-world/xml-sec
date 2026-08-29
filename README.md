@@ -25,6 +25,7 @@ XML Security in pure Rust, built to replace libxmlsec1.
 - **Reusable XML documents** — policy-aware retained parsing, stable semantic identities, shared indexes, and generation-safe mutation across C14N, XMLDSig, and XMLEnc
 - **Compiled operations** — deterministic dependency plans keep policy, cumulative budgets, resolver/cache state, authenticated identities, and mutation gates in one operation context
 - **Selectable XML backend** — `xmloxide` and `roxmltree` are interchangeable compile-time parsers behind one backend-neutral semantic DOM
+- **Reusable XSLT engine** — the workspace includes a safe-Rust, XML-security-neutral XSLT 1.0 compiler and runtime crate
 
 ## Why?
 
@@ -132,6 +133,21 @@ are executed through the public sign/verify APIs with exact valid, invalid,
 and fail-closed classifications; the generated
 [compatibility ledger](docs/compatibility-ledger.md) keeps remaining
 libxmlsec1 parity work explicit.
+
+## Workspace Crates
+
+[`xml-sec-xslt`](crates/xml-sec-xslt) is the reusable XSLT 1.0 engine. It owns
+stylesheet compilation, XPath/XSLT value semantics, template execution,
+result-tree construction, deterministic budgets, and XML/HTML/text serialization
+without depending on XMLDSig, XMLEnc, cryptography, or system libraries.
+Its `ExecutionEnvironment` makes resolver access, operation time, and extension
+permissions explicit; callers can inject a fixed clock or reject nondeterministic
+EXSLT date functions for reproducible security transforms.
+
+The engine remains a separate architectural boundary. Runtime external-document
+resolution and the `xml-sec` XMLDSig transform adapter are subsequent integration
+layers; the main `xml-sec` crate therefore continues to reject XSLT transforms
+until those policy and node-identity contracts are connected.
 
 ## Native CLI
 

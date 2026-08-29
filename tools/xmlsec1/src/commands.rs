@@ -2748,9 +2748,7 @@ fn owned_namespace_declarations(opening: &str) -> Result<HashSet<String>, Comman
         .map(|attribute| {
             let attribute =
                 attribute.map_err(|error| CommandError::Encryption(error.to_string()))?;
-            let name = std::str::from_utf8(attribute.key.as_ref()).map_err(|_| {
-                CommandError::Encryption("generated KeyInfo attribute name is not UTF-8".into())
-            })?;
+            let name = attribute.key.as_ref();
             Ok(match name {
                 "xmlns" => Some(String::new()),
                 _ => name.strip_prefix("xmlns:").map(str::to_owned),

@@ -13,8 +13,28 @@ categories = ["cryptography", "web-programming", "authentication"]
 readme = "README.md"
 
 [workspace]
-members = [".", "tools/capability-ledger"]
+members = [
+    ".",
+    "crates/xml-sec-xslt",
+    "tools/capability-ledger",
+    "vendor/sxd-xpath-no-unsafe",
+]
 resolver = "3"
+
+[patch.crates-io]
+sxd-xpath-no-unsafe = { path = "vendor/sxd-xpath-no-unsafe" }
+
+# The complete libxslt oracle includes multi-megabyte DocBook transforms. Keep
+# production-equivalent XSLT/XPath code generation in the test profile so the
+# per-case watchdog measures algorithmic stalls rather than debug arithmetic.
+[profile.test.package.xml-sec-xslt]
+opt-level = 2
+
+[profile.test.package.sxd-document-no-unsafe]
+opt-level = 2
+
+[profile.test.package.sxd-xpath-no-unsafe]
+opt-level = 2
 
 [[bin]]
 name = "xmlsec1"
@@ -44,11 +64,11 @@ required-features = ["xmlenc"]
 # XML parsing
 roxmltree = { version = "0.21", features = ["positions"], optional = true }
 xmloxide = { version = "0.5", default-features = false, optional = true }
-quick-xml = "0.41"
+quick-xml = "0.42"
 self_cell = "1.3"
 
 # Crypto
-rsa = { package = "sad-rsa", version = "0.2.3", features = ["sha1", "sha2"], optional = true }
+rsa = { package = "sad-rsa", version = "0.10.2", features = ["sha1", "sha2"], optional = true }
 sha1 = { version = "0.11", features = ["oid"], optional = true }
 sha2 = { version = "0.11", features = ["oid"], optional = true }
 p256 = { version = "0.14", features = ["ecdsa"], optional = true }
@@ -70,7 +90,7 @@ aes-kw = { version = "0.3.1", optional = true }
 cbc = { version = "0.2.1", optional = true }
 des = { version = "0.9", optional = true }
 md-5 = { version = "0.11", optional = true }
-pem = { version = "3", optional = true }
+pem = { version = "4", optional = true }
 
 # X.509 certificates
 x509-parser = { version = "0.18", features = ["verify"], optional = true }
