@@ -62,6 +62,43 @@ struct ExternalResourceBudget {
     max_total_bytes: usize,
 }
 
+pub(crate) enum ExternalResourceMapError {
+    Policy(crate::policy::PolicyViolation),
+    TotalLengthOverflow,
+}
+
+pub(crate) fn validate_external_resource_map(
+    resources: &HashMap<String, Vec<u8>>,
+    max_resource_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<(), ExternalResourceMapError> {
+    let mut total = 0usize;
+    for bytes in resources.values() {
+        if bytes.len() > max_resource_bytes {
+            return Err(ExternalResourceMapError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
+                    maximum: max_resource_bytes,
+                    actual: bytes.len(),
+                },
+            ));
+        }
+        total = total
+            .checked_add(bytes.len())
+            .ok_or(ExternalResourceMapError::TotalLengthOverflow)?;
+    }
+    if total > max_total_bytes {
+        return Err(ExternalResourceMapError::Policy(
+            crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                maximum: max_total_bytes,
+                actual: total,
+            },
+        ));
+    }
+    Ok(())
+}
+
 /// Request-scoped external bytes and their shared aggregate work budget.
 ///
 /// Signing reparses its staged document while filling dependent digests. This

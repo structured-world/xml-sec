@@ -736,6 +736,40 @@ fn generated_c14n11_preserves_self_closing_transforms_namespace() {
 }
 
 #[test]
+fn computed_digest_matches_materialized_c14n11_digest() {
+    // C14N 1.0 inherits xml:id onto a subtree apex while C14N 1.1 does not, so
+    // this template detects divergence between compute and fill preparation.
+    let template =
+        template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"))
+            .replacen(
+                concat!(
+                    "<Transforms><Transform Algorithm=\"",
+                    "http://www.w3.org/2006/12/xml-c14n11\"/></Transforms>"
+                ),
+                "",
+                1,
+            );
+    let xml = append_signature_to_root(
+        "<root xml:id=\"ancestor\"><payload ID=\"payload\">one</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+
+    let computed = compute_reference_digest_values(&xml).expect("compute digest");
+    let filled = fill_reference_digest_values(&xml).expect("fill digest");
+    let document = roxmltree::Document::parse(&filled).expect("filled XML must parse");
+    let written = document
+        .descendants()
+        .find(|node| node.has_tag_name((XMLDSIG_NS, "DigestValue")))
+        .and_then(|node| node.text())
+        .expect("filled DigestValue text");
+
+    assert_eq!(computed.len(), 1);
+    assert_eq!(computed[0].digest_value, written);
+    assert_reference_digests_verify(&filled);
+}
+
+#[test]
 fn public_digest_helpers_target_the_last_signature() {
     // These public helpers predate indexed signing and intentionally operate on
     // the last template, matching append-then-fill callers with existing signatures.

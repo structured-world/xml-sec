@@ -919,6 +919,38 @@ fn detached_signing_enforces_policy_request_and_shared_budget_atomically() {
             ..
         }))
     ));
+
+    let unused = vec![0_u8; external_xml.len() * 2];
+    let complete_map = HashMap::from([
+        ("c14n11/xml-base-input.xml".to_owned(), external_xml.clone()),
+        ("unused.bin".to_owned(), unused.clone()),
+    ]);
+    let mut complete_map_policy = base_policy;
+    complete_map_policy.uris.references = UriTypeSet::ALL;
+    complete_map_policy.resources.max_external_resource_bytes = unused.len();
+    complete_map_policy
+        .resources
+        .max_external_resource_total_bytes = unused.len();
+    let mut oversized_map_document =
+        XmlDocument::parse(template.clone()).expect("template must parse");
+    let oversized_map_generation = oversized_map_document.generation();
+    let oversized_map = SignContext::new(&key)
+        .policy(complete_map_policy)
+        .external_resources(&complete_map)
+        .sign_document(&mut oversized_map_document);
+    assert!(matches!(
+        oversized_map,
+        Err(SigningError::Policy(PolicyViolation::ResourceLimit {
+            resource: "aggregate external resource bytes",
+            maximum,
+            actual,
+        })) if maximum == unused.len() && actual == external_xml.len() + unused.len()
+    ));
+    assert_eq!(oversized_map_document.as_xml(), template);
+    assert_eq!(
+        oversized_map_document.generation(),
+        oversized_map_generation
+    );
 }
 
 #[test]

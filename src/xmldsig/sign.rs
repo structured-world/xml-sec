@@ -27,6 +27,7 @@ use sha1::Sha1;
 use sha2::{Sha224, Sha256, Sha384, Sha512};
 use signature::hazmat::{PrehashSigner, RandomizedPrehashSigner};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     ops::Range,
 };
@@ -59,7 +60,8 @@ use super::transforms::{
 };
 use super::types::TransformError;
 use super::uri::{
-    ExternalResourceContext, UriReferenceResolver, validate_signing_reference_request,
+    ExternalResourceContext, ExternalResourceMapError, UriReferenceResolver,
+    validate_external_resource_map, validate_signing_reference_request,
     validate_signing_reference_uri,
 };
 use super::verify::parse_signature_children;
@@ -1606,6 +1608,14 @@ impl<'a> SignContext<'a> {
     fn validate_owned_document_input(&self, document: &XmlDocument) -> Result<(), SigningError> {
         self.policy.validate()?;
         document.validate_operation_policy(&self.policy.xml, &self.policy.resources)?;
+        if let Some(resources) = self.external_resources {
+            validate_external_resource_map(
+                resources,
+                self.policy.resources.max_external_resource_bytes,
+                self.policy.resources.max_external_resource_total_bytes,
+            )
+            .map_err(map_signing_external_resource_map_error)?;
+        }
         Ok(())
     }
 
@@ -1962,6 +1972,16 @@ fn map_owned_document_digest_mutation_error(error: XmlDocumentError) -> SigningD
     }
 }
 
+fn map_signing_external_resource_map_error(error: ExternalResourceMapError) -> SigningError {
+    match error {
+        ExternalResourceMapError::Policy(error) => SigningError::Policy(error),
+        ExternalResourceMapError::TotalLengthOverflow => {
+            SigningDigestError::InvalidStructure("external resource total length overflow".into())
+                .into()
+        }
+    }
+}
+
 fn owned_document_policy_violation(
     error: XmlDocumentError,
 ) -> Result<crate::policy::PolicyViolation, XmlDocumentError> {
@@ -2098,6 +2118,28 @@ fn compute_reference_digest_values_with_options(
     target_signature: Option<usize>,
     id_attributes: &[crate::IdAttributeRegistration],
 ) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
+    let (prepared, target_signature) =
+        prepare_reference_digest_input(xml, policy, execution_budget, target_signature)?;
+    compute_prepared_reference_digest_values_with_options(
+        prepared.as_ref(),
+        transform_options,
+        policy,
+        provider,
+        execution_budget,
+        target_signature,
+        id_attributes,
+    )
+}
+
+fn compute_prepared_reference_digest_values_with_options(
+    xml: &str,
+    transform_options: TransformOptions,
+    policy: Option<&crate::policy::SigningPolicy>,
+    provider: &dyn crate::provider::CryptoProvider,
+    execution_budget: &TransformExecutionBudget,
+    target_signature: usize,
+    id_attributes: &[crate::IdAttributeRegistration],
+) -> Result<Vec<ComputedReferenceDigest>, SigningDigestError> {
     let resource_policy = policy
         .map(|policy| &policy.resources)
         .cloned()
@@ -2113,10 +2155,8 @@ fn compute_reference_digest_values_with_options(
         execution_budget.xml_parse_work(),
         crate::XmlBackend::default(),
     )?;
-    let signature = find_signing_signature_node(
-        &doc,
-        target_signature.map_or(SigningSignatureTarget::Last, SigningSignatureTarget::Index),
-    )?;
+    let signature =
+        find_signing_signature_node(&doc, SigningSignatureTarget::Index(target_signature))?;
     let signed_info = find_required_child(signature, "SignedInfo")?;
     let references = parse_signing_references(signed_info)?;
     validate_signing_references(&references, references.len(), policy, false)?;
@@ -2136,6 +2176,54 @@ fn compute_reference_digest_values_with_options(
             external_resources: &external_resources,
         },
     )
+}
+
+fn prepare_reference_digest_input<'a>(
+    xml: &'a str,
+    policy: Option<&crate::policy::SigningPolicy>,
+    execution_budget: &TransformExecutionBudget,
+    target_signature: Option<usize>,
+) -> Result<(Cow<'a, str>, usize), SigningDigestError> {
+    let default_policy = crate::policy::SigningPolicy::default();
+    let effective_policy = policy.unwrap_or(&default_policy);
+    let settings =
+        DocumentParseSettings::from_policy(&effective_policy.xml, &effective_policy.resources);
+    let document = XmlDocument::parse_with_settings_and_budget(
+        xml.to_owned(),
+        settings,
+        execution_budget.xml_parse_work(),
+    )
+    .map_err(map_owned_document_digest_mutation_error)?;
+    let target_signature = if let Some(target_signature) = target_signature {
+        target_signature
+    } else {
+        document.with_view(|view| {
+            let selected =
+                find_signing_signature_node(view.document(), SigningSignatureTarget::Last)?;
+            signature_index(view.document(), selected)
+        })?
+    };
+    // Preserve the public compute helper's precise pre-policy errors before
+    // applying the default generation policy to the normalized candidate.
+    document.with_view(|view| {
+        let signature = find_signing_signature_node(
+            view.document(),
+            SigningSignatureTarget::Index(target_signature),
+        )?;
+        let signed_info = find_required_child(signature, "SignedInfo")?;
+        let references = parse_signing_references(signed_info)?;
+        validate_signing_references(&references, references.len(), policy, false)
+    })?;
+    let materialized = materialize_second_edition_c14n11_candidate(
+        &document,
+        target_signature,
+        effective_policy,
+        false,
+    )?;
+    Ok((
+        materialized.map_or(Cow::Borrowed(xml), Cow::Owned),
+        target_signature,
+    ))
 }
 
 fn fill_reference_digest_values_in_dependency_order_with_operation(
@@ -2778,43 +2866,21 @@ fn fill_reference_digest_values_with_options(
 ) -> Result<String, SigningDigestError> {
     let default_policy = crate::policy::SigningPolicy::default();
     let effective_policy = policy.unwrap_or(&default_policy);
-    let settings =
-        DocumentParseSettings::from_policy(&effective_policy.xml, &effective_policy.resources);
-    let document = XmlDocument::parse_with_settings_and_budget(
-        xml.to_owned(),
-        settings,
-        execution_budget.xml_parse_work(),
-    )
-    .map_err(map_owned_document_digest_mutation_error)?;
-    let target_signature = if let Some(target_signature) = target_signature {
-        target_signature
-    } else {
-        document.with_view(|view| {
-            let selected =
-                find_signing_signature_node(view.document(), SigningSignatureTarget::Last)?;
-            signature_index(view.document(), selected)
-        })?
-    };
-    let materialized = materialize_second_edition_c14n11_candidate(
-        &document,
-        target_signature,
-        effective_policy,
-        false,
-    )?;
-    let xml = materialized.as_deref().unwrap_or(xml);
-    let digest_values = compute_reference_digest_values_with_options(
-        xml,
+    let (prepared, target_signature) =
+        prepare_reference_digest_input(xml, policy, execution_budget, target_signature)?;
+    let digest_values = compute_prepared_reference_digest_values_with_options(
+        prepared.as_ref(),
         transform_options,
         Some(effective_policy),
         provider,
         execution_budget,
-        Some(target_signature),
+        target_signature,
         id_attributes,
     )?
     .into_iter()
     .map(|digest| digest.digest_value);
     Ok(fill_signed_info_digest_values_at_index_with_budget(
-        xml,
+        prepared.as_ref(),
         digest_values,
         target_signature,
         Some(effective_policy),
