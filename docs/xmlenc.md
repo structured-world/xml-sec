@@ -15,6 +15,8 @@ Dependency and resource checks run before the closure that performs each phase. 
 controlled replacement must start at the context's expected generation, commit exactly
 one new generation, and advance that expectation before any later node can execute;
 stale or foreign document state is therefore rejected before mutation work begins.
+Compiled graph failures are reported as `XmlEncError::OperationPlan`; malformed XMLEnc
+element order or namespaces remain `XmlEncError::InvalidStructure`.
 
 ## Direct-Key Encryption
 

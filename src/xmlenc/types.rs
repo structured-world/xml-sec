@@ -238,7 +238,13 @@ impl OaepDigestAlgorithm {
 
 #[cfg(test)]
 mod tests {
-    use super::OaepDigestAlgorithm;
+    use super::{OaepDigestAlgorithm, XmlEncError};
+
+    #[test]
+    fn operation_plan_failures_have_a_distinct_error_class() {
+        let error = XmlEncError::from(crate::operation::OperationPlanError::StaleResourceIdentity);
+        assert!(matches!(error, XmlEncError::OperationPlan(_)));
+    }
 
     #[test]
     fn oaep_sha384_accepts_both_interoperable_digest_uris() {
@@ -619,6 +625,9 @@ pub enum XmlEncError {
     /// The XML element order or namespace is invalid for the XMLEnc profile.
     #[error("invalid encrypted structure: {0}")]
     InvalidStructure(String),
+    /// The compiled operation graph rejected an identity, dependency, or generation invariant.
+    #[error("invalid XML Encryption operation plan: {0}")]
+    OperationPlan(String),
     /// The selected operation-start node ID is absent or resolves ambiguously.
     #[error("selected node ID is missing or ambiguous: {id}")]
     SelectedNodeUnavailable {
@@ -734,7 +743,7 @@ pub enum XmlEncError {
 
 impl From<crate::operation::OperationPlanError> for XmlEncError {
     fn from(error: crate::operation::OperationPlanError) -> Self {
-        Self::InvalidStructure(format!("invalid XML Encryption operation plan: {error}"))
+        Self::OperationPlan(error.to_string())
     }
 }
 

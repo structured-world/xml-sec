@@ -206,7 +206,7 @@ struct ProcessedDecryption<T> {
 }
 
 fn map_decryption_plan_error(error: OperationPlanError) -> XmlEncError {
-    XmlEncError::InvalidStructure(format!("invalid decryption operation plan: {error}"))
+    XmlEncError::from(error)
 }
 
 impl<'a> DecryptContext<'a> {
@@ -835,7 +835,7 @@ fn decrypt_owned_document_with_context(
         },
     )?;
     let mutation = processed.mutation.ok_or_else(|| {
-        XmlEncError::InvalidStructure("decryption mutation node is unavailable".into())
+        XmlEncError::OperationPlan("decryption mutation node is unavailable".into())
     })?;
     processed
         .operation

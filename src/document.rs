@@ -860,23 +860,6 @@ impl XmlDocument {
         self.prepare_range_replacement(range, replacement, settings, budget)
     }
 
-    #[cfg(all(feature = "xmlenc", test))]
-    pub(crate) fn replace_node_with_fragment_with_budget(
-        &mut self,
-        target: NodeIdentity,
-        replacement: &str,
-        settings: DocumentParseSettings,
-        budget: &XmlParseWorkBudget,
-    ) -> Result<(), XmlDocumentError> {
-        let prepared = self.prepare_node_fragment_replacement_with_budget(
-            target,
-            replacement,
-            settings,
-            budget,
-        )?;
-        self.commit_prepared(prepared)
-    }
-
     /// Replace all children of one element with a well-formed XML fragment.
     pub fn replace_content(
         &mut self,
@@ -3743,7 +3726,7 @@ mod tests {
     fn bounded_fragment_validation_uses_the_active_node_ceiling() {
         // The validation wrapper must not parse attacker-controlled plaintext
         // under a broader document-creation ceiling before the operation limit.
-        let mut document = XmlDocument::parse_with_settings(
+        let document = XmlDocument::parse_with_settings(
             "<root><target/></root>".into(),
             DocumentParseSettings::new(false, 128, 4_096),
         )
@@ -3760,13 +3743,14 @@ mod tests {
         let before = document.as_xml().to_owned();
         let budget = XmlParseWorkBudget::from_resources(&crate::policy::ResourcePolicy::default());
 
+        let replacement = document.prepare_node_fragment_replacement_with_budget(
+            target,
+            "<replacement><child/><child/><malformed>",
+            DocumentParseSettings::new(false, maximum as u32, 4_096),
+            &budget,
+        );
         assert!(matches!(
-            document.replace_node_with_fragment_with_budget(
-                target,
-                "<replacement><child/><child/><malformed>",
-                DocumentParseSettings::new(false, maximum as u32, 4_096),
-                &budget,
-            ),
+            replacement,
             Err(XmlDocumentError::ProjectedNodeLimit { maximum: rejected })
                 if rejected == maximum
         ));
@@ -4122,14 +4106,17 @@ mod tests {
         });
         let budget = XmlParseWorkBudget::from_resources(&crate::policy::ResourcePolicy::default());
 
-        document
-            .replace_node_with_fragment_with_budget(
+        let prepared = document
+            .prepare_node_fragment_replacement_with_budget(
                 target,
                 "middle",
                 DocumentParseSettings::new(false, 3, 1_024),
                 &budget,
             )
-            .expect("both boundary text pairs must merge in the committed document");
+            .expect("both boundary text pairs must fit in the prepared document");
+        document
+            .commit_prepared(prepared)
+            .expect("prepared replacement must commit atomically");
 
         assert_eq!(document.as_xml(), "<root>leftmiddleright</root>");
         assert_eq!(document.with_view(|view| view.node_count()), 3);

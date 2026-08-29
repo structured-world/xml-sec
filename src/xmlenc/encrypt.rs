@@ -151,7 +151,14 @@ fn compile_encryption_plan(
 }
 
 fn map_encryption_plan_error(error: OperationPlanError) -> XmlEncError {
-    XmlEncError::InvalidStructure(format!("invalid encryption operation plan: {error}"))
+    XmlEncError::from(error)
+}
+
+fn require_encryption_mutation(
+    mutation: Option<OperationNodeId>,
+) -> Result<OperationNodeId, XmlEncError> {
+    mutation
+        .ok_or_else(|| XmlEncError::OperationPlan("encryption mutation node is unavailable".into()))
 }
 
 impl fmt::Debug for EncryptedDataBuilder {
@@ -412,22 +419,17 @@ impl EncryptedDataBuilder {
                     self.policy.resources.effective_xml_nodes() as usize,
                 )?;
                 let settings = self.document_parse_settings();
-                if let Some(mutation) = generated.mutation {
-                    operation.run_document_transition(
-                        mutation,
-                        document,
-                        |document, budgets| {
-                            document
-                                .replace_element_with_budget(
-                                    target,
-                                    &result.encrypted_data_xml,
-                                    settings,
-                                    &budgets.xml_parse,
-                                )
-                                .map_err(|error| map_document_error(error, settings))
-                        },
-                    )?;
-                }
+                let mutation = require_encryption_mutation(generated.mutation)?;
+                operation.run_document_transition(mutation, document, |document, budgets| {
+                    document
+                        .replace_element_with_budget(
+                            target,
+                            &result.encrypted_data_xml,
+                            settings,
+                            &budgets.xml_parse,
+                        )
+                        .map_err(|error| map_document_error(error, settings))
+                })?;
                 Ok(())
             }
             EncryptedDataType::Content => {
@@ -474,22 +476,17 @@ impl EncryptedDataBuilder {
                     self.policy.resources.effective_xml_nodes() as usize,
                 )?;
                 let settings = self.document_parse_settings();
-                if let Some(mutation) = generated.mutation {
-                    operation.run_document_transition(
-                        mutation,
-                        document,
-                        |document, budgets| {
-                            document
-                                .replace_content_with_budget(
-                                    target,
-                                    &result.encrypted_data_xml,
-                                    settings,
-                                    &budgets.xml_parse,
-                                )
-                                .map_err(|error| map_document_error(error, settings))
-                        },
-                    )?;
-                }
+                let mutation = require_encryption_mutation(generated.mutation)?;
+                operation.run_document_transition(mutation, document, |document, budgets| {
+                    document
+                        .replace_content_with_budget(
+                            target,
+                            &result.encrypted_data_xml,
+                            settings,
+                            &budgets.xml_parse,
+                        )
+                        .map_err(|error| map_document_error(error, settings))
+                })?;
                 Ok(())
             }
             EncryptedDataType::Other(_) => Err(XmlEncError::InvalidEncryptionConfig(
@@ -508,18 +505,20 @@ impl EncryptedDataBuilder {
         >,
         mutates_document: bool,
     ) -> Result<GeneratedEncryption, XmlEncError> {
+        // Bound caller-controlled inputs before hashing or allocating one plan
+        // node per recipient. The compiled graph then gates all accepted work.
+        self.validate_plaintext_len(plaintext.len())?;
+        self.validate_configuration()?;
         let input_resource = OperationResourceIdentity::external("encryption-input", plaintext);
         let plan = compile_encryption_plan(
             operation,
             self.recipients.len() + usize::from(self.direct_key.is_some()),
             mutates_document,
-            input_resource,
+            input_resource.clone(),
         )?;
-        let observed_input = OperationResourceIdentity::external("encryption-input", plaintext);
-        operation.run_with_resource(plan.document, &observed_input, || {
-            self.validate_plaintext_len(plaintext.len())?;
-            self.validate_configuration()
-        })?;
+        // `plaintext` is immutably borrowed for this call, so the fingerprint
+        // computed after preflight remains the exact observed input identity.
+        operation.run_with_resource(plan.document, &input_resource, || Ok::<_, XmlEncError>(()))?;
 
         let (content_key, encrypted_keys) = operation.run_batch(&plan.keys, || {
             let content_key = if let Some(key) = &self.direct_key {
@@ -1291,6 +1290,15 @@ mod tests {
         KekDecryptor, OaepDigestAlgorithm, PrivateKeyDecryptor, SymmetricKeyDecryptor, decrypt,
         decrypt_document, parse_encrypted_data,
     };
+
+    #[test]
+    fn document_encryption_requires_a_compiled_mutation_node() {
+        assert!(matches!(
+            require_encryption_mutation(None),
+            Err(XmlEncError::OperationPlan(message))
+                if message == "encryption mutation node is unavailable"
+        ));
+    }
 
     #[derive(Debug)]
     struct OverridingOutputProvider {

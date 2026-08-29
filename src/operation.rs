@@ -484,35 +484,6 @@ impl<P, B> OperationExecutionContext<P, B> {
         self.run_ready(node, action)
     }
 
-    pub(crate) fn run_batch_with_resources<T, E>(
-        &self,
-        nodes: &[(OperationNodeId, OperationResourceIdentity)],
-        action: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, E>
-    where
-        E: From<OperationPlanError>,
-    {
-        for (node, observed) in nodes {
-            self.validate_ready(*node, Some(observed))
-                .map_err(E::from)?;
-        }
-        match action() {
-            Ok(value) => {
-                for (node, _) in nodes {
-                    self.executed.borrow_mut().insert(*node);
-                    self.record(*node, true, self.completion_reason(*node));
-                }
-                Ok(value)
-            }
-            Err(error) => {
-                for (node, _) in nodes {
-                    self.record(*node, false, OperationDecisionReason::ActionRejected);
-                }
-                Err(error)
-            }
-        }
-    }
-
     pub(crate) fn run_document_transition<T, E>(
         &mut self,
         node: OperationNodeId,
@@ -602,6 +573,10 @@ impl<P, B> OperationExecutionContext<P, B> {
 
     pub(crate) fn is_authenticated(&self, node: NodeIdentity) -> bool {
         self.authenticated_nodes.borrow().contains(&node)
+    }
+
+    pub(crate) fn is_executed(&self, node: OperationNodeId) -> bool {
+        self.executed.borrow().contains(&node)
     }
 
     pub(crate) fn record(
