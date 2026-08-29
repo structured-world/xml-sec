@@ -626,16 +626,28 @@ impl EncryptedDataBuilder {
                         .key_transport_algorithms
                         .as_ref()
                         .is_some_and(|allowed| !allowed.contains(&parameters.algorithm))
-                        || self.policy.oaep_digests.as_ref().is_some_and(|allowed| {
-                            !allowed.contains(&parameters.digest)
-                                || !allowed.contains(&parameters.mgf_digest)
-                        })
                     {
                         return Err(crate::policy::PolicyViolation::Algorithm {
                             operation: "encryption",
                             algorithm: parameters.algorithm.uri().to_string(),
                         }
                         .into());
+                    }
+                    if let Some(allowed) = &self.policy.oaep_digests {
+                        let rejected_uri = if !allowed.contains(&parameters.digest) {
+                            Some(parameters.digest.uri())
+                        } else if !allowed.contains(&parameters.mgf_digest) {
+                            Some(parameters.mgf_digest.mgf_uri())
+                        } else {
+                            None
+                        };
+                        if let Some(algorithm) = rejected_uri {
+                            return Err(crate::policy::PolicyViolation::Algorithm {
+                                operation: "encryption",
+                                algorithm: algorithm.to_owned(),
+                            }
+                            .into());
+                        }
                     }
                     self.validate_metadata("EncryptedKey Recipient", recipient.as_deref())?;
                     self.validate_key_name("EncryptedKey KeyName", key_name.as_deref())?;
@@ -1609,6 +1621,37 @@ mod tests {
             .encrypt_binary(b"legacy OAEP with explicit MGF")
             .expect("libxmlsec1-compatible legacy OAEP parameters must encrypt");
         assert!(encrypted.encrypted_data_xml.contains("xenc11:MGF"));
+    }
+
+    #[test]
+    fn encryption_policy_reports_the_rejected_mgf_uri() {
+        // The transport and message digest are allowed; only the independently
+        // selected MGF must be identified as the rejected algorithm.
+        let public = RsaPublicKey::from_public_key_pem(include_str!(
+            "../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"
+        ))
+        .expect("tracked RSA public key must parse");
+        let parameters = RsaOaepParameters {
+            algorithm: super::super::KeyTransportAlgorithm::RsaOaepMgf1p,
+            digest: OaepDigestAlgorithm::Sha256,
+            mgf_digest: OaepDigestAlgorithm::Sha384,
+            label: Vec::new(),
+        };
+        let policy = crate::policy::EncryptionPolicy {
+            key_transport_algorithms: Some(std::collections::HashSet::from([parameters.algorithm])),
+            oaep_digests: Some(std::collections::HashSet::from([parameters.digest])),
+            ..crate::policy::EncryptionPolicy::default()
+        };
+        let builder = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .policy(policy)
+            .add_recipient(EncryptionRecipient::rsa_oaep(public).oaep_parameters(parameters));
+
+        assert!(matches!(
+            builder.validate_configuration(),
+            Err(XmlEncError::Policy(
+                crate::policy::PolicyViolation::Algorithm { algorithm, .. }
+            )) if algorithm == OaepDigestAlgorithm::Sha384.mgf_uri()
+        ));
     }
 
     #[test]
