@@ -10,10 +10,11 @@ use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, 
 use crate::budget::Meter;
 use crate::compiler::{DecimalFormat, Expression, Pattern, normalize_xpath_for_sxd};
 use crate::expression::innermost_namespaced_call;
+use crate::resolver::decode_resource;
 use crate::runtime::SourceProcessing;
 use crate::{
-    BudgetKind, Document, Error, ExpandedName, NodeId, NodeKind, NodeReference, ResolvePurpose,
-    Resolver, ResourceIdentity, Result, Value,
+    BudgetKind, Document, Error, ErrorKind, ExpandedName, NodeId, NodeKind, NodeReference,
+    ResolvePurpose, Resolver, ResourceIdentity, Result, Value,
 };
 
 pub(crate) type SourceNode = NodeReference;
@@ -160,6 +161,11 @@ impl Evaluator {
         self.decimal_formats = decimal_formats.to_vec();
         self.extension_functions = extension_functions.into_iter().collect();
         self.extension_functions.extend([
+            ExpandedName::new(Some(EXSLT_COMMON_NS), "node-set"),
+            ExpandedName::new(Some(EXSLT_COMMON_NS), "object-type"),
+            ExpandedName::new(Some(EXSLT_STRINGS_NS), "split"),
+            ExpandedName::new(Some(EXSLT_STRINGS_NS), "tokenize"),
+            ExpandedName::new(Some(EXSLT_STRINGS_NS), "replace"),
             ExpandedName::new(Some(EXSLT_DYNAMIC_NS), "evaluate"),
             ExpandedName::new(Some(EXSLT_DYNAMIC_NS), "map"),
             ExpandedName::new(Some(SAXON_NS), "expression"),
@@ -169,12 +175,6 @@ impl Evaluator {
             ExpandedName::new(Some(SAXON_NS), "node-set"),
             ExpandedName::new(Some(XT_NS), "node-set"),
             ExpandedName::new(Some(LIBXSLT_NS), "node-set"),
-            ExpandedName::new(Some(EXSLT_CRYPTO_NS), "md5"),
-            ExpandedName::new(Some(EXSLT_CRYPTO_NS), "sha1"),
-            ExpandedName::new(Some(EXSLT_CRYPTO_NS), "rc4_encrypt"),
-            ExpandedName::new(Some(EXSLT_CRYPTO_NS), "rc4_decrypt"),
-            ExpandedName::new(Some(LIBXSLT_TEST_NS), "test"),
-            ExpandedName::new(Some(LIBXSLT_TEST_PLUGIN_NS), "testplugin"),
         ]);
     }
 
@@ -231,7 +231,7 @@ impl Evaluator {
         {
             return Ok(XPathValue::StoredExpression(source.clone()));
         }
-        self.evaluate_core(&expression, node, position, size, &variables)
+        self.evaluate_core(&expression, node, position, size, &variables, meter)
     }
 
     fn import_result_tree_fragment(
@@ -355,6 +355,7 @@ impl Evaluator {
                             position,
                             size,
                             &augmented,
+                            meter,
                         )?;
                         match value {
                             XPathValue::NodeSet(nodes) => Value::NodeSet(nodes),
@@ -395,6 +396,7 @@ impl Evaluator {
                                 position,
                                 size,
                                 &augmented,
+                                meter,
                             )? {
                                 XPathValue::NodeSet(_) => "node-set",
                                 XPathValue::ResultTreeFragment(_) => "RTF",
@@ -421,6 +423,7 @@ impl Evaluator {
                             position,
                             size,
                             &augmented,
+                            meter,
                         )?
                         .string(self);
                     let delimiter = if let Some(argument) = call.arguments.get(1) {
@@ -430,6 +433,7 @@ impl Evaluator {
                             position,
                             size,
                             &augmented,
+                            meter,
                         )?
                         .string(self)
                     } else {
@@ -466,23 +470,24 @@ impl Evaluator {
                             position,
                             size,
                             &augmented,
+                            meter,
                         )?
                         .string(self);
                     let searches = self.evaluate_extension_strings(
-                        &call.arguments[1],
-                        expression,
+                        expression.derived(call.arguments[1].clone()),
                         node,
                         position,
                         size,
                         &augmented,
+                        meter,
                     )?;
                     let replacements = self.evaluate_extension_strings(
-                        &call.arguments[2],
-                        expression,
+                        expression.derived(call.arguments[2].clone()),
                         node,
                         position,
                         size,
                         &augmented,
+                        meter,
                     )?;
                     let replaced = replace_exslt_string(&input, &searches, &replacements);
                     let fragment = text_document(&replaced, meter)?;
@@ -504,6 +509,7 @@ impl Evaluator {
                             position,
                             size,
                             &augmented,
+                            meter,
                         )?
                         .string(self);
                     if dynamic_source.is_empty() {
@@ -518,7 +524,15 @@ impl Evaluator {
                             meter,
                         ) {
                             Ok(value) => xpath_value_to_public(value),
-                            Err(_) if kind == ExtensionCallKind::DynamicEvaluate => {
+                            Err(error)
+                                if kind == ExtensionCallKind::DynamicEvaluate
+                                    && !matches!(
+                                        error.kind(),
+                                        ErrorKind::Budget
+                                            | ErrorKind::Resource
+                                            | ErrorKind::Resolver
+                                    ) =>
+                            {
                                 Value::NodeSet(Vec::new())
                             }
                             Err(error) => return Err(error),
@@ -538,6 +552,7 @@ impl Evaluator {
                             position,
                             size,
                             &augmented,
+                            meter,
                         )?
                         .string(self);
                     validate_dynamic_expression(&stored, &expression.namespaces)?;
@@ -578,6 +593,7 @@ impl Evaluator {
                         position,
                         size,
                         &augmented,
+                        meter,
                     )?;
                     let line = match value {
                         XPathValue::NodeSet(nodes) => nodes
@@ -598,6 +614,7 @@ impl Evaluator {
                         position,
                         size,
                         &augmented,
+                        meter,
                     )?
                     else {
                         return Err(Error::Dynamic("dyn:map() requires a node-set".into()));
@@ -609,6 +626,7 @@ impl Evaluator {
                             position,
                             size,
                             &augmented,
+                            meter,
                         )?
                         .string(self);
                     let mut result_nodes = Vec::new();
@@ -676,15 +694,14 @@ impl Evaluator {
 
     fn evaluate_extension_strings(
         &self,
-        source: &str,
-        expression: &Expression,
+        expression: Expression,
         node: &SourceNode,
         position: usize,
         size: usize,
         variables: &HashMap<ExpandedName, Value>,
+        meter: &mut Meter,
     ) -> Result<Vec<String>> {
-        let value =
-            self.evaluate_core(&expression.derived(source), node, position, size, variables)?;
+        let value = self.evaluate_core(&expression, node, position, size, variables, meter)?;
         Ok(match value {
             XPathValue::NodeSet(nodes) => {
                 nodes.iter().map(|node| self.string_value(node)).collect()
@@ -719,6 +736,7 @@ impl Evaluator {
         position: usize,
         size: usize,
         variables: &HashMap<ExpandedName, Value>,
+        meter: &mut Meter,
     ) -> Result<XPathValue> {
         let document = self.package.as_document();
         let context_node = self
@@ -740,6 +758,13 @@ impl Evaluator {
         let isolated = hide_projection_elements_from_axes(&rooted);
         let rewritten = rewrite_outer_context_functions(&isolated);
         if !self.expressions.borrow().contains_key(&rewritten) {
+            // One input byte can produce at most one parser token. This conservative
+            // node-sized allowance bounds the retained AST and cache key before insertion.
+            let retained_bytes = rewritten
+                .len()
+                .saturating_mul(128)
+                .saturating_add(std::mem::size_of::<XPath>());
+            meter.charge(BudgetKind::OwnedBytes, retained_bytes)?;
             let xpath = Factory::new().build(&rewritten).map_err(|error| {
                 Error::Static(format!(
                     "invalid XPath expression `{}`: {error}",
@@ -819,13 +844,6 @@ impl Evaluator {
             },
         );
         context.set_function(
-            "function-available",
-            FunctionAvailable {
-                namespaces: expression.namespaces.clone(),
-                extension_functions: self.extension_functions.clone(),
-            },
-        );
-        context.set_function(
             "unparsed-entity-uri",
             UnparsedEntityUriFunction {
                 entities: self
@@ -837,7 +855,15 @@ impl Evaluator {
             },
         );
         context.set_function("lang", LangFunction);
-        register_exslt_functions(&mut context);
+        let mut extension_functions = self.extension_functions.clone();
+        extension_functions.extend(register_exslt_functions(&mut context));
+        context.set_function(
+            "function-available",
+            FunctionAvailable {
+                namespaces: expression.namespaces.clone(),
+                extension_functions,
+            },
+        );
         context.set_function(
             "document",
             DocumentFunction {
@@ -917,6 +943,7 @@ impl Evaluator {
                     position,
                     size,
                     variables,
+                    meter,
                 )?;
                 let XPathValue::NodeSet(nodes) = base else {
                     return Err(Error::Dynamic(
@@ -936,6 +963,7 @@ impl Evaluator {
                 position,
                 size,
                 variables,
+                meter,
             )?;
             match value {
                 XPathValue::NodeSet(nodes) => requested.extend(nodes.iter().map(|uri_node| {
@@ -963,6 +991,7 @@ impl Evaluator {
             if self.documents.contains_key(&request) {
                 continue;
             }
+            meter.charge(BudgetKind::ExternalDocuments, 1)?;
             let (resource_uri, fragment) = request
                 .href
                 .split_once('#')
@@ -990,10 +1019,8 @@ impl Evaluator {
                 });
             }
             meter.check_additional(BudgetKind::OwnedBytes, resource.bytes.len())?;
-            meter.check_additional(BudgetKind::ExternalDocuments, 1)?;
             let xml = decode_resource(&resource.bytes, resource.encoding.as_deref())?;
             let document = Document::parse(&xml, Some(&resource.canonical_uri))?;
-            meter.charge(BudgetKind::ExternalDocuments, 1)?;
             meter.charge(BudgetKind::OwnedBytes, resource.bytes.len())?;
             let document = if self.source_processing == SourceProcessing::XInclude {
                 let mut stack = vec![resource.identity.clone()];
@@ -1027,6 +1054,7 @@ impl Evaluator {
                 1,
                 1,
                 variables,
+                meter,
             )?;
             let XPathValue::NodeSet(nodes) = selected else {
                 return Err(Error::Dynamic(format!(
@@ -2006,21 +2034,6 @@ fn resolve_xinclude(
     expanded.map(XIncludeContent::Xml)
 }
 
-fn decode_resource(bytes: &[u8], explicit: Option<&str>) -> Result<String> {
-    let encoding = explicit
-        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
-        .or_else(|| encoding_rs::Encoding::for_bom(bytes).map(|(encoding, _)| encoding))
-        .unwrap_or(encoding_rs::UTF_8);
-    let (decoded, _, had_errors) = encoding.decode(bytes);
-    if had_errors {
-        return Err(Error::Xml(format!(
-            "external document contains invalid {} bytes",
-            encoding.name()
-        )));
-    }
-    Ok(decoded.into_owned())
-}
-
 struct NodeMaps {
     forward: HashMap<SourceNode, NodePath>,
     reverse: HashMap<NodePath, SourceNode>,
@@ -2970,50 +2983,65 @@ struct DocumentFunction {
     static_base_uri: Option<String>,
 }
 
-fn register_exslt_functions(context: &mut Context<'_>) {
+fn register_exslt_functions(context: &mut Context<'_>) -> HashSet<ExpandedName> {
+    let mut registered = HashSet::new();
+    macro_rules! register {
+        ($namespace:expr, $name:expr, $function:expr) => {{
+            context.set_function(($namespace, $name), $function);
+            registered.insert(ExpandedName::new(Some($namespace), $name));
+        }};
+    }
     crate::exslt_date::register(context);
-    context.set_function((EXSLT_MATH_NS, "max"), ExsltMathFunction::Max);
-    context.set_function((EXSLT_MATH_NS, "min"), ExsltMathFunction::Min);
-    context.set_function((EXSLT_MATH_NS, "highest"), ExsltMathFunction::Highest);
-    context.set_function((EXSLT_MATH_NS, "lowest"), ExsltMathFunction::Lowest);
-    context.set_function((EXSLT_MATH_NS, "power"), ExsltMathFunction::Power);
-    context.set_function((EXSLT_SETS_NS, "difference"), ExsltSetFunction::Difference);
-    context.set_function(
-        (EXSLT_SETS_NS, "intersection"),
-        ExsltSetFunction::Intersection,
+    registered.extend(
+        crate::exslt_date::function_names()
+            .map(|name| ExpandedName::new(Some(crate::exslt_date::NAMESPACE), name)),
     );
-    context.set_function((EXSLT_SETS_NS, "distinct"), ExsltSetFunction::Distinct);
-    context.set_function(
-        (EXSLT_SETS_NS, "has-same-node"),
-        ExsltSetFunction::HasSameNode,
+    register!(EXSLT_MATH_NS, "max", ExsltMathFunction::Max);
+    register!(EXSLT_MATH_NS, "min", ExsltMathFunction::Min);
+    register!(EXSLT_MATH_NS, "highest", ExsltMathFunction::Highest);
+    register!(EXSLT_MATH_NS, "lowest", ExsltMathFunction::Lowest);
+    register!(EXSLT_MATH_NS, "power", ExsltMathFunction::Power);
+    register!(EXSLT_SETS_NS, "difference", ExsltSetFunction::Difference);
+    register!(
+        EXSLT_SETS_NS,
+        "intersection",
+        ExsltSetFunction::Intersection
     );
-    context.set_function((EXSLT_SETS_NS, "leading"), ExsltSetFunction::Leading);
-    context.set_function((EXSLT_SETS_NS, "trailing"), ExsltSetFunction::Trailing);
-    context.set_function((EXSLT_STRINGS_NS, "align"), ExsltStringFunction::Align);
-    context.set_function((EXSLT_STRINGS_NS, "padding"), ExsltStringFunction::Padding);
-    context.set_function(
-        (EXSLT_STRINGS_NS, "encode-uri"),
-        ExsltStringFunction::EncodeUri,
+    register!(EXSLT_SETS_NS, "distinct", ExsltSetFunction::Distinct);
+    register!(
+        EXSLT_SETS_NS,
+        "has-same-node",
+        ExsltSetFunction::HasSameNode
     );
-    context.set_function(
-        (EXSLT_STRINGS_NS, "decode-uri"),
-        ExsltStringFunction::DecodeUri,
+    register!(EXSLT_SETS_NS, "leading", ExsltSetFunction::Leading);
+    register!(EXSLT_SETS_NS, "trailing", ExsltSetFunction::Trailing);
+    register!(EXSLT_STRINGS_NS, "align", ExsltStringFunction::Align);
+    register!(EXSLT_STRINGS_NS, "padding", ExsltStringFunction::Padding);
+    register!(
+        EXSLT_STRINGS_NS,
+        "encode-uri",
+        ExsltStringFunction::EncodeUri
     );
-    context.set_function((EXSLT_CRYPTO_NS, "md5"), ExsltCryptoFunction::Md5);
-    context.set_function((EXSLT_CRYPTO_NS, "sha1"), ExsltCryptoFunction::Sha1);
-    context.set_function(
-        (EXSLT_CRYPTO_NS, "rc4_encrypt"),
-        ExsltCryptoFunction::Rc4Encrypt,
+    register!(
+        EXSLT_STRINGS_NS,
+        "decode-uri",
+        ExsltStringFunction::DecodeUri
     );
-    context.set_function(
-        (EXSLT_CRYPTO_NS, "rc4_decrypt"),
-        ExsltCryptoFunction::Rc4Decrypt,
+    register!(EXSLT_CRYPTO_NS, "md5", ExsltCryptoFunction::Md5);
+    register!(EXSLT_CRYPTO_NS, "sha1", ExsltCryptoFunction::Sha1);
+    register!(
+        EXSLT_CRYPTO_NS,
+        "rc4_encrypt",
+        ExsltCryptoFunction::Rc4Encrypt
     );
-    context.set_function((LIBXSLT_TEST_NS, "test"), IdentityStringFunction);
-    context.set_function(
-        (LIBXSLT_TEST_PLUGIN_NS, "testplugin"),
-        IdentityStringFunction,
+    register!(
+        EXSLT_CRYPTO_NS,
+        "rc4_decrypt",
+        ExsltCryptoFunction::Rc4Decrypt
     );
+    register!(LIBXSLT_TEST_NS, "test", IdentityStringFunction);
+    register!(LIBXSLT_TEST_PLUGIN_NS, "testplugin", IdentityStringFunction);
+    registered
 }
 
 struct IdentityStringFunction;
@@ -3359,7 +3387,11 @@ impl function::Function for ExsltStringFunction {
                         "str:decode-uri() requires one or two arguments",
                     );
                 }
-                Ok(SxdValue::String(percent_decode_uri(&args[0].string())))
+                let encoding = args.get(1).map(SxdValue::string);
+                Ok(SxdValue::String(percent_decode_uri(
+                    &args[0].string(),
+                    encoding.as_deref(),
+                )?))
             }
         }
     }
@@ -3392,7 +3424,10 @@ fn percent_encode_uri(value: &str, escape_reserved: bool) -> String {
     output
 }
 
-fn percent_decode_uri(value: &str) -> String {
+fn percent_decode_uri(
+    value: &str,
+    encoding: Option<&str>,
+) -> std::result::Result<String, function::Error> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut cursor = 0;
@@ -3409,7 +3444,24 @@ fn percent_decode_uri(value: &str) -> String {
             cursor += 1;
         }
     }
-    String::from_utf8_lossy(&decoded).into_owned()
+    let encoding = encoding
+        .map(|label| {
+            encoding_rs::Encoding::for_label(label.as_bytes()).ok_or_else(|| {
+                function::Error::Other {
+                    what: format!("str:decode-uri() has unknown encoding `{label}`"),
+                }
+            })
+        })
+        .transpose()?
+        .unwrap_or(encoding_rs::UTF_8);
+    let (value, _, had_errors) = encoding.decode(&decoded);
+    if had_errors {
+        return extension_argument_error(&format!(
+            "str:decode-uri() input is not valid {}",
+            encoding.name()
+        ));
+    }
+    Ok(value.into_owned())
 }
 
 impl function::Function for DocumentFunction {
@@ -3523,10 +3575,7 @@ impl function::Function for ElementAvailable {
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
         let name = one_qname_argument(args, &self.namespaces, "element-available")?;
-        let available = (name
-            .namespace
-            .as_deref()
-            .is_none_or(|namespace| namespace == crate::compiler::XSLT_NS)
+        let available = (name.namespace.as_deref() == Some(crate::compiler::XSLT_NS)
             && matches!(
                 name.local.as_str(),
                 "apply-imports"
@@ -3950,7 +3999,7 @@ fn render_decimal(
     };
     let multiplier = if selected.contains(format.percent) {
         100.0
-    } else if selected.contains(format.per_mille) || selected.contains('?') {
+    } else if selected.contains(format.per_mille) {
         1000.0
     } else {
         1.0

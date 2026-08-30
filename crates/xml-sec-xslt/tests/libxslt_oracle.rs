@@ -7,9 +7,9 @@ use std::{collections::HashSet, ops::Range};
 
 use encoding_rs::Encoding;
 use xml_sec_xslt::{
-    Attribute, CompileBudget, Compiler, Document, Error, ExecutionBudget, ExecutionOptions,
-    ExpandedName, Parameters, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity,
-    SourceProcessing, Value,
+    Attribute, BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget,
+    ExecutionOptions, ExpandedName, Parameters, ResolvePurpose, ResolvedResource, Resolver,
+    ResourceIdentity, SourceProcessing, Value,
 };
 
 #[derive(Debug)]
@@ -1179,6 +1179,30 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8]) -> bool {
             );
             true
         }
+        // libxslt treats `?` as an undeclared per-mille symbol. XSLT 1.0 assigns
+        // scaling only to the active decimal-format symbols, so `?` stays literal.
+        "XSLTMark/number.xsl" => {
+            for expected in [
+                "FOUR ?22.00",
+                "FOUR ?22.22",
+                "FOUR ?123.46",
+                "FOUR -?77777.78",
+                "FOUR -?6123.03",
+            ] {
+                assert!(
+                    actual.contains(expected),
+                    "missing strict output `{expected}`"
+                );
+            }
+            assert_eq!(actual.matches("FOUR ").count(), 7);
+            true
+        }
+        // libxslt resolves an unprefixed QName as an XSLT instruction here. XSLT 1.0
+        // requires the argument to expand into the XSLT namespace, so no text is emitted.
+        "general/bug-200.xsl" => {
+            assert!(!actual.contains("found"));
+            true
+        }
         _ => false,
     }
 }
@@ -1195,6 +1219,15 @@ fn is_expected_strict_xslt_error(case: &Case, error: &Error) -> bool {
         ("general/bug-56.xsl", Error::Dynamic(message)) => {
             message.contains("expected to be a nodeset")
         }
+        // libxslt swallows this intentionally infinite dyn:evaluate recursion and emits an
+        // empty result. Operation-wide limits are security boundaries and remain fail-closed.
+        (
+            "exslt/dynamic/recursion.xsl",
+            Error::Budget {
+                kind: BudgetKind::RecursionDepth,
+                ..
+            },
+        ) => true,
         _ => false,
     }
 }

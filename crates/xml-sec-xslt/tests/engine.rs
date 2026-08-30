@@ -1734,3 +1734,205 @@ fn xinclude_fallback_never_swallows_security_budget_failures() {
         Err(Error::StaleResource { .. })
     ));
 }
+
+#[test]
+fn missing_document_resolution_consumes_the_external_document_budget() {
+    // A failed resolver attempt is still attacker-controlled external work.
+    struct MissingResolver;
+    impl Resolver for MissingResolver {
+        fn resolve(
+            &self,
+            uri: &str,
+            _base_uri: Option<&str>,
+            _purpose: ResolvePurpose,
+        ) -> xml_sec_xslt::Result<ResolvedResource> {
+            Err(Error::ResourceNotFound { uri: uri.into() })
+        }
+    }
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="document('missing.xml')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(1024);
+    budget.external_documents = 0;
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<source/>", Some("memory:source.xml")).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(MissingResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::ExternalDocuments,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn xslt_capability_queries_require_expanded_names_and_cover_registered_exslt() {
+    // Capability discovery reports the exact expanded name of executable functions/elements.
+    let stylesheet = r#"<xsl:stylesheet version="1.0"
+        xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+        xmlns:exsl="http://exslt.org/common"
+        xmlns:str="http://exslt.org/strings"
+        xmlns:math="http://exslt.org/math">
+        <xsl:output method="text"/>
+        <xsl:template match="/"><xsl:value-of select="element-available('if')"/><xsl:text>|</xsl:text><xsl:value-of select="element-available('xsl:if')"/><xsl:text>|</xsl:text><xsl:value-of select="function-available('exsl:node-set')"/><xsl:text>|</xsl:text><xsl:value-of select="function-available('str:encode-uri')"/><xsl:text>|</xsl:text><xsl:value-of select="function-available('math:max')"/></xsl:template>
+    </xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "false|true|true|true|true"
+    );
+}
+
+#[test]
+fn html_raw_text_rules_do_not_apply_to_foreign_namespaces() {
+    // HTML raw-text elements are no-namespace HTML names, not arbitrary equal local names.
+    let stylesheet = r#"<xsl:stylesheet version="1.0"
+        xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:f="urn:foreign">
+        <xsl:output method="html" omit-xml-declaration="yes"/>
+        <xsl:template match="/"><html><f:script><xsl:text>&lt;</xsl:text></f:script><script><xsl:text>&lt;</xsl:text></script></html></xsl:template>
+    </xsl:stylesheet>"#;
+    let output = execute(stylesheet, "<source/>");
+    assert!(output.contains("<f:script>&lt;</f:script>"));
+    assert!(output.contains("<script><</script>"));
+}
+
+#[test]
+fn format_number_treats_question_mark_as_an_ordinary_literal() {
+    // Only the decimal-format's configured per-mille character scales the value.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(1, '?0')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "?1");
+}
+
+struct EncodedStylesheetResolver;
+
+impl Resolver for EncodedStylesheetResolver {
+    fn resolve(
+        &self,
+        uri: &str,
+        _base_uri: Option<&str>,
+        purpose: ResolvePurpose,
+    ) -> xml_sec_xslt::Result<ResolvedResource> {
+        assert_eq!(uri, "latin1.xsl");
+        assert_eq!(purpose, ResolvePurpose::Include);
+        let source = b"<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:template name=\"word\"><xsl:text>caf\xe9</xsl:text></xsl:template></xsl:stylesheet>";
+        Ok(ResolvedResource {
+            canonical_uri: "memory:latin1.xsl".into(),
+            identity: ResourceIdentity("latin1.xsl".into()),
+            bytes: source.to_vec(),
+            media_type: Some("application/xslt+xml".into()),
+            encoding: Some("ISO-8859-1".into()),
+        })
+    }
+}
+
+#[test]
+fn imported_stylesheets_honor_resolver_encoding_metadata() {
+    // Included XML modules use the resolver's authoritative byte encoding metadata.
+    let resolver = Arc::new(EncodedStylesheetResolver);
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="latin1.xsl"/><xsl:output method="text"/><xsl:template match="/"><xsl:call-template name="word"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("Latin-1 include compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("stylesheet executes");
+    assert_eq!(result.serialized.bytes, "caf\u{e9}".as_bytes());
+}
+
+#[test]
+fn exslt_decode_uri_honors_the_requested_encoding() {
+    // Percent-decoded octets are interpreted using the caller's declared character encoding.
+    let stylesheet = r#"<xsl:stylesheet version="1.0"
+        xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings">
+        <xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:decode-uri('%E9', 'ISO-8859-1')"/></xsl:template>
+    </xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "\u{e9}");
+
+    let unsupported = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:template match="/"><xsl:value-of select="str:decode-uri('%E9', 'not-an-encoding')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    assert!(matches!(
+        unsupported.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Dynamic(message)) if message.contains("unknown encoding")
+    ));
+}
+
+#[test]
+fn keys_index_full_attribute_axis_patterns() {
+    // Candidate enumeration must include attributes for the unabbreviated XPath axis spelling.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="attrs" match="attribute::*" use="."/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(key('attrs', 'needle'))"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source value=\"needle\"/>"), "1");
+}
+
+#[test]
+fn retained_dynamic_xpath_expressions_consume_owned_memory_budget() {
+    // Distinct attacker-controlled dynamic expressions cannot grow the execution cache for free.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:dyn="http://exslt.org/dynamic"><xsl:template match="/"><xsl:for-each select="root/item"><xsl:value-of select="dyn:evaluate(@expr)"/></xsl:for-each></xsl:template></xsl:stylesheet>"#,
+    );
+    let source_with = |expression: &dyn Fn(usize) -> String| {
+        let expressions = (0..64)
+            .map(|index| format!(r#"<item expr="{}"/>"#, expression(index)))
+            .collect::<String>();
+        Document::parse(&format!("<root>{expressions}</root>"), None).expect("source parses")
+    };
+    let mut budget = execution_budget(1 << 20);
+    budget.owned_bytes = 32 << 10;
+    stylesheet
+        .execute(
+            &source_with(&|_| "1 + 1".into()),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("one cached dynamic expression stays within the budget");
+    assert!(matches!(
+        stylesheet.execute(
+            &source_with(&|index| format!("{index} + 1")),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}

@@ -1,7 +1,9 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::budget::ensure;
+use crate::resolver::decode_resource;
 use crate::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, OutputDefinition,
     OutputMethod, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity, Result,
@@ -104,7 +106,7 @@ impl<R: Resolver> Compiler<R> {
                 self.enter_resource(&resource, state, |state| {
                     let source = resource_source(&resource)?;
                     self.compile_module(
-                        source,
+                        &source,
                         Some(&resource.canonical_uri),
                         None,
                         state,
@@ -116,7 +118,7 @@ impl<R: Resolver> Compiler<R> {
                     self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
                 self.enter_resource(&resource, state, |state| {
                     let source = resource_source(&resource)?;
-                    let document = roxmltree::Document::parse(source)
+                    let document = roxmltree::Document::parse(&source)
                         .map_err(|error| Error::Xml(error.to_string()))?;
                     let included_root = document.root_element();
                     require_stylesheet_module(included_root)?;
@@ -154,7 +156,7 @@ impl<R: Resolver> Compiler<R> {
                     self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
                 self.enter_resource(&resource, state, |state| {
                     let source = resource_source(&resource)?;
-                    let document = roxmltree::Document::parse(source)
+                    let document = roxmltree::Document::parse(&source)
                         .map_err(|error| Error::Xml(error.to_string()))?;
                     let included_root = document.root_element();
                     require_stylesheet_module(included_root)?;
@@ -1222,13 +1224,18 @@ impl CompileContext {
     }
 }
 
-fn resource_source(resource: &ResolvedResource) -> Result<&str> {
-    std::str::from_utf8(&resource.bytes).map_err(|_| {
-        Error::Xml(format!(
-            "stylesheet {} is not UTF-8",
-            resource.canonical_uri
-        ))
-    })
+fn resource_source(resource: &ResolvedResource) -> Result<Cow<'_, str>> {
+    if resource.encoding.is_none() {
+        return std::str::from_utf8(&resource.bytes)
+            .map(Cow::Borrowed)
+            .map_err(|_| {
+                Error::Xml(format!(
+                    "stylesheet {} is not UTF-8",
+                    resource.canonical_uri
+                ))
+            });
+    }
+    decode_resource(&resource.bytes, resource.encoding.as_deref()).map(Cow::Owned)
 }
 
 fn require_stylesheet_module(root: roxmltree::Node<'_, '_>) -> Result<()> {

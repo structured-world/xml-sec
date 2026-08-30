@@ -377,7 +377,8 @@ impl<'a> Execution<'a> {
                 };
                 pending.extend(source.children.iter().rev().copied());
                 nodes.push(SourceNode::Node(id));
-                if declaration.match_pattern.source.contains('@')
+                if (declaration.match_pattern.source.contains('@')
+                    || declaration.match_pattern.source.contains("attribute::"))
                     && let NodeKind::Element { attributes, .. } = &source.kind
                 {
                     nodes.extend(

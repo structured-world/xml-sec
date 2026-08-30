@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{Error, Result};
 
 /// Stable caller-defined identity for resolved bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -32,6 +32,25 @@ pub trait Resolver: Send + Sync {
         base_uri: Option<&str>,
         purpose: ResolvePurpose,
     ) -> Result<ResolvedResource>;
+}
+
+pub(crate) fn decode_resource(bytes: &[u8], explicit: Option<&str>) -> Result<String> {
+    let encoding = if let Some(label) = explicit {
+        encoding_rs::Encoding::for_label(label.as_bytes())
+            .ok_or_else(|| Error::Xml(format!("unsupported resource encoding `{label}`")))?
+    } else {
+        encoding_rs::Encoding::for_bom(bytes)
+            .map(|(encoding, _)| encoding)
+            .unwrap_or(encoding_rs::UTF_8)
+    };
+    let (decoded, _, had_errors) = encoding.decode(bytes);
+    if had_errors {
+        return Err(Error::Xml(format!(
+            "external resource contains invalid {} bytes",
+            encoding.name()
+        )));
+    }
+    Ok(decoded.into_owned())
 }
 
 /// Resolver that denies every external resource.

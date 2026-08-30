@@ -434,6 +434,7 @@ fn serialize_node(
                 if definition.method == OutputMethod::Text
                     || context.parent_name.as_ref().is_some_and(|name| {
                         definition.method == OutputMethod::Html
+                            && name.namespace.is_none()
                             && matches!(
                                 name.local.to_ascii_lowercase().as_str(),
                                 "script" | "style"

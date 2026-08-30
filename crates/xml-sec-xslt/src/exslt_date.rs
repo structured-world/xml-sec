@@ -1,35 +1,40 @@
 use sxd_xpath_no_unsafe::{Context, Value, function};
 
 pub(crate) const NAMESPACE: &str = "http://exslt.org/dates-and-times";
-
 pub(crate) fn register(context: &mut Context<'_>) {
-    for (name, operation) in [
-        ("year", Operation::Year),
-        ("leap-year", Operation::LeapYear),
-        ("month-in-year", Operation::MonthInYear),
-        ("month-name", Operation::MonthName),
-        ("month-abbreviation", Operation::MonthAbbreviation),
-        ("week-in-year", Operation::WeekInYear),
-        ("day-in-year", Operation::DayInYear),
-        ("day-in-month", Operation::DayInMonth),
-        ("day-of-week-in-month", Operation::DayOfWeekInMonth),
-        ("day-in-week", Operation::DayInWeek),
-        ("day-name", Operation::DayName),
-        ("day-abbreviation", Operation::DayAbbreviation),
-        ("time", Operation::Time),
-        ("hour-in-day", Operation::HourInDay),
-        ("minute-in-hour", Operation::MinuteInHour),
-        ("second-in-minute", Operation::SecondInMinute),
-        ("seconds", Operation::Seconds),
-        ("duration", Operation::Duration),
-        ("add-duration", Operation::AddDuration),
-        ("sum", Operation::Sum),
-        ("add", Operation::Add),
-        ("difference", Operation::Difference),
-    ] {
+    for &(name, operation) in FUNCTIONS {
         context.set_function((NAMESPACE, name), DateFunction(operation));
     }
 }
+
+pub(crate) fn function_names() -> impl Iterator<Item = &'static str> {
+    FUNCTIONS.iter().map(|(name, _)| *name)
+}
+
+const FUNCTIONS: &[(&str, Operation)] = &[
+    ("year", Operation::Year),
+    ("leap-year", Operation::LeapYear),
+    ("month-in-year", Operation::MonthInYear),
+    ("month-name", Operation::MonthName),
+    ("month-abbreviation", Operation::MonthAbbreviation),
+    ("week-in-year", Operation::WeekInYear),
+    ("day-in-year", Operation::DayInYear),
+    ("day-in-month", Operation::DayInMonth),
+    ("day-of-week-in-month", Operation::DayOfWeekInMonth),
+    ("day-in-week", Operation::DayInWeek),
+    ("day-name", Operation::DayName),
+    ("day-abbreviation", Operation::DayAbbreviation),
+    ("time", Operation::Time),
+    ("hour-in-day", Operation::HourInDay),
+    ("minute-in-hour", Operation::MinuteInHour),
+    ("second-in-minute", Operation::SecondInMinute),
+    ("seconds", Operation::Seconds),
+    ("duration", Operation::Duration),
+    ("add-duration", Operation::AddDuration),
+    ("sum", Operation::Sum),
+    ("add", Operation::Add),
+    ("difference", Operation::Difference),
+];
 
 #[derive(Clone, Copy)]
 enum Operation {
