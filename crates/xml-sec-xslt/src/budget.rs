@@ -135,28 +135,36 @@ impl Meter {
     }
 
     pub(crate) fn check_additional(&self, kind: BudgetKind, amount: usize) -> Result<()> {
-        let (used, limit) = match kind {
+        let (used, limit) = self.usage(kind)?;
+        ensure(kind, limit, used.saturating_add(amount))
+    }
+
+    pub(crate) fn usage(&self, kind: BudgetKind) -> Result<(usize, usize)> {
+        match kind {
             BudgetKind::ExternalDocuments => {
-                (self.external_documents, self.limits.external_documents)
+                Ok((self.external_documents, self.limits.external_documents))
             }
-            BudgetKind::XPathEvaluations => (self.xpath_evaluations, self.limits.xpath_evaluations),
-            BudgetKind::TemplateApplications => (
+            BudgetKind::XPathEvaluations => {
+                Ok((self.xpath_evaluations, self.limits.xpath_evaluations))
+            }
+            BudgetKind::TemplateApplications => Ok((
                 self.template_applications,
                 self.limits.template_applications,
-            ),
-            BudgetKind::SortComparisons => (self.sort_comparisons, self.limits.sort_comparisons),
-            BudgetKind::KeyEntries => (self.key_entries, self.limits.key_entries),
-            BudgetKind::ResultNodes => (self.result_nodes, self.limits.result_nodes),
-            BudgetKind::SerializedBytes => (self.serialized_bytes, self.limits.serialized_bytes),
-            BudgetKind::Messages => (self.messages, self.limits.messages),
-            BudgetKind::OwnedBytes => (self.owned_bytes, self.limits.owned_bytes),
-            other => {
-                return Err(Error::Dynamic(format!(
-                    "{other:?} cannot be checked during execution"
-                )));
+            )),
+            BudgetKind::SortComparisons => {
+                Ok((self.sort_comparisons, self.limits.sort_comparisons))
             }
-        };
-        ensure(kind, limit, used.saturating_add(amount))
+            BudgetKind::KeyEntries => Ok((self.key_entries, self.limits.key_entries)),
+            BudgetKind::ResultNodes => Ok((self.result_nodes, self.limits.result_nodes)),
+            BudgetKind::SerializedBytes => {
+                Ok((self.serialized_bytes, self.limits.serialized_bytes))
+            }
+            BudgetKind::Messages => Ok((self.messages, self.limits.messages)),
+            BudgetKind::OwnedBytes => Ok((self.owned_bytes, self.limits.owned_bytes)),
+            other => Err(Error::Dynamic(format!(
+                "{other:?} cannot be checked during execution"
+            ))),
+        }
     }
 }
 

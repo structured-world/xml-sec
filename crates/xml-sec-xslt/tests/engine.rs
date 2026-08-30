@@ -2548,6 +2548,37 @@ fn selected_local_variable_values_are_retained_memory_metered() {
 }
 
 #[test]
+fn core_concat_maps_preallocation_rejection_to_the_owned_bytes_budget() {
+    // The XPath fork must reject the aggregate concat reservation before constructing it, while
+    // the public engine preserves the typed operation-budget error.
+    let arguments = std::iter::repeat_n("string(/*)", 64)
+        .collect::<Vec<_>>()
+        .join(",");
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="concat({arguments})"/></xsl:template></xsl:stylesheet>"#
+    ));
+    let source_xml = format!("<source>{}</source>", "x".repeat(16 * 1024));
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = source_xml.len() + (128 * 1024);
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse(&source_xml, None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn supported_secondary_output_does_not_execute_fallback() {
     // xsl:fallback belongs only to unsupported extension execution.
     let stylesheet = compile(
@@ -2838,6 +2869,173 @@ fn global_dependencies_follow_called_named_templates() {
     // A global's value may depend on a later global through a named template call.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:variable name="first"><xsl:call-template name="build"/></xsl:variable><xsl:variable name="later" select="'ready'"/><xsl:template name="build"><xsl:value-of select="$later"/></xsl:template><xsl:template match="/"><xsl:value-of select="$first"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<source/>"), "ready");
+}
+
+#[test]
+fn global_dependencies_follow_only_selectable_apply_templates() {
+    // Named-only and different-mode templates cannot participate in this dispatch, so their
+    // global references must not create a false dependency cycle.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:variable name="first"><xsl:apply-templates select="/" mode="selected"/></xsl:variable><xsl:variable name="later" select="$first"/><xsl:template name="named-only"><xsl:value-of select="$later"/></xsl:template><xsl:template match="/" mode="other"><xsl:value-of select="$later"/></xsl:template><xsl:template match="/" mode="selected"><ready/></xsl:template><xsl:template match="/"><xsl:copy-of select="$first"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "<ready/>\n");
+}
+
+#[test]
+fn global_dependencies_follow_nested_attribute_sets_on_all_consumers() {
+    // Every instruction that applies an attribute set must defer its global until expressions in
+    // nested sets can read globals declared later in stylesheet order.
+    for body in [
+        r#"<literal xsl:use-attribute-sets="outer"/>"#,
+        r#"<xsl:element name="computed" use-attribute-sets="outer"/>"#,
+        r#"<xsl:for-each select="/*"><xsl:copy use-attribute-sets="outer"/></xsl:for-each>"#,
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:attribute-set name="outer" use-attribute-sets="inner"/><xsl:attribute-set name="inner"><xsl:attribute name="state"><xsl:value-of select="$later"/></xsl:attribute></xsl:attribute-set><xsl:variable name="first">{body}</xsl:variable><xsl:variable name="later" select="'ready'"/><xsl:template match="/"><xsl:value-of select="exsl:node-set($first)/*/@state"/></xsl:template></xsl:stylesheet>"#
+        );
+        assert_eq!(execute(&stylesheet, "<source/>"), "ready");
+    }
+}
+
+#[test]
+fn computed_elements_use_the_default_and_prefixed_static_namespaces() {
+    // Unlike xsl:attribute, XSLT 1.0 expands an unprefixed xsl:element name through the default
+    // namespace in scope on the instruction; explicit prefixes use the same static context.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns="urn:stylesheet" xmlns:p="urn:result" xmlns:r="urn:wrapper"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><r:wrapper><xsl:element name="out"/><xsl:element name="p:out"/></r:wrapper></xsl:template></xsl:stylesheet>"#;
+    let output = execute(stylesheet, "<source/>");
+    let output = Document::parse(&output, None).expect("serialized result parses");
+    let names = output
+        .nodes()
+        .filter_map(|(_, node)| match &node.kind {
+            xml_sec_xslt::NodeKind::Element { name, .. } if name.local == "out" => {
+                Some(name.namespace.as_deref())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(names, [Some("urn:stylesheet"), Some("urn:result")]);
+}
+
+#[test]
+fn key_patterns_use_the_parsed_attribute_axis() {
+    // XML whitespace around the axis separator is grammatical and must not hide attribute
+    // candidates from the key index builder.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="by-id" match="attribute :: id" use="."/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(key('by-id', 'needle'))"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<root id=\"needle\"/>"), "1");
+}
+
+#[test]
+fn xinclude_preserves_principal_and_included_id_metadata() {
+    // XInclude projection must remap caller-supplied typed IDs and XML IDs into the completed
+    // logical document rather than rebuilding only node kinds.
+    let resolver = Arc::new(ContextResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            ("included.xml".into(), Some("memory:source.xml".into())),
+            ResolvedResource {
+                canonical_uri: "memory:included.xml".into(),
+                identity: ResourceIdentity("included".into()),
+                bytes: br#"<included xml:id="included-id"/>"#.to_vec(),
+                media_type: Some("application/xml".into()),
+                encoding: None,
+            },
+        );
+    let mut source = Document::parse(
+        r#"<root custom-id="principal-id" xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let owner = source
+        .nodes()
+        .find_map(|(id, node)| matches!(&node.kind, xml_sec_xslt::NodeKind::Element { name, .. } if name.local == "root").then_some(id))
+        .expect("root element exists");
+    source
+        .mark_id_attribute(owner, 0)
+        .expect("caller ID metadata is valid");
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(id('principal-id'))"/><xsl:text>|</xsl:text><xsl:value-of select="count(id('included-id'))"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+            xml_sec_xslt::SourceProcessing::XInclude,
+        )
+        .expect("XInclude transform succeeds");
+    assert_eq!(result.serialized.bytes, b"1|1");
+}
+
+#[derive(Default)]
+struct ByteResolver {
+    resources: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl Resolver for ByteResolver {
+    fn resolve(
+        &self,
+        uri: &str,
+        _base_uri: Option<&str>,
+        _purpose: ResolvePurpose,
+    ) -> xml_sec_xslt::Result<ResolvedResource> {
+        Ok(ResolvedResource {
+            canonical_uri: format!("memory:{uri}"),
+            identity: ResourceIdentity(uri.into()),
+            bytes: self
+                .resources
+                .lock()
+                .expect("test resolver mutex is not poisoned")
+                .get(uri)
+                .cloned()
+                .ok_or_else(|| Error::Resolver {
+                    uri: uri.into(),
+                    message: "missing byte resource".into(),
+                })?,
+            media_type: Some("application/xml".into()),
+            encoding: None,
+        })
+    }
+}
+
+#[test]
+fn external_xml_autodetects_declared_and_initial_encodings() {
+    // Resolver metadata is optional for XML resources: declarations and the XML initial-byte
+    // patterns remain authoritative when callers return raw bytes.
+    let resolver = Arc::new(ByteResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "latin1.xsl".into(),
+            b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"><xsl:output method=\"text\"/><xsl:template match=\"/\">caf\xe9</xsl:template></xsl:stylesheet>".to_vec(),
+        );
+    let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="latin1.xsl"/></xsl:stylesheet>"#;
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(principal, Some("memory:main.xsl"))
+    .expect("declared Latin-1 stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(4096),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("encoded stylesheet executes");
+    assert_eq!(result.serialized.bytes, "café".as_bytes());
 }
 
 #[test]

@@ -110,6 +110,7 @@ use sxd_document_no_unsafe::dom::Document;
 use sxd_document_no_unsafe::{PrefixedName, QName};
 
 use crate::parser::Parser;
+use crate::token::{AxisName, Token};
 use crate::tokenizer::{TokenDeabbreviator, Tokenizer};
 
 pub use crate::context::Context;
@@ -434,6 +435,16 @@ impl Default for Factory {
     fn default() -> Self {
         Factory::new()
     }
+}
+
+/// Reports whether a syntactically valid XPath can traverse the attribute axis.
+///
+/// The tokenizer performs the same whitespace handling and abbreviated-axis expansion as
+/// [`Factory`], so callers do not need to infer axis semantics from source substrings.
+#[must_use]
+pub fn expression_uses_attribute_axis(xpath: &str) -> bool {
+    TokenDeabbreviator::new(Tokenizer::new(xpath))
+        .any(|token| matches!(token, Ok(Token::Axis(AxisName::Attribute))))
 }
 
 /// Errors that may occur when parsing an XPath

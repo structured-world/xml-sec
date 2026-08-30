@@ -623,6 +623,7 @@ impl Document {
         parent: NodeId,
         source: &Self,
         source_id: NodeId,
+        mapping: &mut HashMap<NodeId, NodeId>,
     ) -> NodeId {
         let source_node = source.node(source_id).expect("source subtree node exists");
         let root = self.push(
@@ -633,6 +634,7 @@ impl Document {
         if let Some(node) = self.node_mut(root) {
             node.source_line = source_node.source_line;
         }
+        mapping.insert(source_id, root);
         let mut pending = source_node
             .children
             .iter()
@@ -649,6 +651,7 @@ impl Document {
             if let Some(node) = self.node_mut(target) {
                 node.source_line = source_node.source_line;
             }
+            mapping.insert(source_id, target);
             pending.extend(
                 source_node
                     .children
@@ -658,6 +661,29 @@ impl Document {
             );
         }
         root
+    }
+
+    pub(crate) fn remap_ids_from(
+        &mut self,
+        source: &Self,
+        mapping: &HashMap<NodeId, NodeId>,
+    ) -> Result<()> {
+        for (value, _, source_owner) in source.ids() {
+            let Some(owner) = mapping.get(&source_owner).copied() else {
+                continue;
+            };
+            let logical_root = self
+                .logical_root_for(&NodeReference::Node(owner))
+                .ok_or_else(|| Error::Xml("remapped ID is outside a logical document".into()))?;
+            if self
+                .ids
+                .insert((logical_root, value.to_owned()), owner)
+                .is_some()
+            {
+                return Err(Error::Xml(format!("duplicate XML ID `{value}`")));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn string_value(&self, id: NodeId) -> String {

@@ -571,6 +571,7 @@ pub(crate) struct Expression {
 pub(crate) struct Pattern {
     pub source: String,
     pub namespaces: Vec<(String, String)>,
+    pub matches_attributes: bool,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Sort {
@@ -835,23 +836,35 @@ impl Expression {
 }
 
 impl Variable {
-    pub(crate) fn global_dependencies(&self, templates: &[Template]) -> HashSet<ExpandedName> {
+    pub(crate) fn global_dependencies(
+        &self,
+        templates: &[Template],
+        attribute_sets: &[AttributeSet],
+    ) -> HashSet<ExpandedName> {
         let mut output = HashSet::new();
-        DependencyCollector::new(templates).variable(self, &HashSet::new(), &mut output);
+        DependencyCollector::new(templates, attribute_sets).variable(
+            self,
+            &HashSet::new(),
+            &mut output,
+        );
         output
     }
 }
 
 struct DependencyCollector<'a> {
     templates: &'a [Template],
+    attribute_sets: &'a [AttributeSet],
     traversed_templates: HashSet<usize>,
+    traversed_attribute_sets: HashSet<usize>,
 }
 
 impl<'a> DependencyCollector<'a> {
-    fn new(templates: &'a [Template]) -> Self {
+    fn new(templates: &'a [Template], attribute_sets: &'a [AttributeSet]) -> Self {
         Self {
             templates,
+            attribute_sets,
             traversed_templates: HashSet::new(),
+            traversed_attribute_sets: HashSet::new(),
         }
     }
 
@@ -879,6 +892,25 @@ impl<'a> DependencyCollector<'a> {
         self.sequence(&template.body, locals, output);
     }
 
+    fn attribute_sets(&mut self, names: &[ExpandedName], output: &mut HashSet<ExpandedName>) {
+        let declarations = names
+            .iter()
+            .flat_map(|name| {
+                self.attribute_sets
+                    .iter()
+                    .filter(move |set| &set.name == name)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for set in declarations {
+            if !self.traversed_attribute_sets.insert(set.order) {
+                continue;
+            }
+            self.attribute_sets(&set.uses, output);
+            self.sequence(&set.attributes, HashSet::new(), output);
+        }
+    }
+
     fn sequence(
         &mut self,
         instructions: &[Instruction],
@@ -893,18 +925,20 @@ impl<'a> DependencyCollector<'a> {
                 Instruction::LiteralElement {
                     attributes,
                     children,
+                    attribute_sets,
                     ..
                 } => {
                     for attribute in attributes {
                         collect_avt_dependencies(&attribute.value, &locals, output);
                     }
+                    self.attribute_sets(attribute_sets, output);
                     self.sequence(children, locals.clone(), output);
                 }
                 Instruction::ApplyTemplates {
                     select,
+                    mode,
                     sorts,
                     parameters,
-                    ..
                 } => {
                     collect_expression_dependencies(select, &locals, output);
                     for sort in sorts {
@@ -913,8 +947,14 @@ impl<'a> DependencyCollector<'a> {
                     for parameter in parameters {
                         self.variable(&parameter.variable, &locals, output);
                     }
-                    for template in self.templates {
-                        self.template(template, output);
+                    let selectable = self
+                        .templates
+                        .iter()
+                        .filter(|template| template.pattern.is_some() && template.mode == *mode)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for template in selectable {
+                        self.template(&template, output);
                     }
                 }
                 Instruction::CallTemplate { name, parameters } => {
@@ -958,8 +998,14 @@ impl<'a> DependencyCollector<'a> {
                 Instruction::ValueOf { select, .. } | Instruction::CopyOf(select) => {
                     collect_expression_dependencies(select, &locals, output);
                 }
-                Instruction::Copy { body, .. }
-                | Instruction::Comment(body)
+                Instruction::Copy {
+                    body,
+                    attribute_sets,
+                } => {
+                    self.attribute_sets(attribute_sets, output);
+                    self.sequence(body, locals.clone(), output);
+                }
+                Instruction::Comment(body)
                 | Instruction::ExtensionFallback { body, .. }
                 | Instruction::Message { body, .. } => {
                     self.sequence(body, locals.clone(), output);
@@ -968,9 +1014,17 @@ impl<'a> DependencyCollector<'a> {
                     name,
                     namespace,
                     body,
+                    attribute_sets,
                     ..
+                } => {
+                    collect_avt_dependencies(name, &locals, output);
+                    if let Some(namespace) = namespace {
+                        collect_avt_dependencies(namespace, &locals, output);
+                    }
+                    self.attribute_sets(attribute_sets, output);
+                    self.sequence(body, locals.clone(), output);
                 }
-                | Instruction::Attribute {
+                Instruction::Attribute {
                     name,
                     namespace,
                     body,
@@ -1101,6 +1155,9 @@ impl Pattern {
         Ok(Self {
             source: source.to_owned(),
             namespaces: namespaces(node),
+            matches_attributes: sxd_xpath_no_unsafe::expression_uses_attribute_axis(
+                &normalize_xpath_for_sxd(source),
+            ),
         })
     }
 
@@ -1233,6 +1290,18 @@ pub(crate) fn normalize_xpath_for_sxd(source: &str) -> String {
                 index = next;
                 continue;
             }
+            if characters.get(next..next + 2) == Some(&[':', ':']) {
+                index = next;
+                continue;
+            }
+        }
+        if character == ':' && characters.get(index + 1) == Some(&':') {
+            output.push_str("::");
+            index += 2;
+            while index < characters.len() && characters[index].is_whitespace() {
+                index += 1;
+            }
+            continue;
         }
         if character == '*'
             && output
@@ -1449,7 +1518,7 @@ impl CompileState {
         for global in &mut self.globals {
             let mut dependencies = global
                 .variable
-                .global_dependencies(&self.templates)
+                .global_dependencies(&self.templates, &self.attribute_sets)
                 .into_iter()
                 .collect::<Vec<_>>();
             dependencies.sort_by(|left, right| {
@@ -1591,16 +1660,6 @@ impl CompileContext {
 }
 
 fn resource_source(resource: &ResolvedResource) -> Result<Cow<'_, str>> {
-    if resource.encoding.is_none() {
-        return std::str::from_utf8(&resource.bytes)
-            .map(Cow::Borrowed)
-            .map_err(|_| {
-                Error::Xml(format!(
-                    "stylesheet {} is not UTF-8",
-                    resource.canonical_uri
-                ))
-            });
-    }
     decode_resource(&resource.bytes, resource.encoding.as_deref()).map(Cow::Owned)
 }
 

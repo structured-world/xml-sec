@@ -84,10 +84,16 @@ fn serialize_charged(
     if definition.method == OutputMethod::Html && !definition.indent_explicit {
         definition.indent = true;
     }
-    let mut counter = RenderBuffer::Count(EncodingCounter::new(&definition.encoding)?);
+    let (used, limit) = meter.usage(budget_kind)?;
+    let mut counter = RenderBuffer::counting(
+        EncodingCounter::new(&definition.encoding)?,
+        budget_kind,
+        used,
+        limit,
+    );
     render(document, &definition, &mut counter)?;
     let text_bytes = counter.len();
-    let encoded_bytes = counter.encoded_len();
+    let encoded_bytes = counter.encoded_len()?;
     meter.check_additional(budget_kind, encoded_bytes)?;
     meter.charge(BudgetKind::OwnedBytes, text_bytes)?;
     let mut text = RenderBuffer::Text(String::with_capacity(text_bytes));
@@ -235,28 +241,97 @@ fn push_external_identifier_literal(
 }
 
 enum RenderBuffer {
-    Count(EncodingCounter),
+    Count {
+        counter: EncodingCounter,
+        kind: BudgetKind,
+        used: usize,
+        limit: usize,
+        exceeded: Option<usize>,
+    },
     Text(String),
 }
 
 impl RenderBuffer {
+    fn counting(counter: EncodingCounter, kind: BudgetKind, used: usize, limit: usize) -> Self {
+        Self::Count {
+            counter,
+            kind,
+            used,
+            limit,
+            exceeded: None,
+        }
+    }
+
     fn push_str(&mut self, value: &str) {
         match self {
-            Self::Count(counter) => counter.push_str(value),
+            Self::Count {
+                counter,
+                used,
+                limit,
+                exceeded,
+                ..
+            } => {
+                if exceeded.is_some() {
+                    return;
+                }
+                counter.push_str(value);
+                let actual = used.saturating_add(counter.encoded_bytes);
+                if actual > *limit {
+                    *exceeded = Some(actual);
+                }
+            }
             Self::Text(output) => output.push_str(value),
         }
     }
 
     fn push(&mut self, value: char) {
         match self {
-            Self::Count(counter) => counter.push(value),
+            Self::Count { .. } => {
+                let mut buffer = [0_u8; 4];
+                self.push_str(value.encode_utf8(&mut buffer));
+            }
             Self::Text(output) => output.push(value),
         }
     }
 
+    fn push_repeated(&mut self, byte: u8, count: usize) -> Result<()> {
+        const CHUNK_SIZE: usize = 64;
+        let chunk = [byte; CHUNK_SIZE];
+        let chunk = std::str::from_utf8(&chunk)
+            .map_err(|_| Error::Serialization("non-ASCII repeated render byte".into()))?;
+        let mut remaining = count;
+        while remaining >= CHUNK_SIZE {
+            self.push_str(chunk);
+            self.ensure_within_limit()?;
+            remaining -= CHUNK_SIZE;
+        }
+        if remaining > 0 {
+            self.push_str(&chunk[..remaining]);
+            self.ensure_within_limit()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_within_limit(&self) -> Result<()> {
+        if let Self::Count {
+            kind,
+            limit,
+            exceeded: Some(actual),
+            ..
+        } = self
+        {
+            return Err(Error::Budget {
+                kind: *kind,
+                limit: *limit,
+                actual: *actual,
+            });
+        }
+        Ok(())
+    }
+
     const fn len(&self) -> usize {
         match self {
-            Self::Count(counter) => counter.utf8_bytes,
+            Self::Count { counter, .. } => counter.utf8_bytes,
             Self::Text(output) => output.len(),
         }
     }
@@ -264,14 +339,28 @@ impl RenderBuffer {
     fn into_string(self) -> String {
         match self {
             Self::Text(output) => output,
-            Self::Count(_) => unreachable!("counting buffer does not contain rendered text"),
+            Self::Count { .. } => unreachable!("counting buffer does not contain rendered text"),
         }
     }
 
-    fn encoded_len(&mut self) -> usize {
+    fn encoded_len(&mut self) -> Result<usize> {
         match self {
-            Self::Count(counter) => counter.finish(),
-            Self::Text(output) => output.len(),
+            Self::Count {
+                counter,
+                used,
+                limit,
+                exceeded,
+                ..
+            } => {
+                let encoded = counter.finish();
+                let actual = used.saturating_add(encoded);
+                if actual > *limit {
+                    *exceeded = Some(actual);
+                }
+                self.ensure_within_limit()?;
+                Ok(encoded)
+            }
+            Self::Text(output) => Ok(output.len()),
         }
     }
 }
@@ -316,11 +405,6 @@ impl EncodingCounter {
             kind,
             finished: false,
         })
-    }
-
-    fn push(&mut self, character: char) {
-        let mut buffer = [0_u8; 4];
-        self.push_str(character.encode_utf8(&mut buffer));
     }
 
     fn push_str(&mut self, value: &str) {
@@ -420,6 +504,7 @@ fn serialize_node(
 ) -> Result<()> {
     let mut tasks = vec![RenderTask::Node(id, context)];
     while let Some(task) = tasks.pop() {
+        output.ensure_within_limit()?;
         if let RenderTask::Cdata(value) = task {
             push_cdata(
                 &value,
@@ -440,7 +525,7 @@ fn serialize_node(
         {
             if definition.indent && !mixed && !parent_mixed && has_element_child {
                 output.push('\n');
-                output.push_str(&"  ".repeat(depth));
+                output.push_repeated(b' ', depth.saturating_mul(2))?;
             }
             if !html_void {
                 output.push_str("</");
@@ -543,7 +628,7 @@ fn serialize_node(
                 });
                 if definition.indent && context.depth > 0 && !context.parent_mixed {
                     output.push('\n');
-                    output.push_str(&"  ".repeat(context.depth));
+                    output.push_repeated(b' ', context.depth.saturating_mul(2))?;
                 }
                 output.push('<');
                 push_name(prefix.as_deref(), &name.local, output);
@@ -678,7 +763,10 @@ fn serialize_node(
                 if definition.inject_content_type && html_head {
                     if definition.indent {
                         output.push('\n');
-                        output.push_str(&"  ".repeat(context.depth + 1));
+                        output.push_repeated(
+                            b' ',
+                            context.depth.saturating_add(1).saturating_mul(2),
+                        )?;
                     }
                     if definition.method == OutputMethod::Html {
                         output.push_str("<meta charset=\"");
@@ -1081,4 +1169,23 @@ fn validate_xml_characters(value: &str, version: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EncodingCounter, RenderBuffer};
+
+    #[test]
+    fn counting_buffer_rejects_repeated_indentation_beyond_the_encoded_limit() {
+        // Indentation is emitted without a temporary repeated String, and counting stops before
+        // work can exceed the configured serialized-output ceiling.
+        let mut output = RenderBuffer::counting(
+            EncodingCounter::new("UTF-8").expect("UTF-8 output encoding is supported"),
+            crate::BudgetKind::SerializedBytes,
+            0,
+            6,
+        );
+        output.push_str("<a>");
+        assert!(output.push_repeated(b' ', 4).is_err());
+    }
 }

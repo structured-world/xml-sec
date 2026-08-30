@@ -35,15 +35,12 @@ pub trait Resolver: Send + Sync {
 }
 
 pub(crate) fn decode_resource(bytes: &[u8], explicit: Option<&str>) -> Result<String> {
-    let encoding = if let Some(label) = explicit {
-        encoding_rs::Encoding::for_label(label.as_bytes())
-            .ok_or_else(|| Error::Xml(format!("unsupported resource encoding `{label}`")))?
+    let (encoding, bom_len) = if let Some(label) = explicit {
+        (resource_encoding(label)?, 0)
     } else {
-        encoding_rs::Encoding::for_bom(bytes)
-            .map(|(encoding, _)| encoding)
-            .unwrap_or(encoding_rs::UTF_8)
+        detect_xml_encoding(bytes)?
     };
-    let (decoded, _, had_errors) = encoding.decode(bytes);
+    let (decoded, _, had_errors) = encoding.decode(&bytes[bom_len..]);
     if had_errors {
         return Err(Error::Xml(format!(
             "external resource contains invalid {} bytes",
@@ -51,6 +48,81 @@ pub(crate) fn decode_resource(bytes: &[u8], explicit: Option<&str>) -> Result<St
         )));
     }
     Ok(decoded.into_owned())
+}
+
+fn detect_xml_encoding(bytes: &[u8]) -> Result<(&'static encoding_rs::Encoding, usize)> {
+    let prefix = bytes.get(..4).unwrap_or(bytes);
+    if matches!(prefix, [0x00, 0x00, 0xFE, 0xFF] | [0xFF, 0xFE, 0x00, 0x00])
+        || matches!(prefix, [0x00, 0x00, 0x00, b'<'] | [b'<', 0x00, 0x00, 0x00])
+    {
+        return Err(Error::Xml("unsupported resource encoding `UTF-32`".into()));
+    }
+    if prefix == [0x4C, 0x6F, 0xA7, 0x94] {
+        return Err(Error::Xml(
+            "unsupported EBCDIC XML resource encoding".into(),
+        ));
+    }
+    if let Some((encoding, bom_len)) = encoding_rs::Encoding::for_bom(bytes) {
+        return Ok((encoding, bom_len));
+    }
+    match prefix {
+        [0x00, b'<', 0x00, b'?'] => return Ok((encoding_rs::UTF_16BE, 0)),
+        [b'<', 0x00, b'?', 0x00] => return Ok((encoding_rs::UTF_16LE, 0)),
+        _ => {}
+    }
+    let encoding = xml_declaration_encoding(bytes)?
+        .map(resource_encoding)
+        .transpose()?
+        .unwrap_or(encoding_rs::UTF_8);
+    Ok((encoding, 0))
+}
+
+fn xml_declaration_encoding(bytes: &[u8]) -> Result<Option<&str>> {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    if !bytes.starts_with(b"<?xml") {
+        return Ok(None);
+    }
+    let end = bytes
+        .windows(2)
+        .position(|window| window == b"?>")
+        .ok_or_else(|| Error::Xml("unterminated XML declaration".into()))?;
+    let declaration = std::str::from_utf8(&bytes[..end])
+        .map_err(|_| Error::Xml("XML declaration is not ASCII-compatible".into()))?;
+    let Some(offset) = declaration.find("encoding") else {
+        return Ok(None);
+    };
+    let before = declaration[..offset].chars().next_back();
+    if !before.is_some_and(char::is_whitespace) {
+        return Ok(None);
+    }
+    let value = declaration[offset + "encoding".len()..].trim_start();
+    let value = value
+        .strip_prefix('=')
+        .ok_or_else(|| Error::Xml("malformed XML encoding declaration".into()))?
+        .trim_start();
+    let quote = value
+        .chars()
+        .next()
+        .filter(|quote| matches!(quote, '\'' | '"'))
+        .ok_or_else(|| Error::Xml("XML encoding declaration must be quoted".into()))?;
+    let value = &value[quote.len_utf8()..];
+    let end = value
+        .find(quote)
+        .ok_or_else(|| Error::Xml("unterminated XML encoding declaration".into()))?;
+    let label = &value[..end];
+    if label.is_empty()
+        || !label.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+        })
+    {
+        return Err(Error::Xml(format!("invalid XML encoding name `{label}`")));
+    }
+    Ok(Some(label))
+}
+
+fn resource_encoding(label: &str) -> Result<&'static encoding_rs::Encoding> {
+    encoding_rs::Encoding::for_label(label.as_bytes())
+        .ok_or_else(|| Error::Xml(format!("unsupported resource encoding `{label}`")))
 }
 
 /// Resolver that denies every external resource.
@@ -68,5 +140,34 @@ impl Resolver for NoResolver {
             uri: uri.to_owned(),
             message: "external resource access is not configured".into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_resource;
+
+    #[test]
+    fn xml_encoding_detection_covers_declarations_initial_patterns_and_errors() {
+        // External XML must follow the XML encoding autodetection contract when resolver metadata
+        // is absent, while unsupported labels and encodings fail instead of decoding lossy text.
+        let latin1 = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>caf\xe9</root>";
+        assert_eq!(
+            decode_resource(latin1, None).expect("Latin-1 declaration is supported"),
+            "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>café</root>"
+        );
+
+        let utf16 = "<?xml version=\"1.0\"?><root>λ</root>"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert!(
+            decode_resource(&utf16, None)
+                .expect("UTF-16 initial pattern is detected")
+                .contains("λ")
+        );
+
+        assert!(decode_resource(b"<?xml encoding=\"X-UNKNOWN\"?><root/>", None).is_err());
+        assert!(decode_resource(&[0, 0, 0, b'<'], None).is_err());
     }
 }

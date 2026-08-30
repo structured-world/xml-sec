@@ -3,6 +3,7 @@
 
 use sxd_document_no_unsafe::QName;
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::iter;
 
@@ -76,6 +77,14 @@ pub struct Context<'d> {
     functions: Functions,
     variables: Variables<'d>,
     namespaces: Namespaces,
+    string_allocations: StringAllocationBudget,
+}
+
+#[derive(Default)]
+struct StringAllocationBudget {
+    limit: Option<usize>,
+    used: Cell<usize>,
+    exceeded: Cell<Option<usize>>,
 }
 
 impl<'d> Context<'d> {
@@ -92,7 +101,23 @@ impl<'d> Context<'d> {
             functions: Default::default(),
             variables: Default::default(),
             namespaces: Default::default(),
+            string_allocations: StringAllocationBudget::default(),
         }
+    }
+
+    /// Limit cumulative core-function string allocations during one evaluation.
+    ///
+    /// The counter is reset when the limit is set. This allows an embedding runtime to enforce
+    /// its own memory policy before core XPath functions reserve result buffers.
+    pub fn set_string_allocation_limit(&mut self, limit: usize) {
+        self.string_allocations.limit = Some(limit);
+        self.string_allocations.used.set(0);
+        self.string_allocations.exceeded.set(None);
+    }
+
+    /// Return the attempted allocation total when a core function exceeded the configured limit.
+    pub fn string_allocation_exceeded(&self) -> Option<usize> {
+        self.string_allocations.exceeded.get()
     }
 
     /// Register a function within the context
@@ -146,6 +171,7 @@ pub struct Evaluation<'c, 'd> {
     functions: &'c Functions,
     variables: &'c Variables<'d>,
     namespaces: &'c Namespaces,
+    string_allocations: &'c StringAllocationBudget,
 }
 
 #[cfg(not(feature = "no-unsafe"))]
@@ -159,6 +185,7 @@ impl<'c, 'd> Evaluation<'c, 'd> {
             functions: &context.functions,
             variables: &context.variables,
             namespaces: &context.namespaces,
+            string_allocations: &context.string_allocations,
             position: 1,
             size: 1,
         }
@@ -192,6 +219,22 @@ impl<'c, 'd> Evaluation<'c, 'd> {
     /// Looks up the namespace URI for the given prefix
     pub fn namespace_for(&self, prefix: &str) -> Option<&str> {
         self.namespaces.get(prefix).map(String::as_str)
+    }
+
+    pub(crate) fn reserve_string_allocation(&self, bytes: usize) -> Result<(), function::Error> {
+        let actual = self.string_allocations.used.get().saturating_add(bytes);
+        if self
+            .string_allocations
+            .limit
+            .is_some_and(|limit| actual > limit)
+        {
+            self.string_allocations.exceeded.set(Some(actual));
+            return Err(function::Error::Other {
+                what: "XPath string allocation budget exceeded".into(),
+            });
+        }
+        self.string_allocations.used.set(actual);
+        Ok(())
     }
 
     /// Yields a new `Evaluation` context for each node in the nodeset.

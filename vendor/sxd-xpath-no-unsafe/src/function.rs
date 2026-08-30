@@ -325,13 +325,22 @@ struct Concat;
 impl Function for Concat {
     fn evaluate<'c, 'd>(
         &self,
-        _context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'c, 'd>,
         args: Vec<Value<'d>>,
     ) -> Result<Value<'d>, Error> {
         let args = Args(args);
         args.at_least(2)?;
         let args = args.into_strings();
-        Ok(Value::String(args.concat()))
+        let length = args
+            .iter()
+            .try_fold(0usize, |total, value| total.checked_add(value.len()))
+            .unwrap_or(usize::MAX);
+        context.reserve_string_allocation(length)?;
+        let mut output = String::with_capacity(length);
+        for value in args {
+            output.push_str(&value);
+        }
+        Ok(Value::String(output))
     }
 }
 
@@ -816,6 +825,19 @@ mod test {
         evaluate_literal(Concat, args!["hello", " ", "world"], |r| {
             assert_eq!(Ok(Value::String("hello world".to_owned())), r);
         });
+    }
+
+    #[test]
+    fn concat_checks_the_context_string_allocation_budget_before_allocating() {
+        // concat must reject its aggregate reservation before constructing an oversized String.
+        let package = Package::new();
+        let document = package.as_document();
+        let mut setup = Setup::new();
+        setup.context.set_string_allocation_limit(3);
+        let error = setup
+            .evaluate(document.root(), Concat, args!["ab", "cd"])
+            .expect_err("four-byte concat must exceed the three-byte allocation budget");
+        assert!(error.to_string().contains("string allocation budget"));
     }
 
     #[test]

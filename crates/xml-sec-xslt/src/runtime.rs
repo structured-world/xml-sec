@@ -400,8 +400,7 @@ impl<'a> Execution<'a> {
                 };
                 pending.extend(source.children.iter().rev().copied());
                 nodes.push(SourceNode::Node(id));
-                if (declaration.match_pattern.source.contains('@')
-                    || declaration.match_pattern.source.contains("attribute::"))
+                if declaration.match_pattern.matches_attributes
                     && let NodeKind::Element { attributes, .. } = &source.kind
                 {
                     nodes.extend(
@@ -1448,9 +1447,7 @@ impl<'a> Execution<'a> {
                     .as_ref()
                     .map(|value| self.evaluate_avt(value, node, position, size))
                     .transpose()?
-                    .or_else(|| {
-                        static_namespace(static_namespaces, prefix.as_deref().unwrap_or_default())
-                    });
+                    .or_else(|| computed_element_namespace(static_namespaces, prefix.as_deref()));
                 let (prefix, namespace) =
                     normalize_computed_namespace(prefix, namespace, &lexical)?;
                 require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
@@ -3414,6 +3411,15 @@ fn static_namespace(namespaces: &[(String, String)], prefix: &str) -> Option<Str
         .rev()
         .find(|(candidate, _)| candidate == prefix)
         .map(|(_, uri)| uri.clone())
+}
+
+fn computed_element_namespace(
+    namespaces: &[(String, String)],
+    prefix: Option<&str>,
+) -> Option<String> {
+    // XSLT 1.0 section 7.1.2 includes the default namespace when expanding an unprefixed
+    // xsl:element name. This intentionally differs from xsl:attribute (section 7.1.3).
+    static_namespace(namespaces, prefix.unwrap_or_default())
 }
 
 fn require_bound_computed_prefix(

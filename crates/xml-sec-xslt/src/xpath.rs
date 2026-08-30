@@ -886,6 +886,8 @@ impl Evaluator {
                 .insert(rewritten.clone(), xpath);
         }
         let mut context = Context::new();
+        let (owned_bytes, owned_bytes_limit) = meter.usage(BudgetKind::OwnedBytes)?;
+        context.set_string_allocation_limit(owned_bytes_limit.saturating_sub(owned_bytes));
         for (prefix, uri) in &expression.namespaces {
             context.set_namespace(prefix, uri);
         }
@@ -1012,21 +1014,34 @@ impl Evaluator {
         let xpath = expressions
             .get(&rewritten)
             .expect("compiled XPath was inserted into the execution cache");
-        let value = xpath.evaluate(&context, context_node).map_err(|error| {
-            let message = error.to_string();
-            // sxd-xpath keeps its execution error enum private. A namespaced
-            // unknown function is nevertheless unambiguous: XPath 1.0 has no
-            // namespaced core functions, so this is an unavailable extension
-            // capability rather than a dynamic failure of the stylesheet.
-            if message.starts_with("unknown function") && message.contains("prefix: Some(") {
-                Error::Unsupported(format!(
-                    "XPath extension function in `{}`: {message}",
-                    expression.source
-                ))
-            } else {
-                Error::Dynamic(format!("XPath `{}` failed: {message}", expression.source))
+        let value = match xpath.evaluate(&context, context_node) {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(attempted) = context.string_allocation_exceeded() {
+                    return Err(Error::Budget {
+                        kind: BudgetKind::OwnedBytes,
+                        limit: owned_bytes_limit,
+                        actual: owned_bytes.saturating_add(attempted),
+                    });
+                }
+                let message = error.to_string();
+                // sxd-xpath keeps its execution error enum private. A namespaced
+                // unknown function is nevertheless unambiguous: XPath 1.0 has no
+                // namespaced core functions, so this is an unavailable extension
+                // capability rather than a dynamic failure of the stylesheet.
+                return Err(
+                    if message.starts_with("unknown function") && message.contains("prefix: Some(")
+                    {
+                        Error::Unsupported(format!(
+                            "XPath extension function in `{}`: {message}",
+                            expression.source
+                        ))
+                    } else {
+                        Error::Dynamic(format!("XPath `{}` failed: {message}", expression.source))
+                    },
+                );
             }
-        })?;
+        };
         self.maps
             .project_value(self.package.as_document().root().into(), value)
     }
@@ -2050,6 +2065,7 @@ fn expand_xinclude_document(
         .node(source.root())
         .and_then(|node| node.base_uri.clone());
     let mut output = Document::empty(base_uri);
+    let mut principal_mapping = HashMap::new();
     let mut pending = source
         .node(source.root())
         .into_iter()
@@ -2070,6 +2086,7 @@ fn expand_xinclude_document(
             if let Some(target) = output.node_mut(target) {
                 target.source_line = node.source_line;
             }
+            principal_mapping.insert(source_id, target);
             pending.extend(node.children.iter().rev().map(|child| (*child, target)));
             continue;
         }
@@ -2085,13 +2102,20 @@ fn expand_xinclude_document(
         );
         match result {
             Ok(XIncludeContent::Xml(included)) => {
+                let mut included_mapping = HashMap::new();
                 let children = included
                     .node(included.root())
                     .map(|root| root.children.clone())
                     .unwrap_or_default();
                 for child in children {
-                    output.append_subtree_from(target_parent, &included, child);
+                    output.append_subtree_from(
+                        target_parent,
+                        &included,
+                        child,
+                        &mut included_mapping,
+                    );
                 }
+                output.remap_ids_from(&included, &included_mapping)?;
             }
             Ok(XIncludeContent::Text(value, base_uri)) => {
                 output.push(
@@ -2133,6 +2157,7 @@ fn expand_xinclude_document(
             }
         }
     }
+    output.remap_ids_from(source, &principal_mapping)?;
     Ok(output)
 }
 
