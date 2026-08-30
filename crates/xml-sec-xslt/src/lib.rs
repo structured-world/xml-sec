@@ -29,6 +29,8 @@
 mod budget;
 mod compiler;
 mod error;
+mod expression;
+mod exslt_date;
 mod model;
 mod resolver;
 mod runtime;
@@ -43,6 +45,8 @@ pub use model::{
     Attribute, Document, ExpandedName, Namespace, Node, NodeId, NodeKind, NodeReference,
 };
 pub use resolver::{NoResolver, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity};
-pub use runtime::{ExecutionOptions, Message, Parameters, TransformResult};
+pub use runtime::{
+    ExecutionOptions, Message, Parameters, SecondaryOutput, SourceProcessing, TransformResult,
+};
 pub use serializer::{OutputDefinition, OutputMethod, SerializedOutput};
 pub use value::Value;

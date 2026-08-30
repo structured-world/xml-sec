@@ -13,8 +13,28 @@ categories = ["cryptography", "web-programming", "authentication"]
 readme = "README.md"
 
 [workspace]
-members = [".", "crates/xml-sec-xslt", "tools/capability-ledger"]
+members = [
+    ".",
+    "crates/xml-sec-xslt",
+    "tools/capability-ledger",
+    "vendor/sxd-xpath-no-unsafe",
+]
 resolver = "3"
+
+[patch.crates-io]
+sxd-xpath-no-unsafe = { path = "vendor/sxd-xpath-no-unsafe" }
+
+# The complete libxslt oracle includes multi-megabyte DocBook transforms. Keep
+# production-equivalent XSLT/XPath code generation in the test profile so the
+# per-case watchdog measures algorithmic stalls rather than debug arithmetic.
+[profile.test.package.xml-sec-xslt]
+opt-level = 2
+
+[profile.test.package.sxd-document-no-unsafe]
+opt-level = 2
+
+[profile.test.package.sxd-xpath-no-unsafe]
+opt-level = 2
 
 [[bin]]
 name = "xmlsec1"

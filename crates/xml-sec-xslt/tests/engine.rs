@@ -69,6 +69,49 @@ fn identity_transform_preserves_elements_attributes_and_namespaces() {
 }
 
 #[test]
+fn ancestor_attribute_nodesets_do_not_leak_from_siblings() {
+    // A node-set variable must contain attributes from the context ancestry only;
+    // a prior changed sibling must not activate inherited diff markup.
+    let stylesheet = r#"
+      <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+        <xsl:output omit-xml-declaration="yes"/>
+        <xsl:template match="/"><out><xsl:apply-templates select="root/item/label"/></out></xsl:template>
+        <xsl:template match="item/label">
+          <xsl:variable name="diffval" select="ancestor-or-self::*/@diff"/>
+          <label count="{count($diffval)}" value="{$diffval}">
+            <xsl:if test="$diffval != ''"><marked/></xsl:if>
+            <xsl:value-of select="."/>
+          </label>
+        </xsl:template>
+      </xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            r#"<root><item diff="add"><label>changed</label></item><item><label>may</label></item></root>"#,
+        ),
+        "<out><label count=\"1\" value=\"add\"><marked/>changed</label><label count=\"0\" value=\"\">may</label></out>\n",
+    );
+}
+
+#[test]
+fn arithmetic_on_a_variable_nodeset_path_uses_xpath_semantics() {
+    // A variable-rooted location path is not a variable name; the generic XPath
+    // evaluator must select the attribute before numeric coercion.
+    let stylesheet = r#"
+      <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+        <xsl:output omit-xml-declaration="yes"/>
+        <xsl:template match="/">
+          <xsl:variable name="colspec" select="table/colspec"/>
+          <out><xsl:value-of select="$colspec/@colnum + 1"/></out>
+        </xsl:template>
+      </xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, r#"<table><colspec colnum="2"/></table>"#),
+        "<out>3</out>\n",
+    );
+}
+
+#[test]
 fn templates_modes_parameters_sort_keys_and_numbering_compose() {
     // Exercises cross-feature dynamic context: mode, params, key(), sort and numbering.
     let stylesheet = r#"
@@ -159,6 +202,34 @@ fn malformed_stylesheet_and_budget_exhaustion_are_typed() {
     ));
 }
 
+#[test]
+fn namespace_name_validation_matches_xslt_1_0_compatibility() {
+    // Legacy XSLT 1.0 stylesheets may use relative namespace names, while a
+    // fragment-only name cannot identify an expanded XSLT QName.
+    compile(
+        r#"<xsl:stylesheet version="1.0"
+             xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+             xmlns:local="data_local_to_this_file">
+             <xsl:template match="/"><local:result/></xsl:template>
+           </xsl:stylesheet>"#,
+    );
+
+    let error = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 16, 256, 4 << 20),
+    )
+    .compile(
+        r##"<xsl:stylesheet version="1.0"
+             xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+             xmlns:local="#fragment">
+             <xsl:variable name="local:value" select="1"/>
+           </xsl:stylesheet>"##,
+        Some("memory:fragment-namespace.xsl"),
+    )
+    .expect_err("fragment-only namespace names must be rejected");
+    assert!(matches!(error, Error::Static(_)));
+}
+
 #[derive(Default)]
 struct MemoryResolver {
     resources: Mutex<HashMap<String, String>>,
@@ -189,6 +260,47 @@ impl Resolver for MemoryResolver {
             encoding: Some("UTF-8".into()),
         })
     }
+}
+
+#[test]
+fn document_function_resolves_dynamic_uris_without_cross_document_leaks() {
+    // External trees share stable semantic node identities, but ordinary absolute
+    // paths remain confined to the logical document of the current context node.
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "external.xml".into(),
+            "<catalog><item>external</item></catalog>".into(),
+        );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(//item)"/><xsl:text>|</xsl:text><xsl:value-of select="count(document(/*/@href))"/><xsl:text>|</xsl:text><xsl:value-of select="count(document(/*/@href)/catalog)"/><xsl:text>|</xsl:text><xsl:value-of select="document(/*/@href)/catalog/item"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let output = stylesheet
+        .execute(
+            &Document::parse(
+                "<source href=\"external.xml\"><item>primary</item></source>",
+                Some("memory:source.xml"),
+            )
+            .expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1 << 20),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("external document resolves");
+    assert_eq!(output.serialized.bytes, b"1|1|1|external");
 }
 
 #[test]
@@ -254,7 +366,7 @@ fn serializer_honors_doctype_cdata_html_and_text_contracts() {
     let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" doctype-system="result.dtd" cdata-section-elements="script"/><xsl:template match="/"><doc><script><xsl:text>if (a &lt; b) x = ']]&gt;';</xsl:text></script></doc></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(xml, "<source/>"),
-        "<!DOCTYPE doc SYSTEM \"result.dtd\"><doc><script><![CDATA[if (a < b) x = ']]><![CDATA[>';]]></script></doc>\n",
+        "<!DOCTYPE doc SYSTEM \"result.dtd\">\n<doc><script><![CDATA[if (a < b) x = ']]]]><![CDATA[>';]]></script></doc>\n",
     );
 
     let html = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><html><body><br/><script>if (a &lt; b) x++;</script></body></html></xsl:template></xsl:stylesheet>"#;
@@ -265,6 +377,24 @@ fn serializer_honors_doctype_cdata_html_and_text_contracts() {
 
     let text = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><ignored>A<xsl:value-of select="'&lt;B'"/></ignored></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(text, "<source/>"), "A<B");
+
+    let lexical = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="xml" indent="no" omit-xml-declaration="yes"/><xsl:template match="/"><doc><xsl:text>&#13;</xsl:text></doc></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(lexical, "<source/>"), "<doc>&#13;</doc>");
+
+    let html_pi = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" indent="no"/><xsl:template match="/"><xsl:processing-instruction name="php">Success</xsl:processing-instruction></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(html_pi, "<source/>"), "<?php Success>");
+
+    let html_meta = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><head/></html></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(html_meta, "<source/>"),
+        r#"<html><head><meta charset="UTF-8"></head></html>"#
+    );
+
+    let xhtml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns="http://www.w3.org/1999/xhtml"><xsl:output method="xml" omit-xml-declaration="yes" indent="no"/><xsl:template match="/"><html><link/></html></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(xhtml, "<source/>"),
+        r#"<html xmlns="http://www.w3.org/1999/xhtml"><link/></html>"#
+    );
 }
 
 #[test]
@@ -412,6 +542,13 @@ fn static_xpath_and_template_conflicts_are_resolved_during_compilation() {
         Err(Error::Static(_))
     ));
 
+    let unbound_prefix = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="*[missing:name]"/></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 256, 4096),)
+            .compile(unbound_prefix, None),
+        Err(Error::Static(_))
+    ));
+
     let union = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:apply-templates select="bar"/></xsl:template><xsl:template match="foo|*"><wild/></xsl:template><xsl:template match="bar"><specific/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(union, "<bar/>"), "<specific/>\n");
 }
@@ -442,13 +579,19 @@ fn whitespace_rules_honor_namespaces_specificity_and_inherited_xml_space() {
 #[test]
 fn xpath_context_keeps_predicate_positions_and_all_node_kinds() {
     // XSLT outer context and XPath predicate context must not overwrite one another.
-    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:value-of select="position()"/><xsl:text>:</xsl:text><xsl:value-of select="count(child[position() &lt; 2])"/><xsl:text>|</xsl:text></xsl:for-each><xsl:for-each select="root/@*"><xsl:variable name="a" select="."/><xsl:value-of select="name(current())"/><xsl:text>=</xsl:text><xsl:value-of select="$a"/></xsl:for-each></xsl:template></xsl:stylesheet>"#;
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:value-of select="position()"/><xsl:text>:</xsl:text><xsl:value-of select="count(child[position() &lt; 2])"/><xsl:text>|</xsl:text></xsl:for-each><xsl:value-of select="name(/*)"/><xsl:text>:</xsl:text><xsl:value-of select="local-name(/*)"/><xsl:text>:</xsl:text><xsl:value-of select="namespace-uri(/*)"/><xsl:text>|</xsl:text><xsl:for-each select="root/@*"><xsl:variable name="a" select="."/><xsl:value-of select="name(current())"/><xsl:text>=</xsl:text><xsl:value-of select="$a"/></xsl:for-each></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(
             stylesheet,
             r#"<root id="r"><item><child/><child/></item><item><child/></item></root>"#,
         ),
-        "1:1|2:1|id=r"
+        "1:1|2:1|root:root:|id=r"
+    );
+
+    let default_namespace = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:d="urn:default"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="name(/d:doc)"/><xsl:text>:</xsl:text><xsl:value-of select="local-name(/d:doc)"/><xsl:text>:</xsl:text><xsl:value-of select="namespace-uri(/d:doc)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(default_namespace, r#"<doc xmlns="urn:default"/>"#),
+        "doc:doc:urn:default"
     );
 }
 
@@ -472,6 +615,12 @@ fn numbering_parses_tokens_widths_and_unicode_decimal_patterns() {
     assert_eq!(
         execute(stylesheet, "<book><chapter><section/></chapter></book>"),
         "001|2.|A.1|١٢"
+    );
+
+    let lexical_numbers = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="285311670611"/><xsl:text>|</xsl:text><xsl:value-of select="95012.38841989999"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(lexical_numbers, "<source/>"),
+        "2.85311670611e+11|95012.3884199"
     );
 }
 
@@ -777,6 +926,12 @@ fn namespaces_fallbacks_and_xml_characters_fail_or_emit_by_contract() {
         "<used:out xmlns:used=\"urn:used\"/>\n"
     );
 
+    let undeclared = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns="urn:parent"><xsl:output omit-xml-declaration="yes" indent="no"/><xsl:template match="/"><parent><xsl:copy-of select="/*/*"/></parent></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(undeclared, "<source><child/></source>"),
+        r#"<parent xmlns="urn:parent"><child xmlns=""/></parent>"#
+    );
+
     let fallback = r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:future><xsl:fallback><xsl:value-of select="["/></xsl:fallback></xsl:future></xsl:template></xsl:stylesheet>"#;
     assert!(matches!(
         Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
@@ -805,4 +960,177 @@ fn namespaces_fallbacks_and_xml_characters_fail_or_emit_by_contract() {
         ),
         Err(Error::Serialization(_))
     ));
+}
+
+#[test]
+fn xpath_accepts_whitespace_before_function_arguments() {
+    // XPath permits whitespace between a function QName and its argument list even
+    // though the underlying parser requires lexical normalization.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="concat ('a', 'b')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "ab");
+}
+
+#[test]
+fn xpath_document_root_and_inherited_language_use_xslt_context() {
+    // A root-only path inside a function call must address the current logical
+    // document, and lang() must walk inherited xml:lang declarations.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="string-length(generate-id(/))"/><xsl:text>|</xsl:text><xsl:apply-templates select="root/item"/></xsl:template><xsl:template match="item"><xsl:value-of select="lang('en')"/><xsl:text>|</xsl:text><xsl:value-of select="lang('de')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, r#"<root xml:lang="en-GB"><item/></root>"#),
+        "3|true|false"
+    );
+}
+
+#[test]
+fn stylesheet_defined_exslt_functions_preserve_xpath_values() {
+    // Function calls must retain numeric and result-tree-fragment types across
+    // recursion instead of degrading every extension result to a string.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><xsl:output omit-xml-declaration="yes" indent="no"/><func:function name="f:sum"><xsl:param name="n"/><xsl:param name="step" select="1"/><xsl:choose><xsl:when test="$n &gt; 0"><func:result select="$n + f:sum($n - $step, $step)"/></xsl:when><xsl:otherwise><func:result select="0"/></xsl:otherwise></xsl:choose></func:function><func:function name="f:tree"><func:result><answer><xsl:value-of select="f:sum(3)"/></answer></func:result></func:function><xsl:template match="/"><xsl:copy-of select="f:tree()"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "<answer>6</answer>");
+}
+
+#[test]
+fn exslt_node_set_preserves_nested_parameter_fragments() {
+    // A fragment copied through xsl:with-param must retain element identity when a
+    // second temporary tree filters it and converts it back with exsl:node-set().
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common" exclude-result-prefixes="exsl"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:apply-templates select="source"><xsl:with-param name="selection"><xsl:copy-of select="source/forms"/></xsl:with-param></xsl:apply-templates></xsl:template><xsl:template match="source"><xsl:param name="selection"/><xsl:variable name="filtered"><paradigm><xsl:copy-of select="exsl:node-set($selection)/forms/form[@id='b']"/></paradigm></xsl:variable><out><xsl:copy-of select="exsl:node-set($filtered)/paradigm/form"/></out></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            "<source><forms><form id=\"a\"/><form id=\"b\"/></forms></source>"
+        ),
+        "<out><form id=\"b\"/></out>\n"
+    );
+}
+
+#[test]
+fn exslt_node_set_preserves_large_filtered_parameter_fragments() {
+    // The libxslt node-set.5/.6 stylesheets repeatedly pass copied source
+    // subtrees as RTF parameters. Materialization must preserve descendants
+    // and predicate evaluation before the recursive templates run.
+    let stylesheet = r#"
+      <xsl:stylesheet version="1.0"
+        xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+        xmlns:exsl="http://exslt.org/common"
+        exclude-result-prefixes="exsl">
+        <xsl:output method="text"/>
+        <xsl:template match="document">
+          <xsl:variable name="selection"><xsl:copy-of select="/document/paradigm"/></xsl:variable>
+          <xsl:value-of select="count(exsl:node-set($selection)/paradigm/form)"/>
+          <xsl:text>|</xsl:text>
+          <xsl:value-of select="count(exsl:node-set($selection)/paradigm/form[attribute[@name='caste' and @value='Brahmin']])"/>
+        </xsl:template>
+      </xsl:stylesheet>"#;
+    let source = include_str!("fixtures/libxslt-1.1.45/upstream/tests/exslt/common/node-set.6.xml");
+    assert_eq!(execute(stylesheet, source), "24|12");
+}
+
+#[test]
+fn exslt_function_contract_is_rejected_statically() {
+    // func:result is an instruction, not a top-level declaration or a general
+    // extension fallback, and select/content are mutually exclusive.
+    let outside = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" extension-element-prefixes="func"><xsl:template match="/"><func:result select="1"/></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(outside, None),
+        Err(Error::Static(_))
+    ));
+
+    let mixed = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><func:function name="f:bad"><func:result select="1">content</func:result></func:function></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(mixed, None),
+        Err(Error::Static(_))
+    ));
+}
+
+#[test]
+fn match_patterns_preserve_predicate_context() {
+    // Predicates in match patterns keep the candidate node as their context;
+    // positional sibling steps must not be evaluated against the document wrapper.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" indent="no"/><xsl:template match="/"><out><xsl:apply-templates select="table/row"/></out></xsl:template><xsl:template match="row" priority="-1"><row/></xsl:template><xsl:template match="row[id mod 3 = 2][following-sibling::row[4]/firstname='Bob']"><crazy/></xsl:template></xsl:stylesheet>"#;
+    let source = "<table><row><id>1</id></row><row><id>2</id></row><row/><row/><row/><row><firstname>Bob</firstname></row></table>";
+    let selection = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(//row[id mod 3 = 2][following-sibling::row[4]/firstname='Bob'])"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(selection, source), "1");
+    assert_eq!(
+        execute(stylesheet, source),
+        "<out><row/><crazy/><row/><row/><row/><row/></out>"
+    );
+}
+
+#[test]
+fn self_axis_preserves_node_sets_through_template_parameters() {
+    // self::* and self::text() are axes, not boolean node-kind tests. Values
+    // stored in variables must retain node identity when passed to templates.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:apply-templates select="root"/></xsl:template><xsl:template match="root"><xsl:variable name="element" select="self::*"/><xsl:variable name="text" select="text()/self::text()"/><xsl:call-template name="emit"><xsl:with-param name="element" select="$element"/><xsl:with-param name="text" select="$text"/></xsl:call-template></xsl:template><xsl:template name="emit"><xsl:param name="element"/><xsl:param name="text"/><out><xsl:copy-of select="$element/@id"/><xsl:value-of select="$text"/></out></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root id=\"kept\">content</root>"),
+        "<out id=\"kept\">content</out>\n"
+    );
+}
+
+#[test]
+fn recursive_named_templates_accumulate_result_tree_fragment_parameters() {
+    // DocBook uses this shape to indent method signatures. The RTF accumulator
+    // must remain string-coercible across every recursive call.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="decl"><xsl:text>abc</xsl:text></xsl:variable><xsl:call-template name="repeat"><xsl:with-param name="string">&#160;</xsl:with-param><xsl:with-param name="count" select="string-length($decl)"/></xsl:call-template></xsl:template><xsl:template name="repeat"><xsl:param name="string"/><xsl:param name="count" select="0"/><xsl:param name="result"/><xsl:choose><xsl:when test="$count &gt; 0"><xsl:call-template name="repeat"><xsl:with-param name="string" select="$string"/><xsl:with-param name="count" select="$count - 1"/><xsl:with-param name="result"><xsl:value-of select="$result"/><xsl:value-of select="$string"/></xsl:with-param></xsl:call-template></xsl:when><xsl:otherwise><xsl:value-of select="$result"/></xsl:otherwise></xsl:choose></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<root/>"), "\u{a0}\u{a0}\u{a0}");
+}
+
+#[test]
+fn html_uri_serialization_drops_only_leading_xml_whitespace() {
+    // Match libxslt's HTML serializer: leading XML whitespace is ignored,
+    // while interior and trailing URI spaces are percent-encoded.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="html" omit-xml-declaration="yes"/><xsl:template match="/"><a href="  a b  ">x</a></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root/>"),
+        "<a href=\"a%20b%20%20\">x</a>\n"
+    );
+}
+
+#[test]
+fn imported_predicate_templates_override_base_templates() {
+    // A higher-precedence imported module must be able to suppress nodes that
+    // a lower-precedence generic template would otherwise copy.
+    assert_eq!(
+        execute(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out><xsl:apply-templates/></out></xsl:template><xsl:template match="*"><xsl:copy><xsl:apply-templates/></xsl:copy></xsl:template><xsl:template match="*[@diff='del']"/></xsl:stylesheet>"#,
+            "<root><old diff=\"del\">gone</old><kept>here</kept></root>",
+        ),
+        "<out><root><kept>here</kept></root></out>\n"
+    );
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver.resources.lock().expect("test resolver mutex is not poisoned").insert(
+        "base.xsl".into(),
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out><xsl:apply-templates/></out></xsl:template><xsl:template match="*"><xsl:copy><xsl:apply-templates/></xsl:copy></xsl:template></xsl:stylesheet>"#.into(),
+    );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="base.xsl"/><xsl:output omit-xml-declaration="yes"/><xsl:template match="*[@diff='del']"/></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("imported predicate stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse(
+                "<root><old diff=\"del\">gone</old><kept>here</kept></root>",
+                None,
+            )
+            .expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1 << 20),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("transformation succeeds");
+    assert_eq!(
+        result.serialized.bytes,
+        b"<out><root><kept>here</kept></root></out>\n"
+    );
 }

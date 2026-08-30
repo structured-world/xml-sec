@@ -12,7 +12,10 @@ readme = "README.md"
 encoding_rs = "0.8"
 icu_collator = "2.3.1"
 icu_locale = "2.3.1"
+md-5 = "0.11"
 roxmltree = { version = "0.21", features = ["positions"] }
+quick-xml = "0.42"
+sha1 = "0.11"
 sxd-document-no-unsafe = { version = "0.4.1", default-features = false, features = ["no-unsafe"] }
 sxd-xpath-no-unsafe = { version = "0.5.1", default-features = false, features = ["no-unsafe"] }
 thiserror = "2"

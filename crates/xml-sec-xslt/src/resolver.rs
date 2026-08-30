@@ -11,6 +11,7 @@ pub enum ResolvePurpose {
     Include,
     Import,
     Document,
+    XInclude,
 }
 
 /// Immutable bytes and provenance supplied by a caller-owned resolver.

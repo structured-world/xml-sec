@@ -3,3 +3,5 @@ tests/fixtures/xmlenc/01-phaos-xmlenc-3/** -text whitespace=-trailing-space,-spa
 tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/** -text whitespace=-blank-at-eof
 tests/fixtures/xmldsig/phaos-xmldsig-three/** -text whitespace=-trailing-space,-space-before-tab,-blank-at-eof
 tests/fixtures/xmldsig/external-data/rfc3161.txt -text
+crates/xml-sec-xslt/tests/fixtures/libxslt-1.1.45/upstream/** -text whitespace=-trailing-space,-space-before-tab,-blank-at-eof
+vendor/sxd-xpath-no-unsafe/** -text whitespace=-trailing-space,-space-before-tab,-blank-at-eof

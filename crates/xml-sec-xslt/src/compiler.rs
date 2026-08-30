@@ -3,11 +3,17 @@ use std::sync::Arc;
 
 use crate::budget::ensure;
 use crate::{
-    BudgetKind, CompileBudget, Error, ExpandedName, Namespace, OutputDefinition, OutputMethod,
-    ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity, Result,
+    BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, OutputDefinition,
+    OutputMethod, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity, Result,
 };
 
 pub(crate) const XSLT_NS: &str = "http://www.w3.org/1999/XSL/Transform";
+pub(crate) const EXSLT_FUNCTIONS_NS: &str = "http://exslt.org/functions";
+const SAXON_NS: &str = "http://icl.com/saxon";
+const XT_NS: &str = "http://www.jclark.com/xt";
+const XALAN_REDIRECT_NS: &str = "org.apache.xalan.xslt.extensions.Redirect";
+const LIBXSLT_TEST_NS: &str = "http://xmlsoft.org/XSLT/";
+const LIBXSLT_TEST_PLUGIN_NS: &str = "http://xmlsoft.org/xslt/testplugin";
 
 /// XSLT compiler with an explicit resource boundary and compile budget.
 pub struct Compiler<R> {
@@ -30,7 +36,10 @@ impl<R: Resolver> Compiler<R> {
         )?;
         let mut state = CompileState::new(self.budget);
         self.compile_module(xml, base_uri, None, &mut state, 1)?;
-        state.finish()
+        let mut stylesheet = state.finish()?;
+        stylesheet.principal_document = Document::parse(xml, base_uri)?;
+        stylesheet.principal_base_uri = base_uri.map(str::to_owned);
+        Ok(stylesheet)
     }
 
     fn compile_module(
@@ -70,6 +79,16 @@ impl<R: Resolver> Compiler<R> {
         depth: usize,
         saw_non_import: &mut bool,
     ) -> Result<()> {
+        if root.children().any(|child| {
+            child.is_text()
+                && child
+                    .text()
+                    .is_some_and(|text| !is_xml_whitespace_only(text))
+        }) {
+            return Err(Error::Static(
+                "non-whitespace character data is not allowed at stylesheet top level".into(),
+            ));
+        }
         for child in root.children().filter(roxmltree::Node::is_element) {
             let is_import = child.has_tag_name((XSLT_NS, "import"));
             if is_import && *saw_non_import {
@@ -250,7 +269,8 @@ impl<R: Resolver> Compiler<R> {
             body: vec![compile_literal_element(
                 root,
                 CompileContext::new(version != "1.0", depth, state.budget.recursion_depth)?,
-            )?],
+            )?]
+            .into(),
         });
         Ok(())
     }
@@ -263,6 +283,40 @@ impl<R: Resolver> Compiler<R> {
         state: &mut CompileState,
         depth: usize,
     ) -> Result<()> {
+        if node.has_tag_name((EXSLT_FUNCTIONS_NS, "function")) {
+            let context = CompileContext::new(forward, depth, state.budget.recursion_depth)?
+                .inside_function();
+            let mut children = node.children().peekable();
+            let mut params = Vec::new();
+            while let Some(child) = children.peek().copied() {
+                if child.has_tag_name((XSLT_NS, "param")) {
+                    params.push(compile_variable(child, context)?);
+                    children.next();
+                } else if (child.is_text() && child.text().is_none_or(is_xml_whitespace_only))
+                    || child.is_comment()
+                    || child.is_pi()
+                {
+                    children.next();
+                } else {
+                    break;
+                }
+            }
+            let body = compile_sequence(children, context)?;
+            if count_function_results(&body) > 1 {
+                return Err(Error::Static(
+                    "func:function may contain only one func:result".into(),
+                ));
+            }
+            let order = state.next_order();
+            state.functions.push(ExsltFunction {
+                name: required_qname_attr(node, "name")?,
+                params,
+                body,
+                precedence,
+                order,
+            });
+            return Ok(());
+        }
         if node.tag_name().namespace() != Some(XSLT_NS) {
             return Ok(());
         }
@@ -292,8 +346,7 @@ impl<R: Resolver> Compiler<R> {
                             CompileContext::new(forward, depth, state.budget.recursion_depth)?,
                         )?);
                         children.next();
-                    } else if (child.is_text()
-                        && child.text().is_none_or(|text| text.trim().is_empty()))
+                    } else if (child.is_text() && child.text().is_none_or(is_xml_whitespace_only))
                         || child.is_comment()
                         || child.is_pi()
                     {
@@ -302,10 +355,11 @@ impl<R: Resolver> Compiler<R> {
                         break;
                     }
                 }
-                let body = compile_sequence(
+                let body: Arc<[Instruction]> = compile_sequence(
                     children,
                     CompileContext::new(forward, depth, state.budget.recursion_depth)?,
-                )?;
+                )?
+                .into();
                 let order = state.next_order();
                 if patterns.is_empty() {
                     state.templates.push(Template {
@@ -329,7 +383,7 @@ impl<R: Resolver> Compiler<R> {
                             precedence,
                             order,
                             params: params.clone(),
-                            body: body.clone(),
+                            body: Arc::clone(&body),
                         });
                     }
                 }
@@ -365,18 +419,34 @@ impl<R: Resolver> Compiler<R> {
                 match_pattern: Pattern::new(required_attr(node, "match")?, node)?,
                 use_expression: Expression::new(required_attr(node, "use")?, node)?,
             }),
-            "decimal-format" => state.decimal_formats.push(DecimalFormat::parse(node)?),
-            "namespace-alias" => state.namespace_aliases.push(NamespaceAlias {
-                stylesheet_namespace: alias_namespace(
+            "decimal-format" => {
+                let format = DecimalFormat::parse(node, precedence)?;
+                if let Some(existing) = state.decimal_formats.iter().find(|existing| {
+                    existing.name == format.name && existing.precedence == format.precedence
+                }) {
+                    if existing != &format {
+                        return Err(Error::Static(format!(
+                            "conflicting xsl:decimal-format declaration for {}",
+                            format
+                                .name
+                                .as_ref()
+                                .map_or("the default format", |name| name.local.as_str())
+                        )));
+                    }
+                } else {
+                    state.decimal_formats.push(format);
+                }
+            }
+            "namespace-alias" => state.namespace_aliases.push(parse_namespace_alias(node)?),
+            "attribute-set" => {
+                let order = state.next_order();
+                state.attribute_sets.push(AttributeSet::parse(
                     node,
-                    required_attr(node, "stylesheet-prefix")?,
-                )?,
-                result_namespace: alias_namespace(node, required_attr(node, "result-prefix")?)?,
-            }),
-            "attribute-set" => state.attribute_sets.push(AttributeSet::parse(
-                node,
-                CompileContext::new(forward, depth, state.budget.recursion_depth)?,
-            )?),
+                    CompileContext::new(forward, depth, state.budget.recursion_depth)?,
+                    precedence,
+                    order,
+                )?)
+            }
             _unknown if forward => {}
             unknown => return Err(Error::Static(format!("unknown top-level xsl:{unknown}"))),
         }
@@ -387,6 +457,8 @@ impl<R: Resolver> Compiler<R> {
 /// Immutable compiled XSLT stylesheet.
 #[derive(Debug, Clone)]
 pub struct Stylesheet {
+    pub(crate) principal_document: Document,
+    pub(crate) principal_base_uri: Option<String>,
     pub(crate) templates: Arc<[Template]>,
     pub(crate) globals: Arc<[GlobalVariable]>,
     pub(crate) output: OutputDefinition,
@@ -395,6 +467,7 @@ pub struct Stylesheet {
     pub(crate) decimal_formats: Arc<[DecimalFormat]>,
     pub(crate) namespace_aliases: Arc<[NamespaceAlias]>,
     pub(crate) attribute_sets: Arc<[AttributeSet]>,
+    pub(crate) functions: Arc<[ExsltFunction]>,
     pub(crate) resource_identities: Arc<[ResourceIdentity]>,
 }
 
@@ -418,7 +491,7 @@ pub(crate) struct Template {
     pub precedence: usize,
     pub order: usize,
     pub params: Vec<Variable>,
-    pub body: Vec<Instruction>,
+    pub body: Arc<[Instruction]>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct GlobalVariable {
@@ -426,6 +499,14 @@ pub(crate) struct GlobalVariable {
     pub precedence: usize,
     pub order: usize,
     pub is_parameter: bool,
+}
+#[derive(Debug, Clone)]
+pub(crate) struct ExsltFunction {
+    pub name: ExpandedName,
+    pub params: Vec<Variable>,
+    pub body: Vec<Instruction>,
+    pub precedence: usize,
+    pub order: usize,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Variable {
@@ -523,7 +604,21 @@ pub(crate) enum Instruction {
         terminate: bool,
         body: Vec<Instruction>,
     },
-    Fallback(Vec<Instruction>),
+    SecondaryOutput {
+        uri: AttributeValueTemplate,
+        properties: Vec<(String, AttributeValueTemplate)>,
+        body: Vec<Instruction>,
+    },
+    ExtensionFallback {
+        name: String,
+        present: bool,
+        body: Vec<Instruction>,
+    },
+    CompatibilityComment(String),
+    FunctionResult {
+        select: Option<Expression>,
+        content: Vec<Instruction>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -545,9 +640,9 @@ pub(crate) struct NumberInstruction {
     pub count: Option<Pattern>,
     pub from: Option<Pattern>,
     pub level: String,
-    pub format: String,
-    pub lang: Option<String>,
-    pub letter_value: Option<String>,
+    pub format: AttributeValueTemplate,
+    pub lang: Option<AttributeValueTemplate>,
+    pub letter_value: Option<AttributeValueTemplate>,
     pub grouping_separator: Option<AttributeValueTemplate>,
     pub grouping_size: Option<AttributeValueTemplate>,
 }
@@ -560,6 +655,7 @@ pub(crate) struct KeyDeclaration {
 #[derive(Debug, Clone)]
 pub(crate) struct NamespaceAlias {
     pub stylesheet_namespace: Option<String>,
+    pub output_prefix: Option<String>,
     pub result_namespace: Option<String>,
 }
 #[derive(Debug, Clone)]
@@ -567,10 +663,13 @@ pub(crate) struct AttributeSet {
     pub name: ExpandedName,
     pub uses: Vec<ExpandedName>,
     pub attributes: Vec<Instruction>,
+    pub precedence: usize,
+    pub order: usize,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecimalFormat {
     pub name: Option<ExpandedName>,
+    pub precedence: usize,
     pub decimal_separator: char,
     pub grouping_separator: char,
     pub infinity: String,
@@ -597,14 +696,18 @@ pub(crate) enum NamespaceTest {
 
 impl Expression {
     fn new(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Self> {
+        let namespaces = namespaces(node);
+        validate_xpath_prefixes(source, &namespaces)?;
+        let normalized = normalize_xpath_for_sxd(source);
+        let normalized = crate::xpath::rewrite_absolute_paths_for_validation(&normalized);
         sxd_xpath_no_unsafe::Factory::new()
-            .build(source)
+            .build(&normalized)
             .map_err(|error| {
                 Error::Static(format!("invalid XPath expression `{source}`: {error}"))
             })?;
         Ok(Self {
             source: source.to_owned(),
-            namespaces: namespaces(node),
+            namespaces,
         })
     }
 }
@@ -615,6 +718,7 @@ impl Pattern {
         }
         for branch in split_pattern_branches(source) {
             let branch = branch.trim();
+            validate_xpath_prefixes(branch, &namespaces(node))?;
             let expression = if branch.starts_with('/')
                 || branch.starts_with("id(")
                 || branch.starts_with("key(")
@@ -623,6 +727,8 @@ impl Pattern {
             } else {
                 format!("//{branch}")
             };
+            let expression = normalize_xpath_for_sxd(&expression);
+            let expression = crate::xpath::rewrite_absolute_paths_for_validation(&expression);
             sxd_xpath_no_unsafe::Factory::new()
                 .build(&expression)
                 .map_err(|error| {
@@ -643,7 +749,7 @@ impl Pattern {
     }
     fn default_priority(&self) -> f64 {
         let value = self.source.trim();
-        if value == "*"
+        if matches!(value, "*" | "@*")
             || matches!(
                 value,
                 "node()" | "text()" | "comment()" | "processing-instruction()"
@@ -652,12 +758,140 @@ impl Pattern {
             -0.5
         } else if value.ends_with(":*") {
             -0.25
-        } else if !value.contains(['/', '[', '|']) {
+        } else if !value.contains(['/', '[', '|', '(', ')'])
+            || value
+                .strip_prefix("processing-instruction(")
+                .and_then(|value| value.strip_suffix(')'))
+                .is_some_and(|value| {
+                    let value = value.trim();
+                    (value.starts_with('\'') && value.ends_with('\''))
+                        || (value.starts_with('"') && value.ends_with('"'))
+                })
+        {
             0.0
         } else {
             0.5
         }
     }
+}
+
+fn validate_xpath_prefixes(source: &str, namespaces: &[(String, String)]) -> Result<()> {
+    let characters = source.chars().collect::<Vec<_>>();
+    let mut quote = None;
+    let mut cursor = 0;
+    while cursor < characters.len() {
+        let character = characters[cursor];
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            cursor += 1;
+            continue;
+        }
+        if !is_xpath_name_start(character) {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        cursor += 1;
+        while cursor < characters.len() && is_xpath_ncname_character(characters[cursor]) {
+            cursor += 1;
+        }
+        if cursor >= characters.len()
+            || characters[cursor] != ':'
+            || characters.get(cursor + 1) == Some(&':')
+            || !characters
+                .get(cursor + 1)
+                .copied()
+                .is_some_and(is_xpath_name_start)
+        {
+            continue;
+        }
+        let prefix = characters[start..cursor].iter().collect::<String>();
+        if prefix != "xml" && !namespaces.iter().any(|(declared, _)| declared == &prefix) {
+            return Err(Error::Static(format!(
+                "XPath expression `{source}` uses unbound namespace prefix `{prefix}`"
+            )));
+        }
+        cursor += 1;
+    }
+    Ok(())
+}
+
+fn is_xpath_name_start(character: char) -> bool {
+    character.is_alphabetic() || character == '_'
+}
+
+fn is_xpath_ncname_character(character: char) -> bool {
+    is_xpath_name_start(character) || character.is_ascii_digit() || matches!(character, '-' | '.')
+}
+
+pub(crate) fn normalize_xpath_for_sxd(source: &str) -> String {
+    let characters = source.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(source.len());
+    let mut quote = None;
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+        if let Some(active) = quote {
+            output.push(character);
+            if character == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            output.push(character);
+            index += 1;
+            continue;
+        }
+        if character.is_whitespace()
+            && output
+                .chars()
+                .next_back()
+                .is_some_and(is_xpath_name_character)
+        {
+            let mut next = index + 1;
+            while next < characters.len() && characters[next].is_whitespace() {
+                next += 1;
+            }
+            if next < characters.len() && characters[next] == '(' {
+                index = next;
+                continue;
+            }
+        }
+        if character == '*'
+            && output
+                .chars()
+                .rev()
+                .find(|candidate| !candidate.is_whitespace())
+                .is_some_and(|previous| matches!(previous, '(' | ','))
+        {
+            let next = characters[index + 1..]
+                .iter()
+                .copied()
+                .find(|candidate| !candidate.is_whitespace());
+            if next.is_some_and(|next| matches!(next, ')' | ',')) {
+                output.push_str("child::*");
+                index += 1;
+                continue;
+            }
+        }
+        output.push(character);
+        index += 1;
+    }
+    output
+}
+
+fn is_xpath_name_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
 }
 
 fn split_pattern_branches(source: &str) -> Vec<&str> {
@@ -710,15 +944,36 @@ impl NameTest {
 }
 
 fn alias_namespace(node: roxmltree::Node<'_, '_>, prefix: &str) -> Result<Option<String>> {
-    let prefix = (prefix != "#default").then_some(prefix);
-    node.lookup_namespace_uri(prefix)
+    if prefix == "#default" {
+        return Ok(node.lookup_namespace_uri(None).map(str::to_owned));
+    }
+    node.lookup_namespace_uri(Some(prefix))
         .map(|uri| Some(uri.to_owned()))
-        .ok_or_else(|| {
-            Error::Static(format!(
-                "namespace-alias prefix {} is not bound",
-                prefix.unwrap_or("#default")
-            ))
-        })
+        .ok_or_else(|| Error::Static(format!("namespace-alias prefix {prefix} is not bound")))
+}
+
+fn parse_namespace_alias(node: roxmltree::Node<'_, '_>) -> Result<NamespaceAlias> {
+    let stylesheet_prefix = required_attr(node, "stylesheet-prefix")?;
+    let result_prefix = required_attr(node, "result-prefix")?;
+    let stylesheet_namespace = alias_namespace(node, stylesheet_prefix)?;
+    let result_namespace = if result_prefix == "#default" {
+        node.lookup_namespace_uri(None)
+            .map(str::to_owned)
+            .or_else(|| stylesheet_namespace.clone())
+    } else {
+        alias_namespace(node, result_prefix)?
+    };
+    Ok(NamespaceAlias {
+        stylesheet_namespace,
+        output_prefix: if result_prefix == "#default" {
+            None
+        } else if stylesheet_prefix == "#default" {
+            Some(result_prefix.to_owned())
+        } else {
+            Some(stylesheet_prefix.to_owned())
+        },
+        result_namespace,
+    })
 }
 
 struct CompileState {
@@ -731,6 +986,7 @@ struct CompileState {
     decimal_formats: Vec<DecimalFormat>,
     namespace_aliases: Vec<NamespaceAlias>,
     attribute_sets: Vec<AttributeSet>,
+    functions: Vec<ExsltFunction>,
     resources: Vec<ResourceIdentity>,
     resource_set: HashSet<ResourceIdentity>,
     active_resources: HashSet<ResourceIdentity>,
@@ -753,6 +1009,7 @@ impl CompileState {
             decimal_formats: vec![],
             namespace_aliases: vec![],
             attribute_sets: vec![],
+            functions: vec![],
             resources: vec![],
             resource_set: HashSet::new(),
             active_resources: HashSet::new(),
@@ -796,7 +1053,18 @@ impl CompileState {
                 )));
             }
         }
+        let mut functions = HashSet::new();
+        for function in &self.functions {
+            if !functions.insert((&function.name, function.precedence)) {
+                return Err(Error::Static(format!(
+                    "duplicate EXSLT function {} at equal import precedence",
+                    function.name.local
+                )));
+            }
+        }
         Ok(Stylesheet {
+            principal_document: Document::empty(None),
+            principal_base_uri: None,
             templates: self.templates.into(),
             globals: self.globals.into(),
             output: self.output,
@@ -805,6 +1073,7 @@ impl CompileState {
             decimal_formats: self.decimal_formats.into(),
             namespace_aliases: self.namespace_aliases.into(),
             attribute_sets: self.attribute_sets.into(),
+            functions: self.functions.into(),
             resource_identities: self.resources.into(),
         })
     }
@@ -822,6 +1091,7 @@ struct CompileContext {
     forward: bool,
     depth: usize,
     max_depth: usize,
+    inside_function: bool,
 }
 
 impl CompileContext {
@@ -831,11 +1101,31 @@ impl CompileContext {
             forward,
             depth,
             max_depth,
+            inside_function: false,
         })
     }
 
     fn descend(self) -> Result<Self> {
-        Self::new(self.forward, self.depth.saturating_add(1), self.max_depth)
+        let mut descended = Self::new(self.forward, self.depth.saturating_add(1), self.max_depth)?;
+        descended.inside_function = self.inside_function;
+        Ok(descended)
+    }
+
+    fn inside_function(mut self) -> Self {
+        self.inside_function = true;
+        self
+    }
+
+    fn with_literal_version(mut self, node: roxmltree::Node<'_, '_>) -> Result<Self> {
+        if let Some(version) = node.attribute((XSLT_NS, "version")) {
+            let version = version
+                .parse::<f64>()
+                .ok()
+                .filter(|value| *value >= 1.0)
+                .ok_or_else(|| Error::Static(format!("unsupported XSLT version {version}")))?;
+            self.forward = version > 1.0;
+        }
+        Ok(self)
     }
 }
 
@@ -919,7 +1209,7 @@ fn compile_sequence<'a>(
             if let Some(text) = node.text() {
                 // XSLT strips whitespace-only stylesheet nodes unless explicitly
                 // preserved by xsl:text; retaining indentation changes result trees.
-                if !text.trim().is_empty() {
+                if !is_xml_whitespace_only(text) {
                     out.push(Instruction::Text(text.to_owned(), false));
                 }
             }
@@ -933,22 +1223,86 @@ fn compile_instruction(
     node: roxmltree::Node<'_, '_>,
     context: CompileContext,
 ) -> Result<Instruction> {
+    if node.has_tag_name((EXSLT_FUNCTIONS_NS, "result")) {
+        if !context.inside_function {
+            return Err(Error::Static(
+                "func:result is only permitted inside func:function".into(),
+            ));
+        }
+        let select = node
+            .attribute("select")
+            .map(|value| Expression::new(value, node))
+            .transpose()?;
+        let content = compile_sequence(node.children(), context)?;
+        if select.is_some() && !content.is_empty() {
+            return Err(Error::Static(
+                "func:result with select cannot have content".into(),
+            ));
+        }
+        return Ok(Instruction::FunctionResult { select, content });
+    }
     if node.tag_name().namespace() != Some(XSLT_NS) {
         if is_extension_element(node)? {
+            let locator = match (node.tag_name().namespace(), node.tag_name().name()) {
+                (Some(XT_NS), "document") => Some("href"),
+                (Some(SAXON_NS), "output") | (Some(XALAN_REDIRECT_NS), "write") => Some("file"),
+                _ => None,
+            };
+            if let Some(locator) = locator {
+                let uri = parse_avt(required_attr(node, locator)?, node)?;
+                let properties = node
+                    .attributes()
+                    .filter(|attribute| attribute.name() != locator)
+                    .map(|attribute| {
+                        if attribute.namespace().is_some() {
+                            return Err(Error::Static(format!(
+                                "unsupported namespaced secondary-output attribute {}",
+                                attribute.name()
+                            )));
+                        }
+                        Ok((
+                            attribute.name().to_owned(),
+                            parse_avt(attribute.value(), node)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                return Ok(Instruction::SecondaryOutput {
+                    uri,
+                    properties,
+                    body: compile_sequence(node.children(), context.descend()?)?,
+                });
+            }
+            let compatibility_comment = match (node.tag_name().namespace(), node.tag_name().name())
+            {
+                (Some(LIBXSLT_TEST_NS), "test") => Some("libxslt:test element test worked"),
+                (Some(LIBXSLT_TEST_PLUGIN_NS), "testplugin") => {
+                    Some("libxslt:testplugin element test worked")
+                }
+                _ => None,
+            };
+            if let Some(comment) = compatibility_comment {
+                return Ok(Instruction::CompatibilityComment(comment.into()));
+            }
             let mut fallback = Vec::new();
-            for child in node
+            let fallback_nodes = node
                 .children()
                 .filter(|child| child.has_tag_name((XSLT_NS, "fallback")))
-            {
+                .collect::<Vec<_>>();
+            for child in &fallback_nodes {
                 fallback.extend(compile_sequence(child.children(), context.descend()?)?);
             }
-            return Ok(Instruction::Fallback(fallback));
+            return Ok(Instruction::ExtensionFallback {
+                name: node.tag_name().name().into(),
+                present: !fallback_nodes.is_empty(),
+                body: fallback,
+            });
         }
         return compile_literal_element(node, context);
     }
     let sequence = || compile_sequence(node.children(), context);
     Ok(match node.tag_name().name() {
         "apply-templates" => {
+            reject_known_attributes(node, &["select", "mode", "name"])?;
             let mut sorts = vec![];
             let mut parameters = vec![];
             let mut saw_parameter = false;
@@ -975,7 +1329,10 @@ fn compile_instruction(
         }
         "apply-imports" => {
             if node.children().any(|child| {
-                child.is_element() || child.text().is_some_and(|text| !text.trim().is_empty())
+                child.is_element()
+                    || child
+                        .text()
+                        .is_some_and(|text| !is_xml_whitespace_only(text))
             }) {
                 return Err(Error::Static("xsl:apply-imports must be empty".into()));
             }
@@ -1007,14 +1364,15 @@ fn compile_instruction(
             for child in node.children() {
                 if child.has_tag_name((XSLT_NS, "sort")) && sorting {
                     sorts.push(compile_sort(child)?)
-                } else if child.is_text() && child.text().is_none_or(|text| text.trim().is_empty())
+                } else if (child.is_text() && child.text().is_none_or(is_xml_whitespace_only))
+                    || (!child.is_element() && !child.is_text())
                 {
                     continue;
                 } else {
                     sorting = false;
                     if child.is_text() {
                         if let Some(text) = child.text()
-                            && !text.trim().is_empty()
+                            && !is_xml_whitespace_only(text)
                         {
                             body.push(Instruction::Text(text.into(), false));
                         }
@@ -1082,7 +1440,7 @@ fn compile_instruction(
                 .transpose()?,
             body: sequence()?,
             attribute_sets: qname_list_attr(node, "use-attribute-sets")?,
-            namespaces: namespaces(node),
+            namespaces: computed_element_namespaces(node),
         },
         "attribute" => Instruction::Attribute {
             name: parse_avt(required_attr(node, "name")?, node)?,
@@ -1113,7 +1471,11 @@ fn compile_instruction(
             terminate: yes_no(node.attribute("terminate"))?,
             body: sequence()?,
         },
-        "fallback" => Instruction::Fallback(sequence()?),
+        "fallback" => Instruction::ExtensionFallback {
+            name: "xsl:fallback".into(),
+            present: true,
+            body: sequence()?,
+        },
         _unknown if context.forward => {
             let mut fallback = Vec::new();
             for child in node
@@ -1122,7 +1484,11 @@ fn compile_instruction(
             {
                 fallback.extend(compile_sequence(child.children(), context.descend()?)?);
             }
-            Instruction::Fallback(fallback)
+            Instruction::ExtensionFallback {
+                name: node.tag_name().name().into(),
+                present: true,
+                body: fallback,
+            }
         }
         unknown => {
             return Err(Error::Static(format!(
@@ -1130,6 +1496,83 @@ fn compile_instruction(
             )));
         }
     })
+}
+
+fn is_xml_whitespace_only(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+fn reject_known_attributes(node: roxmltree::Node<'_, '_>, allowed: &[&str]) -> Result<()> {
+    const XSLT_ATTRIBUTES: &[&str] = &[
+        "count",
+        "data-type",
+        "disable-output-escaping",
+        "elements",
+        "format",
+        "from",
+        "grouping-separator",
+        "grouping-size",
+        "href",
+        "lang",
+        "letter-value",
+        "match",
+        "mode",
+        "name",
+        "namespace",
+        "order",
+        "priority",
+        "select",
+        "terminate",
+        "test",
+        "use",
+        "use-attribute-sets",
+        "value",
+    ];
+    for attribute in node.attributes() {
+        if attribute.namespace().is_none()
+            && XSLT_ATTRIBUTES.contains(&attribute.name())
+            && !allowed.contains(&attribute.name())
+        {
+            return Err(Error::Static(format!(
+                "xsl:{} does not permit XSLT attribute {}",
+                node.tag_name().name(),
+                attribute.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn count_function_results(instructions: &[Instruction]) -> usize {
+    instructions
+        .iter()
+        .map(|instruction| match instruction {
+            Instruction::LiteralElement { children, .. }
+            | Instruction::ForEach { body: children, .. }
+            | Instruction::If { body: children, .. }
+            | Instruction::Copy { body: children, .. }
+            | Instruction::Element { body: children, .. }
+            | Instruction::Attribute { body: children, .. }
+            | Instruction::Processing { body: children, .. }
+            | Instruction::Message { body: children, .. }
+            | Instruction::ExtensionFallback { body: children, .. }
+            | Instruction::Comment(children) => count_function_results(children),
+            Instruction::Choose {
+                branches,
+                otherwise,
+            } => branches
+                .iter()
+                .map(|(_, body)| count_function_results(body))
+                .chain(std::iter::once(count_function_results(otherwise)))
+                .max()
+                .unwrap_or(0),
+            Instruction::Variable(variable) => count_function_results(&variable.content),
+            Instruction::FunctionResult { content, .. } => 1 + count_function_results(content),
+            _ => 0,
+        })
+        .sum()
 }
 
 fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {
@@ -1165,6 +1608,7 @@ fn compile_literal_element(
     node: roxmltree::Node<'_, '_>,
     context: CompileContext,
 ) -> Result<Instruction> {
+    let context = context.with_literal_version(node)?;
     let prefix = node
         .lookup_prefix(node.tag_name().namespace().unwrap_or(""))
         .map(str::to_owned);
@@ -1218,12 +1662,42 @@ fn compile_literal_element(
 fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<(bool, HashSet<String>)> {
     let mut exclude_all = false;
     let mut excluded = HashSet::new();
+    if node.ancestors().any(|ancestor| {
+        ancestor.has_tag_name((XSLT_NS, "variable")) || ancestor.has_tag_name((XSLT_NS, "param"))
+    }) && let Some(stylesheet) = node.ancestors().find(|ancestor| {
+        ancestor.has_tag_name((XSLT_NS, "stylesheet"))
+            || ancestor.has_tag_name((XSLT_NS, "transform"))
+    }) {
+        for function in stylesheet
+            .children()
+            .filter(|child| child.has_tag_name((EXSLT_FUNCTIONS_NS, "function")))
+        {
+            if let Some((prefix, _)) = function
+                .attribute("name")
+                .and_then(|name| name.split_once(':'))
+                && let Some(namespace) = function.lookup_namespace_uri(Some(prefix))
+            {
+                excluded.insert(namespace.to_owned());
+            }
+        }
+    }
     let mut ancestors = node
         .ancestors()
         .filter(roxmltree::Node::is_element)
         .collect::<Vec<_>>();
     ancestors.reverse();
     for ancestor in ancestors {
+        if ancestor.has_tag_name((EXSLT_FUNCTIONS_NS, "function"))
+            && let Some((prefix, _)) = ancestor
+                .attribute("name")
+                .and_then(|name| name.split_once(':'))
+            && let Some(namespace) = ancestor.lookup_namespace_uri(Some(prefix))
+        {
+            // libexslt treats the namespace naming a stylesheet-defined function
+            // as implementation vocabulary, not as a namespace to copy into its
+            // result-tree fragment.
+            excluded.insert(namespace.to_owned());
+        }
         for attribute in ["exclude-result-prefixes", "extension-element-prefixes"] {
             let value = if ancestor.tag_name().namespace() == Some(XSLT_NS) {
                 ancestor.attribute(attribute)
@@ -1297,9 +1771,15 @@ fn compile_number(node: roxmltree::Node<'_, '_>) -> Result<NumberInstruction> {
             .map(|v| Pattern::new(v, node))
             .transpose()?,
         level: node.attribute("level").unwrap_or("single").into(),
-        format: node.attribute("format").unwrap_or("1").into(),
-        lang: node.attribute("lang").map(str::to_owned),
-        letter_value: node.attribute("letter-value").map(str::to_owned),
+        format: parse_avt(node.attribute("format").unwrap_or("1"), node)?,
+        lang: node
+            .attribute("lang")
+            .map(|value| parse_avt(value, node))
+            .transpose()?,
+        letter_value: node
+            .attribute("letter-value")
+            .map(|value| parse_avt(value, node))
+            .transpose()?,
         grouping_separator: node
             .attribute("grouping-separator")
             .map(|value| parse_avt(value, node))
@@ -1405,7 +1885,7 @@ fn merge_output(out: &mut OutputDefinition, node: roxmltree::Node<'_, '_>) -> Re
     if let Some(v) = node.attribute("cdata-section-elements") {
         for name in v.split_ascii_whitespace() {
             out.cdata_section_elements
-                .insert(required_qname(node, name)?);
+                .insert(required_output_qname(node, name)?);
         }
     }
     Ok(())
@@ -1435,7 +1915,7 @@ impl NameTest {
     }
 }
 impl DecimalFormat {
-    fn parse(node: roxmltree::Node<'_, '_>) -> Result<Self> {
+    fn parse(node: roxmltree::Node<'_, '_>, precedence: usize) -> Result<Self> {
         fn one(node: roxmltree::Node<'_, '_>, name: &str, default: char) -> Result<char> {
             node.attribute(name).map_or(Ok(default), |v| {
                 let mut c = v.chars();
@@ -1450,6 +1930,7 @@ impl DecimalFormat {
         }
         Ok(Self {
             name: optional_qname_attr(node, "name")?,
+            precedence,
             decimal_separator: one(node, "decimal-separator", '.')?,
             grouping_separator: one(node, "grouping-separator", ',')?,
             infinity: node.attribute("infinity").unwrap_or("Infinity").into(),
@@ -1464,7 +1945,12 @@ impl DecimalFormat {
     }
 }
 impl AttributeSet {
-    fn parse(node: roxmltree::Node<'_, '_>, context: CompileContext) -> Result<Self> {
+    fn parse(
+        node: roxmltree::Node<'_, '_>,
+        context: CompileContext,
+        precedence: usize,
+        order: usize,
+    ) -> Result<Self> {
         let uses = node
             .attribute("use-attribute-sets")
             .map(|v| {
@@ -1491,6 +1977,8 @@ impl AttributeSet {
             name: required_qname_attr(node, "name")?,
             uses,
             attributes,
+            precedence,
+            order,
         })
     }
 }
@@ -1499,10 +1987,22 @@ fn namespaces(node: roxmltree::Node<'_, '_>) -> Vec<(String, String)> {
         .filter_map(|n| n.name().map(|p| (p.into(), n.uri().into())))
         .collect()
 }
+
+fn computed_element_namespaces(node: roxmltree::Node<'_, '_>) -> Vec<(String, String)> {
+    node.namespaces()
+        .map(|namespace| {
+            (
+                namespace.name().unwrap_or_default().into(),
+                namespace.uri().into(),
+            )
+        })
+        .collect()
+}
 fn required_attr<'a>(node: roxmltree::Node<'a, '_>, name: &str) -> Result<&'a str> {
     node.attribute(name)
         .ok_or_else(|| Error::Static(format!("xsl:{} requires {name}", node.tag_name().name())))
 }
+
 fn required_qname_attr(node: roxmltree::Node<'_, '_>, name: &str) -> Result<ExpandedName> {
     required_qname(node, required_attr(node, name)?)
 }
@@ -1524,16 +2024,48 @@ fn optional_qname_attr(node: roxmltree::Node<'_, '_>, name: &str) -> Result<Opti
 }
 fn required_qname(node: roxmltree::Node<'_, '_>, value: &str) -> Result<ExpandedName> {
     if let Some((prefix, local)) = value.split_once(':') {
-        if prefix.is_empty() || local.is_empty() || local.contains(':') {
+        if !is_ncname(prefix) || !is_ncname(local) || local.contains(':') {
             return Err(Error::Static(format!("invalid QName {value}")));
         }
         let uri = node
             .lookup_namespace_uri(Some(prefix))
             .ok_or_else(|| Error::Static(format!("unbound prefix {prefix}")))?;
+        if uri.starts_with('#') {
+            return Err(Error::Static(format!(
+                "QName {value} uses fragment-only namespace name `{uri}`"
+            )));
+        }
         Ok(ExpandedName::new(Some(uri), local))
     } else {
+        if !is_ncname(value) {
+            return Err(Error::Static(format!("invalid QName {value}")));
+        }
         Ok(ExpandedName::new(None::<String>, value))
     }
+}
+
+fn required_output_qname(node: roxmltree::Node<'_, '_>, value: &str) -> Result<ExpandedName> {
+    let mut name = required_qname(node, value)?;
+    if !value.contains(':') {
+        name.namespace = node.lookup_namespace_uri(None).map(str::to_owned);
+    }
+    Ok(name)
+}
+
+fn is_ncname(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_alphabetic())
+        && chars.all(|ch| {
+            ch == '_'
+                || ch == '-'
+                || ch == '.'
+                || ch == '\u{B7}'
+                || ch.is_alphanumeric()
+                || matches!(ch, '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}')
+        })
 }
 fn attribute_prefix(
     node: roxmltree::Node<'_, '_>,

@@ -29,6 +29,8 @@ pub enum Error {
     Dynamic(String),
     #[error("resource {identity:?} changed while compiling the stylesheet")]
     StaleResource { identity: ResourceIdentity },
+    #[error("resource not found: {uri}")]
+    ResourceNotFound { uri: String },
     #[error("resource resolution failed for {uri}: {message}")]
     Resolver { uri: String, message: String },
     #[error("{kind:?} budget exceeded: limit {limit}, attempted {actual}")]
@@ -51,7 +53,7 @@ impl Error {
             Self::Xml(_) => ErrorKind::Xml,
             Self::Static(_) => ErrorKind::Static,
             Self::Dynamic(_) => ErrorKind::Dynamic,
-            Self::StaleResource { .. } => ErrorKind::Resource,
+            Self::StaleResource { .. } | Self::ResourceNotFound { .. } => ErrorKind::Resource,
             Self::Resolver { .. } => ErrorKind::Resolver,
             Self::Budget { .. } => ErrorKind::Budget,
             Self::Serialization(_) => ErrorKind::Serialization,

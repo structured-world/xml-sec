@@ -2,178 +2,187 @@
 set -euo pipefail
 
 readonly SOURCE_DIR="${LIBXSLT_SOURCE_DIR:-}"
+readonly PINNED_COMMIT="35323d6a15f6e63c9919ddbc0abe64c90a0dd88a"
 readonly DESTINATION="crates/xml-sec-xslt/tests/fixtures/libxslt-1.1.45"
-readonly CASES=(
-  test-10-1
-  test-10-2
-  test-10-3
-  test-11.2-1
-  test-11.2-2
-  test-11.2-3
-  test-11.2-4
-  test-11.2-5
-  test-11.2-6
-  test-12.2-1
-  test-12.2-2
-  test-15-1
-  test-16.1-1
-  test-16.1-2
-  test-2.3-1
-  test-2.3-2
-  test-2.6.2-1
-  test-3.4-1
-  test-3.4-2
-  test-3.4-3
-  test-5.2-1
-  test-5.2-11
-  test-5.2-12
-  test-5.2-13
-  test-5.2-14
-  test-5.2-15
-  test-5.2-16
-  test-5.2-17
-  test-5.2-18
-  test-5.2-19
-  test-5.2-2
-  test-5.2-20
-  test-5.2-21
-  test-5.2-22
-  test-5.2-3
-  test-5.2-4
-  test-5.2-5
-  test-5.2-6
-  test-5.2-7
-  test-5.2-8
-  test-5.2-9
-  test-5.3
-  test-5.4-1
-  test-5.4-2
-  test-5.4-3
-  test-5.4-4
-  test-5.4-5
-  test-5.5-1
-  test-5.8
-  test-6
-  test-7.1.1-2
-  test-7.1.1-3
-  test-7.1.1
-  test-7.1.3
-  test-7.1.4
-  test-7.3
-  test-7.4
-  test-7.5-1
-  test-7.6.1-1
-  test-7.6.1-2
-  test-7.6.1-3
-  test-7.6.2-1
-  test-7.6.2-2
-  test-7.7-1
-  test-7.7-2
-  test-7.7-3
-  test-7.7-4
-  test-7.7-5
-  test-7.7-6
-  test-9.1-1
-)
-readonly HTML_CASES=(
-  test-2.5-1
-  test-8-1
-  test-9.1-2
-)
-readonly SEMANTIC_CASES=(
-  test-12.4-1
-)
-readonly DTD_CASES=(
-  stand-2.7-1
-  test-5.2-10
-)
-readonly STATIC_ERROR_CASES=(
-  test-6.1
+readonly RUNTEST_SUITES=(
+  REC2
+  REC
+  general
+  encoding
+  documents
+  numbers
+  keys
+  namespaces
+  extensions
+  reports
+  exslt/common
+  exslt/crypto
+  exslt/date
+  exslt/dynamic
+  exslt/functions
+  exslt/math
+  exslt/saxon
+  exslt/sets
+  exslt/strings
+  plugins
 )
 
-if [[ -z "$SOURCE_DIR" || ! -d "$SOURCE_DIR/tests/REC" ]]; then
+if [[ -z "$SOURCE_DIR" ]] || ! git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "LIBXSLT_SOURCE_DIR must point to a libxslt checkout" >&2
+  exit 2
+fi
+source_commit="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+if [[ "$source_commit" != "$PINNED_COMMIT" ]]; then
+  echo "libxslt checkout must be at pinned commit $PINNED_COMMIT" >&2
   exit 2
 fi
 
 stage="$(mktemp -d)"
-trap 'rm -rf "$stage"' EXIT
-mkdir -p "$stage"
+donor_stage="$(mktemp -d)"
+trap 'rm -rf "$stage" "$donor_stage"' EXIT
+mkdir -p "$stage/upstream"
 
-for case_name in "${CASES[@]}" "${HTML_CASES[@]}" "${SEMANTIC_CASES[@]}"; do
-  for extension in xsl xml out; do
-    source="$SOURCE_DIR/tests/REC/$case_name.$extension"
-    if [[ ! -f "$source" ]]; then
-      echo "missing oracle fixture: $source" >&2
-      exit 2
-    fi
-    cp "$source" "$stage/$case_name.$extension"
+# Archive the pinned commit rather than copying the donor worktree. Autotools
+# and local builds leave ignored Makefile.in and generated data behind even in
+# a git-clean checkout; those files are not part of the upstream source corpus.
+git -C "$SOURCE_DIR" archive --format=tar "$PINNED_COMMIT" tests Copyright \
+  | tar -xf - -C "$donor_stage"
+readonly DONOR_DIR="$donor_stage"
+
+# Keep the complete upstream test tree. Besides direct input/output triplets,
+# stylesheets depend on sibling modules, DTDs, entities, images, and generated
+# suite metadata. Vendoring only files referenced by currently passing cases
+# silently changes the corpus whenever engine coverage grows.
+cp -R "$DONOR_DIR/tests/." "$stage/upstream/tests/"
+cp "$DONOR_DIR/Copyright" "$stage/LICENSE"
+
+manifest="$stage/cases.tsv"
+printf 'suite\tstylesheet\tsource\toutput\terrors\tkind\n' > "$manifest"
+
+for suite in "${RUNTEST_SUITES[@]}"; do
+  suite_dir="$DONOR_DIR/tests/$suite"
+  [[ -d "$suite_dir" ]] || continue
+  while IFS= read -r stylesheet; do
+    stem="${stylesheet%.xsl}"
+    source="$stem.xml"
+    [[ -f "$source" ]] || continue
+    relative_stem="${stem#"$DONOR_DIR/tests/"}"
+    output=""
+    errors=""
+    [[ -f "$stem.out" ]] && output="$relative_stem.out"
+    [[ -f "$stem.err" ]] && errors="$relative_stem.err"
+    printf 'runtest\t%s.xsl\t%s.xml\t%s\t%s\ttransform\n' \
+      "$relative_stem" "$relative_stem" "$output" "$errors" >> "$manifest"
+  done < <(find "$suite_dir" -maxdepth 1 -type f -name '*.xsl' | LC_ALL=C sort)
+done
+
+# runtest.c executes standalone stylesheet documents separately. The XML file
+# is both stylesheet and source; the xml-stylesheet PI resolves the module.
+while IFS= read -r source; do
+  stem="${source%.xml}"
+  relative_stem="${stem#"$DONOR_DIR/tests/"}"
+  output=""
+  errors=""
+  [[ -f "$stem.stand.out" ]] && output="$relative_stem.stand.out"
+  [[ -f "$stem.stand.err" ]] && errors="$relative_stem.stand.err"
+  printf 'runtest-standalone\t%s.xml\t%s.xml\t%s\t%s\tstandalone\n' \
+    "$relative_stem" "$relative_stem" "$output" "$errors" >> "$manifest"
+done < <(find "$DONOR_DIR/tests/REC" -maxdepth 1 -type f -name 'stand*.xml' | LC_ALL=C sort)
+
+# XSLTMark's Makefile drives every committed .out target. Three database inputs
+# are deterministically generated by its own dbgen.pl, exactly as upstream does.
+for size in 100 1000 10000; do
+  perl "$DONOR_DIR/tests/XSLTMark/dbgen.pl" "$size" \
+    > "$stage/upstream/tests/XSLTMark/db$size.xml"
+done
+while IFS= read -r output; do
+  name="$(basename "$output" .out)"
+  stylesheet="$name.xsl"
+  source="$name.xml"
+  case "$name" in
+    alphabetize|avts|creation|dbtail|decoy|encrypt|functions|patterns|prettyprint)
+      source="db100.xml"
+      ;;
+    identity|stringsort)
+      source="db1000.xml"
+      ;;
+    dbonerow)
+      source="db10000.xml"
+      ;;
+    attsets|chart|total)
+      source="chart.xml"
+      ;;
+    backwards|game)
+      source="game.xml"
+      ;;
+    reverser)
+      source="gettysburg.xml"
+      ;;
+    summarize)
+      source="queens.xsl"
+      ;;
+    xslbench2|xslbench3)
+      source="xslbenchdream.xml"
+      ;;
+    breadth|depth)
+      stylesheet="find.xsl"
+      ;;
+  esac
+  printf 'xsltmark\tXSLTMark/%s\tXSLTMark/%s\tXSLTMark/%s.out\t\ttransform\n' \
+    "$stylesheet" "$source" "$name" >> "$manifest"
+done < <(find "$DONOR_DIR/tests/XSLTMark" -maxdepth 1 -type f -name '*.out' | LC_ALL=C sort)
+
+# DocBook runs each source document through the HTML, XHTML, and FO roots.
+while IFS= read -r source; do
+  name="$(basename "$source" .xml)"
+  for format in html xhtml fo; do
+    extension="$format"
+    [[ "$format" == "fo" ]] && extension="fo"
+    output="$DONOR_DIR/tests/docbook/result/$format/$name.$extension"
+    [[ -f "$output" ]] || continue
+    printf 'docbook\tdocbook/%s/docbook.xsl\tdocbook/test/%s.xml\tdocbook/result/%s/%s.%s\t\ttransform\n' \
+      "$format" "$name" "$format" "$name" "$extension" >> "$manifest"
   done
-done
+done < <(find "$DONOR_DIR/tests/docbook/test" -maxdepth 1 -type f -name '*.xml' | LC_ALL=C sort)
 
-for case_name in "${CASES[@]}"; do
-  printf '%s\texact\n' "$case_name" >> "$stage/cases.tsv"
-done
-for case_name in "${HTML_CASES[@]}"; do
-  printf '%s\thtml\n' "$case_name" >> "$stage/cases.tsv"
-done
-for case_name in "${SEMANTIC_CASES[@]}"; do
-  printf '%s\tsemantic\n' "$case_name" >> "$stage/cases.tsv"
-done
+printf 'multiple\tmultiple/dict.xsl\tmultiple/dict.xml\tmultiple/result.xml\t\tmultiple-output\n' \
+  >> "$manifest"
+printf 'xinclude\txinclude/e.xsl\txinclude/e.xml\txinclude/normal.out\t\ttransform\n' \
+  >> "$manifest"
+printf 'xinclude\txinclude/e.xsl\txinclude/e.xml\txinclude/xinclude.out\t\txinclude\n' \
+  >> "$manifest"
+printf 'xmlspec\txmlspec/REC-xml-2e.xsl\txmlspec/REC-xml-20001006.xml\txmlspec/REC-xml-20001006.html\t\ttransform\n' \
+  >> "$manifest"
+printf 'xmlspec\txmlspec/REC-xml-2e.xsl\txmlspec/REC-xml-20001006.xml\txmlspec/REC-xml-20001006-review.html\t\txmlspec-review\n' \
+  >> "$manifest"
 
-for case_name in "${DTD_CASES[@]}"; do
-  for extension in xsl xml out; do
-    source="$SOURCE_DIR/tests/REC/$case_name.$extension"
-    if [[ ! -f "$source" ]]; then
-      echo "missing DTD policy fixture: $source" >&2
-      exit 2
-    fi
-    cp "$source" "$stage/$case_name.$extension"
-  done
-done
-
-for case_name in "${DTD_CASES[@]}"; do
-  printf '%s\tdtd-rejected\n' "$case_name" >> "$stage/cases.tsv"
-done
-
-for case_name in "${STATIC_ERROR_CASES[@]}"; do
-  for extension in xsl xml err; do
-    source="$SOURCE_DIR/tests/REC/$case_name.$extension"
-    if [[ ! -f "$source" ]]; then
-      echo "missing static-error fixture: $source" >&2
-      exit 2
-    fi
-    cp "$source" "$stage/$case_name.$extension"
-  done
-  printf '%s\tstatic-rejected\n' "$case_name" >> "$stage/cases.tsv"
-done
-
-for module in article.xsl bigfont.xsl; do
-  cp "$SOURCE_DIR/tests/REC/$module" "$stage/$module"
-done
+# Every vendored path is hashed so --check detects omissions and byte drift,
+# including helper files that are not top-level test entry points.
+(
+  cd "$stage/upstream"
+  find tests -type f -print0 \
+    | LC_ALL=C sort -z \
+    | xargs -0 shasum -a 256
+) > "$stage/files.sha256"
 
 cat > "$stage/README.md" <<'EOF'
-# libxslt XSLT 1.0 oracle fixtures
+# libxslt 1.1.45 oracle corpus
 
-These files contain every self-contained positive `tests/REC` triplet from libxslt 1.1.45,
-commit `35323d6a15f6e63c9919ddbc0abe64c90a0dd88a`. The `.out` files are oracle
-output bytes; integration tests execute the corresponding `.xsl` and `.xml`
-through `xml-sec-xslt`. `cases.tsv` records whether each case uses exact bytes,
-HTML whitespace normalization, semantic `generate-id()` checks, deliberate
-DTD rejection, or a static-error expectation.
+`upstream/tests` is the complete test tree from libxslt 1.1.45 commit
+`35323d6a15f6e63c9919ddbc0abe64c90a0dd88a`, not a curated fixture subset.
+It includes the core `runtest.c` suites, REC/REC2, EXSLT, XSLTMark, DocBook,
+multiple-output, XInclude, xmlspec, fuzz inputs, dependencies, and golden files.
 
-The two DTD-bearing source cases are retained as security-policy regressions:
-libxslt accepts them, while `xml-sec-xslt` deliberately rejects XML containing
-a DTD. `article.xsl` and `bigfont.xsl` are dependencies of `test-2.6.2-1`.
-
-The fixtures retain libxslt's MIT license. See `LICENSE` in this directory.
+`cases.tsv` is generated from the suite directories registered by `runtest.c`.
+`files.sha256` accounts for every upstream file and makes accidental corpus
+truncation or fixture rewriting visible in CI. The original MIT license is in
+`LICENSE`.
 EOF
-cp "$SOURCE_DIR/Copyright" "$stage/LICENSE"
 
 if [[ "${1:-}" == "--check" ]]; then
   diff -ru "$DESTINATION" "$stage"
 else
   rm -rf "$DESTINATION"
   mkdir -p "$DESTINATION"
-  cp "$stage"/* "$DESTINATION"/
+  cp -R "$stage/." "$DESTINATION/"
 fi

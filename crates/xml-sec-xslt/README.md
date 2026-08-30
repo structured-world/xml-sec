@@ -17,21 +17,25 @@ XPath node sets retain element, attribute, and namespace identities. Converting 
 public `Value` to a string therefore requires the associated `Document`; result-tree
 fragments remain owned temporary trees rather than flattened text.
 
-Runtime external-document resolution and the XMLDSig transform adapter are kept
-outside this crate's current execution path so their policy and identity contracts
-can be layered without introducing XML-security types into the reusable engine.
+Stylesheet modules and runtime `document()` resources use the same explicit
+resolver contract with purpose, base URI, stable resource identity, and byte
+budgeting. The XMLDSig transform adapter remains outside this crate so no
+XML-security types enter the reusable engine.
 
 ## Compatibility oracle
 
-The integration suite includes every self-contained positive triplet in libxslt
-1.1.45's XSLT 1.0 REC corpus. Portable output is compared byte-for-byte; HTML
-indentation and `generate-id()` use semantic comparisons where XSLT permits
-implementation-defined values. Two DTD-bearing cases assert this engine's
-deliberate fail-closed XML policy, and the standalone upstream negative case
-asserts typed static rejection. CI also builds pinned libxml2 2.15.1 and libxslt
-1.1.45 revisions, verifies the vendored fixture snapshot, and executes the same
-cases with `xsltproc` to detect oracle or fixture drift independently of the
-Rust implementation.
+The repository vendors the complete libxslt 1.1.45 test tree and registers all
+554 transformations driven by its core, REC/REC2, EXSLT, XSLTMark, DocBook,
+multiple-output, XInclude, and xmlspec suites. Every registered case executes
+through this engine. Portable output is compared byte-for-byte; comparisons are
+normalized only where the donor output is stale or XSLT permits
+implementation-defined lexical values. The harness projects donor DTD defaults,
+ID and tokenized attributes, entities, and unparsed-entity system identifiers
+without granting production code implicit filesystem access.
+
+`files.sha256` accounts for all 2,021 files in the pinned upstream source tree, so
+the importer and CI detect fixture omissions and byte drift independently of
+engine behavior.
 
 Refresh or verify the snapshot from a matching donor checkout with:
 

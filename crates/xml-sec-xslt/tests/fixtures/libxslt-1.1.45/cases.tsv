@@ -1,77 +1,555 @@
-test-10-1	exact
-test-10-2	exact
-test-10-3	exact
-test-11.2-1	exact
-test-11.2-2	exact
-test-11.2-3	exact
-test-11.2-4	exact
-test-11.2-5	exact
-test-11.2-6	exact
-test-12.2-1	exact
-test-12.2-2	exact
-test-15-1	exact
-test-16.1-1	exact
-test-16.1-2	exact
-test-2.3-1	exact
-test-2.3-2	exact
-test-2.6.2-1	exact
-test-3.4-1	exact
-test-3.4-2	exact
-test-3.4-3	exact
-test-5.2-1	exact
-test-5.2-11	exact
-test-5.2-12	exact
-test-5.2-13	exact
-test-5.2-14	exact
-test-5.2-15	exact
-test-5.2-16	exact
-test-5.2-17	exact
-test-5.2-18	exact
-test-5.2-19	exact
-test-5.2-2	exact
-test-5.2-20	exact
-test-5.2-21	exact
-test-5.2-22	exact
-test-5.2-3	exact
-test-5.2-4	exact
-test-5.2-5	exact
-test-5.2-6	exact
-test-5.2-7	exact
-test-5.2-8	exact
-test-5.2-9	exact
-test-5.3	exact
-test-5.4-1	exact
-test-5.4-2	exact
-test-5.4-3	exact
-test-5.4-4	exact
-test-5.4-5	exact
-test-5.5-1	exact
-test-5.8	exact
-test-6	exact
-test-7.1.1-2	exact
-test-7.1.1-3	exact
-test-7.1.1	exact
-test-7.1.3	exact
-test-7.1.4	exact
-test-7.3	exact
-test-7.4	exact
-test-7.5-1	exact
-test-7.6.1-1	exact
-test-7.6.1-2	exact
-test-7.6.1-3	exact
-test-7.6.2-1	exact
-test-7.6.2-2	exact
-test-7.7-1	exact
-test-7.7-2	exact
-test-7.7-3	exact
-test-7.7-4	exact
-test-7.7-5	exact
-test-7.7-6	exact
-test-9.1-1	exact
-test-2.5-1	html
-test-8-1	html
-test-9.1-2	html
-test-12.4-1	semantic
-stand-2.7-1	dtd-rejected
-test-5.2-10	dtd-rejected
-test-6.1	static-rejected
+suite	stylesheet	source	output	errors	kind
+runtest	REC2/html.xsl	REC2/html.xml	REC2/html.out		transform
+runtest	REC2/svg.xsl	REC2/svg.xml	REC2/svg.out		transform
+runtest	REC2/vrml.xsl	REC2/vrml.xml	REC2/vrml.out		transform
+runtest	REC/stand-2.7-1.xsl	REC/stand-2.7-1.xml	REC/stand-2.7-1.out		transform
+runtest	REC/test-10-1.xsl	REC/test-10-1.xml	REC/test-10-1.out		transform
+runtest	REC/test-10-2.xsl	REC/test-10-2.xml	REC/test-10-2.out		transform
+runtest	REC/test-10-3.xsl	REC/test-10-3.xml	REC/test-10-3.out		transform
+runtest	REC/test-11.2-1.xsl	REC/test-11.2-1.xml	REC/test-11.2-1.out		transform
+runtest	REC/test-11.2-2.xsl	REC/test-11.2-2.xml	REC/test-11.2-2.out		transform
+runtest	REC/test-11.2-3.xsl	REC/test-11.2-3.xml	REC/test-11.2-3.out		transform
+runtest	REC/test-11.2-4.xsl	REC/test-11.2-4.xml	REC/test-11.2-4.out		transform
+runtest	REC/test-11.2-5.xsl	REC/test-11.2-5.xml	REC/test-11.2-5.out		transform
+runtest	REC/test-11.2-6.xsl	REC/test-11.2-6.xml	REC/test-11.2-6.out		transform
+runtest	REC/test-12.2-1.xsl	REC/test-12.2-1.xml	REC/test-12.2-1.out		transform
+runtest	REC/test-12.2-2.xsl	REC/test-12.2-2.xml	REC/test-12.2-2.out		transform
+runtest	REC/test-12.4-1.xsl	REC/test-12.4-1.xml	REC/test-12.4-1.out		transform
+runtest	REC/test-15-1.xsl	REC/test-15-1.xml	REC/test-15-1.out		transform
+runtest	REC/test-16.1-1.xsl	REC/test-16.1-1.xml	REC/test-16.1-1.out		transform
+runtest	REC/test-16.1-2.xsl	REC/test-16.1-2.xml	REC/test-16.1-2.out		transform
+runtest	REC/test-2.3-1.xsl	REC/test-2.3-1.xml	REC/test-2.3-1.out		transform
+runtest	REC/test-2.3-2.xsl	REC/test-2.3-2.xml	REC/test-2.3-2.out		transform
+runtest	REC/test-2.5-1.xsl	REC/test-2.5-1.xml	REC/test-2.5-1.out	REC/test-2.5-1.err	transform
+runtest	REC/test-2.6.2-1.xsl	REC/test-2.6.2-1.xml	REC/test-2.6.2-1.out		transform
+runtest	REC/test-3.4-1.xsl	REC/test-3.4-1.xml	REC/test-3.4-1.out		transform
+runtest	REC/test-3.4-2.xsl	REC/test-3.4-2.xml	REC/test-3.4-2.out		transform
+runtest	REC/test-3.4-3.xsl	REC/test-3.4-3.xml	REC/test-3.4-3.out		transform
+runtest	REC/test-5.2-1.xsl	REC/test-5.2-1.xml	REC/test-5.2-1.out		transform
+runtest	REC/test-5.2-10.xsl	REC/test-5.2-10.xml	REC/test-5.2-10.out		transform
+runtest	REC/test-5.2-11.xsl	REC/test-5.2-11.xml	REC/test-5.2-11.out		transform
+runtest	REC/test-5.2-12.xsl	REC/test-5.2-12.xml	REC/test-5.2-12.out		transform
+runtest	REC/test-5.2-13.xsl	REC/test-5.2-13.xml	REC/test-5.2-13.out		transform
+runtest	REC/test-5.2-14.xsl	REC/test-5.2-14.xml	REC/test-5.2-14.out		transform
+runtest	REC/test-5.2-15.xsl	REC/test-5.2-15.xml	REC/test-5.2-15.out		transform
+runtest	REC/test-5.2-16.xsl	REC/test-5.2-16.xml	REC/test-5.2-16.out		transform
+runtest	REC/test-5.2-17.xsl	REC/test-5.2-17.xml	REC/test-5.2-17.out		transform
+runtest	REC/test-5.2-18.xsl	REC/test-5.2-18.xml	REC/test-5.2-18.out		transform
+runtest	REC/test-5.2-19.xsl	REC/test-5.2-19.xml	REC/test-5.2-19.out		transform
+runtest	REC/test-5.2-2.xsl	REC/test-5.2-2.xml	REC/test-5.2-2.out		transform
+runtest	REC/test-5.2-20.xsl	REC/test-5.2-20.xml	REC/test-5.2-20.out		transform
+runtest	REC/test-5.2-21.xsl	REC/test-5.2-21.xml	REC/test-5.2-21.out		transform
+runtest	REC/test-5.2-22.xsl	REC/test-5.2-22.xml	REC/test-5.2-22.out		transform
+runtest	REC/test-5.2-3.xsl	REC/test-5.2-3.xml	REC/test-5.2-3.out		transform
+runtest	REC/test-5.2-4.xsl	REC/test-5.2-4.xml	REC/test-5.2-4.out		transform
+runtest	REC/test-5.2-5.xsl	REC/test-5.2-5.xml	REC/test-5.2-5.out		transform
+runtest	REC/test-5.2-6.xsl	REC/test-5.2-6.xml	REC/test-5.2-6.out		transform
+runtest	REC/test-5.2-7.xsl	REC/test-5.2-7.xml	REC/test-5.2-7.out		transform
+runtest	REC/test-5.2-8.xsl	REC/test-5.2-8.xml	REC/test-5.2-8.out		transform
+runtest	REC/test-5.2-9.xsl	REC/test-5.2-9.xml	REC/test-5.2-9.out		transform
+runtest	REC/test-5.3.xsl	REC/test-5.3.xml	REC/test-5.3.out		transform
+runtest	REC/test-5.4-1.xsl	REC/test-5.4-1.xml	REC/test-5.4-1.out		transform
+runtest	REC/test-5.4-2.xsl	REC/test-5.4-2.xml	REC/test-5.4-2.out		transform
+runtest	REC/test-5.4-3.xsl	REC/test-5.4-3.xml	REC/test-5.4-3.out		transform
+runtest	REC/test-5.4-4.xsl	REC/test-5.4-4.xml	REC/test-5.4-4.out		transform
+runtest	REC/test-5.4-5.xsl	REC/test-5.4-5.xml	REC/test-5.4-5.out		transform
+runtest	REC/test-5.5-1.xsl	REC/test-5.5-1.xml	REC/test-5.5-1.out		transform
+runtest	REC/test-5.8.xsl	REC/test-5.8.xml	REC/test-5.8.out		transform
+runtest	REC/test-6.1.xsl	REC/test-6.1.xml		REC/test-6.1.err	transform
+runtest	REC/test-6.xsl	REC/test-6.xml	REC/test-6.out		transform
+runtest	REC/test-7.1.1-2.xsl	REC/test-7.1.1-2.xml	REC/test-7.1.1-2.out		transform
+runtest	REC/test-7.1.1-3.xsl	REC/test-7.1.1-3.xml	REC/test-7.1.1-3.out		transform
+runtest	REC/test-7.1.1.xsl	REC/test-7.1.1.xml	REC/test-7.1.1.out		transform
+runtest	REC/test-7.1.3.xsl	REC/test-7.1.3.xml	REC/test-7.1.3.out		transform
+runtest	REC/test-7.1.4.xsl	REC/test-7.1.4.xml	REC/test-7.1.4.out		transform
+runtest	REC/test-7.3.xsl	REC/test-7.3.xml	REC/test-7.3.out		transform
+runtest	REC/test-7.4.xsl	REC/test-7.4.xml	REC/test-7.4.out		transform
+runtest	REC/test-7.5-1.xsl	REC/test-7.5-1.xml	REC/test-7.5-1.out		transform
+runtest	REC/test-7.6.1-1.xsl	REC/test-7.6.1-1.xml	REC/test-7.6.1-1.out		transform
+runtest	REC/test-7.6.1-2.xsl	REC/test-7.6.1-2.xml	REC/test-7.6.1-2.out		transform
+runtest	REC/test-7.6.1-3.xsl	REC/test-7.6.1-3.xml	REC/test-7.6.1-3.out		transform
+runtest	REC/test-7.6.2-1.xsl	REC/test-7.6.2-1.xml	REC/test-7.6.2-1.out		transform
+runtest	REC/test-7.6.2-2.xsl	REC/test-7.6.2-2.xml	REC/test-7.6.2-2.out		transform
+runtest	REC/test-7.7-1.xsl	REC/test-7.7-1.xml	REC/test-7.7-1.out		transform
+runtest	REC/test-7.7-2.xsl	REC/test-7.7-2.xml	REC/test-7.7-2.out		transform
+runtest	REC/test-7.7-3.xsl	REC/test-7.7-3.xml	REC/test-7.7-3.out		transform
+runtest	REC/test-7.7-4.xsl	REC/test-7.7-4.xml	REC/test-7.7-4.out		transform
+runtest	REC/test-7.7-5.xsl	REC/test-7.7-5.xml	REC/test-7.7-5.out		transform
+runtest	REC/test-7.7-6.xsl	REC/test-7.7-6.xml	REC/test-7.7-6.out		transform
+runtest	REC/test-8-1.xsl	REC/test-8-1.xml	REC/test-8-1.out		transform
+runtest	REC/test-9.1-1.xsl	REC/test-9.1-1.xml	REC/test-9.1-1.out		transform
+runtest	REC/test-9.1-2.xsl	REC/test-9.1-2.xml	REC/test-9.1-2.out		transform
+runtest	general/array.xsl	general/array.xml	general/array.out		transform
+runtest	general/bug-1-.xsl	general/bug-1-.xml	general/bug-1-.out		transform
+runtest	general/bug-10-.xsl	general/bug-10-.xml	general/bug-10-.out		transform
+runtest	general/bug-100.xsl	general/bug-100.xml	general/bug-100.out		transform
+runtest	general/bug-101.xsl	general/bug-101.xml	general/bug-101.out		transform
+runtest	general/bug-102.xsl	general/bug-102.xml	general/bug-102.out		transform
+runtest	general/bug-103.xsl	general/bug-103.xml	general/bug-103.out		transform
+runtest	general/bug-104.xsl	general/bug-104.xml	general/bug-104.out		transform
+runtest	general/bug-105.xsl	general/bug-105.xml	general/bug-105.out		transform
+runtest	general/bug-106.xsl	general/bug-106.xml	general/bug-106.out		transform
+runtest	general/bug-107.xsl	general/bug-107.xml	general/bug-107.out		transform
+runtest	general/bug-108.xsl	general/bug-108.xml	general/bug-108.out		transform
+runtest	general/bug-109.xsl	general/bug-109.xml	general/bug-109.out		transform
+runtest	general/bug-11-.xsl	general/bug-11-.xml	general/bug-11-.out		transform
+runtest	general/bug-110.xsl	general/bug-110.xml	general/bug-110.out		transform
+runtest	general/bug-111.xsl	general/bug-111.xml	general/bug-111.out		transform
+runtest	general/bug-112.xsl	general/bug-112.xml	general/bug-112.out		transform
+runtest	general/bug-113.xsl	general/bug-113.xml	general/bug-113.out		transform
+runtest	general/bug-114.xsl	general/bug-114.xml	general/bug-114.out		transform
+runtest	general/bug-115.xsl	general/bug-115.xml	general/bug-115.out		transform
+runtest	general/bug-116.xsl	general/bug-116.xml	general/bug-116.out		transform
+runtest	general/bug-117.xsl	general/bug-117.xml	general/bug-117.out		transform
+runtest	general/bug-118.xsl	general/bug-118.xml	general/bug-118.out		transform
+runtest	general/bug-119.xsl	general/bug-119.xml	general/bug-119.out		transform
+runtest	general/bug-12-.xsl	general/bug-12-.xml	general/bug-12-.out		transform
+runtest	general/bug-120.xsl	general/bug-120.xml	general/bug-120.out		transform
+runtest	general/bug-121.xsl	general/bug-121.xml	general/bug-121.out		transform
+runtest	general/bug-122.xsl	general/bug-122.xml	general/bug-122.out		transform
+runtest	general/bug-123.xsl	general/bug-123.xml	general/bug-123.out		transform
+runtest	general/bug-124.xsl	general/bug-124.xml	general/bug-124.out		transform
+runtest	general/bug-125.xsl	general/bug-125.xml	general/bug-125.out		transform
+runtest	general/bug-126.xsl	general/bug-126.xml	general/bug-126.out		transform
+runtest	general/bug-127.xsl	general/bug-127.xml	general/bug-127.out		transform
+runtest	general/bug-128.xsl	general/bug-128.xml	general/bug-128.out		transform
+runtest	general/bug-129.xsl	general/bug-129.xml	general/bug-129.out		transform
+runtest	general/bug-13-.xsl	general/bug-13-.xml	general/bug-13-.out		transform
+runtest	general/bug-130.xsl	general/bug-130.xml	general/bug-130.out		transform
+runtest	general/bug-131.xsl	general/bug-131.xml	general/bug-131.out		transform
+runtest	general/bug-132.xsl	general/bug-132.xml	general/bug-132.out		transform
+runtest	general/bug-133.xsl	general/bug-133.xml	general/bug-133.out		transform
+runtest	general/bug-134.xsl	general/bug-134.xml	general/bug-134.out		transform
+runtest	general/bug-135.xsl	general/bug-135.xml	general/bug-135.out		transform
+runtest	general/bug-136.xsl	general/bug-136.xml	general/bug-136.out		transform
+runtest	general/bug-137.xsl	general/bug-137.xml	general/bug-137.out		transform
+runtest	general/bug-138.xsl	general/bug-138.xml	general/bug-138.out		transform
+runtest	general/bug-139.xsl	general/bug-139.xml	general/bug-139.out		transform
+runtest	general/bug-14-.xsl	general/bug-14-.xml	general/bug-14-.out		transform
+runtest	general/bug-140.xsl	general/bug-140.xml	general/bug-140.out		transform
+runtest	general/bug-141.xsl	general/bug-141.xml	general/bug-141.out		transform
+runtest	general/bug-142.xsl	general/bug-142.xml	general/bug-142.out		transform
+runtest	general/bug-143.xsl	general/bug-143.xml	general/bug-143.out		transform
+runtest	general/bug-144.xsl	general/bug-144.xml	general/bug-144.out		transform
+runtest	general/bug-145.xsl	general/bug-145.xml		general/bug-145.err	transform
+runtest	general/bug-147.xsl	general/bug-147.xml	general/bug-147.out		transform
+runtest	general/bug-148.xsl	general/bug-148.xml	general/bug-148.out		transform
+runtest	general/bug-149.xsl	general/bug-149.xml	general/bug-149.out		transform
+runtest	general/bug-15-.xsl	general/bug-15-.xml	general/bug-15-.out		transform
+runtest	general/bug-150.xsl	general/bug-150.xml	general/bug-150.out		transform
+runtest	general/bug-151.xsl	general/bug-151.xml			transform
+runtest	general/bug-152.xsl	general/bug-152.xml	general/bug-152.out		transform
+runtest	general/bug-153.xsl	general/bug-153.xml	general/bug-153.out		transform
+runtest	general/bug-154.xsl	general/bug-154.xml			transform
+runtest	general/bug-155.xsl	general/bug-155.xml	general/bug-155.out		transform
+runtest	general/bug-156.xsl	general/bug-156.xml		general/bug-156.err	transform
+runtest	general/bug-157.xsl	general/bug-157.xml	general/bug-157.out	general/bug-157.err	transform
+runtest	general/bug-158.xsl	general/bug-158.xml	general/bug-158.out		transform
+runtest	general/bug-159.xsl	general/bug-159.xml	general/bug-159.out		transform
+runtest	general/bug-16-.xsl	general/bug-16-.xml	general/bug-16-.out		transform
+runtest	general/bug-160.xsl	general/bug-160.xml	general/bug-160.out		transform
+runtest	general/bug-161.xsl	general/bug-161.xml	general/bug-161.out		transform
+runtest	general/bug-163.xsl	general/bug-163.xml	general/bug-163.out		transform
+runtest	general/bug-164.xsl	general/bug-164.xml	general/bug-164.out		transform
+runtest	general/bug-165.xsl	general/bug-165.xml		general/bug-165.err	transform
+runtest	general/bug-166.xsl	general/bug-166.xml	general/bug-166.out		transform
+runtest	general/bug-167.xsl	general/bug-167.xml	general/bug-167.out		transform
+runtest	general/bug-168.xsl	general/bug-168.xml	general/bug-168.out		transform
+runtest	general/bug-169.xsl	general/bug-169.xml	general/bug-169.out		transform
+runtest	general/bug-17-.xsl	general/bug-17-.xml	general/bug-17-.out		transform
+runtest	general/bug-170.xsl	general/bug-170.xml	general/bug-170.out		transform
+runtest	general/bug-171.xsl	general/bug-171.xml	general/bug-171.out		transform
+runtest	general/bug-172.xsl	general/bug-172.xml	general/bug-172.out		transform
+runtest	general/bug-173.xsl	general/bug-173.xml	general/bug-173.out		transform
+runtest	general/bug-174.xsl	general/bug-174.xml		general/bug-174.err	transform
+runtest	general/bug-175.xsl	general/bug-175.xml	general/bug-175.out	general/bug-175.err	transform
+runtest	general/bug-176.xsl	general/bug-176.xml	general/bug-176.out		transform
+runtest	general/bug-177.xsl	general/bug-177.xml	general/bug-177.out		transform
+runtest	general/bug-178.xsl	general/bug-178.xml	general/bug-178.out		transform
+runtest	general/bug-179.xsl	general/bug-179.xml	general/bug-179.out		transform
+runtest	general/bug-18-.xsl	general/bug-18-.xml	general/bug-18-.out		transform
+runtest	general/bug-180.xsl	general/bug-180.xml		general/bug-180.err	transform
+runtest	general/bug-181.xsl	general/bug-181.xml	general/bug-181.out		transform
+runtest	general/bug-182.xsl	general/bug-182.xml	general/bug-182.out		transform
+runtest	general/bug-183.xsl	general/bug-183.xml	general/bug-183.out		transform
+runtest	general/bug-184.xsl	general/bug-184.xml		general/bug-184.err	transform
+runtest	general/bug-186.xsl	general/bug-186.xml	general/bug-186.out		transform
+runtest	general/bug-187.xsl	general/bug-187.xml	general/bug-187.out	general/bug-187.err	transform
+runtest	general/bug-188.xsl	general/bug-188.xml	general/bug-188.out		transform
+runtest	general/bug-189.xsl	general/bug-189.xml	general/bug-189.out		transform
+runtest	general/bug-19-.xsl	general/bug-19-.xml	general/bug-19-.out		transform
+runtest	general/bug-190.xsl	general/bug-190.xml	general/bug-190.out		transform
+runtest	general/bug-191.xsl	general/bug-191.xml		general/bug-191.err	transform
+runtest	general/bug-192.xsl	general/bug-192.xml	general/bug-192.out		transform
+runtest	general/bug-193.xsl	general/bug-193.xml	general/bug-193.out		transform
+runtest	general/bug-194.xsl	general/bug-194.xml		general/bug-194.err	transform
+runtest	general/bug-195.xsl	general/bug-195.xml	general/bug-195.out		transform
+runtest	general/bug-196.xsl	general/bug-196.xml	general/bug-196.out		transform
+runtest	general/bug-197.xsl	general/bug-197.xml	general/bug-197.out		transform
+runtest	general/bug-198.xsl	general/bug-198.xml	general/bug-198.out		transform
+runtest	general/bug-199.xsl	general/bug-199.xml	general/bug-199.out		transform
+runtest	general/bug-2-.xsl	general/bug-2-.xml	general/bug-2-.out		transform
+runtest	general/bug-20-.xsl	general/bug-20-.xml	general/bug-20-.out		transform
+runtest	general/bug-200.xsl	general/bug-200.xml	general/bug-200.out		transform
+runtest	general/bug-201.xsl	general/bug-201.xml		general/bug-201.err	transform
+runtest	general/bug-202.xsl	general/bug-202.xml		general/bug-202.err	transform
+runtest	general/bug-203.xsl	general/bug-203.xml		general/bug-203.err	transform
+runtest	general/bug-204.xsl	general/bug-204.xml		general/bug-204.err	transform
+runtest	general/bug-205.xsl	general/bug-205.xml	general/bug-205.out		transform
+runtest	general/bug-206.xsl	general/bug-206.xml	general/bug-206.out		transform
+runtest	general/bug-207.xsl	general/bug-207.xml	general/bug-207.out		transform
+runtest	general/bug-208.xsl	general/bug-208.xml		general/bug-208.err	transform
+runtest	general/bug-209.xsl	general/bug-209.xml	general/bug-209.out		transform
+runtest	general/bug-21-.xsl	general/bug-21-.xml	general/bug-21-.out		transform
+runtest	general/bug-210.xsl	general/bug-210.xml	general/bug-210.out		transform
+runtest	general/bug-211.xsl	general/bug-211.xml	general/bug-211.out		transform
+runtest	general/bug-212.xsl	general/bug-212.xml	general/bug-212.out		transform
+runtest	general/bug-213.xsl	general/bug-213.xml	general/bug-213.out		transform
+runtest	general/bug-214.xsl	general/bug-214.xml	general/bug-214.out		transform
+runtest	general/bug-215.xsl	general/bug-215.xml		general/bug-215.err	transform
+runtest	general/bug-216.xsl	general/bug-216.xml	general/bug-216.out		transform
+runtest	general/bug-217.xsl	general/bug-217.xml	general/bug-217.out		transform
+runtest	general/bug-218.xsl	general/bug-218.xml	general/bug-218.out		transform
+runtest	general/bug-219.xsl	general/bug-219.xml	general/bug-219.out		transform
+runtest	general/bug-22-.xsl	general/bug-22-.xml	general/bug-22-.out		transform
+runtest	general/bug-220.xsl	general/bug-220.xml	general/bug-220.out		transform
+runtest	general/bug-221.xsl	general/bug-221.xml	general/bug-221.out		transform
+runtest	general/bug-222.xsl	general/bug-222.xml	general/bug-222.out		transform
+runtest	general/bug-223.xsl	general/bug-223.xml	general/bug-223.out		transform
+runtest	general/bug-224.xsl	general/bug-224.xml	general/bug-224.out		transform
+runtest	general/bug-225.xsl	general/bug-225.xml	general/bug-225.out		transform
+runtest	general/bug-23-.xsl	general/bug-23-.xml	general/bug-23-.out		transform
+runtest	general/bug-24-.xsl	general/bug-24-.xml	general/bug-24-.out		transform
+runtest	general/bug-25-.xsl	general/bug-25-.xml	general/bug-25-.out		transform
+runtest	general/bug-26-.xsl	general/bug-26-.xml	general/bug-26-.out		transform
+runtest	general/bug-27-.xsl	general/bug-27-.xml	general/bug-27-.out		transform
+runtest	general/bug-28-.xsl	general/bug-28-.xml	general/bug-28-.out		transform
+runtest	general/bug-29-.xsl	general/bug-29-.xml	general/bug-29-.out		transform
+runtest	general/bug-3-.xsl	general/bug-3-.xml	general/bug-3-.out		transform
+runtest	general/bug-30-.xsl	general/bug-30-.xml	general/bug-30-.out		transform
+runtest	general/bug-31-.xsl	general/bug-31-.xml	general/bug-31-.out		transform
+runtest	general/bug-32-.xsl	general/bug-32-.xml	general/bug-32-.out		transform
+runtest	general/bug-33-.xsl	general/bug-33-.xml	general/bug-33-.out		transform
+runtest	general/bug-35-.xsl	general/bug-35-.xml	general/bug-35-.out		transform
+runtest	general/bug-36-.xsl	general/bug-36-.xml	general/bug-36-.out		transform
+runtest	general/bug-37-.xsl	general/bug-37-.xml	general/bug-37-.out		transform
+runtest	general/bug-38-.xsl	general/bug-38-.xml	general/bug-38-.out		transform
+runtest	general/bug-39-.xsl	general/bug-39-.xml	general/bug-39-.out		transform
+runtest	general/bug-4-.xsl	general/bug-4-.xml	general/bug-4-.out		transform
+runtest	general/bug-40-.xsl	general/bug-40-.xml	general/bug-40-.out		transform
+runtest	general/bug-41-.xsl	general/bug-41-.xml	general/bug-41-.out		transform
+runtest	general/bug-42-.xsl	general/bug-42-.xml	general/bug-42-.out		transform
+runtest	general/bug-43-.xsl	general/bug-43-.xml	general/bug-43-.out		transform
+runtest	general/bug-44-.xsl	general/bug-44-.xml	general/bug-44-.out		transform
+runtest	general/bug-45-.xsl	general/bug-45-.xml	general/bug-45-.out		transform
+runtest	general/bug-46-.xsl	general/bug-46-.xml	general/bug-46-.out		transform
+runtest	general/bug-47-.xsl	general/bug-47-.xml	general/bug-47-.out		transform
+runtest	general/bug-48-.xsl	general/bug-48-.xml	general/bug-48-.out		transform
+runtest	general/bug-49-.xsl	general/bug-49-.xml	general/bug-49-.out		transform
+runtest	general/bug-5-.xsl	general/bug-5-.xml	general/bug-5-.out		transform
+runtest	general/bug-50-.xsl	general/bug-50-.xml	general/bug-50-.out		transform
+runtest	general/bug-52.xsl	general/bug-52.xml	general/bug-52.out		transform
+runtest	general/bug-53.xsl	general/bug-53.xml	general/bug-53.out		transform
+runtest	general/bug-54.xsl	general/bug-54.xml	general/bug-54.out		transform
+runtest	general/bug-55.xsl	general/bug-55.xml	general/bug-55.out		transform
+runtest	general/bug-56.xsl	general/bug-56.xml	general/bug-56.out		transform
+runtest	general/bug-57.xsl	general/bug-57.xml	general/bug-57.out		transform
+runtest	general/bug-59.xsl	general/bug-59.xml	general/bug-59.out		transform
+runtest	general/bug-6-.xsl	general/bug-6-.xml	general/bug-6-.out		transform
+runtest	general/bug-60.xsl	general/bug-60.xml	general/bug-60.out	general/bug-60.err	transform
+runtest	general/bug-61.xsl	general/bug-61.xml	general/bug-61.out		transform
+runtest	general/bug-62.xsl	general/bug-62.xml	general/bug-62.out		transform
+runtest	general/bug-63.xsl	general/bug-63.xml	general/bug-63.out		transform
+runtest	general/bug-64.xsl	general/bug-64.xml	general/bug-64.out		transform
+runtest	general/bug-65.xsl	general/bug-65.xml	general/bug-65.out		transform
+runtest	general/bug-66.xsl	general/bug-66.xml	general/bug-66.out		transform
+runtest	general/bug-68.xsl	general/bug-68.xml	general/bug-68.out		transform
+runtest	general/bug-69.xsl	general/bug-69.xml	general/bug-69.out		transform
+runtest	general/bug-7-.xsl	general/bug-7-.xml	general/bug-7-.out		transform
+runtest	general/bug-70.xsl	general/bug-70.xml	general/bug-70.out		transform
+runtest	general/bug-71.xsl	general/bug-71.xml	general/bug-71.out		transform
+runtest	general/bug-72.xsl	general/bug-72.xml	general/bug-72.out		transform
+runtest	general/bug-73.xsl	general/bug-73.xml	general/bug-73.out		transform
+runtest	general/bug-74.xsl	general/bug-74.xml	general/bug-74.out		transform
+runtest	general/bug-75.xsl	general/bug-75.xml	general/bug-75.out		transform
+runtest	general/bug-76.xsl	general/bug-76.xml	general/bug-76.out		transform
+runtest	general/bug-77.xsl	general/bug-77.xml	general/bug-77.out		transform
+runtest	general/bug-78.xsl	general/bug-78.xml	general/bug-78.out		transform
+runtest	general/bug-79.xsl	general/bug-79.xml	general/bug-79.out		transform
+runtest	general/bug-8-.xsl	general/bug-8-.xml	general/bug-8-.out		transform
+runtest	general/bug-80.xsl	general/bug-80.xml	general/bug-80.out		transform
+runtest	general/bug-81.xsl	general/bug-81.xml	general/bug-81.out		transform
+runtest	general/bug-82.xsl	general/bug-82.xml	general/bug-82.out		transform
+runtest	general/bug-83.xsl	general/bug-83.xml	general/bug-83.out		transform
+runtest	general/bug-84.xsl	general/bug-84.xml	general/bug-84.out		transform
+runtest	general/bug-86.xsl	general/bug-86.xml	general/bug-86.out		transform
+runtest	general/bug-87.xsl	general/bug-87.xml	general/bug-87.out		transform
+runtest	general/bug-88.xsl	general/bug-88.xml	general/bug-88.out		transform
+runtest	general/bug-89.xsl	general/bug-89.xml	general/bug-89.out		transform
+runtest	general/bug-9-.xsl	general/bug-9-.xml	general/bug-9-.out		transform
+runtest	general/bug-90.xsl	general/bug-90.xml	general/bug-90.out		transform
+runtest	general/bug-91.xsl	general/bug-91.xml	general/bug-91.out		transform
+runtest	general/bug-92.xsl	general/bug-92.xml	general/bug-92.out		transform
+runtest	general/bug-93.xsl	general/bug-93.xml	general/bug-93.out		transform
+runtest	general/bug-94.xsl	general/bug-94.xml	general/bug-94.out		transform
+runtest	general/bug-95.xsl	general/bug-95.xml	general/bug-95.out		transform
+runtest	general/bug-96.xsl	general/bug-96.xml	general/bug-96.out		transform
+runtest	general/bug-97.xsl	general/bug-97.xml	general/bug-97.out		transform
+runtest	general/bug-98.xsl	general/bug-98.xml	general/bug-98.out		transform
+runtest	general/bug-99.xsl	general/bug-99.xml	general/bug-99.out		transform
+runtest	general/character.xsl	general/character.xml	general/character.out		transform
+runtest	general/date_add.xsl	general/date_add.xml	general/date_add.out		transform
+runtest	general/doc.xsl	general/doc.xml	general/doc.out		transform
+runtest	encoding/bug-146.xsl	encoding/bug-146.xml	encoding/bug-146.out		transform
+runtest	documents/bredfort.xsl	documents/bredfort.xml	documents/bredfort.out		transform
+runtest	documents/fragment.xsl	documents/fragment.xml	documents/fragment.out		transform
+runtest	documents/message.xsl	documents/message.xml		documents/message.err	transform
+runtest	documents/test.xsl	documents/test.xml	documents/test.out		transform
+runtest	documents/test_bad.xsl	documents/test_bad.xml	documents/test_bad.out	documents/test_bad.err	transform
+runtest	numbers/format-number.xsl	numbers/format-number.xml	numbers/format-number.out		transform
+runtest	keys/dates.xsl	keys/dates.xml	keys/dates.out		transform
+runtest	namespaces/extra.xsl	namespaces/extra.xml	namespaces/extra.out		transform
+runtest	namespaces/extra2.xsl	namespaces/extra2.xml		namespaces/extra2.err	transform
+runtest	namespaces/tst.xsl	namespaces/tst.xml	namespaces/tst.out		transform
+runtest	namespaces/tst2.xsl	namespaces/tst2.xml	namespaces/tst2.out		transform
+runtest	namespaces/tst3.xsl	namespaces/tst3.xml	namespaces/tst3.out		transform
+runtest	namespaces/tst4.xsl	namespaces/tst4.xml	namespaces/tst4.out		transform
+runtest	namespaces/tst5.xsl	namespaces/tst5.xml	namespaces/tst5.out		transform
+runtest	namespaces/tst6.xsl	namespaces/tst6.xml	namespaces/tst6.out		transform
+runtest	namespaces/tst7.xsl	namespaces/tst7.xml	namespaces/tst7.out		transform
+runtest	namespaces/tst8.xsl	namespaces/tst8.xml	namespaces/tst8.out		transform
+runtest	namespaces/tst9.xsl	namespaces/tst9.xml	namespaces/tst9.out		transform
+runtest	extensions/evaluate.xsl	extensions/evaluate.xml	extensions/evaluate.out		transform
+runtest	extensions/list.xsl	extensions/list.xml	extensions/list.out		transform
+runtest	extensions/module.xsl	extensions/module.xml	extensions/module.out		transform
+runtest	reports/cmdlineparams.xsl	reports/cmdlineparams.xml	reports/cmdlineparams.out		transform
+runtest	reports/recglobparam.xsl	reports/recglobparam.xml		reports/recglobparam.err	transform
+runtest	reports/recglobvar.xsl	reports/recglobvar.xml		reports/recglobvar.err	transform
+runtest	reports/reclocparam.xsl	reports/reclocparam.xml		reports/reclocparam.err	transform
+runtest	reports/reclocvar.xsl	reports/reclocvar.xml		reports/reclocvar.err	transform
+runtest	reports/tst-1.xsl	reports/tst-1.xml		reports/tst-1.err	transform
+runtest	reports/tst-2.xsl	reports/tst-2.xml		reports/tst-2.err	transform
+runtest	reports/undefvar.xsl	reports/undefvar.xml		reports/undefvar.err	transform
+runtest	exslt/common/dynamic-id.xsl	exslt/common/dynamic-id.xml	exslt/common/dynamic-id.out		transform
+runtest	exslt/common/import-test1.xsl	exslt/common/import-test1.xml	exslt/common/import-test1.out		transform
+runtest	exslt/common/node-set.1.xsl	exslt/common/node-set.1.xml	exslt/common/node-set.1.out		transform
+runtest	exslt/common/node-set.2.xsl	exslt/common/node-set.2.xml	exslt/common/node-set.2.out		transform
+runtest	exslt/common/node-set.3.xsl	exslt/common/node-set.3.xml	exslt/common/node-set.3.out		transform
+runtest	exslt/common/node-set.4.xsl	exslt/common/node-set.4.xml	exslt/common/node-set.4.out		transform
+runtest	exslt/common/node-set.5.xsl	exslt/common/node-set.5.xml	exslt/common/node-set.5.out		transform
+runtest	exslt/common/node-set.6.xsl	exslt/common/node-set.6.xml	exslt/common/node-set.6.out		transform
+runtest	exslt/common/node-set.7.xsl	exslt/common/node-set.7.xml	exslt/common/node-set.7.out		transform
+runtest	exslt/common/node-set.8.xsl	exslt/common/node-set.8.xml	exslt/common/node-set.8.out		transform
+runtest	exslt/common/node-set.9.xsl	exslt/common/node-set.9.xml	exslt/common/node-set.9.out		transform
+runtest	exslt/common/object-type.1.xsl	exslt/common/object-type.1.xml	exslt/common/object-type.1.out		transform
+runtest	exslt/crypto/crypt.1.xsl	exslt/crypto/crypt.1.xml	exslt/crypto/crypt.1.out		transform
+runtest	exslt/crypto/hash.1.xsl	exslt/crypto/hash.1.xml	exslt/crypto/hash.1.out		transform
+runtest	exslt/date/add-duration.1.xsl	exslt/date/add-duration.1.xml	exslt/date/add-duration.1.out		transform
+runtest	exslt/date/add-duration.2.xsl	exslt/date/add-duration.2.xml	exslt/date/add-duration.2.out		transform
+runtest	exslt/date/add.1.xsl	exslt/date/add.1.xml	exslt/date/add.1.out		transform
+runtest	exslt/date/add.2.xsl	exslt/date/add.2.xml	exslt/date/add.2.out		transform
+runtest	exslt/date/date.1.xsl	exslt/date/date.1.xml	exslt/date/date.1.out		transform
+runtest	exslt/date/date.2.xsl	exslt/date/date.2.xml	exslt/date/date.2.out		transform
+runtest	exslt/date/datetime.1.xsl	exslt/date/datetime.1.xml	exslt/date/datetime.1.out		transform
+runtest	exslt/date/datetime.2.xsl	exslt/date/datetime.2.xml	exslt/date/datetime.2.out		transform
+runtest	exslt/date/difference.1.xsl	exslt/date/difference.1.xml	exslt/date/difference.1.out		transform
+runtest	exslt/date/difference.2.xsl	exslt/date/difference.2.xml	exslt/date/difference.2.out		transform
+runtest	exslt/date/duration.1.xsl	exslt/date/duration.1.xml	exslt/date/duration.1.out		transform
+runtest	exslt/date/duration.2.xsl	exslt/date/duration.2.xml	exslt/date/duration.2.out		transform
+runtest	exslt/date/gday.1.xsl	exslt/date/gday.1.xml	exslt/date/gday.1.out		transform
+runtest	exslt/date/gday.2.xsl	exslt/date/gday.2.xml	exslt/date/gday.2.out		transform
+runtest	exslt/date/gmonth.1.xsl	exslt/date/gmonth.1.xml	exslt/date/gmonth.1.out		transform
+runtest	exslt/date/gmonth.2.xsl	exslt/date/gmonth.2.xml	exslt/date/gmonth.2.out		transform
+runtest	exslt/date/gmonthday.1.xsl	exslt/date/gmonthday.1.xml	exslt/date/gmonthday.1.out		transform
+runtest	exslt/date/gmonthday.2.xsl	exslt/date/gmonthday.2.xml	exslt/date/gmonthday.2.out		transform
+runtest	exslt/date/gyear.1.xsl	exslt/date/gyear.1.xml	exslt/date/gyear.1.out		transform
+runtest	exslt/date/gyear.2.xsl	exslt/date/gyear.2.xml	exslt/date/gyear.2.out		transform
+runtest	exslt/date/gyearmonth.1.xsl	exslt/date/gyearmonth.1.xml	exslt/date/gyearmonth.1.out		transform
+runtest	exslt/date/gyearmonth.2.xsl	exslt/date/gyearmonth.2.xml	exslt/date/gyearmonth.2.out		transform
+runtest	exslt/date/seconds.1.xsl	exslt/date/seconds.1.xml	exslt/date/seconds.1.out		transform
+runtest	exslt/date/seconds.2.xsl	exslt/date/seconds.2.xml	exslt/date/seconds.2.out		transform
+runtest	exslt/date/sum.1.xsl	exslt/date/sum.1.xml	exslt/date/sum.1.out		transform
+runtest	exslt/date/sum.2.xsl	exslt/date/sum.2.xml	exslt/date/sum.2.out		transform
+runtest	exslt/date/time.1.xsl	exslt/date/time.1.xml	exslt/date/time.1.out		transform
+runtest	exslt/date/time.2.xsl	exslt/date/time.2.xml	exslt/date/time.2.out		transform
+runtest	exslt/dynamic/dynmap.xsl	exslt/dynamic/dynmap.xml	exslt/dynamic/dynmap.out		transform
+runtest	exslt/dynamic/recursion.xsl	exslt/dynamic/recursion.xml	exslt/dynamic/recursion.out	exslt/dynamic/recursion.err	transform
+runtest	exslt/functions/function.1.xsl	exslt/functions/function.1.xml	exslt/functions/function.1.out		transform
+runtest	exslt/functions/function.10.xsl	exslt/functions/function.10.xml	exslt/functions/function.10.out		transform
+runtest	exslt/functions/function.11.xsl	exslt/functions/function.11.xml	exslt/functions/function.11.out		transform
+runtest	exslt/functions/function.2.xsl	exslt/functions/function.2.xml	exslt/functions/function.2.out		transform
+runtest	exslt/functions/function.3.xsl	exslt/functions/function.3.xml	exslt/functions/function.3.out		transform
+runtest	exslt/functions/function.4.xsl	exslt/functions/function.4.xml	exslt/functions/function.4.out		transform
+runtest	exslt/functions/function.5.xsl	exslt/functions/function.5.xml	exslt/functions/function.5.out		transform
+runtest	exslt/functions/function.6.xsl	exslt/functions/function.6.xml	exslt/functions/function.6.out		transform
+runtest	exslt/functions/function.7.xsl	exslt/functions/function.7.xml	exslt/functions/function.7.out		transform
+runtest	exslt/functions/function.8.xsl	exslt/functions/function.8.xml	exslt/functions/function.8.out		transform
+runtest	exslt/functions/function.9.xsl	exslt/functions/function.9.xml	exslt/functions/function.9.out		transform
+runtest	exslt/math/highest.1.xsl	exslt/math/highest.1.xml	exslt/math/highest.1.out		transform
+runtest	exslt/math/highest.2.xsl	exslt/math/highest.2.xml	exslt/math/highest.2.out		transform
+runtest	exslt/math/highest.5.xsl	exslt/math/highest.5.xml	exslt/math/highest.5.out		transform
+runtest	exslt/math/lowest.1.xsl	exslt/math/lowest.1.xml	exslt/math/lowest.1.out		transform
+runtest	exslt/math/lowest.2.xsl	exslt/math/lowest.2.xml	exslt/math/lowest.2.out		transform
+runtest	exslt/math/max.1.xsl	exslt/math/max.1.xml	exslt/math/max.1.out		transform
+runtest	exslt/math/max.2.xsl	exslt/math/max.2.xml	exslt/math/max.2.out		transform
+runtest	exslt/math/max.3.xsl	exslt/math/max.3.xml	exslt/math/max.3.out		transform
+runtest	exslt/math/max.5.xsl	exslt/math/max.5.xml	exslt/math/max.5.out		transform
+runtest	exslt/math/min.1.xsl	exslt/math/min.1.xml	exslt/math/min.1.out		transform
+runtest	exslt/math/min.2.xsl	exslt/math/min.2.xml	exslt/math/min.2.out		transform
+runtest	exslt/math/power.1.xsl	exslt/math/power.1.xml	exslt/math/power.1.out		transform
+runtest	exslt/saxon/eval.1.xsl	exslt/saxon/eval.1.xml	exslt/saxon/eval.1.out		transform
+runtest	exslt/saxon/eval.2.xsl	exslt/saxon/eval.2.xml		exslt/saxon/eval.2.err	transform
+runtest	exslt/saxon/eval.3.xsl	exslt/saxon/eval.3.xml		exslt/saxon/eval.3.err	transform
+runtest	exslt/saxon/lineno.1.xsl	exslt/saxon/lineno.1.xml	exslt/saxon/lineno.1.out		transform
+runtest	exslt/sets/difference.1.xsl	exslt/sets/difference.1.xml	exslt/sets/difference.1.out		transform
+runtest	exslt/sets/distinct.1.xsl	exslt/sets/distinct.1.xml	exslt/sets/distinct.1.out		transform
+runtest	exslt/sets/has-same-node.1.xsl	exslt/sets/has-same-node.1.xml	exslt/sets/has-same-node.1.out		transform
+runtest	exslt/sets/leading.1.xsl	exslt/sets/leading.1.xml	exslt/sets/leading.1.out		transform
+runtest	exslt/sets/trailing.1.xsl	exslt/sets/trailing.1.xml	exslt/sets/trailing.1.out		transform
+runtest	exslt/strings/align.1.xsl	exslt/strings/align.1.xml	exslt/strings/align.1.out		transform
+runtest	exslt/strings/padding.1.xsl	exslt/strings/padding.1.xml	exslt/strings/padding.1.out		transform
+runtest	exslt/strings/replace.1.xsl	exslt/strings/replace.1.xml	exslt/strings/replace.1.out		transform
+runtest	exslt/strings/split.1.xsl	exslt/strings/split.1.xml	exslt/strings/split.1.out		transform
+runtest	exslt/strings/tokenize.1.xsl	exslt/strings/tokenize.1.xml	exslt/strings/tokenize.1.out		transform
+runtest	exslt/strings/tokenize.2.xsl	exslt/strings/tokenize.2.xml	exslt/strings/tokenize.2.out		transform
+runtest	exslt/strings/tokenize.3.xsl	exslt/strings/tokenize.3.xml	exslt/strings/tokenize.3.out		transform
+runtest	exslt/strings/uri.xsl	exslt/strings/uri.xml	exslt/strings/uri.out		transform
+runtest	plugins/plugin.xsl	plugins/plugin.xml	plugins/plugin.out		transform
+runtest-standalone	REC/stand-2.7-1.xml	REC/stand-2.7-1.xml	REC/stand-2.7-1.stand.out		standalone
+runtest-standalone	REC/stand-2.7-2.xml	REC/stand-2.7-2.xml	REC/stand-2.7-2.stand.out		standalone
+runtest-standalone	REC/stand-2.7-3.xml	REC/stand-2.7-3.xml	REC/stand-2.7-3.stand.out		standalone
+xsltmark	XSLTMark/alphabetize.xsl	XSLTMark/db100.xml	XSLTMark/alphabetize.out		transform
+xsltmark	XSLTMark/attsets.xsl	XSLTMark/chart.xml	XSLTMark/attsets.out		transform
+xsltmark	XSLTMark/avts.xsl	XSLTMark/db100.xml	XSLTMark/avts.out		transform
+xsltmark	XSLTMark/axis.xsl	XSLTMark/axis.xml	XSLTMark/axis.out		transform
+xsltmark	XSLTMark/backwards.xsl	XSLTMark/game.xml	XSLTMark/backwards.out		transform
+xsltmark	XSLTMark/bottles.xsl	XSLTMark/bottles.xml	XSLTMark/bottles.out		transform
+xsltmark	XSLTMark/find.xsl	XSLTMark/breadth.xml	XSLTMark/breadth.out		transform
+xsltmark	XSLTMark/brutal.xsl	XSLTMark/brutal.xml	XSLTMark/brutal.out		transform
+xsltmark	XSLTMark/chart.xsl	XSLTMark/chart.xml	XSLTMark/chart.out		transform
+xsltmark	XSLTMark/creation.xsl	XSLTMark/db100.xml	XSLTMark/creation.out		transform
+xsltmark	XSLTMark/current.xsl	XSLTMark/current.xml	XSLTMark/current.out		transform
+xsltmark	XSLTMark/dbonerow.xsl	XSLTMark/db10000.xml	XSLTMark/dbonerow.out		transform
+xsltmark	XSLTMark/dbtail.xsl	XSLTMark/db100.xml	XSLTMark/dbtail.out		transform
+xsltmark	XSLTMark/decoy.xsl	XSLTMark/db100.xml	XSLTMark/decoy.out		transform
+xsltmark	XSLTMark/find.xsl	XSLTMark/depth.xml	XSLTMark/depth.out		transform
+xsltmark	XSLTMark/encrypt.xsl	XSLTMark/db100.xml	XSLTMark/encrypt.out		transform
+xsltmark	XSLTMark/functions.xsl	XSLTMark/db100.xml	XSLTMark/functions.out		transform
+xsltmark	XSLTMark/game.xsl	XSLTMark/game.xml	XSLTMark/game.out		transform
+xsltmark	XSLTMark/html.xsl	XSLTMark/html.xml	XSLTMark/html.out		transform
+xsltmark	XSLTMark/identity.xsl	XSLTMark/db1000.xml	XSLTMark/identity.out		transform
+xsltmark	XSLTMark/inventory.xsl	XSLTMark/inventory.xml	XSLTMark/inventory.out		transform
+xsltmark	XSLTMark/metric.xsl	XSLTMark/metric.xml	XSLTMark/metric.out		transform
+xsltmark	XSLTMark/number.xsl	XSLTMark/number.xml	XSLTMark/number.out		transform
+xsltmark	XSLTMark/oddtemplate.xsl	XSLTMark/oddtemplate.xml	XSLTMark/oddtemplate.out		transform
+xsltmark	XSLTMark/patterns.xsl	XSLTMark/db100.xml	XSLTMark/patterns.out		transform
+xsltmark	XSLTMark/prettyprint.xsl	XSLTMark/db100.xml	XSLTMark/prettyprint.out		transform
+xsltmark	XSLTMark/priority.xsl	XSLTMark/priority.xml	XSLTMark/priority.out		transform
+xsltmark	XSLTMark/products.xsl	XSLTMark/products.xml	XSLTMark/products.out		transform
+xsltmark	XSLTMark/queens.xsl	XSLTMark/queens.xml	XSLTMark/queens.out		transform
+xsltmark	XSLTMark/reverser.xsl	XSLTMark/gettysburg.xml	XSLTMark/reverser.out		transform
+xsltmark	XSLTMark/stringsort.xsl	XSLTMark/db1000.xml	XSLTMark/stringsort.out		transform
+xsltmark	XSLTMark/summarize.xsl	XSLTMark/queens.xsl	XSLTMark/summarize.out		transform
+xsltmark	XSLTMark/total.xsl	XSLTMark/chart.xml	XSLTMark/total.out		transform
+xsltmark	XSLTMark/tower.xsl	XSLTMark/tower.xml	XSLTMark/tower.out		transform
+xsltmark	XSLTMark/trend.xsl	XSLTMark/trend.xml	XSLTMark/trend.out		transform
+xsltmark	XSLTMark/union.xsl	XSLTMark/union.xml	XSLTMark/union.out		transform
+xsltmark	XSLTMark/xpath.xsl	XSLTMark/xpath.xml	XSLTMark/xpath.out		transform
+xsltmark	XSLTMark/xslbench1.xsl	XSLTMark/xslbench1.xml	XSLTMark/xslbench1.out		transform
+xsltmark	XSLTMark/xslbench2.xsl	XSLTMark/xslbenchdream.xml	XSLTMark/xslbench2.out		transform
+xsltmark	XSLTMark/xslbench3.xsl	XSLTMark/xslbenchdream.xml	XSLTMark/xslbench3.out		transform
+docbook	docbook/html/docbook.xsl	docbook/test/article.xml	docbook/result/html/article.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/article.xml	docbook/result/xhtml/article.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/article.xml	docbook/result/fo/article.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/article2.xml	docbook/result/html/article2.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/article2.xml	docbook/result/xhtml/article2.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/article2.xml	docbook/result/fo/article2.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/article3.xml	docbook/result/html/article3.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/article3.xml	docbook/result/xhtml/article3.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/article3.xml	docbook/result/fo/article3.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/bib.xml	docbook/result/html/bib.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/bib.xml	docbook/result/xhtml/bib.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/bib.xml	docbook/result/fo/bib.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/book.xml	docbook/result/html/book.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/book.xml	docbook/result/xhtml/book.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/book.xml	docbook/result/fo/book.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/book2.xml	docbook/result/html/book2.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/book2.xml	docbook/result/xhtml/book2.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/book2.xml	docbook/result/fo/book2.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/book3.xml	docbook/result/html/book3.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/book3.xml	docbook/result/xhtml/book3.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/book3.xml	docbook/result/fo/book3.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/callout.xml	docbook/result/html/callout.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/callout.xml	docbook/result/xhtml/callout.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/callout.xml	docbook/result/fo/callout.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/chunk.xml	docbook/result/html/chunk.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/chunk.xml	docbook/result/xhtml/chunk.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/chunk.xml	docbook/result/fo/chunk.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/classsynop.xml	docbook/result/html/classsynop.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/classsynop.xml	docbook/result/xhtml/classsynop.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/classsynop.xml	docbook/result/fo/classsynop.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/condition.xml	docbook/result/html/condition.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/condition.xml	docbook/result/xhtml/condition.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/condition.xml	docbook/result/fo/condition.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/docbook40.xml	docbook/result/html/docbook40.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/docbook40.xml	docbook/result/xhtml/docbook40.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/docbook40.xml	docbook/result/fo/docbook40.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/external.xml	docbook/result/html/external.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/external.xml	docbook/result/xhtml/external.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/external.xml	docbook/result/fo/external.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/figtest.xml	docbook/result/html/figtest.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/figtest.xml	docbook/result/xhtml/figtest.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/figtest.xml	docbook/result/fo/figtest.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/foottest.xml	docbook/result/html/foottest.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/foottest.xml	docbook/result/xhtml/foottest.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/foottest.xml	docbook/result/fo/foottest.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/fotest.xml	docbook/result/html/fotest.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/fotest.xml	docbook/result/xhtml/fotest.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/fotest.xml	docbook/result/fo/fotest.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/func.xml	docbook/result/html/func.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/func.xml	docbook/result/xhtml/func.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/func.xml	docbook/result/fo/func.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/gdp-handbook.xml	docbook/result/html/gdp-handbook.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/gdp-handbook.xml	docbook/result/xhtml/gdp-handbook.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/gdp-handbook.xml	docbook/result/fo/gdp-handbook.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/graphics.xml	docbook/result/html/graphics.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/graphics.xml	docbook/result/xhtml/graphics.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/graphics.xml	docbook/result/fo/graphics.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/gtest.xml	docbook/result/html/gtest.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/gtest.xml	docbook/result/xhtml/gtest.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/gtest.xml	docbook/result/fo/gtest.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/idxbook.xml	docbook/result/html/idxbook.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/idxbook.xml	docbook/result/xhtml/idxbook.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/idxbook.xml	docbook/result/fo/idxbook.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/kwrite.xml	docbook/result/html/kwrite.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/kwrite.xml	docbook/result/xhtml/kwrite.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/kwrite.xml	docbook/result/fo/kwrite.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/multilingual.xml	docbook/result/html/multilingual.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/multilingual.xml	docbook/result/xhtml/multilingual.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/multilingual.xml	docbook/result/fo/multilingual.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/qa.xml	docbook/result/html/qa.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/qa.xml	docbook/result/xhtml/qa.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/qa.xml	docbook/result/fo/qa.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/qa2.xml	docbook/result/html/qa2.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/qa2.xml	docbook/result/xhtml/qa2.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/qa2.xml	docbook/result/fo/qa2.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/sectest.xml	docbook/result/html/sectest.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/sectest.xml	docbook/result/xhtml/sectest.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/sectest.xml	docbook/result/fo/sectest.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/set.xml	docbook/result/html/set.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/set.xml	docbook/result/xhtml/set.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/set.xml	docbook/result/fo/set.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/table.xml	docbook/result/html/table.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/table.xml	docbook/result/xhtml/table.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/table.xml	docbook/result/fo/table.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/test.xml	docbook/result/html/test.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/test.xml	docbook/result/xhtml/test.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/test.xml	docbook/result/fo/test.fo		transform
+docbook	docbook/html/docbook.xsl	docbook/test/verbtest.xml	docbook/result/html/verbtest.html		transform
+docbook	docbook/xhtml/docbook.xsl	docbook/test/verbtest.xml	docbook/result/xhtml/verbtest.xhtml		transform
+docbook	docbook/fo/docbook.xsl	docbook/test/verbtest.xml	docbook/result/fo/verbtest.fo		transform
+multiple	multiple/dict.xsl	multiple/dict.xml	multiple/result.xml		multiple-output
+xinclude	xinclude/e.xsl	xinclude/e.xml	xinclude/normal.out		transform
+xinclude	xinclude/e.xsl	xinclude/e.xml	xinclude/xinclude.out		xinclude
+xmlspec	xmlspec/REC-xml-2e.xsl	xmlspec/REC-xml-20001006.xml	xmlspec/REC-xml-20001006.html		transform
+xmlspec	xmlspec/REC-xml-2e.xsl	xmlspec/REC-xml-20001006.xml	xmlspec/REC-xml-20001006-review.html		xmlspec-review
