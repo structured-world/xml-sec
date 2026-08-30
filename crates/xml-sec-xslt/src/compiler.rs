@@ -36,7 +36,7 @@ impl<R: Resolver> Compiler<R> {
             self.budget.stylesheet_bytes,
             xml.len(),
         )?;
-        let mut state = CompileState::new(self.budget);
+        let mut state = CompileState::new(self.budget, xml.len());
         self.compile_module(xml, base_uri, None, &mut state, 1)?;
         let mut stylesheet = state.finish()?;
         stylesheet.principal_document = Document::parse(xml, base_uri)?;
@@ -226,6 +226,9 @@ impl<R: Resolver> Compiler<R> {
             return Err(Error::StaleResource {
                 identity: resource.identity.clone(),
             });
+        }
+        if !state.resolved_identities.contains_key(&resource.identity) {
+            state.charge_stylesheet(resource.bytes.len())?;
         }
         state.owned_bytes = state.owned_bytes.saturating_add(resource.bytes.len());
         ensure(
@@ -1356,12 +1359,13 @@ struct CompileState {
     resolved_identities: HashMap<ResourceIdentity, Arc<ResolvedResource>>,
     module_documents: HashMap<String, Document>,
     imported_modules: usize,
+    stylesheet_bytes: usize,
     owned_bytes: usize,
     precedence: usize,
     order: usize,
 }
 impl CompileState {
-    fn new(budget: CompileBudget) -> Self {
+    fn new(budget: CompileBudget, stylesheet_bytes: usize) -> Self {
         Self {
             budget,
             templates: vec![],
@@ -1380,6 +1384,7 @@ impl CompileState {
             resolved_identities: HashMap::new(),
             module_documents: HashMap::new(),
             imported_modules: 0,
+            stylesheet_bytes,
             owned_bytes: 0,
             precedence: 0,
             order: 0,
@@ -1403,6 +1408,21 @@ impl CompileState {
             BudgetKind::OwnedBytes,
             self.budget.owned_bytes,
             self.owned_bytes,
+        )
+    }
+    fn charge_stylesheet(&mut self, amount: usize) -> Result<()> {
+        self.stylesheet_bytes = self
+            .stylesheet_bytes
+            .checked_add(amount)
+            .ok_or(Error::Budget {
+                kind: BudgetKind::StylesheetBytes,
+                limit: self.budget.stylesheet_bytes,
+                actual: usize::MAX,
+            })?;
+        ensure(
+            BudgetKind::StylesheetBytes,
+            self.budget.stylesheet_bytes,
+            self.stylesheet_bytes,
         )
     }
     fn finish(mut self) -> Result<Stylesheet> {
@@ -1727,7 +1747,11 @@ fn compile_instruction(
                 return Ok(Instruction::SecondaryOutput {
                     uri,
                     properties,
-                    body: compile_sequence(node.children(), context.descend()?)?,
+                    body: compile_sequence(
+                        node.children()
+                            .filter(|child| !child.has_tag_name((XSLT_NS, "fallback"))),
+                        context.descend()?,
+                    )?,
                 });
             }
             let compatibility_comment = match (node.tag_name().namespace(), node.tag_name().name())

@@ -135,52 +135,19 @@ fn render(
         text.push_str("?>");
         text.push('\n');
     }
-    if let Some(root_name) = document.node(document.root()).and_then(|root| {
-        root.children.iter().find_map(|id| {
-            document.node(*id).and_then(|node| match &node.kind {
-                NodeKind::Element { name, prefix, .. } => Some(prefix.as_ref().map_or_else(
-                    || name.local.clone(),
-                    |prefix| format!("{prefix}:{}", name.local),
-                )),
-                _ => None,
-            })
-        })
-    }) && (definition.doctype_system.is_some()
-        || (definition.method == OutputMethod::Html
-            && (definition.doctype_public.is_some() || definition.version.as_deref() == Some("5"))))
-    {
-        text.push_str("<!DOCTYPE ");
-        text.push_str(&root_name);
-        match (&definition.doctype_public, &definition.doctype_system) {
-            (Some(public), Some(system)) => {
-                text.push_str(" PUBLIC \"");
-                text.push_str(public);
-                text.push('"');
-                text.push_str(" \"");
-                text.push_str(system);
-                text.push('"');
-            }
-            (Some(public), None) if definition.method == OutputMethod::Html => {
-                text.push_str(" PUBLIC \"");
-                text.push_str(public);
-                text.push('"');
-            }
-            (Some(_), None) => {}
-            (None, Some(system)) => {
-                text.push_str(" SYSTEM \"");
-                text.push_str(system);
-                text.push('"');
-            }
-            (None, None) => {}
-        }
-        text.push('>');
-        text.push('\n');
-    }
     let children = &document
         .node(document.root())
         .ok_or_else(|| Error::Serialization("missing result root".into()))?
         .children;
+    let document_element = children.iter().copied().find(|child| {
+        document
+            .node(*child)
+            .is_some_and(|node| matches!(node.kind, NodeKind::Element { .. }))
+    });
     for (index, child) in children.iter().enumerate() {
+        if Some(*child) == document_element {
+            render_doctype(document, *child, definition, text)?;
+        }
         serialize_node(document, *child, definition, text, RenderContext::root())?;
         if definition.method == OutputMethod::Xml
             && (definition.indent || !definition.omit_xml_declaration)
@@ -197,6 +164,54 @@ fn render(
     {
         text.push('\n');
     }
+    Ok(())
+}
+
+fn render_doctype(
+    document: &Document,
+    element: NodeId,
+    definition: &OutputDefinition,
+    text: &mut RenderBuffer,
+) -> Result<()> {
+    if definition.doctype_system.is_none()
+        && !(definition.method == OutputMethod::Html
+            && (definition.doctype_public.is_some() || definition.version.as_deref() == Some("5")))
+    {
+        return Ok(());
+    }
+    let Some(NodeKind::Element { name, prefix, .. }) =
+        document.node(element).map(|node| &node.kind)
+    else {
+        return Err(Error::Serialization(
+            "document element disappeared during serialization".into(),
+        ));
+    };
+    text.push_str("<!DOCTYPE ");
+    push_name(prefix.as_deref(), &name.local, text);
+    match (&definition.doctype_public, &definition.doctype_system) {
+        (Some(public), Some(system)) => {
+            text.push_str(" PUBLIC \"");
+            text.push_str(public);
+            text.push('"');
+            text.push_str(" \"");
+            text.push_str(system);
+            text.push('"');
+        }
+        (Some(public), None) if definition.method == OutputMethod::Html => {
+            text.push_str(" PUBLIC \"");
+            text.push_str(public);
+            text.push('"');
+        }
+        (Some(_), None) => {}
+        (None, Some(system)) => {
+            text.push_str(" SYSTEM \"");
+            text.push_str(system);
+            text.push('"');
+        }
+        (None, None) => {}
+    }
+    text.push('>');
+    text.push('\n');
     Ok(())
 }
 
@@ -593,6 +608,8 @@ fn serialize_node(
                     output.push(' ');
                     push_name(attribute.prefix.as_deref(), &attribute.name.local, output);
                     if definition.method == OutputMethod::Html
+                        && name.namespace.is_none()
+                        && attribute.name.namespace.is_none()
                         && is_html_boolean_attribute(&name.local, &attribute.name.local)
                         && attribute.value.eq_ignore_ascii_case(&attribute.name.local)
                     {

@@ -1,4 +1,5 @@
 use sxd_xpath_no_unsafe::{Context, Value, function};
+use time::OffsetDateTime;
 
 pub(crate) const NAMESPACE: &str = "http://exslt.org/dates-and-times";
 pub(crate) fn register(context: &mut Context<'_>) {
@@ -152,9 +153,39 @@ impl function::Function for DateFunction {
                         .map_or_else(String::new, DurationValue::render),
                 ))
             }
-            operation => evaluate_component(operation, args.first().map(Value::string).as_deref()),
+            operation => {
+                let input = args.first().map(Value::string);
+                let current;
+                let input = if let Some(input) = input.as_deref() {
+                    input
+                } else {
+                    current = current_datetime()?;
+                    &current
+                };
+                evaluate_component(operation, Some(input))
+            }
         }
     }
+}
+
+fn current_datetime() -> std::result::Result<String, function::Error> {
+    let current = OffsetDateTime::now_local().map_err(|error| function::Error::Other {
+        what: format!("EXSLT current local datetime is unavailable: {error}"),
+    })?;
+    let offset = current.offset().whole_seconds();
+    let sign = if offset < 0 { '-' } else { '+' };
+    let offset = offset.unsigned_abs();
+    Ok(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{sign}{:02}:{:02}",
+        current.year(),
+        u8::from(current.month()),
+        current.day(),
+        current.hour(),
+        current.minute(),
+        current.second(),
+        offset / 3600,
+        (offset % 3600) / 60,
+    ))
 }
 
 fn evaluate_component(

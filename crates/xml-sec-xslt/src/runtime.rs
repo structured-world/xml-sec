@@ -1398,6 +1398,7 @@ impl<'a> Execution<'a> {
                     .or_else(|| {
                         static_namespace(static_namespaces, prefix.as_deref().unwrap_or_default())
                     });
+                let (prefix, namespace) = normalize_computed_namespace(prefix, namespace);
                 require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
                 let namespaces = namespace
                     .as_ref()
@@ -1449,6 +1450,7 @@ impl<'a> Execution<'a> {
                             .as_deref()
                             .and_then(|prefix| static_namespace(static_namespaces, prefix))
                     });
+                let (prefix, namespace) = normalize_computed_namespace(prefix, namespace);
                 require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
                 let value =
                     self.capture_text(body, node, position, size, depth, current_precedence)?;
@@ -2124,22 +2126,31 @@ impl<'a> Execution<'a> {
         size: usize,
         depth: usize,
     ) -> Result<Value> {
-        if let Some(select) = &variable.select {
-            Ok(xpath_to_public(
-                self.evaluate(select, node, position, size)?,
-            ))
+        let value = if let Some(select) = &variable.select {
+            xpath_to_public(self.evaluate(select, node, position, size)?)
         } else if variable.content.is_empty() {
-            Ok(Value::String(String::new()))
+            Value::String(String::new())
         } else {
-            Ok(Value::ResultTreeFragment(self.capture_fragment(
+            Value::ResultTreeFragment(self.capture_fragment(
                 &variable.content,
                 node,
                 position,
                 size,
                 depth,
                 None,
-            )?))
-        }
+            )?)
+        };
+        // Selected XPath values become owned by a persistent lexical scope. Result-tree
+        // fragments are already metered while their document is built, so only their binding
+        // name is additional retained storage here.
+        let retained = expanded_name_owned_bytes(&variable.name).saturating_add(
+            variable
+                .select
+                .as_ref()
+                .map_or(0, |_| value_owned_bytes(&value)),
+        );
+        self.meter.charge(BudgetKind::OwnedBytes, retained)?;
+        Ok(value)
     }
     fn evaluate_with_params(
         &mut self,
@@ -2230,6 +2241,11 @@ impl<'a> Execution<'a> {
                     context_position,
                     context_size,
                 )?;
+                if !matches!(data_type.as_str(), "text" | "number") {
+                    return Err(Error::Dynamic(format!(
+                        "xsl:sort data-type must evaluate to `text` or `number`, got `{data_type}`"
+                    )));
+                }
                 let collator = lang
                     .as_deref()
                     .map(|lang| locale_collator(lang, case_order.as_deref()))
@@ -2556,16 +2572,17 @@ impl<'a> Execution<'a> {
         };
         Ok(attributes.len())
     }
-    fn add_namespace(&mut self, namespace: Namespace) -> Result<()> {
-        self.meter
-            .charge(BudgetKind::OwnedBytes, namespace_owned_bytes(&namespace))?;
+    fn add_namespace(&mut self, mut namespace: Namespace) -> Result<()> {
         let node = self
             .result
-            .node_mut(self.parent())
+            .node(self.parent())
             .ok_or_else(|| Error::Dynamic("namespace has no result parent".into()))?;
         let NodeKind::Element {
-            name, namespaces, ..
-        } = &mut node.kind
+            name,
+            prefix,
+            attributes,
+            namespaces,
+        } = &node.kind
         else {
             return Err(Error::Dynamic(
                 "namespace requires an element result".into(),
@@ -2576,12 +2593,39 @@ impl<'a> Execution<'a> {
                 "namespace cannot be added after result children".into(),
             ));
         }
-        // A non-empty default binding would change an unprefixed, no-namespace
-        // result element's expanded name when serialized. Namespace-node
-        // copying must preserve the element identity instead.
-        if namespace.prefix.is_none() && name.namespace.is_none() {
+        // Namespace-node copying cannot retarget an existing result QName. Preserve the copied
+        // URI under a fresh prefix whenever its lexical prefix is already semantically occupied.
+        let conflicts_with_element = namespace.prefix == *prefix
+            && name.namespace.as_deref() != Some(namespace.uri.as_str());
+        let conflicts_with_attribute = attributes.iter().any(|attribute| {
+            attribute.prefix == namespace.prefix
+                && attribute.name.namespace.as_deref() != Some(namespace.uri.as_str())
+        });
+        if conflicts_with_element || conflicts_with_attribute {
+            if namespaces
+                .iter()
+                .any(|existing| existing.uri == namespace.uri)
+            {
+                return Ok(());
+            }
+            namespace.prefix = Some(unused_namespace_prefix(namespaces));
+        }
+        // A non-empty default binding would change an unprefixed, no-namespace result element's
+        // expanded name when serialized. There is no QName use for that binding to preserve.
+        if namespace.prefix.is_none() && prefix.is_none() && name.namespace.is_none() {
             return Ok(());
         }
+        self.meter
+            .charge(BudgetKind::OwnedBytes, namespace_owned_bytes(&namespace))?;
+        let node = self
+            .result
+            .node_mut(self.parent())
+            .ok_or_else(|| Error::Dynamic("namespace has no result parent".into()))?;
+        let NodeKind::Element { namespaces, .. } = &mut node.kind else {
+            return Err(Error::Dynamic(
+                "namespace requires an element result".into(),
+            ));
+        };
         if let Some(existing) = namespaces
             .iter_mut()
             .find(|existing| existing.prefix == namespace.prefix)
@@ -3234,6 +3278,17 @@ fn split_name(value: &str) -> Result<(Option<String>, String)> {
     }
 }
 
+fn normalize_computed_namespace(
+    prefix: Option<String>,
+    namespace: Option<String>,
+) -> (Option<String>, Option<String>) {
+    if namespace.as_deref() == Some("") {
+        (None, None)
+    } else {
+        (prefix, namespace)
+    }
+}
+
 fn static_namespace(namespaces: &[(String, String)], prefix: &str) -> Option<String> {
     namespaces
         .iter()
@@ -3549,11 +3604,11 @@ fn same_node_kind_and_name(document: &Document, left: &SourceNode, right: &Sourc
             ) => left == right,
             (Some(NodeKind::Text { .. }), Some(NodeKind::Text { .. }))
             | (Some(NodeKind::Comment(_)), Some(NodeKind::Comment(_)))
-            | (
-                Some(NodeKind::ProcessingInstruction { .. }),
-                Some(NodeKind::ProcessingInstruction { .. }),
-            )
             | (Some(NodeKind::Root), Some(NodeKind::Root)) => true,
+            (
+                Some(NodeKind::ProcessingInstruction { target: left, .. }),
+                Some(NodeKind::ProcessingInstruction { target: right, .. }),
+            ) => left == right,
             _ => false,
         },
         _ => false,

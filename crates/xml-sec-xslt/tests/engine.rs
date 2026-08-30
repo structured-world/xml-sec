@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::HashMap, sync::Mutex};
 
 use pretty_assertions::assert_eq;
@@ -200,7 +201,7 @@ fn doctype_uses_the_first_element_qualified_name() {
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:test"><xsl:output omit-xml-declaration="yes" doctype-system="result.dtd"/><xsl:template match="/"><xsl:comment>before</xsl:comment><p:root/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<source/>"),
-        "<!DOCTYPE p:root SYSTEM \"result.dtd\">\n<!--before--><p:root xmlns:p=\"urn:test\"/>\n"
+        "<!--before--><!DOCTYPE p:root SYSTEM \"result.dtd\">\n<p:root xmlns:p=\"urn:test\"/>\n"
     );
 }
 
@@ -2334,6 +2335,268 @@ fn evaluated_sort_order_rejects_unknown_values() {
         ),
         Err(Error::Dynamic(message)) if message.contains("xsl:sort") && message.contains("order")
     ));
+}
+
+#[test]
+fn computed_names_normalize_an_explicit_empty_namespace() {
+    // An empty namespace URI removes the lexical prefix; retaining it would serialize an
+    // undeclarable `xmlns:p=""` binding and change the expanded-name contract.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:source"><xsl:output omit-xml-declaration="yes" indent="no"/><xsl:template match="/"><xsl:element name="p:out" namespace=""><xsl:attribute name="p:value" namespace="">ok</xsl:attribute></xsl:element></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "<out value=\"ok\"/>");
+}
+
+#[test]
+fn html_boolean_minimization_requires_unnamespaced_names() {
+    // HTML boolean shorthand applies to HTML attributes only, never to foreign expanded names.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:x="urn:foreign"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><input x:checked="checked"/><x:input checked="checked"/></html></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "<html xmlns:x=\"urn:foreign\"><input x:checked=\"checked\"><x:input checked=\"checked\"></x:input></html>"
+    );
+}
+
+#[test]
+fn evaluated_sort_data_type_rejects_unknown_values() {
+    // XSLT defines exactly text and number; an unknown AVT result is not a text fallback.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="kind" select="'binary'"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:sort data-type="{$kind}"/></xsl:for-each></xsl:template></xsl:stylesheet>"#,
+    );
+    let error = stylesheet
+        .execute(
+            &Document::parse("<root><item/></root>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("unsupported sort data type must fail");
+    assert!(
+        matches!(error, Error::Dynamic(message) if message.contains("data-type") && message.contains("binary"))
+    );
+}
+
+#[test]
+fn zero_argument_exslt_date_components_use_the_current_datetime() {
+    // Zero-argument EXSLT date component functions operate on the current local date/time.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:date="http://exslt.org/dates-and-times"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="date:year()"/><xsl:text>|</xsl:text><xsl:value-of select="date:month-in-year()"/><xsl:text>|</xsl:text><xsl:value-of select="date:hour-in-day()"/></xsl:template></xsl:stylesheet>"#;
+    let output = execute(stylesheet, "<source/>");
+    let values = output
+        .split('|')
+        .map(|value| value.parse::<u32>().expect("current component is numeric"))
+        .collect::<Vec<_>>();
+    assert!((1970..=9999).contains(&values[0]));
+    assert!((1..=12).contains(&values[1]));
+    assert!(values[2] <= 23);
+}
+
+#[derive(Default)]
+struct CountingResolver {
+    calls: AtomicUsize,
+    resources: Mutex<HashMap<String, String>>,
+}
+
+impl Resolver for CountingResolver {
+    fn resolve(
+        &self,
+        uri: &str,
+        _base_uri: Option<&str>,
+        _purpose: ResolvePurpose,
+    ) -> xml_sec_xslt::Result<ResolvedResource> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let bytes = self
+            .resources
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .get(uri)
+            .cloned()
+            .ok_or_else(|| Error::ResourceNotFound { uri: uri.into() })?;
+        Ok(ResolvedResource {
+            canonical_uri: format!("memory:{uri}"),
+            identity: ResourceIdentity(uri.into()),
+            bytes: bytes.into_bytes(),
+            media_type: Some("application/xml".into()),
+            encoding: Some("UTF-8".into()),
+        })
+    }
+}
+
+#[test]
+fn imported_stylesheets_share_the_cumulative_stylesheet_byte_budget() {
+    // The graph limit covers principal and imported bytes, even when retained-memory allows both.
+    let resolver = Arc::new(CountingResolver::default());
+    resolver.resources.lock().expect("resolver mutex").insert(
+        "included.xsl".into(),
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="included"/></xsl:stylesheet>"#.into(),
+    );
+    let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="included.xsl"/></xsl:stylesheet>"#;
+    let error = Compiler::new(
+        resolver,
+        CompileBudget::new(principal.len() + 1, 8, 256, 1 << 20),
+    )
+    .compile(principal, Some("memory:main.xsl"))
+    .expect_err("module graph exceeds cumulative stylesheet bytes");
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::StylesheetBytes,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn xinclude_budget_is_checked_before_resolver_access() {
+    // A denied external-document operation must not cross the resolver trust boundary.
+    let resolver = Arc::new(CountingResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("resolver mutex")
+        .insert("included.xml".into(), "<included/>".into());
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="included.xml"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let mut budget = execution_budget(1024);
+    budget.external_documents = 0;
+    assert!(matches!(
+        compile(r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#)
+            .execute_with_source_processing(
+                &source,
+                &Parameters::new(),
+                resolver.clone(),
+                ExecutionOptions { budget, initial_mode: None, initial_template: None },
+                xml_sec_xslt::SourceProcessing::XInclude,
+            ),
+        Err(Error::Budget { kind: BudgetKind::ExternalDocuments, .. })
+    ));
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn document_fragments_share_one_physical_resource_cache_entry() {
+    // Fragment selectors identify views of one fetched document, not separate resources.
+    let resolver = Arc::new(CountingResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("resolver mutex")
+        .insert("external.xml".into(), "<doc/>".into());
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(document('external.xml')/doc | document('external.xml#xpointer(/doc)'))"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("document views resolve");
+    assert_eq!(result.serialized.bytes, b"1");
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn doctype_is_emitted_immediately_before_the_document_element() {
+    // Top-level comments and processing instructions precede the document type declaration.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" doctype-system="result.dtd"/><xsl:template match="/"><xsl:comment>before</xsl:comment><xsl:processing-instruction name="before">value</xsl:processing-instruction><root/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "<!--before--><?before value?><!DOCTYPE root SYSTEM \"result.dtd\">\n<root/>\n"
+    );
+}
+
+#[test]
+fn selected_local_variable_values_are_retained_memory_metered() {
+    // A selected string remains owned by the lexical scope and must consume retained memory.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:variable name="payload" select="concat('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = 32;
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn supported_secondary_output_does_not_execute_fallback() {
+    // xsl:fallback belongs only to unsupported extension execution.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:xt="http://www.jclark.com/xt" extension-element-prefixes="xt"><xsl:template match="/"><xt:document href="memory:out.xml"><kept/><xsl:fallback><bad/></xsl:fallback></xt:document></xsl:template></xsl:stylesheet>"#,
+    );
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("secondary output executes");
+    assert_eq!(
+        result.secondary_outputs[0].serialized.bytes,
+        b"<?xml version=\"1.0\"?>\n<kept/>\n"
+    );
+}
+
+#[test]
+fn default_processing_instruction_numbering_matches_the_target() {
+    // The default count pattern for a PI is processing-instruction(target), not every PI.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/processing-instruction()"/></xsl:template><xsl:template match="processing-instruction()"><xsl:value-of select="name()"/><xsl:text>:</xsl:text><xsl:number/><xsl:text>|</xsl:text></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root><?a one?><?b two?><?a three?></root>"),
+        "a:1|b:1|a:2|"
+    );
+}
+
+#[test]
+fn copied_namespace_nodes_preserve_existing_result_qnames() {
+    // Namespace fixup may rename a copied binding, but it must never retarget the owner QName.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:result"><xsl:output omit-xml-declaration="yes" indent="no"/><xsl:template match="/"><p:out><xsl:copy-of select="root/namespace::p"/></p:out></xsl:template></xsl:stylesheet>"#;
+    let output = execute(stylesheet, r#"<root xmlns:p="urn:source"/>"#);
+    let parsed = roxmltree::Document::parse(&output).expect("result remains namespace-well-formed");
+    assert_eq!(
+        parsed.root_element().tag_name().namespace(),
+        Some("urn:result")
+    );
+    assert!(
+        parsed
+            .root_element()
+            .namespaces()
+            .any(|namespace| namespace.uri() == "urn:source")
+    );
 }
 
 #[test]

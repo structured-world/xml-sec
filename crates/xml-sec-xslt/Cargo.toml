@@ -19,6 +19,7 @@ sha1 = "0.11"
 sxd-document-no-unsafe = { version = "0.4.1", default-features = false, features = ["no-unsafe"] }
 sxd-xpath-no-unsafe = { version = "0.5.1", default-features = false, features = ["no-unsafe"] }
 thiserror = "2"
+time = { version = "0.3.55", features = ["local-offset"] }
 url = "2"
 
 [dev-dependencies]

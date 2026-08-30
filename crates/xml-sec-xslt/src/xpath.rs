@@ -1015,7 +1015,6 @@ impl Evaluator {
             if self.documents.contains_key(&request) {
                 continue;
             }
-            meter.charge(BudgetKind::ExternalDocuments, 1)?;
             let (resource_uri, fragment) = request
                 .href
                 .split_once('#')
@@ -1023,48 +1022,65 @@ impl Evaluator {
                     (resource, Some(fragment))
                 });
             let fragment = fragment.map(str::to_owned);
-            let resource = match self.resolver.resolve(
-                resource_uri,
-                request.base_uri.as_deref(),
-                ResolvePurpose::Document,
-            ) {
-                Ok(resource) => resource,
-                Err(Error::ResourceNotFound { .. }) => {
-                    self.cache_document(request, Vec::new());
-                    continue;
-                }
-                Err(error) => return Err(error),
+            let resource_request = DocumentRequest {
+                href: resource_uri.to_owned(),
+                base_uri: request.base_uri.clone(),
             };
-            if let Some(previous) = self.resource_identities.get(&resource.identity)
-                && previous != &resource.bytes
-            {
-                return Err(Error::StaleResource {
-                    identity: resource.identity,
-                });
-            }
-            meter.check_additional(BudgetKind::OwnedBytes, resource.bytes.len())?;
-            let xml = decode_resource(&resource.bytes, resource.encoding.as_deref())?;
-            let document = Document::parse(&xml, Some(&resource.canonical_uri))?;
-            meter.charge(BudgetKind::OwnedBytes, resource.bytes.len())?;
-            let document = if self.source_processing == SourceProcessing::XInclude {
-                let mut stack = vec![resource.identity.clone()];
-                expand_xinclude_document(
-                    &document,
-                    self.resolver.as_ref(),
-                    meter,
-                    &mut self.resource_identities,
-                    &mut stack,
-                    1,
-                )?
+            let root = if let Some(nodes) = self.documents.get(&resource_request) {
+                nodes.first().cloned()
             } else {
-                document
+                meter.charge(BudgetKind::ExternalDocuments, 1)?;
+                let resource = match self.resolver.resolve(
+                    resource_uri,
+                    request.base_uri.as_deref(),
+                    ResolvePurpose::Document,
+                ) {
+                    Ok(resource) => resource,
+                    Err(Error::ResourceNotFound { .. }) => {
+                        self.cache_document(resource_request.clone(), Vec::new());
+                        self.cache_document(request, Vec::new());
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(previous) = self.resource_identities.get(&resource.identity)
+                    && previous != &resource.bytes
+                {
+                    return Err(Error::StaleResource {
+                        identity: resource.identity,
+                    });
+                }
+                meter.check_additional(BudgetKind::OwnedBytes, resource.bytes.len())?;
+                let xml = decode_resource(&resource.bytes, resource.encoding.as_deref())?;
+                let document = Document::parse(&xml, Some(&resource.canonical_uri))?;
+                meter.charge(BudgetKind::OwnedBytes, resource.bytes.len())?;
+                let document = if self.source_processing == SourceProcessing::XInclude {
+                    let mut stack = vec![resource.identity.clone()];
+                    expand_xinclude_document(
+                        &document,
+                        self.resolver.as_ref(),
+                        meter,
+                        &mut self.resource_identities,
+                        &mut stack,
+                        1,
+                    )?
+                } else {
+                    document
+                };
+                let root = self.import_document(&document, meter)?;
+                self.resource_identities
+                    .insert(resource.identity, resource.bytes);
+                self.cache_document(resource_request.clone(), vec![root.clone()]);
+                Some(root)
             };
-            let root = self.import_document(&document, meter)?;
-            self.resource_identities
-                .insert(resource.identity, resource.bytes);
-            self.cache_document(request.clone(), vec![root.clone()]);
+            let Some(root) = root else {
+                self.cache_document(request, Vec::new());
+                continue;
+            };
             if let Some(fragment) = fragment {
                 fragments.push((request, root, fragment));
+            } else if request != resource_request {
+                self.cache_document(request, vec![root]);
             }
         }
         for (request, root, fragment) in fragments {
@@ -2012,6 +2028,9 @@ fn resolve_xinclude(
             "XInclude xpointer selection is not implemented".into(),
         ));
     }
+    // Denied operations must not cross the resolver boundary. Charging before resolution also
+    // bounds repeated failed attempts that are handled by xi:fallback.
+    meter.charge(BudgetKind::ExternalDocuments, 1)?;
     let resource = resolver.resolve(href, node.base_uri.as_deref(), ResolvePurpose::XInclude)?;
     if include_stack.contains(&resource.identity) {
         return Err(Error::Resolver {
@@ -2026,9 +2045,7 @@ fn resolve_xinclude(
             identity: resource.identity,
         });
     }
-    meter.check_additional(BudgetKind::ExternalDocuments, 1)?;
     meter.check_additional(BudgetKind::OwnedBytes, resource.bytes.len())?;
-    meter.charge(BudgetKind::ExternalDocuments, 1)?;
     meter.charge(BudgetKind::OwnedBytes, resource.bytes.len())?;
     identities.insert(resource.identity.clone(), resource.bytes.clone());
     let parse = attribute("parse").unwrap_or("xml");
