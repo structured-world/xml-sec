@@ -2125,7 +2125,7 @@ fn retained_dynamic_xpath_expressions_consume_owned_memory_budget() {
         Document::parse(&format!("<root>{expressions}</root>"), None).expect("source parses")
     };
     let mut budget = execution_budget(1 << 20);
-    budget.owned_bytes = 32 << 10;
+    budget.owned_bytes = 128 << 10;
     stylesheet
         .execute(
             &source_with(&|_| "1 + 1".into()),
@@ -2140,7 +2140,7 @@ fn retained_dynamic_xpath_expressions_consume_owned_memory_budget() {
         .expect("one cached dynamic expression stays within the budget");
     assert!(matches!(
         stylesheet.execute(
-            &source_with(&|index| format!("{index} + 1")),
+            &source_with(&|index| format!("{index} + {}1", "1 + ".repeat(64))),
             &Parameters::new(),
             Arc::new(NoResolver),
             ExecutionOptions {
@@ -3142,5 +3142,226 @@ fn level_any_numbering_counts_attributes_on_preceding_elements() {
     assert_eq!(
         execute(stylesheet, "<root><a id=\"x\"/><b id=\"y\"/></root>"),
         "1|2|"
+    );
+}
+
+#[test]
+fn retained_node_paths_consume_the_execution_memory_budget() {
+    // Deep documents retain ancestor paths for cross-model identity; that quadratic storage must
+    // remain inside the same OwnedBytes boundary as the semantic and XPath projections.
+    let source_xml = format!("{}text{}", "<n>".repeat(220), "</n>".repeat(220));
+    let source = Document::parse(&source_xml, None).expect("deep source parses");
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = 512 * 1024;
+    assert!(matches!(
+        stylesheet.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn named_templates_preserve_the_callers_current_template_rule() {
+    // apply-imports inside a named template continues from the matched caller's import
+    // precedence, not from the named template declaration's precedence.
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "base.xsl".into(),
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:call-template name="bridge"/></xsl:template></xsl:stylesheet>"#.into(),
+        );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="base.xsl"/><xsl:output method="text"/><xsl:template name="bridge"><xsl:apply-imports/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("cross-precedence named template compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source>ok</source>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("named call preserves the current matched rule");
+    assert_eq!(result.serialized.bytes, b"ok");
+
+    let no_current_rule = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="bridge"><xsl:apply-imports/></xsl:template><xsl:template match="/">wrong</xsl:template></xsl:stylesheet>"#,
+    );
+    assert!(matches!(
+        no_current_rule.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: Some(ExpandedName::new(None::<String>, "bridge")),
+            },
+        ),
+        Err(Error::Dynamic(message)) if message.contains("current template rule")
+    ));
+}
+
+#[test]
+fn duplicate_with_param_bindings_are_static_errors() {
+    // One invocation cannot assign two values to the same expanded parameter name.
+    for invocation in [
+        r#"<xsl:apply-templates><xsl:with-param name="value" select="1"/><xsl:with-param name="value" select="2"/></xsl:apply-templates>"#,
+        r#"<xsl:call-template name="target"><xsl:with-param name="value" select="1"/><xsl:with-param name="value" select="2"/></xsl:call-template>"#,
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/">{invocation}</xsl:template><xsl:template name="target"/></xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+            )
+            .compile(&stylesheet, None),
+            Err(Error::Static(message)) if message.contains("duplicate xsl:with-param")
+        ));
+    }
+}
+
+#[test]
+fn retained_pattern_match_sets_consume_the_execution_memory_budget() {
+    // Distinct complex patterns may each select the whole source, but their retained cache sets
+    // cannot multiply memory beyond the operation's OwnedBytes limit.
+    let templates = (1..=120)
+        .map(|index| format!(r#"<xsl:template match="item[position() &gt;= 1][{index} &gt; 0]"/>"#))
+        .collect::<String>();
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{templates}<xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template></xsl:stylesheet>"#
+    ));
+    let source_xml = format!("<root>{}</root>", "<item/>".repeat(800));
+    let source = Document::parse(&source_xml, None).expect("broad-pattern source parses");
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = 4 << 20;
+    assert!(matches!(
+        stylesheet.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn document_function_resolves_xml_shorthand_pointers() {
+    // A bare fragment is an XPointer shorthand pointer and resolves through the imported
+    // document's typed ID index rather than being parsed as an XPath expression.
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            "external.xml".into(),
+            r#"<doc><item xml:id="target">selected</item></doc>"#.into(),
+        );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document('external.xml#target')"/><xsl:text>|</xsl:text><xsl:value-of select="count(document('external.xml#missing'))"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("shorthand-pointer stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("shorthand pointers resolve through XML IDs");
+    assert_eq!(result.serialized.bytes, b"selected|0");
+}
+
+#[test]
+fn format_number_honors_apostrophe_quoted_literals() {
+    // DecimalFormat quotes remove syntax from enclosed symbols; doubled apostrophes emit one
+    // literal apostrophe without changing the active numeric subpattern.
+    let stylesheet = r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(12, &quot;'#'0&quot;)"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(12, &quot;'%'0&quot;)"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(12, &quot;''0&quot;)"/></xsl:template></xsl:stylesheet>"##;
+    assert_eq!(execute(stylesheet, "<source/>"), "#12|%12|'12");
+}
+
+#[test]
+fn exslt_padding_is_metered_before_result_allocation() {
+    // A scalar consumer must not let str:padding allocate a large temporary string before the
+    // operation's OwnedBytes budget sees the requested result.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="string-length(str:padding(1048576, 'é'))"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = 256 * 1024;
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn namespace_generate_ids_are_stable_and_injective() {
+    // Lexically different namespace prefixes must never collide through mixed raw/hex encoding.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="generate-id(root/namespace::*[name() = 'C3A9']) != generate-id(root/namespace::*[name() = 'é'])"/><xsl:text>|</xsl:text><xsl:value-of select="generate-id(root/namespace::*[name() = 'é']) = generate-id(root/namespace::*[name() = 'é'])"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            r#"<root xmlns:C3A9="urn:ascii" xmlns:é="urn:utf8"/>"#
+        ),
+        "true|true"
     );
 }

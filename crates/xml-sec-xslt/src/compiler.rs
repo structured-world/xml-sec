@@ -1783,15 +1783,19 @@ fn compile_instruction(
         "apply-templates" => {
             let mut sorts = vec![];
             let mut parameters = vec![];
+            let mut parameter_names = HashSet::new();
             let mut saw_parameter = false;
             for child in node.children().filter(roxmltree::Node::is_element) {
                 if child.has_tag_name((XSLT_NS, "sort")) && !saw_parameter {
                     sorts.push(compile_sort(child, &context)?)
                 } else if child.has_tag_name((XSLT_NS, "with-param")) {
                     saw_parameter = true;
-                    parameters.push(WithParam {
-                        variable: compile_variable(child, context.descend()?)?,
-                    })
+                    push_with_param(
+                        &mut parameters,
+                        &mut parameter_names,
+                        child,
+                        context.descend()?,
+                    )?;
                 } else {
                     return Err(Error::Static(
                         "xsl:apply-templates accepts only xsl:sort and xsl:with-param".into(),
@@ -1817,19 +1821,21 @@ fn compile_instruction(
             Instruction::ApplyImports
         }
         "call-template" => {
-            let parameters = node
-                .children()
-                .filter(roxmltree::Node::is_element)
-                .map(|child| {
-                    if !child.has_tag_name((XSLT_NS, "with-param")) {
-                        return Err(Error::Static(
-                            "xsl:call-template accepts only xsl:with-param".into(),
-                        ));
-                    }
-                    compile_variable(child, context.descend()?)
-                        .map(|variable| WithParam { variable })
-                })
-                .collect::<Result<_>>()?;
+            let mut parameters = Vec::new();
+            let mut parameter_names = HashSet::new();
+            for child in node.children().filter(roxmltree::Node::is_element) {
+                if !child.has_tag_name((XSLT_NS, "with-param")) {
+                    return Err(Error::Static(
+                        "xsl:call-template accepts only xsl:with-param".into(),
+                    ));
+                }
+                push_with_param(
+                    &mut parameters,
+                    &mut parameter_names,
+                    child,
+                    context.descend()?,
+                )?;
+            }
             Instruction::CallTemplate {
                 name: required_qname_attr(node, "name")?,
                 parameters,
@@ -1985,6 +1991,23 @@ fn compile_instruction(
             )));
         }
     })
+}
+
+fn push_with_param(
+    parameters: &mut Vec<WithParam>,
+    names: &mut HashSet<ExpandedName>,
+    node: roxmltree::Node<'_, '_>,
+    context: CompileContext,
+) -> Result<()> {
+    let variable = compile_variable(node, context)?;
+    if !names.insert(variable.name.clone()) {
+        return Err(Error::Static(format!(
+            "duplicate xsl:with-param binding `{}`",
+            variable.name.local
+        )));
+    }
+    parameters.push(WithParam { variable });
+    Ok(())
 }
 
 fn is_xml_whitespace_only(value: &str) -> bool {

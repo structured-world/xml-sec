@@ -107,7 +107,13 @@ impl Stylesheet {
         )?;
         let root = SourceNode::Node(prepared.root());
         if let Some(name) = options.initial_template {
-            state.call_named(&name, &HashMap::new(), &root, 1, 1, 1)?;
+            state.call_named(
+                &name,
+                &HashMap::new(),
+                &root,
+                ApplyFrame::new(1, 1, 1),
+                None,
+            )?;
         } else {
             state.apply_one(
                 root,
@@ -229,10 +235,11 @@ struct ApplyFrame {
 
 enum TemplateTask {
     EnterTemplate {
-        template: Template,
+        template: Box<Template>,
         params: HashMap<ExpandedName, Value>,
         node: SourceNode,
         frame: ApplyFrame,
+        current_rule_precedence: Option<usize>,
     },
     ApplyOne {
         node: SourceNode,
@@ -560,7 +567,13 @@ impl<'a> Execution<'a> {
         }
         if let Some(template) = selected {
             self.modes.push(mode.cloned());
-            let result = self.execute_template(template, node, params, position, size, depth);
+            let result = self.execute_template(
+                template,
+                node,
+                params,
+                ApplyFrame::new(position, size, depth),
+                Some(template.precedence),
+            );
             self.modes.pop();
             result
         } else {
@@ -573,15 +586,15 @@ impl<'a> Execution<'a> {
         template: &Template,
         node: SourceNode,
         params: &HashMap<ExpandedName, Value>,
-        position: usize,
-        size: usize,
-        depth: usize,
+        frame: ApplyFrame,
+        current_rule_precedence: Option<usize>,
     ) -> Result<()> {
         let mut tasks = vec![TemplateTask::EnterTemplate {
-            template: template.clone(),
+            template: Box::new(template.clone()),
             params: params.clone(),
             node,
-            frame: ApplyFrame::new(position, size, depth),
+            frame,
+            current_rule_precedence,
         }];
         while let Some(task) = tasks.pop() {
             match task {
@@ -590,7 +603,15 @@ impl<'a> Execution<'a> {
                     params,
                     node,
                     frame,
-                } => self.push_template_tasks(&mut tasks, &template, &params, node, frame)?,
+                    current_rule_precedence,
+                } => self.push_template_tasks(
+                    &mut tasks,
+                    &template,
+                    &params,
+                    node,
+                    frame,
+                    current_rule_precedence,
+                )?,
                 TemplateTask::ApplyOne {
                     node,
                     mode,
@@ -659,10 +680,11 @@ impl<'a> Execution<'a> {
                                     ))
                                 })?;
                             tasks.push(TemplateTask::EnterTemplate {
-                                template: target,
+                                template: Box::new(target),
                                 params: supplied,
                                 node,
                                 frame: ApplyFrame::new(position, size, depth + 1),
+                                current_rule_precedence: precedence,
                             });
                         }
                         Instruction::ApplyTemplates {
@@ -691,12 +713,17 @@ impl<'a> Execution<'a> {
                             }
                         }
                         Instruction::ApplyImports => {
+                            let current_rule_precedence = precedence.ok_or_else(|| {
+                                Error::Dynamic(
+                                    "xsl:apply-imports requires a current template rule".into(),
+                                )
+                            })?;
                             tasks.push(TemplateTask::ApplyOne {
                                 node,
                                 mode: self.modes.last().cloned().flatten(),
                                 params: Arc::new(HashMap::new()),
                                 frame: ApplyFrame {
-                                    max_precedence: precedence,
+                                    max_precedence: Some(current_rule_precedence),
                                     position,
                                     size,
                                     depth: depth + 1,
@@ -966,11 +993,13 @@ impl<'a> Execution<'a> {
         if let Some(template) = selected {
             self.modes.push(mode);
             tasks.push(TemplateTask::RestoreMode);
+            let current_rule_precedence = Some(template.precedence);
             tasks.push(TemplateTask::EnterTemplate {
-                template,
+                template: Box::new(template),
                 params: (*params).clone(),
                 node,
                 frame,
+                current_rule_precedence,
             });
             return Ok(());
         }
@@ -1012,6 +1041,7 @@ impl<'a> Execution<'a> {
         params: &HashMap<ExpandedName, Value>,
         node: SourceNode,
         frame: ApplyFrame,
+        current_rule_precedence: Option<usize>,
     ) -> Result<()> {
         let ApplyFrame {
             position,
@@ -1040,7 +1070,7 @@ impl<'a> Execution<'a> {
             position,
             size,
             depth,
-            precedence: Some(template.precedence),
+            precedence: current_rule_precedence,
         });
         Ok(())
     }
@@ -1211,13 +1241,16 @@ impl<'a> Execution<'a> {
                 Ok(())
             }
             Instruction::ApplyImports => {
+                let current_rule_precedence = current_precedence.ok_or_else(|| {
+                    Error::Dynamic("xsl:apply-imports requires a current template rule".into())
+                })?;
                 let mode = self.modes.last().cloned().flatten();
                 self.apply_one(
                     node.clone(),
                     mode.as_ref(),
                     &HashMap::new(),
                     ApplyFrame {
-                        max_precedence: current_precedence,
+                        max_precedence: Some(current_rule_precedence),
                         position,
                         size,
                         depth: depth + 1,
@@ -1227,7 +1260,13 @@ impl<'a> Execution<'a> {
             Instruction::CallTemplate { name, parameters } => {
                 let supplied =
                     self.evaluate_with_params(parameters, node, position, size, depth)?;
-                self.call_named(name, &supplied, node, position, size, depth + 1)
+                self.call_named(
+                    name,
+                    &supplied,
+                    node,
+                    ApplyFrame::new(position, size, depth + 1),
+                    current_precedence,
+                )
             }
             Instruction::ForEach {
                 select,
@@ -2208,9 +2247,8 @@ impl<'a> Execution<'a> {
         name: &ExpandedName,
         params: &HashMap<ExpandedName, Value>,
         node: &SourceNode,
-        position: usize,
-        size: usize,
-        depth: usize,
+        frame: ApplyFrame,
+        current_rule_precedence: Option<usize>,
     ) -> Result<()> {
         let template = self
             .stylesheet
@@ -2219,7 +2257,13 @@ impl<'a> Execution<'a> {
             .filter(|template| template.name.as_ref() == Some(name))
             .max_by_key(|template| (template.precedence, template.order))
             .ok_or_else(|| Error::Dynamic(format!("named template {} not found", name.local)))?;
-        self.execute_template(template, node.clone(), params, position, size, depth)
+        self.execute_template(
+            template,
+            node.clone(),
+            params,
+            frame,
+            current_rule_precedence,
+        )
     }
     fn evaluate_avt(
         &mut self,

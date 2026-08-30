@@ -8,7 +8,9 @@ use sxd_document_no_unsafe::{Package, QName};
 use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, nodeset};
 
 use crate::budget::Meter;
-use crate::compiler::{DecimalFormat, Expression, NameTest, Pattern, normalize_xpath_for_sxd};
+use crate::compiler::{
+    DecimalFormat, Expression, NameTest, Pattern, is_ncname, normalize_xpath_for_sxd,
+};
 use crate::expression::innermost_namespaced_call;
 use crate::resolver::decode_resource;
 use crate::runtime::{SourceProcessing, apply_whitespace_rules};
@@ -53,6 +55,24 @@ fn source_base_uri(source: &Document, node: &SourceNode) -> Option<String> {
 }
 
 type PatternCacheKey = (String, Vec<(String, String)>, NodeId);
+
+fn pattern_cache_entry_owned_bytes(key: &PatternCacheKey, node_count: usize) -> usize {
+    let namespace_bytes = key.1.iter().fold(0usize, |total, (prefix, uri)| {
+        total
+            .saturating_add(std::mem::size_of::<(String, String)>())
+            .saturating_add(prefix.len())
+            .saturating_add(uri.len())
+    });
+    std::mem::size_of::<PatternCacheKey>()
+        .saturating_add(key.0.len())
+        .saturating_add(namespace_bytes)
+        // Hash tables retain control bytes and spare capacity in addition to each node value.
+        .saturating_add(
+            node_count
+                .saturating_mul(std::mem::size_of::<SourceNode>())
+                .saturating_mul(2),
+        )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DocumentRequest {
@@ -124,8 +144,8 @@ impl Evaluator {
             .map(|(uri, document)| (uri.clone(), source.import(document)))
             .collect::<Vec<_>>();
         let package = project_semantic_document(&source, meter)?;
-        let root: nodeset::Node<'_> = package.as_document().root().into();
-        let maps = NodeMaps::new(&source, root)?;
+        let maps = NodeMaps::new(&source, meter)?;
+        meter_node_base_uri_entries(&source, maps.reverse.iter(), meter)?;
         let node_base_uris = Rc::new(RefCell::new(
             maps.reverse
                 .iter()
@@ -309,8 +329,15 @@ impl Evaluator {
             .find_map(|child| child.element())
             .ok_or_else(|| Error::Dynamic("semantic projection root is missing".into()))?;
         project_logical_root(&self.source, logical_root, sxd_document, documents)?;
-        let root: nodeset::Node<'_> = sxd_document.root().into();
-        self.maps.extend(&self.source, root, first_new_node)?;
+        self.maps.extend(&self.source, first_new_node, meter)?;
+        meter_node_base_uri_entries(
+            &self.source,
+            self.maps
+                .reverse
+                .iter()
+                .filter(|(_, node)| source_node_owner(node).0 >= first_new_node),
+            meter,
+        )?;
         self.node_base_uris.borrow_mut().extend(
             self.maps
                 .reverse
@@ -358,6 +385,7 @@ impl Evaluator {
                         | (EXSLT_STRINGS_NS, "split")
                         | (EXSLT_STRINGS_NS, "tokenize")
                         | (EXSLT_STRINGS_NS, "replace")
+                        | (EXSLT_STRINGS_NS, "padding")
                         | (EXSLT_DYNAMIC_NS, "evaluate")
                         | (EXSLT_DYNAMIC_NS, "map")
                         | (SAXON_NS, "expression")
@@ -375,6 +403,7 @@ impl Evaluator {
                 (EXSLT_STRINGS_NS, "split") => ExtensionCallKind::Split,
                 (EXSLT_STRINGS_NS, "tokenize") => ExtensionCallKind::Tokenize,
                 (EXSLT_STRINGS_NS, "replace") => ExtensionCallKind::Replace,
+                (EXSLT_STRINGS_NS, "padding") => ExtensionCallKind::Padding,
                 (EXSLT_DYNAMIC_NS, "evaluate") => ExtensionCallKind::DynamicEvaluate,
                 (EXSLT_DYNAMIC_NS, "map") => ExtensionCallKind::DynamicMap,
                 (SAXON_NS, "expression") => ExtensionCallKind::SaxonExpression,
@@ -494,6 +523,7 @@ impl Evaluator {
                         ExtensionCallKind::NodeSet => unreachable!(),
                         ExtensionCallKind::ObjectType => unreachable!(),
                         ExtensionCallKind::Replace => unreachable!(),
+                        ExtensionCallKind::Padding => unreachable!(),
                         ExtensionCallKind::DynamicEvaluate
                         | ExtensionCallKind::DynamicMap
                         | ExtensionCallKind::SaxonExpression
@@ -543,6 +573,37 @@ impl Evaluator {
                     let root = self.import_document(&fragment, meter)?;
                     let nodes = self.children(&root);
                     Value::NodeSet(nodes)
+                }
+                ExtensionCallKind::Padding => {
+                    if !(1..=2).contains(&call.arguments.len()) {
+                        return Err(Error::Dynamic(
+                            "str:padding() requires one or two arguments".into(),
+                        ));
+                    }
+                    let length = self
+                        .evaluate_core(
+                            &expression.derived(call.arguments[0].clone()),
+                            node,
+                            position,
+                            size,
+                            &augmented,
+                            meter,
+                        )?
+                        .number(self);
+                    let pattern = if let Some(argument) = call.arguments.get(1) {
+                        self.evaluate_core(
+                            &expression.derived(argument.clone()),
+                            node,
+                            position,
+                            size,
+                            &augmented,
+                            meter,
+                        )?
+                        .string(self)
+                    } else {
+                        " ".into()
+                    };
+                    Value::String(meter_exslt_padding(length, &pattern, meter)?)
                 }
                 ExtensionCallKind::DynamicEvaluate | ExtensionCallKind::SaxonEvaluate => {
                     if call.arguments.len() != 1 {
@@ -1117,10 +1178,32 @@ impl Evaluator {
             }
         }
         for (request, root, fragment) in fragments {
-            let expression = fragment
+            let Some(expression) = fragment
                 .strip_prefix("xpointer(")
                 .and_then(|fragment| fragment.strip_suffix(')'))
-                .ok_or_else(|| Error::Unsupported(format!("document fragment `{fragment}`")))?;
+            else {
+                if !is_ncname(&fragment) {
+                    return Err(Error::Unsupported(format!(
+                        "document fragment `{fragment}`"
+                    )));
+                }
+                let SourceNode::Node(logical_root) = root else {
+                    return Err(Error::Dynamic(
+                        "document fragment root is not a document node".into(),
+                    ));
+                };
+                let selected = self
+                    .source
+                    .ids()
+                    .find_map(|(value, root, owner)| {
+                        (root == logical_root && value == fragment)
+                            .then_some(SourceNode::Node(owner))
+                    })
+                    .into_iter()
+                    .collect();
+                self.cache_document(request, selected);
+                continue;
+            };
             let selected = self.evaluate_core(
                 &Expression::generated(expression, Vec::new()),
                 &root,
@@ -1205,6 +1288,10 @@ impl Evaluator {
             if let XPathValue::NodeSet(nodes) = value {
                 let matches = nodes.contains(node);
                 if let Some(cache_key) = cache_key {
+                    meter.charge(
+                        BudgetKind::OwnedBytes,
+                        pattern_cache_entry_owned_bytes(&cache_key, nodes.len()),
+                    )?;
                     self.pattern_matches
                         .insert(cache_key, nodes.into_iter().collect());
                 }
@@ -2138,24 +2225,19 @@ struct NodeMaps {
 struct NodeOrder(usize, u8, usize);
 
 impl NodeMaps {
-    fn new(source: &Document, root: nodeset::Node<'_>) -> Result<Self> {
+    fn new(source: &Document, meter: &mut Meter) -> Result<Self> {
         let mut maps = Self {
             forward: HashMap::new(),
             reverse: HashMap::new(),
             order: HashMap::new(),
             next_order: 0,
         };
-        maps.extend(source, root, 0)?;
+        maps.extend(source, 0, meter)?;
         Ok(maps)
     }
 
-    fn extend(
-        &mut self,
-        source: &Document,
-        root: nodeset::Node<'_>,
-        first_node: usize,
-    ) -> Result<()> {
-        let paths = semantic_node_paths_from(source, first_node)?;
+    fn extend(&mut self, source: &Document, first_node: usize, meter: &mut Meter) -> Result<()> {
+        let paths = semantic_node_paths_from(source, first_node, meter)?;
         let order_base = self.next_order;
         self.next_order = self.next_order.saturating_add(paths.len());
         for (id, node) in source.nodes().skip(first_node) {
@@ -2164,6 +2246,7 @@ impl NodeMaps {
             })?;
             let path = NodePath::Ordinary(path);
             let key = SourceNode::Node(id);
+            meter_node_map_entry(&path, meter)?;
             self.forward.insert(key.clone(), path.clone());
             self.reverse.insert(path.clone(), key.clone());
             let rank = order_base.saturating_add(rank);
@@ -2176,24 +2259,38 @@ impl NodeMaps {
             } = &node.kind
             {
                 for (index, source_attribute) in attributes.iter().enumerate() {
+                    meter.check_additional(
+                        BudgetKind::OwnedBytes,
+                        path.ordinary()
+                            .len()
+                            .saturating_mul(std::mem::size_of::<usize>()),
+                    )?;
                     let attribute_path = NodePath::Attribute {
                         parent: path.ordinary().to_vec(),
                         namespace: source_attribute.name.namespace.clone(),
                         local: source_attribute.name.local.clone(),
                     };
                     let key = SourceNode::Attribute { owner: id, index };
+                    meter_node_map_entry(&attribute_path, meter)?;
                     self.forward.insert(key.clone(), attribute_path.clone());
                     self.reverse.insert(attribute_path, key.clone());
                     self.order
                         .insert(key.clone(), NodeOrder(rank.saturating_mul(3), 2, index));
                 }
                 for (index, namespace) in namespaces.iter().enumerate() {
+                    meter.check_additional(
+                        BudgetKind::OwnedBytes,
+                        path.ordinary()
+                            .len()
+                            .saturating_mul(std::mem::size_of::<usize>()),
+                    )?;
                     let namespace_path = NodePath::Namespace {
                         parent: path.ordinary().to_vec(),
                         prefix: namespace.prefix.clone().unwrap_or_default(),
                         uri: namespace.uri.clone(),
                     };
                     let key = SourceNode::Namespace { owner: id, index };
+                    meter_node_map_entry(&namespace_path, meter)?;
                     self.forward.insert(key.clone(), namespace_path.clone());
                     self.reverse.insert(namespace_path, key.clone());
                     // XPath 1.0 leaves namespace-axis order implementation-defined.
@@ -2211,7 +2308,6 @@ impl NodeMaps {
                 }
             }
         }
-        let _ = root;
         Ok(())
     }
     fn to_sxd<'d>(&self, root: nodeset::Node<'d>, node: &SourceNode) -> Option<nodeset::Node<'d>> {
@@ -2314,6 +2410,7 @@ impl NodeMaps {
 fn semantic_node_paths_from(
     source: &Document,
     first_node: usize,
+    meter: &mut Meter,
 ) -> Result<HashMap<NodeId, (Vec<usize>, usize)>> {
     let mut paths = HashMap::new();
     let mut rank = 0usize;
@@ -2321,15 +2418,30 @@ fn semantic_node_paths_from(
         if logical_root.0 < first_node {
             continue;
         }
+        meter.charge(
+            BudgetKind::OwnedBytes,
+            2usize.saturating_mul(std::mem::size_of::<usize>()),
+        )?;
         let root_path = vec![0, document_index];
         let mut pending = vec![(logical_root, root_path)];
         while let Some((parent, parent_path)) = pending.pop() {
+            meter.charge(
+                BudgetKind::OwnedBytes,
+                std::mem::size_of::<(NodeId, Vec<usize>, usize)>(),
+            )?;
             paths.insert(parent, (parent_path.clone(), rank));
             rank = rank.saturating_add(1);
             let node = source.node(parent).ok_or_else(|| {
                 Error::Dynamic(format!("stale semantic node {parent:?} in document path"))
             })?;
             for (index, child) in node.children.iter().copied().enumerate().rev() {
+                meter.charge(
+                    BudgetKind::OwnedBytes,
+                    parent_path
+                        .len()
+                        .saturating_add(1)
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                )?;
                 let mut child_path = parent_path.clone();
                 child_path.push(index);
                 pending.push((child, child_path));
@@ -2337,6 +2449,35 @@ fn semantic_node_paths_from(
         }
     }
     Ok(paths)
+}
+
+fn meter_node_map_entry(path: &NodePath, meter: &mut Meter) -> Result<()> {
+    let retained = path
+        .owned_bytes()
+        .saturating_mul(2)
+        .saturating_add(std::mem::size_of::<SourceNode>().saturating_mul(3))
+        .saturating_add(std::mem::size_of::<NodeOrder>());
+    meter.charge(BudgetKind::OwnedBytes, retained)
+}
+
+fn meter_node_base_uri_entries<'a>(
+    source: &Document,
+    entries: impl Iterator<Item = (&'a NodePath, &'a SourceNode)>,
+    meter: &mut Meter,
+) -> Result<()> {
+    for (path, node) in entries {
+        let base_uri_bytes = source
+            .node(source_node_owner(node))
+            .and_then(|node| node.base_uri.as_deref())
+            .map_or(0, str::len);
+        meter.charge(
+            BudgetKind::OwnedBytes,
+            path.owned_bytes()
+                .saturating_add(std::mem::size_of::<Option<String>>())
+                .saturating_add(base_uri_bytes),
+        )?;
+    }
+    Ok(())
 }
 
 fn element_pattern_name_matches(
@@ -2565,6 +2706,7 @@ enum ExtensionCallKind {
     NodeSet,
     ObjectType,
     Replace,
+    Padding,
     Split,
     Tokenize,
     DynamicEvaluate,
@@ -2668,6 +2810,37 @@ fn split_exslt_string(input: &str, delimiter: &str) -> Vec<String> {
             .map(str::to_owned)
             .collect()
     }
+}
+
+fn meter_exslt_padding(length: f64, pattern: &str, meter: &mut Meter) -> Result<String> {
+    let requested = length.floor().max(0.0);
+    let length = if requested.is_finite() && requested <= usize::MAX as f64 {
+        requested as usize
+    } else {
+        usize::MAX
+    };
+    let pattern_characters = pattern.chars().count();
+    if pattern_characters == 0 || length == 0 {
+        return Ok(String::new());
+    }
+    let complete = length / pattern_characters;
+    let remainder = length % pattern_characters;
+    let retained_bytes = pattern
+        .len()
+        .checked_mul(complete)
+        .and_then(|bytes| {
+            pattern
+                .chars()
+                .take(remainder)
+                .try_fold(bytes, |total, character| {
+                    total.checked_add(character.len_utf8())
+                })
+        })
+        .unwrap_or(usize::MAX);
+    meter.charge(BudgetKind::OwnedBytes, retained_bytes)?;
+    let mut output = pattern.repeat(complete);
+    output.extend(pattern.chars().take(remainder));
+    Ok(output)
 }
 
 fn tokenize_exslt_string(input: &str, delimiters: &str) -> Vec<String> {
@@ -2889,14 +3062,6 @@ impl function::Function for GenerateId {
         let Some(node) = nodes.document_order().first().cloned() else {
             return Ok(SxdValue::String(String::new()));
         };
-        if let nodeset::Node::Namespace(namespace) = &node {
-            let owner = NodePath::Ordinary(path_to(&nodeset::Node::Element(namespace.parent)));
-            let owner_id = assign_generated_id(&self.assigned, owner);
-            return Ok(SxdValue::String(format!(
-                "id{owner_id}ns{}",
-                encode_namespace_id_suffix(namespace.prefix())
-            )));
-        }
         let id = assign_generated_id(&self.assigned, typed_path_to(&node));
         Ok(SxdValue::String(format!("id{id}")))
     }
@@ -2906,25 +3071,6 @@ fn assign_generated_id(assigned: &RefCell<HashMap<NodePath, usize>>, path: NodeP
     let mut assigned = assigned.borrow_mut();
     let next = assigned.len() + 1;
     *assigned.entry(path).or_insert(next)
-}
-
-fn encode_namespace_id_suffix(prefix: &str) -> String {
-    prefix
-        .chars()
-        .flat_map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
-                character.to_string().chars().collect::<Vec<_>>()
-            } else {
-                let mut bytes = [0; 4];
-                character
-                    .encode_utf8(&mut bytes)
-                    .as_bytes()
-                    .iter()
-                    .flat_map(|byte| format!("{byte:02X}").chars().collect::<Vec<_>>())
-                    .collect()
-            }
-        })
-        .collect()
 }
 
 enum NodeNameFunction {
@@ -3487,17 +3633,10 @@ impl function::Function for ExsltStringFunction {
                 Ok(SxdValue::String(result))
             }
             Self::Padding => {
-                if !(1..=2).contains(&args.len()) {
-                    return extension_argument_error("str:padding() requires one or two arguments");
-                }
-                let length = args[0].number().floor().max(0.0) as usize;
-                let pattern = args.get(1).map_or_else(|| " ".into(), SxdValue::string);
-                if pattern.is_empty() {
-                    return Ok(SxdValue::String(String::new()));
-                }
-                Ok(SxdValue::String(
-                    pattern.chars().cycle().take(length).collect(),
-                ))
+                let _ = args;
+                extension_argument_error(
+                    "str:padding() must be evaluated through the metered extension context",
+                )
             }
             Self::EncodeUri => {
                 if args.len() != 2 {
@@ -4226,64 +4365,74 @@ fn render_decimal(
             format.infinity.clone()
         });
     }
-    let alternatives = pattern.split(format.pattern_separator).collect::<Vec<_>>();
+    let alternatives = tokenize_decimal_pattern(pattern, format)?;
     let negative = value < 0.0;
     let negative_subpattern = negative
         && alternatives.len() > 1
         && alternatives[0] != alternatives[1]
-        && decimal_pattern_shape(alternatives[0], format)
-            == decimal_pattern_shape(alternatives[1], format);
+        && decimal_pattern_shape(&alternatives[0], format)
+            == decimal_pattern_shape(&alternatives[1], format);
     let selected = if negative_subpattern {
-        alternatives[1]
+        &alternatives[1]
     } else {
-        alternatives[0]
+        &alternatives[0]
     };
-    let multiplier = if selected.contains(format.percent) {
+    let multiplier = if selected
+        .iter()
+        .any(|token| token.syntax && token.value == format.percent)
+    {
         100.0
-    } else if selected.contains(format.per_mille) {
+    } else if selected
+        .iter()
+        .any(|token| token.syntax && token.value == format.per_mille)
+    {
         1000.0
     } else {
         1.0
     };
-    let characters = selected.char_indices().collect::<Vec<_>>();
-    let first = characters
+    let first = selected
         .iter()
-        .find(|(_, character)| {
-            matches!(*character, value if value == format.digit || value == format.zero_digit || value == format.decimal_separator)
+        .position(|token| {
+            token.syntax
+                && matches!(token.value, value if value == format.digit || value == format.zero_digit || value == format.decimal_separator)
         })
-        .map(|(index, _)| *index)
         .ok_or_else(|| function::Error::Other {
             what: "format-number pattern has no digit".into(),
         })?;
-    let last = characters
+    let last = selected
         .iter()
-        .rev()
-        .find(|(_, character)| {
-            *character == format.digit
-                || *character == format.zero_digit
-                || *character == format.decimal_separator
+        .rposition(|token| {
+            token.syntax
+                && matches!(token.value, value if value == format.digit || value == format.zero_digit || value == format.decimal_separator)
         })
-        .map(|(index, character)| index + character.len_utf8())
-        .unwrap_or(first);
+        .map(|index| index + 1)
+        .unwrap_or(first + 1);
     let number_pattern = &selected[first..last];
-    let mut split = number_pattern.split(format.decimal_separator);
-    let integer_pattern = split.next().unwrap_or_default();
-    let fraction_pattern = split.next().unwrap_or_default();
+    let decimal = number_pattern
+        .iter()
+        .position(|token| token.syntax && token.value == format.decimal_separator);
+    let (integer_pattern, fraction_pattern) = decimal.map_or((number_pattern, &[][..]), |index| {
+        (&number_pattern[..index], &number_pattern[index + 1..])
+    });
     let minimum_integer = integer_pattern
-        .chars()
-        .filter(|c| *c == format.zero_digit)
+        .iter()
+        .filter(|token| token.syntax && token.value == format.zero_digit)
         .count();
     let minimum_fraction = fraction_pattern
-        .chars()
-        .filter(|c| *c == format.zero_digit)
+        .iter()
+        .filter(|token| token.syntax && token.value == format.zero_digit)
         .count();
     let mut maximum_fraction = fraction_pattern
-        .chars()
-        .filter(|c| *c == format.zero_digit || *c == format.digit)
+        .iter()
+        .filter(|token| {
+            token.syntax && matches!(token.value, value if value == format.zero_digit || value == format.digit)
+        })
         .count();
     let mut minimum_fraction = minimum_fraction;
     if integer_pattern.is_empty()
-        && number_pattern.starts_with(format.decimal_separator)
+        && number_pattern
+            .first()
+            .is_some_and(|token| token.syntax && token.value == format.decimal_separator)
         && maximum_fraction > 0
     {
         minimum_fraction = minimum_fraction.max(1);
@@ -4308,10 +4457,16 @@ fn render_decimal(
     if minimum_integer == 0 && minimum_fraction > 0 && scaled < 1.0 {
         integer.clear();
     }
-    if let Some(group) = integer_pattern.rfind(format.grouping_separator) {
-        let size = integer_pattern[group + format.grouping_separator.len_utf8()..]
-            .chars()
-            .filter(|c| *c == format.zero_digit || *c == format.digit)
+    if let Some(group) = integer_pattern
+        .iter()
+        .rposition(|token| token.syntax && token.value == format.grouping_separator)
+    {
+        let size = integer_pattern[group + 1..]
+            .iter()
+            .filter(|token| {
+                token.syntax
+                    && matches!(token.value, value if value == format.zero_digit || value == format.digit)
+            })
             .count();
         if size > 0 {
             let chars = integer.chars().rev().collect::<Vec<_>>();
@@ -4329,15 +4484,19 @@ fn render_decimal(
     if negative && !negative_subpattern {
         output.push(format.minus_sign);
     }
-    output.push_str(&selected[..first]);
+    output.extend(selected[..first].iter().map(|token| token.value));
     output.push_str(&integer);
-    if !fraction.is_empty() || number_pattern.ends_with(format.decimal_separator) {
+    if !fraction.is_empty()
+        || number_pattern
+            .last()
+            .is_some_and(|token| token.syntax && token.value == format.decimal_separator)
+    {
         output.push(format.decimal_separator);
         if !fraction.is_empty() {
             output.push_str(fraction);
         }
     }
-    output.push_str(&selected[last..]);
+    output.extend(selected[last..].iter().map(|token| token.value));
     if format.zero_digit != '0' {
         output = output
             .chars()
@@ -4351,34 +4510,101 @@ fn render_decimal(
     Ok(output)
 }
 
-fn decimal_pattern_shape(pattern: &str, format: &DecimalFormat) -> (usize, usize, usize, usize) {
-    let first = pattern.char_indices().find_map(|(index, character)| {
-        matches!(character, value if value == format.digit || value == format.zero_digit || value == format.decimal_separator)
-            .then_some(index)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecimalPatternToken {
+    value: char,
+    syntax: bool,
+}
+
+fn tokenize_decimal_pattern(
+    pattern: &str,
+    format: &DecimalFormat,
+) -> std::result::Result<Vec<Vec<DecimalPatternToken>>, function::Error> {
+    let mut alternatives = vec![Vec::new()];
+    let mut quoted = false;
+    let mut characters = pattern.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\'' {
+            if characters.peek() == Some(&'\'') {
+                characters.next();
+                alternatives
+                    .last_mut()
+                    .expect("decimal pattern has one subpattern")
+                    .push(DecimalPatternToken {
+                        value: '\'',
+                        syntax: false,
+                    });
+            } else {
+                quoted = !quoted;
+            }
+            continue;
+        }
+        if !quoted && character == format.pattern_separator {
+            alternatives.push(Vec::new());
+            continue;
+        }
+        alternatives
+            .last_mut()
+            .expect("decimal pattern has one subpattern")
+            .push(DecimalPatternToken {
+                value: character,
+                syntax: !quoted,
+            });
+    }
+    if quoted {
+        return Err(function::Error::Other {
+            what: "format-number pattern has an unterminated quoted literal".into(),
+        });
+    }
+    Ok(alternatives)
+}
+
+fn decimal_pattern_shape(
+    pattern: &[DecimalPatternToken],
+    format: &DecimalFormat,
+) -> (usize, usize, usize, usize) {
+    let first = pattern.iter().position(|token| {
+        token.syntax
+            && matches!(token.value, value if value == format.digit || value == format.zero_digit || value == format.decimal_separator)
     });
-    let last = pattern.char_indices().rev().find_map(|(index, character)| {
-        matches!(character, value if value == format.digit || value == format.zero_digit || value == format.decimal_separator)
-            .then_some(index + character.len_utf8())
+    let last = pattern.iter().rposition(|token| {
+        token.syntax
+            && matches!(token.value, value if value == format.digit || value == format.zero_digit || value == format.decimal_separator)
     });
     let Some((first, last)) = first.zip(last) else {
         return (0, 0, 0, 0);
     };
-    let number = &pattern[first..last];
-    let mut parts = number.split(format.decimal_separator);
-    let integer = parts.next().unwrap_or_default();
-    let fraction = parts.next().unwrap_or_default();
-    let minimum_integer = integer.chars().filter(|c| *c == format.zero_digit).count();
-    let minimum_fraction = fraction.chars().filter(|c| *c == format.zero_digit).count();
+    let number = &pattern[first..=last];
+    let decimal = number
+        .iter()
+        .position(|token| token.syntax && token.value == format.decimal_separator);
+    let (integer, fraction) = decimal.map_or((number, &[][..]), |index| {
+        (&number[..index], &number[index + 1..])
+    });
+    let minimum_integer = integer
+        .iter()
+        .filter(|token| token.syntax && token.value == format.zero_digit)
+        .count();
+    let minimum_fraction = fraction
+        .iter()
+        .filter(|token| token.syntax && token.value == format.zero_digit)
+        .count();
     let maximum_fraction = fraction
-        .chars()
-        .filter(|c| *c == format.zero_digit || *c == format.digit)
+        .iter()
+        .filter(|token| {
+            token.syntax && matches!(token.value, value if value == format.zero_digit || value == format.digit)
+        })
         .count();
     let grouping = integer
-        .rfind(format.grouping_separator)
+        .iter()
+        .rposition(|token| token.syntax && token.value == format.grouping_separator)
         .map(|index| {
-            integer[index + format.grouping_separator.len_utf8()..]
-                .chars()
-                .filter(|c| *c == format.zero_digit || *c == format.digit)
+            integer[index + 1..]
+                .iter()
+                .filter(|token| {
+                    token.syntax
+                        && matches!(token.value, value if value == format.zero_digit || value == format.digit)
+                })
                 .count()
         })
         .unwrap_or(0);

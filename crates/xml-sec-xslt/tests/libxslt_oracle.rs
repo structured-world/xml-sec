@@ -1133,6 +1133,7 @@ fn assert_case(case: &Case) {
             );
         }
         (Ok(result), None) if case.errors.is_none() && result.serialized.bytes.is_empty() => {}
+        (Ok(result), None) if is_expected_message_only_success(case, &result) => {}
         (Ok(_), None) => panic!(
             "{}: transformation succeeded but upstream expects an error",
             case_name(case)
@@ -1144,6 +1145,20 @@ fn assert_case(case: &Case) {
         (Err(error), Some(_)) if is_expected_strict_xslt_error(case, &error) => {}
         (Err(error), _) => panic!("{}: {error}", case_name(case)),
     }
+}
+
+fn is_expected_message_only_success(case: &Case, result: &xml_sec_xslt::TransformResult) -> bool {
+    // The donor stores nonterminating xsl:message text in `.err` but has no `.out` file.
+    // The transform succeeds normatively; our serializer also emits the default XML declaration
+    // for its otherwise empty result tree, so validate both that output and the messages exactly.
+    case.suite == "runtest"
+        && case.stylesheet == Path::new("general/bug-156.xsl")
+        && result.serialized.bytes == b"<?xml version=\"1.0\"?>\n\n"
+        && result
+            .messages
+            .iter()
+            .map(|message| (message.content.as_str(), message.terminate))
+            .eq([("From main", false), ("From second import", false)])
 }
 
 fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u8]) -> bool {
@@ -1775,6 +1790,12 @@ fn normalize_generated_ids(bytes: &[u8]) -> Vec<u8> {
         while bytes.get(end).is_some_and(u8::is_ascii_digit) {
             end += 1;
         }
+        if bytes.get(end..end + 2) == Some(b"ns") {
+            end += 2;
+            while bytes.get(end).is_some_and(u8::is_ascii_hexdigit) {
+                end += 1;
+            }
+        }
         if starts_id && end > digit_start {
             let next = assigned.len() + 1;
             let id = *assigned.entry(bytes[cursor..end].to_vec()).or_insert(next);
@@ -1794,6 +1815,29 @@ fn generated_id_normalization_accepts_libxslt_pointer_ids() {
         normalize_generated_ids(b"idp106373348418272 id7 idp106373348418272"),
         b"id1 id2 id1"
     );
+    assert_eq!(
+        normalize_generated_ids(b"id1 id2 id2ns id2nsC3A9 id3"),
+        b"id1 id2 id3 id4 id5"
+    );
+}
+
+#[test]
+fn nonterminating_message_fixture_is_a_successful_transformation() {
+    let case = cases()
+        .into_iter()
+        .find(|case| case.stylesheet == Path::new("general/bug-156.xsl"))
+        .expect("message-only oracle case exists");
+    let result = execute(&case).expect("nonterminating messages do not fail the transform");
+    assert_eq!(result.serialized.bytes, b"<?xml version=\"1.0\"?>\n\n");
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .map(|message| (message.content.as_str(), message.terminate))
+            .collect::<Vec<_>>(),
+        [("From main", false), ("From second import", false)]
+    );
+    assert!(is_expected_message_only_success(&case, &result));
 }
 
 fn normalize_case_specific_oracle_output(case: &Case, bytes: Vec<u8>) -> Vec<u8> {
