@@ -1391,6 +1391,7 @@ impl<'a> Execution<'a> {
                     .or_else(|| {
                         static_namespace(static_namespaces, prefix.as_deref().unwrap_or_default())
                     });
+                require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
                 let namespaces = namespace
                     .as_ref()
                     .map(|uri| {
@@ -1441,6 +1442,7 @@ impl<'a> Execution<'a> {
                             .as_deref()
                             .and_then(|prefix| static_namespace(static_namespaces, prefix))
                     });
+                require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
                 let value =
                     self.capture_text(body, node, position, size, depth, current_precedence)?;
                 self.add_attribute(Attribute {
@@ -1469,6 +1471,7 @@ impl<'a> Execution<'a> {
                 }
                 let value =
                     self.capture_text(body, node, position, size, depth, current_precedence)?;
+                let value = value.trim_start_matches([' ', '\t', '\r', '\n']).to_owned();
                 if value.contains("?>") {
                     return Err(Error::Dynamic("processing instruction contains ?>".into()));
                 }
@@ -2223,14 +2226,16 @@ impl<'a> Execution<'a> {
                     .as_deref()
                     .map(|lang| locale_collator(lang, case_order.as_deref()))
                     .transpose()?;
+                let order =
+                    self.evaluate_avt(&sort.order, context_node, context_position, context_size)?;
+                if !matches!(order.as_str(), "ascending" | "descending") {
+                    return Err(Error::Dynamic(format!(
+                        "xsl:sort order must evaluate to `ascending` or `descending`, got `{order}`"
+                    )));
+                }
                 Ok(EvaluatedSort {
                     data_type,
-                    order: self.evaluate_avt(
-                        &sort.order,
-                        context_node,
-                        context_position,
-                        context_size,
-                    )?,
+                    order,
                     case_order,
                     collator,
                 })
@@ -2411,6 +2416,7 @@ impl<'a> Execution<'a> {
                 previous_overwrite && Some(set.precedence) == highest_precedence;
             let set_start = self.current_attribute_count()?;
             for used in &set.uses {
+                self.meter.recursion(depth + 1)?;
                 self.apply_attribute_set(used, node, position, size, depth + 1, active)?
             }
             let previous_position = self.attribute_insert_position.replace(set_start);
@@ -3146,20 +3152,13 @@ fn direct_variable_reference(
 }
 
 fn is_lexical_variable_name(value: &str) -> bool {
-    let valid_part = |part: &str| {
-        let mut characters = part.chars();
-        characters
-            .next()
-            .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
-            && characters.all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-            })
-    };
     let mut parts = value.split(':');
     let Some(first) = parts.next() else {
         return false;
     };
-    valid_part(first) && parts.next().is_none_or(valid_part) && parts.next().is_none()
+    crate::compiler::is_ncname(first)
+        && parts.next().is_none_or(crate::compiler::is_ncname)
+        && parts.next().is_none()
 }
 
 fn quoted_literal(value: &str) -> Option<&str> {
@@ -3192,6 +3191,21 @@ fn static_namespace(namespaces: &[(String, String)], prefix: &str) -> Option<Str
         .rev()
         .find(|(candidate, _)| candidate == prefix)
         .map(|(_, uri)| uri.clone())
+}
+
+fn require_bound_computed_prefix(
+    prefix: Option<&str>,
+    namespace: Option<&str>,
+    lexical: &str,
+) -> Result<()> {
+    if let Some(prefix) = prefix
+        && namespace.is_none()
+    {
+        return Err(Error::Dynamic(format!(
+            "computed QName `{lexical}` uses unbound prefix `{prefix}`"
+        )));
+    }
+    Ok(())
 }
 fn format_number_sequence(
     values: &[f64],

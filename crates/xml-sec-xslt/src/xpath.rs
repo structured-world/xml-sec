@@ -755,7 +755,7 @@ impl Evaluator {
             .ok_or_else(|| Error::Dynamic("XPath logical document root is stale".into()))?;
         let normalized = normalize_xpath_for_sxd(&expression.source);
         let rooted = rewrite_absolute_paths(&normalized, logical_root_index);
-        let isolated = hide_projection_elements_from_axes(&rooted);
+        let isolated = hide_projection_elements_from_axes(&rooted, logical_root_index);
         let rewritten = rewrite_outer_context_functions(&isolated);
         if !self.expressions.borrow().contains_key(&rewritten) {
             // One input byte can produce at most one parser token. This conservative
@@ -2349,8 +2349,29 @@ pub(crate) fn rewrite_absolute_paths_for_validation(source: &str) -> String {
 fn document_calls(source: &str) -> Vec<(String, Option<String>)> {
     let mut calls = Vec::new();
     let mut cursor = 0;
-    while let Some(relative) = source[cursor..].find("document") {
-        let start = cursor + relative;
+    let mut quote = None;
+    while cursor < source.len() {
+        let character = source[cursor..]
+            .chars()
+            .next()
+            .expect("cursor is in bounds");
+        if let Some(active) = quote {
+            cursor += character.len_utf8();
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            cursor += character.len_utf8();
+            continue;
+        }
+        if !source[cursor..].starts_with("document") {
+            cursor += character.len_utf8();
+            continue;
+        }
+        let start = cursor;
         let before = source[..start].chars().next_back();
         if before.is_some_and(is_xpath_name_character) {
             cursor = start + "document".len();
@@ -3616,7 +3637,7 @@ impl function::Function for ElementAvailable {
     }
 }
 
-fn hide_projection_elements_from_axes(source: &str) -> String {
+fn hide_projection_elements_from_axes(source: &str, logical_root_index: usize) -> String {
     const AXES: &[&str] = &[
         "ancestor-or-self::*",
         "ancestor::*",
@@ -3656,6 +3677,13 @@ fn hide_projection_elements_from_axes(source: &str) -> String {
             // so filtering by namespace-uri() would observe the hidden value.
             // The private QName test is evaluated directly by the XPath engine.
             output.push_str("[not(self::__xml_sec_docs:*)]");
+            if matches!(*axis, "following::*" | "preceding::*") {
+                // Every logical document is a sibling wrapper in the projection. Filtering by
+                // that wrapper's ordinal keeps these otherwise package-wide axes document-local.
+                output.push_str(&format!(
+                    "[count(ancestor::__xml_sec_docs:document/preceding-sibling::__xml_sec_docs:document) = {logical_root_index}]"
+                ));
+            }
             cursor += axis.len();
             continue;
         }

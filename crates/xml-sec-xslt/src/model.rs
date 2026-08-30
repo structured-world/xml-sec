@@ -216,6 +216,7 @@ impl Document {
         let mut document = Self::empty(base_uri.map(str::to_owned));
         document.source_xml = Some(xml.to_owned());
         let mut reader = Reader::from_str(xml);
+        let mut saw_document_element = false;
         let mut elements = vec![(
             document.root,
             vec![Namespace {
@@ -229,9 +230,21 @@ impl Document {
                 .map_err(|error| Error::Xml(error.to_string()))?
             {
                 Event::Start(start) => {
+                    if elements.len() == 1 {
+                        if saw_document_element {
+                            return Err(Error::Xml("multiple document elements".into()));
+                        }
+                        saw_document_element = true;
+                    }
                     push_stream_element(&mut document, &mut elements, &start, false)?
                 }
                 Event::Empty(start) => {
+                    if elements.len() == 1 {
+                        if saw_document_element {
+                            return Err(Error::Xml("multiple document elements".into()));
+                        }
+                        saw_document_element = true;
+                    }
                     push_stream_element(&mut document, &mut elements, &start, true)?
                 }
                 Event::End(_) => {
@@ -242,11 +255,23 @@ impl Document {
                 }
                 Event::Text(text) => {
                     let value = text.xml10_content().into_owned();
+                    if elements.len() == 1
+                        && !value.trim_matches([' ', '\t', '\r', '\n']).is_empty()
+                    {
+                        return Err(Error::Xml(
+                            "non-whitespace text outside the document element".into(),
+                        ));
+                    }
                     if elements.len() > 1 && !value.is_empty() {
                         push_parsed_text(&mut document, &elements, value);
                     }
                 }
                 Event::CData(text) => {
+                    if elements.len() == 1 {
+                        return Err(Error::Xml(
+                            "CDATA is not allowed outside the document element".into(),
+                        ));
+                    }
                     push_parsed_text(&mut document, &elements, text.xml10_content().into_owned());
                 }
                 Event::Comment(comment) => {
@@ -273,6 +298,12 @@ impl Document {
                     );
                 }
                 Event::GeneralRef(reference) => {
+                    if elements.len() == 1 {
+                        return Err(Error::Xml(
+                            "character and entity references are not allowed outside the document element"
+                                .into(),
+                        ));
+                    }
                     let reference = reference.as_ref();
                     let value = match reference {
                         "amp" => "&".into(),
@@ -305,6 +336,9 @@ impl Document {
         }
         if elements.len() != 1 {
             return Err(Error::Xml("unclosed element".into()));
+        }
+        if !saw_document_element {
+            return Err(Error::Xml("document element is missing".into()));
         }
         document.register_xml_ids()?;
         Ok(document)

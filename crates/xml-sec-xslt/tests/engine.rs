@@ -1936,3 +1936,207 @@ fn retained_dynamic_xpath_expressions_consume_owned_memory_budget() {
         })
     ));
 }
+
+#[test]
+fn xpath_document_scanner_ignores_calls_inside_string_literals() {
+    // Literal text that resembles document() must never cross the resolver boundary.
+    let resolver = Arc::new(ContextResolver::default());
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="'document(&quot;secret.xml&quot;)'"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let output = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("literal expression executes");
+    assert_eq!(output.serialized.bytes, b"document(\"secret.xml\")");
+    assert!(
+        resolver
+            .calls
+            .lock()
+            .expect("test resolver mutex is not poisoned")
+            .is_empty()
+    );
+}
+
+#[test]
+fn computed_elements_require_bound_prefixes() {
+    // A lexical prefix without a namespace binding cannot form a result-tree QName.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:element name="p:item"/></xsl:template></xsl:stylesheet>"#,
+    );
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Dynamic(message)) if message.contains("unbound") && message.contains('p')
+    ));
+}
+
+#[test]
+fn unicode_variable_names_preserve_result_tree_fragments() {
+    // XML NCNames are Unicode; the direct-value path must retain fragment node identity.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:variable name="é"><kept/></xsl:variable><out><xsl:copy-of select="$é"/></out></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "<out><kept/></out>\n");
+}
+
+#[test]
+fn processing_instruction_strips_leading_xml_whitespace() {
+    // XSLT strips leading PI data whitespace before the serializer adds one separator.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:processing-instruction name="p"><xsl:text>  value</xsl:text></xsl:processing-instruction></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "<?p value?>\n");
+}
+
+#[derive(Default)]
+struct IncludeChainResolver {
+    calls: Mutex<usize>,
+}
+
+impl Resolver for IncludeChainResolver {
+    fn resolve(
+        &self,
+        uri: &str,
+        _base_uri: Option<&str>,
+        purpose: ResolvePurpose,
+    ) -> xml_sec_xslt::Result<ResolvedResource> {
+        assert_eq!(purpose, ResolvePurpose::Include);
+        *self
+            .calls
+            .lock()
+            .expect("test resolver mutex is not poisoned") += 1;
+        let index = uri
+            .strip_prefix("level-")
+            .and_then(|value| value.strip_suffix(".xsl"))
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("chain URI contains a level");
+        let next = index + 1;
+        let source = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="level-{next}.xsl"/></xsl:stylesheet>"#
+        );
+        Ok(ResolvedResource {
+            canonical_uri: format!("memory:{uri}"),
+            identity: ResourceIdentity(uri.into()),
+            bytes: source.into_bytes(),
+            media_type: Some("application/xslt+xml".into()),
+            encoding: Some("UTF-8".into()),
+        })
+    }
+}
+
+#[test]
+fn include_import_scan_checks_recursion_before_resolving_the_next_module() {
+    // Compile depth bounds resolver work as well as the later declaration traversal.
+    let resolver = Arc::new(IncludeChainResolver::default());
+    let error = Compiler::new(resolver.clone(), CompileBudget::new(1 << 20, 32, 3, 1 << 20))
+        .compile(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="level-1.xsl"/></xsl:stylesheet>"#,
+            Some("memory:main.xsl"),
+        )
+        .expect_err("include chain must stop at the compile recursion limit");
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::RecursionDepth,
+            ..
+        }
+    ));
+    assert_eq!(
+        *resolver
+            .calls
+            .lock()
+            .expect("test resolver mutex is not poisoned"),
+        2,
+        "the over-limit module must not be resolved"
+    );
+}
+
+#[test]
+fn attribute_set_dependencies_obey_execution_recursion_budget() {
+    // Acyclic dependency chains must not bypass the native-stack recursion gate.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:attribute-set name="a" use-attribute-sets="b"/><xsl:attribute-set name="b" use-attribute-sets="c"/><xsl:attribute-set name="c" use-attribute-sets="d"/><xsl:attribute-set name="d"><xsl:attribute name="ok">yes</xsl:attribute></xsl:attribute-set><xsl:template match="/"><out xsl:use-attribute-sets="a"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(1024);
+    budget.recursion_depth = 3;
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::RecursionDepth,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn evaluated_sort_order_rejects_unknown_values() {
+    // Invalid AVT results are dynamic errors, never an implicit ascending fallback.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="order" select="'sideways'"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:sort order="{$order}"/><xsl:value-of select="."/></xsl:for-each></xsl:template></xsl:stylesheet>"#,
+    );
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<root><item>b</item><item>a</item></root>", None)
+                .expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Dynamic(message)) if message.contains("xsl:sort") && message.contains("order")
+    ));
+}
+
+#[test]
+fn deep_streaming_parser_enforces_single_document_element() {
+    // The deep parser must enforce XML document grammar rather than accept fragments.
+    let nested = format!("{}x{}", "<n>".repeat(129), "</n>".repeat(129));
+    for malformed in [
+        format!("{nested}<second/>"),
+        format!("top-level{nested}"),
+        format!("{nested}top-level"),
+    ] {
+        assert!(matches!(
+            Document::parse(&malformed, None),
+            Err(Error::Xml(_))
+        ));
+    }
+}
+
+#[test]
+fn following_and_preceding_axes_stay_inside_the_logical_document() {
+    // Projection siblings include stylesheet/external trees and are not XPath-visible documents.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item[last()]"><xsl:value-of select="count(following::*)"/><xsl:text>|</xsl:text><xsl:value-of select="count(preceding::*)"/></xsl:for-each></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<root><before/><item/></root>"), "0|1");
+}

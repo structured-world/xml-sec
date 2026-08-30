@@ -101,6 +101,11 @@ impl<R: Resolver> Compiler<R> {
                 ));
             }
             if is_import {
+                ensure(
+                    BudgetKind::RecursionDepth,
+                    state.budget.recursion_depth,
+                    depth + 1,
+                )?;
                 let resource =
                     self.resolve_module(child, base_uri, ResolvePurpose::Import, state)?;
                 self.enter_resource(&resource, state, |state| {
@@ -114,6 +119,11 @@ impl<R: Resolver> Compiler<R> {
                     )
                 })?;
             } else if child.has_tag_name((XSLT_NS, "include")) {
+                ensure(
+                    BudgetKind::RecursionDepth,
+                    state.budget.recursion_depth,
+                    depth + 1,
+                )?;
                 let resource =
                     self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
                 self.enter_resource(&resource, state, |state| {
@@ -152,6 +162,11 @@ impl<R: Resolver> Compiler<R> {
                 continue;
             }
             if child.has_tag_name((XSLT_NS, "include")) {
+                ensure(
+                    BudgetKind::RecursionDepth,
+                    state.budget.recursion_depth,
+                    depth + 1,
+                )?;
                 let resource =
                     self.resolve_module(child, base_uri, ResolvePurpose::Include, state)?;
                 self.enter_resource(&resource, state, |state| {
