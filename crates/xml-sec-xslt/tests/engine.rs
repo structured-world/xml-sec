@@ -4214,3 +4214,47 @@ fn text_output_allows_non_xml_characters_without_adding_markup_rules() {
         Err(Error::Serialization(message)) if message.contains("XML")
     ));
 }
+
+#[test]
+fn call_template_rejects_non_whitespace_character_data() {
+    // call-template has a with-param-only content model; text must not disappear during filtering.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:call-template name="target">unexpected</xsl:call-template></xsl:template><xsl:template name="target"/></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(stylesheet, None),
+        Err(Error::Static(message)) if message.contains("call-template")
+    ));
+}
+
+#[test]
+fn disable_output_escaping_is_not_absorbed_into_cdata() {
+    // DOE creates a serialization boundary even inside an element selected for CDATA output.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" cdata-section-elements="out"/><xsl:template match="/"><out>before<xsl:text disable-output-escaping="yes">&lt;raw/&gt;</xsl:text>after</out></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "<out><![CDATA[before]]><raw/><![CDATA[after]]></out>\n"
+    );
+}
+
+#[test]
+fn stylesheet_versions_use_numeric_xslt_semantics() {
+    // The version attribute is an XSLT Number, so equivalent lexical forms remain strict 1.0.
+    for version in ["1", "1.00"] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="{version}" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/">ok</xsl:template></xsl:stylesheet>"#
+        );
+        assert_eq!(execute(&stylesheet, "<source/>"), "ok");
+    }
+}
+
+#[test]
+fn literal_extension_attributes_do_not_change_instruction_semantics() {
+    // An unqualified attribute on a literal result element is copied, not interpreted as XSLT.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:e="urn:extension"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out extension-element-prefixes="e"><e:item/></out></xsl:template></xsl:stylesheet>"#;
+    let output = execute(stylesheet, "<source/>");
+    assert!(
+        output.contains("extension-element-prefixes=\"e\""),
+        "{output}"
+    );
+    assert!(output.contains("<e:item"), "{output}");
+}

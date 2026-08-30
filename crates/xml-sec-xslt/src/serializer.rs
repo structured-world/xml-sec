@@ -897,14 +897,18 @@ fn serialize_node(
                         continue;
                     }
                     if cdata
-                        && let Some(NodeKind::Text { value, .. }) =
-                            document.node(child).map(|node| &node.kind)
+                        && let Some(NodeKind::Text {
+                            value,
+                            disable_output_escaping: false,
+                        }) = document.node(child).map(|node| &node.kind)
                     {
                         let mut combined = value.clone();
                         index += 1;
                         while let Some(next) = node.children.get(index)
-                            && let Some(NodeKind::Text { value, .. }) =
-                                document.node(*next).map(|node| &node.kind)
+                            && let Some(NodeKind::Text {
+                                value,
+                                disable_output_escaping: false,
+                            }) = document.node(*next).map(|node| &node.kind)
                         {
                             combined.push_str(value);
                             index += 1;

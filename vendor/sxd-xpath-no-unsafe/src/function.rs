@@ -476,13 +476,29 @@ impl Function for NormalizeSpace {
         let mut args = Args(args);
         args.at_most(1)?;
         let arg = args.pop_string_value_or_context_node(context);
-        // TODO: research itertools or another pure-iterator solution
-        let s: Vec<_> = arg
+        let length = arg
             .split(XmlChar::is_space_char)
-            .filter(|s| !s.is_empty())
-            .collect();
-        let s = s.join(" ");
-        Ok(Value::String(s))
+            .filter(|part| !part.is_empty())
+            .try_fold((0usize, false), |(length, has_part), part| {
+                length
+                    .checked_add(usize::from(has_part))
+                    .and_then(|length| length.checked_add(part.len()))
+                    .map(|length| (length, true))
+            })
+            .map(|(length, _)| length)
+            .unwrap_or(usize::MAX);
+        context.reserve_string_allocation(length)?;
+        let mut normalized = String::with_capacity(length);
+        for part in arg
+            .split(XmlChar::is_space_char)
+            .filter(|part| !part.is_empty())
+        {
+            if !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            normalized.push_str(part);
+        }
+        Ok(Value::String(normalized))
     }
 }
 
@@ -953,6 +969,19 @@ mod test {
         evaluate_literal(NormalizeSpace, args!["hello\t\r\n world"], |r| {
             assert_eq!(Ok(Value::String("hello world".to_owned())), r);
         });
+    }
+
+    #[test]
+    fn normalize_space_checks_the_string_allocation_budget_before_allocating() {
+        // Tokenization must not allocate an intermediate vector outside the context budget.
+        let package = Package::new();
+        let document = package.as_document();
+        let mut setup = Setup::new();
+        setup.context.set_string_allocation_limit(3);
+        let error = setup
+            .evaluate(document.root(), NormalizeSpace, args!["a b c"])
+            .expect_err("five-byte normalized output exceeds the allocation budget");
+        assert!(error.to_string().contains("string allocation budget"));
     }
 
     fn translate_test(s: &str, from: &str, to: &str) -> String {

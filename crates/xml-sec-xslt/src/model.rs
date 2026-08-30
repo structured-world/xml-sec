@@ -342,17 +342,12 @@ impl Document {
                         "gt" => ">".into(),
                         "lt" => "<".into(),
                         "quot" => "\"".into(),
-                        value if value.starts_with("#x") => u32::from_str_radix(&value[2..], 16)
-                            .ok()
-                            .and_then(char::from_u32)
-                            .map(String::from)
-                            .ok_or_else(|| Error::Xml("invalid character reference".into()))?,
-                        value if value.starts_with('#') => value[1..]
-                            .parse::<u32>()
-                            .ok()
-                            .and_then(char::from_u32)
-                            .map(String::from)
-                            .ok_or_else(|| Error::Xml("invalid character reference".into()))?,
+                        value if value.starts_with("#x") => {
+                            decode_xml_character_reference(&value[2..], 16)?
+                        }
+                        value if value.starts_with('#') => {
+                            decode_xml_character_reference(&value[1..], 10)?
+                        }
                         name => {
                             return Err(Error::Xml(format!(
                                 "unresolved entity reference &{name};"
@@ -788,6 +783,22 @@ impl Document {
         self.source_xml = None;
         remap
     }
+}
+
+fn decode_xml_character_reference(digits: &str, radix: u32) -> Result<String> {
+    u32::from_str_radix(digits, radix)
+        .ok()
+        .and_then(char::from_u32)
+        .filter(|character| is_xml10_character(*character))
+        .map(String::from)
+        .ok_or_else(|| Error::Xml("invalid character reference".into()))
+}
+
+fn is_xml10_character(character: char) -> bool {
+    matches!(
+        u32::from(character),
+        0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+    )
 }
 
 fn push_stream_element(
@@ -1324,6 +1335,8 @@ mod parser_boundary_tests {
                 "<p:leaf/>",
                 "<leaf xmlns:a=\"urn:u\" xmlns:b=\"urn:u\" a:x=\"1\" b:x=\"2\"/>",
                 "<leaf xmlns:xml=\"urn:wrong\"/>",
+                "<leaf>&#0;</leaf>",
+                "<leaf>&#x1;</leaf>",
             ] {
                 let xml = nested_xml(depth, leaf);
                 assert_eq!(

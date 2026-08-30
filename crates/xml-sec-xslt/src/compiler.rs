@@ -1669,12 +1669,7 @@ impl CompileContext {
 
     fn with_literal_version(mut self, node: roxmltree::Node<'_, '_>) -> Result<Self> {
         if let Some(version) = node.attribute((XSLT_NS, "version")) {
-            let version = version
-                .parse::<f64>()
-                .ok()
-                .filter(|value| *value >= 1.0)
-                .ok_or_else(|| Error::Static(format!("unsupported XSLT version {version}")))?;
-            self.forward = version > 1.0;
+            self.forward = parse_stylesheet_version(version)? > 1.0;
         }
         Ok(self)
     }
@@ -1698,15 +1693,17 @@ fn require_stylesheet_module(root: roxmltree::Node<'_, '_>) -> Result<()> {
 
 fn module_forward_compatible(root: roxmltree::Node<'_, '_>) -> Result<bool> {
     match root.attribute("version") {
-        Some("1.0") => Ok(false),
-        Some(version) => version
-            .parse::<f64>()
-            .ok()
-            .filter(|value| *value > 1.0)
-            .map(|_| true)
-            .ok_or_else(|| Error::Static(format!("unsupported XSLT version {version}"))),
+        Some(version) => Ok(parse_stylesheet_version(version)? > 1.0),
         None => Err(Error::Static("xsl:stylesheet requires version".into())),
     }
+}
+
+fn parse_stylesheet_version(version: &str) -> Result<f64> {
+    version
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 1.0)
+        .ok_or_else(|| Error::Static(format!("unsupported XSLT version {version}")))
 }
 
 fn effective_base_uri(
@@ -1899,7 +1896,12 @@ fn compile_instruction(
         "call-template" => {
             let mut parameters = Vec::new();
             let mut parameter_names = HashSet::new();
-            for child in node.children().filter(roxmltree::Node::is_element) {
+            for child in node.children() {
+                if !child.is_element()
+                    && (!child.is_text() || child.text().is_none_or(is_xml_whitespace_only))
+                {
+                    continue;
+                }
                 if !child.has_tag_name((XSLT_NS, "with-param")) {
                     return Err(Error::Static(
                         "xsl:call-template accepts only xsl:with-param".into(),
@@ -2198,7 +2200,11 @@ fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {
     for ancestor in node.ancestors().filter(roxmltree::Node::is_element) {
         let Some(prefixes) = ancestor
             .attribute((XSLT_NS, "extension-element-prefixes"))
-            .or_else(|| ancestor.attribute("extension-element-prefixes"))
+            .or_else(|| {
+                (ancestor.tag_name().namespace() == Some(XSLT_NS))
+                    .then(|| ancestor.attribute("extension-element-prefixes"))
+                    .flatten()
+            })
         else {
             continue;
         };
