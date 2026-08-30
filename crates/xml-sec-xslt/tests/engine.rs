@@ -2621,3 +2621,214 @@ fn following_and_preceding_axes_stay_inside_the_logical_document() {
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item[last()]"><xsl:value-of select="count(following::*)"/><xsl:text>|</xsl:text><xsl:value-of select="count(preceding::*)"/></xsl:for-each></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<root><before/><item/></root>"), "0|1");
 }
+
+#[test]
+fn whitespace_rules_apply_to_every_loaded_source_document() {
+    // strip-space is a stylesheet-wide rule and must run after both document() loading and
+    // XInclude expansion, not only on the principal source passed to execute().
+    let resolver = Arc::new(CountingResolver::default());
+    resolver.resources.lock().expect("resolver mutex").insert(
+        "external.xml".into(),
+        "<external>  <item/>  </external>".into(),
+    );
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:strip-space elements="*"/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(document('external.xml')/external/text())"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", Some("memory:source.xml")).expect("source parses"),
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("external document transforms");
+    assert_eq!(result.serialized.bytes, b"0");
+
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:strip-space elements="*"/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(root/external/text())"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="external.xml"/></root>"#,
+        Some("memory:source.xml"),
+    )
+    .expect("source parses");
+    let result = stylesheet
+        .execute_with_source_processing(
+            &source,
+            &Parameters::new(),
+            resolver,
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+            xml_sec_xslt::SourceProcessing::XInclude,
+        )
+        .expect("expanded source transforms");
+    assert_eq!(result.serialized.bytes, b"0");
+}
+
+#[test]
+fn built_in_template_rules_consume_supplied_parameters_in_fragments() {
+    // The built-in element rule is equivalent to apply-templates without with-param.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="fragment"><xsl:apply-templates select="root/wrapper"><xsl:with-param name="value" select="'supplied'"/></xsl:apply-templates></xsl:variable><xsl:value-of select="$fragment"/></xsl:template><xsl:template match="leaf"><xsl:param name="value" select="'default'"/><xsl:value-of select="$value"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root><wrapper><leaf/></wrapper></root>"),
+        "default"
+    );
+}
+
+#[test]
+fn html_uri_escaping_uses_element_attribute_pairs_and_expanded_names() {
+    // URI escaping applies only to the pairs listed by the XSLT HTML output contract.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:x="urn:foreign"><xsl:output method="html" indent="no"/><xsl:template match="/"><html><div href="é"/><foo src="é"/><a href="é" x:href="é"/></html></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "<html xmlns:x=\"urn:foreign\"><div href=\"é\"></div><foo src=\"é\"></foo><a href=\"%C3%A9\" x:href=\"é\"></a></html>"
+    );
+}
+
+#[test]
+fn for_each_honors_inherited_stylesheet_xml_space() {
+    // The specialized sort/body parser must preserve the same stylesheet text nodes as the
+    // general sequence compiler.
+    let preserved = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="/" xml:space="preserve"> </xsl:for-each><xsl:text>|</xsl:text></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(preserved, "<source/>"), " |");
+    let stripped = preserved.replace(" xml:space=\"preserve\"", "");
+    assert_eq!(execute(&stripped, "<source/>"), "|");
+}
+
+#[test]
+fn computed_attributes_reject_reserved_namespace_names() {
+    // Namespace declarations are namespace nodes, never attributes constructed by xsl:attribute.
+    for (name, namespace) in [
+        ("xmlns", None),
+        ("value", Some("http://www.w3.org/2000/xmlns/")),
+    ] {
+        let namespace = namespace.map_or_else(String::new, |uri| format!(" namespace=\"{uri}\""));
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out><xsl:attribute name="{name}"{namespace}>value</xsl:attribute></out></xsl:template></xsl:stylesheet>"#
+        );
+        let error = compile(&stylesheet)
+            .execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect_err("reserved computed attribute must fail");
+        assert!(matches!(error, Error::Dynamic(message) if message.contains("namespace")));
+    }
+}
+
+#[test]
+fn xsl_number_level_is_validated_during_compilation() {
+    // Literal enum errors are static even when dynamic control flow never executes the node.
+    let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:if test="false()"><xsl:number level="sideways"/></xsl:if></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(invalid, None),
+        Err(Error::Static(message)) if message.contains("xsl:number") && message.contains("level")
+    ));
+    for level in ["single", "multiple", "any"] {
+        let valid = invalid.replace("sideways", level);
+        Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 32, 4096))
+            .compile(&valid, None)
+            .expect("defined xsl:number level compiles");
+    }
+}
+
+#[test]
+fn text_output_rejects_characters_unrepresentable_in_its_encoding() {
+    // Character references are markup and cannot preserve a character in method=text output.
+    let text = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text" encoding="ISO-8859-1"/><xsl:template match="/">€</xsl:template></xsl:stylesheet>"#,
+    );
+    assert!(matches!(
+        text.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Serialization(message)) if message.contains("ISO-8859-1") && message.contains('€')
+    ));
+    let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="xml" encoding="ISO-8859-1" omit-xml-declaration="yes"/><xsl:template match="/"><out>€</out></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(xml, "<source/>"), "<out>&#8364;</out>\n");
+}
+
+#[test]
+fn optimized_translate_uses_the_first_duplicate_mapping() {
+    // XPath translate() assigns each source character by its first position in the map string.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="from" select="'aa'"/><xsl:param name="to" select="'xy'"/><xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template><xsl:template match="item"><xsl:value-of select="translate(., $from, $to)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<root><item>a</item></root>"), "x");
+}
+
+#[test]
+fn deep_streaming_parser_rejects_reserved_namespace_rebindings() {
+    // The depth fallback parser must enforce the same Namespaces in XML constraints as roxmltree.
+    for declaration in [
+        "xmlns:xml=\"urn:wrong\"",
+        "xmlns:p=\"http://www.w3.org/XML/1998/namespace\"",
+        "xmlns:xmlns=\"urn:wrong\"",
+        "xmlns:p=\"http://www.w3.org/2000/xmlns/\"",
+    ] {
+        let xml = format!(
+            "{}<leaf {declaration}/>{}",
+            "<n>".repeat(129),
+            "</n>".repeat(129)
+        );
+        assert!(matches!(Document::parse(&xml, None), Err(Error::Xml(_))));
+    }
+    let valid = format!(
+        "{}<leaf xml:lang=\"en\"/>{}",
+        "<n>".repeat(129),
+        "</n>".repeat(129)
+    );
+    Document::parse(&valid, None).expect("reserved xml binding remains implicitly available");
+}
+
+#[test]
+fn doctype_identifiers_use_a_safe_literal_delimiter() {
+    // A system identifier containing one quote kind uses the other; two kinds cannot form an
+    // XML external identifier literal and must fail rather than emitting malformed markup.
+    let quoted = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes" doctype-system="a&quot;b"/><xsl:template match="/"><root/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(quoted, "<source/>"),
+        "<!DOCTYPE root SYSTEM 'a\"b'>\n<root/>\n"
+    );
+    let impossible = quoted.replace("a&quot;b", "a&quot;b&apos;c");
+    let error = compile(&impossible)
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("unquotable system identifier must fail");
+    assert!(
+        matches!(error, Error::Serialization(message) if message.contains("system identifier"))
+    );
+}

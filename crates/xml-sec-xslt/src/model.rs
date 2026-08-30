@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::{Error, Result};
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
 /// Stable index of a node inside one owned document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -751,8 +752,10 @@ fn push_stream_element(
             .map_err(|error| Error::Xml(error.to_string()))?
             .into_owned();
         if name == "xmlns" {
+            validate_namespace_binding(None, &value)?;
             set_namespace(&mut namespaces, None, value);
         } else if let Some(prefix) = name.strip_prefix("xmlns:") {
+            validate_namespace_binding(Some(prefix), &value)?;
             set_namespace(&mut namespaces, Some(prefix.into()), value);
         } else {
             raw_attributes.push((name.to_owned(), value));
@@ -851,6 +854,20 @@ fn set_namespace(namespaces: &mut Vec<Namespace>, prefix: Option<String>, uri: S
     } else {
         namespaces.push(Namespace { prefix, uri });
     }
+}
+
+fn validate_namespace_binding(prefix: Option<&str>, uri: &str) -> Result<()> {
+    if prefix == Some("xmlns") || uri == XMLNS_NS {
+        return Err(Error::Xml(
+            "the xmlns prefix and namespace URI are reserved".into(),
+        ));
+    }
+    if (prefix == Some("xml")) != (uri == XML_NS) {
+        return Err(Error::Xml(
+            "the xml prefix must be bound only to its reserved namespace URI".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn lexical_nesting_depth(xml: &str) -> usize {

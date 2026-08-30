@@ -9,12 +9,12 @@ use icu_locale::Locale;
 
 use crate::budget::Meter;
 use crate::compiler::{
-    AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction, Sort, Stylesheet,
-    Template, Variable,
+    AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction, NameTest, Sort,
+    Stylesheet, Template, Variable,
 };
 use crate::expression::innermost_namespaced_call;
 use crate::serializer::serialize;
-use crate::xpath::{Evaluator, SourceNode, XPathValue};
+use crate::xpath::{Evaluator, EvaluatorSourceOptions, SourceNode, XPathValue};
 use crate::{
     Attribute, BudgetKind, Document, Error, ExecutionBudget, ExpandedName, Namespace, NodeId,
     NodeKind, NodeReference, Resolver, Result, SerializedOutput, Value,
@@ -136,26 +136,37 @@ impl Stylesheet {
         }
         meter.charge(BudgetKind::OwnedBytes, source_bytes)?;
         let mut prepared = source.clone();
-        let original = source;
-        prepared.retain_nodes(|id, node| {
+        apply_whitespace_rules(&mut prepared, &self.whitespace);
+        Ok(Cow::Owned(prepared))
+    }
+}
+
+pub(crate) fn apply_whitespace_rules(
+    document: &mut Document,
+    rules: &[(NameTest, bool, usize, usize)],
+) {
+    if rules.is_empty() {
+        return;
+    }
+    let removed = document
+        .nodes()
+        .filter_map(|(id, node)| {
             let NodeKind::Text { value, .. } = &node.kind else {
-                return true;
+                return None;
             };
             if !value
                 .chars()
                 .all(|character| matches!(character, '\t' | '\n' | '\r' | ' '))
             {
-                return true;
+                return None;
             }
-            let Some(parent) = node.parent.and_then(|parent| original.node(parent)) else {
-                return true;
-            };
+            let parent = node.parent.and_then(|parent| document.node(parent))?;
             let NodeKind::Element { name, .. } = &parent.kind else {
-                return true;
+                return None;
             };
             let xml_space = node.parent.and_then(|mut ancestor| {
                 loop {
-                    let current = original.node(ancestor)?;
+                    let current = document.node(ancestor)?;
                     if let NodeKind::Element { attributes, .. } = &current.kind
                         && let Some(value) = attributes.iter().find_map(|attribute| {
                             (attribute.name.namespace.as_deref()
@@ -170,16 +181,17 @@ impl Stylesheet {
                 }
             });
             if xml_space == Some("preserve") {
-                return true;
+                return None;
             }
-            let decision = self
-                .whitespace
+            let decision = rules
                 .iter()
                 .filter(|(test, _, _, _)| test.matches(name))
                 .max_by_key(|(test, _, precedence, order)| (*precedence, test.priority(), *order));
-            !matches!(decision, Some((_, false, _, _))) || id == original.root()
-        });
-        Ok(Cow::Owned(prepared))
+            matches!(decision, Some((_, false, _, _))).then_some(id)
+        })
+        .collect::<HashSet<_>>();
+    if !removed.is_empty() {
+        document.retain_nodes(|id, _| !removed.contains(&id));
     }
 }
 
@@ -291,7 +303,10 @@ impl<'a> Execution<'a> {
             &stylesheet.module_documents,
             resolver,
             &mut meter,
-            source_processing,
+            EvaluatorSourceOptions {
+                processing: source_processing,
+                whitespace: Arc::clone(&stylesheet.whitespace),
+            },
         )?;
         let mut state = Self {
             stylesheet,
@@ -549,7 +564,7 @@ impl<'a> Execution<'a> {
             self.modes.pop();
             result
         } else {
-            self.built_in(node, mode, params, depth)
+            self.built_in(node, mode, depth)
         }
     }
 
@@ -1034,7 +1049,6 @@ impl<'a> Execution<'a> {
         &mut self,
         node: SourceNode,
         mode: Option<&ExpandedName>,
-        params: &HashMap<ExpandedName, Value>,
         depth: usize,
     ) -> Result<()> {
         match &node {
@@ -1051,7 +1065,7 @@ impl<'a> Execution<'a> {
                         self.apply_one(
                             child,
                             mode,
-                            params,
+                            &HashMap::new(),
                             ApplyFrame::new(index + 1, size, depth + 1),
                         )?;
                     }
@@ -1451,6 +1465,7 @@ impl<'a> Execution<'a> {
                             .and_then(|prefix| static_namespace(static_namespaces, prefix))
                     });
                 let (prefix, namespace) = normalize_computed_namespace(prefix, namespace);
+                validate_computed_attribute_name(prefix.as_deref(), &local, namespace.as_deref())?;
                 require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
                 let value =
                     self.capture_text(body, node, position, size, depth, current_precedence)?;
@@ -1863,16 +1878,20 @@ impl<'a> Execution<'a> {
         {
             let from = self.variable_string(from)?;
             let to = self.variable_string(to)?;
-            let replacements = from.chars().zip(to.chars()).collect::<HashMap<_, _>>();
-            let removed = from.chars().skip(to.chars().count()).collect::<Vec<_>>();
+            let mut target = to.chars();
+            let mut replacements = HashMap::new();
+            for character in from.chars() {
+                replacements
+                    .entry(character)
+                    .or_insert_with(|| target.next());
+            }
             return Ok(Some(XPathValue::String(
                 input
                     .chars()
                     .filter_map(|character| {
                         replacements
                             .get(&character)
-                            .copied()
-                            .or_else(|| (!removed.contains(&character)).then_some(character))
+                            .map_or(Some(character), |replacement| *replacement)
                     })
                     .collect(),
             )));
@@ -3308,6 +3327,21 @@ fn require_bound_computed_prefix(
         return Err(Error::Dynamic(format!(
             "computed QName `{lexical}` uses unbound prefix `{prefix}`"
         )));
+    }
+    Ok(())
+}
+
+fn validate_computed_attribute_name(
+    prefix: Option<&str>,
+    local: &str,
+    namespace: Option<&str>,
+) -> Result<()> {
+    const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
+
+    if (prefix.is_none() && local == "xmlns") || namespace == Some(XMLNS_NS) {
+        return Err(Error::Dynamic(
+            "xsl:attribute cannot construct an XML namespace declaration".into(),
+        ));
     }
     Ok(())
 }

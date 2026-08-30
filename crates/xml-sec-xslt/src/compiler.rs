@@ -1846,7 +1846,9 @@ fn compile_instruction(
             for child in node.children() {
                 if child.has_tag_name((XSLT_NS, "sort")) && sorting {
                     sorts.push(compile_sort(child, &context)?)
-                } else if (child.is_text() && child.text().is_none_or(is_xml_whitespace_only))
+                } else if (child.is_text()
+                    && child.text().is_none_or(is_xml_whitespace_only)
+                    && !stylesheet_space_is_preserved(child))
                     || (!child.is_element() && !child.is_text())
                 {
                     continue;
@@ -1854,7 +1856,8 @@ fn compile_instruction(
                     sorting = false;
                     if child.is_text() {
                         if let Some(text) = child.text()
-                            && !is_xml_whitespace_only(text)
+                            && (!is_xml_whitespace_only(text)
+                                || stylesheet_space_is_preserved(child))
                         {
                             body.push(Instruction::Text(text.into(), false));
                         }
@@ -2290,6 +2293,12 @@ fn compile_number(
     context: &CompileContext,
 ) -> Result<NumberInstruction> {
     validate_instruction_attributes(node)?;
+    let level = node.attribute("level").unwrap_or("single");
+    if !matches!(level, "single" | "multiple" | "any") {
+        return Err(Error::Static(format!(
+            "xsl:number level must be single, multiple, or any, got `{level}`"
+        )));
+    }
     Ok(NumberInstruction {
         value: node
             .attribute("value")
@@ -2303,7 +2312,7 @@ fn compile_number(
             .attribute("from")
             .map(|v| Pattern::new(v, node))
             .transpose()?,
-        level: node.attribute("level").unwrap_or("single").into(),
+        level: level.into(),
         format: parse_avt(node.attribute("format").unwrap_or("1"), node, context)?,
         lang: node
             .attribute("lang")

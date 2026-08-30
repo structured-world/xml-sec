@@ -94,6 +94,9 @@ fn serialize_charged(
     render(document, &definition, &mut text)?;
     let text = text.into_string();
     validate_xml_characters(&text, definition.version.as_deref().unwrap_or("1.0"))?;
+    if definition.method == OutputMethod::Text {
+        validate_text_encoding(&text, &definition.encoding)?;
+    }
     let bytes = encode(&text, &definition.encoding, meter, budget_kind)?;
     Ok(SerializedOutput {
         bytes,
@@ -190,28 +193,44 @@ fn render_doctype(
     push_name(prefix.as_deref(), &name.local, text);
     match (&definition.doctype_public, &definition.doctype_system) {
         (Some(public), Some(system)) => {
-            text.push_str(" PUBLIC \"");
-            text.push_str(public);
-            text.push('"');
-            text.push_str(" \"");
-            text.push_str(system);
-            text.push('"');
+            text.push_str(" PUBLIC ");
+            push_external_identifier_literal(public, "public identifier", text)?;
+            text.push(' ');
+            push_external_identifier_literal(system, "system identifier", text)?;
         }
         (Some(public), None) if definition.method == OutputMethod::Html => {
-            text.push_str(" PUBLIC \"");
-            text.push_str(public);
-            text.push('"');
+            text.push_str(" PUBLIC ");
+            push_external_identifier_literal(public, "public identifier", text)?;
         }
         (Some(_), None) => {}
         (None, Some(system)) => {
-            text.push_str(" SYSTEM \"");
-            text.push_str(system);
-            text.push('"');
+            text.push_str(" SYSTEM ");
+            push_external_identifier_literal(system, "system identifier", text)?;
         }
         (None, None) => {}
     }
     text.push('>');
     text.push('\n');
+    Ok(())
+}
+
+fn push_external_identifier_literal(
+    value: &str,
+    kind: &str,
+    output: &mut RenderBuffer,
+) -> Result<()> {
+    let delimiter = if !value.contains('"') {
+        '"'
+    } else if !value.contains('\'') {
+        '\''
+    } else {
+        return Err(Error::Serialization(format!(
+            "doctype {kind} contains both quote delimiters"
+        )));
+    };
+    output.push(delimiter);
+    output.push_str(value);
+    output.push(delimiter);
     Ok(())
 }
 
@@ -617,7 +636,9 @@ fn serialize_node(
                     }
                     output.push_str("=\"");
                     if definition.method == OutputMethod::Html
-                        && is_html_uri_attribute(&attribute.name.local)
+                        && name.namespace.is_none()
+                        && attribute.name.namespace.is_none()
+                        && is_html_uri_attribute(&name.local, &attribute.name.local)
                     {
                         escape_html_attribute(&escape_html_uri(&attribute.value), output);
                     } else if definition.method == OutputMethod::Html {
@@ -806,10 +827,18 @@ fn reject_xml11_restricted_markup(
     Ok(())
 }
 
-fn is_html_uri_attribute(local: &str) -> bool {
+fn is_html_uri_attribute(element: &str, attribute: &str) -> bool {
+    let element = element.to_ascii_lowercase();
+    let attribute = attribute.to_ascii_lowercase();
     matches!(
-        local.to_ascii_lowercase().as_str(),
-        "action" | "cite" | "href" | "longdesc" | "name" | "src" | "usemap"
+        (element.as_str(), attribute.as_str()),
+        ("form", "action")
+            | ("blockquote" | "q" | "del" | "ins", "cite")
+            | ("a" | "area" | "link" | "base", "href")
+            | ("img" | "frame" | "iframe", "longdesc")
+            | ("a", "name")
+            | ("img" | "input" | "frame" | "iframe" | "script", "src")
+            | ("img" | "input" | "object", "usemap")
     )
 }
 
@@ -993,6 +1022,39 @@ fn encode(value: &str, label: &str, meter: &mut Meter, budget_kind: BudgetKind) 
         }
     }
     Ok(bytes)
+}
+
+fn validate_text_encoding(value: &str, label: &str) -> Result<()> {
+    if label.eq_ignore_ascii_case("utf-8")
+        || label.eq_ignore_ascii_case("utf-16")
+        || label.eq_ignore_ascii_case("utf-16le")
+        || label.eq_ignore_ascii_case("utf-16be")
+    {
+        return Ok(());
+    }
+    if label.eq_ignore_ascii_case("iso-8859-1") || label.eq_ignore_ascii_case("latin1") {
+        if let Some(character) = value.chars().find(|character| u32::from(*character) > 0xff) {
+            return Err(Error::Serialization(format!(
+                "text output character `{character}` is not representable in {label}"
+            )));
+        }
+        return Ok(());
+    }
+    let encoding = encoding_rs::Encoding::for_label(label.as_bytes())
+        .ok_or_else(|| Error::Serialization(format!("unsupported output encoding {label}")))?;
+    let (_, _, had_errors) = encoding.encode(value);
+    if had_errors {
+        let character = value.chars().find(|character| {
+            let mut bytes = [0_u8; 4];
+            let encoded = character.encode_utf8(&mut bytes);
+            encoding.encode(encoded).2
+        });
+        return Err(Error::Serialization(format!(
+            "text output character `{}` is not representable in {label}",
+            character.unwrap_or('\u{fffd}')
+        )));
+    }
+    Ok(())
 }
 
 fn first_element(document: &Document) -> Option<&crate::Node> {

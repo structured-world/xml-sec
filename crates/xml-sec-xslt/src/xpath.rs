@@ -8,10 +8,10 @@ use sxd_document_no_unsafe::{Package, QName};
 use sxd_xpath_no_unsafe::{Context, Factory, Value as SxdValue, XPath, function, nodeset};
 
 use crate::budget::Meter;
-use crate::compiler::{DecimalFormat, Expression, Pattern, normalize_xpath_for_sxd};
+use crate::compiler::{DecimalFormat, Expression, NameTest, Pattern, normalize_xpath_for_sxd};
 use crate::expression::innermost_namespaced_call;
 use crate::resolver::decode_resource;
-use crate::runtime::SourceProcessing;
+use crate::runtime::{SourceProcessing, apply_whitespace_rules};
 use crate::{
     BudgetKind, Document, Error, ErrorKind, ExpandedName, NodeId, NodeKind, NodeReference,
     ResolvePurpose, Resolver, ResourceIdentity, Result, Value,
@@ -33,6 +33,11 @@ const SAXON_NS: &str = "http://icl.com/saxon";
 const LIBXSLT_NS: &str = "http://xmlsoft.org/XSLT/namespace";
 const XT_NS: &str = "http://www.jclark.com/xt";
 const XALAN_REDIRECT_NS: &str = "org.apache.xalan.xslt.extensions.Redirect";
+
+pub(crate) struct EvaluatorSourceOptions {
+    pub(crate) processing: SourceProcessing,
+    pub(crate) whitespace: Arc<[(NameTest, bool, usize, usize)]>,
+}
 
 fn source_node_owner(node: &SourceNode) -> NodeId {
     match node {
@@ -79,6 +84,7 @@ pub(crate) struct Evaluator {
     result_tree_fragments: HashMap<u64, SourceNode>,
     dynamic_evaluation_depth: usize,
     source_processing: SourceProcessing,
+    whitespace: Arc<[(NameTest, bool, usize, usize)]>,
 }
 
 impl Evaluator {
@@ -93,12 +99,12 @@ impl Evaluator {
         module_documents: &[(String, Document)],
         resolver: Arc<R>,
         meter: &mut Meter,
-        source_processing: SourceProcessing,
+        source_options: EvaluatorSourceOptions,
     ) -> Result<Self> {
         // SXD receives the normalized semantic tree, not the caller's parser-specific
         // lexical node layout. Typed paths then make every cross-model identity explicit.
         let mut resource_identities = HashMap::new();
-        let mut source = if source_processing == SourceProcessing::XInclude {
+        let mut source = if source_options.processing == SourceProcessing::XInclude {
             expand_xinclude_document(
                 source,
                 resolver.as_ref(),
@@ -110,6 +116,7 @@ impl Evaluator {
         } else {
             source.clone()
         };
+        apply_whitespace_rules(&mut source, &source_options.whitespace);
         let stylesheet_root = source.import(principal_stylesheet);
         let module_roots = module_documents
             .iter()
@@ -168,7 +175,8 @@ impl Evaluator {
             resource_identities,
             result_tree_fragments: HashMap::new(),
             dynamic_evaluation_depth: 0,
-            source_processing,
+            source_processing: source_options.processing,
+            whitespace: source_options.whitespace,
         })
     }
 
@@ -1054,7 +1062,7 @@ impl Evaluator {
                 let xml = decode_resource(&resource.bytes, resource.encoding.as_deref())?;
                 let document = Document::parse(&xml, Some(&resource.canonical_uri))?;
                 meter.charge(BudgetKind::OwnedBytes, resource.bytes.len())?;
-                let document = if self.source_processing == SourceProcessing::XInclude {
+                let mut document = if self.source_processing == SourceProcessing::XInclude {
                     let mut stack = vec![resource.identity.clone()];
                     expand_xinclude_document(
                         &document,
@@ -1067,6 +1075,7 @@ impl Evaluator {
                 } else {
                     document
                 };
+                apply_whitespace_rules(&mut document, &self.whitespace);
                 let root = self.import_document(&document, meter)?;
                 self.resource_identities
                     .insert(resource.identity, resource.bytes);
