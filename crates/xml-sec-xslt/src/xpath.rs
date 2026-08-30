@@ -228,11 +228,26 @@ impl Evaluator {
                         .position(|candidate| *candidate == root)
                 })
                 .ok_or_else(|| Error::Dynamic("key node has no logical document".into()))?;
+            let path = typed_path_to(&sxd);
             meter.charge(BudgetKind::KeyEntries, 1)?;
-            index
-                .entry((name, value, document_index))
-                .or_default()
-                .push(typed_path_to(&sxd));
+            let path_bytes = path.owned_bytes();
+            let retained_key_bytes = std::mem::size_of::<(ExpandedName, String, usize)>()
+                .saturating_add(name.local.len())
+                .saturating_add(name.namespace.as_deref().map_or(0, str::len))
+                .saturating_add(value.len());
+            match index.entry((name, value, document_index)) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    meter.charge(BudgetKind::OwnedBytes, path_bytes)?;
+                    entry.get_mut().push(path);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    meter.charge(
+                        BudgetKind::OwnedBytes,
+                        retained_key_bytes.saturating_add(path_bytes),
+                    )?;
+                    entry.insert(vec![path]);
+                }
+            }
         }
         drop(index);
         self.pattern_matches.clear();
@@ -1835,9 +1850,7 @@ impl XPathValue {
     pub(crate) fn boolean(&self) -> bool {
         match self {
             Self::NodeSet(nodes) => !nodes.is_empty(),
-            Self::ResultTreeFragment(document) => document
-                .node(document.root())
-                .is_some_and(|root| !root.children.is_empty()),
+            Self::ResultTreeFragment(_) => true,
             Self::Boolean(value) => *value,
             Self::Number(value) => *value != 0.0 && !value.is_nan(),
             Self::String(value) => !value.is_empty(),
@@ -3703,12 +3716,12 @@ impl function::Function for ElementAvailable {
 
 fn hide_projection_elements_from_axes(source: &str, logical_root_index: usize) -> String {
     const AXES: &[&str] = &[
-        "ancestor-or-self::*",
-        "ancestor::*",
-        "following::*",
-        "preceding::*",
-        "parent::*",
-        "self::*",
+        "ancestor-or-self",
+        "ancestor",
+        "following",
+        "preceding",
+        "parent",
+        "self",
     ];
     let mut output = String::with_capacity(source.len());
     let mut quote = None;
@@ -3732,29 +3745,117 @@ fn hide_projection_elements_from_axes(source: &str, logical_root_index: usize) -
             cursor += character.len_utf8();
             continue;
         }
-        if let Some(axis) = AXES
-            .iter()
-            .find(|axis| source[cursor..].starts_with(**axis))
+        if source[cursor..].starts_with("..")
+            && source[..cursor]
+                .chars()
+                .next_back()
+                .is_none_or(|previous| previous != '.' && !is_xpath_name_character(previous))
+            && source[cursor + 2..]
+                .chars()
+                .next()
+                .is_none_or(|next| next != '.' && !next.is_ascii_digit())
         {
-            output.push_str(axis);
-            // Name functions intentionally hide projection nodes from callers,
-            // so filtering by namespace-uri() would observe the hidden value.
-            // The private QName test is evaluated directly by the XPath engine.
-            output.push_str("[not(self::__xml_sec_docs:*)]");
-            if matches!(*axis, "following::*" | "preceding::*") {
+            output.push_str("..[parent::node()][not(self::__xml_sec_docs:documents)]");
+            cursor += 2;
+            continue;
+        }
+        let axis = AXES.iter().find(|axis| {
+            source[cursor..].starts_with(**axis) && source[cursor + axis.len()..].starts_with("::")
+        });
+        if let Some(axis) = axis
+            && let Some(end) = xpath_axis_node_test_end(source, cursor + axis.len() + 2)
+        {
+            let node_test = source[cursor + axis.len() + 2..end].trim();
+            output.push_str(&source[cursor..end]);
+            // The package root and its `documents` container are implementation nodes.
+            // A per-document wrapper represents the XPath root node and remains visible only
+            // to node(), never to element principal-node tests.
+            output.push_str("[not(self::__xml_sec_docs:documents)]");
+            if xpath_test_matches_root(node_test) {
+                output.push_str("[parent::node()]");
+            } else {
+                output.push_str("[not(self::__xml_sec_docs:document)]");
+            }
+            if matches!(*axis, "following" | "preceding") {
                 // Every logical document is a sibling wrapper in the projection. Filtering by
                 // that wrapper's ordinal keeps these otherwise package-wide axes document-local.
                 output.push_str(&format!(
                     "[count(ancestor::__xml_sec_docs:document/preceding-sibling::__xml_sec_docs:document) = {logical_root_index}]"
                 ));
             }
-            cursor += axis.len();
+            cursor = end;
             continue;
         }
         output.push(character);
         cursor += character.len_utf8();
     }
     output
+}
+
+fn xpath_axis_node_test_end(source: &str, mut cursor: usize) -> Option<usize> {
+    while source[cursor..]
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+    {
+        cursor += source[cursor..].chars().next()?.len_utf8();
+    }
+    if source[cursor..].starts_with('*') {
+        return Some(cursor + 1);
+    }
+    let start = cursor;
+    while let Some(character) = source[cursor..].chars().next() {
+        if !is_xpath_name_character(character) && character != ':' && character != '*' {
+            break;
+        }
+        cursor += character.len_utf8();
+    }
+    if cursor == start {
+        return None;
+    }
+    while source[cursor..]
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+    {
+        cursor += source[cursor..].chars().next()?.len_utf8();
+    }
+    if !source[cursor..].starts_with('(') {
+        return Some(cursor);
+    }
+    let mut depth = 0usize;
+    let mut quote = None;
+    for (offset, character) in source[cursor..].char_indices() {
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == '(' {
+            depth += 1;
+        } else if character == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(cursor + offset + 1);
+            }
+        }
+    }
+    None
+}
+
+fn xpath_test_matches_root(node_test: &str) -> bool {
+    let Some(arguments) = node_test
+        .strip_prefix("node")
+        .map(str::trim_start)
+        .and_then(|value| value.strip_prefix('('))
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return false;
+    };
+    arguments.trim().is_empty()
 }
 
 struct FunctionAvailable {
@@ -3779,6 +3880,7 @@ impl function::Function for FunctionAvailable {
                     | "contains"
                     | "count"
                     | "current"
+                    | "document"
                     | "false"
                     | "floor"
                     | "format-number"
@@ -3852,6 +3954,24 @@ impl NodePath {
             | Self::Attribute { parent: path, .. }
             | Self::Namespace { parent: path, .. } => path,
         }
+    }
+
+    fn owned_bytes(&self) -> usize {
+        let payload = self
+            .ordinary()
+            .len()
+            .saturating_mul(std::mem::size_of::<usize>());
+        std::mem::size_of::<Self>().saturating_add(match self {
+            Self::Ordinary(_) => payload,
+            Self::Attribute {
+                namespace, local, ..
+            } => payload
+                .saturating_add(namespace.as_deref().map_or(0, str::len))
+                .saturating_add(local.len()),
+            Self::Namespace { prefix, uri, .. } => payload
+                .saturating_add(prefix.len())
+                .saturating_add(uri.len()),
+        })
     }
 }
 

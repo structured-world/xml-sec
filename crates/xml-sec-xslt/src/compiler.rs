@@ -837,61 +837,196 @@ impl Expression {
 impl Variable {
     pub(crate) fn global_dependencies(&self, templates: &[Template]) -> HashSet<ExpandedName> {
         let mut output = HashSet::new();
-        collect_variable_dependencies(self, &HashSet::new(), &mut output);
-        if sequence_applies_templates(&self.content) {
-            for template in templates {
-                let locals = template
-                    .params
-                    .iter()
-                    .map(|parameter| parameter.name.clone())
-                    .collect();
-                collect_sequence_dependencies(&template.body, locals, &mut output);
-            }
-        }
+        DependencyCollector::new(templates).variable(self, &HashSet::new(), &mut output);
         output
     }
 }
 
-fn sequence_applies_templates(instructions: &[Instruction]) -> bool {
-    instructions.iter().any(|instruction| match instruction {
-        Instruction::ApplyTemplates { .. } => true,
-        Instruction::LiteralElement { children, .. }
-        | Instruction::ForEach { body: children, .. }
-        | Instruction::If { body: children, .. }
-        | Instruction::Copy { body: children, .. }
-        | Instruction::Element { body: children, .. }
-        | Instruction::Attribute { body: children, .. }
-        | Instruction::Comment(children)
-        | Instruction::Processing { body: children, .. }
-        | Instruction::Message { body: children, .. }
-        | Instruction::SecondaryOutput { body: children, .. }
-        | Instruction::ExtensionFallback { body: children, .. }
-        | Instruction::FunctionResult {
-            content: children, ..
-        } => sequence_applies_templates(children),
-        Instruction::Choose {
-            branches,
-            otherwise,
-        } => {
-            branches
-                .iter()
-                .any(|(_, body)| sequence_applies_templates(body))
-                || sequence_applies_templates(otherwise)
-        }
-        Instruction::Variable(variable) => sequence_applies_templates(&variable.content),
-        _ => false,
-    })
+struct DependencyCollector<'a> {
+    templates: &'a [Template],
+    traversed_templates: HashSet<usize>,
 }
 
-fn collect_variable_dependencies(
-    variable: &Variable,
-    locals: &HashSet<ExpandedName>,
-    output: &mut HashSet<ExpandedName>,
-) {
-    if let Some(select) = &variable.select {
-        collect_expression_dependencies(select, locals, output);
+impl<'a> DependencyCollector<'a> {
+    fn new(templates: &'a [Template]) -> Self {
+        Self {
+            templates,
+            traversed_templates: HashSet::new(),
+        }
     }
-    collect_sequence_dependencies(&variable.content, locals.clone(), output);
+
+    fn variable(
+        &mut self,
+        variable: &Variable,
+        locals: &HashSet<ExpandedName>,
+        output: &mut HashSet<ExpandedName>,
+    ) {
+        if let Some(select) = &variable.select {
+            collect_expression_dependencies(select, locals, output);
+        }
+        self.sequence(&variable.content, locals.clone(), output);
+    }
+
+    fn template(&mut self, template: &Template, output: &mut HashSet<ExpandedName>) {
+        if !self.traversed_templates.insert(template.order) {
+            return;
+        }
+        let mut locals = HashSet::new();
+        for parameter in &template.params {
+            self.variable(parameter, &locals, output);
+            locals.insert(parameter.name.clone());
+        }
+        self.sequence(&template.body, locals, output);
+    }
+
+    fn sequence(
+        &mut self,
+        instructions: &[Instruction],
+        mut locals: HashSet<ExpandedName>,
+        output: &mut HashSet<ExpandedName>,
+    ) {
+        for instruction in instructions {
+            match instruction {
+                Instruction::Text(..)
+                | Instruction::ApplyImports
+                | Instruction::CompatibilityComment(_) => {}
+                Instruction::LiteralElement {
+                    attributes,
+                    children,
+                    ..
+                } => {
+                    for attribute in attributes {
+                        collect_avt_dependencies(&attribute.value, &locals, output);
+                    }
+                    self.sequence(children, locals.clone(), output);
+                }
+                Instruction::ApplyTemplates {
+                    select,
+                    sorts,
+                    parameters,
+                    ..
+                } => {
+                    collect_expression_dependencies(select, &locals, output);
+                    for sort in sorts {
+                        collect_sort_dependencies(sort, &locals, output);
+                    }
+                    for parameter in parameters {
+                        self.variable(&parameter.variable, &locals, output);
+                    }
+                    for template in self.templates {
+                        self.template(template, output);
+                    }
+                }
+                Instruction::CallTemplate { name, parameters } => {
+                    for parameter in parameters {
+                        self.variable(&parameter.variable, &locals, output);
+                    }
+                    if let Some(template) = self
+                        .templates
+                        .iter()
+                        .filter(|template| template.name.as_ref() == Some(name))
+                        .max_by_key(|template| (template.precedence, template.order))
+                    {
+                        self.template(template, output);
+                    }
+                }
+                Instruction::ForEach {
+                    select,
+                    sorts,
+                    body,
+                } => {
+                    collect_expression_dependencies(select, &locals, output);
+                    for sort in sorts {
+                        collect_sort_dependencies(sort, &locals, output);
+                    }
+                    self.sequence(body, locals.clone(), output);
+                }
+                Instruction::If { test, body } => {
+                    collect_expression_dependencies(test, &locals, output);
+                    self.sequence(body, locals.clone(), output);
+                }
+                Instruction::Choose {
+                    branches,
+                    otherwise,
+                } => {
+                    for (test, body) in branches {
+                        collect_expression_dependencies(test, &locals, output);
+                        self.sequence(body, locals.clone(), output);
+                    }
+                    self.sequence(otherwise, locals.clone(), output);
+                }
+                Instruction::ValueOf { select, .. } | Instruction::CopyOf(select) => {
+                    collect_expression_dependencies(select, &locals, output);
+                }
+                Instruction::Copy { body, .. }
+                | Instruction::Comment(body)
+                | Instruction::ExtensionFallback { body, .. }
+                | Instruction::Message { body, .. } => {
+                    self.sequence(body, locals.clone(), output);
+                }
+                Instruction::Element {
+                    name,
+                    namespace,
+                    body,
+                    ..
+                }
+                | Instruction::Attribute {
+                    name,
+                    namespace,
+                    body,
+                    ..
+                } => {
+                    collect_avt_dependencies(name, &locals, output);
+                    if let Some(namespace) = namespace {
+                        collect_avt_dependencies(namespace, &locals, output);
+                    }
+                    self.sequence(body, locals.clone(), output);
+                }
+                Instruction::Processing { name, body } => {
+                    collect_avt_dependencies(name, &locals, output);
+                    self.sequence(body, locals.clone(), output);
+                }
+                Instruction::Number(number) => {
+                    if let Some(value) = &number.value {
+                        collect_expression_dependencies(value, &locals, output);
+                    }
+                    for value in [
+                        Some(&number.format),
+                        number.lang.as_ref(),
+                        number.letter_value.as_ref(),
+                        number.grouping_separator.as_ref(),
+                        number.grouping_size.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        collect_avt_dependencies(value, &locals, output);
+                    }
+                }
+                Instruction::Variable(variable) => {
+                    self.variable(variable, &locals, output);
+                    locals.insert(variable.name.clone());
+                }
+                Instruction::SecondaryOutput {
+                    uri,
+                    properties,
+                    body,
+                } => {
+                    collect_avt_dependencies(uri, &locals, output);
+                    for (_, value) in properties {
+                        collect_avt_dependencies(value, &locals, output);
+                    }
+                    self.sequence(body, locals.clone(), output);
+                }
+                Instruction::FunctionResult { select, content } => {
+                    if let Some(select) = select {
+                        collect_expression_dependencies(select, &locals, output);
+                    }
+                    self.sequence(content, locals.clone(), output);
+                }
+            }
+        }
+    }
 }
 
 fn collect_expression_dependencies(
@@ -929,143 +1064,6 @@ fn collect_sort_dependencies(
     }
     if let Some(value) = &sort.lang {
         collect_avt_dependencies(value, locals, output);
-    }
-}
-
-fn collect_sequence_dependencies(
-    instructions: &[Instruction],
-    mut locals: HashSet<ExpandedName>,
-    output: &mut HashSet<ExpandedName>,
-) {
-    for instruction in instructions {
-        match instruction {
-            Instruction::Text(..)
-            | Instruction::ApplyImports
-            | Instruction::CompatibilityComment(_) => {}
-            Instruction::LiteralElement {
-                attributes,
-                children,
-                ..
-            } => {
-                for attribute in attributes {
-                    collect_avt_dependencies(&attribute.value, &locals, output);
-                }
-                collect_sequence_dependencies(children, locals.clone(), output);
-            }
-            Instruction::ApplyTemplates {
-                select,
-                sorts,
-                parameters,
-                ..
-            } => {
-                collect_expression_dependencies(select, &locals, output);
-                for sort in sorts {
-                    collect_sort_dependencies(sort, &locals, output);
-                }
-                for parameter in parameters {
-                    collect_variable_dependencies(&parameter.variable, &locals, output);
-                }
-            }
-            Instruction::CallTemplate { parameters, .. } => {
-                for parameter in parameters {
-                    collect_variable_dependencies(&parameter.variable, &locals, output);
-                }
-            }
-            Instruction::ForEach {
-                select,
-                sorts,
-                body,
-            } => {
-                collect_expression_dependencies(select, &locals, output);
-                for sort in sorts {
-                    collect_sort_dependencies(sort, &locals, output);
-                }
-                collect_sequence_dependencies(body, locals.clone(), output);
-            }
-            Instruction::If { test, body } => {
-                collect_expression_dependencies(test, &locals, output);
-                collect_sequence_dependencies(body, locals.clone(), output);
-            }
-            Instruction::Choose {
-                branches,
-                otherwise,
-            } => {
-                for (test, body) in branches {
-                    collect_expression_dependencies(test, &locals, output);
-                    collect_sequence_dependencies(body, locals.clone(), output);
-                }
-                collect_sequence_dependencies(otherwise, locals.clone(), output);
-            }
-            Instruction::ValueOf { select, .. } | Instruction::CopyOf(select) => {
-                collect_expression_dependencies(select, &locals, output);
-            }
-            Instruction::Copy { body, .. }
-            | Instruction::Comment(body)
-            | Instruction::ExtensionFallback { body, .. }
-            | Instruction::Message { body, .. } => {
-                collect_sequence_dependencies(body, locals.clone(), output);
-            }
-            Instruction::Element {
-                name,
-                namespace,
-                body,
-                ..
-            }
-            | Instruction::Attribute {
-                name,
-                namespace,
-                body,
-                ..
-            } => {
-                collect_avt_dependencies(name, &locals, output);
-                if let Some(namespace) = namespace {
-                    collect_avt_dependencies(namespace, &locals, output);
-                }
-                collect_sequence_dependencies(body, locals.clone(), output);
-            }
-            Instruction::Processing { name, body } => {
-                collect_avt_dependencies(name, &locals, output);
-                collect_sequence_dependencies(body, locals.clone(), output);
-            }
-            Instruction::Number(number) => {
-                if let Some(value) = &number.value {
-                    collect_expression_dependencies(value, &locals, output);
-                }
-                for value in [
-                    Some(&number.format),
-                    number.lang.as_ref(),
-                    number.letter_value.as_ref(),
-                    number.grouping_separator.as_ref(),
-                    number.grouping_size.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    collect_avt_dependencies(value, &locals, output);
-                }
-            }
-            Instruction::Variable(variable) => {
-                collect_variable_dependencies(variable, &locals, output);
-                locals.insert(variable.name.clone());
-            }
-            Instruction::SecondaryOutput {
-                uri,
-                properties,
-                body,
-            } => {
-                collect_avt_dependencies(uri, &locals, output);
-                for (_, value) in properties {
-                    collect_avt_dependencies(value, &locals, output);
-                }
-                collect_sequence_dependencies(body, locals.clone(), output);
-            }
-            Instruction::FunctionResult { select, content } => {
-                if let Some(select) = select {
-                    collect_expression_dependencies(select, &locals, output);
-                }
-                collect_sequence_dependencies(content, locals.clone(), output);
-            }
-        }
     }
 }
 
@@ -1113,7 +1111,8 @@ impl Pattern {
             .collect()
     }
     fn default_priority(&self) -> f64 {
-        let value = self.source.trim();
+        let normalized = normalize_xpath_for_sxd(self.source.trim());
+        let value = normalized.as_str();
         if matches!(value, "*" | "@*")
             || matches!(
                 value,
@@ -2227,10 +2226,8 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<(bool, Ha
         for attribute in ["exclude-result-prefixes", "extension-element-prefixes"] {
             let value = if ancestor.tag_name().namespace() == Some(XSLT_NS) {
                 ancestor.attribute(attribute)
-            } else if attribute == "extension-element-prefixes" {
-                ancestor.attribute((XSLT_NS, attribute))
             } else {
-                None
+                ancestor.attribute((XSLT_NS, attribute))
             };
             let Some(value) = value else {
                 continue;

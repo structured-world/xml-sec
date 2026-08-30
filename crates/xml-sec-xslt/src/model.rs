@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Error, Result};
@@ -789,6 +789,17 @@ fn push_stream_element(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut expanded_names = HashSet::with_capacity(attributes.len());
+    if let Some(duplicate) = attributes
+        .iter()
+        .find(|attribute| !expanded_names.insert(attribute.name.clone()))
+    {
+        return Err(Error::Xml(format!(
+            "duplicate expanded attribute {{{}}}{}",
+            duplicate.name.namespace.as_deref().unwrap_or(""),
+            duplicate.name.local
+        )));
+    }
     let inherited_base = document.node(parent).and_then(|node| node.base_uri.clone());
     let effective_base = if let Some(attribute) = attributes.iter().find(|attribute| {
         attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "base"

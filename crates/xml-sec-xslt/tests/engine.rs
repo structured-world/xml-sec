@@ -2832,3 +2832,159 @@ fn doctype_identifiers_use_a_safe_literal_delimiter() {
         matches!(error, Error::Serialization(message) if message.contains("system identifier"))
     );
 }
+
+#[test]
+fn global_dependencies_follow_called_named_templates() {
+    // A global's value may depend on a later global through a named template call.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:variable name="first"><xsl:call-template name="build"/></xsl:variable><xsl:variable name="later" select="'ready'"/><xsl:template name="build"><xsl:value-of select="$later"/></xsl:template><xsl:template match="/"><xsl:value-of select="$first"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "ready");
+}
+
+#[test]
+fn computed_names_enforce_reserved_prefix_namespace_pairs() {
+    // Reserved lexical prefixes are remapped without changing the requested expanded name.
+    for (instruction, namespace, local, attribute) in [
+        (
+            r#"<xsl:element name="xml:node" namespace="urn:not-xml"/>"#,
+            "urn:not-xml",
+            "node",
+            false,
+        ),
+        (
+            r#"<xsl:element name="xmlns:node" namespace="urn:any"/>"#,
+            "urn:any",
+            "node",
+            false,
+        ),
+        (
+            r#"<out><xsl:attribute name="xml:value" namespace="urn:not-xml">x</xsl:attribute></out>"#,
+            "urn:not-xml",
+            "value",
+            true,
+        ),
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/">{instruction}</xsl:template></xsl:stylesheet>"#
+        );
+        let output = execute(&stylesheet, "<source/>");
+        let parsed =
+            roxmltree::Document::parse(&output).expect("computed output is namespace-valid");
+        let root = parsed.root_element();
+        let name = if attribute {
+            root.attributes()
+                .find(|candidate| candidate.name() == local)
+                .expect("computed attribute exists")
+                .name()
+        } else {
+            root.tag_name().name()
+        };
+        let actual_namespace = if attribute {
+            root.attributes()
+                .find(|candidate| candidate.name() == local)
+                .and_then(|candidate| candidate.namespace())
+        } else {
+            root.tag_name().namespace()
+        };
+        assert_eq!(name, local);
+        assert_eq!(actual_namespace, Some(namespace));
+    }
+    let forbidden = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out><xsl:attribute name="value" namespace="http://www.w3.org/2000/xmlns/">x</xsl:attribute></out></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        compile(forbidden).execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Dynamic(_))
+    ));
+    let remapped = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:element name="p:node" namespace="http://www.w3.org/XML/1998/namespace"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(remapped, "<source/>"), "<xml:node/>\n");
+}
+
+#[test]
+fn deep_streaming_parser_rejects_duplicate_expanded_attributes() {
+    // Namespace aliases cannot bypass XML's uniqueness rule in the depth fallback parser.
+    let xml = format!(
+        "{}<leaf xmlns:a=\"urn:u\" xmlns:b=\"urn:u\" a:x=\"1\" b:x=\"2\"/>{}",
+        "<n>".repeat(129),
+        "</n>".repeat(129)
+    );
+    assert!(matches!(Document::parse(&xml, None), Err(Error::Xml(_))));
+}
+
+#[test]
+fn literal_result_elements_honor_local_excluded_prefixes() {
+    // xsl:exclude-result-prefixes applies where it is declared on a literal result element.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out xmlns:p="urn:unused" xsl:exclude-result-prefixes="p"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "<out/>\n");
+}
+
+#[test]
+fn logical_document_roots_hide_projection_parents_for_every_axis_form() {
+    // The private package wrapper is never an XPath parent or ancestor of a document root.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(parent::node())"/><xsl:text>|</xsl:text><xsl:value-of select="count(ancestor::node())"/><xsl:text>|</xsl:text><xsl:value-of select="count(..)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "0|0|0");
+}
+
+#[test]
+fn empty_result_tree_fragments_are_true_singleton_root_node_sets() {
+    // XSLT boolean conversion observes the fragment root even when it has no children.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:variable name="empty"><xsl:if test="false()"><never/></xsl:if></xsl:variable><xsl:template match="/"><xsl:if test="$empty">direct</xsl:if><xsl:text>|</xsl:text><xsl:value-of select="boolean($empty)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "direct|true");
+    assert!(Value::ResultTreeFragment(Document::empty(None)).into_boolean());
+}
+
+#[test]
+fn function_available_advertises_document() {
+    // Capability introspection must agree with the registered XSLT document() function.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="function-available('document')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "true");
+}
+
+#[test]
+fn key_indexes_charge_retained_values_to_owned_bytes() {
+    // Key-entry count alone must not permit unbounded copies of large distinct use values.
+    let value = "x".repeat(64 * 1024);
+    let source_xml = format!("<root><item code=\"{value}\"/></root>");
+    let source = Document::parse(&source_xml, None).expect("large key source parses");
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="by-code" match="item" use="@code"/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(key('by-code', root/item/@code))"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = 180 * 1024;
+    assert!(matches!(
+        stylesheet.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn scalar_fast_paths_resolve_prefixed_variables() {
+    // Optimized scalar expressions use the same expanded variable names as general XPath.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:params"><xsl:output method="text"/><xsl:param name="p:n" select="2"/><xsl:param name="p:text" select="'ok'"/><xsl:template match="/"><xsl:value-of select="$p:n + 1"/><xsl:text>|</xsl:text><xsl:value-of select="string-length($p:text) &gt; 0"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "3|true");
+}
+
+#[test]
+fn processing_instruction_pattern_priority_ignores_xpath_whitespace() {
+    // Equivalent PI target patterns have equal default priority, so later stylesheet order wins.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/processing-instruction()"/></xsl:template><xsl:template match="processing-instruction ('target')">early</xsl:template><xsl:template match="processing-instruction('target')">late</xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<root><?target value?></root>"), "late");
+}

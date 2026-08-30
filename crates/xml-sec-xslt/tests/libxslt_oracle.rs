@@ -1203,6 +1203,12 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8]) -> bool {
             assert!(!actual.contains("found"));
             true
         }
+        // libxslt ignores xsl:exclude-result-prefixes on this literal result element.
+        // XSLT 1.0 section 7.1.1 makes the exclusion effective for that subtree.
+        "REC/test-7.1.1-3.xsl" => {
+            assert_eq!(actual, "<?xml version=\"1.0\"?>\n<out>SUCCESS</out>\n");
+            true
+        }
         _ => false,
     }
 }

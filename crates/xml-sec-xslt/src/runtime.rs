@@ -1412,7 +1412,8 @@ impl<'a> Execution<'a> {
                     .or_else(|| {
                         static_namespace(static_namespaces, prefix.as_deref().unwrap_or_default())
                     });
-                let (prefix, namespace) = normalize_computed_namespace(prefix, namespace);
+                let (prefix, namespace) =
+                    normalize_computed_namespace(prefix, namespace, &lexical)?;
                 require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
                 let namespaces = namespace
                     .as_ref()
@@ -1464,7 +1465,8 @@ impl<'a> Execution<'a> {
                             .as_deref()
                             .and_then(|prefix| static_namespace(static_namespaces, prefix))
                     });
-                let (prefix, namespace) = normalize_computed_namespace(prefix, namespace);
+                let (prefix, namespace) =
+                    normalize_computed_namespace(prefix, namespace, &lexical)?;
                 validate_computed_attribute_name(prefix.as_deref(), &local, namespace.as_deref())?;
                 require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
                 let value =
@@ -1862,7 +1864,7 @@ impl<'a> Execution<'a> {
             && is_lexical_variable_name(variable.trim())
             && let Ok(increment) = increment.trim().parse::<f64>()
         {
-            let value = self.variable_string(variable.trim())?;
+            let value = self.variable_string(variable.trim(), &expression.namespaces)?;
             return Ok(Some(XPathValue::Number(xpath_number(&value) + increment)));
         }
         if let Some(arguments) = source
@@ -1876,8 +1878,8 @@ impl<'a> Execution<'a> {
                 self.evaluator
                     .relative_string(input.trim(), node, &expression.namespaces)?
         {
-            let from = self.variable_string(from)?;
-            let to = self.variable_string(to)?;
+            let from = self.variable_string(from, &expression.namespaces)?;
+            let to = self.variable_string(to, &expression.namespaces)?;
             let mut target = to.chars();
             let mut replacements = HashMap::new();
             for character in from.chars() {
@@ -1909,7 +1911,9 @@ impl<'a> Execution<'a> {
                 .and_then(|value| value.split_once('*'))
             && let Ok(factor) = factor.trim().parse::<f64>()
         {
-            let length = xpath_number(&self.variable_string(variable.trim())?) * factor;
+            let length =
+                xpath_number(&self.variable_string(variable.trim(), &expression.namespaces)?)
+                    * factor;
             let take = length.round().max(1.0) as usize - 1;
             return Ok(Some(XPathValue::String(
                 literal.chars().take(take).collect(),
@@ -1919,7 +1923,7 @@ impl<'a> Execution<'a> {
             .strip_prefix("string-length($")
             .and_then(|value| value.strip_suffix(") > 0"))
         {
-            let value = self.variable_string(variable)?;
+            let value = self.variable_string(variable, &expression.namespaces)?;
             return Ok(Some(XPathValue::Boolean(!value.is_empty())));
         }
         if let Some(arguments) = source
@@ -1928,7 +1932,7 @@ impl<'a> Execution<'a> {
             && let Some((variable, delimiter)) = arguments.split_once(',')
             && let Some(delimiter) = quoted_literal(delimiter.trim())
         {
-            let value = self.variable_string(variable.trim())?;
+            let value = self.variable_string(variable.trim(), &expression.namespaces)?;
             return Ok(Some(XPathValue::String(
                 value
                     .split_once(delimiter)
@@ -1944,9 +1948,9 @@ impl<'a> Execution<'a> {
             && let Some((length_variable, increment)) = offset.split_once(")+")
             && let Ok(increment) = increment.trim().parse::<usize>()
         {
-            let value = self.variable_string(variable.trim())?;
+            let value = self.variable_string(variable.trim(), &expression.namespaces)?;
             let length = self
-                .variable_string(length_variable.trim())?
+                .variable_string(length_variable.trim(), &expression.namespaces)?
                 .chars()
                 .count();
             let start = length.saturating_add(increment).saturating_sub(1);
@@ -1954,18 +1958,30 @@ impl<'a> Execution<'a> {
                 value.chars().skip(start).collect(),
             )));
         }
+        if let Some(variable) = source
+            .strip_prefix("boolean($")
+            .and_then(|value| value.strip_suffix(')'))
+            && is_lexical_variable_name(variable)
+        {
+            let value = self.variable_value(variable, &expression.namespaces)?;
+            return Ok(Some(XPathValue::Boolean(value.clone().into_boolean())));
+        }
         Ok(None)
     }
 
-    fn variable_string(&self, local: &str) -> Result<String> {
-        let name = ExpandedName::new(None::<String>, local);
+    fn variable_value(&self, lexical: &str, namespaces: &[(String, String)]) -> Result<&Value> {
+        let name = expanded_variable_name(lexical, namespaces)?;
         self.scopes
             .iter()
             .rev()
             .find_map(|scope| scope.get(&name))
+            .ok_or_else(|| Error::Dynamic(format!("undefined variable ${lexical}")))
+    }
+
+    fn variable_string(&self, lexical: &str, namespaces: &[(String, String)]) -> Result<String> {
+        self.variable_value(lexical, namespaces)
             .cloned()
             .map(|value| value.into_string(&self.evaluator.source))
-            .ok_or_else(|| Error::Dynamic(format!("undefined variable ${local}")))
     }
 
     fn prepare_custom_function_calls(
@@ -3247,20 +3263,23 @@ fn direct_variable_reference(
     if !is_lexical_variable_name(lexical) {
         return Ok(None);
     }
+    expanded_variable_name(lexical, &expression.namespaces).map(Some)
+}
+
+fn expanded_variable_name(lexical: &str, namespaces: &[(String, String)]) -> Result<ExpandedName> {
     let (prefix, local) = lexical
         .split_once(':')
         .map_or((None, lexical), |(prefix, local)| (Some(prefix), local));
     let namespace = prefix
         .map(|prefix| {
-            expression
-                .namespaces
+            namespaces
                 .iter()
                 .find(|(candidate, _)| candidate == prefix)
                 .map(|(_, namespace)| namespace.clone())
                 .ok_or_else(|| Error::Static(format!("unbound variable prefix {prefix}")))
         })
         .transpose()?;
-    Ok(Some(ExpandedName::new(namespace, local)))
+    Ok(ExpandedName::new(namespace, local))
 }
 
 fn is_lexical_variable_name(value: &str) -> bool {
@@ -3300,12 +3319,29 @@ fn split_name(value: &str) -> Result<(Option<String>, String)> {
 fn normalize_computed_namespace(
     prefix: Option<String>,
     namespace: Option<String>,
-) -> (Option<String>, Option<String>) {
+    lexical: &str,
+) -> Result<(Option<String>, Option<String>)> {
+    const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+    const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
+
     if namespace.as_deref() == Some("") {
-        (None, None)
-    } else {
-        (prefix, namespace)
+        return Ok((None, None));
     }
+    if namespace.as_deref() == Some(XMLNS_NS) {
+        return Err(Error::Dynamic(format!(
+            "computed QName `{lexical}` uses the reserved xmlns namespace"
+        )));
+    }
+    if namespace.as_deref() == Some(XML_NS) {
+        // XSLT permits changing the lexical prefix to construct the requested expanded name.
+        return Ok((Some("xml".into()), namespace));
+    }
+    if matches!(prefix.as_deref(), Some("xml" | "xmlns")) {
+        // Preserve the requested expanded name while letting namespace fixup choose a legal
+        // replacement for a reserved lexical prefix.
+        return Ok((None, namespace));
+    }
+    Ok((prefix, namespace))
 }
 
 fn static_namespace(namespaces: &[(String, String)], prefix: &str) -> Option<String> {

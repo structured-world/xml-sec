@@ -27,12 +27,9 @@ impl Value {
             Self::Number(value) => value != 0.0 && !value.is_nan(),
             Self::String(value) => !value.is_empty(),
             Self::StoredExpression(value) => !value.is_empty(),
-            Self::ResultTreeFragment(document) => {
-                !document.string_value(document.root()).is_empty()
-                    || document
-                        .node(document.root())
-                        .is_some_and(|root| !root.children.is_empty())
-            }
+            // XSLT 1.0 defines every result-tree fragment as the equivalent node-set
+            // containing its root node, including fragments with no constructed children.
+            Self::ResultTreeFragment(_) => true,
         }
     }
 
