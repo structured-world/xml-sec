@@ -1810,14 +1810,7 @@ fn compile_instruction(
             }
         }
         "apply-imports" => {
-            if node.children().any(|child| {
-                child.is_element()
-                    || child
-                        .text()
-                        .is_some_and(|text| !is_xml_whitespace_only(text))
-            }) {
-                return Err(Error::Static("xsl:apply-imports must be empty".into()));
-            }
+            require_empty_instruction(node)?;
             Instruction::ApplyImports
         }
         "call-template" => {
@@ -1912,11 +1905,17 @@ fn compile_instruction(
                 otherwise,
             }
         }
-        "value-of" => Instruction::ValueOf {
-            select: context.expression(required_attr(node, "select")?, node)?,
-            disable_output_escaping: yes_no(node.attribute("disable-output-escaping"))?,
-        },
-        "copy-of" => Instruction::CopyOf(context.expression(required_attr(node, "select")?, node)?),
+        "value-of" => {
+            require_empty_instruction(node)?;
+            Instruction::ValueOf {
+                select: context.expression(required_attr(node, "select")?, node)?,
+                disable_output_escaping: yes_no(node.attribute("disable-output-escaping"))?,
+            }
+        }
+        "copy-of" => {
+            require_empty_instruction(node)?;
+            Instruction::CopyOf(context.expression(required_attr(node, "select")?, node)?)
+        }
         "copy" => Instruction::Copy {
             body: sequence()?,
             attribute_sets: qname_list_attr(node, "use-attribute-sets")?,
@@ -1965,11 +1964,11 @@ fn compile_instruction(
             terminate: yes_no(node.attribute("terminate"))?,
             body: sequence()?,
         },
-        "fallback" => Instruction::ExtensionFallback {
-            name: "xsl:fallback".into(),
-            present: true,
-            body: sequence()?,
-        },
+        "fallback" => {
+            return Err(Error::Static(
+                "xsl:fallback is permitted only as a child of an extension instruction".into(),
+            ));
+        }
         _unknown if context.forward => {
             let mut fallback = Vec::new();
             let fallback_nodes = node
@@ -2014,6 +2013,21 @@ fn is_xml_whitespace_only(value: &str) -> bool {
     value
         .bytes()
         .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+fn require_empty_instruction(node: roxmltree::Node<'_, '_>) -> Result<()> {
+    if node.children().any(|child| {
+        child.is_element()
+            || child
+                .text()
+                .is_some_and(|text| !is_xml_whitespace_only(text))
+    }) {
+        return Err(Error::Static(format!(
+            "xsl:{} must be empty",
+            node.tag_name().name()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_instruction_attributes(node: roxmltree::Node<'_, '_>) -> Result<()> {
@@ -2287,6 +2301,7 @@ fn compile_variable(node: roxmltree::Node<'_, '_>, context: CompileContext) -> R
 }
 fn compile_sort(node: roxmltree::Node<'_, '_>, context: &CompileContext) -> Result<Sort> {
     validate_instruction_attributes(node)?;
+    require_empty_instruction(node)?;
     Ok(Sort {
         select: context.expression(node.attribute("select").unwrap_or("."), node)?,
         data_type: parse_avt(node.attribute("data-type").unwrap_or("text"), node, context)?,
@@ -2310,6 +2325,7 @@ fn compile_number(
     context: &CompileContext,
 ) -> Result<NumberInstruction> {
     validate_instruction_attributes(node)?;
+    require_empty_instruction(node)?;
     let level = node.attribute("level").unwrap_or("single");
     if !matches!(level, "single" | "multiple" | "any") {
         return Err(Error::Static(format!(

@@ -568,7 +568,7 @@ impl Evaluator {
                         &augmented,
                         meter,
                     )?;
-                    let replaced = replace_exslt_string(&input, &searches, &replacements);
+                    let replaced = replace_exslt_string(&input, &searches, &replacements, meter)?;
                     let fragment = text_document(&replaced, meter)?;
                     let root = self.import_document(&fragment, meter)?;
                     let nodes = self.children(&root);
@@ -1549,6 +1549,9 @@ impl Evaluator {
         node: &SourceNode,
     ) -> Result<Option<Vec<SourceNode>>> {
         let source = expression.source.trim();
+        if source.contains('|') && source != "*|text()" {
+            return Ok(None);
+        }
         let steps = source.split('/').collect::<Vec<_>>();
         if steps.is_empty()
             || steps.iter().any(|step| {
@@ -2932,8 +2935,30 @@ fn text_document(value: &str, meter: &mut Meter) -> Result<Document> {
     Ok(document)
 }
 
-fn replace_exslt_string(input: &str, searches: &[String], replacements: &[String]) -> String {
-    let mut output = String::new();
+fn replace_exslt_string(
+    input: &str,
+    searches: &[String],
+    replacements: &[String],
+    meter: &mut Meter,
+) -> Result<String> {
+    let mut output_bytes = 0usize;
+    for_each_exslt_replacement_segment(input, searches, replacements, |segment| {
+        output_bytes = output_bytes.saturating_add(segment.len());
+    });
+    meter.charge(BudgetKind::OwnedBytes, output_bytes)?;
+    let mut output = String::with_capacity(output_bytes);
+    for_each_exslt_replacement_segment(input, searches, replacements, |segment| {
+        output.push_str(segment);
+    });
+    Ok(output)
+}
+
+fn for_each_exslt_replacement_segment(
+    input: &str,
+    searches: &[String],
+    replacements: &[String],
+    mut emit: impl FnMut(&str),
+) {
     let mut cursor = 0;
     let has_non_empty = searches.iter().any(|search| !search.is_empty());
     while cursor < input.len() {
@@ -2944,7 +2969,7 @@ fn replace_exslt_string(input: &str, searches: &[String], replacements: &[String
             .filter(|(_, search)| !search.is_empty() && remaining.starts_with(search.as_str()))
             .max_by_key(|(index, search)| (search.len(), usize::MAX - *index));
         if let Some((index, search)) = matched {
-            output.push_str(replacements.get(index).map_or("", String::as_str));
+            emit(replacements.get(index).map_or("", String::as_str));
             cursor += search.len();
             continue;
         }
@@ -2952,16 +2977,15 @@ fn replace_exslt_string(input: &str, searches: &[String], replacements: &[String
             .chars()
             .next()
             .expect("cursor remains inside the input");
-        output.push(character);
+        emit(&remaining[..character.len_utf8()]);
         cursor += character.len_utf8();
         if !has_non_empty
             && let Some(index) = searches.iter().position(String::is_empty)
             && cursor < input.len()
         {
-            output.push_str(replacements.get(index).map_or("", String::as_str));
+            emit(replacements.get(index).map_or("", String::as_str));
         }
     }
-    output
 }
 
 fn rewrite_outer_context_functions(source: &str) -> String {

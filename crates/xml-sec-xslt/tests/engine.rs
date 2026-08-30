@@ -3365,3 +3365,112 @@ fn namespace_generate_ids_are_stable_and_injective() {
         "true|true"
     );
 }
+
+#[test]
+fn exslt_replace_is_metered_before_multiplicative_expansion() {
+    // The replacement result can be the product of two individually bounded strings. The
+    // execution budget must reject that product before the result String reserves its capacity.
+    let replacement = "y".repeat(32 * 1024);
+    let stylesheet = compile(&format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:variable name="replacement">{replacement}</xsl:variable><xsl:template match="/"><xsl:value-of select="str:replace(string(.), 'x', $replacement)"/></xsl:template></xsl:stylesheet>"#
+    ));
+    let source_xml = format!("<source>{}</source>", "x".repeat(1024));
+    let mut budget = execution_budget(source_xml.len());
+    budget.owned_bytes = 256 * 1024;
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse(&source_xml, None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn standalone_fallback_is_a_static_error() {
+    // xsl:fallback is meaningful only as a direct child of an extension instruction.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:fallback><out/></xsl:fallback></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+        )
+        .compile(stylesheet, None),
+        Err(Error::Static(message)) if message.contains("extension instruction")
+    ));
+}
+
+#[test]
+fn instruction_value_capture_rejects_non_text_nodes() {
+    // XSLT does not flatten forbidden element descendants into attribute, comment, or PI values.
+    for instruction in [
+        r#"<out><xsl:attribute name="value"><bad>attribute</bad></xsl:attribute></out>"#,
+        r#"<xsl:comment><bad>comment</bad></xsl:comment>"#,
+        r#"<xsl:processing-instruction name="target"><bad>pi</bad></xsl:processing-instruction>"#,
+    ] {
+        let stylesheet = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/">{instruction}</xsl:template></xsl:stylesheet>"#
+        ));
+        assert!(matches!(
+            stylesheet.execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            ),
+            Err(Error::Dynamic(message)) if message.contains("text nodes")
+        ));
+    }
+}
+
+#[test]
+fn child_axis_fast_path_preserves_union_precedence() {
+    // `|` binds below `/`: the text() operand remains relative to the original context node.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root"><xsl:for-each select="a/*|text()"><xsl:value-of select="name()"/><xsl:text>:</xsl:text><xsl:value-of select="."/><xsl:text>|</xsl:text></xsl:for-each></xsl:for-each></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root>outer<a>inner<b>B</b></a></root>"),
+        ":outer|b:B|"
+    );
+}
+
+#[test]
+fn empty_xslt_instructions_reject_content() {
+    // Instructions with an EMPTY content model may contain formatting whitespace, but no
+    // executable child or non-whitespace character data.
+    for instruction in [
+        r#"<xsl:value-of select="1"><bad/></xsl:value-of>"#,
+        r#"<xsl:copy-of select=".">content</xsl:copy-of>"#,
+        r#"<xsl:number><bad/></xsl:number>"#,
+        r#"<xsl:apply-templates><xsl:sort select="."><bad/></xsl:sort></xsl:apply-templates>"#,
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/">{instruction}</xsl:template></xsl:stylesheet>"#
+        );
+        assert!(matches!(
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+            )
+            .compile(&stylesheet, None),
+            Err(Error::Static(message)) if message.contains("must be empty")
+        ));
+    }
+
+    compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="1">
+        </xsl:value-of><xsl:copy-of select="."> </xsl:copy-of><xsl:number> </xsl:number><xsl:apply-templates><xsl:sort select="."> </xsl:sort></xsl:apply-templates></xsl:template></xsl:stylesheet>"#,
+    );
+}

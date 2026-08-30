@@ -2395,11 +2395,36 @@ impl<'a> Execution<'a> {
         let stack = std::mem::replace(&mut self.output_stack, vec![NodeId(0)]);
         let result =
             self.execute_scoped_sequence(body, node, position, size, depth + 1, precedence);
-        let captured = self.result.string_value(self.result.root());
+        let captured = result.and_then(|()| {
+            let root = self
+                .result
+                .node(self.result.root())
+                .ok_or_else(|| Error::Dynamic("captured result has no root node".into()))?;
+            let mut bytes = 0usize;
+            for child in &root.children {
+                let Some(NodeKind::Text { value, .. }) =
+                    self.result.node(*child).map(|node| &node.kind)
+                else {
+                    return Err(Error::Dynamic(
+                        "xsl:attribute, xsl:comment, and xsl:processing-instruction content may produce only text nodes".into(),
+                    ));
+                };
+                bytes = bytes.saturating_add(value.len());
+            }
+            self.meter.charge(BudgetKind::OwnedBytes, bytes)?;
+            let mut captured = String::with_capacity(bytes);
+            for child in &root.children {
+                if let Some(NodeKind::Text { value, .. }) =
+                    self.result.node(*child).map(|node| &node.kind)
+                {
+                    captured.push_str(value);
+                }
+            }
+            Ok(captured)
+        });
         self.result = previous;
         self.output_stack = stack;
-        result?;
-        Ok(captured)
+        captured
     }
     fn capture_fragment(
         &mut self,
