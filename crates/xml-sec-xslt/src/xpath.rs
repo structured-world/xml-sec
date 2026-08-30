@@ -73,6 +73,7 @@ pub(crate) struct Evaluator {
     extension_functions: HashSet<ExpandedName>,
     resolver: Arc<dyn Resolver>,
     documents: HashMap<DocumentRequest, Vec<SourceNode>>,
+    document_roots: Rc<RefCell<HashMap<DocumentRequest, Vec<NodePath>>>>,
     resource_identities: HashMap<ResourceIdentity, Vec<u8>>,
     result_tree_fragments: HashMap<u64, SourceNode>,
     dynamic_evaluation_depth: usize,
@@ -117,6 +118,19 @@ impl Evaluator {
                 .map(|(path, node)| (path.clone(), source_base_uri(&source, node)))
                 .collect(),
         ));
+        let principal_request = DocumentRequest {
+            href: String::new(),
+            base_uri: principal_base_uri,
+        };
+        let principal_root = SourceNode::Node(stylesheet_root);
+        let document_roots = Rc::new(RefCell::new(HashMap::from([(
+            principal_request.clone(),
+            maps.forward
+                .get(&principal_root)
+                .cloned()
+                .into_iter()
+                .collect(),
+        )])));
         Ok(Self {
             source,
             package,
@@ -129,13 +143,8 @@ impl Evaluator {
             decimal_formats: Vec::new(),
             extension_functions: HashSet::new(),
             resolver,
-            documents: HashMap::from([(
-                DocumentRequest {
-                    href: String::new(),
-                    base_uri: principal_base_uri.clone(),
-                },
-                vec![SourceNode::Node(stylesheet_root)],
-            )]),
+            documents: HashMap::from([(principal_request, vec![principal_root])]),
+            document_roots,
             resource_identities,
             result_tree_fragments: HashMap::new(),
             dynamic_evaluation_depth: 0,
@@ -277,8 +286,22 @@ impl Evaluator {
                 .filter(|(_, node)| source_node_owner(node).0 >= first_new_node)
                 .map(|(path, node)| (path.clone(), source_base_uri(&self.source, node))),
         );
-        self.pattern_matches.clear();
+        // Pattern results are keyed by logical root. Importing a separate document adds a
+        // new root but cannot change the nodes selected in roots that were already projected.
+        // Retaining those entries avoids re-running every complex template pattern whenever
+        // document() lazily imports another resource.
         Ok(SourceNode::Node(logical_root))
+    }
+
+    fn cache_document(&mut self, request: DocumentRequest, nodes: Vec<SourceNode>) {
+        let roots = nodes
+            .iter()
+            .filter_map(|node| self.maps.forward.get(node).cloned())
+            .collect();
+        self.document_roots
+            .borrow_mut()
+            .insert(request.clone(), roots);
+        self.documents.insert(request, nodes);
     }
 
     fn prepare_extension_calls(
@@ -836,19 +859,7 @@ impl Evaluator {
             "document",
             DocumentFunction {
                 static_base_uri: expression.static_base_uri.clone(),
-                roots: self
-                    .documents
-                    .iter()
-                    .map(|(request, nodes)| {
-                        (
-                            request.clone(),
-                            nodes
-                                .iter()
-                                .filter_map(|node| self.maps.forward.get(node).cloned())
-                                .collect(),
-                        )
-                    })
-                    .collect(),
+                roots: Rc::clone(&self.document_roots),
                 node_base_uris: Rc::clone(&self.node_base_uris),
             },
         );
@@ -983,7 +994,7 @@ impl Evaluator {
             ) {
                 Ok(resource) => resource,
                 Err(Error::ResourceNotFound { .. }) => {
-                    self.documents.insert(request, Vec::new());
+                    self.cache_document(request, Vec::new());
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -1017,7 +1028,7 @@ impl Evaluator {
             let root = self.import_document(&document, meter)?;
             self.resource_identities
                 .insert(resource.identity, resource.bytes);
-            self.documents.insert(request.clone(), vec![root.clone()]);
+            self.cache_document(request.clone(), vec![root.clone()]);
             if let Some(fragment) = fragment {
                 fragments.push((request, root, fragment));
             }
@@ -1039,7 +1050,7 @@ impl Evaluator {
                     "document fragment `{fragment}` did not select nodes"
                 )));
             };
-            self.documents.insert(request, nodes);
+            self.cache_document(request, nodes);
         }
         Ok(())
     }
@@ -2971,7 +2982,7 @@ impl function::Function for UnparsedEntityUriFunction {
 }
 
 struct DocumentFunction {
-    roots: HashMap<DocumentRequest, Vec<NodePath>>,
+    roots: Rc<RefCell<HashMap<DocumentRequest, Vec<NodePath>>>>,
     node_base_uris: Rc<RefCell<HashMap<NodePath, Option<String>>>>,
     static_base_uri: Option<String>,
 }
@@ -3472,16 +3483,14 @@ impl function::Function for DocumentFunction {
         };
         let root: nodeset::Node<'d> = context.node.document().root().into();
         let mut result = nodeset::Nodeset::new();
+        let roots = self.roots.borrow();
         for request in requests {
-            let paths = self
-                .roots
-                .get(&request)
-                .ok_or_else(|| function::Error::Other {
-                    what: format!(
-                        "document resource `{}` with base {:?} was not prepared",
-                        request.href, request.base_uri
-                    ),
-                })?;
+            let paths = roots.get(&request).ok_or_else(|| function::Error::Other {
+                what: format!(
+                    "document resource `{}` with base {:?} was not prepared",
+                    request.href, request.base_uri
+                ),
+            })?;
             for path in paths {
                 let node = resolve_node_path(root.clone(), path).ok_or_else(|| {
                     function::Error::Other {
