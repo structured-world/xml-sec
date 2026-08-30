@@ -17,7 +17,7 @@ use crate::serializer::serialize;
 use crate::xpath::{Evaluator, SourceNode, XPathValue};
 use crate::{
     Attribute, BudgetKind, Document, Error, ExecutionBudget, ExpandedName, Namespace, NodeId,
-    NodeKind, Resolver, Result, SerializedOutput, Value,
+    NodeKind, NodeReference, Resolver, Result, SerializedOutput, Value,
 };
 
 /// Top-level stylesheet parameters supplied by the caller.
@@ -445,7 +445,14 @@ impl<'a> Execution<'a> {
                 if global.is_parameter
                     && let Some(value) = parameters.get(&global.variable.name)
                 {
-                    self.scopes[0].insert(global.variable.name.clone(), value.clone());
+                    let owned_bytes = expanded_name_owned_bytes(&global.variable.name)
+                        .saturating_add(value_owned_bytes(value));
+                    self.meter
+                        .check_additional(BudgetKind::OwnedBytes, owned_bytes)?;
+                    let name = global.variable.name.clone();
+                    let value = value.clone();
+                    self.meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
+                    self.scopes[0].insert(name, value);
                     progressed = true;
                     continue;
                 }
@@ -954,11 +961,12 @@ impl<'a> Execution<'a> {
                 Some(NodeKind::Root | NodeKind::Element { .. }) => {
                     let children = self.evaluator.children(&node);
                     let total = children.len();
+                    let built_in_params = Arc::new(HashMap::new());
                     for (index, child) in children.into_iter().enumerate().rev() {
                         tasks.push(TemplateTask::ApplyOne {
                             node: child,
                             mode: mode.clone(),
-                            params: Arc::clone(&params),
+                            params: Arc::clone(&built_in_params),
                             frame: ApplyFrame::new(index + 1, total, frame.depth + 1),
                         });
                     }
@@ -1481,6 +1489,15 @@ impl<'a> Execution<'a> {
                 } else {
                     self.number_sequence(number, node)?
                 };
+                if values.is_empty() {
+                    return Ok(());
+                }
+                if number.value.is_some()
+                    && let [value] = values.as_slice()
+                    && (!value.is_finite() || *value < 0.5)
+                {
+                    return self.append_text(&crate::value::format_xpath_number(*value), false);
+                }
                 let grouping_separator = number
                     .grouping_separator
                     .as_ref()
@@ -2660,6 +2677,10 @@ impl<'a> Execution<'a> {
                 for id in ids {
                     if Some(id) == boundary {
                         count = 0;
+                        if id == owner {
+                            break;
+                        }
+                        continue;
                     }
                     if matches(self, &SourceNode::Node(id))? {
                         count += 1;
@@ -3150,12 +3171,15 @@ fn quoted_literal(value: &str) -> Option<&str> {
 
 fn split_name(value: &str) -> Result<(Option<String>, String)> {
     if let Some((prefix, local)) = value.split_once(':') {
-        if prefix.is_empty() || local.is_empty() || local.contains(':') {
+        if local.contains(':')
+            || !crate::compiler::is_ncname(prefix)
+            || !crate::compiler::is_ncname(local)
+        {
             return Err(Error::Dynamic(format!("invalid computed QName {value}")));
         }
         Ok((Some(prefix.into()), local.into()))
-    } else if value.is_empty() {
-        Err(Error::Dynamic("computed QName is empty".into()))
+    } else if !crate::compiler::is_ncname(value) {
+        Err(Error::Dynamic(format!("invalid computed QName {value}")))
     } else {
         Ok((None, value.into()))
     }
@@ -3176,6 +3200,9 @@ fn format_number_sequence(
     separator: Option<char>,
     size: Option<usize>,
 ) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
     let tokens = tokenize_number_format(format);
     if tokens.formats.is_empty() {
         return values
@@ -3255,6 +3282,29 @@ fn node_kind_owned_bytes(kind: &NodeKind) -> usize {
             )
             .saturating_add(namespaces.iter().fold(0usize, |total, namespace| {
                 total.saturating_add(namespace_owned_bytes(namespace))
+            })),
+    }
+}
+
+fn value_owned_bytes(value: &Value) -> usize {
+    match value {
+        Value::NodeSet(nodes) => nodes
+            .len()
+            .saturating_mul(std::mem::size_of::<NodeReference>()),
+        Value::Boolean(_) | Value::Number(_) => 0,
+        Value::String(value) | Value::StoredExpression(value) => value.len(),
+        Value::ResultTreeFragment(document) => document
+            .source_xml()
+            .map_or(0, str::len)
+            .saturating_add(document.nodes().fold(0usize, |total, (_, node)| {
+                total
+                    .saturating_add(node_kind_owned_bytes(&node.kind))
+                    .saturating_add(node.base_uri.as_ref().map_or(0, String::len))
+                    .saturating_add(
+                        node.children
+                            .len()
+                            .saturating_mul(std::mem::size_of::<NodeId>()),
+                    )
             })),
     }
 }

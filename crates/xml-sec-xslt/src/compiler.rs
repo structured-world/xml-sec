@@ -1392,10 +1392,10 @@ fn compile_instruction(
         }
         return compile_literal_element(node, context);
     }
+    validate_instruction_attributes(node)?;
     let sequence = || compile_sequence(node.children(), context.clone());
     Ok(match node.tag_name().name() {
         "apply-templates" => {
-            reject_known_attributes(node, &["select", "mode", "name"])?;
             let mut sorts = vec![];
             let mut parameters = vec![];
             let mut saw_parameter = false;
@@ -1490,11 +1490,13 @@ fn compile_instruction(
             let mut saw_otherwise = false;
             for child in node.children().filter(roxmltree::Node::is_element) {
                 if child.has_tag_name((XSLT_NS, "when")) && !saw_otherwise {
+                    validate_instruction_attributes(child)?;
                     branches.push((
                         context.expression(required_attr(child, "test")?, child)?,
                         compile_sequence(child.children(), context.descend()?)?,
                     ));
                 } else if child.has_tag_name((XSLT_NS, "otherwise")) {
+                    validate_instruction_attributes(child)?;
                     if saw_otherwise {
                         return Err(Error::Static(
                             "xsl:choose permits only one xsl:otherwise".into(),
@@ -1602,9 +1604,41 @@ fn is_xml_whitespace_only(value: &str) -> bool {
         .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
 }
 
+fn validate_instruction_attributes(node: roxmltree::Node<'_, '_>) -> Result<()> {
+    let allowed: &[&str] = match node.tag_name().name() {
+        "apply-templates" => &["select", "mode"],
+        "apply-imports" | "choose" | "otherwise" | "comment" | "fallback" => &[],
+        "call-template" | "processing-instruction" => &["name"],
+        "for-each" | "copy-of" => &["select"],
+        "if" | "when" => &["test"],
+        "value-of" => &["select", "disable-output-escaping"],
+        "copy" => &["use-attribute-sets"],
+        "element" => &["name", "namespace", "use-attribute-sets"],
+        "attribute" => &["name", "namespace"],
+        "text" => &["disable-output-escaping"],
+        "number" => &[
+            "value",
+            "count",
+            "from",
+            "level",
+            "format",
+            "lang",
+            "letter-value",
+            "grouping-separator",
+            "grouping-size",
+        ],
+        "variable" | "param" | "with-param" => &["name", "select"],
+        "message" => &["terminate"],
+        "sort" => &["select", "lang", "data-type", "order", "case-order"],
+        _ => return Ok(()),
+    };
+    reject_known_attributes(node, allowed)
+}
+
 fn reject_known_attributes(node: roxmltree::Node<'_, '_>, allowed: &[&str]) -> Result<()> {
     const XSLT_ATTRIBUTES: &[&str] = &[
         "count",
+        "case-order",
         "data-type",
         "disable-output-escaping",
         "elements",
@@ -1614,6 +1648,7 @@ fn reject_known_attributes(node: roxmltree::Node<'_, '_>, allowed: &[&str]) -> R
         "grouping-size",
         "href",
         "lang",
+        "level",
         "letter-value",
         "match",
         "mode",
@@ -1823,6 +1858,7 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<(bool, Ha
     Ok((exclude_all, excluded))
 }
 fn compile_variable(node: roxmltree::Node<'_, '_>, context: CompileContext) -> Result<Variable> {
+    validate_instruction_attributes(node)?;
     let select = node
         .attribute("select")
         .map(|value| context.expression(value, node))
@@ -1840,6 +1876,7 @@ fn compile_variable(node: roxmltree::Node<'_, '_>, context: CompileContext) -> R
     })
 }
 fn compile_sort(node: roxmltree::Node<'_, '_>, context: &CompileContext) -> Result<Sort> {
+    validate_instruction_attributes(node)?;
     Ok(Sort {
         select: context.expression(node.attribute("select").unwrap_or("."), node)?,
         data_type: parse_avt(node.attribute("data-type").unwrap_or("text"), node, context)?,
@@ -1862,6 +1899,7 @@ fn compile_number(
     node: roxmltree::Node<'_, '_>,
     context: &CompileContext,
 ) -> Result<NumberInstruction> {
+    validate_instruction_attributes(node)?;
     Ok(NumberInstruction {
         value: node
             .attribute("value")

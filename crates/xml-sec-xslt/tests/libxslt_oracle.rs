@@ -1111,6 +1111,9 @@ fn assert_case(case: &Case) {
                 case,
                 normalize_generated_ids(&actual),
             ));
+            if assert_strict_xslt_output_deviation(case, &actual) {
+                return;
+            }
             let expected = if actual_is_html {
                 normalize_html_indentation(&expected).into_bytes()
             } else if actual_is_xml {
@@ -1138,7 +1141,61 @@ fn assert_case(case: &Case) {
         // neither a result file nor a diagnostic golden. Absence of both files is
         // still an expected failure, not permission to accept successful output.
         (Err(_), None) => {}
+        (Err(error), Some(_)) if is_expected_strict_xslt_error(case, &error) => {}
         (Err(error), _) => panic!("{}: {error}", case_name(case)),
+    }
+}
+
+fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8]) -> bool {
+    let stylesheet = case.stylesheet.to_string_lossy();
+    let actual = String::from_utf8_lossy(actual);
+    match stylesheet.as_ref() {
+        // libxslt forwards parameters through built-in template rules. XSLT 1.0 defines the
+        // built-in rule as an apply-templates without with-param, so the strict result must not
+        // retain the forms carried by the original parameter.
+        "exslt/common/node-set.5.xsl" => {
+            assert!(actual.contains("<horizontal>"));
+            assert!(actual.contains("<vertical>"));
+            assert!(!actual.contains("<forms><form>"));
+            true
+        }
+        "exslt/common/node-set.6.xsl" => {
+            assert!(actual.contains("<cells/>"));
+            true
+        }
+        // libxslt applies numbering tokens to negative and zero values. XSLT 1.0 requires the
+        // XPath string form for values below 0.5, independent of the requested token.
+        "general/bug-187.xsl" => {
+            assert_eq!(actual.matches("<number>-123.456</number>").count(), 3);
+            assert_eq!(actual.matches("<number>0</number>").count(), 2);
+            true
+        }
+        "general/bug-219.xsl" => {
+            let zero_values = actual.matches("<value v=\"0\">").count();
+            assert!(zero_values > 1);
+            assert_eq!(
+                zero_values,
+                actual.matches("<value v=\"0\">0</value>").count()
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+fn is_expected_strict_xslt_error(case: &Case, error: &Error) -> bool {
+    let stylesheet = case.stylesheet.to_string_lossy();
+    match (stylesheet.as_ref(), error) {
+        // This historical libxslt regression fixture relies on silently ignoring a misplaced
+        // name attribute. Strict compilation rejects the instruction-specific attribute.
+        ("general/bug-48-.xsl", Error::Static(message)) => {
+            message.contains("xsl:apply-templates does not permit XSLT attribute name")
+        }
+        // count() requires a node-set; libxslt historically exposed an RTF as one implicitly.
+        ("general/bug-56.xsl", Error::Dynamic(message)) => {
+            message.contains("expected to be a nodeset")
+        }
+        _ => false,
     }
 }
 

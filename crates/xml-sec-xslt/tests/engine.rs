@@ -4,8 +4,8 @@ use std::{collections::HashMap, sync::Mutex};
 use pretty_assertions::assert_eq;
 use xml_sec_xslt::{
     BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, ExecutionOptions,
-    NoResolver, NodeReference, Parameters, ResolvePurpose, ResolvedResource, Resolver,
-    ResourceIdentity, Value,
+    ExpandedName, NoResolver, NodeReference, Parameters, ResolvePurpose, ResolvedResource,
+    Resolver, ResourceIdentity, Value,
 };
 
 fn compile(source: &str) -> xml_sec_xslt::Stylesheet {
@@ -127,6 +127,140 @@ fn templates_modes_parameters_sort_keys_and_numbering_compose() {
             r#"<root><item id="b" name="z"/><item id="a" name="A"/></root>"#
         ),
         "<out>B!A!z</out>\n",
+    );
+}
+
+#[test]
+fn built_in_template_rules_do_not_forward_parameters() {
+    // A parameter targets only the selected template; an intervening built-in rule must not
+    // accidentally pass it to explicit templates selected for that rule's children.
+    let stylesheet = r#"
+      <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+        <xsl:output method="text"/>
+        <xsl:template match="/"><xsl:apply-templates select="wrapper"><xsl:with-param name="value" select="'forwarded'"/></xsl:apply-templates></xsl:template>
+        <xsl:template match="leaf"><xsl:param name="value" select="'default'"/><xsl:value-of select="$value"/></xsl:template>
+      </xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<wrapper><leaf/></wrapper>"), "default");
+}
+
+#[test]
+fn computed_names_require_lexical_qnames() {
+    // Invalid dynamic names must fail before malformed element or attribute markup reaches the
+    // serializer; both unprefixed and prefixed QName parts use NCName validation.
+    for instruction in [
+        r#"<xsl:element name="1invalid"/>"#,
+        r#"<xsl:attribute name="p:a b" namespace="urn:test">value</xsl:attribute>"#,
+    ] {
+        let stylesheet = format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out>{instruction}</out></xsl:template></xsl:stylesheet>"#
+        );
+        let error = compile(&stylesheet)
+            .execute(
+                &Document::parse("<root/>", None).expect("source must parse"),
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1 << 20),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect_err("invalid computed QName must fail");
+        assert!(matches!(error, Error::Dynamic(message) if message.contains("computed QName")));
+    }
+}
+
+#[test]
+fn result_tree_fragments_require_explicit_nodeset_conversion() {
+    // XSLT 1.0 content-created variables are RTFs: direct path navigation is a dynamic error,
+    // while exsl:node-set is the explicit operation that exposes their nodes.
+    let invalid = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:variable name="fragment"><item/></xsl:variable><xsl:copy-of select="$fragment/item"/></xsl:template></xsl:stylesheet>"#;
+    let error = compile(invalid)
+        .execute(
+            &Document::parse("<root/>", None).expect("source must parse"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1 << 20),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("an RTF must not support direct path navigation");
+    assert!(matches!(error, Error::Dynamic(_)));
+
+    let explicit = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common" exclude-result-prefixes="exsl"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:variable name="fragment"><item/></xsl:variable><xsl:copy-of select="exsl:node-set($fragment)/item"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(explicit, "<root/>"), "<item/>\n");
+}
+
+#[test]
+fn doctype_uses_the_first_element_qualified_name() {
+    // Prolog nodes do not replace the document element, and a prefixed root requires the same
+    // qualified name in both the DOCTYPE and serialized start tag.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:test"><xsl:output omit-xml-declaration="yes" doctype-system="result.dtd"/><xsl:template match="/"><xsl:comment>before</xsl:comment><p:root/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "<!DOCTYPE p:root SYSTEM \"result.dtd\">\n<!--before--><p:root xmlns:p=\"urn:test\"/>\n"
+    );
+}
+
+#[test]
+fn instruction_specific_attributes_are_rejected() {
+    // Known attributes on the wrong instruction are static errors rather than silently ignored
+    // behavior that makes a malformed stylesheet appear valid.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="." terminate="yes"/></xsl:template></xsl:stylesheet>"#;
+    let error = Compiler::new(
+        Arc::new(NoResolver),
+        CompileBudget::new(1 << 20, 16, 256, 4 << 20),
+    )
+    .compile(stylesheet, None)
+    .expect_err("misplaced known XSLT attribute must fail");
+    assert!(matches!(error, Error::Static(message) if message.contains("does not permit")));
+}
+
+#[test]
+fn external_parameter_payload_is_owned_byte_metered() {
+    // Caller-owned parameter strings are cloned into the persistent global scope, so their
+    // payload must be rejected before the clone can bypass a tight execution-owned-byte limit.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="payload"/><xsl:template match="/"><out/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "payload"),
+        Value::String("x".repeat(1024)),
+    );
+    let mut budget = execution_budget(1 << 20);
+    budget.owned_bytes = 64;
+    let error = stylesheet
+        .execute(
+            &Document::parse("<r/>", None).expect("source must parse"),
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("external parameter clone must be metered");
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn number_empty_boundary_and_exceptional_values_follow_xslt() {
+    // Empty sequences emit no formatting punctuation, level-any excludes its from boundary,
+    // and exceptional explicit values bypass numbering tokens entirely.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="section/section/item"/><xsl:text>|</xsl:text><xsl:number count="missing" format="(1)"/><xsl:text>|</xsl:text><xsl:number value="0" format="001"/><xsl:text>|</xsl:text><xsl:number value="1 div 0" format="001"/></xsl:template><xsl:template match="item"><xsl:number level="any" count="section|item" from="section"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<section><section><item/></section></section>"),
+        "1||0|Infinity"
     );
 }
 

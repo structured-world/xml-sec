@@ -231,24 +231,7 @@ impl Evaluator {
         {
             return Ok(XPathValue::StoredExpression(source.clone()));
         }
-        let variables = self.materialize_result_tree_fragments(&variables, meter)?;
         self.evaluate_core(&expression, node, position, size, &variables)
-    }
-
-    fn materialize_result_tree_fragments(
-        &mut self,
-        variables: &HashMap<ExpandedName, Value>,
-        meter: &mut Meter,
-    ) -> Result<HashMap<ExpandedName, Value>> {
-        let mut materialized = variables.clone();
-        for value in materialized.values_mut() {
-            let Value::ResultTreeFragment(fragment) = value else {
-                continue;
-            };
-            let root = self.import_result_tree_fragment(fragment, meter)?;
-            *value = Value::NodeSet(vec![root]);
-        }
-        Ok(materialized)
     }
 
     fn import_result_tree_fragment(

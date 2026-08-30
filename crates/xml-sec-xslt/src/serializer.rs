@@ -135,20 +135,22 @@ fn render(
         text.push_str("?>");
         text.push('\n');
     }
-    if let Some(root_name) = document
-        .node(document.root())
-        .and_then(|root| root.children.iter().find_map(|id| document.node(*id)))
-        .and_then(|node| match &node.kind {
-            NodeKind::Element { name, .. } => Some(name.local.as_str()),
-            _ => None,
+    if let Some(root_name) = document.node(document.root()).and_then(|root| {
+        root.children.iter().find_map(|id| {
+            document.node(*id).and_then(|node| match &node.kind {
+                NodeKind::Element { name, prefix, .. } => Some(prefix.as_ref().map_or_else(
+                    || name.local.clone(),
+                    |prefix| format!("{prefix}:{}", name.local),
+                )),
+                _ => None,
+            })
         })
-        && (definition.doctype_system.is_some()
-            || (definition.method == OutputMethod::Html
-                && (definition.doctype_public.is_some()
-                    || definition.version.as_deref() == Some("5"))))
+    }) && (definition.doctype_system.is_some()
+        || (definition.method == OutputMethod::Html
+            && (definition.doctype_public.is_some() || definition.version.as_deref() == Some("5"))))
     {
         text.push_str("<!DOCTYPE ");
-        text.push_str(root_name);
+        text.push_str(&root_name);
         match (&definition.doctype_public, &definition.doctype_system) {
             (Some(public), Some(system)) => {
                 text.push_str(" PUBLIC \"");
