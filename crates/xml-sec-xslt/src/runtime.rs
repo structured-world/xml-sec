@@ -288,6 +288,7 @@ impl<'a> Execution<'a> {
             source,
             &stylesheet.principal_document,
             stylesheet.principal_base_uri.clone(),
+            &stylesheet.module_documents,
             resolver,
             &mut meter,
             source_processing,
@@ -439,6 +440,10 @@ impl<'a> Execution<'a> {
         }
         let mut pending = effective.into_values().collect::<Vec<_>>();
         pending.sort_by_key(|global| global.order);
+        let global_names = pending
+            .iter()
+            .map(|global| global.variable.name.clone())
+            .collect::<HashSet<_>>();
         while !pending.is_empty() {
             let mut deferred = Vec::new();
             let mut progressed = false;
@@ -457,22 +462,24 @@ impl<'a> Execution<'a> {
                     progressed = true;
                     continue;
                 }
-                match self.evaluate_variable(
+                if global
+                    .dependencies
+                    .iter()
+                    .filter(|name| global_names.contains(*name))
+                    .any(|name| !self.scopes[0].contains_key(name))
+                {
+                    deferred.push(global);
+                    continue;
+                }
+                let value = self.evaluate_variable(
                     &global.variable,
                     &SourceNode::Node(self.evaluator.source.root()),
                     1,
                     1,
                     1,
-                ) {
-                    Ok(value) => {
-                        self.scopes[0].insert(global.variable.name.clone(), value);
-                        progressed = true;
-                    }
-                    Err(Error::Dynamic(message)) if message.contains("unknown variable") => {
-                        deferred.push(global)
-                    }
-                    Err(error) => return Err(error),
-                }
+                )?;
+                self.scopes[0].insert(global.variable.name.clone(), value);
+                progressed = true;
             }
             if !progressed {
                 let names = deferred
@@ -1666,13 +1673,18 @@ impl<'a> Execution<'a> {
         position: usize,
         size: usize,
     ) -> Result<XPathValue> {
+        self.meter.charge(BudgetKind::XPathEvaluations, 1)?;
         if xpath_calls_key(&expression.source) {
             self.ensure_key_index(&expression.source, &expression.namespaces, node)?;
         }
         if let Some(name) = direct_variable_reference(expression)?
             && let Some(value) = self.scopes.iter().rev().find_map(|scope| scope.get(&name))
         {
-            return Ok(public_to_xpath(value.clone()));
+            let value = match value.clone() {
+                Value::NodeSet(nodes) => Value::NodeSet(self.evaluator.document_order(nodes)),
+                value => value,
+            };
+            return Ok(public_to_xpath(value));
         }
         match expression.source.trim() {
             "." => return Ok(XPathValue::NodeSet(vec![node.clone()])),
@@ -1809,13 +1821,9 @@ impl<'a> Execution<'a> {
                 )));
             }
             "normalize-space(.)" => {
-                return Ok(Some(XPathValue::String(
-                    self.evaluator
-                        .string_value(node)
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                )));
+                return Ok(Some(XPathValue::String(normalize_xpath_space(
+                    &self.evaluator.string_value(node),
+                ))));
             }
             "concat('<',name(.),'>')" => {
                 return Ok(Some(XPathValue::String(format!(
@@ -2443,8 +2451,32 @@ impl<'a> Execution<'a> {
         if value.is_empty() {
             return Ok(());
         }
+        let parent = self.parent();
+        let previous = self
+            .result
+            .node(parent)
+            .and_then(|node| node.children.last().copied());
+        if let Some(previous) = previous
+            && self.result.node(previous).is_some_and(|node| {
+                matches!(
+                    &node.kind,
+                    NodeKind::Text {
+                        disable_output_escaping,
+                        ..
+                    } if *disable_output_escaping == disable
+                )
+            })
+        {
+            self.meter.charge(BudgetKind::OwnedBytes, value.len())?;
+            if let Some(NodeKind::Text { value: current, .. }) =
+                self.result.node_mut(previous).map(|node| &mut node.kind)
+            {
+                current.push_str(value);
+            }
+            return Ok(());
+        }
         self.push_node(
-            self.parent(),
+            parent,
             NodeKind::Text {
                 value: value.into(),
                 disable_output_escaping: disable,
@@ -2771,6 +2803,23 @@ impl<'a> Execution<'a> {
         }
         Ok(count)
     }
+}
+
+fn normalize_xpath_space(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for character in value.chars() {
+        if matches!(character, ' ' | '\t' | '\r' | '\n') {
+            pending_space = !output.is_empty();
+        } else {
+            if pending_space {
+                output.push(' ');
+                pending_space = false;
+            }
+            output.push(character);
+        }
+    }
+    output
 }
 
 fn try_stable_sort_by<T: Copy>(

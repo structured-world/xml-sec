@@ -90,6 +90,7 @@ impl Evaluator {
         source: &Document,
         principal_stylesheet: &Document,
         principal_base_uri: Option<String>,
+        module_documents: &[(String, Document)],
         resolver: Arc<R>,
         meter: &mut Meter,
         source_processing: SourceProcessing,
@@ -110,6 +111,10 @@ impl Evaluator {
             source.clone()
         };
         let stylesheet_root = source.import(principal_stylesheet);
+        let module_roots = module_documents
+            .iter()
+            .map(|(uri, document)| (uri.clone(), source.import(document)))
+            .collect::<Vec<_>>();
         let package = project_semantic_document(&source, meter)?;
         let root: nodeset::Node<'_> = package.as_document().root().into();
         let maps = NodeMaps::new(&source, root)?;
@@ -124,14 +129,28 @@ impl Evaluator {
             base_uri: principal_base_uri,
         };
         let principal_root = SourceNode::Node(stylesheet_root);
-        let document_roots = Rc::new(RefCell::new(HashMap::from([(
+        let mut document_root_entries = HashMap::from([(
             principal_request.clone(),
             maps.forward
                 .get(&principal_root)
                 .cloned()
                 .into_iter()
                 .collect(),
-        )])));
+        )]);
+        let mut documents = HashMap::from([(principal_request, vec![principal_root])]);
+        for (uri, root) in module_roots {
+            let request = DocumentRequest {
+                href: String::new(),
+                base_uri: Some(uri),
+            };
+            let root = SourceNode::Node(root);
+            document_root_entries.insert(
+                request.clone(),
+                maps.forward.get(&root).cloned().into_iter().collect(),
+            );
+            documents.insert(request, vec![root]);
+        }
+        let document_roots = Rc::new(RefCell::new(document_root_entries));
         Ok(Self {
             source,
             package,
@@ -144,7 +163,7 @@ impl Evaluator {
             decimal_formats: Vec::new(),
             extension_functions: HashSet::new(),
             resolver,
-            documents: HashMap::from([(principal_request, vec![principal_root])]),
+            documents,
             document_roots,
             resource_identities,
             result_tree_fragments: HashMap::new(),
@@ -221,7 +240,6 @@ impl Evaluator {
         variables: &HashMap<ExpandedName, Value>,
         meter: &mut Meter,
     ) -> Result<XPathValue> {
-        meter.charge(BudgetKind::XPathEvaluations, 1)?;
         self.prepare_document_calls(expression, node, position, size, variables, meter)?;
         let (expression, variables) =
             self.prepare_extension_calls(expression, node, position, size, variables, meter)?;
@@ -232,6 +250,12 @@ impl Evaluator {
             return Ok(XPathValue::StoredExpression(source.clone()));
         }
         self.evaluate_core(&expression, node, position, size, &variables, meter)
+    }
+
+    pub(crate) fn document_order(&self, mut nodes: Vec<SourceNode>) -> Vec<SourceNode> {
+        nodes.sort_by_key(|node| self.maps.order.get(node).copied());
+        nodes.dedup();
+        nodes
     }
 
     fn import_result_tree_fragment(
@@ -1216,7 +1240,8 @@ impl Evaluator {
             let (lexical, predicate) = value.split_once("[@")?;
             (!predicate.contains(['[', ']'])).then_some((lexical, predicate))
         }) && let Some((attribute_name, expected)) = predicate.split_once('=')
-            && !attribute_name.contains(':')
+            && let attribute_name = attribute_name.trim()
+            && crate::compiler::is_ncname(attribute_name)
             && let Some(expected) = quoted_pattern_literal(expected.trim())
         {
             let NodeKind::Element {
@@ -2314,14 +2339,7 @@ fn rewrite_absolute_paths(source: &str, logical_root_index: usize) -> String {
             previous_non_whitespace = Some(character);
             continue;
         }
-        if character == '/'
-            && previous_non_whitespace.is_none_or(|previous| {
-                matches!(
-                    previous,
-                    '(' | '[' | ',' | '|' | '=' | '<' | '>' | '+' | '-'
-                )
-            })
-        {
+        if character == '/' && absolute_path_can_start(&output, previous_non_whitespace) {
             output.push_str(&logical_root);
             if characters
                 .clone()
@@ -2340,6 +2358,26 @@ fn rewrite_absolute_paths(source: &str, logical_root_index: usize) -> String {
         }
     }
     output
+}
+
+fn absolute_path_can_start(output: &str, previous: Option<char>) -> bool {
+    if previous.is_none_or(|previous| {
+        matches!(
+            previous,
+            '(' | '[' | ',' | '|' | '=' | '<' | '>' | '+' | '-'
+        )
+    }) {
+        return true;
+    }
+    let trimmed = output.trim_end();
+    ["and", "or", "div", "mod"].iter().any(|operator| {
+        trimmed.strip_suffix(operator).is_some_and(|prefix| {
+            prefix
+                .chars()
+                .next_back()
+                .is_none_or(|character| !is_xpath_name_character(character))
+        })
+    })
 }
 
 pub(crate) fn rewrite_absolute_paths_for_validation(source: &str) -> String {

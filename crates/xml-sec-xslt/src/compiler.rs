@@ -233,6 +233,14 @@ impl<R: Resolver> Compiler<R> {
             state.budget.owned_bytes,
             state.owned_bytes,
         )?;
+        if !state.module_documents.contains_key(&resource.canonical_uri) {
+            let source = resource_source(&resource)?;
+            let document = Document::parse(&source, Some(&resource.canonical_uri))?;
+            state.charge_owned(source.len())?;
+            state
+                .module_documents
+                .insert(resource.canonical_uri.clone(), document);
+        }
         state
             .resolved_identities
             .entry(resource.identity.clone())
@@ -431,6 +439,7 @@ impl<R: Resolver> Compiler<R> {
                     precedence,
                     order,
                     is_parameter: node.tag_name().name() == "param",
+                    dependencies: Arc::from([]),
                 });
             }
             "output" => merge_output(&mut state.output, node)?,
@@ -491,6 +500,7 @@ impl<R: Resolver> Compiler<R> {
 pub struct Stylesheet {
     pub(crate) principal_document: Document,
     pub(crate) principal_base_uri: Option<String>,
+    pub(crate) module_documents: Arc<[(String, Document)]>,
     pub(crate) templates: Arc<[Template]>,
     pub(crate) globals: Arc<[GlobalVariable]>,
     pub(crate) output: OutputDefinition,
@@ -531,6 +541,7 @@ pub(crate) struct GlobalVariable {
     pub precedence: usize,
     pub order: usize,
     pub is_parameter: bool,
+    pub dependencies: Arc<[ExpandedName]>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct ExsltFunction {
@@ -765,6 +776,302 @@ impl Expression {
             static_base_uri: None,
         }
     }
+
+    fn referenced_variables(&self, output: &mut HashSet<ExpandedName>) {
+        let mut quote = None;
+        let characters = self.source.char_indices().collect::<Vec<_>>();
+        let mut index = 0usize;
+        while index < characters.len() {
+            let (_, character) = characters[index];
+            if let Some(active) = quote {
+                if character == active {
+                    quote = None;
+                }
+                index += 1;
+                continue;
+            }
+            if matches!(character, '\'' | '"') {
+                quote = Some(character);
+                index += 1;
+                continue;
+            }
+            if character != '$' {
+                index += 1;
+                continue;
+            }
+            let start = index + 1;
+            let mut end = start;
+            while end < characters.len()
+                && (characters[end].1.is_alphanumeric()
+                    || matches!(characters[end].1, '_' | '-' | '.' | ':'))
+            {
+                end += 1;
+            }
+            let Some((byte_start, _)) = characters.get(start) else {
+                break;
+            };
+            let byte_end = characters
+                .get(end)
+                .map_or(self.source.len(), |(offset, _)| *offset);
+            let lexical = &self.source[*byte_start..byte_end];
+            if is_lexical_qname(lexical) {
+                let (prefix, local) = lexical
+                    .split_once(':')
+                    .map_or((None, lexical), |(prefix, local)| (Some(prefix), local));
+                let namespace = prefix.and_then(|prefix| {
+                    self.namespaces
+                        .iter()
+                        .find(|(candidate, _)| candidate == prefix)
+                        .map(|(_, namespace)| namespace.clone())
+                });
+                output.insert(ExpandedName::new(namespace, local));
+            }
+            index = end.max(index + 1);
+        }
+    }
+}
+
+impl Variable {
+    pub(crate) fn global_dependencies(&self, templates: &[Template]) -> HashSet<ExpandedName> {
+        let mut output = HashSet::new();
+        collect_variable_dependencies(self, &HashSet::new(), &mut output);
+        if sequence_applies_templates(&self.content) {
+            for template in templates {
+                let locals = template
+                    .params
+                    .iter()
+                    .map(|parameter| parameter.name.clone())
+                    .collect();
+                collect_sequence_dependencies(&template.body, locals, &mut output);
+            }
+        }
+        output
+    }
+}
+
+fn sequence_applies_templates(instructions: &[Instruction]) -> bool {
+    instructions.iter().any(|instruction| match instruction {
+        Instruction::ApplyTemplates { .. } => true,
+        Instruction::LiteralElement { children, .. }
+        | Instruction::ForEach { body: children, .. }
+        | Instruction::If { body: children, .. }
+        | Instruction::Copy { body: children, .. }
+        | Instruction::Element { body: children, .. }
+        | Instruction::Attribute { body: children, .. }
+        | Instruction::Comment(children)
+        | Instruction::Processing { body: children, .. }
+        | Instruction::Message { body: children, .. }
+        | Instruction::SecondaryOutput { body: children, .. }
+        | Instruction::ExtensionFallback { body: children, .. }
+        | Instruction::FunctionResult {
+            content: children, ..
+        } => sequence_applies_templates(children),
+        Instruction::Choose {
+            branches,
+            otherwise,
+        } => {
+            branches
+                .iter()
+                .any(|(_, body)| sequence_applies_templates(body))
+                || sequence_applies_templates(otherwise)
+        }
+        Instruction::Variable(variable) => sequence_applies_templates(&variable.content),
+        _ => false,
+    })
+}
+
+fn collect_variable_dependencies(
+    variable: &Variable,
+    locals: &HashSet<ExpandedName>,
+    output: &mut HashSet<ExpandedName>,
+) {
+    if let Some(select) = &variable.select {
+        collect_expression_dependencies(select, locals, output);
+    }
+    collect_sequence_dependencies(&variable.content, locals.clone(), output);
+}
+
+fn collect_expression_dependencies(
+    expression: &Expression,
+    locals: &HashSet<ExpandedName>,
+    output: &mut HashSet<ExpandedName>,
+) {
+    let mut references = HashSet::new();
+    expression.referenced_variables(&mut references);
+    output.extend(references.into_iter().filter(|name| !locals.contains(name)));
+}
+
+fn collect_avt_dependencies(
+    avt: &AttributeValueTemplate,
+    locals: &HashSet<ExpandedName>,
+    output: &mut HashSet<ExpandedName>,
+) {
+    for part in &avt.0 {
+        if let AvtPart::Expression(expression) = part {
+            collect_expression_dependencies(expression, locals, output);
+        }
+    }
+}
+
+fn collect_sort_dependencies(
+    sort: &Sort,
+    locals: &HashSet<ExpandedName>,
+    output: &mut HashSet<ExpandedName>,
+) {
+    collect_expression_dependencies(&sort.select, locals, output);
+    collect_avt_dependencies(&sort.data_type, locals, output);
+    collect_avt_dependencies(&sort.order, locals, output);
+    if let Some(value) = &sort.case_order {
+        collect_avt_dependencies(value, locals, output);
+    }
+    if let Some(value) = &sort.lang {
+        collect_avt_dependencies(value, locals, output);
+    }
+}
+
+fn collect_sequence_dependencies(
+    instructions: &[Instruction],
+    mut locals: HashSet<ExpandedName>,
+    output: &mut HashSet<ExpandedName>,
+) {
+    for instruction in instructions {
+        match instruction {
+            Instruction::Text(..)
+            | Instruction::ApplyImports
+            | Instruction::CompatibilityComment(_) => {}
+            Instruction::LiteralElement {
+                attributes,
+                children,
+                ..
+            } => {
+                for attribute in attributes {
+                    collect_avt_dependencies(&attribute.value, &locals, output);
+                }
+                collect_sequence_dependencies(children, locals.clone(), output);
+            }
+            Instruction::ApplyTemplates {
+                select,
+                sorts,
+                parameters,
+                ..
+            } => {
+                collect_expression_dependencies(select, &locals, output);
+                for sort in sorts {
+                    collect_sort_dependencies(sort, &locals, output);
+                }
+                for parameter in parameters {
+                    collect_variable_dependencies(&parameter.variable, &locals, output);
+                }
+            }
+            Instruction::CallTemplate { parameters, .. } => {
+                for parameter in parameters {
+                    collect_variable_dependencies(&parameter.variable, &locals, output);
+                }
+            }
+            Instruction::ForEach {
+                select,
+                sorts,
+                body,
+            } => {
+                collect_expression_dependencies(select, &locals, output);
+                for sort in sorts {
+                    collect_sort_dependencies(sort, &locals, output);
+                }
+                collect_sequence_dependencies(body, locals.clone(), output);
+            }
+            Instruction::If { test, body } => {
+                collect_expression_dependencies(test, &locals, output);
+                collect_sequence_dependencies(body, locals.clone(), output);
+            }
+            Instruction::Choose {
+                branches,
+                otherwise,
+            } => {
+                for (test, body) in branches {
+                    collect_expression_dependencies(test, &locals, output);
+                    collect_sequence_dependencies(body, locals.clone(), output);
+                }
+                collect_sequence_dependencies(otherwise, locals.clone(), output);
+            }
+            Instruction::ValueOf { select, .. } | Instruction::CopyOf(select) => {
+                collect_expression_dependencies(select, &locals, output);
+            }
+            Instruction::Copy { body, .. }
+            | Instruction::Comment(body)
+            | Instruction::ExtensionFallback { body, .. }
+            | Instruction::Message { body, .. } => {
+                collect_sequence_dependencies(body, locals.clone(), output);
+            }
+            Instruction::Element {
+                name,
+                namespace,
+                body,
+                ..
+            }
+            | Instruction::Attribute {
+                name,
+                namespace,
+                body,
+                ..
+            } => {
+                collect_avt_dependencies(name, &locals, output);
+                if let Some(namespace) = namespace {
+                    collect_avt_dependencies(namespace, &locals, output);
+                }
+                collect_sequence_dependencies(body, locals.clone(), output);
+            }
+            Instruction::Processing { name, body } => {
+                collect_avt_dependencies(name, &locals, output);
+                collect_sequence_dependencies(body, locals.clone(), output);
+            }
+            Instruction::Number(number) => {
+                if let Some(value) = &number.value {
+                    collect_expression_dependencies(value, &locals, output);
+                }
+                for value in [
+                    Some(&number.format),
+                    number.lang.as_ref(),
+                    number.letter_value.as_ref(),
+                    number.grouping_separator.as_ref(),
+                    number.grouping_size.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    collect_avt_dependencies(value, &locals, output);
+                }
+            }
+            Instruction::Variable(variable) => {
+                collect_variable_dependencies(variable, &locals, output);
+                locals.insert(variable.name.clone());
+            }
+            Instruction::SecondaryOutput {
+                uri,
+                properties,
+                body,
+            } => {
+                collect_avt_dependencies(uri, &locals, output);
+                for (_, value) in properties {
+                    collect_avt_dependencies(value, &locals, output);
+                }
+                collect_sequence_dependencies(body, locals.clone(), output);
+            }
+            Instruction::FunctionResult { select, content } => {
+                if let Some(select) = select {
+                    collect_expression_dependencies(select, &locals, output);
+                }
+                collect_sequence_dependencies(content, locals.clone(), output);
+            }
+        }
+    }
+}
+
+fn is_lexical_qname(value: &str) -> bool {
+    let mut parts = value.split(':');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    is_ncname(first) && parts.next().is_none_or(is_ncname) && parts.next().is_none()
 }
 impl Pattern {
     fn new(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Self> {
@@ -1047,6 +1354,7 @@ struct CompileState {
     active_resources: HashSet<ResourceIdentity>,
     resolved_requests: HashMap<ResolveRequest, Arc<ResolvedResource>>,
     resolved_identities: HashMap<ResourceIdentity, Arc<ResolvedResource>>,
+    module_documents: HashMap<String, Document>,
     imported_modules: usize,
     owned_bytes: usize,
     precedence: usize,
@@ -1070,6 +1378,7 @@ impl CompileState {
             active_resources: HashSet::new(),
             resolved_requests: HashMap::new(),
             resolved_identities: HashMap::new(),
+            module_documents: HashMap::new(),
             imported_modules: 0,
             owned_bytes: 0,
             precedence: 0,
@@ -1120,6 +1429,31 @@ impl CompileState {
                 )));
             }
         }
+        let mut dependency_bytes = 0usize;
+        for global in &mut self.globals {
+            let mut dependencies = global
+                .variable
+                .global_dependencies(&self.templates)
+                .into_iter()
+                .collect::<Vec<_>>();
+            dependencies.sort_by(|left, right| {
+                left.namespace
+                    .cmp(&right.namespace)
+                    .then_with(|| left.local.cmp(&right.local))
+            });
+            dependency_bytes = dependency_bytes.saturating_add(
+                dependencies
+                    .iter()
+                    .map(|name| {
+                        name.local
+                            .len()
+                            .saturating_add(name.namespace.as_ref().map_or(0, String::len))
+                    })
+                    .sum(),
+            );
+            global.dependencies = dependencies.into();
+        }
+        self.charge_owned(dependency_bytes)?;
         let mut functions = HashSet::new();
         for function in &self.functions {
             if !functions.insert((&function.name, function.precedence)) {
@@ -1132,6 +1466,7 @@ impl CompileState {
         Ok(Stylesheet {
             principal_document: Document::empty(None),
             principal_base_uri: None,
+            module_documents: self.module_documents.into_iter().collect::<Vec<_>>().into(),
             templates: self.templates.into(),
             globals: self.globals.into(),
             output: self.output,
@@ -1324,7 +1659,7 @@ fn compile_sequence<'a>(
             if let Some(text) = node.text() {
                 // XSLT strips whitespace-only stylesheet nodes unless explicitly
                 // preserved by xsl:text; retaining indentation changes result trees.
-                if !is_xml_whitespace_only(text) {
+                if !is_xml_whitespace_only(text) || stylesheet_space_is_preserved(node) {
                     out.push(Instruction::Text(text.to_owned(), false));
                 }
             }
@@ -1333,6 +1668,14 @@ fn compile_sequence<'a>(
         }
     }
     Ok(out)
+}
+
+fn stylesheet_space_is_preserved(node: roxmltree::Node<'_, '_>) -> bool {
+    const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+    node.ancestors()
+        .filter(roxmltree::Node::is_element)
+        .find_map(|ancestor| ancestor.attribute((XML_NS, "space")))
+        == Some("preserve")
 }
 fn compile_instruction(
     node: roxmltree::Node<'_, '_>,
@@ -1600,15 +1943,16 @@ fn compile_instruction(
         },
         _unknown if context.forward => {
             let mut fallback = Vec::new();
-            for child in node
+            let fallback_nodes = node
                 .children()
                 .filter(|child| child.has_tag_name((XSLT_NS, "fallback")))
-            {
+                .collect::<Vec<_>>();
+            for child in &fallback_nodes {
                 fallback.extend(compile_sequence(child.children(), context.descend()?)?);
             }
             Instruction::ExtensionFallback {
                 name: node.tag_name().name().into(),
-                present: true,
+                present: !fallback_nodes.is_empty(),
                 body: fallback,
             }
         }

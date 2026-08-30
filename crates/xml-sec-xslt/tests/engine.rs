@@ -821,6 +821,224 @@ fn whitespace_rules_honor_namespaces_specificity_and_inherited_xml_space() {
 }
 
 #[test]
+fn stylesheet_xml_space_controls_literal_whitespace() {
+    // xml:space applies to stylesheet text nodes too; nested `default` resumes stripping.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out xml:space="preserve"> <kept> </kept><reset xml:space="default"> </reset> </out></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "<out xml:space=\"preserve\"> <kept> </kept><reset xml:space=\"default\"/> </out>\n"
+    );
+}
+
+#[test]
+fn forward_compatible_instruction_requires_an_actual_fallback() {
+    // Forward-compatible processing suppresses unknown instructions only through xsl:fallback.
+    let missing = r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:future/></xsl:template></xsl:stylesheet>"#;
+    let error = compile(missing)
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect_err("unknown instruction without fallback must fail dynamically");
+    assert!(matches!(error, Error::Unsupported(message) if message.contains("no xsl:fallback")));
+
+    let present = r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:future><xsl:fallback>fallback</xsl:fallback></xsl:future></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(present, "<source/>"), "fallback");
+}
+
+#[test]
+fn deferred_globals_do_not_repeat_observable_work() {
+    // Dependency ordering must precede execution so retry cannot duplicate messages or outputs.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:xt="http://www.jclark.com/xt" extension-element-prefixes="xt"><xsl:output method="text"/><xsl:variable name="dependent"><xsl:message>once</xsl:message><xt:document href="memory:once.xml" method="text">once</xt:document><xsl:value-of select="$later"/></xsl:variable><xsl:variable name="later" select="'ok'"/><xsl:template match="/"><xsl:value-of select="$dependent"/></xsl:template></xsl:stylesheet>"#;
+    let result = compile(stylesheet)
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("ordered globals execute");
+    assert_eq!(result.messages.len(), 1);
+    assert_eq!(result.secondary_outputs.len(), 1);
+}
+
+#[test]
+fn included_module_document_is_retained_for_document_empty_uri() {
+    // document('') is the stylesheet module containing the expression, not always the principal.
+    #[derive(Default)]
+    struct ModuleResolver {
+        calls: Mutex<Vec<ResolvePurpose>>,
+    }
+    impl Resolver for ModuleResolver {
+        fn resolve(
+            &self,
+            uri: &str,
+            _base_uri: Option<&str>,
+            purpose: ResolvePurpose,
+        ) -> xml_sec_xslt::Result<ResolvedResource> {
+            self.calls.lock().expect("calls lock").push(purpose);
+            assert_eq!(uri, "module.xsl");
+            Ok(ResolvedResource {
+                canonical_uri: "memory:module.xsl".into(),
+                identity: ResourceIdentity("module".into()),
+                bytes: br#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><marker>module</marker><xsl:template name="read"><xsl:value-of select="document('')/*/marker"/></xsl:template></xsl:stylesheet>"#.to_vec(),
+                media_type: Some("application/xslt+xml".into()),
+                encoding: Some("UTF-8".into()),
+            })
+        }
+    }
+    let resolver = Arc::new(ModuleResolver::default());
+    let stylesheet = Compiler::new(
+        Arc::clone(&resolver),
+        CompileBudget::new(1 << 20, 8, 256, 4 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:include href="module.xsl"/><xsl:template match="/"><xsl:call-template name="read"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet graph compiles");
+    resolver.calls.lock().expect("calls lock").clear();
+    let output = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::clone(&resolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("retained module document resolves without runtime I/O");
+    assert_eq!(output.serialized.bytes, b"module");
+    assert!(resolver.calls.lock().expect("calls lock").is_empty());
+}
+
+#[test]
+fn xpath_fast_paths_preserve_xpath_node_and_space_semantics() {
+    // Absolute paths after word operators are operands, and normalize-space uses XML whitespace.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(/root)=1 and /root/item"/><xsl:text>|</xsl:text><xsl:value-of select="false() or /root/item"/><xsl:text>|</xsl:text><xsl:value-of select="normalize-space(.)"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root><item/> a\u{a0}b \t c </root>"),
+        "true|true|a\u{a0}b c"
+    );
+}
+
+#[test]
+fn adjacent_result_text_nodes_coalesce_without_crossing_doe_boundaries() {
+    // XPath sees one adjacent text node, while differing disable-output-escaping is metadata boundary.
+    let coalesced = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="fragment"><xsl:text>a</xsl:text><xsl:text>b</xsl:text></xsl:variable><xsl:value-of select="count(exsl:node-set($fragment)/text())"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(coalesced, "<source/>"), "1");
+
+    let separated = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template match="/"><xsl:variable name="fragment"><xsl:text>a</xsl:text><xsl:text disable-output-escaping="yes">b</xsl:text></xsl:variable><xsl:value-of select="count(exsl:node-set($fragment)/text())"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(separated, "<source/>"), "2");
+}
+
+#[test]
+fn direct_nodeset_parameters_are_normalized_to_document_order() {
+    // Caller vector order is not XPath node-set order.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:param name="nodes"/><xsl:template match="/"><out first="{$nodes}"><xsl:copy-of select="$nodes"/></out></xsl:template></xsl:stylesheet>"#,
+    );
+    let document = Document::parse("<root><item>first</item><item>second</item></root>", None)
+        .expect("source parses");
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "nodes"),
+        Value::NodeSet(vec![
+            NodeReference::Node(xml_sec_xslt::NodeId(4)),
+            NodeReference::Node(xml_sec_xslt::NodeId(2)),
+        ]),
+    );
+    let output = stylesheet
+        .execute(
+            &document,
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("node-set parameter executes");
+    assert_eq!(
+        output.serialized.bytes,
+        b"<out first=\"first\"><item>first</item><item>second</item></out>\n"
+    );
+}
+
+#[test]
+fn every_xpath_dispatch_consumes_exactly_one_evaluation() {
+    // Optimized expressions are still logical XPath evaluations and generic dispatch is not double charged.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template name="run"><xsl:value-of select="."/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(1024);
+    budget.xpath_evaluations = 0;
+    let error = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: Some(ExpandedName::new(None::<String>, "run")),
+            },
+        )
+        .expect_err("optimized XPath must consume budget");
+    assert!(matches!(
+        error,
+        Error::Budget {
+            kind: BudgetKind::XPathEvaluations,
+            ..
+        }
+    ));
+
+    let generic = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template name="run"><xsl:value-of select="1 + 1"/></xsl:template></xsl:stylesheet>"#,
+    );
+    budget.xpath_evaluations = 1;
+    let output = generic
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: Some(ExpandedName::new(None::<String>, "run")),
+            },
+        )
+        .expect("generic expression consumes one evaluation");
+    assert_eq!(output.serialized.bytes, b"2");
+}
+
+#[test]
+fn optimized_attribute_pattern_trims_grammar_whitespace() {
+    // Whitespace around `=` belongs to the predicate grammar, not the attribute QName.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template><xsl:template match="item[@id = 'wanted']">yes</xsl:template><xsl:template match="item">no</xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            "<root><item id=\"wanted\"/><item id=\"other\"/></root>"
+        ),
+        "yesno"
+    );
+}
+
+#[test]
 fn xpath_context_keeps_predicate_positions_and_all_node_kinds() {
     // XSLT outer context and XPath predicate context must not overwrite one another.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:value-of select="position()"/><xsl:text>:</xsl:text><xsl:value-of select="count(child[position() &lt; 2])"/><xsl:text>|</xsl:text></xsl:for-each><xsl:value-of select="name(/*)"/><xsl:text>:</xsl:text><xsl:value-of select="local-name(/*)"/><xsl:text>:</xsl:text><xsl:value-of select="namespace-uri(/*)"/><xsl:text>|</xsl:text><xsl:for-each select="root/@*"><xsl:variable name="a" select="."/><xsl:value-of select="name(current())"/><xsl:text>=</xsl:text><xsl:value-of select="$a"/></xsl:for-each></xsl:template></xsl:stylesheet>"#;
