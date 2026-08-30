@@ -85,6 +85,75 @@ pub(crate) fn innermost_namespaced_call(
     None
 }
 
+pub(crate) fn unprefixed_function_calls(source: &str, name: &str) -> Vec<FunctionCall> {
+    let mut calls = Vec::new();
+    let mut quote = None;
+    let mut cursor = 0;
+    while cursor < source.len() {
+        let Some(character) = source[cursor..].chars().next() else {
+            break;
+        };
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+            cursor += character.len_utf8();
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            cursor += character.len_utf8();
+            continue;
+        }
+        if !is_name_start(character) {
+            cursor += character.len_utf8();
+            continue;
+        }
+        let start = cursor;
+        cursor += character.len_utf8();
+        while cursor < source.len() {
+            let Some(next) = source[cursor..].chars().next() else {
+                break;
+            };
+            if !is_name_character(next) {
+                break;
+            }
+            cursor += next.len_utf8();
+        }
+        if &source[start..cursor] != name {
+            continue;
+        }
+        let mut open = cursor;
+        while open < source.len()
+            && source[open..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+        {
+            open += source[open..]
+                .chars()
+                .next()
+                .expect("cursor is inside source")
+                .len_utf8();
+        }
+        if !source[open..].starts_with('(') {
+            continue;
+        }
+        let Some(close) = matching_parenthesis(source, open) else {
+            continue;
+        };
+        calls.push(FunctionCall {
+            start,
+            end: close + 1,
+            arguments: split_function_arguments(&source[open + 1..close]),
+            namespace: String::new(),
+            local: name.to_owned(),
+            display_name: name.to_owned(),
+        });
+    }
+    calls
+}
+
 fn matching_parenthesis(source: &str, open: usize) -> Option<usize> {
     let mut quote = None;
     let mut depth = 0usize;

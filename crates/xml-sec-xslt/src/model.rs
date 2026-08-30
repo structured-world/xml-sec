@@ -737,7 +737,10 @@ impl Document {
         }
     }
 
-    pub(crate) fn retain_nodes(&mut self, mut keep: impl FnMut(NodeId, &Node) -> bool) {
+    pub(crate) fn retain_nodes(
+        &mut self,
+        mut keep: impl FnMut(NodeId, &Node) -> bool,
+    ) -> HashMap<NodeId, NodeId> {
         let mut retained = vec![self.root];
         let mut cursor = 0;
         while cursor < retained.len() {
@@ -783,6 +786,7 @@ impl Document {
         self.root = NodeId(0);
         self.logical_roots = vec![self.root];
         self.source_xml = None;
+        remap
     }
 }
 

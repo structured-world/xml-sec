@@ -14,7 +14,7 @@ use crate::compiler::{
 };
 use crate::expression::innermost_namespaced_call;
 use crate::serializer::{serialize, serialize_fragment};
-use crate::xpath::{Evaluator, EvaluatorSourceOptions, SourceNode, XPathValue};
+use crate::xpath::{Evaluator, EvaluatorSourceOptions, SourceNode, XPathValue, xpath_number};
 use crate::{
     Attribute, BudgetKind, Document, Error, ExecutionBudget, ExecutionEnvironment, ExpandedName,
     Namespace, NodeId, NodeKind, NodeReference, Resolver, Result, SerializedOutput, Value,
@@ -65,6 +65,11 @@ pub struct TransformResult {
 pub struct SecondaryOutput {
     pub uri: String,
     pub serialized: SerializedOutput,
+}
+
+struct PreparedSource<'a> {
+    document: Cow<'a, Document>,
+    remap: Option<HashMap<NodeId, NodeId>>,
 }
 
 impl Stylesheet {
@@ -134,13 +139,14 @@ impl Stylesheet {
         let prepared = self.prepare_source(source, source_bytes, &mut meter)?;
         let mut state = Execution::new(
             self,
-            prepared.as_ref(),
+            prepared.document.as_ref(),
             parameters,
+            prepared.remap.as_ref(),
             environment,
             meter,
             source_processing,
         )?;
-        let root = SourceNode::Node(prepared.root());
+        let root = SourceNode::Node(prepared.document.root());
         if let Some(name) = options.initial_template {
             state.call_named(
                 &name,
@@ -171,23 +177,29 @@ impl Stylesheet {
         source: &'a Document,
         source_bytes: usize,
         meter: &mut Meter,
-    ) -> Result<Cow<'a, Document>> {
+    ) -> Result<PreparedSource<'a>> {
         if self.whitespace.is_empty() {
-            return Ok(Cow::Borrowed(source));
+            return Ok(PreparedSource {
+                document: Cow::Borrowed(source),
+                remap: None,
+            });
         }
         meter.charge(BudgetKind::OwnedBytes, source_bytes)?;
         let mut prepared = source.clone();
-        apply_whitespace_rules(&mut prepared, &self.whitespace);
-        Ok(Cow::Owned(prepared))
+        let remap = apply_whitespace_rules(&mut prepared, &self.whitespace);
+        Ok(PreparedSource {
+            document: Cow::Owned(prepared),
+            remap,
+        })
     }
 }
 
 pub(crate) fn apply_whitespace_rules(
     document: &mut Document,
     rules: &[(NameTest, bool, usize, usize)],
-) {
+) -> Option<HashMap<NodeId, NodeId>> {
     if rules.is_empty() {
-        return;
+        return None;
     }
     let removed = document
         .nodes()
@@ -232,8 +244,9 @@ pub(crate) fn apply_whitespace_rules(
         })
         .collect::<HashSet<_>>();
     if !removed.is_empty() {
-        document.retain_nodes(|id, _| !removed.contains(&id));
+        return Some(document.retain_nodes(|id, _| !removed.contains(&id)));
     }
+    None
 }
 
 struct Execution<'a> {
@@ -334,6 +347,7 @@ impl<'a> Execution<'a> {
         stylesheet: &'a Stylesheet,
         source: &'a Document,
         parameters: &Parameters,
+        source_remap: Option<&HashMap<NodeId, NodeId>>,
         environment: ExecutionEnvironment<R>,
         mut meter: Meter,
         source_processing: SourceProcessing,
@@ -377,7 +391,7 @@ impl<'a> Execution<'a> {
                 .iter()
                 .map(|function| function.name.clone()),
         );
-        state.initialize_globals(parameters)?;
+        state.initialize_globals(parameters, source_remap)?;
         Ok(state)
     }
 
@@ -487,7 +501,11 @@ impl<'a> Execution<'a> {
             .matches(pattern, node, variables, &mut self.meter)
     }
 
-    fn initialize_globals(&mut self, parameters: &Parameters) -> Result<()> {
+    fn initialize_globals(
+        &mut self,
+        parameters: &Parameters,
+        source_remap: Option<&HashMap<NodeId, NodeId>>,
+    ) -> Result<()> {
         let mut effective = HashMap::new();
         for global in self.stylesheet.globals.iter() {
             if effective.get(&global.variable.name).is_none_or(
@@ -509,12 +527,15 @@ impl<'a> Execution<'a> {
                 if global.is_parameter
                     && let Some(value) = parameters.get(&global.variable.name)
                 {
+                    let value = source_remap.map_or_else(
+                        || value.clone(),
+                        |remap| remap_parameter_value(value, remap),
+                    );
                     let owned_bytes = expanded_name_owned_bytes(&global.variable.name)
-                        .saturating_add(value_owned_bytes(value));
+                        .saturating_add(value_owned_bytes(&value));
                     self.meter
                         .check_additional(BudgetKind::OwnedBytes, owned_bytes)?;
                     let name = global.variable.name.clone();
-                    let value = value.clone();
                     self.meter.charge(BudgetKind::OwnedBytes, owned_bytes)?;
                     self.scopes[0].insert(name, value);
                     progressed = true;
@@ -3007,6 +3028,38 @@ impl<'a> Execution<'a> {
     }
 }
 
+fn remap_parameter_value(value: &Value, remap: &HashMap<NodeId, NodeId>) -> Value {
+    let Value::NodeSet(nodes) = value else {
+        return value.clone();
+    };
+    Value::NodeSet(
+        nodes
+            .iter()
+            .filter_map(|node| match node {
+                NodeReference::Node(id) => remap.get(id).copied().map(NodeReference::Node),
+                NodeReference::Attribute { owner, index } => {
+                    remap
+                        .get(owner)
+                        .copied()
+                        .map(|owner| NodeReference::Attribute {
+                            owner,
+                            index: *index,
+                        })
+                }
+                NodeReference::Namespace { owner, index } => {
+                    remap
+                        .get(owner)
+                        .copied()
+                        .map(|owner| NodeReference::Namespace {
+                            owner,
+                            index: *index,
+                        })
+                }
+            })
+            .collect(),
+    )
+}
+
 fn normalize_xpath_space(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     let mut pending_space = false;
@@ -3065,18 +3118,8 @@ fn try_stable_sort_by<T: Copy>(
     Ok(())
 }
 
-fn xpath_number(value: &str) -> f64 {
-    value.trim().parse().unwrap_or(f64::NAN)
-}
-
 fn xpath_calls_key(source: &str) -> bool {
-    source.match_indices("key").any(|(index, _)| {
-        let before = source[..index].chars().next_back();
-        let after = source[index + 3..].trim_start().chars().next();
-        !before.is_some_and(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
-        }) && after == Some('(')
-    })
+    !crate::expression::unprefixed_function_calls(source, "key").is_empty()
 }
 
 fn literal_key_names(
@@ -3084,28 +3127,20 @@ fn literal_key_names(
     namespaces: &[(String, String)],
 ) -> Result<Option<Vec<ExpandedName>>> {
     let mut names = Vec::new();
-    let mut remainder = source;
-    while let Some(offset) = remainder.find("key") {
-        let before = remainder[..offset].chars().next_back();
-        remainder = &remainder[offset + 3..];
-        if before.is_some_and(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
-        }) {
-            continue;
-        }
-        let call = remainder.trim_start();
-        let Some(arguments) = call.strip_prefix('(') else {
-            continue;
-        };
-        let arguments = arguments.trim_start();
-        let Some(quote @ ('\'' | '"')) = arguments.chars().next() else {
+    for call in crate::expression::unprefixed_function_calls(source, "key") {
+        let Some(argument) = call.arguments.first() else {
             return Ok(None);
         };
-        let quoted = &arguments[quote.len_utf8()..];
-        let Some(end) = quoted.find(quote) else {
+        let argument = argument.trim();
+        let Some(quote @ ('\'' | '"')) = argument.chars().next() else {
             return Ok(None);
         };
-        let lexical = &quoted[..end];
+        let Some(lexical) = argument
+            .strip_prefix(quote)
+            .and_then(|value| value.strip_suffix(quote))
+        else {
+            return Ok(None);
+        };
         let (prefix, local) = lexical
             .split_once(':')
             .map_or((None, lexical), |(prefix, local)| (Some(prefix), local));
@@ -3122,7 +3157,6 @@ fn literal_key_names(
         if !names.contains(&name) {
             names.push(name);
         }
-        remainder = &quoted[end + quote.len_utf8()..];
     }
     Ok(Some(names))
 }

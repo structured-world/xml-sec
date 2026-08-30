@@ -1218,6 +1218,16 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
             assert!(!actual.contains("found"));
             true
         }
+        // element-available() reports instructions. xsl:decimal-format is a top-level
+        // declaration, although libxslt advertises it as an executable instruction.
+        "extensions/list.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            assert_eq!(
+                actual.as_ref(),
+                expected.replace("xsl:decimal-format available\n", "")
+            );
+            true
+        }
         // libxslt ignores xsl:exclude-result-prefixes on this literal result element.
         // XSLT 1.0 section 7.1.1 makes the exclusion effective for that subtree.
         "REC/test-7.1.1-3.xsl" => {

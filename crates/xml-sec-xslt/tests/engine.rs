@@ -3978,3 +3978,239 @@ fn instruction_attributes_follow_strict_and_forward_compatible_rules() {
         r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="." future-option="yes"/></xsl:template></xsl:stylesheet>"#,
     );
 }
+
+#[test]
+fn latin1_xml_serialization_distinguishes_markup_from_character_data() {
+    // Character references preserve text and attributes, while XML names cannot contain them.
+    let data = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="ISO-8859-1" omit-xml-declaration="yes"/><xsl:template match="/"><out value="€">€</out></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(data, "<source/>"),
+        "<out value=\"&#8364;\">&#8364;</out>\n"
+    );
+
+    let name = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="ISO-8859-1"/><xsl:template match="/"><xsl:element name="λ"/></xsl:template></xsl:stylesheet>"#;
+    assert!(matches!(
+        compile(name).execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        ),
+        Err(Error::Serialization(message)) if message.contains("name") && message.contains('λ')
+    ));
+}
+
+#[test]
+fn latin1_cdata_reopens_around_unrepresentable_characters() {
+    // A character reference is markup, so an unencodable CDATA character must close the section.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output encoding="ISO-8859-1" omit-xml-declaration="yes" cdata-section-elements="out"/><xsl:template match="/"><out>a€b</out></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<source/>"),
+        "<out><![CDATA[a]]>&#8364;<![CDATA[b]]></out>\n"
+    );
+}
+
+#[test]
+fn encode_uri_charges_expansion_before_constructing_it() {
+    // Percent encoding can triple UTF-8 input and must be rejected at the allocation boundary.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:param name="value"/><xsl:template match="/"><xsl:value-of select="str:encode-uri($value, true())"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let value = "€".repeat(4096);
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "value"),
+        Value::String(value),
+    );
+    let mut budget = execution_budget(1024);
+    budget.owned_bytes = 64 * 1024;
+    assert!(matches!(
+        stylesheet.execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None
+            },
+        ),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn capability_queries_distinguish_instructions_and_declarations() {
+    // XSLT 1.0 element-available reports executable instructions, not top-level declarations.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="element-available('xsl:decimal-format')"/><xsl:text>|</xsl:text><xsl:value-of select="exsl:object-type(system-property('xsl:version'))"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "false|number");
+}
+
+#[test]
+fn quoted_key_text_does_not_prepare_key_indexes() {
+    // Function-like text inside an XPath string literal cannot trigger key construction.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="all" match="*" use="name()"/><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="'key('"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let mut budget = execution_budget(1024);
+    budget.key_entries = 0;
+    let result = stylesheet
+        .execute(
+            &Document::parse("<root><item/></root>", None).expect("source parses"),
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("quoted text does not build keys");
+    assert_eq!(result.serialized.bytes, b"key(");
+}
+
+#[test]
+fn dynamic_map_preserves_boolean_lexical_values() {
+    // EXSLT dyn:map scalar nodes use XPath's true/false lexical representation.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:dyn="http://exslt.org/dynamic"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="dyn:map(root/item, '. = 2')[1]"/><xsl:text>|</xsl:text><xsl:value-of select="dyn:map(root/item, '. = 2')[2]"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root><item>1</item><item>2</item></root>"),
+        "false|true"
+    );
+}
+
+#[test]
+fn dynamic_qnames_require_complete_qname_grammar() {
+    // Runtime key and decimal-format names must reject extra colons and invalid NCNames.
+    for select in [
+        "key('p:a:b', 'x')",
+        "format-number(1, '0', 'p:a:b')",
+        "key('1bad', 'x')",
+    ] {
+        let stylesheet = compile(&format!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:p"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="{select}"/></xsl:template></xsl:stylesheet>"#
+        ));
+        assert!(matches!(
+            stylesheet.execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &Parameters::new(), Arc::new(NoResolver),
+                ExecutionOptions { budget: execution_budget(1024), initial_mode: None, initial_template: None },
+            ),
+            Err(Error::Dynamic(message)) if message.contains("QName")
+        ));
+    }
+}
+
+#[test]
+fn format_number_applies_affixes_and_negative_subpatterns_to_infinity() {
+    // Infinity substitutes for the numeric portion after the selected subpattern is parsed.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(1 div 0, 'P0S')"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(-1 div 0, 'P0S;N0Z')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "PInfinityS|NInfinityZ");
+}
+
+#[test]
+fn stripped_source_nodes_remap_external_nodeset_parameters() {
+    // Whitespace compaction changes NodeIds; caller node, attribute and namespace handles follow it.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:strip-space elements="*"/><xsl:output method="text"/><xsl:param name="node"/><xsl:param name="attr"/><xsl:param name="namespace"/><xsl:param name="removed"/><xsl:template match="/"><xsl:value-of select="$node"/><xsl:text>|</xsl:text><xsl:value-of select="$attr"/><xsl:text>|</xsl:text><xsl:value-of select="$namespace"/><xsl:text>|</xsl:text><xsl:value-of select="count($removed)"/></xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse(
+        "<root>  <item xmlns:p=\"urn:kept\" id=\"kept\">value</item></root>",
+        None,
+    )
+    .expect("source parses");
+    let mut parameters = Parameters::new();
+    parameters.insert(
+        ExpandedName::new(None::<String>, "node"),
+        Value::NodeSet(vec![NodeReference::Node(xml_sec_xslt::NodeId(3))]),
+    );
+    parameters.insert(
+        ExpandedName::new(None::<String>, "attr"),
+        Value::NodeSet(vec![NodeReference::Attribute {
+            owner: xml_sec_xslt::NodeId(3),
+            index: 0,
+        }]),
+    );
+    parameters.insert(
+        ExpandedName::new(None::<String>, "namespace"),
+        Value::NodeSet(vec![NodeReference::Namespace {
+            owner: xml_sec_xslt::NodeId(3),
+            index: 1,
+        }]),
+    );
+    parameters.insert(
+        ExpandedName::new(None::<String>, "removed"),
+        Value::NodeSet(vec![NodeReference::Node(xml_sec_xslt::NodeId(2))]),
+    );
+    let result = stylesheet
+        .execute(
+            &source,
+            &parameters,
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("compacted parameter nodes remain valid");
+    assert_eq!(result.serialized.bytes, b"value|kept|urn:kept|0");
+}
+
+#[test]
+fn arithmetic_fast_path_uses_xpath_number_grammar() {
+    // Parameter arithmetic must reject exponent and leading-plus forms just like number().
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:param name="value"/><xsl:template match="/"><xsl:value-of select="$value + 1"/></xsl:template></xsl:stylesheet>"#,
+    );
+    for (value, expected) in [("1e2", "NaN"), ("+1", "NaN"), ("-1.5", "-0.5")] {
+        let mut parameters = Parameters::new();
+        parameters.insert(
+            ExpandedName::new(None::<String>, "value"),
+            Value::String(value.into()),
+        );
+        let result = stylesheet
+            .execute(
+                &Document::parse("<source/>", None).expect("source parses"),
+                &parameters,
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect("arithmetic executes");
+        assert_eq!(
+            String::from_utf8(result.serialized.bytes).expect("UTF-8"),
+            expected
+        );
+    }
+}
+
+#[test]
+fn text_output_allows_non_xml_characters_without_adding_markup_rules() {
+    // The text method emits text-node data directly; XML character validity belongs to XML output.
+    let text = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:str="http://exslt.org/strings"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="str:decode-uri('%01')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(text, "<source/>").as_bytes(), b"\x01");
+
+    let xml = text.replace(
+        "method=\"text\"",
+        "method=\"xml\" omit-xml-declaration=\"yes\"",
+    );
+    assert!(matches!(
+        compile(&xml).execute(
+            &Document::parse("<source/>", None).expect("source parses"), &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions { budget: execution_budget(1024), initial_mode: None, initial_template: None },
+        ),
+        Err(Error::Serialization(message)) if message.contains("XML")
+    ));
+}

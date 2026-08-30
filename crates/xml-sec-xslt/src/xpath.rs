@@ -132,7 +132,7 @@ impl Evaluator {
         } else {
             source.clone()
         };
-        apply_whitespace_rules(&mut source, &source_options.whitespace);
+        let _ = apply_whitespace_rules(&mut source, &source_options.whitespace);
         let stylesheet_root = source.import(principal_stylesheet);
         let module_roots = module_documents
             .iter()
@@ -745,9 +745,8 @@ impl Evaluator {
                                     }
                                 }
                             }
-                            XPathValue::Boolean(value) => {
-                                scalars.push(("boolean", if value { "true" } else { "" }.into()))
-                            }
+                            XPathValue::Boolean(value) => scalars
+                                .push(("boolean", if value { "true" } else { "false" }.into())),
                             XPathValue::Number(value) => {
                                 scalars.push(("number", crate::value::format_xpath_number(value)))
                             }
@@ -1116,7 +1115,7 @@ impl Evaluator {
                     } else {
                         document
                     };
-                    apply_whitespace_rules(&mut document, &self.whitespace);
+                    let _ = apply_whitespace_rules(&mut document, &self.whitespace);
                     let root = self.import_document(&document, meter)?;
                     self.resource_identities
                         .insert(resource.identity.clone(), resource.bytes);
@@ -1964,7 +1963,7 @@ impl XPathValue {
     }
 }
 
-fn xpath_number(value: &str) -> f64 {
+pub(crate) fn xpath_number(value: &str) -> f64 {
     let trimmed = value.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
     let valid = !trimmed.is_empty()
         && !trimmed.starts_with('+')
@@ -3536,9 +3535,14 @@ impl function::Function for ExsltStringFunction {
                 if args.len() != 2 {
                     return extension_argument_error("str:encode-uri() requires two arguments");
                 }
+                let value = args[0].string();
+                let escape_reserved = args[1].boolean();
+                let encoded_len = percent_encoded_uri_len(&value, escape_reserved)?;
+                context.reserve_string_allocation(encoded_len)?;
                 Ok(SxdValue::String(percent_encode_uri(
-                    &args[0].string(),
-                    args[1].boolean(),
+                    &value,
+                    escape_reserved,
+                    encoded_len,
                 )))
             }
             Self::DecodeUri => {
@@ -3563,9 +3567,10 @@ fn extension_argument_error<T>(message: &str) -> std::result::Result<T, function
     })
 }
 
-fn percent_encode_uri(value: &str, escape_reserved: bool) -> String {
+fn percent_encode_uri(value: &str, escape_reserved: bool, encoded_len: usize) -> String {
     const RESERVED: &str = ";/?:@&=+$,[]#";
-    let mut output = String::new();
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut output = String::with_capacity(encoded_len);
     for byte in value.as_bytes() {
         let character = char::from(*byte);
         if character.is_ascii_alphanumeric()
@@ -3578,10 +3583,34 @@ fn percent_encode_uri(value: &str, escape_reserved: bool) -> String {
         {
             output.push(character);
         } else {
-            output.push_str(&format!("%{byte:02X}"));
+            output.push('%');
+            output.push(char::from(HEX[usize::from(*byte >> 4)]));
+            output.push(char::from(HEX[usize::from(*byte & 0x0f)]));
         }
     }
     output
+}
+
+fn percent_encoded_uri_len(
+    value: &str,
+    escape_reserved: bool,
+) -> std::result::Result<usize, function::Error> {
+    const RESERVED: &str = ";/?:@&=+$,[]#";
+    value.as_bytes().iter().try_fold(0usize, |length, byte| {
+        let character = char::from(*byte);
+        let encoded = !(character.is_ascii_alphanumeric()
+            || matches!(
+                character,
+                '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '(' | ')'
+            )
+            || character == '@'
+            || (!escape_reserved && RESERVED.contains(character)));
+        length
+            .checked_add(if encoded { 3 } else { 1 })
+            .ok_or_else(|| function::Error::Other {
+                what: "str:encode-uri() result length overflow".into(),
+            })
+    })
 }
 
 fn percent_decode_uri(
@@ -3708,6 +3737,7 @@ impl function::Function for SystemProperty {
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
         let name = one_qname_argument(args, &self.namespaces, "system-property")?;
         if name.namespace.as_deref() == Some(crate::compiler::XSLT_NS) && name.local == "version" {
+            // XSLT 1.0 section 12.4 defines xsl:version as the number 1.0.
             return Ok(SxdValue::Number(1.0));
         }
         let value = if name.namespace.as_deref() == Some(crate::compiler::XSLT_NS) {
@@ -3757,7 +3787,6 @@ impl function::Function for ElementAvailable {
                     | "variable"
                     | "param"
                     | "with-param"
-                    | "decimal-format"
                     | "when"
                     | "otherwise"
             ))
@@ -4158,6 +4187,14 @@ fn resolve_lexical_name(
     namespaces: &[(String, String)],
 ) -> std::result::Result<ExpandedName, function::Error> {
     if let Some((prefix, local)) = lexical.split_once(':') {
+        if !crate::compiler::is_ncname(prefix)
+            || !crate::compiler::is_ncname(local)
+            || local.contains(':')
+        {
+            return Err(function::Error::Other {
+                what: format!("invalid QName {lexical}"),
+            });
+        }
         let namespace = namespaces
             .iter()
             .find(|(candidate, _)| candidate == prefix)
@@ -4166,8 +4203,12 @@ fn resolve_lexical_name(
                 what: format!("unbound QName prefix {prefix}"),
             })?;
         Ok(ExpandedName::new(Some(namespace), local))
-    } else {
+    } else if crate::compiler::is_ncname(lexical) {
         Ok(ExpandedName::new(None::<String>, lexical))
+    } else {
+        Err(function::Error::Other {
+            what: format!("invalid QName {lexical}"),
+        })
     }
 }
 
@@ -4254,15 +4295,8 @@ fn render_decimal(
     if value.is_nan() {
         return Ok(format.nan.clone());
     }
-    if value.is_infinite() {
-        return Ok(if value.is_sign_negative() {
-            format!("{}{}", format.minus_sign, format.infinity)
-        } else {
-            format.infinity.clone()
-        });
-    }
     let alternatives = tokenize_decimal_pattern(pattern, format)?;
-    let negative = value < 0.0;
+    let negative = value.is_sign_negative();
     let negative_subpattern = negative
         && alternatives.len() > 1
         && alternatives[0] != alternatives[1]
@@ -4303,6 +4337,16 @@ fn render_decimal(
         })
         .map(|index| index + 1)
         .unwrap_or(first + 1);
+    if value.is_infinite() {
+        let mut output = String::new();
+        if negative && !negative_subpattern {
+            output.push(format.minus_sign);
+        }
+        output.extend(selected[..first].iter().map(|token| token.value));
+        output.push_str(&format.infinity);
+        output.extend(selected[last..].iter().map(|token| token.value));
+        return Ok(output);
+    }
     let number_pattern = &selected[first..last];
     let decimal = number_pattern
         .iter()

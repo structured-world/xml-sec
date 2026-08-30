@@ -60,6 +60,42 @@ pub struct SerializedOutput {
     pub media_type: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+enum OutputEncoding {
+    Unicode,
+    Latin1,
+    Other(&'static encoding_rs::Encoding),
+}
+
+impl OutputEncoding {
+    fn new(label: &str) -> Result<Self> {
+        if label.eq_ignore_ascii_case("utf-8")
+            || label.eq_ignore_ascii_case("utf-16")
+            || label.eq_ignore_ascii_case("utf-16le")
+            || label.eq_ignore_ascii_case("utf-16be")
+        {
+            Ok(Self::Unicode)
+        } else if label.eq_ignore_ascii_case("iso-8859-1") || label.eq_ignore_ascii_case("latin1") {
+            Ok(Self::Latin1)
+        } else {
+            encoding_rs::Encoding::for_label(label.as_bytes())
+                .map(Self::Other)
+                .ok_or_else(|| Error::Serialization(format!("unsupported output encoding {label}")))
+        }
+    }
+
+    fn represents(self, character: char) -> bool {
+        match self {
+            Self::Unicode => true,
+            Self::Latin1 => u32::from(character) <= 0xff,
+            Self::Other(encoding) => {
+                let mut bytes = [0_u8; 4];
+                !encoding.encode(character.encode_utf8(&mut bytes)).2
+            }
+        }
+    }
+}
+
 pub(crate) fn serialize(
     document: &Document,
     definition: &OutputDefinition,
@@ -82,11 +118,11 @@ pub(crate) fn serialize_fragment(document: &Document, meter: &mut Meter) -> Resu
         used,
         limit,
     );
-    render(document, &definition, &mut counter)?;
+    render(document, &definition, OutputEncoding::Unicode, &mut counter)?;
     let bytes = counter.len();
     meter.charge(BudgetKind::OwnedBytes, bytes)?;
     let mut text = RenderBuffer::Text(String::with_capacity(bytes));
-    render(document, &definition, &mut text)?;
+    render(document, &definition, OutputEncoding::Unicode, &mut text)?;
     Ok(text.into_string())
 }
 
@@ -106,6 +142,7 @@ fn serialize_charged(
     if definition.method == OutputMethod::Html && !definition.indent_explicit {
         definition.indent = true;
     }
+    let encoding = OutputEncoding::new(&definition.encoding)?;
     let (used, limit) = meter.usage(budget_kind)?;
     let mut counter = RenderBuffer::counting(
         EncodingCounter::new(&definition.encoding)?,
@@ -113,17 +150,21 @@ fn serialize_charged(
         used,
         limit,
     );
-    render(document, &definition, &mut counter)?;
+    render(document, &definition, encoding, &mut counter)?;
     let text_bytes = counter.len();
     let encoded_bytes = counter.encoded_len()?;
     meter.check_additional(budget_kind, encoded_bytes)?;
     meter.charge(BudgetKind::OwnedBytes, text_bytes)?;
     let mut text = RenderBuffer::Text(String::with_capacity(text_bytes));
-    render(document, &definition, &mut text)?;
+    render(document, &definition, encoding, &mut text)?;
     let text = text.into_string();
-    validate_xml_characters(&text, definition.version.as_deref().unwrap_or("1.0"))?;
+    if definition.method == OutputMethod::Xml {
+        validate_xml_characters(&text, definition.version.as_deref().unwrap_or("1.0"))?;
+    }
     if definition.method == OutputMethod::Text {
         validate_text_encoding(&text, &definition.encoding)?;
+    } else {
+        reject_unrepresentable_markup(&text, encoding, "serialized output")?;
     }
     let bytes = encode(&text, &definition.encoding, meter, budget_kind)?;
     Ok(SerializedOutput {
@@ -145,6 +186,7 @@ fn serialize_charged(
 fn render(
     document: &Document,
     definition: &OutputDefinition,
+    encoding: OutputEncoding,
     text: &mut RenderBuffer,
 ) -> Result<()> {
     if definition.method == OutputMethod::Xml && !definition.omit_xml_declaration {
@@ -177,9 +219,16 @@ fn render(
     });
     for (index, child) in children.iter().enumerate() {
         if Some(*child) == document_element {
-            render_doctype(document, *child, definition, text)?;
+            render_doctype(document, *child, definition, encoding, text)?;
         }
-        serialize_node(document, *child, definition, text, RenderContext::root())?;
+        serialize_node(
+            document,
+            *child,
+            definition,
+            encoding,
+            text,
+            RenderContext::root(),
+        )?;
         if definition.method == OutputMethod::Xml
             && (definition.indent || !definition.omit_xml_declaration)
             && index + 1 < children.len()
@@ -202,6 +251,7 @@ fn render_doctype(
     document: &Document,
     element: NodeId,
     definition: &OutputDefinition,
+    encoding: OutputEncoding,
     text: &mut RenderBuffer,
 ) -> Result<()> {
     if definition.doctype_system.is_none()
@@ -218,22 +268,22 @@ fn render_doctype(
         ));
     };
     text.push_str("<!DOCTYPE ");
-    push_name(prefix.as_deref(), &name.local, text);
+    push_name(prefix.as_deref(), &name.local, encoding, text)?;
     match (&definition.doctype_public, &definition.doctype_system) {
         (Some(public), Some(system)) => {
             text.push_str(" PUBLIC ");
-            push_external_identifier_literal(public, "public identifier", text)?;
+            push_external_identifier_literal(public, "public identifier", encoding, text)?;
             text.push(' ');
-            push_external_identifier_literal(system, "system identifier", text)?;
+            push_external_identifier_literal(system, "system identifier", encoding, text)?;
         }
         (Some(public), None) if definition.method == OutputMethod::Html => {
             text.push_str(" PUBLIC ");
-            push_external_identifier_literal(public, "public identifier", text)?;
+            push_external_identifier_literal(public, "public identifier", encoding, text)?;
         }
         (Some(_), None) => {}
         (None, Some(system)) => {
             text.push_str(" SYSTEM ");
-            push_external_identifier_literal(system, "system identifier", text)?;
+            push_external_identifier_literal(system, "system identifier", encoding, text)?;
         }
         (None, None) => {}
     }
@@ -245,8 +295,10 @@ fn render_doctype(
 fn push_external_identifier_literal(
     value: &str,
     kind: &str,
+    encoding: OutputEncoding,
     output: &mut RenderBuffer,
 ) -> Result<()> {
+    reject_unrepresentable_markup(value, encoding, kind)?;
     let delimiter = if !value.contains('"') {
         '"'
     } else if !value.contains('\'') {
@@ -436,12 +488,7 @@ impl EncodingCounter {
                 self.encoded_bytes = self.encoded_bytes.saturating_add(value.len())
             }
             EncodingCounterKind::Latin1 => {
-                for character in value.chars() {
-                    self.encoded_bytes = self.encoded_bytes.saturating_add(
-                        u8::try_from(u32::from(character))
-                            .map_or_else(|_| format!("&#{};", u32::from(character)).len(), |_| 1),
-                    );
-                }
+                self.encoded_bytes = self.encoded_bytes.saturating_add(value.chars().count());
             }
             EncodingCounterKind::Utf16 => {
                 self.encoded_bytes = self
@@ -521,6 +568,7 @@ fn serialize_node(
     document: &Document,
     id: NodeId,
     definition: &OutputDefinition,
+    encoding: OutputEncoding,
     output: &mut RenderBuffer,
     context: RenderContext,
 ) -> Result<()> {
@@ -531,6 +579,7 @@ fn serialize_node(
             push_cdata(
                 &value,
                 definition.version.as_deref().unwrap_or("1.0"),
+                encoding,
                 output,
             );
             continue;
@@ -551,7 +600,7 @@ fn serialize_node(
             }
             if !html_void {
                 output.push_str("</");
-                push_name(prefix.as_deref(), &name.local, output);
+                push_name(prefix.as_deref(), &name.local, encoding, output)?;
                 output.push('>');
             }
             continue;
@@ -582,11 +631,15 @@ fn serialize_node(
                             )
                     })
                 {
+                    if definition.method == OutputMethod::Html {
+                        reject_unrepresentable_markup(value, encoding, "HTML raw text")?;
+                    }
                     output.push_str(value);
                 } else if *disable_output_escaping {
                     push_xml_raw_text(
                         value,
                         definition.version.as_deref().unwrap_or("1.0"),
+                        encoding,
                         output,
                     );
                 } else if context
@@ -597,18 +650,21 @@ fn serialize_node(
                     push_cdata(
                         value,
                         definition.version.as_deref().unwrap_or("1.0"),
+                        encoding,
                         output,
                     );
                 } else {
                     escape_text(
                         value,
                         definition.version.as_deref().unwrap_or("1.0"),
+                        encoding,
                         output,
                     );
                 }
             }
             NodeKind::Comment(value) if definition.method != OutputMethod::Text => {
                 reject_xml11_restricted_markup(value, definition, "comment")?;
+                reject_unrepresentable_markup(value, encoding, "comment")?;
                 output.push_str("<!--");
                 output.push_str(value);
                 output.push_str("-->");
@@ -618,7 +674,9 @@ fn serialize_node(
             {
                 if let Some(value) = value {
                     reject_xml11_restricted_markup(value, definition, "processing instruction")?;
+                    reject_unrepresentable_markup(value, encoding, "processing instruction")?;
                 }
+                reject_unrepresentable_markup(target, encoding, "processing-instruction target")?;
                 output.push_str("<?");
                 output.push_str(target);
                 if let Some(value) = value {
@@ -653,7 +711,7 @@ fn serialize_node(
                     output.push_repeated(b' ', context.depth.saturating_mul(2))?;
                 }
                 output.push('<');
-                push_name(prefix.as_deref(), &name.local, output);
+                push_name(prefix.as_deref(), &name.local, encoding, output)?;
                 let mut current_namespaces = context.in_scope_namespaces.clone();
                 let inherited_default_namespace = current_namespaces
                     .iter()
@@ -712,12 +770,14 @@ fn serialize_node(
                     output.push_str(" xmlns");
                     if let Some(prefix) = &namespace.prefix {
                         output.push(':');
+                        reject_unrepresentable_markup(prefix, encoding, "namespace prefix")?;
                         output.push_str(prefix);
                     }
                     output.push_str("=\"");
                     escape_attribute(
                         &namespace.uri,
                         definition.version.as_deref().unwrap_or("1.0"),
+                        encoding,
                         output,
                     );
                     output.push('"');
@@ -732,7 +792,12 @@ fn serialize_node(
                 }
                 for attribute in attributes {
                     output.push(' ');
-                    push_name(attribute.prefix.as_deref(), &attribute.name.local, output);
+                    push_name(
+                        attribute.prefix.as_deref(),
+                        &attribute.name.local,
+                        encoding,
+                        output,
+                    )?;
                     if definition.method == OutputMethod::Html
                         && name.namespace.is_none()
                         && attribute.name.namespace.is_none()
@@ -747,13 +812,14 @@ fn serialize_node(
                         && attribute.name.namespace.is_none()
                         && is_html_uri_attribute(&name.local, &attribute.name.local)
                     {
-                        escape_html_attribute(&escape_html_uri(&attribute.value), output);
+                        escape_html_attribute(&escape_html_uri(&attribute.value), encoding, output);
                     } else if definition.method == OutputMethod::Html {
-                        escape_html_attribute(&attribute.value, output);
+                        escape_html_attribute(&attribute.value, encoding, output);
                     } else {
                         escape_attribute(
                             &attribute.value,
                             definition.version.as_deref().unwrap_or("1.0"),
+                            encoding,
                             output,
                         );
                     }
@@ -795,6 +861,7 @@ fn serialize_node(
                         escape_attribute(
                             &definition.encoding,
                             definition.version.as_deref().unwrap_or("1.0"),
+                            encoding,
                             output,
                         );
                         output.push_str("\">");
@@ -805,6 +872,7 @@ fn serialize_node(
                         escape_attribute(
                             &definition.encoding,
                             definition.version.as_deref().unwrap_or("1.0"),
+                            encoding,
                             output,
                         );
                         output.push_str("\" />");
@@ -889,7 +957,7 @@ fn serialize_node(
     Ok(())
 }
 
-fn push_cdata(value: &str, version: &str, output: &mut RenderBuffer) {
+fn push_cdata(value: &str, version: &str, encoding: OutputEncoding, output: &mut RenderBuffer) {
     output.push_str("<![CDATA[");
     let mut start = 0usize;
     for (offset, character) in value.char_indices() {
@@ -897,6 +965,12 @@ fn push_cdata(value: &str, version: &str, output: &mut RenderBuffer) {
             push_cdata_segment(&value[start..offset], output);
             output.push_str("]]>");
             output.push_str(&format!("&#x{:X};", u32::from(character)));
+            output.push_str("<![CDATA[");
+            start = offset + character.len_utf8();
+        } else if !encoding.represents(character) {
+            push_cdata_segment(&value[start..offset], output);
+            output.push_str("]]>");
+            output.push_str(&format!("&#{};", u32::from(character)));
             output.push_str("<![CDATA[");
             start = offset + character.len_utf8();
         }
@@ -911,10 +985,17 @@ fn push_cdata_segment(value: &str, output: &mut RenderBuffer) {
     output.push_str(&value.replace("]]>", "]]]]><![CDATA[>"));
 }
 
-fn push_xml_raw_text(value: &str, version: &str, output: &mut RenderBuffer) {
+fn push_xml_raw_text(
+    value: &str,
+    version: &str,
+    encoding: OutputEncoding,
+    output: &mut RenderBuffer,
+) {
     for character in value.chars() {
         if version == "1.1" && is_xml11_restricted(character) {
             output.push_str(&format!("&#x{:X};", u32::from(character)));
+        } else if !encoding.represents(character) {
+            output.push_str(&format!("&#{};", u32::from(character)));
         } else {
             output.push(character);
         }
@@ -986,18 +1067,29 @@ fn is_html_encoding_meta(node: &crate::Node) -> bool {
         })
 }
 
-fn push_name(prefix: Option<&str>, local: &str, output: &mut RenderBuffer) {
+fn push_name(
+    prefix: Option<&str>,
+    local: &str,
+    encoding: OutputEncoding,
+    output: &mut RenderBuffer,
+) -> Result<()> {
     if let Some(prefix) = prefix {
+        reject_unrepresentable_markup(prefix, encoding, "XML name")?;
         output.push_str(prefix);
         output.push(':');
     }
+    reject_unrepresentable_markup(local, encoding, "XML name")?;
     output.push_str(local);
+    Ok(())
 }
 
-fn escape_text(value: &str, version: &str, output: &mut RenderBuffer) {
+fn escape_text(value: &str, version: &str, encoding: OutputEncoding, output: &mut RenderBuffer) {
     for character in value.chars() {
         if version == "1.1" && is_xml11_restricted(character) {
             output.push_str(&format!("&#x{:X};", u32::from(character)));
+            continue;
+        } else if !encoding.represents(character) {
+            output.push_str(&format!("&#{};", u32::from(character)));
             continue;
         }
         match character {
@@ -1010,10 +1102,18 @@ fn escape_text(value: &str, version: &str, output: &mut RenderBuffer) {
     }
 }
 
-fn escape_attribute(value: &str, version: &str, output: &mut RenderBuffer) {
+fn escape_attribute(
+    value: &str,
+    version: &str,
+    encoding: OutputEncoding,
+    output: &mut RenderBuffer,
+) {
     for character in value.chars() {
         if version == "1.1" && is_xml11_restricted(character) {
             output.push_str(&format!("&#x{:X};", u32::from(character)));
+            continue;
+        } else if !encoding.represents(character) {
+            output.push_str(&format!("&#{};", u32::from(character)));
             continue;
         }
         match character {
@@ -1058,8 +1158,12 @@ fn is_html_boolean_attribute(element: &str, attribute: &str) -> bool {
     )
 }
 
-fn escape_html_attribute(value: &str, output: &mut RenderBuffer) {
+fn escape_html_attribute(value: &str, encoding: OutputEncoding, output: &mut RenderBuffer) {
     for character in value.chars() {
+        if !encoding.represents(character) {
+            output.push_str(&format!("&#{};", u32::from(character)));
+            continue;
+        }
         match character {
             '&' => output.push_str("&amp;"),
             '"' => output.push_str("&quot;"),
@@ -1068,22 +1172,33 @@ fn escape_html_attribute(value: &str, output: &mut RenderBuffer) {
     }
 }
 
+fn reject_unrepresentable_markup(value: &str, encoding: OutputEncoding, kind: &str) -> Result<()> {
+    if let Some(character) = value
+        .chars()
+        .find(|character| !encoding.represents(*character))
+    {
+        return Err(Error::Serialization(format!(
+            "{kind} character `{character}` is not representable in the output encoding"
+        )));
+    }
+    Ok(())
+}
+
 fn encode(value: &str, label: &str, meter: &mut Meter, budget_kind: BudgetKind) -> Result<Vec<u8>> {
     if label.eq_ignore_ascii_case("utf-8") {
         meter.charge(budget_kind, value.len())?;
         return Ok(value.as_bytes().to_vec());
     }
     if label.eq_ignore_ascii_case("iso-8859-1") || label.eq_ignore_ascii_case("latin1") {
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(value.chars().count());
         for character in value.chars() {
-            if let Ok(byte) = u8::try_from(u32::from(character)) {
-                meter.charge(budget_kind, 1)?;
-                bytes.push(byte);
-            } else {
-                let reference = format!("&#{};", u32::from(character));
-                meter.charge(budget_kind, reference.len())?;
-                bytes.extend_from_slice(reference.as_bytes());
-            }
+            let byte = u8::try_from(u32::from(character)).map_err(|_| {
+                Error::Serialization(format!(
+                    "character `{character}` reached the Latin-1 encoder without escaping"
+                ))
+            })?;
+            meter.charge(budget_kind, 1)?;
+            bytes.push(byte);
         }
         return Ok(bytes);
     }
