@@ -86,14 +86,6 @@ pub(crate) fn format_xpath_number(value: f64) -> String {
     if value == 0.0 {
         return "0".into();
     }
-    let exponent = value.abs().log10().floor() as i32;
-    let scale = 10_f64.powi(14_i32.saturating_sub(exponent));
-    let scaled = value * scale;
-    let value = if scale.is_finite() && scale != 0.0 && scaled.is_finite() {
-        scaled.round() / scale
-    } else {
-        value
-    };
     expand_decimal_exponent(&value.to_string())
 }
 
@@ -148,8 +140,14 @@ mod tests {
     fn xpath_finite_numbers_do_not_lose_significant_digits() {
         assert_eq!(format_xpath_number(59.999_999_999_99), "59.99999999999");
         assert_eq!(format_xpath_number(0.000_01), "0.00001");
-        assert_eq!(format_xpath_number(0.640_000_000_000_000_1), "0.64");
-        assert_eq!(format_xpath_number(95_012.388_419_899_99), "95012.3884199");
+        assert_eq!(
+            format_xpath_number(0.640_000_000_000_000_1),
+            "0.6400000000000001"
+        );
+        assert_eq!(
+            format_xpath_number(95_012.388_419_899_99),
+            "95012.38841989999"
+        );
         assert_eq!(format_xpath_number(285_311_670_611.0), "285311670611");
     }
 }

@@ -1111,9 +1111,6 @@ fn assert_case(case: &Case) {
                 case,
                 normalize_generated_ids(&actual),
             ));
-            if assert_strict_xslt_output_deviation(case, &actual) {
-                return;
-            }
             let expected = if actual_is_html {
                 normalize_html_indentation(&expected).into_bytes()
             } else if actual_is_xml {
@@ -1125,6 +1122,9 @@ fn assert_case(case: &Case) {
                 case,
                 normalize_generated_ids(&expected),
             ));
+            if assert_strict_xslt_output_deviation(case, &actual, &expected) {
+                return;
+            }
             assert!(
                 actual == expected,
                 "{}: serialized output differs from libxslt: {}",
@@ -1146,7 +1146,7 @@ fn assert_case(case: &Case) {
     }
 }
 
-fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8]) -> bool {
+fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u8]) -> bool {
     let stylesheet = case.stylesheet.to_string_lossy();
     let actual = String::from_utf8_lossy(actual);
     match stylesheet.as_ref() {
@@ -1209,8 +1209,103 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8]) -> bool {
             assert_eq!(actual, "<?xml version=\"1.0\"?>\n<out>SUCCESS</out>\n");
             true
         }
+        // XSLT 1.0 section 7.1.1 assigns the namespace node designated by result-prefix,
+        // including its prefix. libxslt retains the stylesheet prefix while changing only URI.
+        "REC/test-7.1.1.xsl" => {
+            assert!(actual.contains("<xsl:stylesheet"));
+            assert!(actual.contains("<xsl:template"));
+            assert!(!actual.contains("<axsl:"));
+            true
+        }
+        // XPath document order places attributes of preceding elements before attributes of the
+        // current element. libxslt restarts level-any attribute numbering for each owner.
+        "general/bug-197.xsl" => {
+            assert!(actual.contains("<root attr=\"1\">"));
+            assert!(actual.contains("<foo attr=\"2\">"));
+            assert!(actual.contains("<bar attr=\"3\"/>"));
+            true
+        }
+        // XPath 1.0 section 4.2 requires enough decimal digits to distinguish the IEEE-754 value.
+        // libxslt rounds these arithmetic results to a shorter, non-distinguishing representation.
+        "general/bug-5-.xsl" => {
+            assert!(numeric_lexical_forms_are_ieee_equivalent(&actual, expected));
+            true
+        }
+        "general/bug-81.xsl" => {
+            assert_eq!(actual.matches("0.6400000000000001").count(), 2);
+            true
+        }
+        "XSLTMark/metric.xsl" => {
+            assert!(actual.contains("<measurement unit=\"yd\">95012.38841989999</measurement>"));
+            true
+        }
         _ => false,
     }
+}
+
+fn numeric_lexical_forms_are_ieee_equivalent(actual: &str, expected: &[u8]) -> bool {
+    let Ok(expected) = std::str::from_utf8(expected) else {
+        return false;
+    };
+    let mut actual_cursor = 0;
+    let mut expected_cursor = 0;
+    loop {
+        let actual_token = next_decimal_token(actual, actual_cursor);
+        let expected_token = next_decimal_token(expected, expected_cursor);
+        let (Some((actual_start, actual_end)), Some((expected_start, expected_end))) =
+            (actual_token, expected_token)
+        else {
+            return actual_token.is_none()
+                && expected_token.is_none()
+                && actual[actual_cursor..] == expected[expected_cursor..];
+        };
+        if actual[actual_cursor..actual_start] != expected[expected_cursor..expected_start] {
+            return false;
+        }
+        let actual_number = &actual[actual_start..actual_end];
+        let expected_number = &expected[expected_start..expected_end];
+        if actual_number != expected_number {
+            let (Ok(actual_number), Ok(expected_number)) =
+                (actual_number.parse::<f64>(), expected_number.parse::<f64>())
+            else {
+                return false;
+            };
+            let scale = actual_number.abs().max(expected_number.abs()).max(1.0);
+            if (actual_number - expected_number).abs() > f64::EPSILON * scale * 16.0 {
+                return false;
+            }
+        }
+        actual_cursor = actual_end;
+        expected_cursor = expected_end;
+    }
+}
+
+fn next_decimal_token(value: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = value.as_bytes();
+    let mut start = from;
+    while start < bytes.len() {
+        let starts_number = bytes[start].is_ascii_digit()
+            || ((bytes[start] == b'-' || bytes[start] == b'.')
+                && bytes.get(start + 1).is_some_and(u8::is_ascii_digit));
+        if starts_number {
+            break;
+        }
+        start += 1;
+    }
+    if start == bytes.len() {
+        return None;
+    }
+    let mut end = start + usize::from(matches!(bytes[start], b'-' | b'.'));
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+    }
+    Some((start, end))
 }
 
 fn is_expected_strict_xslt_error(case: &Case, error: &Error) -> bool {
@@ -1837,6 +1932,22 @@ fn stale_gdp_uri_normalization_removes_only_the_known_leading_prefix() {
         ),
         b"<a href=\"http://example.test/a b\">"
     );
+}
+
+#[test]
+fn strict_numeric_oracle_comparison_preserves_structure_and_rejects_large_deltas() {
+    assert!(numeric_lexical_forms_are_ieee_equivalent(
+        "<v>1664.4799999999998</v>",
+        b"<v>1664.48</v>"
+    ));
+    assert!(!numeric_lexical_forms_are_ieee_equivalent(
+        "<other>1664.4799999999998</other>",
+        b"<v>1664.48</v>"
+    ));
+    assert!(!numeric_lexical_forms_are_ieee_equivalent(
+        "<v>1664.49</v>",
+        b"<v>1664.48</v>"
+    ));
 }
 
 fn first_difference(actual: &[u8], expected: &[u8]) -> String {

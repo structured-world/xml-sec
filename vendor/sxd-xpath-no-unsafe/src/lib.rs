@@ -229,7 +229,22 @@ pub enum Value<'d> {
 }
 
 fn str_to_num(s: &str) -> f64 {
-    s.trim().parse().unwrap_or(::std::f64::NAN)
+    let lexical = s.trim();
+    let unsigned = lexical.strip_prefix('-').unwrap_or(lexical);
+    let mut parts = unsigned.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    let has_digit = !integer.is_empty() || fraction.is_some_and(|value| !value.is_empty());
+    let valid = !unsigned.is_empty()
+        && has_digit
+        && parts.next().is_none()
+        && integer.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.is_none_or(|value| value.bytes().all(|byte| byte.is_ascii_digit()));
+    if valid {
+        lexical.parse().unwrap_or(::std::f64::NAN)
+    } else {
+        ::std::f64::NAN
+    }
 }
 
 impl<'d> Value<'d> {

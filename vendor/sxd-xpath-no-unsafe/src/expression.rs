@@ -470,7 +470,24 @@ impl Expression for Relational {
         let left_val = self.left.evaluate(context)?;
         let right_val = self.right.evaluate(context)?;
         let op = self.operation;
-        Ok(Boolean(op(left_val.number(), right_val.number())))
+        let result = match (&left_val, &right_val) {
+            (Value::Nodeset(left), Value::Nodeset(right)) => left.iter().any(|left| {
+                right.iter().any(|right| {
+                    op(
+                        Value::String(left.string_value()).number(),
+                        Value::String(right.string_value()).number(),
+                    )
+                })
+            }),
+            (Value::Nodeset(left), right) => left
+                .iter()
+                .any(|left| op(Value::String(left.string_value()).number(), right.number())),
+            (left, Value::Nodeset(right)) => right
+                .iter()
+                .any(|right| op(left.number(), Value::String(right.string_value()).number())),
+            (left, right) => op(left.number(), right.number()),
+        };
+        Ok(Boolean(result))
     }
 }
 
@@ -520,7 +537,7 @@ impl Predicate {
         let value = self.expression.evaluate(context)?;
 
         let v = match value {
-            Number(v) => context.position == v as usize,
+            Number(v) => context.position as f64 == v,
             _ => value.boolean(),
         };
 

@@ -278,7 +278,7 @@ fn whitespace_aliases_and_decimal_formats_affect_results() {
       </xsl:stylesheet>"#;
     assert_eq!(
         execute(stylesheet, "<root>  <item/>\n</root>"),
-        "<old:r xmlns:old=\"urn:new\" xmlns:new=\"urn:new\">0|1.234,50</old:r>\n",
+        "<new:r xmlns:new=\"urn:new\">0|1.234,50</new:r>\n",
     );
 }
 
@@ -1083,7 +1083,7 @@ fn numbering_parses_tokens_widths_and_unicode_decimal_patterns() {
     let lexical_numbers = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="285311670611"/><xsl:text>|</xsl:text><xsl:value-of select="95012.38841989999"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(
         execute(lexical_numbers, "<source/>"),
-        "285311670611|95012.3884199"
+        "285311670611|95012.38841989999"
     );
 }
 
@@ -2987,4 +2987,160 @@ fn processing_instruction_pattern_priority_ignores_xpath_whitespace() {
     // Equivalent PI target patterns have equal default priority, so later stylesheet order wins.
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/processing-instruction()"/></xsl:template><xsl:template match="processing-instruction ('target')">early</xsl:template><xsl:template match="processing-instruction('target')">late</xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<root><?target value?></root>"), "late");
+}
+
+#[test]
+fn xpath_number_strings_preserve_distinguishable_f64_digits() {
+    // XPath string conversion must not collapse distinct IEEE-754 values before serialization.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="1.2345678901234567"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "1.2345678901234567");
+}
+
+#[test]
+fn deep_streaming_parser_expands_internal_general_entities() {
+    // The depth-safe parser must retain the same internal-entity semantics as the normal parser.
+    let xml = format!(
+        "<!DOCTYPE n [<!ENTITY nested \"ok\"><!ENTITY value \"<leaf attr='&nested;'>&nested;</leaf>\">]>{}&value;{}",
+        "<n>".repeat(129),
+        "</n>".repeat(129)
+    );
+    let document = Document::parse(&xml, None).expect("deep document with internal entity parses");
+    let result = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="//leaf/@attr"/><xsl:text>|</xsl:text><xsl:value-of select="//leaf"/></xsl:template></xsl:stylesheet>"#,
+    )
+    .execute(
+        &document,
+        &Parameters::new(),
+        Arc::new(NoResolver),
+        ExecutionOptions {
+            budget: execution_budget(xml.len()),
+            initial_mode: None,
+            initial_template: None,
+        },
+    )
+    .expect("deep entity document transforms");
+    assert_eq!(result.serialized.bytes, b"ok|ok");
+
+    let cyclic = format!(
+        "<!DOCTYPE n [<!ENTITY a \"&b;\"><!ENTITY b \"&a;\">]>{}&a;{}",
+        "<n>".repeat(129),
+        "</n>".repeat(129)
+    );
+    assert!(matches!(Document::parse(&cyclic, None), Err(Error::Xml(_))));
+}
+
+struct CanonicalIdentityResolver {
+    calls: AtomicUsize,
+}
+
+impl Resolver for CanonicalIdentityResolver {
+    fn resolve(
+        &self,
+        _uri: &str,
+        _base_uri: Option<&str>,
+        _purpose: ResolvePurpose,
+    ) -> xml_sec_xslt::Result<ResolvedResource> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(ResolvedResource {
+            canonical_uri: "memory:canonical.xml".into(),
+            identity: ResourceIdentity("canonical-document".into()),
+            bytes: b"<doc/>".to_vec(),
+            media_type: Some("application/xml".into()),
+            encoding: Some("UTF-8".into()),
+        })
+    }
+}
+
+#[test]
+fn document_function_coalesces_lexical_aliases_by_resource_identity() {
+    // Resolver provenance, not lexical href spelling, defines external document identity.
+    let resolver = Arc::new(CanonicalIdentityResolver {
+        calls: AtomicUsize::new(0),
+    });
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(document('doc.xml')/doc | document('./doc.xml')/doc)"/></xsl:template></xsl:stylesheet>"#,
+        Some("memory:main.xsl"),
+    )
+    .expect("stylesheet compiles");
+    let result = stylesheet
+        .execute(
+            &Document::parse("<source/>", None).expect("source parses"),
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1024),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("canonical document aliases resolve");
+    assert_eq!(result.serialized.bytes, b"1");
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn namespace_alias_uses_the_declared_result_prefix() {
+    // The alias chooses both the result namespace URI and its lexical output prefix.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:old="urn:old" xmlns:new="urn:new"><xsl:namespace-alias stylesheet-prefix="old" result-prefix="new"/><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><old:result/></xsl:template></xsl:stylesheet>"#;
+    let output = execute(stylesheet, "<source/>");
+    assert!(output.starts_with("<new:result"), "{output}");
+    assert!(output.contains("xmlns:new=\"urn:new\""), "{output}");
+}
+
+#[test]
+fn explicit_axis_node_tests_keep_their_default_priority() {
+    // Explicit child/attribute axes are priority-equivalent to their abbreviated node tests.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/foo | root/foo/@id"/></xsl:template><xsl:template match="foo">element-specific|</xsl:template><xsl:template match="child::node()">element-generic|</xsl:template><xsl:template match="@id">attribute-specific|</xsl:template><xsl:template match="attribute::node()">attribute-generic|</xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root><foo id=\"x\"/></root>"),
+        "element-specific|attribute-specific|"
+    );
+}
+
+#[test]
+fn xpath_string_to_number_rejects_non_xpath_lexical_forms() {
+    // XPath 1.0 accepts decimal syntax only, not Rust's leading-plus or exponent forms.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="number('+1')"/><xsl:text>|</xsl:text><xsl:value-of select="number('1e2')"/><xsl:text>|</xsl:text><xsl:value-of select="number('1.5')"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "NaN|NaN|1.5");
+}
+
+#[test]
+fn computed_names_accept_the_complete_xml_name_start_range() {
+    // U+200C is an XML 1.0 NameStartChar even though Rust does not classify it alphabetically.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:element name="&#x200C;result"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<source/>"), "<\u{200c}result/>\n");
+}
+
+#[test]
+fn relational_nodeset_comparisons_are_existential() {
+    // Every nodeset member participates; the first node in document order is not privileged.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root/n &lt; 5"/><xsl:text>|</xsl:text><xsl:value-of select="root/n &lt; root/limit"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(
+            stylesheet,
+            "<root><n>10</n><n>1</n><limit>0</limit><limit>5</limit></root>"
+        ),
+        "true|true"
+    );
+}
+
+#[test]
+fn fractional_numeric_predicates_do_not_select_truncated_positions() {
+    // A numeric predicate matches only exact context position equality.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(root/item[1.5])"/></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(execute(stylesheet, "<root><item/><item/></root>"), "0");
+}
+
+#[test]
+fn level_any_numbering_counts_attributes_on_preceding_elements() {
+    // Attribute document order includes attributes of elements preceding the current owner.
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:apply-templates select="root/*/@id"/></xsl:template><xsl:template match="@id"><xsl:number level="any" count="@id"/><xsl:text>|</xsl:text></xsl:template></xsl:stylesheet>"#;
+    assert_eq!(
+        execute(stylesheet, "<root><a id=\"x\"/><b id=\"y\"/></root>"),
+        "1|2|"
+    );
 }

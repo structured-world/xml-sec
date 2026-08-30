@@ -2712,10 +2712,6 @@ impl<'a> Execution<'a> {
         node: &SourceNode,
     ) -> Result<Vec<f64>> {
         let mut lineage = vec![node.clone()];
-        let owner = match node {
-            SourceNode::Node(id) => *id,
-            SourceNode::Attribute { owner, .. } | SourceNode::Namespace { owner, .. } => *owner,
-        };
         let mut cursor = match node {
             SourceNode::Node(id) => self.evaluator.source.node(*id).and_then(|node| node.parent),
             SourceNode::Attribute { owner, .. } | SourceNode::Namespace { owner, .. } => {
@@ -2769,10 +2765,6 @@ impl<'a> Execution<'a> {
                 Ok(values)
             }
             "any" => {
-                if matches!(node, SourceNode::Attribute { .. }) {
-                    let count = self.sibling_number(node, &mut matches)?;
-                    return Ok((count > 0).then_some(count as f64).into_iter().collect());
-                }
                 let mut boundary = None::<NodeId>;
                 for candidate in &lineage {
                     if from(self, candidate)? {
@@ -2793,21 +2785,24 @@ impl<'a> Execution<'a> {
                     .source
                     .subtree_in_document_order(logical_root);
                 for id in ids {
-                    if Some(id) == boundary {
-                        count = 0;
-                        if id == owner {
-                            break;
+                    let element = SourceNode::Node(id);
+                    let candidates = std::iter::once(element.clone())
+                        .chain(self.evaluator.attributes(&element))
+                        .chain(self.evaluator.namespaces(&element));
+                    for candidate in candidates {
+                        if candidate == element && Some(id) == boundary {
+                            count = 0;
+                        } else if matches(self, &candidate)? {
+                            count += 1;
                         }
-                        continue;
-                    }
-                    if matches(self, &SourceNode::Node(id))? {
-                        count += 1;
-                    }
-                    if id == owner {
-                        break;
+                        if &candidate == node {
+                            return Ok((count > 0).then_some(count as f64).into_iter().collect());
+                        }
                     }
                 }
-                Ok((count > 0).then_some(count as f64).into_iter().collect())
+                Err(Error::Dynamic(
+                    "numbering node is outside its logical document".into(),
+                ))
             }
             level => Err(Error::Static(format!(
                 "unsupported xsl:number level {level}"

@@ -5,6 +5,9 @@ use crate::{Error, Result};
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
+// Keep the streaming fallback aligned with roxmltree's entity-expansion safety ceilings.
+const MAX_ENTITY_EXPANSION_DEPTH: usize = 10;
+const MAX_NESTED_ENTITY_REFERENCES: usize = 255;
 
 /// Stable index of a node inside one owned document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -216,7 +219,9 @@ impl Document {
 
         let mut document = Self::empty(base_uri.map(str::to_owned));
         document.source_xml = Some(xml.to_owned());
-        let mut reader = Reader::from_str(xml);
+        let entities = internal_general_entities(xml)?;
+        let expanded_xml = expand_document_entities(xml, &entities)?;
+        let mut reader = Reader::from_str(&expanded_xml);
         let mut saw_document_element = false;
         let mut elements = vec![(
             document.root,
@@ -879,6 +884,243 @@ fn validate_namespace_binding(prefix: Option<&str>, uri: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn internal_general_entities(xml: &str) -> Result<HashMap<String, String>> {
+    let Some((start, end)) = doctype_span(xml)? else {
+        return Ok(HashMap::new());
+    };
+    let doctype = &xml[start..end];
+    let Some(subset_start) = doctype.find('[') else {
+        return Ok(HashMap::new());
+    };
+    let Some(subset_end) = doctype.rfind(']') else {
+        return Err(Error::Xml(
+            "unterminated document type internal subset".into(),
+        ));
+    };
+    let subset = &doctype[subset_start + 1..subset_end];
+    let mut entities = HashMap::new();
+    let mut cursor = 0;
+    while cursor < subset.len() {
+        if subset[cursor..].starts_with("<!--") {
+            let length = subset[cursor + 4..]
+                .find("-->")
+                .map(|offset| offset + 7)
+                .ok_or_else(|| Error::Xml("unterminated DTD comment".into()))?;
+            cursor += length;
+            continue;
+        }
+        if !subset[cursor..].starts_with("<!ENTITY") {
+            cursor += subset[cursor..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
+        cursor += "<!ENTITY".len();
+        skip_xml_whitespace(subset, &mut cursor);
+        if subset[cursor..].starts_with('%') {
+            cursor = declaration_end(subset, cursor)?;
+            continue;
+        }
+        let name_start = cursor;
+        while cursor < subset.len()
+            && !subset.as_bytes()[cursor].is_ascii_whitespace()
+            && subset.as_bytes()[cursor] != b'>'
+        {
+            cursor += 1;
+        }
+        let name = &subset[name_start..cursor];
+        if name.is_empty() {
+            return Err(Error::Xml("internal entity declaration has no name".into()));
+        }
+        skip_xml_whitespace(subset, &mut cursor);
+        let Some(quote) = subset.as_bytes().get(cursor).copied() else {
+            return Err(Error::Xml(
+                "unterminated internal entity declaration".into(),
+            ));
+        };
+        if !matches!(quote, b'\'' | b'"') {
+            cursor = declaration_end(subset, cursor)?;
+            continue;
+        }
+        cursor += 1;
+        let value_start = cursor;
+        while subset
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(|byte| *byte != quote)
+        {
+            cursor += 1;
+        }
+        if cursor == subset.len() {
+            return Err(Error::Xml(format!(
+                "unterminated value for internal entity `{name}`"
+            )));
+        }
+        let value = subset[value_start..cursor].to_owned();
+        cursor += 1;
+        cursor = declaration_end(subset, cursor)?;
+        if entities.insert(name.to_owned(), value).is_some() {
+            return Err(Error::Xml(format!(
+                "duplicate internal entity declaration `{name}`"
+            )));
+        }
+    }
+    Ok(entities)
+}
+
+fn doctype_span(xml: &str) -> Result<Option<(usize, usize)>> {
+    let Some(start) = xml.find("<!DOCTYPE") else {
+        return Ok(None);
+    };
+    let mut quote = None;
+    let mut subset_depth = 0usize;
+    let mut cursor = start + "<!DOCTYPE".len();
+    while cursor < xml.len() {
+        if let Some(active) = quote {
+            let ch = xml[cursor..]
+                .chars()
+                .next()
+                .expect("cursor remains before the string end");
+            cursor += ch.len_utf8();
+            if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        if xml[cursor..].starts_with("<!--") {
+            let length = xml[cursor + 4..]
+                .find("-->")
+                .map(|offset| offset + 7)
+                .ok_or_else(|| Error::Xml("unterminated DTD comment".into()))?;
+            cursor += length;
+            continue;
+        }
+        let ch = xml[cursor..]
+            .chars()
+            .next()
+            .expect("cursor remains before the string end");
+        cursor += ch.len_utf8();
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => subset_depth += 1,
+            ']' if subset_depth > 0 => subset_depth -= 1,
+            '>' if subset_depth == 0 => return Ok(Some((start, cursor))),
+            _ => {}
+        }
+    }
+    Err(Error::Xml("unterminated document type declaration".into()))
+}
+
+fn declaration_end(subset: &str, mut cursor: usize) -> Result<usize> {
+    let mut quote = None;
+    while cursor < subset.len() {
+        let ch = subset[cursor..]
+            .chars()
+            .next()
+            .expect("cursor remains on a character boundary");
+        cursor += ch.len_utf8();
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            }
+        } else {
+            match ch {
+                '\'' | '"' => quote = Some(ch),
+                '>' => return Ok(cursor),
+                _ => {}
+            }
+        }
+    }
+    Err(Error::Xml("unterminated entity declaration".into()))
+}
+
+fn skip_xml_whitespace(value: &str, cursor: &mut usize) {
+    while value
+        .as_bytes()
+        .get(*cursor)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        *cursor += 1;
+    }
+}
+
+fn expand_document_entities(xml: &str, entities: &HashMap<String, String>) -> Result<String> {
+    if entities.is_empty() {
+        return Ok(xml.to_owned());
+    }
+    let Some((_, doctype_end)) = doctype_span(xml)? else {
+        return Ok(xml.to_owned());
+    };
+    let mut expanded = String::with_capacity(xml.len());
+    let mut references = 0;
+    expanded.push_str(&xml[..doctype_end]);
+    expanded.push_str(&expand_entity_references(
+        &xml[doctype_end..],
+        entities,
+        0,
+        &mut references,
+    )?);
+    Ok(expanded)
+}
+
+fn expand_entity_references(
+    value: &str,
+    entities: &HashMap<String, String>,
+    depth: usize,
+    references: &mut usize,
+) -> Result<String> {
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let tail = &value[cursor..];
+        let protected_end = if tail.starts_with("<!--") {
+            tail.find("-->").map(|offset| offset + 3)
+        } else if tail.starts_with("<![CDATA[") {
+            tail.find("]]>").map(|offset| offset + 3)
+        } else if tail.starts_with("<?") {
+            tail.find("?>").map(|offset| offset + 2)
+        } else {
+            None
+        };
+        if let Some(length) = protected_end {
+            output.push_str(&tail[..length]);
+            cursor += length;
+            continue;
+        }
+        if tail.starts_with('&')
+            && let Some(end) = tail.find(';')
+            && let name = &tail[1..end]
+            && let Some(replacement) = entities.get(name)
+        {
+            let mut top_level_references = 0;
+            let references = if depth == 0 {
+                &mut top_level_references
+            } else {
+                &mut *references
+            };
+            *references += 1;
+            if depth >= MAX_ENTITY_EXPANSION_DEPTH || *references > MAX_NESTED_ENTITY_REFERENCES {
+                return Err(Error::Xml(format!(
+                    "entity reference expansion limit exceeded at `{name}`"
+                )));
+            }
+            output.push_str(&expand_entity_references(
+                replacement,
+                entities,
+                depth + 1,
+                references,
+            )?);
+            cursor += end + 1;
+            continue;
+        }
+        let ch = tail
+            .chars()
+            .next()
+            .expect("cursor remains before the string end");
+        output.push(ch);
+        cursor += ch.len_utf8();
+    }
+    Ok(output)
 }
 
 fn lexical_nesting_depth(xml: &str) -> usize {

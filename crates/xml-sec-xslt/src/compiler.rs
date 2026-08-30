@@ -1112,7 +1112,10 @@ impl Pattern {
     }
     fn default_priority(&self) -> f64 {
         let normalized = normalize_xpath_for_sxd(self.source.trim());
-        let value = normalized.as_str();
+        let value = normalized
+            .strip_prefix("child::")
+            .or_else(|| normalized.strip_prefix("attribute::"))
+            .unwrap_or(&normalized);
         if matches!(value, "*" | "@*")
             || matches!(
                 value,
@@ -1329,13 +1332,7 @@ fn parse_namespace_alias(node: roxmltree::Node<'_, '_>) -> Result<NamespaceAlias
     };
     Ok(NamespaceAlias {
         stylesheet_namespace,
-        output_prefix: if result_prefix == "#default" {
-            None
-        } else if stylesheet_prefix == "#default" {
-            Some(result_prefix.to_owned())
-        } else {
-            Some(stylesheet_prefix.to_owned())
-        },
+        output_prefix: (result_prefix != "#default").then(|| result_prefix.to_owned()),
         result_namespace,
     })
 }
@@ -2599,15 +2596,36 @@ pub(crate) fn is_ncname(value: &str) -> bool {
     let Some(first) = chars.next() else {
         return false;
     };
-    (first == '_' || first.is_alphabetic())
-        && chars.all(|ch| {
-            ch == '_'
-                || ch == '-'
-                || ch == '.'
-                || ch == '\u{B7}'
-                || ch.is_alphanumeric()
-                || matches!(ch, '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}')
-        })
+    is_ncname_start(first) && chars.all(is_ncname_char)
+}
+
+fn is_ncname_start(ch: char) -> bool {
+    matches!(
+        ch,
+        'A'..='Z'
+            | '_'
+            | 'a'..='z'
+            | '\u{C0}'..='\u{D6}'
+            | '\u{D8}'..='\u{F6}'
+            | '\u{F8}'..='\u{2FF}'
+            | '\u{370}'..='\u{37D}'
+            | '\u{37F}'..='\u{1FFF}'
+            | '\u{200C}'..='\u{200D}'
+            | '\u{2070}'..='\u{218F}'
+            | '\u{2C00}'..='\u{2FEF}'
+            | '\u{3001}'..='\u{D7FF}'
+            | '\u{F900}'..='\u{FDCF}'
+            | '\u{FDF0}'..='\u{FFFD}'
+            | '\u{10000}'..='\u{EFFFF}'
+    )
+}
+
+fn is_ncname_char(ch: char) -> bool {
+    is_ncname_start(ch)
+        || matches!(
+            ch,
+            '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}'
+        )
 }
 fn attribute_prefix(
     node: roxmltree::Node<'_, '_>,

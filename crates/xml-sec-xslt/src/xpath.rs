@@ -81,6 +81,7 @@ pub(crate) struct Evaluator {
     documents: HashMap<DocumentRequest, Vec<SourceNode>>,
     document_roots: Rc<RefCell<HashMap<DocumentRequest, Vec<NodePath>>>>,
     resource_identities: HashMap<ResourceIdentity, Vec<u8>>,
+    resource_documents: HashMap<ResourceIdentity, SourceNode>,
     result_tree_fragments: HashMap<u64, SourceNode>,
     dynamic_evaluation_depth: usize,
     source_processing: SourceProcessing,
@@ -173,6 +174,7 @@ impl Evaluator {
             documents,
             document_roots,
             resource_identities,
+            resource_documents: HashMap::new(),
             result_tree_fragments: HashMap::new(),
             dynamic_evaluation_depth: 0,
             source_processing: source_options.processing,
@@ -1073,29 +1075,36 @@ impl Evaluator {
                         identity: resource.identity,
                     });
                 }
-                meter.check_additional(BudgetKind::OwnedBytes, resource.bytes.len())?;
-                let xml = decode_resource(&resource.bytes, resource.encoding.as_deref())?;
-                let document = Document::parse(&xml, Some(&resource.canonical_uri))?;
-                meter.charge(BudgetKind::OwnedBytes, resource.bytes.len())?;
-                let mut document = if self.source_processing == SourceProcessing::XInclude {
-                    let mut stack = vec![resource.identity.clone()];
-                    expand_xinclude_document(
-                        &document,
-                        self.resolver.as_ref(),
-                        meter,
-                        &mut self.resource_identities,
-                        &mut stack,
-                        1,
-                    )?
+                if let Some(root) = self.resource_documents.get(&resource.identity).cloned() {
+                    self.cache_document(resource_request.clone(), vec![root.clone()]);
+                    Some(root)
                 } else {
-                    document
-                };
-                apply_whitespace_rules(&mut document, &self.whitespace);
-                let root = self.import_document(&document, meter)?;
-                self.resource_identities
-                    .insert(resource.identity, resource.bytes);
-                self.cache_document(resource_request.clone(), vec![root.clone()]);
-                Some(root)
+                    meter.check_additional(BudgetKind::OwnedBytes, resource.bytes.len())?;
+                    let xml = decode_resource(&resource.bytes, resource.encoding.as_deref())?;
+                    let document = Document::parse(&xml, Some(&resource.canonical_uri))?;
+                    meter.charge(BudgetKind::OwnedBytes, resource.bytes.len())?;
+                    let mut document = if self.source_processing == SourceProcessing::XInclude {
+                        let mut stack = vec![resource.identity.clone()];
+                        expand_xinclude_document(
+                            &document,
+                            self.resolver.as_ref(),
+                            meter,
+                            &mut self.resource_identities,
+                            &mut stack,
+                            1,
+                        )?
+                    } else {
+                        document
+                    };
+                    apply_whitespace_rules(&mut document, &self.whitespace);
+                    let root = self.import_document(&document, meter)?;
+                    self.resource_identities
+                        .insert(resource.identity.clone(), resource.bytes);
+                    self.resource_documents
+                        .insert(resource.identity, root.clone());
+                    self.cache_document(resource_request.clone(), vec![root.clone()]);
+                    Some(root)
+                }
             };
             let Some(root) = root else {
                 self.cache_document(request, Vec::new());
@@ -1395,6 +1404,26 @@ impl Evaluator {
             .unwrap_or_default();
         (0..count)
             .map(|index| SourceNode::Attribute {
+                owner: *owner,
+                index,
+            })
+            .collect()
+    }
+
+    pub(crate) fn namespaces(&self, node: &SourceNode) -> Vec<SourceNode> {
+        let SourceNode::Node(owner) = node else {
+            return Vec::new();
+        };
+        let count = self
+            .source
+            .node(*owner)
+            .and_then(|node| match &node.kind {
+                NodeKind::Element { namespaces, .. } => Some(namespaces.len()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        (0..count)
+            .map(|index| SourceNode::Namespace {
                 owner: *owner,
                 index,
             })
